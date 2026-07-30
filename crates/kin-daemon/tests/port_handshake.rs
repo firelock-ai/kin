@@ -88,7 +88,7 @@ async fn direct_containment_hard_parent_worker() {
         .env(CONTAINMENT_TREE_PARENT, &descendant_marker)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut tree = spawn_daemon_test_command(&mut command, "hard-parent containment tree")
+    let mut tree = spawn_daemon_test_command(command, "hard-parent containment tree")
         .expect("spawn hard-parent containment tree");
     let direct_pid = tree.id().expect("hard-parent direct child pid");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -132,7 +132,7 @@ fn spawn_daemon_ephemeral(repo_root: &Path) -> DaemonChild {
         )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    spawn_daemon_test_command(&mut command, "ephemeral-port daemon")
+    spawn_daemon_test_command(command, "ephemeral-port daemon")
         .expect("failed to spawn contained kin-daemon")
 }
 
@@ -209,32 +209,74 @@ async fn daemon_binds_ephemeral_port_and_publishes_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_a_direct_daemon_child_terminates_its_containment() {
-    let repo = tempfile::TempDir::new().expect("tempdir");
-    kin_core::init(repo.path()).expect("init scratch repo");
-    let mut child = spawn_daemon_ephemeral(repo.path());
-    let pid = child.id().expect("spawned daemon pid");
-    let deadline = Instant::now() + READINESS_TIMEOUT;
-    while read_port_file(&repo.path().join(".kin")).is_none() {
-        assert_child_alive(&mut child, "bound");
-        assert!(
-            Instant::now() < deadline,
-            "daemon never published its port before the Drop check"
+    #[cfg(windows)]
+    {
+        // Windows repository initialization currently fails closed before it
+        // can publish a capability-owned config replacement. This test owns
+        // only the independent DaemonChild containment contract, so exercise
+        // that contract with the same native test executable instead of
+        // weakening repository initialization for a lifecycle fixture.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let marker = root.path().join("direct-contained-child.pid");
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        isolate_daemon_test_command(&mut command);
+        command
+            .args(["--exact", "direct_containment_tree_worker", "--nocapture"])
+            .env(CONTAINMENT_TREE_DESCENDANT, &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = spawn_daemon_test_command(command, "direct contained child")
+            .expect("spawn direct contained child");
+        let pid = child.id().expect("spawned contained child pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.is_file() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(marker.is_file(), "direct contained child was never ready");
+        let start_time = live_process_start_time(pid).expect("live contained child identity");
+
+        drop(child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while live_process_start_time(pid) == Some(start_time) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_ne!(
+            live_process_start_time(pid),
+            Some(start_time),
+            "contained Drop left direct child pid {pid} alive"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let start_time = live_process_start_time(pid).expect("live daemon process identity");
 
-    drop(child);
+    #[cfg(not(windows))]
+    {
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        kin_core::init(repo.path()).expect("init scratch repo");
+        let mut child = spawn_daemon_ephemeral(repo.path());
+        let pid = child.id().expect("spawned daemon pid");
+        let deadline = Instant::now() + READINESS_TIMEOUT;
+        while read_port_file(&repo.path().join(".kin")).is_none() {
+            assert_child_alive(&mut child, "bound");
+            assert!(
+                Instant::now() < deadline,
+                "daemon never published its port before the Drop check"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let start_time = live_process_start_time(pid).expect("live daemon process identity");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while live_process_start_time(pid) == Some(start_time) && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while live_process_start_time(pid) == Some(start_time) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_ne!(
+            live_process_start_time(pid),
+            Some(start_time),
+            "contained Drop left direct daemon pid {pid} alive"
+        );
     }
-    assert_ne!(
-        live_process_start_time(pid),
-        Some(start_time),
-        "contained Drop left direct daemon pid {pid} alive"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -248,7 +290,7 @@ async fn dropping_containment_terminates_a_late_descendant() {
         .env(CONTAINMENT_TREE_PARENT, &descendant_marker)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let child = spawn_daemon_test_command(&mut command, "direct-containment tree")
+    let child = spawn_daemon_test_command(command, "direct-containment tree")
         .expect("spawn direct-containment tree");
     let parent_pid = child.id().expect("contained parent pid");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -300,7 +342,7 @@ async fn explicit_cleanup_proves_quiescence_before_releasing_containment() {
         .env(CONTAINMENT_TREE_PARENT, &descendant_marker)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = spawn_daemon_test_command(&mut command, "explicit-cleanup tree")
+    let mut child = spawn_daemon_test_command(command, "explicit-cleanup tree")
         .expect("spawn explicit-cleanup tree");
     let parent_pid = child.id().expect("contained parent pid");
     let deadline = Instant::now() + Duration::from_secs(10);

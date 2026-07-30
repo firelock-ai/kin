@@ -12,6 +12,15 @@
 //! Earlier lossy history conversion and commit-synthesizing export APIs are not
 //! part of the clean-slate model-v6 surface.
 
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run Kin Git fixture process-group guardian");
+    assert_eq!(dispatched, requested);
+}
+
 pub mod admission_history;
 pub mod authority;
 pub mod error;

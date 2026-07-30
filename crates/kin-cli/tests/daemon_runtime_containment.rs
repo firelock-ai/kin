@@ -4,7 +4,7 @@
 #![cfg(any(unix, windows))]
 
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessStatus, System};
@@ -14,6 +14,11 @@ mod common;
 const TREE_PARENT: &str = "KIN_TEST_RUNTIME_TREE_PARENT";
 const TREE_DESCENDANT: &str = "KIN_TEST_RUNTIME_TREE_DESCENDANT";
 const TREE_STOP: &str = "KIN_TEST_RUNTIME_TREE_STOP";
+
+#[test]
+fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
+    common::bounded_capture_deadline_cannot_be_bypassed_by_continuous_output();
+}
 
 fn publish_marker_atomically(marker: &std::path::Path, contents: impl AsRef<[u8]>) {
     let mut staged_name = marker.as_os_str().to_os_string();
@@ -31,11 +36,11 @@ fn read_pid_marker(marker: &std::path::Path) -> Option<u32> {
 }
 
 struct KillAndReapChild {
-    child: Child,
+    child: common::RuntimeOwnedChild,
 }
 
 impl KillAndReapChild {
-    fn new(child: Child) -> Self {
+    fn new(child: common::RuntimeOwnedChild) -> Self {
         Self { child }
     }
 
@@ -69,7 +74,7 @@ impl KillAndReapChild {
 }
 
 impl std::ops::Deref for KillAndReapChild {
-    type Target = Child;
+    type Target = common::RuntimeOwnedChild;
 
     fn deref(&self) -> &Self::Target {
         &self.child

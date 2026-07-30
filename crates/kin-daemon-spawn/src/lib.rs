@@ -59,6 +59,83 @@ const TEST_RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
 #[cfg(unix)]
 const TEST_RUNTIME_PROCESS_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP";
 
+/// Private executable mode used by the process-group guardian.
+///
+/// Product binaries call [`run_process_group_guardian_if_requested`] before
+/// parsing their normal arguments. Test binaries expose one exact test that
+/// calls the same dispatcher. A launcher adds this variable only after its
+/// caller has scrubbed ambient authority, so a scrub cannot silently remove
+/// the dispatch capability.
+#[doc(hidden)]
+pub const PROCESS_GROUP_GUARDIAN_MODE_ENV: &str = "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_MODE";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_READY_ENV: &str = "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_READY";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_WATCHER_MODE: &str = "watcher-v1";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_SENTINEL_MODE: &str = "sentinel-v1";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_CLEANUP_TIMEOUT_MS_ENV: &str =
+    "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_CLEANUP_TIMEOUT_MS";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_LAUNCHER_PID_ENV: &str =
+    "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_LAUNCHER_PID";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_TARGET_PGID_ENV: &str =
+    "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_TARGET_PGID";
+
+/// Test-only fault injection that makes the watcher exit before publishing
+/// readiness for the already launcher-owned sentinel.
+#[cfg(unix)]
+#[doc(hidden)]
+pub const PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY_ENV: &str =
+    "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY";
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN: Duration = Duration::from_secs(1);
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_REAPER_TERMINAL_MARGIN: Duration = Duration::from_secs(1);
+
+#[cfg(unix)]
+const PROCESS_GROUP_GUARDIAN_KILL_PASSES: usize = 3;
+
+#[cfg(unix)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessGroupCleanupTrigger {
+    ParentBarrierComplete = 1,
+    WatcherBarrierRequired = 2,
+}
+
+#[cfg(unix)]
+impl ProcessGroupCleanupTrigger {
+    fn parse(byte: u8) -> std::io::Result<Self> {
+        match byte {
+            value if value == Self::ParentBarrierComplete as u8 => Ok(Self::ParentBarrierComplete),
+            value if value == Self::WatcherBarrierRequired as u8 => {
+                Ok(Self::WatcherBarrierRequired)
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid process-group cleanup trigger byte: {byte}"),
+            )),
+        }
+    }
+}
+
 /// How long to wait between polls of the port file.
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -121,21 +198,31 @@ pub fn scrub_daemon_process_authority(command: &mut Command) {
     let explicit_authority = command
         .get_envs()
         .map(|(key, _)| key.to_os_string())
-        .filter(|key| is_daemon_ambient_authority(key))
         .collect::<Vec<_>>();
-    for key in std::env::vars_os()
-        .map(|(key, _)| key)
-        .filter(|key| is_daemon_ambient_authority(key))
-        .chain(explicit_authority)
-    {
+    for key in daemon_ambient_authority_keys(explicit_authority) {
         command.env_remove(key);
     }
 
-    let host_path = std::env::var_os("KIN_ORIGINAL_PATH")
+    command
+        .env("PATH", daemon_host_path())
+        .env("KIN_VFS_DISABLE", "1");
+}
+
+fn daemon_ambient_authority_keys(
+    explicit: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(explicit)
+        .filter(|key| is_daemon_ambient_authority(key))
+        .collect()
+}
+
+fn daemon_host_path() -> std::ffi::OsString {
+    std::env::var_os("KIN_ORIGINAL_PATH")
         .filter(|value| !value.is_empty())
         .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_default();
-    command.env("PATH", host_path).env("KIN_VFS_DISABLE", "1");
+        .unwrap_or_default()
 }
 
 fn is_daemon_ambient_authority(key: &std::ffi::OsStr) -> bool {
@@ -168,6 +255,1772 @@ fn env_name_starts_with(actual: &str, expected: &str) -> bool {
 #[cfg(not(windows))]
 fn env_name_starts_with(actual: &str, expected: &str) -> bool {
     actual.starts_with(expected)
+}
+
+// ── Stable process-group guardian ──────────────────────────────────────
+
+/// Environment-only configuration for guardian-owned internal processes.
+///
+/// This deliberately exposes no executable, argument, stdio, working-directory,
+/// process-group, or `pre_exec` surface. The launcher applies the completed
+/// environment independently to the sentinel and watcher before adding its
+/// private dispatch values, so caller configuration can never enter either
+/// internal child's fork-to-exec path.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct ProcessGroupGuardianEnvironment {
+    clear: bool,
+    values: std::collections::BTreeMap<std::ffi::OsString, Option<std::ffi::OsString>>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuardianEnvironment {
+    /// Set one environment value.
+    pub fn env(
+        &mut self,
+        key: impl Into<std::ffi::OsString>,
+        value: impl Into<std::ffi::OsString>,
+    ) -> &mut Self {
+        self.values.insert(key.into(), Some(value.into()));
+        self
+    }
+
+    /// Set a sequence of environment values.
+    pub fn envs<K, V, I>(&mut self, values: I) -> &mut Self
+    where
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        for (key, value) in values {
+            self.env(key, value);
+        }
+        self
+    }
+
+    /// Remove one inherited or explicitly configured environment value.
+    pub fn env_remove(&mut self, key: impl Into<std::ffi::OsString>) -> &mut Self {
+        let key = key.into();
+        if self.clear {
+            self.values.remove(&key);
+        } else {
+            self.values.insert(key, None);
+        }
+        self
+    }
+
+    /// Prevent the internal processes from inheriting the launcher environment.
+    pub fn env_clear(&mut self) -> &mut Self {
+        self.clear = true;
+        self.values.clear();
+        self
+    }
+
+    /// Inspect the explicit environment overlay.
+    ///
+    /// As with [`Command::get_envs`], removed values are represented by `None`;
+    /// after [`Self::env_clear`] only subsequently added values are present.
+    pub fn get_envs(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&std::ffi::OsStr, Option<&std::ffi::OsStr>)> {
+        self.values
+            .iter()
+            .map(|(key, value)| (key.as_os_str(), value.as_deref()))
+    }
+
+    fn apply_to(&self, command: &mut Command) {
+        if self.clear {
+            command.env_clear();
+        }
+        for (key, value) in &self.values {
+            match value {
+                Some(value) => {
+                    command.env(key, value);
+                }
+                None => {
+                    command.env_remove(key);
+                }
+            }
+        }
+    }
+}
+
+/// Guardian-environment equivalent of [`scrub_daemon_process_authority`].
+///
+/// Both boundaries share the same authority classification and host PATH
+/// selection. This variant cannot configure anything except environment state,
+/// so it is safe to pass directly to [`ProcessGroupGuardianLauncher::spawn_with`].
+#[cfg(unix)]
+pub fn scrub_daemon_guardian_environment(environment: &mut ProcessGroupGuardianEnvironment) {
+    let explicit_authority = environment
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .collect::<Vec<_>>();
+    for key in daemon_ambient_authority_keys(explicit_authority) {
+        environment.env_remove(key);
+    }
+    environment
+        .env("PATH", daemon_host_path())
+        .env("KIN_VFS_DISABLE", "1");
+}
+
+/// Describe the executable entrypoint used by a Unix process-group guardian.
+///
+/// Production binaries use [`Self::product`]. A Rust test binary uses
+/// [`Self::exact_test`] to route the re-executed process to one exact worker
+/// without running the rest of the test suite.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct ProcessGroupGuardianLauncher {
+    executable: PathBuf,
+    arguments: Vec<std::ffi::OsString>,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    cleanup_timeout: Duration,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuardianLauncher {
+    /// Launch through a product executable whose `main` calls
+    /// [`run_process_group_guardian_if_requested`] before normal argument
+    /// parsing or runtime construction.
+    pub fn product(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            cleanup_timeout: PROCESS_GROUP_GUARDIAN_DEFAULT_CLEANUP_TIMEOUT,
+        }
+    }
+
+    /// Launch through one exact Rust test worker.
+    ///
+    /// The named test should do nothing except assert that
+    /// [`run_process_group_guardian_if_requested`] returned `Ok(true)`.
+    pub fn exact_test(
+        executable: impl Into<PathBuf>,
+        exact_test_name: impl Into<std::ffi::OsString>,
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            arguments: vec![
+                "--exact".into(),
+                exact_test_name.into(),
+                "--nocapture".into(),
+            ],
+            environment: Vec::new(),
+            cleanup_timeout: PROCESS_GROUP_GUARDIAN_DEFAULT_CLEANUP_TIMEOUT,
+        }
+    }
+
+    /// Add an environment value after the caller's authority scrub.
+    ///
+    /// This is primarily for deterministic fault injection in containment
+    /// tests. Product configuration should stay on the target command rather
+    /// than the guardian.
+    #[must_use]
+    pub fn with_env(
+        mut self,
+        key: impl Into<std::ffi::OsString>,
+        value: impl Into<std::ffi::OsString>,
+    ) -> Self {
+        self.environment.push((key.into(), value.into()));
+        self
+    }
+
+    /// Bound process-group cleanup and watcher handoff.
+    ///
+    /// Production callers normally keep the default. A shorter value is useful
+    /// for adversarial tests of stopped or killed cleanup authorities.
+    #[must_use]
+    pub fn with_cleanup_timeout(mut self, cleanup_timeout: Duration) -> Self {
+        self.cleanup_timeout = cleanup_timeout.max(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        self
+    }
+
+    /// Spawn a launcher-owned sentinel and its separate watcher.
+    ///
+    /// `configure_environment` receives an environment-only builder. It runs
+    /// once before either internal command is built; the resulting overlay is
+    /// copied to both commands before private dispatch capability is installed.
+    /// This ordering is load-bearing: adding the internal mode before an
+    /// authority scrub can leave a normal product process waiting for input
+    /// instead of starting a watcher.
+    ///
+    /// The readiness path must be unique to this launch and its parent
+    /// directory must already exist.
+    pub fn spawn_with(
+        &self,
+        readiness_path: &Path,
+        deadline: std::time::Instant,
+        configure_environment: impl FnOnce(&mut ProcessGroupGuardianEnvironment),
+    ) -> std::io::Result<ProcessGroupGuardian> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let _ = std::fs::remove_file(readiness_path);
+        let watcher_reaper = process_group_watcher_reaper()?;
+        let launcher_pid = unsafe { libc::getpid() };
+        if launcher_pid <= 0 {
+            return Err(std::io::Error::other(
+                "process-group guardian launcher has no valid PID",
+            ));
+        }
+        let mut environment = ProcessGroupGuardianEnvironment::default();
+        configure_environment(&mut environment);
+
+        let mut sentinel_command = Command::new(&self.executable);
+        sentinel_command.args(&self.arguments);
+        environment.apply_to(&mut sentinel_command);
+        for (key, value) in &self.environment {
+            sentinel_command.env(key, value);
+        }
+        sentinel_command
+            .env(
+                PROCESS_GROUP_GUARDIAN_MODE_ENV,
+                PROCESS_GROUP_GUARDIAN_SENTINEL_MODE,
+            )
+            .env(PROCESS_GROUP_GUARDIAN_READY_ENV, readiness_path)
+            .env(
+                PROCESS_GROUP_GUARDIAN_LAUNCHER_PID_ENV,
+                launcher_pid.to_string(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut sentinel = sentinel_command
+            .spawn()
+            .map_err(|error| contextual_guardian_io(error, "spawn process-group sentinel"))?;
+        let process_group = match child_id_to_pid(&sentinel, "process-group sentinel") {
+            Ok(process_group) => process_group,
+            Err(error) => {
+                reap_unarmed_process_group_sentinel(&watcher_reaper, sentinel);
+                return Err(error);
+            }
+        };
+        if unsafe { libc::getpgid(process_group) } != process_group {
+            let observed_group = unsafe { libc::getpgid(process_group) };
+            reap_unarmed_process_group_sentinel(&watcher_reaper, sentinel);
+            return Err(std::io::Error::other(format!(
+                "process-group sentinel did not lead its group: pid={process_group}, pgid={observed_group}"
+            )));
+        }
+        let mut sentinel_arm = match sentinel.stdin.take() {
+            Some(arm) => {
+                if let Err(error) = set_nonblocking(arm.as_raw_fd()) {
+                    reap_unarmed_process_group_sentinel(&watcher_reaper, sentinel);
+                    return Err(contextual_guardian_io(
+                        error,
+                        "make process-group sentinel arm nonblocking",
+                    ));
+                }
+                Some(arm)
+            }
+            None => {
+                reap_unarmed_process_group_sentinel(&watcher_reaper, sentinel);
+                return Err(std::io::Error::other(
+                    "process-group sentinel did not expose its arm pipe",
+                ));
+            }
+        };
+
+        let mut watcher_command = Command::new(&self.executable);
+        watcher_command.args(&self.arguments);
+        environment.apply_to(&mut watcher_command);
+        for (key, value) in &self.environment {
+            watcher_command.env(key, value);
+        }
+        watcher_command
+            .env(
+                PROCESS_GROUP_GUARDIAN_MODE_ENV,
+                PROCESS_GROUP_GUARDIAN_WATCHER_MODE,
+            )
+            .env(PROCESS_GROUP_GUARDIAN_READY_ENV, readiness_path)
+            .env(
+                PROCESS_GROUP_GUARDIAN_CLEANUP_TIMEOUT_MS_ENV,
+                self.cleanup_timeout.as_millis().to_string(),
+            )
+            .env(
+                PROCESS_GROUP_GUARDIAN_LAUNCHER_PID_ENV,
+                launcher_pid.to_string(),
+            )
+            .env(
+                PROCESS_GROUP_GUARDIAN_TARGET_PGID_ENV,
+                process_group.to_string(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut watcher = match watcher_command.spawn() {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                sentinel_arm.take();
+                reap_unarmed_process_group_sentinel(&watcher_reaper, sentinel);
+                return Err(contextual_guardian_io(error, "spawn process-group watcher"));
+            }
+        };
+        let watcher_id = watcher.id();
+        let mut ownership = match watcher.stdin.take() {
+            Some(ownership) => {
+                if let Err(error) = set_nonblocking(ownership.as_raw_fd()) {
+                    let mut ownership = Some(ownership);
+                    return Err(reap_failed_process_group_watcher(
+                        watcher,
+                        sentinel,
+                        &mut sentinel_arm,
+                        &mut ownership,
+                        process_group,
+                        self.cleanup_timeout,
+                        &watcher_reaper,
+                        contextual_guardian_io(
+                            error,
+                            "make process-group cleanup request nonblocking",
+                        ),
+                    ));
+                }
+                Some(ownership)
+            }
+            None => {
+                let mut ownership = None;
+                let error = std::io::Error::other(
+                    "process-group watcher did not expose its ownership pipe",
+                );
+                return Err(reap_failed_process_group_watcher(
+                    watcher,
+                    sentinel,
+                    &mut sentinel_arm,
+                    &mut ownership,
+                    process_group,
+                    self.cleanup_timeout,
+                    &watcher_reaper,
+                    error,
+                ));
+            }
+        };
+
+        loop {
+            if let Ok(readiness) = std::fs::read_to_string(readiness_path) {
+                if let Ok(readiness) = parse_process_group_guardian_readiness(&readiness) {
+                    let validation = validate_process_group_guardian_readiness(
+                        watcher_id,
+                        process_group,
+                        readiness,
+                    );
+                    if let Err(error) = validation {
+                        let _ = std::fs::remove_file(readiness_path);
+                        return Err(reap_failed_process_group_watcher(
+                            watcher,
+                            sentinel,
+                            &mut sentinel_arm,
+                            &mut ownership,
+                            process_group,
+                            self.cleanup_timeout,
+                            &watcher_reaper,
+                            error,
+                        ));
+                    }
+                    if let Err(error) = arm_process_group_sentinel(&mut sentinel_arm, &mut sentinel)
+                    {
+                        let _ = std::fs::remove_file(readiness_path);
+                        return Err(reap_failed_process_group_watcher(
+                            watcher,
+                            sentinel,
+                            &mut sentinel_arm,
+                            &mut ownership,
+                            process_group,
+                            self.cleanup_timeout,
+                            &watcher_reaper,
+                            error,
+                        ));
+                    }
+                    let _ = std::fs::remove_file(readiness_path);
+                    return Ok(ProcessGroupGuardian {
+                        process_group: readiness.process_group,
+                        watcher: Some(watcher),
+                        sentinel: Some(sentinel),
+                        ownership,
+                        watcher_status: None,
+                        watcher_failure: None,
+                        group_barrier_completed: false,
+                        cleanup_timeout: self.cleanup_timeout,
+                        watcher_reaper,
+                    });
+                }
+                // The watcher publishes by atomic rename, but tolerate a
+                // non-atomic test fixture and keep observing until the
+                // deadline or watcher exit establishes the real outcome.
+            }
+
+            match watcher.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = std::fs::remove_file(readiness_path);
+                    return Err(reap_failed_process_group_watcher(
+                        watcher,
+                        sentinel,
+                        &mut sentinel_arm,
+                        &mut ownership,
+                        process_group,
+                        self.cleanup_timeout,
+                        &watcher_reaper,
+                        std::io::Error::other(format!(
+                            "process-group watcher exited before readiness: {status}"
+                        )),
+                    ));
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = std::fs::remove_file(readiness_path);
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "process-group watcher did not publish readiness before the deadline",
+                    );
+                    return Err(reap_failed_process_group_watcher(
+                        watcher,
+                        sentinel,
+                        &mut sentinel_arm,
+                        &mut ownership,
+                        process_group,
+                        self.cleanup_timeout,
+                        &watcher_reaper,
+                        error,
+                    ));
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(readiness_path);
+                    let error =
+                        contextual_guardian_io(error, "inspect process-group watcher readiness");
+                    return Err(reap_failed_process_group_watcher(
+                        watcher,
+                        sentinel,
+                        &mut sentinel_arm,
+                        &mut ownership,
+                        process_group,
+                        self.cleanup_timeout,
+                        &watcher_reaper,
+                        error,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Readiness published after the watcher validates the launcher-owned sentinel.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessGroupGuardianReadiness {
+    /// PID of the external watcher. It must lead a group distinct from the
+    /// target so group cleanup cannot kill its own cleanup authority.
+    pub watcher_pid: libc::pid_t,
+    /// PID and PGID of the sentinel owned and ultimately reaped by the launcher.
+    pub process_group: libc::pid_t,
+}
+
+/// Parse the versioned watcher readiness record.
+#[cfg(unix)]
+pub fn parse_process_group_guardian_readiness(
+    value: &str,
+) -> std::io::Result<ProcessGroupGuardianReadiness> {
+    let mut fields = value.split_whitespace();
+    let version = fields.next();
+    let watcher_pid = fields
+        .next()
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|value| *value > 0);
+    let process_group = fields
+        .next()
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|value| *value > 0);
+    if version != Some("kin-pg-guardian-v1")
+        || fields.next().is_some()
+        || watcher_pid.is_none()
+        || process_group.is_none()
+        || watcher_pid == process_group
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid process-group guardian readiness: {value:?}"),
+        ));
+    }
+    Ok(ProcessGroupGuardianReadiness {
+        watcher_pid: watcher_pid.expect("validated watcher pid"),
+        process_group: process_group.expect("validated process group"),
+    })
+}
+
+#[cfg(unix)]
+fn validate_process_group_guardian_readiness(
+    expected_watcher_id: u32,
+    expected_process_group: libc::pid_t,
+    readiness: ProcessGroupGuardianReadiness,
+) -> std::io::Result<()> {
+    let expected_watcher = libc::pid_t::try_from(expected_watcher_id).map_err(|_| {
+        std::io::Error::other("process-group watcher PID does not fit a native pid")
+    })?;
+    if readiness.watcher_pid != expected_watcher {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process-group watcher readiness named PID {}, expected {expected_watcher}",
+                readiness.watcher_pid
+            ),
+        ));
+    }
+    if readiness.process_group != expected_process_group {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process-group watcher readiness named target {}, expected {expected_process_group}",
+                readiness.process_group
+            ),
+        ));
+    }
+    let watcher_group = unsafe { libc::getpgid(readiness.watcher_pid) };
+    if watcher_group != readiness.watcher_pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process-group watcher does not lead its group: pid={}, pgid={watcher_group}",
+                readiness.watcher_pid
+            ),
+        ));
+    }
+    let observed_target_group = unsafe { libc::getpgid(readiness.process_group) };
+    if observed_target_group != readiness.process_group {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process-group sentinel does not pin its target group: pid={}, pgid={observed_target_group}",
+                readiness.process_group
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Owned parent side of a Unix process-group guardian.
+///
+/// The ownership pipe tells the watcher when cleanup must start, while the
+/// launcher-owned sentinel pins the target process-group identity. Configured
+/// children and their ordinary fork/exec descendants inherit that group. At
+/// explicit cleanup the launcher stops the whole group as a kernel-enforced
+/// fork barrier, kills it repeatedly, then hands completion to the watcher. The
+/// watcher performs that barrier only for owner death or failed parent cleanup.
+/// The launcher reaps its sentinel and performs the final exact empty-group
+/// check after callers wait their owned direct children.
+///
+/// This is intentionally a same-credential, group-preserving cooperative
+/// contract, not a security sandbox. A child that changes credentials or
+/// deliberately detaches with `setsid`, `setpgid`, double-fork daemonization,
+/// or an equivalent escape is outside the guarantee. Callers must not describe
+/// such hostile descendants as contained.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ProcessGroupGuardian {
+    process_group: libc::pid_t,
+    watcher: Option<std::process::Child>,
+    sentinel: Option<std::process::Child>,
+    ownership: Option<std::process::ChildStdin>,
+    watcher_status: Option<std::process::ExitStatus>,
+    watcher_failure: Option<String>,
+    group_barrier_completed: bool,
+    cleanup_timeout: Duration,
+    watcher_reaper: std::sync::mpsc::Sender<WatcherReaperJob>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuardian {
+    /// Stable target group to assign to contained children.
+    pub fn process_group(&self) -> libc::pid_t {
+        self.process_group
+    }
+
+    /// PID of the external watcher while it remains owned.
+    pub fn watcher_id(&self) -> Option<u32> {
+        self.watcher.as_ref().map(std::process::Child::id)
+    }
+
+    /// Atomically admit and spawn a child inside this guardian.
+    ///
+    /// The command is consumed so the guardian's `pre_exec` callback can never
+    /// remain attached to a caller-reused command after a failed spawn. Rust
+    /// applies the requested process group before caller callbacks, which means
+    /// an earlier callback that stalls is already inside the pinned group.
+    /// Taking `&mut self` makes the watcher-liveness check and spawn admission
+    /// indivisible from [`Self::request_cleanup`].
+    ///
+    /// Callers must finish their environment/authority scrub before calling
+    /// this method.
+    pub fn spawn(&mut self, mut command: Command) -> std::io::Result<std::process::Child> {
+        self.prepare_spawn_admission(&mut command)?;
+        command.spawn()
+    }
+
+    /// Tokio equivalent of [`Self::spawn`] with the same atomic admission
+    /// guarantee.
+    pub fn spawn_tokio(
+        &mut self,
+        mut command: tokio::process::Command,
+    ) -> std::io::Result<tokio::process::Child> {
+        self.prepare_spawn_admission(command.as_std_mut())?;
+        command.spawn()
+    }
+
+    fn prepare_spawn_admission(&mut self, command: &mut Command) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        self.ensure_watcher_live_for_admission()?;
+        let ownership = self.ownership.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "process-group guardian admission is already sealed",
+            )
+        })?;
+        let ownership_fd = ownership.as_raw_fd();
+        command.process_group(self.process_group);
+        unsafe {
+            command.pre_exec(move || close_fd_allow_already_closed(ownership_fd));
+        }
+        Ok(())
+    }
+
+    fn ensure_watcher_live_for_admission(&mut self) -> std::io::Result<()> {
+        self.observe_watcher_exit()?;
+        if self.watcher.is_some() {
+            return Ok(());
+        }
+        if self.watcher_failure.is_none() {
+            let status = self
+                .watcher_status
+                .as_ref()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_else(|| "unknown status".to_string());
+            let fallback = self.complete_parent_barrier();
+            self.record_watcher_failure(match fallback {
+                Ok(()) => format!("process-group watcher exited before admission: {status}"),
+                Err(error) => format!(
+                    "process-group watcher exited before admission: {status}; \
+                     parent fallback barrier failed: {error}"
+                ),
+            });
+        }
+
+        let detail = self
+            .watcher_failure
+            .as_deref()
+            .unwrap_or("process-group watcher is no longer available");
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("process-group guardian rejected child admission: {detail}"),
+        ))
+    }
+
+    /// Transfer cleanup authority to the watcher.
+    ///
+    /// Repeated calls are harmless. On the first explicit request, the launcher
+    /// keeps the ownership writer open while it runs its bounded
+    /// STOP/repeated-KILL barrier. It then tells the watcher either that the
+    /// parent barrier completed or that watcher fallback is required. EOF
+    /// remains the fail-closed watcher trigger for launcher death or a failed
+    /// handoff. Exactly one healthy authority signals the group, and neither
+    /// trigger consumes the sentinel or performs final proof.
+    pub fn request_cleanup(&mut self) {
+        if let Some(mut ownership) = self.ownership.take() {
+            let trigger = match self.complete_parent_barrier() {
+                Ok(()) => ProcessGroupCleanupTrigger::ParentBarrierComplete,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "launcher-side process-group cleanup barrier failed; requiring watcher fallback"
+                    );
+                    ProcessGroupCleanupTrigger::WatcherBarrierRequired
+                }
+            };
+            if let Err(error) = send_process_group_cleanup_trigger(&mut ownership, trigger) {
+                tracing::warn!(
+                    ?trigger,
+                    %error,
+                    "could not hand process-group cleanup result to watcher; EOF requires watcher fallback"
+                );
+            }
+        }
+        if let Err(error) = self.observe_watcher_exit() {
+            self.record_watcher_failure(error.to_string());
+        }
+    }
+
+    /// Poll and reap a completed watcher.
+    ///
+    /// A successful result combines the completed launcher-or-watcher
+    /// STOP/repeated-KILL barrier with launcher-side sentinel reap and one
+    /// exact final `kill(-pgid, 0) == ESRCH` emptiness check.
+    pub fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.observe_watcher_exit()?;
+        if self.watcher.is_some() {
+            return Ok(None);
+        }
+        let Some(status) = self.watcher_status.take() else {
+            return Err(std::io::Error::other(
+                "process-group watcher was already finalized",
+            ));
+        };
+
+        self.ownership.take();
+        let finalization = finalize_owned_process_group(
+            &mut self.sentinel,
+            self.process_group,
+            std::time::Instant::now() + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN,
+        );
+        match finalization {
+            Ok(()) => {
+                if let Some(failure) = self.watcher_failure.take() {
+                    return Err(guardian_watcher_failure(failure, None));
+                }
+            }
+            Err(finalization_error) => {
+                if let Some(sentinel) = self.sentinel.take() {
+                    transfer_owned_process_group_children_to_reaper(
+                        &self.watcher_reaper,
+                        None,
+                        Some(sentinel),
+                        self.process_group,
+                        self.group_barrier_completed,
+                    );
+                }
+                if let Some(failure) = self.watcher_failure.take() {
+                    return Err(guardian_watcher_failure(failure, Some(finalization_error)));
+                }
+                return Err(finalization_error);
+            }
+        }
+        Ok(Some(status))
+    }
+
+    /// Wait through watcher quiescence and launcher-side exact finalization.
+    pub fn reap_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_reap()? {
+                return Ok(status);
+            }
+            if self.watcher.is_none() {
+                return Err(std::io::Error::other(
+                    "process-group watcher was already reaped",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "process-group watcher did not complete cleanup before the deadline",
+                ));
+            }
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    fn observe_watcher_exit(&mut self) -> std::io::Result<()> {
+        let Some(watcher) = self.watcher.as_mut() else {
+            return Ok(());
+        };
+        let Some(status) = watcher
+            .try_wait()
+            .map_err(|error| contextual_guardian_io(error, "poll process-group watcher"))?
+        else {
+            return Ok(());
+        };
+        self.watcher.take();
+        self.watcher_status = Some(status);
+        if status.success() {
+            self.group_barrier_completed = true;
+            return Ok(());
+        }
+
+        let failure = format!("process-group watcher cleanup failed with status {status}");
+        let fallback = self.complete_parent_barrier();
+        self.record_watcher_failure(match fallback {
+            Ok(()) => failure,
+            Err(error) => format!("{failure}; parent fallback barrier failed: {error}"),
+        });
+        Ok(())
+    }
+
+    fn quiesce_from_parent(&mut self) -> std::io::Result<()> {
+        if self.sentinel.is_none() {
+            return Err(std::io::Error::other(
+                "process-group sentinel is no longer available for a safe fallback",
+            ));
+        }
+        quiesce_pinned_process_group(
+            self.process_group,
+            std::time::Instant::now() + self.cleanup_timeout,
+        )
+    }
+
+    fn complete_parent_barrier(&mut self) -> std::io::Result<()> {
+        if self.group_barrier_completed {
+            return Ok(());
+        }
+        self.quiesce_from_parent()?;
+        self.group_barrier_completed = true;
+        Ok(())
+    }
+
+    fn record_watcher_failure(&mut self, failure: String) {
+        if self.watcher_failure.is_none() {
+            self.watcher_failure = Some(failure);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuardian {
+    fn drop(&mut self) {
+        self.request_cleanup();
+        let deadline = std::time::Instant::now()
+            + self.cleanup_timeout
+            + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN;
+        loop {
+            match self.try_reap() {
+                Ok(Some(_)) => return,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let watcher = self.watcher.take();
+                    let sentinel = self.sentinel.take();
+                    tracing::warn!(
+                        watcher_pid = ?watcher.as_ref().map(std::process::Child::id),
+                        sentinel_pid = ?sentinel.as_ref().map(std::process::Child::id),
+                        "process-group guardian exceeded its cleanup bound; transferring every remaining owned child to durable reaper"
+                    );
+                    transfer_owned_process_group_children_to_reaper(
+                        &self.watcher_reaper,
+                        watcher,
+                        sentinel,
+                        self.process_group,
+                        self.group_barrier_completed,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let watcher = self.watcher.take();
+                    let sentinel = self.sentinel.take();
+                    if watcher.is_some() || sentinel.is_some() {
+                        tracing::warn!(
+                            watcher_pid = ?watcher.as_ref().map(std::process::Child::id),
+                            sentinel_pid = ?sentinel.as_ref().map(std::process::Child::id),
+                            %error,
+                            "guardian finalization failed with children still owned; transferring every remaining handle to durable reaper"
+                        );
+                        transfer_owned_process_group_children_to_reaper(
+                            &self.watcher_reaper,
+                            watcher,
+                            sentinel,
+                            self.process_group,
+                            self.group_barrier_completed,
+                        );
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            "process-group guardian reported failed cleanup during Drop"
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_id_to_pid(child: &std::process::Child, label: &str) -> std::io::Result<libc::pid_t> {
+    libc::pid_t::try_from(child.id())
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| std::io::Error::other(format!("{label} PID does not fit a native pid")))
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn close_fd_allow_already_closed(fd: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::close(fd) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBADF) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn write_one_byte_nonblocking(
+    writer: &mut std::process::ChildStdin,
+    byte: u8,
+    context: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let deadline = std::time::Instant::now() + PROCESS_GROUP_GUARDIAN_POLL_INTERVAL;
+    loop {
+        match writer.write(&[byte]) {
+            Ok(1) => return Ok(()),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!("{context}: one-byte write made no progress"),
+                ));
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => return Err(contextual_guardian_io(error, context)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn send_process_group_cleanup_trigger(
+    ownership: &mut std::process::ChildStdin,
+    trigger: ProcessGroupCleanupTrigger,
+) -> std::io::Result<()> {
+    write_one_byte_nonblocking(
+        ownership,
+        trigger as u8,
+        "hand process-group cleanup result to watcher",
+    )
+}
+
+#[cfg(unix)]
+fn arm_process_group_sentinel(
+    sentinel_arm: &mut Option<std::process::ChildStdin>,
+    _sentinel: &mut std::process::Child,
+) -> std::io::Result<()> {
+    let mut sentinel_arm = sentinel_arm.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "process-group sentinel arm is no longer available",
+        )
+    })?;
+    write_one_byte_nonblocking(&mut sentinel_arm, 1, "arm process-group sentinel")
+}
+
+#[cfg(unix)]
+fn reap_unarmed_process_group_sentinel(
+    reaper: &std::sync::mpsc::Sender<WatcherReaperJob>,
+    mut sentinel: std::process::Child,
+) {
+    let sentinel_pid = sentinel.id();
+    if let Err(error) = sentinel.kill() {
+        tracing::warn!(
+            sentinel_pid,
+            %error,
+            "could not terminate unarmed process-group sentinel immediately"
+        );
+    }
+    let deadline = std::time::Instant::now() + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN;
+    match reap_child_until(&mut sentinel, deadline) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                sentinel_pid,
+                "unarmed process-group sentinel exceeded its direct reap bound; transferring its exact child handle to durable reaper"
+            );
+            transfer_owned_process_group_children_to_reaper(reaper, Some(sentinel), None, 0, false);
+        }
+        Err(error) => {
+            tracing::warn!(
+                sentinel_pid,
+                %error,
+                "unarmed process-group sentinel reap failed; transferring its exact child handle to durable reaper"
+            );
+            transfer_owned_process_group_children_to_reaper(reaper, Some(sentinel), None, 0, false);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reap_child_until(
+    child: &mut std::process::Child,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct WatcherReaperJob {
+    watcher: Option<std::process::Child>,
+    sentinel: Option<std::process::Child>,
+    process_group: libc::pid_t,
+    group_barrier_completed: bool,
+    force_deadline: std::time::Instant,
+    terminal_deadline: std::time::Instant,
+    forced: bool,
+    terminal_action_issued: bool,
+    watcher_terminal_warning_emitted: bool,
+    sentinel_terminal_warning_emitted: bool,
+}
+
+#[cfg(unix)]
+static PROCESS_GROUP_WATCHER_REAPER: OnceLock<std::sync::mpsc::Sender<WatcherReaperJob>> =
+    OnceLock::new();
+
+#[cfg(unix)]
+fn process_group_watcher_reaper() -> std::io::Result<std::sync::mpsc::Sender<WatcherReaperJob>> {
+    if let Some(reaper) = PROCESS_GROUP_WATCHER_REAPER.get() {
+        return Ok(reaper.clone());
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("kin-process-group-watcher-reaper".to_string())
+        .spawn(move || process_group_watcher_reaper_loop(receiver))
+        .map_err(|error| {
+            contextual_guardian_io(error, "start durable process-group watcher reaper")
+        })?;
+    match PROCESS_GROUP_WATCHER_REAPER.set(sender.clone()) {
+        Ok(()) => Ok(sender),
+        Err(_) => Ok(PROCESS_GROUP_WATCHER_REAPER
+            .get()
+            .expect("another thread initialized the watcher reaper")
+            .clone()),
+    }
+}
+
+#[cfg(unix)]
+fn process_group_watcher_reaper_loop(receiver: std::sync::mpsc::Receiver<WatcherReaperJob>) {
+    let mut jobs = Vec::new();
+    loop {
+        match receiver.recv_timeout(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL) {
+            Ok(job) => jobs.push(job),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if jobs.is_empty() => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        while let Ok(job) = receiver.try_recv() {
+            jobs.push(job);
+        }
+        let mut index = 0;
+        while index < jobs.len() {
+            if poll_watcher_reaper_job(&mut jobs[index]) {
+                jobs.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn poll_watcher_reaper_job(job: &mut WatcherReaperJob) -> bool {
+    let now = std::time::Instant::now();
+
+    let watcher_poll = job.watcher.as_mut().map(std::process::Child::try_wait);
+    if let Some(watcher_poll) = watcher_poll {
+        match watcher_poll {
+            Ok(Some(status)) => {
+                job.watcher.take();
+                if status.success() {
+                    job.group_barrier_completed = true;
+                } else if !job.forced {
+                    issue_reaper_group_barrier(job, now);
+                    job.forced = true;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    watcher_pid = ?job.watcher.as_ref().map(std::process::Child::id),
+                    %error,
+                    "durable reaper could not poll watcher; retaining owned handle"
+                );
+            }
+        }
+    }
+
+    if job.watcher.is_some() && now >= job.force_deadline && !job.forced {
+        issue_reaper_group_barrier(job, now);
+        if let Some(watcher) = job.watcher.as_mut() {
+            let _ = watcher.kill();
+        }
+        job.forced = true;
+    }
+
+    if job.watcher.is_some() && now >= job.terminal_deadline && !job.terminal_action_issued {
+        issue_reaper_group_barrier(job, now);
+        if let Some(watcher) = job.watcher.as_mut() {
+            let _ = watcher.kill();
+        }
+        job.terminal_action_issued = true;
+    }
+
+    if job.watcher.is_some()
+        && job.terminal_action_issued
+        && now >= job.terminal_deadline + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN
+        && !job.watcher_terminal_warning_emitted
+    {
+        tracing::error!(
+            watcher_pid = ?job.watcher.as_ref().map(std::process::Child::id),
+            "watcher exceeded its hard terminal reap bound; retaining and polling its owned handle"
+        );
+        job.watcher_terminal_warning_emitted = true;
+    }
+
+    // The watcher may still send group signals until its status is collected.
+    // Never consume the sentinel (and release the numeric PGID pin) first.
+    if job.watcher.is_some() {
+        return false;
+    }
+
+    let Some(sentinel_poll) = job.sentinel.as_mut().map(std::process::Child::try_wait) else {
+        return true;
+    };
+    match sentinel_poll {
+        Ok(Some(status)) => {
+            job.sentinel.take();
+            log_reaper_group_finalization(status, job.process_group);
+            true
+        }
+        Ok(None) => {
+            if now >= job.terminal_deadline && !job.terminal_action_issued {
+                issue_reaper_group_barrier(job, now);
+                job.terminal_action_issued = true;
+            }
+            if job.terminal_action_issued
+                && now >= job.terminal_deadline + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN
+                && !job.sentinel_terminal_warning_emitted
+            {
+                tracing::error!(
+                    sentinel_pid = ?job.sentinel.as_ref().map(std::process::Child::id),
+                    "sentinel exceeded its hard terminal reap bound; retaining and polling its owned handle"
+                );
+                job.sentinel_terminal_warning_emitted = true;
+            }
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                sentinel_pid = ?job.sentinel.as_ref().map(std::process::Child::id),
+                %error,
+                "durable reaper could not poll sentinel; retaining owned handle"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+fn issue_reaper_group_barrier(job: &mut WatcherReaperJob, now: std::time::Instant) {
+    if job.sentinel.is_none() || job.group_barrier_completed {
+        return;
+    }
+    match quiesce_pinned_process_group(
+        job.process_group,
+        now + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN,
+    ) {
+        Ok(()) => job.group_barrier_completed = true,
+        Err(error) => {
+            tracing::warn!(
+                watcher_pid = ?job.watcher.as_ref().map(std::process::Child::id),
+                sentinel_pid = ?job.sentinel.as_ref().map(std::process::Child::id),
+                %error,
+                "durable reaper could not complete the pinned-group barrier"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn log_reaper_group_finalization(
+    sentinel_status: std::process::ExitStatus,
+    process_group: libc::pid_t,
+) {
+    let sentinel_was_killed = sentinel_exit_was_sigkill(sentinel_status);
+    // The sentinel handle was just reaped and consumed. This is the one final
+    // group probe; no reaper path may signal the numeric PGID after this call.
+    let empty_probe = unsafe { libc::kill(-process_group, 0) };
+    let group_empty =
+        empty_probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    if !sentinel_was_killed {
+        tracing::error!(
+            %sentinel_status,
+            process_group,
+            "durable reaper observed unexpected sentinel exit"
+        );
+    }
+    if !group_empty {
+        tracing::error!(
+            process_group,
+            "durable reaper final probe found the process group still observable"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn transfer_process_group_watcher_to_reaper(
+    reaper: &std::sync::mpsc::Sender<WatcherReaperJob>,
+    watcher: std::process::Child,
+    sentinel: std::process::Child,
+    process_group: libc::pid_t,
+) {
+    transfer_owned_process_group_children_to_reaper(
+        reaper,
+        Some(watcher),
+        Some(sentinel),
+        process_group,
+        false,
+    );
+}
+
+#[cfg(unix)]
+fn transfer_owned_process_group_children_to_reaper(
+    reaper: &std::sync::mpsc::Sender<WatcherReaperJob>,
+    watcher: Option<std::process::Child>,
+    sentinel: Option<std::process::Child>,
+    process_group: libc::pid_t,
+    group_barrier_completed: bool,
+) {
+    debug_assert!(watcher.is_some() || sentinel.is_some());
+    let force_deadline = std::time::Instant::now();
+    let job = WatcherReaperJob {
+        watcher,
+        sentinel,
+        process_group,
+        group_barrier_completed,
+        force_deadline,
+        terminal_deadline: force_deadline + PROCESS_GROUP_GUARDIAN_REAPER_TERMINAL_MARGIN,
+        forced: false,
+        terminal_action_issued: false,
+        watcher_terminal_warning_emitted: false,
+        sentinel_terminal_warning_emitted: false,
+    };
+    if let Err(error) = reaper.send(job) {
+        let job = error.0;
+        tracing::error!(
+            watcher_pid = ?job.watcher.as_ref().map(std::process::Child::id),
+            sentinel_pid = ?job.sentinel.as_ref().map(std::process::Child::id),
+            "durable process-group watcher reaper disconnected; starting retained fallback reaper"
+        );
+        start_retained_fallback_reaper(job);
+    }
+}
+
+#[cfg(unix)]
+fn reap_failed_process_group_watcher(
+    mut watcher: std::process::Child,
+    mut sentinel: std::process::Child,
+    sentinel_arm: &mut Option<std::process::ChildStdin>,
+    ownership: &mut Option<std::process::ChildStdin>,
+    process_group: libc::pid_t,
+    cleanup_timeout: Duration,
+    watcher_reaper: &std::sync::mpsc::Sender<WatcherReaperJob>,
+    primary_error: std::io::Error,
+) -> std::io::Error {
+    let arm_error = arm_process_group_sentinel(sentinel_arm, &mut sentinel).err();
+    if let Some(mut ownership) = ownership.take() {
+        if let Err(error) = send_process_group_cleanup_trigger(
+            &mut ownership,
+            ProcessGroupCleanupTrigger::WatcherBarrierRequired,
+        ) {
+            tracing::warn!(
+                %error,
+                "could not require watcher cleanup after guardian startup failure; EOF remains fail-closed"
+            );
+        }
+    }
+    let deadline =
+        std::time::Instant::now() + cleanup_timeout + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN;
+    match reap_child_until(&mut watcher, deadline) {
+        Ok(Some(status)) => {
+            let fallback = if status.success() {
+                Ok(())
+            } else {
+                quiesce_pinned_process_group(process_group, deadline)
+            };
+            let group_barrier_completed = fallback.is_ok();
+            let mut sentinel = Some(sentinel);
+            let finalization = finalize_owned_process_group(&mut sentinel, process_group, deadline);
+            let finalization_error = finalization.err();
+            if let Some(sentinel) = sentinel.take() {
+                transfer_owned_process_group_children_to_reaper(
+                    watcher_reaper,
+                    None,
+                    Some(sentinel),
+                    process_group,
+                    group_barrier_completed,
+                );
+            }
+            guardian_startup_failure(primary_error, arm_error, fallback.err(), finalization_error)
+        }
+        Ok(None) => {
+            let watcher_pid = watcher.id();
+            transfer_process_group_watcher_to_reaper(
+                watcher_reaper,
+                watcher,
+                sentinel,
+                process_group,
+            );
+            std::io::Error::new(
+                primary_error.kind(),
+                format!(
+                    "{primary_error}; process-group watcher exceeded cleanup bound \
+                     and was transferred to the durable reaper (pid={watcher_pid})"
+                ),
+            )
+        }
+        Err(reap_error) => {
+            let watcher_pid = watcher.id();
+            transfer_process_group_watcher_to_reaper(
+                watcher_reaper,
+                watcher,
+                sentinel,
+                process_group,
+            );
+            std::io::Error::new(
+                primary_error.kind(),
+                format!(
+                    "{primary_error}; process-group watcher reap failed: {reap_error} \
+                     and was transferred to the durable reaper (pid={watcher_pid})"
+                ),
+            )
+        }
+    }
+}
+
+#[cfg(unix)]
+fn start_retained_fallback_reaper(job: WatcherReaperJob) {
+    let retained = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
+    let worker_retained = std::sync::Arc::clone(&retained);
+    let spawn = std::thread::Builder::new()
+        .name("kin-process-group-fallback-reaper".to_string())
+        .spawn(move || {
+            let mut job = worker_retained
+                .lock()
+                .expect("fallback reaper job lock poisoned")
+                .take()
+                .expect("fallback reaper job already taken");
+            run_retained_watcher_reaper_job(&mut job);
+        });
+    if let Err(error) = spawn {
+        tracing::error!(
+            %error,
+            "could not start fallback reaper thread; attempting bounded synchronous drain"
+        );
+        let mut job = retained
+            .lock()
+            .expect("fallback reaper job lock poisoned")
+            .take()
+            .expect("failed fallback thread must leave its job owned");
+        let drain_deadline = std::time::Instant::now() + PROCESS_GROUP_GUARDIAN_PARENT_REAP_MARGIN;
+        while std::time::Instant::now() < drain_deadline {
+            if poll_watcher_reaper_job(&mut job) {
+                return;
+            }
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+        issue_reaper_group_barrier(&mut job, std::time::Instant::now());
+        tracing::error!(
+            watcher_pid = ?job.watcher.as_ref().map(std::process::Child::id),
+            sentinel_pid = ?job.sentinel.as_ref().map(std::process::Child::id),
+            "catastrophic reaper failure: intentionally retaining owned child handles after bounded drain"
+        );
+        let _retained_forever = Box::leak(Box::new(job));
+    }
+}
+
+#[cfg(unix)]
+fn run_retained_watcher_reaper_job(job: &mut WatcherReaperJob) {
+    while !poll_watcher_reaper_job(job) {
+        std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessGroupSignalOutcome {
+    Delivered,
+    Absent,
+}
+
+#[cfg(unix)]
+fn quiesce_pinned_process_group(
+    process_group: libc::pid_t,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    if signal_process_group_strict(process_group, libc::SIGSTOP)?
+        == ProcessGroupSignalOutcome::Absent
+    {
+        return Ok(());
+    }
+    if signal_process_group_strict(process_group, libc::SIGKILL)?
+        == ProcessGroupSignalOutcome::Absent
+    {
+        return Ok(());
+    }
+    for _ in 1..PROCESS_GROUP_GUARDIAN_KILL_PASSES {
+        if signal_process_group_after_delivered_kill(process_group)?
+            == ProcessGroupSignalOutcome::Absent
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process-group STOP/KILL barrier exceeded its deadline",
+            ));
+        }
+        std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finalize_owned_process_group(
+    sentinel: &mut Option<std::process::Child>,
+    process_group: libc::pid_t,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let sentinel_child = sentinel
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("process-group sentinel was already finalized"))?;
+    let status = reap_child_until(sentinel_child, deadline)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "process-group sentinel did not exit before finalization deadline",
+        )
+    })?;
+    let sentinel_was_killed = sentinel_exit_was_sigkill(status);
+    // Taking the already-reaped handle releases the PID pin. From this point
+    // onward no code may send STOP/KILL to the numeric process group.
+    sentinel.take();
+
+    // This is deliberately the one and only post-reap numeric group probe.
+    // ESRCH is exact empty-group success. A direct child that has exited but
+    // has not yet been waited remains visible here and fails closed.
+    let empty_probe = unsafe { libc::kill(-process_group, 0) };
+    let group_empty =
+        empty_probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    if !sentinel_was_killed {
+        return Err(std::io::Error::other(format!(
+            "process-group sentinel exited unexpectedly: {status}"
+        )));
+    }
+    if !group_empty {
+        return Err(std::io::Error::other(format!(
+            "process group {process_group} remained observable after sentinel reap; \
+             callers must kill and wait owned direct children before guardian finalization"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn guardian_watcher_failure(
+    failure: impl std::fmt::Display,
+    finalization_error: Option<std::io::Error>,
+) -> std::io::Error {
+    match finalization_error {
+        Some(error) => {
+            std::io::Error::other(format!("{failure}; group finalization failed: {error}"))
+        }
+        None => std::io::Error::other(failure.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn guardian_startup_failure(
+    primary: std::io::Error,
+    arm_error: Option<std::io::Error>,
+    fallback_error: Option<std::io::Error>,
+    finalization_error: Option<std::io::Error>,
+) -> std::io::Error {
+    let mut message = primary.to_string();
+    if let Some(error) = arm_error {
+        message.push_str(&format!("; sentinel arm failed: {error}"));
+    }
+    if let Some(error) = fallback_error {
+        message.push_str(&format!("; parent fallback barrier failed: {error}"));
+    }
+    if let Some(error) = finalization_error {
+        message.push_str(&format!("; group finalization failed: {error}"));
+    }
+    std::io::Error::new(primary.kind(), message)
+}
+
+/// Run the internal guardian or sentinel mode selected in the environment.
+///
+/// Product executables call this before parsing normal arguments. Exact Rust
+/// test workers call it as their complete test body. `Ok(false)` means no
+/// internal mode was requested and normal executable startup should continue.
+#[cfg(unix)]
+pub fn run_process_group_guardian_if_requested() -> std::io::Result<bool> {
+    match std::env::var(PROCESS_GROUP_GUARDIAN_MODE_ENV).as_deref() {
+        Ok(PROCESS_GROUP_GUARDIAN_WATCHER_MODE) => {
+            run_process_group_watcher()?;
+            Ok(true)
+        }
+        Ok(PROCESS_GROUP_GUARDIAN_SENTINEL_MODE) => {
+            run_process_group_sentinel();
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Non-Unix executables have no process-group guardian mode.
+#[cfg(not(unix))]
+pub fn run_process_group_guardian_if_requested() -> std::io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn run_process_group_sentinel() -> ! {
+    use std::io::Read as _;
+
+    let launcher_pid = match required_positive_pid_env(PROCESS_GROUP_GUARDIAN_LAUNCHER_PID_ENV) {
+        Ok(pid) => pid,
+        Err(_) => unsafe { libc::_exit(70) },
+    };
+    if set_nonblocking(libc::STDIN_FILENO).is_err() {
+        unsafe { libc::_exit(70) };
+    }
+
+    // Before the watcher publishes readiness, the sentinel is deliberately
+    // unarmed. Launcher death changes PPID (and closes stdin), so a death in
+    // the sentinel/watcher launch gap cannot strand a pinned numeric PGID.
+    let mut arm = std::io::stdin().lock();
+    let mut byte = [0_u8; 1];
+    loop {
+        match arm.read(&mut byte) {
+            Ok(1) => break,
+            Ok(0) => unsafe { libc::_exit(0) },
+            Ok(_) => unreachable!("one-byte sentinel arm buffer"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => unsafe { libc::_exit(70) },
+        }
+        if unsafe { libc::getppid() } != launcher_pid {
+            unsafe { libc::_exit(0) };
+        }
+        std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+    }
+
+    loop {
+        if unsafe { libc::getppid() } != launcher_pid {
+            // The watcher remains the owner-death STOP/KILL authority. This
+            // direct group kill is the last-resort backstop for simultaneous
+            // launcher and watcher loss; it necessarily includes the sentinel.
+            let process_group = unsafe { libc::getpgrp() };
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+                libc::_exit(70);
+            }
+        }
+        std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn run_process_group_watcher() -> std::io::Result<()> {
+    if std::env::var_os(PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY_ENV).is_some() {
+        return Err(std::io::Error::other(
+            "injected process-group watcher exit before readiness",
+        ));
+    }
+
+    let readiness_path = std::env::var_os(PROCESS_GROUP_GUARDIAN_READY_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process-group watcher has no readiness path",
+            )
+        })?;
+    let cleanup_timeout = std::env::var(PROCESS_GROUP_GUARDIAN_CLEANUP_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .filter(|value| !value.is_zero())
+        .unwrap_or(PROCESS_GROUP_GUARDIAN_DEFAULT_CLEANUP_TIMEOUT);
+    let launcher_pid = required_positive_pid_env(PROCESS_GROUP_GUARDIAN_LAUNCHER_PID_ENV)?;
+    let process_group = required_positive_pid_env(PROCESS_GROUP_GUARDIAN_TARGET_PGID_ENV)?;
+    let observed_group = unsafe { libc::getpgid(process_group) };
+    if observed_group != process_group {
+        return Err(std::io::Error::other(format!(
+            "process-group watcher did not find its launcher-owned sentinel: \
+             pid={process_group}, pgid={observed_group}"
+        )));
+    }
+
+    set_nonblocking(libc::STDIN_FILENO).map_err(|error| {
+        contextual_guardian_io(error, "make process-group ownership channel nonblocking")
+    })?;
+    publish_process_group_guardian_readiness(&readiness_path, process_group)?;
+    match wait_for_process_group_cleanup_trigger(launcher_pid) {
+        Ok(ProcessGroupCleanupTrigger::ParentBarrierComplete) => Ok(()),
+        Ok(ProcessGroupCleanupTrigger::WatcherBarrierRequired) => {
+            quiesce_pinned_process_group(process_group, std::time::Instant::now() + cleanup_timeout)
+        }
+        Err(trigger_error) => {
+            let cleanup = quiesce_pinned_process_group(
+                process_group,
+                std::time::Instant::now() + cleanup_timeout,
+            );
+            match cleanup {
+                Ok(()) => Err(trigger_error),
+                Err(cleanup_error) => Err(std::io::Error::new(
+                    trigger_error.kind(),
+                    format!(
+                        "{trigger_error}; fail-closed watcher barrier also failed: {cleanup_error}"
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn publish_process_group_guardian_readiness(
+    readiness_path: &Path,
+    process_group: libc::pid_t,
+) -> std::io::Result<()> {
+    let watcher_pid = unsafe { libc::getpid() };
+    let watcher_group = unsafe { libc::getpgrp() };
+    if watcher_pid <= 0 || watcher_group != watcher_pid || watcher_pid == process_group {
+        return Err(std::io::Error::other(format!(
+            "invalid process-group watcher topology: pid={watcher_pid}, pgid={watcher_group}, target={process_group}"
+        )));
+    }
+    let readiness = format!("kin-pg-guardian-v1 {watcher_pid} {process_group}\n");
+    let temporary_path = readiness_path.with_extension(format!("tmp-{watcher_pid}"));
+    std::fs::write(&temporary_path, readiness)
+        .map_err(|error| contextual_guardian_io(error, "write process-group watcher readiness"))?;
+    std::fs::rename(&temporary_path, readiness_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary_path);
+        contextual_guardian_io(error, "publish process-group watcher readiness")
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_cleanup_trigger(
+    launcher_pid: libc::pid_t,
+) -> std::io::Result<ProcessGroupCleanupTrigger> {
+    use std::io::Read as _;
+
+    let mut ownership = std::io::stdin().lock();
+    let mut buffer = [0_u8; 1];
+    loop {
+        match ownership.read(&mut buffer) {
+            Ok(0) => return Ok(ProcessGroupCleanupTrigger::WatcherBarrierRequired),
+            Ok(1) => return ProcessGroupCleanupTrigger::parse(buffer[0]),
+            Ok(_) => unreachable!("one-byte process-group cleanup buffer"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                return Err(contextual_guardian_io(
+                    error,
+                    "read process-group watcher ownership pipe",
+                ));
+            }
+        }
+        if unsafe { libc::getppid() } != launcher_pid {
+            return Ok(ProcessGroupCleanupTrigger::WatcherBarrierRequired);
+        }
+        std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn required_positive_pid_env(name: &str) -> std::io::Result<libc::pid_t> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("process-group internal mode has no valid {name}"),
+            )
+        })
+}
+
+#[cfg(unix)]
+fn signal_process_group_strict(
+    process_group: libc::pid_t,
+    signal: libc::c_int,
+) -> std::io::Result<ProcessGroupSignalOutcome> {
+    let result = unsafe { libc::kill(-process_group, signal) };
+    if result == 0 {
+        return Ok(ProcessGroupSignalOutcome::Delivered);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(ProcessGroupSignalOutcome::Absent)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group_after_delivered_kill(
+    process_group: libc::pid_t,
+) -> std::io::Result<ProcessGroupSignalOutcome> {
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(ProcessGroupSignalOutcome::Delivered);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(ProcessGroupSignalOutcome::Absent),
+        Some(libc::EPERM) => {
+            // This path is reachable only after a same-credential SIGKILL was
+            // delivered successfully. Darwin reports EPERM once that group is
+            // zombie-only. An initial STOP or KILL EPERM remains a hard error.
+            Ok(ProcessGroupSignalOutcome::Absent)
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn sentinel_exit_was_sigkill(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    status.signal() == Some(libc::SIGKILL)
+}
+
+#[cfg(unix)]
+fn contextual_guardian_io(
+    error: std::io::Error,
+    context: impl std::fmt::Display,
+) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{context}: {error}"))
 }
 
 // ── Spawn plan ──────────────────────────────────────────────────────────
@@ -342,7 +2195,7 @@ pub async fn await_reported_port(
     loop {
         match startup_disposition(child) {
             Ok(StartupDisposition::Exited(status)) => {
-                return Err(PortWaitError::ChildExited(status))
+                return Err(PortWaitError::ChildExited(status));
             }
             Ok(_) => {}
             Err(error) => return Err(PortWaitError::Unwatchable(error)),
@@ -563,6 +2416,1270 @@ pub async fn register_started_daemon(kin_root: &Path, daemon_url: &str) -> Resul
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    const INERT_GROUP_MEMBER_ENV: &str = "KIN_INTERNAL_TEST_INERT_GROUP_MEMBER";
+
+    #[cfg(unix)]
+    const ESCAPE_GROUP_ENV: &str = "KIN_INTERNAL_TEST_ESCAPE_GROUP";
+
+    #[cfg(unix)]
+    const OWNER_DEATH_DRIVER_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_OWNER_DEATH_DRIVER";
+
+    #[cfg(unix)]
+    const OWNER_DEATH_REPORT_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_OWNER_DEATH_REPORT";
+
+    #[cfg(unix)]
+    const LATE_RELAY_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_LATE_RELAY";
+
+    #[cfg(unix)]
+    const LATE_RELAY_TRIGGER_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_LATE_RELAY_TRIGGER";
+
+    #[cfg(unix)]
+    const LATE_RELAY_REPORT_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_LATE_RELAY_REPORT";
+
+    #[cfg(unix)]
+    const LATE_RELAY_ESCAPE_CHILD_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_LATE_RELAY_ESCAPE_CHILD";
+
+    #[cfg(unix)]
+    const PREEXEC_STALL_DRIVER_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_PREEXEC_STALL_DRIVER";
+
+    #[cfg(unix)]
+    const PREEXEC_STALL_REPORT_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_PREEXEC_STALL_REPORT";
+
+    #[cfg(unix)]
+    const FORK_BOUNDARY_WORKER_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_FORK_BOUNDARY_WORKER";
+
+    #[cfg(unix)]
+    const FORK_BOUNDARY_TRIGGER_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_FORK_BOUNDARY_TRIGGER";
+
+    #[cfg(unix)]
+    const FORK_BOUNDARY_RACE_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_FORK_BOUNDARY_RACE";
+
+    #[cfg(unix)]
+    const FORK_BOUNDARY_REPORT_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_FORK_BOUNDARY_REPORT";
+
+    #[cfg(unix)]
+    const FORK_BOUNDARY_SIGNAL_ENV: &str = "KIN_INTERNAL_TEST_GUARDIAN_FORK_BOUNDARY_SIGNAL";
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_guardian_worker() {
+        let requested = std::env::var_os(PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+        let dispatched = run_process_group_guardian_if_requested()
+            .expect("run exact process-group guardian worker");
+        assert_eq!(dispatched, requested);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inert_process_group_member_worker() {
+        if std::env::var_os(INERT_GROUP_MEMBER_ENV).is_none() {
+            return;
+        }
+        if std::env::var_os(ESCAPE_GROUP_ENV).is_some() {
+            assert_ne!(unsafe { libc::setsid() }, -1, "escape target process group");
+        }
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_group_relay_worker() {
+        use std::process::Stdio;
+
+        if std::env::var_os(LATE_RELAY_ENV).is_none() {
+            return;
+        }
+        let trigger =
+            PathBuf::from(std::env::var_os(LATE_RELAY_TRIGGER_ENV).expect("late relay trigger"));
+        let report =
+            PathBuf::from(std::env::var_os(LATE_RELAY_REPORT_ENV).expect("late relay report"));
+        wait_for_test_path(&trigger, Duration::from_secs(5));
+        let mut child = Command::new(std::env::current_exe().expect("late relay executable"));
+        child
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if std::env::var_os(LATE_RELAY_ESCAPE_CHILD_ENV).is_some() {
+            child.env(ESCAPE_GROUP_ENV, "1");
+        }
+        let child = child.spawn().expect("spawn late inherited member");
+        let child_id = child.id();
+        // This worker is deliberately killed as a process-group member. Moving
+        // the handle out of Drop makes that intentional non-wait explicit.
+        std::mem::forget(child);
+        std::fs::write(&report, format!("{child_id}\n")).expect("publish late inherited member");
+        if std::env::var_os(LATE_RELAY_ESCAPE_CHILD_ENV).is_some() {
+            return;
+        }
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_owner_death_driver_worker() {
+        use std::process::Stdio;
+
+        if std::env::var_os(OWNER_DEATH_DRIVER_ENV).is_none() {
+            return;
+        }
+        let report_path =
+            PathBuf::from(std::env::var_os(OWNER_DEATH_REPORT_ENV).expect("owner-death report"));
+        let readiness_path = report_path.with_extension("guardian-ready");
+        let executable = std::env::current_exe().expect("resolve owner-death test executable");
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .expect("spawn owner-death process-group guardian");
+        let watcher_id = guardian.watcher_id().expect("owned watcher");
+        let process_group = guardian.process_group();
+        let mut member_command = Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let member = guardian
+            .spawn(member_command)
+            .expect("spawn owner-death contained member");
+        let member_id = member.id();
+        // The hard `_exit` below intentionally bypasses Rust cleanup so the
+        // watcher, rather than this driver, must reap the containment tree.
+        std::mem::forget(member);
+        std::fs::write(
+            report_path,
+            format!("{watcher_id} {process_group} {member_id}\n"),
+        )
+        .expect("publish owner-death process ids");
+
+        // Do not unwind and do not run `ProcessGroupGuardian::drop`. Exact PPID
+        // change (with ownership EOF as a secondary trigger) is under test.
+        unsafe {
+            libc::_exit(0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_preexec_stall_driver_worker() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        if std::env::var_os(PREEXEC_STALL_DRIVER_ENV).is_none() {
+            return;
+        }
+        let report_path = PathBuf::from(
+            std::env::var_os(PREEXEC_STALL_REPORT_ENV).expect("pre-exec stall report"),
+        );
+        let stalled_path = report_path.with_extension("stalled");
+        let readiness_path = report_path.with_extension("guardian-ready");
+        let executable = std::env::current_exe().expect("resolve pre-exec stall executable");
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .expect("spawn pre-exec stall guardian");
+        std::fs::write(
+            &report_path,
+            format!(
+                "{} {}\n",
+                guardian.watcher_id().expect("owned watcher"),
+                guardian.process_group()
+            ),
+        )
+        .expect("publish pre-exec stall guardian ids");
+
+        let stalled_path =
+            CString::new(stalled_path.as_os_str().as_bytes()).expect("NUL-free stall marker");
+        let mut member_command = Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            member_command.pre_exec(move || {
+                let fd = libc::open(
+                    stalled_path.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o600,
+                );
+                if fd == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let marker = b"stalled\n";
+                if libc::write(fd, marker.as_ptr().cast(), marker.len()) == -1 {
+                    let error = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    return Err(error);
+                }
+                libc::close(fd);
+                loop {
+                    libc::pause();
+                }
+            });
+        }
+
+        // This blocks in Command::spawn's exec handshake. The outer test kills
+        // this driver after observing the marker from the earlier callback.
+        let _ = guardian.spawn(member_command);
+        unsafe { libc::_exit(71) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fork_boundary_worker() {
+        if std::env::var_os(FORK_BOUNDARY_WORKER_ENV).is_none() {
+            return;
+        }
+        let trigger = PathBuf::from(
+            std::env::var_os(FORK_BOUNDARY_TRIGGER_ENV).expect("fork boundary trigger"),
+        );
+        let race =
+            PathBuf::from(std::env::var_os(FORK_BOUNDARY_RACE_ENV).expect("fork boundary race"));
+        let report =
+            PathBuf::from(std::env::var_os(FORK_BOUNDARY_REPORT_ENV).expect("fork report"));
+        let signal_path =
+            PathBuf::from(std::env::var_os(FORK_BOUNDARY_SIGNAL_ENV).expect("fork signal"));
+        let signal =
+            std::os::unix::net::UnixDatagram::unbound().expect("create fork-boundary signal");
+        std::fs::write(&report, b"ready\n").expect("publish fork-boundary readiness");
+        wait_for_test_path(&trigger, Duration::from_secs(5));
+
+        let seed_child = unsafe { libc::fork() };
+        assert_ne!(seed_child, -1, "seed fork-boundary child");
+        if seed_child == 0 {
+            loop {
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+        {
+            use std::io::Write as _;
+
+            let mut report = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&report)
+                .expect("open fork-boundary report");
+            writeln!(report, "{seed_child}\narmed").expect("publish armed fork boundary");
+            report.flush().expect("flush armed fork boundary");
+        }
+
+        // Spin only inside this short-lived adversarial worker. Once released,
+        // stop at the instruction immediately before fork so the parent can
+        // resume this process and enter cleanup against the same boundary.
+        while !race.exists() {
+            std::hint::spin_loop();
+        }
+        assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+        assert_eq!(
+            signal
+                .send_to(&[1], &signal_path)
+                .expect("send pre-fork signal"),
+            1
+        );
+        let boundary_child = unsafe { libc::fork() };
+        assert_ne!(boundary_child, -1, "cleanup-boundary child");
+        if boundary_child > 0 {
+            use std::io::Write as _;
+
+            assert_eq!(
+                signal
+                    .send_to(&[2], &signal_path)
+                    .expect("send post-fork signal"),
+                1
+            );
+            let mut report = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&report)
+                .expect("reopen fork-boundary report");
+            writeln!(report, "{boundary_child}").expect("publish cleanup-boundary child");
+            report.flush().expect("flush cleanup-boundary child");
+        }
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_parser_is_versioned_and_fail_closed() {
+        assert_eq!(
+            parse_process_group_guardian_readiness("kin-pg-guardian-v1 41 42\n").unwrap(),
+            ProcessGroupGuardianReadiness {
+                watcher_pid: 41,
+                process_group: 42,
+            }
+        );
+        for malformed in [
+            "",
+            "41 42",
+            "kin-pg-guardian-v2 41 42",
+            "kin-pg-guardian-v1 0 42",
+            "kin-pg-guardian-v1 41 -42",
+            "kin-pg-guardian-v1 42 42",
+            "kin-pg-guardian-v1 41 42 trailing",
+        ] {
+            assert!(
+                parse_process_group_guardian_readiness(malformed).is_err(),
+                "{malformed:?} bypassed readiness validation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_trigger_parser_is_typed_and_fail_closed() {
+        assert_eq!(
+            ProcessGroupCleanupTrigger::parse(
+                ProcessGroupCleanupTrigger::ParentBarrierComplete as u8
+            )
+            .unwrap(),
+            ProcessGroupCleanupTrigger::ParentBarrierComplete
+        );
+        assert_eq!(
+            ProcessGroupCleanupTrigger::parse(
+                ProcessGroupCleanupTrigger::WatcherBarrierRequired as u8
+            )
+            .unwrap(),
+            ProcessGroupCleanupTrigger::WatcherBarrierRequired
+        );
+        for unknown in [0, 3, u8::MAX] {
+            let error = ProcessGroupCleanupTrigger::parse(unknown)
+                .expect_err("unknown cleanup trigger must fail closed");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_spawn_consumes_command_without_poisoning_next_admission() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+
+        let missing = Command::new(root.path().join("definitely-not-an-executable"));
+        assert_eq!(
+            guardian.spawn(missing).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let mut fresh = Command::new(executable);
+        fresh
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut member = guardian.spawn(fresh).unwrap();
+        guardian.request_cleanup();
+        let status = member.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_sigkill_during_earlier_preexec_stall_cleans_the_group() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let report_path = root.path().join("preexec-stall.report");
+        let stalled_path = report_path.with_extension("stalled");
+        let executable = std::env::current_exe().unwrap();
+        let mut driver = Command::new(executable);
+        driver
+            .args([
+                "--exact",
+                "tests::guardian_preexec_stall_driver_worker",
+                "--nocapture",
+            ])
+            .env(PREEXEC_STALL_DRIVER_ENV, "1")
+            .env(PREEXEC_STALL_REPORT_ENV, &report_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut driver = driver.spawn().unwrap();
+        wait_for_test_path(&report_path, Duration::from_secs(5));
+        wait_for_test_path(&stalled_path, Duration::from_secs(5));
+        let ids = std::fs::read_to_string(&report_path)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2, "malformed pre-exec stall report");
+
+        driver.kill().unwrap();
+        let status = driver.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        wait_for_test_pid_gone(ids[0], Duration::from_secs(5));
+        wait_for_test_process_group_gone(ids[1], Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_death_during_cleanup_request_cannot_skip_parent_barrier() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        )
+        .with_cleanup_timeout(Duration::from_millis(100));
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let watcher_pid = libc::pid_t::try_from(guardian.watcher_id().unwrap()).unwrap();
+        let sentinel_pid = guardian.process_group();
+        let mut member_command = Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut member = guardian.spawn(member_command).unwrap();
+
+        // Freeze the watcher so it cannot win the race by completing normally,
+        // then release its SIGKILL concurrently with the explicit request. No
+        // sleep or preliminary try_wait makes its death observable first.
+        assert_eq!(unsafe { libc::kill(watcher_pid, libc::SIGSTOP) }, 0);
+        let race = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let killer_race = std::sync::Arc::clone(&race);
+        let killer = std::thread::spawn(move || {
+            killer_race.wait();
+            unsafe { libc::kill(watcher_pid, libc::SIGKILL) }
+        });
+        race.wait();
+        guardian.request_cleanup();
+        assert_eq!(killer.join().unwrap(), 0);
+        let member_status = member.wait().unwrap();
+        assert_eq!(member_status.signal(), Some(libc::SIGKILL));
+        let error = guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .expect_err("killed watcher must remain a reported cleanup failure");
+        assert!(error.to_string().contains("watcher cleanup failed"));
+        wait_for_test_pid_gone(sentinel_pid, Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_watcher_and_sentinel_reach_terminal_reaper_deadline() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        )
+        .with_cleanup_timeout(Duration::from_millis(50));
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let watcher_pid = libc::pid_t::try_from(guardian.watcher_id().unwrap()).unwrap();
+        let sentinel_pid = guardian.process_group();
+        let mut member_command = Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut member = guardian.spawn(member_command).unwrap();
+
+        assert_eq!(unsafe { libc::kill(watcher_pid, libc::SIGSTOP) }, 0);
+        drop(guardian);
+        let member_status = member.wait().unwrap();
+        assert_eq!(member_status.signal(), Some(libc::SIGKILL));
+        wait_for_test_pid_gone(watcher_pid, Duration::from_secs(5));
+        wait_for_test_pid_gone(sentinel_pid, Duration::from_secs(5));
+        assert_test_child_reaped(watcher_pid);
+        assert_test_child_reaped(sentinel_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_barrier_catches_repeated_forks_at_the_cleanup_boundary() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut observed_completed_boundary_forks = 0;
+        const ROUNDS: usize = 16;
+
+        for round in 0..ROUNDS {
+            let readiness_path = root.path().join(format!("guardian-{round}.ready"));
+            let trigger_path = root.path().join(format!("fork-{round}.trigger"));
+            let race_path = root.path().join(format!("fork-{round}.race"));
+            let report_path = root.path().join(format!("fork-{round}.report"));
+            let signal_path = root.path().join(format!("fork-{round}.signal.sock"));
+            let fork_boundary_signal =
+                std::os::unix::net::UnixDatagram::bind(&signal_path).expect("bind pre-fork signal");
+            fork_boundary_signal
+                .set_nonblocking(true)
+                .expect("make fork-boundary signal nonblocking");
+            let launcher = ProcessGroupGuardianLauncher::exact_test(
+                &executable,
+                "tests::process_group_guardian_worker",
+            );
+            let mut guardian = launcher
+                .spawn_with(
+                    &readiness_path,
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    |_| {},
+                )
+                .unwrap();
+            let mut worker_command = Command::new(&executable);
+            worker_command
+                .args(["--exact", "tests::fork_boundary_worker", "--nocapture"])
+                .env(FORK_BOUNDARY_WORKER_ENV, "1")
+                .env(FORK_BOUNDARY_TRIGGER_ENV, &trigger_path)
+                .env(FORK_BOUNDARY_RACE_ENV, &race_path)
+                .env(FORK_BOUNDARY_REPORT_ENV, &report_path)
+                .env(FORK_BOUNDARY_SIGNAL_ENV, &signal_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let worker = guardian.spawn(worker_command).unwrap();
+            let mut round_owner = ForkBoundaryRoundOwner::new(guardian, worker);
+            let worker_pid = libc::pid_t::try_from(round_owner.worker.id()).unwrap();
+            wait_for_test_path(&report_path, Duration::from_secs(5));
+            std::fs::write(&trigger_path, b"seed\n").unwrap();
+            let armed = wait_for_test_report_fields(&report_path, 3, Duration::from_secs(5));
+            assert_eq!(armed[2], "armed");
+
+            // Put the worker at the instruction immediately before its second
+            // fork. Byte 1 is the exact pre-fork edge. Even rounds enter the
+            // STOP/KILL barrier immediately and preserve the race; odd rounds
+            // require byte 2, sent after a successful fork but before PID
+            // publication, so completed-fork coverage is deterministic.
+            std::fs::write(&race_path, b"fork-at-cleanup\n").unwrap();
+            wait_for_test_pid_stopped(worker_pid, Duration::from_secs(5));
+            assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGCONT) }, 0);
+            receive_fork_boundary_signal(
+                &fork_boundary_signal,
+                &mut round_owner.worker,
+                1,
+                Duration::from_secs(15),
+            );
+            if round % 2 == 1 {
+                receive_fork_boundary_signal(
+                    &fork_boundary_signal,
+                    &mut round_owner.worker,
+                    2,
+                    Duration::from_secs(15),
+                );
+                observed_completed_boundary_forks += 1;
+            }
+            round_owner.guardian.request_cleanup();
+            let worker_status = round_owner.worker.wait().unwrap();
+            assert_eq!(worker_status.signal(), Some(libc::SIGKILL));
+            round_owner
+                .guardian
+                .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            round_owner.completed = true;
+        }
+
+        assert_eq!(
+            observed_completed_boundary_forks,
+            ROUNDS / 2,
+            "every odd round must prove a completed boundary fork before cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unfinished_fork_boundary_round_reaps_every_owned_process() {
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let watcher_pid = libc::pid_t::try_from(guardian.watcher_id().unwrap()).unwrap();
+        let sentinel_pid = guardian.process_group();
+        let mut worker_command = Command::new(executable);
+        worker_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let worker = guardian.spawn(worker_command).unwrap();
+        let worker_pid = libc::pid_t::try_from(worker.id()).unwrap();
+
+        drop(ForkBoundaryRoundOwner::new(guardian, worker));
+
+        for pid in [worker_pid, watcher_pid, sentinel_pid] {
+            wait_for_test_pid_gone(pid, Duration::from_secs(5));
+            assert_test_child_reaped(pid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreaped_direct_child_prevents_false_empty_success() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let process_group = guardian.process_group();
+        let mut member_command = Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut member = guardian.spawn(member_command).unwrap();
+
+        guardian.request_cleanup();
+        let error = guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .expect_err("an unreaped direct zombie must block exact empty success");
+        assert!(
+            error.to_string().contains("remained observable"),
+            "unexpected direct-zombie error: {error}"
+        );
+        let member_status = member.wait().unwrap();
+        assert_eq!(member_status.signal(), Some(libc::SIGKILL));
+        wait_for_test_process_group_gone(process_group, Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_forked_member_inherits_group_and_is_killed_by_barrier() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let trigger_path = root.path().join("late-relay.trigger");
+        let report_path = root.path().join("late-relay.report");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+
+        let mut relay_command = Command::new(executable);
+        relay_command
+            .args(["--exact", "tests::late_group_relay_worker", "--nocapture"])
+            .env(LATE_RELAY_ENV, "1")
+            .env(LATE_RELAY_TRIGGER_ENV, &trigger_path)
+            .env(LATE_RELAY_REPORT_ENV, &report_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut relay = guardian.spawn(relay_command).unwrap();
+        std::fs::write(&trigger_path, b"fork\n").unwrap();
+        wait_for_test_path(&report_path, Duration::from_secs(5));
+        let late_member_pid = std::fs::read_to_string(&report_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        guardian.request_cleanup();
+        let status = relay.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "late-member relay escaped cleanup: {status}"
+        );
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .expect("guardian proves the inherited late-member group empty");
+        wait_for_test_pid_gone(late_member_pid, Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deliberate_late_setsid_escape_is_outside_the_guardian_contract() {
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let trigger_path = root.path().join("late-escape.trigger");
+        let report_path = root.path().join("late-escape.report");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        )
+        .with_cleanup_timeout(Duration::from_millis(150));
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let target_group = guardian.process_group();
+        let mut relay_command = Command::new(executable);
+        relay_command
+            .args(["--exact", "tests::late_group_relay_worker", "--nocapture"])
+            .env(LATE_RELAY_ENV, "1")
+            .env(LATE_RELAY_TRIGGER_ENV, &trigger_path)
+            .env(LATE_RELAY_REPORT_ENV, &report_path)
+            .env(LATE_RELAY_ESCAPE_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut relay = guardian.spawn(relay_command).unwrap();
+        std::fs::write(&trigger_path, b"fork\n").unwrap();
+        wait_for_test_path(&report_path, Duration::from_secs(5));
+        let late_member_pid = std::fs::read_to_string(&report_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert!(relay.wait().unwrap().success());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::getpgid(late_member_pid) } == target_group {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "late inherited member did not escape the target group"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+
+        guardian.request_cleanup();
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(2))
+            .expect("detached child is explicitly outside the cooperative group contract");
+        assert_eq!(unsafe { libc::kill(late_member_pid, 0) }, 0);
+
+        assert_eq!(unsafe { libc::kill(late_member_pid, libc::SIGKILL) }, 0);
+        wait_for_test_pid_gone(late_member_pid, Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_drop_synchronously_reaps_the_watcher() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let watcher_pid = libc::pid_t::try_from(guardian.watcher_id().unwrap()).unwrap();
+        let mut member_command = Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut member = guardian.spawn(member_command).unwrap();
+
+        guardian.request_cleanup();
+        let status = member.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        drop(guardian);
+
+        let mut watcher_status = 0;
+        let wait = unsafe { libc::waitpid(watcher_pid, &mut watcher_status, libc::WNOHANG) };
+        assert_eq!(wait, -1, "Drop left watcher {watcher_pid} waitable");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "Drop did not reap watcher {watcher_pid}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tokio_spawn_is_atomically_admitted_and_reaped() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let mut member_command = tokio::process::Command::new(executable);
+        member_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut member = guardian.spawn_tokio(member_command).unwrap();
+
+        guardian.request_cleanup();
+        let status = member.wait().await.unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_seals_future_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        guardian.request_cleanup();
+        let rejected = Command::new("true");
+        let error = guardian.spawn(rejected).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deliberate_direct_setsid_escape_is_outside_the_guardian_contract() {
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        )
+        .with_cleanup_timeout(Duration::from_millis(150));
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        let target_group = guardian.process_group();
+        let mut escaped_command = Command::new(executable);
+        escaped_command
+            .args([
+                "--exact",
+                "tests::inert_process_group_member_worker",
+                "--nocapture",
+            ])
+            .env(INERT_GROUP_MEMBER_ENV, "1")
+            .env(ESCAPE_GROUP_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut escaped = guardian.spawn(escaped_command).unwrap();
+        let escaped_pid = libc::pid_t::try_from(escaped.id()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::getpgid(escaped_pid) } == target_group {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "escaped worker did not leave the target group"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+
+        guardian.request_cleanup();
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(2))
+            .expect("detached child is explicitly outside the cooperative group contract");
+        assert_eq!(
+            unsafe { libc::kill(escaped_pid, 0) },
+            0,
+            "watcher falsely claimed success by killing an out-of-group member"
+        );
+
+        escaped.kill().unwrap();
+        escaped.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kernel_owner_death_eof_leaves_watcher_to_finish_cleanup() {
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let report_path = root.path().join("owner-death.report");
+        let executable = std::env::current_exe().unwrap();
+        let mut driver = Command::new(executable);
+        driver
+            .args([
+                "--exact",
+                "tests::guardian_owner_death_driver_worker",
+                "--nocapture",
+            ])
+            .env(OWNER_DEATH_DRIVER_ENV, "1")
+            .env(OWNER_DEATH_REPORT_ENV, &report_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut driver = driver.spawn().unwrap();
+        let status = driver.wait().unwrap();
+        assert!(status.success(), "owner-death driver failed: {status}");
+        wait_for_test_path(&report_path, Duration::from_secs(5));
+        let report = std::fs::read_to_string(&report_path).unwrap();
+        let pids = report
+            .split_whitespace()
+            .map(|value| value.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 3, "malformed owner-death report: {report:?}");
+
+        wait_for_test_pid_gone(pids[0], Duration::from_secs(5));
+        wait_for_test_pid_gone(pids[1], Duration::from_secs(5));
+        wait_for_test_pid_gone(pids[2], Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_path(path: &Path, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_report_fields(
+        path: &Path,
+        minimum_fields: usize,
+        timeout: Duration,
+    ) -> Vec<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(report) = std::fs::read_to_string(path) {
+                let fields = report
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if fields.len() >= minimum_fields {
+                    return fields;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {minimum_fields} fields in {}",
+                path.display()
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_pid_stopped(pid: libc::pid_t, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut status = 0;
+            let result =
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if result == pid {
+                assert!(
+                    libc::WIFSTOPPED(status),
+                    "process {pid} reached a terminal state before its fork boundary: {status}"
+                );
+                return;
+            }
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                panic!(
+                    "could not observe process {pid} at its fork boundary: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} did not stop at its fork boundary"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    struct ForkBoundaryRoundOwner {
+        guardian: ProcessGroupGuardian,
+        worker: std::process::Child,
+        completed: bool,
+    }
+
+    #[cfg(unix)]
+    impl ForkBoundaryRoundOwner {
+        fn new(guardian: ProcessGroupGuardian, worker: std::process::Child) -> Self {
+            Self {
+                guardian,
+                worker,
+                completed: false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForkBoundaryRoundOwner {
+        fn drop(&mut self) {
+            if self.completed {
+                return;
+            }
+            self.guardian.request_cleanup();
+            let _ = self.worker.kill();
+            let _ = self.worker.wait();
+            let _ = self
+                .guardian
+                .reap_until(std::time::Instant::now() + Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(unix)]
+    fn receive_fork_boundary_signal(
+        signal_socket: &std::os::unix::net::UnixDatagram,
+        worker: &mut std::process::Child,
+        expected: u8,
+        timeout: Duration,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut signal = [0_u8; 1];
+        loop {
+            match signal_socket.recv(&mut signal) {
+                Ok(1) => {
+                    assert_eq!(
+                        signal,
+                        [expected],
+                        "fork-boundary worker published an out-of-order signal"
+                    );
+                    return;
+                }
+                Ok(received) => {
+                    panic!("fork-boundary worker published a {received}-byte signal")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match worker.try_wait() {
+                        Ok(Some(status)) => {
+                            panic!("fork-boundary worker exited before signal {expected}: {status}")
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            panic!("failed to poll fork-boundary worker before signal {expected}: {error}")
+                        }
+                    }
+                }
+                Err(error) => {
+                    panic!("failed to receive fork-boundary signal {expected}: {error}")
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for fork-boundary signal {expected}"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_pid_gone(pid: libc::pid_t, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} survived guardian cleanup"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_process_group_gone(process_group: libc::pid_t, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let result = unsafe { libc::kill(-process_group, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process group {process_group} survived guardian cleanup"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_test_child_reaped(pid: libc::pid_t) {
+        let mut child_status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut child_status, libc::WNOHANG) };
+        assert_eq!(result, -1, "child {pid} remained waitable");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "child {pid} was gone but not reaped by its owner"
+        );
+    }
+
     #[test]
     fn spawn_plan_always_lets_the_daemon_choose_the_port() {
         let plan = DaemonSpawnPlan {
@@ -685,6 +3802,35 @@ mod tests {
             envs.get("PATH").is_some_and(Option::is_some),
             "daemon scrub must bind the child to a host PATH"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guardian_environment_scrub_matches_the_daemon_command_boundary() {
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        let mut guardian_environment = ProcessGroupGuardianEnvironment::default();
+        for (key, value) in [
+            ("GIT_DIR", "/ambient/repository/.git"),
+            ("KIN_DAEMON_URL", "http://stale.invalid"),
+            ("DYLD_LIBRARY_PATH", "/ambient/dyld"),
+            ("KIN_REGISTRY_PATH", "/declared/registry.toml"),
+        ] {
+            command.env(key, value);
+            guardian_environment.env(key, value);
+        }
+
+        scrub_daemon_process_authority(&mut command);
+        scrub_daemon_guardian_environment(&mut guardian_environment);
+
+        let command_environment = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let guardian_environment = guardian_environment
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(guardian_environment, command_environment);
     }
 
     #[cfg(windows)]

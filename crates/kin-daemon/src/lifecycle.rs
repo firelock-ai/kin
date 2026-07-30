@@ -1181,7 +1181,7 @@ fn validate_launch_agent_daemon_binary(path: &Path) -> Result<(), String> {
     command.arg("--compat-json");
     let label = format!("{} --compat-json", path.display());
     let output = output_macos_command_with_deadline(
-        &mut command,
+        command,
         &label,
         LAUNCHCTL_DEADLINE,
         LAUNCHCTL_CAPTURE_LIMIT,
@@ -1256,6 +1256,9 @@ const LAUNCHCTL_CLEANUP_GRACE: Duration = Duration::from_secs(5);
 const LAUNCHCTL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(target_os = "macos")]
 const LAUNCHCTL_CAPTURE_LIMIT: u64 = 64 * 1024;
+#[cfg(all(test, target_os = "macos"))]
+static RETAINED_LAUNCHCTL_DIRECT_REAP_COMPLETED_PID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 /// A regular-file output capture that removes its private backing file on
 /// every return path.
@@ -1325,133 +1328,45 @@ impl Drop for LaunchctlCapture {
 
 /// Stable ownership for the complete `launchctl` process group.
 ///
-/// The guardian remains the group leader until every live member has been
-/// disproven. Its stdin is an ownership pipe: ordinary cleanup closes it, and
-/// parent death closes it in the kernel, causing the guardian to kill the
-/// group even if Rust cleanup never runs.
+/// The shared watcher owns a separate inert sentinel in the target group. Its
+/// stdin is an ownership pipe: ordinary cleanup closes it, and parent death
+/// closes it in the kernel. The watcher remains outside the target group so it
+/// can establish a stop barrier, kill every member, and prove the pinned group
+/// empty even if Rust cleanup never runs.
 #[cfg(target_os = "macos")]
 struct LaunchctlContainment {
-    process_group: libc::pid_t,
-    guardian: Option<Child>,
-    guardian_stdin: Option<std::process::ChildStdin>,
-    termination_requested: bool,
+    guardian: Option<kin_daemon_spawn::ProcessGroupGuardian>,
 }
 
 #[cfg(target_os = "macos")]
 impl LaunchctlContainment {
-    fn spawn(command: &mut Command, deadline: Instant) -> std::io::Result<(Child, Self)> {
-        use std::os::unix::process::CommandExt as _;
-
+    fn spawn(command: Command, deadline: Instant) -> std::io::Result<(Child, Self)> {
         let readiness = LaunchctlCapture::create("guardian-ready")?;
-        let mut guardian_command = Command::new("/bin/sh");
-        guardian_command
-            .args([
-                "-c",
-                "set -eu\n\
-                 ready=$1\n\
-                 printf '%s\\n' \"$$\" > \"$ready\"\n\
-                 IFS= read -r _ || true\n\
-                 kill -KILL 0",
-                "kin-launchctl-guardian",
-            ])
-            .arg(&readiness.path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        kin_daemon_spawn::scrub_daemon_process_authority(&mut guardian_command);
-        let mut guardian = guardian_command
-            .spawn()
+        let launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+            std::env::current_exe()
+                .map_err(|error| lifecycle_io(error, "resolve launchctl guardian executable"))?,
+            "kin_process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(&readiness.path, deadline, |guardian_environment| {
+                // Preserve the launchctl caller's authority boundary. The
+                // shared launcher installs its private dispatch values only
+                // after this scrub returns.
+                kin_daemon_spawn::scrub_daemon_guardian_environment(guardian_environment);
+            })
             .map_err(|error| lifecycle_io(error, "spawn launchctl parent-death guardian"))?;
-        let process_group = match libc::pid_t::try_from(guardian.id()) {
-            Ok(process_group) => process_group,
-            Err(_) => {
-                let _ = guardian.kill();
-                let _ = guardian.wait();
-                return Err(std::io::Error::other(
-                    "launchctl guardian id does not fit a native process-group id",
-                ));
-            }
-        };
-        let guardian_stdin = match guardian.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = guardian.kill();
-                let _ = guardian.wait();
-                return Err(std::io::Error::other(
-                    "launchctl guardian did not expose its ownership pipe",
-                ));
-            }
-        };
-        let mut containment = Self {
-            process_group,
-            guardian: Some(guardian),
-            guardian_stdin: Some(guardian_stdin),
-            termination_requested: false,
-        };
 
-        let expected_ready = process_group.to_string();
-        loop {
-            let ready = readiness
-                .read_bounded(64)
-                .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).trim() == expected_ready);
-            if ready {
-                break;
-            }
-            match containment
-                .guardian
-                .as_mut()
-                .expect("guardian remains owned during readiness")
-                .try_wait()
-            {
-                Ok(Some(status)) => {
-                    containment.guardian.take();
-                    containment.guardian_stdin.take();
-                    return Err(std::io::Error::other(format!(
-                        "launchctl guardian exited before readiness: {status}"
-                    )));
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(LAUNCHCTL_POLL_INTERVAL);
-                }
-                Ok(None) => {
-                    let cleanup = containment.terminate_and_reap("unready launchctl guardian");
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "launchctl guardian readiness exceeded command deadline; cleanup={}",
-                            render_lifecycle_result(&cleanup)
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    let cleanup =
-                        containment.terminate_and_reap("uninspectable launchctl guardian");
-                    return Err(lifecycle_io(
-                        error,
-                        format!(
-                            "inspect launchctl guardian readiness; cleanup={}",
-                            render_lifecycle_result(&cleanup)
-                        ),
-                    ));
-                }
-            }
-        }
-
-        let observed_group = unsafe { libc::getpgid(process_group) };
-        if observed_group != process_group {
-            let cleanup = containment.terminate_and_reap("misbound launchctl guardian");
-            return Err(std::io::Error::other(format!(
-                "launchctl guardian group changed: expected {process_group}, observed \
-                 {observed_group}; cleanup={}",
-                render_lifecycle_result(&cleanup)
-            )));
-        }
-
-        command.process_group(process_group);
-        match command.spawn() {
-            Ok(child) => Ok((child, containment)),
+        match guardian.spawn(command) {
+            Ok(child) => Ok((
+                child,
+                Self {
+                    guardian: Some(guardian),
+                },
+            )),
             Err(error) => {
+                let mut containment = Self {
+                    guardian: Some(guardian),
+                };
                 let cleanup = containment.terminate_and_reap("unlaunched launchctl");
                 Err(lifecycle_io(
                     error,
@@ -1465,84 +1380,34 @@ impl LaunchctlContainment {
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
-        if self.guardian.is_none() || self.termination_requested {
-            return Ok(());
+        if let Some(guardian) = self.guardian.as_mut() {
+            guardian.request_cleanup();
         }
-        self.termination_requested = true;
-        let signal = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
-        self.guardian_stdin.take();
-        if signal == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(lifecycle_io(error, "terminate launchctl process group"))
-        }
+        Ok(())
     }
 
-    fn is_empty(&self) -> bool {
-        if self.guardian.is_none() {
-            return true;
-        }
-        let system = sysinfo::System::new_all();
-        for (pid, process) in system.processes() {
-            let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-                continue;
-            };
-            if unsafe { libc::getpgid(pid) } == self.process_group
-                && !matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-            {
-                return false;
-            }
-        }
-        true
+    fn take_guardian(&mut self) -> Option<kin_daemon_spawn::ProcessGroupGuardian> {
+        self.guardian.take()
     }
 
-    fn confirm_empty_until(&self, deadline: Instant, label: &str) -> std::io::Result<()> {
-        loop {
-            if self.is_empty() {
-                return Ok(());
+    fn confirm_empty_until(&mut self, deadline: Instant, label: &str) -> std::io::Result<()> {
+        let Some(guardian) = self.guardian.as_mut() else {
+            return Ok(());
+        };
+        match guardian.reap_until(deadline) {
+            Ok(_) => {
+                self.guardian.take();
+                Ok(())
             }
-            if Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("{label} containment remained live after termination"),
-                ));
-            }
-            std::thread::sleep(LAUNCHCTL_POLL_INTERVAL);
+            Err(error) => Err(lifecycle_io(
+                error,
+                format!("prove {label} process-group containment empty"),
+            )),
         }
     }
 
     fn reap_guardian_until(&mut self, deadline: Instant, label: &str) -> std::io::Result<()> {
-        loop {
-            let Some(guardian) = self.guardian.as_mut() else {
-                return Ok(());
-            };
-            match guardian.try_wait() {
-                Ok(Some(_)) => {
-                    self.guardian.take();
-                    self.guardian_stdin.take();
-                    return Ok(());
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(LAUNCHCTL_POLL_INTERVAL);
-                }
-                Ok(None) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("{label} guardian was not reaped"),
-                    ));
-                }
-                Err(error) => {
-                    return Err(lifecycle_io(error, format!("reap {label} guardian")));
-                }
-            }
-        }
+        self.confirm_empty_until(deadline, label)
     }
 
     fn terminate_and_reap(&mut self, label: &str) -> std::io::Result<()> {
@@ -1563,18 +1428,10 @@ impl LaunchctlContainment {
 impl Drop for LaunchctlContainment {
     fn drop(&mut self) {
         let _ = self.terminate();
-        if self
-            .confirm_empty_until(
-                Instant::now() + LAUNCHCTL_CLEANUP_GRACE,
-                "launchctl command",
-            )
-            .is_ok()
-        {
-            let _ = self.reap_guardian_until(
-                Instant::now() + LAUNCHCTL_CLEANUP_GRACE,
-                "launchctl command",
-            );
-        }
+        let _ = self.confirm_empty_until(
+            Instant::now() + LAUNCHCTL_CLEANUP_GRACE,
+            "launchctl command",
+        );
     }
 }
 
@@ -1598,38 +1455,6 @@ fn poll_launchctl_child_until(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn terminate_launchctl_tree(
-    child: &mut Child,
-    containment: &mut LaunchctlContainment,
-    label: &str,
-) -> std::io::Result<()> {
-    let terminate = containment.terminate();
-    let direct_kill = match child.kill() {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-        Err(error) => Err(lifecycle_io(error, format!("kill direct {label} process"))),
-    };
-    let direct_reap =
-        match poll_launchctl_child_until(child, Instant::now() + LAUNCHCTL_CLEANUP_GRACE, label) {
-            Ok(Some(_)) => direct_kill,
-            Ok(None) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("direct {label} process was not reaped"),
-            )),
-            Err(error) => Err(error),
-        };
-    let empty = containment.confirm_empty_until(Instant::now() + LAUNCHCTL_CLEANUP_GRACE, label);
-    let guardian_reap = if empty.is_ok() {
-        containment.reap_guardian_until(Instant::now() + LAUNCHCTL_CLEANUP_GRACE, label)
-    } else {
-        Err(std::io::Error::other(
-            "guardian reap skipped because live containment was not disproven",
-        ))
-    };
-    combine_lifecycle_cleanup(terminate, direct_reap, empty, guardian_reap)
-}
-
 /// Unwind-safe ownership of both the direct process and its complete tree.
 ///
 /// `std::process::Child` does not wait in Drop. Keeping the child beside the
@@ -1638,15 +1463,162 @@ fn terminate_launchctl_tree(
 /// the stable guardian.
 #[cfg(target_os = "macos")]
 struct RunningLaunchctlCommand {
-    child: Child,
+    child: Option<Child>,
     containment: LaunchctlContainment,
+    #[cfg(test)]
+    force_direct_reap_retention: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl RunningLaunchctlCommand {
-    fn cleanup(&mut self, label: &str) -> std::io::Result<()> {
-        terminate_launchctl_tree(&mut self.child, &mut self.containment, label)
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("launchctl direct-child handle remains owned")
     }
+
+    fn cleanup(&mut self, label: &str) -> std::io::Result<()> {
+        if self.child.is_none() && self.containment.guardian.is_none() {
+            return Ok(());
+        }
+
+        let terminate = self.containment.terminate();
+        let direct_kill = match self.child.as_mut() {
+            Some(child) => match child.kill() {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+                Err(error) => Err(lifecycle_io(error, format!("kill direct {label} process"))),
+            },
+            None => Ok(()),
+        };
+        #[cfg(test)]
+        let force_direct_reap_retention = std::mem::take(&mut self.force_direct_reap_retention);
+        #[cfg(not(test))]
+        let force_direct_reap_retention = false;
+        let (direct_reaped, direct_reap) = match self.child.as_mut() {
+            Some(_) if force_direct_reap_retention => (
+                false,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("direct {label} process was not reaped by the forced test path"),
+                )),
+            ),
+            Some(child) => match poll_launchctl_child_until(
+                child,
+                Instant::now() + LAUNCHCTL_CLEANUP_GRACE,
+                label,
+            ) {
+                Ok(Some(_)) => (true, direct_kill),
+                Ok(None) => (
+                    false,
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("direct {label} process was not reaped"),
+                    )),
+                ),
+                Err(error) => (false, Err(error)),
+            },
+            None => (true, Ok(())),
+        };
+
+        if !direct_reaped {
+            let retention = retain_failed_launchctl_command(self, label);
+            return Err(std::io::Error::other(format!(
+                "containment terminate={}; direct reap={}; containment proof deferred until exact \
+                 direct status is retained; retention={}",
+                render_lifecycle_result(&terminate),
+                render_lifecycle_result(&direct_reap),
+                render_lifecycle_result(&retention)
+            )));
+        }
+        self.child.take();
+
+        let empty = self
+            .containment
+            .confirm_empty_until(Instant::now() + LAUNCHCTL_CLEANUP_GRACE, label);
+        let guardian_reap = if empty.is_ok() {
+            self.containment
+                .reap_guardian_until(Instant::now() + LAUNCHCTL_CLEANUP_GRACE, label)
+        } else {
+            Err(std::io::Error::other(
+                "guardian reap skipped because live containment was not disproven",
+            ))
+        };
+        combine_lifecycle_cleanup(terminate, direct_reap, empty, guardian_reap)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct RetainedLaunchctlCleanup {
+    child: Child,
+    guardian: kin_daemon_spawn::ProcessGroupGuardian,
+}
+
+#[cfg(target_os = "macos")]
+impl RetainedLaunchctlCleanup {
+    fn run(mut self) {
+        #[cfg(test)]
+        let child_id = self.child.id();
+        self.guardian.request_cleanup();
+        let _ = self.child.kill();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    std::thread::sleep(LAUNCHCTL_POLL_INTERVAL);
+                }
+            }
+        }
+        #[cfg(test)]
+        RETAINED_LAUNCHCTL_DIRECT_REAP_COMPLETED_PID
+            .store(child_id, std::sync::atomic::Ordering::SeqCst);
+        // The exact direct status is now reaped. Only now may guardian
+        // finalization consume the sentinel and release the numeric PGID pin.
+        let _ = self
+            .guardian
+            .reap_until(Instant::now() + LAUNCHCTL_CLEANUP_GRACE);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn retain_failed_launchctl_command(
+    running: &mut RunningLaunchctlCommand,
+    label: &str,
+) -> std::io::Result<()> {
+    let Some(child) = running.child.take() else {
+        if let Some(mut guardian) = running.containment.take_guardian() {
+            guardian.request_cleanup();
+            std::mem::forget(guardian);
+        }
+        return Err(std::io::Error::other(format!(
+            "{label} lost its exact direct-child handle; guardian intentionally retained"
+        )));
+    };
+    let Some(guardian) = running.containment.take_guardian() else {
+        std::mem::forget(child);
+        return Err(std::io::Error::other(format!(
+            "{label} lost its guardian; exact direct-child handle intentionally retained"
+        )));
+    };
+
+    let retained = std::mem::ManuallyDrop::new(RetainedLaunchctlCleanup { child, guardian });
+    std::thread::Builder::new()
+        .name("kin-retained-launchctl-cleanup".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            retained.run();
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "spawn retained launchctl cleanup owner for {label}: {error}; exact guardian \
+                     and direct-child handles intentionally retained"
+                ),
+            )
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -1717,7 +1689,7 @@ fn cap_command_capture_files(command: &mut Command, capture_limit: u64) -> std::
 
 #[cfg(target_os = "macos")]
 fn output_macos_command_with_deadline(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
     timeout: Duration,
     capture_limit: u64,
@@ -1728,12 +1700,17 @@ fn output_macos_command_with_deadline(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.file.try_clone()?))
         .stderr(Stdio::from(stderr.file.try_clone()?));
-    kin_daemon_spawn::scrub_daemon_process_authority(command);
-    cap_command_capture_files(command, capture_limit)?;
+    kin_daemon_spawn::scrub_daemon_process_authority(&mut command);
+    cap_command_capture_files(&mut command, capture_limit)?;
 
     let deadline = Instant::now() + timeout;
     let (child, containment) = LaunchctlContainment::spawn(command, deadline)?;
-    let mut running = RunningLaunchctlCommand { child, containment };
+    let mut running = RunningLaunchctlCommand {
+        child: Some(child),
+        containment,
+        #[cfg(test)]
+        force_direct_reap_retention: false,
+    };
     loop {
         let stdout_len = stdout.len();
         let stderr_len = stderr.len();
@@ -1764,7 +1741,7 @@ fn output_macos_command_with_deadline(
             }
         }
 
-        match running.child.try_wait() {
+        match running.child_mut().try_wait() {
             Ok(Some(status)) => {
                 let descendant_cleanup = running.containment.terminate_and_reap(label);
                 if let Err(error) = descendant_cleanup {
@@ -1839,7 +1816,7 @@ fn launchctl_action(action: &str, plist_path: &Path) -> Result<(), LaunchctlActi
     command.arg(action).arg(plist_path);
     let label = format!("launchctl {action}");
     let output = output_macos_command_with_deadline(
-        &mut command,
+        command,
         &label,
         LAUNCHCTL_DEADLINE,
         LAUNCHCTL_CAPTURE_LIMIT,
@@ -2039,7 +2016,7 @@ fn read_plist_program_arguments(plist_path: &Path) -> Result<Vec<String>, String
         .arg("-")
         .arg(plist_path);
     let output = output_macos_command_with_deadline(
-        &mut command,
+        command,
         "plutil extract ProgramArguments",
         LAUNCHCTL_DEADLINE,
         LAUNCHCTL_CAPTURE_LIMIT,
@@ -2805,9 +2782,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_bounded_command_closes_stdin_and_captures_output() {
-        let mut command = lifecycle_worker_command("stdio");
+        let command = lifecycle_worker_command("stdio");
         let output = output_macos_command_with_deadline(
-            &mut command,
+            command,
             "lifecycle stdio fixture",
             Duration::from_secs(5),
             4096,
@@ -2822,9 +2799,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_bounded_command_enforces_capture_limit() {
-        let mut command = lifecycle_worker_command("flood");
+        let command = lifecycle_worker_command("flood");
         let error = output_macos_command_with_deadline(
-            &mut command,
+            command,
             "lifecycle capture fixture",
             Duration::from_secs(5),
             1024,
@@ -2845,7 +2822,7 @@ mod tests {
 
         let started = Instant::now();
         let error = output_macos_command_with_deadline(
-            &mut command,
+            command,
             "lifecycle deadline fixture",
             Duration::from_secs(2),
             4096,
@@ -2870,7 +2847,7 @@ mod tests {
         command.env(LIFECYCLE_DESCENDANT_MARKER, &marker);
 
         let output = output_macos_command_with_deadline(
-            &mut command,
+            command,
             "lifecycle inherited-output fixture",
             Duration::from_secs(5),
             4096,
@@ -2899,10 +2876,14 @@ mod tests {
         let mut direct_pid = 0;
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (child, containment) =
-                LaunchctlContainment::spawn(&mut command, Instant::now() + Duration::from_secs(5))
+                LaunchctlContainment::spawn(command, Instant::now() + Duration::from_secs(5))
                     .expect("spawn unwind-guard fixture");
             direct_pid = child.id();
-            let _running = RunningLaunchctlCommand { child, containment };
+            let _running = RunningLaunchctlCommand {
+                child: Some(child),
+                containment,
+                force_direct_reap_retention: false,
+            };
             let _descendant_pid = wait_for_worker_pid(&marker);
             panic!("exercise bounded-command unwind guard");
         }));
@@ -2915,13 +2896,67 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_failed_direct_reap_retains_exact_child_and_guardian_until_reaped() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let marker = root.path().join("descendant.pid");
+        let mut command = lifecycle_worker_command("spawn-descendant-and-wait");
+        command
+            .env(LIFECYCLE_DESCENDANT_MARKER, &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        kin_daemon_spawn::scrub_daemon_process_authority(&mut command);
+        cap_command_capture_files(&mut command, 4096).expect("install capture file limit");
+
+        let (child, containment) =
+            LaunchctlContainment::spawn(command, Instant::now() + Duration::from_secs(5))
+                .expect("spawn retained-cleanup fixture");
+        let direct_pid = child.id();
+        let descendant = wait_for_worker_pid(&marker);
+        let mut running = RunningLaunchctlCommand {
+            child: Some(child),
+            containment,
+            force_direct_reap_retention: true,
+        };
+
+        RETAINED_LAUNCHCTL_DIRECT_REAP_COMPLETED_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+        let error = running
+            .cleanup("forced retained launchctl cleanup")
+            .expect_err("forced foreground reap miss must report retained cleanup");
+        assert!(
+            error.to_string().contains("retention=ok"),
+            "cleanup must report a durable retained owner: {error}"
+        );
+        assert!(
+            running.child.is_none() && running.containment.guardian.is_none(),
+            "exact child and guardian must move together into retained ownership"
+        );
+
+        let reaped_deadline = Instant::now() + Duration::from_secs(5);
+        while RETAINED_LAUNCHCTL_DIRECT_REAP_COMPLETED_PID.load(std::sync::atomic::Ordering::SeqCst)
+            != direct_pid
+            && Instant::now() < reaped_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            RETAINED_LAUNCHCTL_DIRECT_REAP_COMPLETED_PID.load(std::sync::atomic::Ordering::SeqCst)
+                == direct_pid,
+            "retained owner never collected the exact direct-child status"
+        );
+        wait_for_process_exit(direct_pid);
+        wait_for_process_exit(descendant);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn launchctl_nonzero_status_prevents_plist_deletion() {
         let root = tempfile::tempdir().expect("tempdir");
         let plist_path = root.path().join("agent.plist");
         std::fs::write(&plist_path, "fixture").expect("write plist fixture");
-        let mut command = lifecycle_worker_command("nonzero");
+        let command = lifecycle_worker_command("nonzero");
         let output = output_macos_command_with_deadline(
-            &mut command,
+            command,
             "launchctl status fixture",
             Duration::from_secs(5),
             4096,
@@ -2946,9 +2981,9 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let plist_path = root.path().join("agent.plist");
         std::fs::write(&plist_path, "fixture").expect("write plist fixture");
-        let mut command = lifecycle_worker_command("not-loaded");
+        let command = lifecycle_worker_command("not-loaded");
         let output = output_macos_command_with_deadline(
-            &mut command,
+            command,
             "launchctl not-loaded fixture",
             Duration::from_secs(5),
             4096,

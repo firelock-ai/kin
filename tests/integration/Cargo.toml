@@ -25,5 +25,8 @@ kin-migrate = { workspace = true }
 kin-daemon = { workspace = true }
 kin-git = { workspace = true, features = ["test-support"] }
 
+[target.'cfg(unix)'.dependencies]
+kin-daemon-spawn = { workspace = true }
+
 # External
 tempfile = { workspace = true }

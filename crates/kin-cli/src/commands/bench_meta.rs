@@ -593,7 +593,7 @@ fn git_output_inner_with_resolution_policy_from(
         .args(args)
         .current_dir(&repo_root);
     run_bench_git_command(
-        &mut command,
+        command,
         args,
         &host_path,
         timeout,
@@ -624,7 +624,7 @@ fn absolute_bench_host_search_path(
 }
 
 fn run_bench_git_command(
-    command: &mut Command,
+    mut command: Command,
     args: &[&str],
     host_path: &OsStr,
     timeout: Duration,
@@ -632,7 +632,7 @@ fn run_bench_git_command(
     deadline_start: BenchGitDeadlineStart,
 ) -> Result<String> {
     let label = format!("Git benchmark metadata query {args:?}");
-    finalize_bench_git_process(command, host_path);
+    finalize_bench_git_process(&mut command, host_path);
     let output = match deadline_start {
         BenchGitDeadlineStart::Immediate => {
             crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(

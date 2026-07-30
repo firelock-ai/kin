@@ -124,7 +124,7 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    spawn_daemon_test_command(&mut cmd, "chaos-recovery daemon")
+    spawn_daemon_test_command(cmd, "chaos-recovery daemon")
         .expect("failed to spawn contained kin-daemon")
 }
 

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::{MigrateError, Result};
+use crate::MigrationProcessHost;
 
 #[cfg(windows)]
 const NULL_GIT_CONFIG: &str = "NUL";
@@ -32,7 +33,11 @@ pub struct RepoScan {
 /// This phase deliberately does not walk the working tree. Repository
 /// membership comes from the imported Git tree; scanning only identifies the
 /// repository root and selected branch.
-pub fn scan_repo(repo_path: &Path) -> Result<RepoScan> {
+///
+/// `process_host` makes the bounded-probe containment authority explicit. On
+/// Unix, a product host must satisfy the entrypoint contract documented by
+/// [`MigrationProcessHost::product`].
+pub fn scan_repo(repo_path: &Path, process_host: &MigrationProcessHost) -> Result<RepoScan> {
     if !repo_path.exists() {
         return Err(MigrateError::SourceNotFound(
             repo_path.display().to_string(),
@@ -44,7 +49,7 @@ pub fn scan_repo(repo_path: &Path) -> Result<RepoScan> {
         .map_err(|error| MigrateError::io(repo_path, error))?;
     let mut git_probe = git_command(&root)?;
     git_probe.args(["rev-parse", "--git-dir"]);
-    let git_probe = run_git_metadata(&mut git_probe, "migration repository probe")
+    let git_probe = run_git_metadata(process_host, git_probe, "migration repository probe")
         .map_err(|error| MigrateError::io(&root, error))?;
     if !git_probe.status.success() {
         return Err(MigrateError::NotAGitRepo(repo_path.display().to_string()));
@@ -56,17 +61,17 @@ pub fn scan_repo(repo_path: &Path) -> Result<RepoScan> {
     );
 
     Ok(RepoScan {
-        default_branch: detect_default_branch(&root),
+        default_branch: detect_default_branch(&root, process_host),
         root,
     })
 }
 
 /// Detect the checked-out branch without interpreting `.git` internals. This
 /// also works for linked worktrees where `.git` is a file.
-fn detect_default_branch(repo_path: &Path) -> Option<String> {
+fn detect_default_branch(repo_path: &Path, process_host: &MigrationProcessHost) -> Option<String> {
     let mut command = git_command(repo_path).ok()?;
     command.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    let output = run_git_metadata(&mut command, "migration branch probe").ok()?;
+    let output = run_git_metadata(process_host, command, "migration branch probe").ok()?;
     output
         .status
         .success()
@@ -142,12 +147,17 @@ fn absolute_host_search_path(
     })
 }
 
-fn run_git_metadata(command: &mut ProductGitCommand, label: &str) -> std::io::Result<Output> {
+fn run_git_metadata(
+    process_host: &MigrationProcessHost,
+    mut command: ProductGitCommand,
+    label: &str,
+) -> std::io::Result<Output> {
     // This is the final command mutation before the bounded helper attaches
     // owned stdio and spawns the process.
     isolate_git_process(&mut command.inner, &command.host_path);
     crate::bounded_process::output_finalized_with_timeout_and_limit(
-        &mut command.inner,
+        process_host,
+        command.inner,
         label,
         MIGRATION_GIT_TIMEOUT,
         MIGRATION_GIT_CAPTURE_LIMIT,
@@ -201,11 +211,23 @@ fn env_name_starts_with(actual: &str, expected: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn test_process_host() -> MigrationProcessHost {
+        MigrationProcessHost::exact_test(
+            std::env::current_exe().expect("resolve migration unit-test executable"),
+            "kin_process_group_guardian_worker",
+        )
+    }
+
     fn make_git_repo() -> Option<tempfile::TempDir> {
         let dir = tempfile::tempdir().unwrap();
         let mut command = git_command(dir.path()).ok()?;
         command.args(["init", "-b", "main"]);
-        let output = run_git_metadata(&mut command, "migration test repository init").ok()?;
+        let output = run_git_metadata(
+            &test_process_host(),
+            command,
+            "migration test repository init",
+        )
+        .ok()?;
         output.status.success().then_some(dir)
     }
 
@@ -312,21 +334,21 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.path().join("readme.md"), "# Hello").unwrap();
 
-        let scan = scan_repo(dir.path()).unwrap();
+        let scan = scan_repo(dir.path(), &test_process_host()).unwrap();
         assert_eq!(scan.root, dir.path().canonicalize().unwrap());
         assert_eq!(scan.default_branch, Some("main".to_string()));
     }
 
     #[test]
     fn scan_missing_dir_fails() {
-        let err = scan_repo(Path::new("/nonexistent/repo")).unwrap_err();
+        let err = scan_repo(Path::new("/nonexistent/repo"), &test_process_host()).unwrap_err();
         assert!(matches!(err, MigrateError::SourceNotFound(_)));
     }
 
     #[test]
     fn scan_non_git_dir_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let err = scan_repo(dir.path()).unwrap_err();
+        let err = scan_repo(dir.path(), &test_process_host()).unwrap_err();
         assert!(matches!(err, MigrateError::NotAGitRepo(_)));
     }
 
@@ -336,7 +358,7 @@ mod tests {
             return;
         };
         std::fs::write(dir.path().join("untracked.rs"), "fn untracked() {}").unwrap();
-        let scan = scan_repo(dir.path()).unwrap();
+        let scan = scan_repo(dir.path(), &test_process_host()).unwrap();
         assert_eq!(scan.root, dir.path().canonicalize().unwrap());
     }
 
@@ -345,7 +367,7 @@ mod tests {
         let Some(dir) = make_git_repo() else {
             return;
         };
-        let branch = detect_default_branch(dir.path());
+        let branch = detect_default_branch(dir.path(), &test_process_host());
         assert_eq!(branch, Some("main".to_string()));
     }
 

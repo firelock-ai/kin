@@ -27,13 +27,9 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
         .arg("--compat-json")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1")
         .env("KIN_DAEMON_DISABLE_LSP", "1");
-    let output = daemon_test_output(
-        &mut command,
-        "kin-daemon --compat-json",
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("run kin-daemon --compat-json");
+    let output = daemon_test_output(command, "kin-daemon --compat-json", Duration::from_secs(30))
+        .await
+        .expect("run kin-daemon --compat-json");
 
     assert!(
         output.status.success(),

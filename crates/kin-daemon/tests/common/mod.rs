@@ -4,8 +4,6 @@
 //! Shared subprocess isolation for daemon integration tests.
 
 use std::ops::{Deref, DerefMut};
-#[cfg(unix)]
-use std::path::PathBuf;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,6 +17,10 @@ const DAEMON_TEST_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 /// Maximum rendered UTF-8 bytes, including any truncation marker.
 const DAEMON_TEST_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const DAEMON_TEST_DIAGNOSTIC_MARKER: &str = "\n[bounded capture truncated]";
+#[cfg(unix)]
+const DAEMON_TEST_RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
+#[cfg(unix)]
+const DAEMON_TEST_RUNTIME_PROCESS_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP";
 
 /// Remove all inherited Kin authority and loader injection before a scratch
 /// daemon applies its intentional test environment.
@@ -194,7 +196,7 @@ async fn daemon_isolation_scrubs_ambient_and_command_local_git_and_loader_author
         worker.env(key, "ambient-hostile");
     }
     let output = adversarial_authority_worker_output(
-        &mut worker,
+        worker,
         "daemon authority scrub worker",
         Duration::from_secs(10),
     )
@@ -214,199 +216,88 @@ async fn daemon_isolation_scrubs_ambient_and_command_local_git_and_loader_author
 
 #[cfg(unix)]
 struct DaemonContainment {
-    process_group: libc::pid_t,
-    guardian: Option<std::process::Child>,
+    guardian: std::sync::Mutex<Option<kin_daemon_spawn::ProcessGroupGuardian>>,
     signaled: bool,
+    runtime_owner: String,
     _guardian_root: tempfile::TempDir,
 }
 
-#[cfg(unix)]
-const DAEMON_CONTAINMENT_GUARDIAN_PARENT: &str = "KIN_TEST_DAEMON_CONTAINMENT_GUARDIAN_PARENT";
-#[cfg(unix)]
-const DAEMON_CONTAINMENT_GUARDIAN_READY: &str = "KIN_TEST_DAEMON_CONTAINMENT_GUARDIAN_READY";
-
-/// Stable Unix process-group leader for direct daemon integration fixtures.
-///
-/// This test returns immediately in an ordinary suite. A contained subprocess
-/// launch runs the exact test in its own process group and passes the expected
-/// parent PID. If that parent is hard-killed, adoption changes `getppid()` and
-/// the guardian kills its own group before exiting.
+/// Exact test-harness entrypoint for the shared process-group guardian.
 #[cfg(unix)]
 #[test]
 fn daemon_containment_guardian_worker() {
-    let Some(expected_parent) = std::env::var_os(DAEMON_CONTAINMENT_GUARDIAN_PARENT) else {
-        return;
-    };
-    let expected_parent = expected_parent
-        .to_string_lossy()
-        .parse::<libc::pid_t>()
-        .expect("parse daemon-containment guardian parent");
-    let ready = PathBuf::from(
-        std::env::var_os(DAEMON_CONTAINMENT_GUARDIAN_READY)
-            .expect("daemon-containment guardian readiness path"),
-    );
-    assert_eq!(
-        unsafe { libc::getppid() },
-        expected_parent,
-        "daemon-containment guardian started under the wrong parent"
-    );
-    std::fs::write(ready, b"ready").expect("publish daemon-containment guardian readiness");
-    loop {
-        let current_parent = unsafe { libc::getppid() };
-        if current_parent != expected_parent || current_parent == 1 {
-            let _ = unsafe { libc::kill(0, libc::SIGKILL) };
-            std::process::abort();
-        }
-        std::thread::sleep(DAEMON_POLL_INTERVAL);
-    }
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run daemon-test process-group guardian worker");
+    assert_eq!(dispatched, requested);
 }
 
 #[cfg(unix)]
-fn scrub_std_daemon_test_command(command: &mut std::process::Command) {
+fn scrub_daemon_test_guardian_environment(
+    environment: &mut kin_daemon_spawn::ProcessGroupGuardianEnvironment,
+) {
     for key in std::env::vars_os()
         .map(|(key, _)| key)
         .filter(|key| is_daemon_test_authority(key))
     {
-        command.env_remove(key);
+        environment.env_remove(key);
     }
-    command.env("KIN_VFS_DISABLE", "1");
-}
-
-#[cfg(unix)]
-fn terminate_std_child_within(child: &mut std::process::Child, label: &str) -> Result<(), String> {
-    let kill_error = child.kill().err();
-    let deadline = Instant::now() + DAEMON_REAP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(DAEMON_POLL_INTERVAL);
-            }
-            Ok(None) => {
-                return Err(format!(
-                    "{label} was not reaped within {DAEMON_REAP_TIMEOUT:?}; \
-                     kill={kill_error:?}"
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "reap {label}: {error}; initial kill={kill_error:?}"
-                ));
-            }
-        }
-    }
+    environment.env("KIN_VFS_DISABLE", "1");
 }
 
 #[cfg(unix)]
 impl DaemonContainment {
     fn start_guardian(label: &str) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt as _;
-
-        let parent_pid = libc::pid_t::try_from(std::process::id())
-            .map_err(|_| std::io::Error::other("test parent pid does not fit pid_t"))?;
         let guardian_root = tempfile::Builder::new()
             .prefix("kin-daemon-containment-guardian-")
             .tempdir()?;
         let ready = guardian_root.path().join("ready");
-        let mut command = std::process::Command::new(std::env::current_exe()?);
-        scrub_std_daemon_test_command(&mut command);
-        command
-            .args([
-                "--exact",
-                "common::daemon_containment_guardian_worker",
-                "--nocapture",
-            ])
-            .env(DAEMON_CONTAINMENT_GUARDIAN_PARENT, parent_pid.to_string())
-            .env(DAEMON_CONTAINMENT_GUARDIAN_READY, &ready)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut guardian = command.spawn().map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!("spawn {label} containment guardian: {error}"),
+        let runtime_owner = uuid::Uuid::new_v4().to_string();
+        let launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+            std::env::current_exe()?,
+            "common::daemon_containment_guardian_worker",
+        )
+        .with_env(DAEMON_TEST_RUNTIME_OWNER_ENV, &runtime_owner);
+        let guardian = launcher
+            .spawn_with(
+                &ready,
+                Instant::now() + Duration::from_secs(5),
+                scrub_daemon_test_guardian_environment,
             )
-        })?;
-        let process_group = match libc::pid_t::try_from(guardian.id()) {
-            Ok(process_group) => process_group,
-            Err(_) => {
-                let cleanup =
-                    terminate_std_child_within(&mut guardian, "invalid-pid containment guardian");
-                return Err(std::io::Error::other(format!(
-                    "{label} guardian pid does not fit a native process-group id; \
-                     cleanup={cleanup:?}"
-                )));
-            }
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let actual_group = unsafe { libc::getpgid(process_group) };
-            if actual_group == process_group && ready.is_file() {
-                break;
-            }
-            if actual_group == -1 {
-                let error = std::io::Error::last_os_error();
-                let status = guardian.try_wait();
-                let cleanup =
-                    terminate_std_child_within(&mut guardian, "unready containment guardian");
-                return Err(std::io::Error::new(
+            .map_err(|error| {
+                std::io::Error::new(
                     error.kind(),
-                    format!(
-                        "{label} containment guardian did not establish process group \
-                         {process_group}: {error}; status={status:?}; cleanup={cleanup:?}"
-                    ),
-                ));
-            }
-            match guardian.try_wait() {
-                Ok(None) => {}
-                Ok(Some(status)) => {
-                    return Err(std::io::Error::other(format!(
-                        "{label} containment guardian exited before readiness: {status}"
-                    )));
-                }
-                Err(error) => {
-                    let cleanup = terminate_std_child_within(
-                        &mut guardian,
-                        "unpollable containment guardian",
-                    );
-                    return Err(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "poll {label} containment guardian readiness: {error}; \
-                             cleanup={cleanup:?}"
-                        ),
-                    ));
-                }
-            }
-            if Instant::now() >= deadline {
-                let cleanup =
-                    terminate_std_child_within(&mut guardian, "timed-out containment guardian");
-                return Err(std::io::Error::other(format!(
-                    "{label} containment guardian was not ready in process group \
-                     {process_group}; observed group={actual_group}; ready={}; \
-                     cleanup={cleanup:?}",
-                    ready.is_file(),
-                )));
-            }
-            std::thread::sleep(DAEMON_POLL_INTERVAL);
-        }
+                    format!("spawn {label} containment guardian: {error}"),
+                )
+            })?;
         Ok(Self {
-            process_group,
-            guardian: Some(guardian),
+            guardian: std::sync::Mutex::new(Some(guardian)),
             signaled: false,
+            runtime_owner,
             _guardian_root: guardian_root,
         })
     }
 
-    fn spawn(command: &mut Command, label: &str) -> std::io::Result<(Child, Self)> {
-        use std::os::unix::process::CommandExt as _;
-
+    fn spawn(mut command: Command, label: &str) -> std::io::Result<(Child, Self)> {
         let mut containment = Self::start_guardian(label)?;
-        command
-            .as_std_mut()
-            .process_group(containment.process_group);
-        match command.spawn() {
+        let spawn = {
+            let mut guardian = containment
+                .guardian
+                .lock()
+                .map_err(|_| std::io::Error::other("daemon containment guardian lock poisoned"))?;
+            let guardian = guardian.as_mut().ok_or_else(|| {
+                std::io::Error::other("daemon containment guardian exited before child spawn")
+            })?;
+            let process_group = guardian.process_group();
+            command
+                .env(DAEMON_TEST_RUNTIME_OWNER_ENV, &containment.runtime_owner)
+                .env(
+                    DAEMON_TEST_RUNTIME_PROCESS_GROUP_ENV,
+                    process_group.to_string(),
+                );
+            guardian.spawn_tokio(command)
+        };
+        match spawn {
             Ok(child) => Ok((child, containment)),
             Err(error) => {
                 let cleanup = containment.terminate();
@@ -430,84 +321,69 @@ impl DaemonContainment {
         }
     }
 
-    /// Signal the owned group at most once while the guardian still pins its
-    /// identity. After this method returns, the numeric PGID is never used as
-    /// kill authority again.
+    /// Seal guardian admission and transfer repeated cleanup to the watcher.
     fn terminate(&mut self) -> std::io::Result<()> {
-        if self.signaled {
+        if std::mem::replace(&mut self.signaled, true) {
             return Ok(());
         }
-        if self.guardian.is_none() {
-            self.signaled = true;
-            return Err(std::io::Error::other(
-                "daemon containment lost its guardian before termination",
-            ));
-        }
-        // Do not call `try_wait` here: observing an exited guardian would reap
-        // it before descendant quiescence is proven. The owned, unreaped PID is
-        // the stable identity that makes this one numeric PGID signal safe.
-        let result = loop {
-            if unsafe { libc::kill(-self.process_group, libc::SIGKILL) } == 0 {
-                break Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                break Ok(());
-            }
-            break Err(error);
-        };
-        self.signaled = true;
-        result
+        let guardian = self
+            .guardian
+            .get_mut()
+            .map_err(|_| std::io::Error::other("daemon containment guardian lock poisoned"))?;
+        let guardian = guardian.as_mut().ok_or_else(|| {
+            std::io::Error::other("daemon containment lost its guardian before termination")
+        })?;
+        guardian.request_cleanup();
+        Ok(())
     }
 
     fn reap_guardian(&mut self) -> std::io::Result<()> {
-        let Some(guardian) = self.guardian.as_mut() else {
+        let guardian = self
+            .guardian
+            .get_mut()
+            .map_err(|_| std::io::Error::other("daemon containment guardian lock poisoned"))?;
+        let Some(guardian_handle) = guardian.as_mut() else {
             return Ok(());
         };
-        let deadline = Instant::now() + DAEMON_REAP_TIMEOUT;
-        loop {
-            match guardian.try_wait()? {
-                Some(_) => {
-                    self.guardian = None;
-                    return Ok(());
-                }
-                None if Instant::now() < deadline => {
-                    std::thread::sleep(DAEMON_POLL_INTERVAL);
-                }
-                None => {
-                    return Err(std::io::Error::other(format!(
-                        "daemon containment guardian was not reaped within \
-                         {DAEMON_REAP_TIMEOUT:?}"
-                    )));
-                }
-            }
-        }
+        guardian_handle.reap_until(Instant::now() + DAEMON_REAP_TIMEOUT)?;
+        guardian.take();
+        Ok(())
     }
 
     fn is_empty(&self) -> std::io::Result<bool> {
-        let system = sysinfo::System::new_all();
-        Ok(system.processes().iter().all(|(pid, process)| {
-            let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-                return true;
-            };
-            (unsafe { libc::getpgid(pid) }) != self.process_group
-                || matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-        }))
+        let mut guardian = self
+            .guardian
+            .lock()
+            .map_err(|_| std::io::Error::other("daemon containment guardian lock poisoned"))?;
+        let Some(guardian_handle) = guardian.as_mut() else {
+            return Ok(true);
+        };
+        if guardian_handle.try_reap()?.is_some() {
+            guardian.take();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn take_guardian(&mut self) -> Option<kin_daemon_spawn::ProcessGroupGuardian> {
+        match self.guardian.get_mut() {
+            Ok(guardian) => guardian.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for DaemonContainment {
     fn drop(&mut self) {
+        // DaemonChild owns the ordered path: terminate containment, reap the
+        // direct child, then prove the group empty and reap the guardian.
+        // This catastrophic fallback intentionally leaks the exact guardian
+        // handle rather than let its Drop finalize before the direct status.
         let _ = self.terminate();
-        if confirm_containment_empty_blocking(self, "daemon containment drop").is_ok() {
-            let _ = self.reap_guardian();
+        if let Some(mut guardian) = self.take_guardian() {
+            guardian.request_cleanup();
+            std::mem::forget(guardian);
         }
     }
 }
@@ -534,7 +410,7 @@ impl Drop for WindowsOwnedHandle {
 
 #[cfg(windows)]
 impl DaemonContainment {
-    fn spawn(command: &mut Command, label: &str) -> std::io::Result<(Child, Self)> {
+    fn spawn(mut command: Command, label: &str) -> std::io::Result<(Child, Self)> {
         use std::os::windows::process::CommandExt as _;
         use windows_sys::Win32::Foundation::{
             GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
@@ -751,7 +627,7 @@ struct DaemonContainment {
 
 #[cfg(not(any(unix, windows)))]
 impl DaemonContainment {
-    fn spawn(command: &mut Command, label: &str) -> std::io::Result<(Child, Self)> {
+    fn spawn(mut command: Command, label: &str) -> std::io::Result<(Child, Self)> {
         let child = command.spawn().map_err(|error| {
             std::io::Error::new(error.kind(), format!("spawn {label}: {error}"))
         })?;
@@ -779,49 +655,129 @@ impl DaemonContainment {
 /// can execute. Drop terminates the whole tree; explicit shutdown additionally
 /// reaps the direct child and proves the containment empty.
 pub struct DaemonChild {
-    child: Child,
+    child: Option<Child>,
     containment: DaemonContainment,
+    label: String,
+}
+
+#[cfg(unix)]
+struct RetainedDaemonCleanup {
+    guardian: kin_daemon_spawn::ProcessGroupGuardian,
+    child: Child,
+}
+
+#[cfg(unix)]
+impl RetainedDaemonCleanup {
+    fn run(mut self) {
+        self.guardian.request_cleanup();
+        let _ = self.child.start_kill();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) | Err(_) => std::thread::sleep(DAEMON_POLL_INTERVAL),
+            }
+        }
+        // The direct daemon status is now reaped. Guardian finalization is
+        // permitted only after this point.
+        let _ = self
+            .guardian
+            .reap_until(Instant::now() + DAEMON_REAP_TIMEOUT);
+    }
+}
+
+#[cfg(unix)]
+fn retain_failed_daemon_child(child: &mut DaemonChild, label: &str) -> Result<(), String> {
+    let Some(direct_child) = child.child.take() else {
+        if let Some(mut guardian) = child.containment.take_guardian() {
+            guardian.request_cleanup();
+            std::mem::forget(guardian);
+        }
+        return Err(format!(
+            "{label} lost its direct child; guardian intentionally retained"
+        ));
+    };
+    let Some(guardian) = child.containment.take_guardian() else {
+        std::mem::forget(direct_child);
+        return Err(format!(
+            "{label} lost its guardian; exact direct-child handle intentionally leaked"
+        ));
+    };
+    let retained = std::mem::ManuallyDrop::new(RetainedDaemonCleanup {
+        guardian,
+        child: direct_child,
+    });
+    std::thread::Builder::new()
+        .name("kin-test-retained-daemon".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            retained.run();
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "spawn retained daemon cleanup owner for {label}: {error}; exact guardian and \
+                 direct-child handles intentionally leaked"
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn retain_failed_daemon_child(child: &mut DaemonChild, label: &str) -> Result<(), String> {
+    if let Some(direct_child) = child.child.take() {
+        std::mem::forget(direct_child);
+    }
+    Err(format!(
+        "{label} direct-child handle intentionally retained after failed reap"
+    ))
 }
 
 impl Deref for DaemonChild {
     type Target = Child;
 
     fn deref(&self) -> &Self::Target {
-        &self.child
+        self.child.as_ref().expect("daemon child handle retained")
     }
 }
 
 impl DerefMut for DaemonChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.child
+        self.child.as_mut().expect("daemon child handle retained")
     }
 }
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
-        let _ = self.containment.terminate();
-        let _ = self.child.start_kill();
+        let label = self.label.clone();
+        if let Err(mut error) = terminate_daemon_blocking(self, &label) {
+            let retention = retain_failed_daemon_child(self, &label);
+            error.push_str(&format!("; failed-reap retention={retention:?}"));
+            if std::thread::panicking() {
+                eprintln!("{error}");
+            } else {
+                panic!("{error}");
+            }
+        }
     }
 }
 
 /// Spawn a direct daemon fixture with closed stdin and stable tree ownership.
 pub fn spawn_daemon_test_command(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
 ) -> std::io::Result<DaemonChild> {
-    prepare_daemon_test_command_for_spawn(command);
+    prepare_daemon_test_command_for_spawn(&mut command);
     spawn_contained_test_command(command, label)
 }
 
-fn spawn_contained_test_command(
-    command: &mut Command,
-    label: &str,
-) -> std::io::Result<DaemonChild> {
+fn spawn_contained_test_command(command: Command, label: &str) -> std::io::Result<DaemonChild> {
     let (child, containment) = DaemonContainment::spawn(command, label)?;
-    Ok(DaemonChild { child, containment })
+    Ok(DaemonChild {
+        child: Some(child),
+        containment,
+        label: label.to_string(),
+    })
 }
 
-#[cfg(unix)]
 fn confirm_containment_empty_blocking(
     containment: &DaemonContainment,
     label: &str,
@@ -864,24 +820,123 @@ async fn confirm_containment_empty(
     }
 }
 
+fn terminate_daemon_blocking(child: &mut DaemonChild, label: &str) -> Result<ExitStatus, String> {
+    let initial_probe = child
+        .child
+        .as_mut()
+        .expect("daemon child handle retained")
+        .try_wait();
+    let probe_error = initial_probe.as_ref().err().map(ToString::to_string);
+    let initial_status = initial_probe.ok().flatten();
+    let containment_error = child.containment.terminate().err();
+    let direct_kill_error = if initial_status.is_none() {
+        child
+            .child
+            .as_mut()
+            .expect("daemon child handle retained")
+            .start_kill()
+            .err()
+    } else {
+        None
+    };
+    let status = match initial_status {
+        Some(status) => Ok(status),
+        None => {
+            let deadline = Instant::now() + DAEMON_REAP_TIMEOUT;
+            loop {
+                match child
+                    .child
+                    .as_mut()
+                    .expect("daemon child handle retained")
+                    .try_wait()
+                {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(DAEMON_POLL_INTERVAL);
+                    }
+                    Ok(None) => {
+                        break Err(format!(
+                            "{label} was not reaped within {DAEMON_REAP_TIMEOUT:?}"
+                        ));
+                    }
+                    Err(error) => break Err(format!("reap {label}: {error}")),
+                }
+            }
+        }
+    };
+    let (quiescence, guardian_reap) = if status.is_ok() {
+        let quiescence = confirm_containment_empty_blocking(&child.containment, label);
+        let guardian_reap = if quiescence.is_ok() {
+            child.containment.reap_guardian()
+        } else {
+            Err(std::io::Error::other(
+                "daemon containment guardian retained because quiescence was not proven",
+            ))
+        };
+        (quiescence, guardian_reap)
+    } else {
+        (
+            Err(format!(
+                "{label} containment proof skipped because the direct child was not reaped"
+            )),
+            Err(std::io::Error::other(
+                "daemon containment guardian retained because the direct child was not reaped",
+            )),
+        )
+    };
+    match (
+        probe_error,
+        containment_error,
+        status,
+        quiescence,
+        guardian_reap,
+    ) {
+        (None, None, Ok(status), Ok(()), Ok(())) => Ok(status),
+        (probe_error, containment_error, status, quiescence, guardian_reap) => Err(format!(
+            "{label} cleanup failed: initial probe={probe_error:?}; \
+             containment termination={containment_error:?}; \
+             direct kill={direct_kill_error:?}; direct reap={status:?}; \
+             containment quiescence={quiescence:?}; guardian reap={guardian_reap:?}"
+        )),
+    }
+}
+
 /// Force a directly spawned test daemon tree down and explicitly reap its
 /// direct child within a fixed wall-clock budget.
 ///
 /// The containment signal is authoritative for descendants; the direct kill
 /// is a backstop for a malformed containment setup.
 pub async fn terminate_daemon(child: &mut DaemonChild, label: &str) -> Result<ExitStatus, String> {
-    let initial_probe = child.child.try_wait();
+    let initial_probe = child
+        .child
+        .as_mut()
+        .expect("daemon child handle retained")
+        .try_wait();
     let probe_error = initial_probe.as_ref().err().map(ToString::to_string);
     let initial_status = initial_probe.ok().flatten();
     let containment_error = child.containment.terminate().err();
     let direct_kill_error = if initial_status.is_none() {
-        child.child.start_kill().err()
+        child
+            .child
+            .as_mut()
+            .expect("daemon child handle retained")
+            .start_kill()
+            .err()
     } else {
         None
     };
     let status = match initial_status {
         Some(status) => Ok(status),
-        None => match tokio::time::timeout(DAEMON_REAP_TIMEOUT, child.child.wait()).await {
+        None => match tokio::time::timeout(
+            DAEMON_REAP_TIMEOUT,
+            child
+                .child
+                .as_mut()
+                .expect("daemon child handle retained")
+                .wait(),
+        )
+        .await
+        {
             Ok(Ok(status)) => Ok(status),
             Ok(Err(error)) => Err(format!("reap {label}: {error}")),
             Err(_) => Err(format!(
@@ -889,13 +944,25 @@ pub async fn terminate_daemon(child: &mut DaemonChild, label: &str) -> Result<Ex
             )),
         },
     };
-    let quiescence = confirm_containment_empty(&child.containment, label).await;
-    let guardian_reap = if quiescence.is_ok() {
-        child.containment.reap_guardian()
+    let (quiescence, guardian_reap) = if status.is_ok() {
+        let quiescence = confirm_containment_empty(&child.containment, label).await;
+        let guardian_reap = if quiescence.is_ok() {
+            child.containment.reap_guardian()
+        } else {
+            Err(std::io::Error::other(
+                "daemon containment guardian retained because quiescence was not proven",
+            ))
+        };
+        (quiescence, guardian_reap)
     } else {
-        Err(std::io::Error::other(
-            "daemon containment guardian retained because quiescence was not proven",
-        ))
+        (
+            Err(format!(
+                "{label} containment proof skipped because the direct child was not reaped"
+            )),
+            Err(std::io::Error::other(
+                "daemon containment guardian retained because the direct child was not reaped",
+            )),
+        )
     };
     match (
         probe_error,
@@ -918,7 +985,7 @@ pub async fn terminate_daemon(child: &mut DaemonChild, label: &str) -> Result<Ex
 /// same authority/containment contract as long-lived daemon fixtures.
 #[allow(dead_code)]
 pub async fn daemon_test_output(
-    command: &mut Command,
+    command: Command,
     label: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
@@ -930,7 +997,7 @@ pub async fn daemon_test_output(
 /// worker. Lifecycle bounds and OS descendant containment remain identical to
 /// every other direct daemon test launch.
 async fn adversarial_authority_worker_output(
-    command: &mut Command,
+    command: Command,
     label: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
@@ -1142,20 +1209,23 @@ fn compact_daemon_test_capture(stream: &CapturedDaemonTestStream) -> String {
 }
 
 async fn contained_test_output(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
     timeout: Duration,
     apply_final_authority_scrub: bool,
 ) -> Result<Output, String> {
-    BoundedDaemonTestCapture::configure(command);
+    BoundedDaemonTestCapture::configure(&mut command);
     let mut child = if apply_final_authority_scrub {
         spawn_daemon_test_command(command, label)
     } else {
-        prepare_contained_test_command(command);
+        prepare_contained_test_command(&mut command);
         spawn_contained_test_command(command, label)
     }
     .map_err(|error| format!("{error}"))?;
-    let capture = match BoundedDaemonTestCapture::start(&mut child.child, label) {
+    let capture = match BoundedDaemonTestCapture::start(
+        child.child.as_mut().expect("daemon child handle retained"),
+        label,
+    ) {
         Ok(capture) => capture,
         Err(error) => {
             let cleanup = terminate_daemon(&mut child, label).await;
@@ -1172,7 +1242,12 @@ async fn contained_test_output(
             capture_overflowed = true;
             break;
         }
-        match child.child.try_wait() {
+        match child
+            .child
+            .as_mut()
+            .expect("daemon child handle retained")
+            .try_wait()
+        {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < deadline => {
                 tokio::time::sleep(DAEMON_POLL_INTERVAL).await;

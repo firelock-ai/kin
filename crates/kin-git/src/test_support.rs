@@ -36,7 +36,7 @@ const CAPTURE_TRUNCATION_MARKER: &[u8] = b"\n[output truncated at capture limit]
 /// customization API. That keeps final scrubbing, bounded active capture, the
 /// hard deadline, and whole-tree cleanup impossible to bypass accidentally.
 pub struct FixtureGitCommand {
-    inner: Command,
+    inner: Option<Command>,
     sandbox: tempfile::TempDir,
     host_path: OsString,
     safe_git_environment: BTreeMap<&'static str, OsString>,
@@ -83,7 +83,7 @@ impl FixtureGitCommand {
         std::fs::create_dir_all(&hooks).expect("create isolated Git fixture hooks directory");
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(hooks.as_os_str());
-        command.inner.args([
+        command.inner_mut().args([
             OsStr::new("-c"),
             hooks_config.as_os_str(),
             OsStr::new("-c"),
@@ -115,7 +115,7 @@ impl FixtureGitCommand {
         std::fs::create_dir_all(sandbox.path().join("xdg"))
             .expect("create isolated Git fixture XDG home");
         Self {
-            inner: Command::new(program),
+            inner: Some(Command::new(program)),
             sandbox,
             host_path,
             safe_git_environment: BTreeMap::new(),
@@ -124,7 +124,7 @@ impl FixtureGitCommand {
     }
 
     pub fn arg(&mut self, argument: impl AsRef<OsStr>) -> &mut Self {
-        self.inner.arg(argument);
+        self.inner_mut().arg(argument);
         self
     }
 
@@ -133,12 +133,12 @@ impl FixtureGitCommand {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.inner.args(arguments);
+        self.inner_mut().args(arguments);
         self
     }
 
     pub fn current_dir(&mut self, directory: impl AsRef<Path>) -> &mut Self {
-        self.inner.current_dir(directory);
+        self.inner_mut().current_dir(directory);
         self
     }
 
@@ -152,46 +152,52 @@ impl FixtureGitCommand {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        self.inner.env(key, value);
+        self.inner_mut().env(key, value);
         self
     }
 
     pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
-        self.inner.env_remove(key);
+        self.inner_mut().env_remove(key);
         self
     }
 
     pub fn author_name(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        let _ = self.inner_mut();
         self.safe_git_environment
             .insert("GIT_AUTHOR_NAME", value.as_ref().to_os_string());
         self
     }
 
     pub fn author_email(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        let _ = self.inner_mut();
         self.safe_git_environment
             .insert("GIT_AUTHOR_EMAIL", value.as_ref().to_os_string());
         self
     }
 
     pub fn author_date(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        let _ = self.inner_mut();
         self.safe_git_environment
             .insert("GIT_AUTHOR_DATE", value.as_ref().to_os_string());
         self
     }
 
     pub fn committer_name(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        let _ = self.inner_mut();
         self.safe_git_environment
             .insert("GIT_COMMITTER_NAME", value.as_ref().to_os_string());
         self
     }
 
     pub fn committer_email(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        let _ = self.inner_mut();
         self.safe_git_environment
             .insert("GIT_COMMITTER_EMAIL", value.as_ref().to_os_string());
         self
     }
 
     pub fn committer_date(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        let _ = self.inner_mut();
         self.safe_git_environment
             .insert("GIT_COMMITTER_DATE", value.as_ref().to_os_string());
         self
@@ -232,26 +238,32 @@ impl FixtureGitCommand {
         timeout: Duration,
         max_capture_bytes_per_stream: u64,
     ) -> io::Result<Output> {
+        if self.inner.is_none() {
+            return Err(Self::consumed_error());
+        }
         self.prepare_for_launch();
 
-        self.inner.stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.inner_mut()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let _input = if let Some(bytes) = input {
             let mut file = tempfile::tempfile()?;
             file.write_all(bytes)?;
             file.seek(SeekFrom::Start(0))?;
-            self.inner.stdin(Stdio::from(file.try_clone()?));
+            self.inner_mut().stdin(Stdio::from(file.try_clone()?));
             Some(file)
         } else {
-            self.inner.stdin(Stdio::null());
+            self.inner_mut().stdin(Stdio::null());
             None
         };
 
-        let (mut child, mut tree) = FixtureProcessTree::spawn(&mut self.inner, self.label)?;
+        let command = self.take_inner()?;
+        let (mut child, mut tree) = FixtureProcessTree::spawn(command, self.label)?;
         let capture =
             match BoundedCapturePair::start(&mut child, max_capture_bytes_per_stream, self.label) {
                 Ok(capture) => capture,
                 Err(error) => {
-                    let cleanup = cleanup_live_tree(&mut child, &mut tree, self.label);
+                    let cleanup = cleanup_failed_live_tree(child, tree, self.label);
                     return Err(io::Error::new(
                         error.kind(),
                         format!(
@@ -266,7 +278,7 @@ impl FixtureGitCommand {
             if let Some(event) = capture.try_event() {
                 match event {
                     CaptureEvent::LimitExceeded { stream } => {
-                        let cleanup = cleanup_live_tree(&mut child, &mut tree, self.label);
+                        let cleanup = cleanup_failed_live_tree(child, tree, self.label);
                         let captured =
                             capture.finish_until(Instant::now() + FIXTURE_GIT_REAP_GRACE);
                         return Err(io::Error::new(
@@ -283,7 +295,7 @@ impl FixtureGitCommand {
                         ));
                     }
                     CaptureEvent::ReadFailed { stream, error } => {
-                        let cleanup = cleanup_live_tree(&mut child, &mut tree, self.label);
+                        let cleanup = cleanup_failed_live_tree(child, tree, self.label);
                         let captured =
                             capture.finish_until(Instant::now() + FIXTURE_GIT_REAP_GRACE);
                         return Err(io_other(format!(
@@ -327,7 +339,7 @@ impl FixtureGitCommand {
                     std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
                 }
                 Ok(None) => {
-                    let cleanup = cleanup_live_tree(&mut child, &mut tree, self.label);
+                    let cleanup = cleanup_failed_live_tree(child, tree, self.label);
                     let captured = capture.finish_until(Instant::now() + FIXTURE_GIT_REAP_GRACE);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -342,7 +354,7 @@ impl FixtureGitCommand {
                     ));
                 }
                 Err(error) => {
-                    let cleanup = cleanup_live_tree(&mut child, &mut tree, self.label);
+                    let cleanup = cleanup_failed_live_tree(child, tree, self.label);
                     let captured = capture.finish_until(Instant::now() + FIXTURE_GIT_REAP_GRACE);
                     return Err(io_other(format!(
                         "failed to poll {}: {error}; {cleanup}; capture={}",
@@ -355,15 +367,40 @@ impl FixtureGitCommand {
     }
 
     fn prepare_for_launch(&mut self) {
-        isolate_fixture_git(&mut self.inner);
-        self.inner
+        let command = self
+            .inner
+            .as_mut()
+            .expect("fixture Git command was already consumed");
+        isolate_fixture_git(command);
+        command
             .env("PATH", &self.host_path)
             .env("HOME", self.sandbox.path().join("home"))
             .env("USERPROFILE", self.sandbox.path().join("home"))
             .env("XDG_CONFIG_HOME", self.sandbox.path().join("xdg"));
         for (key, value) in &self.safe_git_environment {
-            self.inner.env(key, value);
+            command.env(key, value);
         }
+    }
+
+    fn inner_mut(&mut self) -> &mut Command {
+        self.inner
+            .as_mut()
+            .expect("fixture Git command was already consumed")
+    }
+
+    #[cfg(test)]
+    fn inner_ref(&self) -> &Command {
+        self.inner
+            .as_ref()
+            .expect("fixture Git command was already consumed")
+    }
+
+    fn take_inner(&mut self) -> io::Result<Command> {
+        self.inner.take().ok_or_else(Self::consumed_error)
+    }
+
+    fn consumed_error() -> io::Error {
+        io::Error::other("fixture Git command was already consumed")
     }
 }
 
@@ -422,6 +459,46 @@ pub fn isolate_fixture_git(command: &mut Command) {
             .unwrap_or_else(|| Path::new("."))
             .join(".kin-test-global-gitconfig"),
     );
+}
+
+/// Environment-only equivalent of [`isolate_fixture_git`] for process-group
+/// guardian sentinels and watchers.
+#[cfg(unix)]
+pub fn isolate_fixture_guardian_environment(
+    environment: &mut kin_daemon_spawn::ProcessGroupGuardianEnvironment,
+) {
+    let host_path = fixture_host_path();
+    isolate_fixture_guardian_environment_with_path(environment, &host_path);
+}
+
+#[cfg(unix)]
+fn isolate_fixture_guardian_environment_with_path(
+    environment: &mut kin_daemon_spawn::ProcessGroupGuardianEnvironment,
+    host_path: &OsStr,
+) {
+    let explicit_authority = environment
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_fixture_authority(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_fixture_authority(key))
+        .chain(explicit_authority)
+    {
+        environment.env_remove(key);
+    }
+
+    environment
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("PATH", host_path)
+        .env("KIN_VFS_DISABLE", "1");
 }
 
 fn fixture_host_path() -> OsString {
@@ -502,79 +579,57 @@ fn env_name_starts_with(actual: &str, expected: &str) -> bool {
 
 #[cfg(unix)]
 struct FixtureProcessTree {
-    process_group: Option<UnixFixtureProcessGroup>,
-    guardian: Option<Child>,
-    guardian_stdin: Option<std::process::ChildStdin>,
+    process_group: Option<libc::pid_t>,
+    guardian: Option<kin_daemon_spawn::ProcessGroupGuardian>,
 }
 
 #[cfg(unix)]
-fn isolate_fixture_guardian(command: &mut Command, host_path: &OsStr) {
-    isolate_fixture_git(command);
-    command.env("PATH", host_path);
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy)]
-enum UnixFixtureProcessGroup {
-    Armed(libc::pid_t),
-    TerminationRequested(libc::pid_t),
-}
-
-#[cfg(unix)]
-impl UnixFixtureProcessGroup {
-    fn id(self) -> libc::pid_t {
-        match self {
-            Self::Armed(process_group) | Self::TerminationRequested(process_group) => process_group,
-        }
-    }
+fn isolate_fixture_guardian(
+    environment: &mut kin_daemon_spawn::ProcessGroupGuardianEnvironment,
+    host_path: &OsStr,
+) {
+    isolate_fixture_guardian_environment_with_path(environment, host_path);
 }
 
 #[cfg(unix)]
 impl FixtureProcessTree {
-    fn spawn(command: &mut Command, label: &str) -> io::Result<(Child, Self)> {
-        use std::os::unix::process::CommandExt as _;
-
+    fn spawn(command: Command, label: &str) -> io::Result<(Child, Self)> {
         let host_path = command
             .get_envs()
             .find(|(key, _)| env_name_eq(&key.to_string_lossy(), "PATH"))
             .and_then(|(_, value)| value.map(OsStr::to_os_string))
             .unwrap_or_else(fixture_host_path);
-        // The guardian is the stable group leader and parent-death watchdog.
-        // Its stdin stays open only while this test process is alive. If the
-        // parent disappears, EOF makes the guardian kill its entire group.
-        let mut guardian_command = Command::new("/bin/sh");
-        guardian_command
-            .args(["-c", "IFS= read -r _; kill -KILL 0"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        isolate_fixture_guardian(&mut guardian_command, &host_path);
-        let mut guardian = guardian_command.spawn().map_err(|error| {
-            io_other(format!(
-                "failed to spawn parent-death guardian for {label}: {error}"
-            ))
-        })?;
-        let process_group = libc::pid_t::try_from(guardian.id())
-            .map_err(|_| io_other("fixture guardian id does not fit a native process-group id"))?;
-        let guardian_stdin = match guardian.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = guardian.kill();
-                let _ = guardian.wait();
-                return Err(io_other(
-                    "fixture guardian did not expose its watchdog stdin",
-                ));
-            }
-        };
+        let readiness_root = tempfile::Builder::new()
+            .prefix("kin-git-fixture-guardian-")
+            .tempdir()?;
+        let readiness = readiness_root.path().join("ready");
+        let launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+            std::env::current_exe()?,
+            "kin_process_group_guardian_worker",
+        );
+        let guardian = launcher
+            .spawn_with(
+                &readiness,
+                Instant::now() + FIXTURE_GIT_REAP_GRACE,
+                |guardian_environment| isolate_fixture_guardian(guardian_environment, &host_path),
+            )
+            .map_err(|error| {
+                io_other(format!(
+                    "failed to spawn repeated process-group guardian for {label}: {error}"
+                ))
+            })?;
+        let process_group = guardian.process_group();
         let mut tree = Self {
-            process_group: Some(UnixFixtureProcessGroup::Armed(process_group)),
+            process_group: Some(process_group),
             guardian: Some(guardian),
-            guardian_stdin: Some(guardian_stdin),
         };
 
-        command.process_group(process_group);
-        match command.spawn() {
+        let spawn_result = tree
+            .guardian
+            .as_mut()
+            .expect("new fixture process tree owns its guardian")
+            .spawn(command);
+        match spawn_result {
             Ok(child) => Ok((child, tree)),
             Err(error) => {
                 let cleanup = cleanup_reaped_tree(&mut tree)
@@ -589,93 +644,100 @@ impl FixtureProcessTree {
     }
 
     fn terminate(&mut self) -> io::Result<()> {
-        self.guardian_stdin.take();
-        let Some(UnixFixtureProcessGroup::Armed(process_group)) = self.process_group else {
-            return Ok(());
-        };
-        // Mark the numeric group as already signaled before making the syscall.
-        // Cleanup may continue to inspect this exact group, but neither a
-        // second terminate call nor Drop may signal the number again.
-        self.process_group = Some(UnixFixtureProcessGroup::TerminationRequested(process_group));
-        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
+        if let Some(guardian) = self.guardian.as_mut() {
+            guardian.request_cleanup();
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(io_other(format!(
-                "failed to terminate bounded Git fixture process group: {error}"
-            )))
-        }
+        Ok(())
     }
 
     fn reap_auxiliary_until(&mut self, deadline: Instant) -> io::Result<bool> {
-        loop {
-            let reaped = match self.guardian.as_mut() {
-                Some(guardian) => guardian.try_wait()?.is_some(),
-                None => true,
-            };
-            if reaped {
+        let Some(guardian) = self.guardian.as_mut() else {
+            return Ok(true);
+        };
+        match guardian.reap_until(deadline) {
+            Ok(_) => {
                 self.guardian.take();
-                return Ok(true);
+                self.process_group.take();
+                Ok(true)
             }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
-    fn is_empty(&self) -> io::Result<bool> {
-        let Some(process_group) = self.process_group else {
+    fn is_empty(&mut self) -> io::Result<bool> {
+        let Some(guardian) = self.guardian.as_mut() else {
             return Ok(true);
         };
-        if self.guardian.is_none() {
-            return Err(io_other(
-                "cannot inspect Git fixture process group after releasing its stable guardian",
-            ));
+        if guardian.try_reap()?.is_some() {
+            self.guardian.take();
+            self.process_group.take();
+            return Ok(true);
         }
-        let system = sysinfo::System::new_all();
-        for (pid, process) in system.processes() {
-            let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-                continue;
-            };
-            if unsafe { libc::getpgid(pid) } == process_group.id()
-                && !matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(false)
     }
 
     fn disarm_after_confirmed_cleanup(&mut self) {
         self.process_group.take();
+        self.guardian.take();
     }
 }
 
 #[cfg(unix)]
 impl Drop for FixtureProcessTree {
     fn drop(&mut self) {
-        // Closing the ownership pipe is the guardian's parent-death signal.
-        // Let the stable group leader consume EOF and execute its group kill;
-        // killing/reaping it here could win that race after quiescence failed
-        // and discard the last trustworthy owner of the numeric PGID.
-        self.guardian_stdin.take();
-        // Only an authority that was never asked to terminate can signal here.
-        // A termination-requested numeric PGID is discarded without reuse.
-        if let Some(UnixFixtureProcessGroup::Armed(process_group)) = self.process_group.take() {
-            let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+        if let Some(guardian) = self.guardian.as_mut() {
+            guardian.request_cleanup();
         }
-        // Deliberately drop, rather than kill or wait on, an unreaped guardian.
-        // Successful cleanup already reaps it and sets this field to None.
-        // On a failed empty-group proof, retaining the child process lets the
-        // EOF watchdog finish before the OS releases its group-leader identity.
+        // If synchronous cleanup could not prove emptiness, dropping the child
+        // handle deliberately leaves the external watcher alive. It retains
+        // the sentinel PGID pin and completes the repeated stop/kill proof
+        // after this owner has gone away.
+    }
+}
+
+#[cfg(unix)]
+struct RetainedFixtureProcessCleanup {
+    child: Child,
+    tree: FixtureProcessTree,
+}
+
+#[cfg(unix)]
+impl RetainedFixtureProcessCleanup {
+    fn run(mut self) -> ExitStatus {
+        let _ = self.tree.terminate();
+        let _ = self.child.kill();
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
+                }
+            }
+        };
+
+        // The exact child has been reaped. Only now may cleanup consume the
+        // guardian's sentinel and release the pinned process-group identity.
+        let _ = cleanup_reaped_tree(&mut self.tree);
+        status
+    }
+}
+
+#[cfg(unix)]
+fn retain_unreaped_fixture_process(child: Child, tree: FixtureProcessTree, label: &str) -> String {
+    let retained = std::mem::ManuallyDrop::new(RetainedFixtureProcessCleanup { child, tree });
+    match std::thread::Builder::new()
+        .name("kin-retained-git-fixture".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            let _ = retained.run();
+        }) {
+        Ok(_) => format!("retained exact child and guardian for asynchronous cleanup of {label}"),
+        Err(error) => format!(
+            "failed to spawn retained cleanup owner for {label}: {error}; exact child and \
+             guardian intentionally leaked"
+        ),
     }
 }
 
@@ -700,7 +762,7 @@ impl Drop for FixtureOwnedHandle {
 
 #[cfg(windows)]
 impl FixtureProcessTree {
-    fn spawn(command: &mut Command, label: &str) -> io::Result<(Child, Self)> {
+    fn spawn(mut command: Command, label: &str) -> io::Result<(Child, Self)> {
         use std::os::windows::io::AsRawHandle as _;
         use std::os::windows::process::CommandExt as _;
         use windows_sys::Win32::Foundation::{
@@ -888,7 +950,7 @@ impl FixtureProcessTree {
         Ok(true)
     }
 
-    fn is_empty(&self) -> io::Result<bool> {
+    fn is_empty(&mut self) -> io::Result<bool> {
         use windows_sys::Win32::System::JobObjects::{
             JobObjectBasicAccountingInformation, QueryInformationJobObject,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
@@ -942,7 +1004,7 @@ struct FixtureProcessTree;
 
 #[cfg(not(any(unix, windows)))]
 impl FixtureProcessTree {
-    fn spawn(command: &mut Command, label: &str) -> io::Result<(Child, Self)> {
+    fn spawn(mut command: Command, label: &str) -> io::Result<(Child, Self)> {
         command
             .spawn()
             .map(|child| (child, Self))
@@ -957,7 +1019,7 @@ impl FixtureProcessTree {
         Ok(true)
     }
 
-    fn is_empty(&self) -> io::Result<bool> {
+    fn is_empty(&mut self) -> io::Result<bool> {
         Ok(true)
     }
 
@@ -981,6 +1043,7 @@ fn cleanup_reaped_tree(tree: &mut FixtureProcessTree) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn cleanup_live_tree(child: &mut Child, tree: &mut FixtureProcessTree, label: &str) -> String {
     let deadline = Instant::now() + FIXTURE_GIT_REAP_GRACE;
     let terminate_error = tree.terminate().err();
@@ -1020,6 +1083,59 @@ fn cleanup_live_tree(child: &mut Child, tree: &mut FixtureProcessTree, label: &s
     )
 }
 
+fn cleanup_failed_live_tree(mut child: Child, mut tree: FixtureProcessTree, label: &str) -> String {
+    let deadline = Instant::now() + FIXTURE_GIT_REAP_GRACE;
+    let terminate_error = tree.terminate().err();
+    let direct_kill_error = child.kill().err();
+    let (direct_reaped, reap_error) = match poll_child_until(&mut child, deadline, label) {
+        Ok(status) => (status.is_some(), None),
+        Err(error) => (false, Some(error)),
+    };
+
+    #[cfg(unix)]
+    if !direct_reaped {
+        let retention = retain_unreaped_fixture_process(child, tree, label);
+        return format!(
+            "direct-kill error: {}; reap error: {}; auxiliary-reap error: skipped until exact \
+             child status is reaped; containment-cleanup error: skipped until exact child status \
+             is reaped; direct child reaped: false; {retention}",
+            display_optional_error(direct_kill_error.as_ref()),
+            display_optional_error(reap_error.as_ref()),
+        );
+    }
+
+    let containment_error = confirm_tree_empty_until(
+        &mut tree,
+        Instant::now() + FIXTURE_GIT_REAP_GRACE,
+        terminate_error,
+    )
+    .err();
+    let auxiliary_error = if containment_error.is_none() {
+        match tree.reap_auxiliary_until(Instant::now() + FIXTURE_GIT_REAP_GRACE) {
+            Ok(true) => None,
+            Ok(false) => Some(io_other(
+                "bounded Git fixture guardian was not reaped before the cleanup deadline",
+            )),
+            Err(error) => Some(error),
+        }
+    } else {
+        Some(io_other(
+            "guardian reap skipped because live containment was not disproven",
+        ))
+    };
+    if containment_error.is_none() && auxiliary_error.is_none() {
+        tree.disarm_after_confirmed_cleanup();
+    };
+    format!(
+        "direct-kill error: {}; reap error: {}; auxiliary-reap error: {}; containment-cleanup \
+         error: {}; direct child reaped: {direct_reaped}",
+        display_optional_error(direct_kill_error.as_ref()),
+        display_optional_error(reap_error.as_ref()),
+        display_optional_error(auxiliary_error.as_ref()),
+        display_optional_error(containment_error.as_ref()),
+    )
+}
+
 fn poll_child_until(
     child: &mut Child,
     deadline: Instant,
@@ -1040,7 +1156,7 @@ fn poll_child_until(
 }
 
 fn confirm_tree_empty_until(
-    tree: &FixtureProcessTree,
+    tree: &mut FixtureProcessTree,
     deadline: Instant,
     terminate_error: Option<io::Error>,
 ) -> io::Result<()> {
@@ -1711,7 +1827,7 @@ mod tests {
     #[test]
     fn guardian_uses_the_same_final_authority_scrub_and_host_path() {
         let host_path = fixture_host_path();
-        let mut guardian = Command::new("/bin/sh");
+        let mut guardian = kin_daemon_spawn::ProcessGroupGuardianEnvironment::default();
         guardian
             .env("GIT_DIR", "/hostile/repository")
             .env("KIN_VFS_WORKSPACE", "/hostile/workspace")
@@ -1769,9 +1885,9 @@ mod tests {
 
         let mut command = fixture_git();
         assert!(
-            Path::new(command.inner.get_program()).is_absolute(),
+            Path::new(command.inner_ref().get_program()).is_absolute(),
             "fixture Git executable was not resolved absolutely: {:?}",
-            command.inner.get_program()
+            command.inner_ref().get_program()
         );
         let output = command
             .env("PATH", temp.path())
@@ -1948,7 +2064,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn confirmed_cleanup_disarms_numeric_process_group_before_drop() {
+    fn confirmed_cleanup_releases_numeric_process_group_before_drop() {
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "exit 0"])
@@ -1956,20 +2072,14 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let (mut child, mut tree) =
-            FixtureProcessTree::spawn(&mut command, "one-shot process-group fixture").unwrap();
-        assert!(matches!(
-            tree.process_group,
-            Some(UnixFixtureProcessGroup::Armed(_))
-        ));
+            FixtureProcessTree::spawn(command, "one-shot process-group fixture").unwrap();
+        assert!(tree.process_group.is_some());
         assert!(child.wait().unwrap().success());
 
         tree.terminate().unwrap();
-        assert!(matches!(
-            tree.process_group,
-            Some(UnixFixtureProcessGroup::TerminationRequested(_))
-        ));
+        assert!(tree.process_group.is_some());
         tree.terminate()
-            .expect("a repeated terminate request must not signal the PGID again");
+            .expect("a repeated cleanup request must remain harmless");
         cleanup_reaped_tree(&mut tree).unwrap();
 
         assert!(
@@ -1981,56 +2091,6 @@ mod tests {
             "confirmed cleanup retained an already-reaped guardian"
         );
         drop(tree);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_quiescence_drop_allows_guardian_eof_group_kill_to_finish() {
-        use std::os::unix::process::CommandExt as _;
-
-        let temp = tempfile::tempdir().unwrap();
-        let marker = temp.path().join("guardian-eof.marker");
-        let mut guardian = Command::new("/bin/sh");
-        guardian
-            .args([
-                OsStr::new("-c"),
-                OsStr::new("IFS= read -r _; sleep 0.2; printf watchdog > \"$1\"; kill -KILL 0"),
-                OsStr::new("fixture-guardian"),
-                marker.as_os_str(),
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut guardian = guardian.spawn().unwrap();
-        let process_group = libc::pid_t::try_from(guardian.id()).unwrap();
-        let guardian_stdin = guardian.stdin.take().unwrap();
-        let tree = FixtureProcessTree {
-            process_group: Some(UnixFixtureProcessGroup::TerminationRequested(process_group)),
-            guardian: Some(guardian),
-            guardian_stdin: Some(guardian_stdin),
-        };
-
-        // This is the state left after termination was requested but the
-        // empty-group proof failed. Drop must close the ownership pipe without
-        // killing/reaping the guardian before it consumes EOF.
-        drop(tree);
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !marker.is_file() && Instant::now() < deadline {
-            std::thread::sleep(FIXTURE_GIT_POLL_INTERVAL);
-        }
-        let marker_written = marker.is_file();
-        let mut status = 0;
-        let reaped = unsafe { libc::waitpid(process_group, &mut status, 0) };
-        assert!(
-            marker_written,
-            "failed-quiescence Drop killed the guardian before its EOF watchdog ran"
-        );
-        assert_eq!(
-            reaped, process_group,
-            "test could not reap the completed EOF guardian"
-        );
     }
 
     #[cfg(unix)]
@@ -2066,7 +2126,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let (mut descendant, tree) =
-            FixtureProcessTree::spawn(&mut descendant, "parent-death descendant").unwrap();
+            FixtureProcessTree::spawn(descendant, "parent-death descendant").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let pid_marker = marker.with_extension("pid");
         let descendant_pid = loop {
@@ -2153,6 +2213,31 @@ mod tests {
             b"finished",
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_cleanup_reaps_exact_child_before_guardian_finalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "test_support::tests::stalled_worker",
+                "--nocapture",
+            ])
+            .env(STALLED_WORKER, temp.path().join("retained-cleanup"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (child, tree) =
+            FixtureProcessTree::spawn(command, "retained Git fixture cleanup").unwrap();
+
+        let status = RetainedFixtureProcessCleanup { child, tree }.run();
+        assert!(
+            !status.success(),
+            "retained cleanup did not terminate its exact direct child"
+        );
     }
 
     #[test]

@@ -8,6 +8,15 @@
 //! Exact repository-v6 init/branch/checkout/export behavior is covered at the
 //! owning crate boundaries; this crate keeps only genuine cross-crate flows.
 
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_migrate::run_migration_process_host_if_requested()
+        .expect("run Kin integration process-group guardian");
+    assert_eq!(dispatched, requested);
+}
+
 #[cfg(test)]
 mod helpers;
 

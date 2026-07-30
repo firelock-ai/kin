@@ -28,7 +28,8 @@ const TRUNCATION_MARKER: &[u8] = b"\n[output truncated at capture limit]\n";
 /// boundary. This function installs owned stdio before spawning; on Windows the
 /// containment spawn also adds `CREATE_SUSPENDED` until Job ownership is bound.
 pub(crate) fn output_finalized_with_timeout_and_limit(
-    command: &mut Command,
+    process_host: &crate::MigrationProcessHost,
+    mut command: Command,
     label: &str,
     timeout: Duration,
     max_capture_bytes_per_stream: u64,
@@ -38,11 +39,11 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let (mut child, mut tree) = ProbeProcessTree::spawn(command)?;
+    let (mut child, mut tree) = ProbeProcessTree::spawn(process_host, command)?;
     let capture = match BoundedCapturePair::start(&mut child, max_capture_bytes_per_stream, label) {
         Ok(capture) => capture,
         Err(error) => {
-            let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+            let cleanup = terminate_tree_and_reap(child, tree, label);
             return Err(contextual_io(
                 error,
                 format!(
@@ -57,7 +58,7 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
         if let Some(event) = capture.try_event() {
             match event {
                 CaptureEvent::LimitExceeded { stream } => {
-                    let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                    let cleanup = terminate_tree_and_reap(child, tree, label);
                     let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                     return Err(contextual_io(
                         capture_limit_error(
@@ -70,7 +71,7 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
                     ));
                 }
                 CaptureEvent::ReadFailed { stream, error } => {
-                    let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                    let cleanup = terminate_tree_and_reap(child, tree, label);
                     let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                     return Err(std::io::Error::other(format!(
                         "read {label} {stream} capture: {error}; cleanup={}; capture={}",
@@ -104,7 +105,7 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
                 std::thread::sleep(POLL_INTERVAL);
             }
             Ok(None) => {
-                let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                let cleanup = terminate_tree_and_reap(child, tree, label);
                 let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -119,7 +120,7 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
                 ));
             }
             Err(error) => {
-                let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                let cleanup = terminate_tree_and_reap(child, tree, label);
                 let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                 return Err(std::io::Error::new(
                     error.kind(),
@@ -618,10 +619,16 @@ fn poll_child_until(
 }
 
 fn confirm_tree_empty_until(
-    tree: &ProbeProcessTree,
+    tree: &mut ProbeProcessTree,
     deadline: Instant,
     label: &str,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        return tree.confirm_empty_until(deadline, label);
+    }
+
+    #[cfg(not(unix))]
     loop {
         if tree.is_empty()? {
             return Ok(());
@@ -644,8 +651,8 @@ fn terminate_descendants(tree: &mut ProbeProcessTree, label: &str) -> std::io::R
 }
 
 fn terminate_tree_and_reap(
-    child: &mut Child,
-    tree: &mut ProbeProcessTree,
+    mut child: Child,
+    mut tree: ProbeProcessTree,
     label: &str,
 ) -> std::io::Result<()> {
     let terminate = tree.terminate();
@@ -654,7 +661,10 @@ fn terminate_tree_and_reap(
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
         Err(error) => Err(contextual_io(error, format!("kill direct {label} process"))),
     };
-    let reap = match poll_child_until(child, Instant::now() + REAP_GRACE, label) {
+    let direct_status = poll_child_until(&mut child, Instant::now() + REAP_GRACE, label);
+    #[cfg(unix)]
+    let direct_reaped = matches!(&direct_status, Ok(Some(_)));
+    let reap = match direct_status {
         Ok(Some(_)) => direct_kill,
         Ok(None) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -662,11 +672,24 @@ fn terminate_tree_and_reap(
         )),
         Err(error) => Err(error),
     };
-    // Even a direct-child polling error must not skip the independent
-    // containment proof. Give descendant cleanup its own grace window rather
-    // than consuming it while waiting for the direct process.
-    let empty = confirm_tree_empty_until(tree, Instant::now() + REAP_GRACE, label);
-    let auxiliary_reap = reap_auxiliary_after_confirmed_empty(tree, &empty, label);
+
+    #[cfg(unix)]
+    if !direct_reaped {
+        let terminate_detail = render_result(&terminate);
+        let reap_detail = render_result(&reap);
+        let retention = retain_unreaped_probe_process(child, tree, label);
+        return Err(std::io::Error::other(format!(
+            "containment terminate={terminate_detail}; direct reap={reap_detail}; containment \
+             empty=skipped until exact child status is reaped; auxiliary reap=skipped until exact \
+             child status is reaped; {retention}"
+        )));
+    }
+
+    // Unix guardian finalization is permitted only after the exact direct
+    // status above. Other platforms retain their existing independent
+    // containment cleanup after a polling failure.
+    let empty = confirm_tree_empty_until(&mut tree, Instant::now() + REAP_GRACE, label);
+    let auxiliary_reap = reap_auxiliary_after_confirmed_empty(&mut tree, &empty, label);
     combine_cleanup(terminate, reap, empty, auxiliary_reap)
 }
 
@@ -714,136 +737,51 @@ fn contextual_io(error: std::io::Error, context: String) -> std::io::Error {
 
 #[cfg(unix)]
 struct ProbeProcessTree {
-    process_group: libc::pid_t,
-    guardian: Option<Child>,
-    guardian_stdin: Option<std::process::ChildStdin>,
-    termination_requested: bool,
+    guardian: Option<kin_daemon_spawn::ProcessGroupGuardian>,
 }
 
 #[cfg(unix)]
 impl ProbeProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
-        use std::os::unix::process::CommandExt as _;
-
-        // Keep a stable process-group owner alive until every member is proven
-        // dead. The pipe is an ownership capability: normal cleanup closes it,
-        // and OS close-on-parent-death gives the guardian EOF if the CLI is
-        // killed before Rust Drop can run.
+    fn spawn(
+        process_host: &crate::MigrationProcessHost,
+        command: Command,
+    ) -> std::io::Result<(Child, Self)> {
+        // The watcher owns an inert sentinel in the target process group. Its
+        // ownership pipe closes both on ordinary cleanup and hard parent death,
+        // while the separately grouped watcher stays alive long enough to stop,
+        // kill, and repeatedly prove the target group empty.
         let readiness_root = tempfile::tempdir()?;
         let ready_path = readiness_root.path().join("guardian.ready");
-        let mut guardian_command = Command::new("/bin/sh");
-        guardian_command
-            .args([
-                "-c",
-                "set -eu\n\
-                 ready=$1\n\
-                 printf '%s\\n' \"$$\" > \"$ready\"\n\
-                 IFS= read -r _ || true\n\
-                 kill -KILL 0",
-                "kin-migration-probe-guardian",
-            ])
-            .arg(&ready_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        // The guardian uses only an absolute shell path and shell builtins.
-        // It must not inherit loader, repository, or Kin authority from the
-        // caller.
-        guardian_command.env_clear();
-        let mut guardian = guardian_command.spawn().map_err(|error| {
-            contextual_io(
-                error,
-                "spawn migration-probe parent-death guardian".to_string(),
+        let mut guardian = process_host
+            .guardian_launcher()
+            .spawn_with(
+                &ready_path,
+                Instant::now() + REAP_GRACE,
+                |guardian_environment| {
+                    // The old guardian inherited no ambient authority. Keep that
+                    // boundary in the shared launcher; its private dispatch values
+                    // are installed only after this scrub returns.
+                    guardian_environment.env_clear();
+                },
             )
-        })?;
-        let process_group = libc::pid_t::try_from(guardian.id()).map_err(|_| {
-            let _ = guardian.kill();
-            let _ = guardian.wait();
-            std::io::Error::other(
-                "migration-probe guardian id does not fit a native process-group id",
-            )
-        })?;
-        let guardian_stdin = match guardian.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = guardian.kill();
-                let _ = guardian.wait();
-                return Err(std::io::Error::other(
-                    "migration-probe guardian did not expose its ownership pipe",
-                ));
-            }
-        };
-        let mut tree = Self {
-            process_group,
-            guardian: Some(guardian),
-            guardian_stdin: Some(guardian_stdin),
-            termination_requested: false,
-        };
+            .map_err(|error| {
+                contextual_io(
+                    error,
+                    "spawn migration-probe parent-death guardian".to_string(),
+                )
+            })?;
 
-        let expected_ready = process_group.to_string();
-        let deadline = Instant::now() + REAP_GRACE;
-        loop {
-            let ready = std::fs::read_to_string(&ready_path)
-                .is_ok_and(|value| value.trim() == expected_ready);
-            if ready {
-                break;
-            }
-            match tree
-                .guardian
-                .as_mut()
-                .expect("guardian remains owned during readiness")
-                .try_wait()
-            {
-                Ok(Some(status)) => {
-                    tree.guardian.take();
-                    tree.guardian_stdin.take();
-                    return Err(std::io::Error::other(format!(
-                        "migration-probe guardian exited before readiness: {status}"
-                    )));
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Ok(None) => {
-                    let cleanup =
-                        terminate_descendants(&mut tree, "unready migration-probe guardian");
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "migration-probe guardian did not become ready; cleanup={}",
-                            render_result(&cleanup)
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    let cleanup =
-                        terminate_descendants(&mut tree, "uninspectable migration-probe guardian");
-                    return Err(contextual_io(
-                        error,
-                        format!(
-                            "inspect migration-probe guardian readiness; cleanup={}",
-                            render_result(&cleanup)
-                        ),
-                    ));
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&ready_path);
-        let observed_group = unsafe { libc::getpgid(process_group) };
-        if observed_group != process_group {
-            let cleanup = terminate_descendants(&mut tree, "misbound migration-probe guardian");
-            return Err(std::io::Error::other(format!(
-                "migration-probe guardian group changed: expected {process_group}, observed \
-                 {observed_group}; cleanup={}",
-                render_result(&cleanup)
-            )));
-        }
-
-        command.process_group(process_group);
-        match command.spawn() {
-            Ok(child) => Ok((child, tree)),
+        match guardian.spawn(command) {
+            Ok(child) => Ok((
+                child,
+                Self {
+                    guardian: Some(guardian),
+                },
+            )),
             Err(error) => {
+                let mut tree = Self {
+                    guardian: Some(guardian),
+                };
                 let cleanup = terminate_descendants(&mut tree, "unlaunched migration probe");
                 Err(contextual_io(
                     error,
@@ -857,75 +795,30 @@ impl ProbeProcessTree {
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
-        if self.guardian.is_none() || self.termination_requested {
-            return Ok(());
+        if let Some(guardian) = self.guardian.as_mut() {
+            guardian.request_cleanup();
         }
-        self.termination_requested = true;
-        let signal = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
-        // Closing the pipe is the parent-death path and a fallback if the
-        // direct signal failed. This is the only place either termination
-        // capability is consumed, so Drop cannot signal a recycled PGID.
-        self.guardian_stdin.take();
-        if signal == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(contextual_io(
-                error,
-                "terminate migration-probe process group".to_string(),
-            ))
-        }
+        Ok(())
     }
 
-    fn is_empty(&self) -> std::io::Result<bool> {
-        if self.guardian.is_none() {
-            return Ok(true);
-        }
-        let system = sysinfo::System::new_all();
-        for (pid, process) in system.processes() {
-            let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-                continue;
-            };
-            if unsafe { libc::getpgid(pid) } == self.process_group
-                && !matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-            {
-                return Ok(false);
+    fn confirm_empty_until(&mut self, deadline: Instant, label: &str) -> std::io::Result<()> {
+        let Some(guardian) = self.guardian.as_mut() else {
+            return Ok(());
+        };
+        match guardian.reap_until(deadline) {
+            Ok(_) => {
+                self.guardian.take();
+                Ok(())
             }
+            Err(error) => Err(contextual_io(
+                error,
+                format!("prove {label} process-group containment empty"),
+            )),
         }
-        Ok(true)
     }
 
     fn reap_auxiliary_until(&mut self, deadline: Instant, label: &str) -> std::io::Result<()> {
-        loop {
-            let Some(guardian) = self.guardian.as_mut() else {
-                return Ok(());
-            };
-            match guardian.try_wait() {
-                Ok(Some(_)) => {
-                    self.guardian.take();
-                    self.guardian_stdin.take();
-                    return Ok(());
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Ok(None) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("{label} guardian was not reaped"),
-                    ));
-                }
-                Err(error) => {
-                    return Err(contextual_io(error, format!("reap {label} guardian")));
-                }
-            }
-        }
+        self.confirm_empty_until(deadline, label)
     }
 }
 
@@ -933,16 +826,52 @@ impl ProbeProcessTree {
 impl Drop for ProbeProcessTree {
     fn drop(&mut self) {
         let _ = self.terminate();
-        let empty = confirm_tree_empty_until(self, Instant::now() + REAP_GRACE, "migration probe");
-        if empty.is_ok() {
-            let _ = self.reap_auxiliary_until(Instant::now() + REAP_GRACE, "migration probe");
-            if let Some(mut guardian) = self.guardian.take() {
-                // Quiescence has been proven, so releasing this exact
-                // still-owned PID cannot hide a live process-group member.
-                let _ = guardian.kill();
-                let _ = guardian.wait();
+        let _ = confirm_tree_empty_until(self, Instant::now() + REAP_GRACE, "migration probe");
+    }
+}
+
+#[cfg(unix)]
+struct RetainedProbeProcessCleanup {
+    child: Child,
+    tree: ProbeProcessTree,
+}
+
+#[cfg(unix)]
+impl RetainedProbeProcessCleanup {
+    fn run(mut self) -> ExitStatus {
+        let _ = self.tree.terminate();
+        let _ = self.child.kill();
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    std::thread::sleep(POLL_INTERVAL);
+                }
             }
-        }
+        };
+
+        // Keep the sentinel PGID pin until the exact child status has been
+        // consumed, then allow the guardian to prove the group empty.
+        let _ = terminate_descendants(&mut self.tree, "retained migration probe");
+        status
+    }
+}
+
+#[cfg(unix)]
+fn retain_unreaped_probe_process(child: Child, tree: ProbeProcessTree, label: &str) -> String {
+    let retained = std::mem::ManuallyDrop::new(RetainedProbeProcessCleanup { child, tree });
+    match std::thread::Builder::new()
+        .name("kin-retained-migration-probe".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            let _ = retained.run();
+        }) {
+        Ok(_) => format!("retained exact child and guardian for asynchronous cleanup of {label}"),
+        Err(error) => format!(
+            "failed to spawn retained cleanup owner for {label}: {error}; exact child and \
+             guardian intentionally leaked"
+        ),
     }
 }
 
@@ -967,7 +896,10 @@ impl Drop for OwnedHandle {
 
 #[cfg(windows)]
 impl ProbeProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+    fn spawn(
+        _process_host: &crate::MigrationProcessHost,
+        mut command: Command,
+    ) -> std::io::Result<(Child, Self)> {
         use std::os::windows::io::AsRawHandle as _;
         use std::os::windows::process::CommandExt as _;
         use windows_sys::Win32::Foundation::{
@@ -1202,7 +1134,10 @@ struct ProbeProcessTree;
 
 #[cfg(not(any(unix, windows)))]
 impl ProbeProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+    fn spawn(
+        _process_host: &crate::MigrationProcessHost,
+        mut command: Command,
+    ) -> std::io::Result<(Child, Self)> {
         Ok((command.spawn()?, Self))
     }
 
@@ -1226,6 +1161,13 @@ mod tests {
 
     const PROBE_WORKER_ENV: &str = "KINTEST_MIGRATION_PROBE_WORKER";
     const PROBE_DESCENDANT_MARKER_ENV: &str = "KINTEST_MIGRATION_PROBE_DESCENDANT_MARKER";
+
+    fn test_process_host() -> crate::MigrationProcessHost {
+        crate::MigrationProcessHost::exact_test(
+            std::env::current_exe().expect("resolve migration bounded-process test executable"),
+            "kin_process_group_guardian_worker",
+        )
+    }
 
     fn publish_pid_marker(marker: &std::path::Path) -> std::io::Result<()> {
         let pid = std::process::id();
@@ -1329,7 +1271,8 @@ mod tests {
                 .env(PROBE_WORKER_ENV, "descendant")
                 .env(PROBE_DESCENDANT_MARKER_ENV, marker);
             let result = output_finalized_with_timeout_and_limit(
-                &mut nested_probe,
+                &test_process_host(),
+                nested_probe,
                 "parent-death migration probe fixture",
                 Duration::from_secs(30),
                 1024 * 1024,
@@ -1365,6 +1308,29 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_cleanup_reaps_exact_child_before_guardian_finalization() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "bounded_process::tests::probe_worker",
+                "--nocapture",
+            ])
+            .env(PROBE_WORKER_ENV, "sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (child, tree) = ProbeProcessTree::spawn(&test_process_host(), command).unwrap();
+
+        let status = RetainedProbeProcessCleanup { child, tree }.run();
+        assert!(
+            !status.success(),
+            "retained cleanup did not terminate its exact direct child"
+        );
+    }
+
     #[test]
     fn bounded_probe_closes_stdin_and_captures_output() {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -1376,7 +1342,8 @@ mod tests {
             ])
             .env(PROBE_WORKER_ENV, "complete");
         let output = output_finalized_with_timeout_and_limit(
-            &mut command,
+            &test_process_host(),
+            command,
             "migration probe fixture",
             Duration::from_secs(5),
             1024 * 1024,
@@ -1398,7 +1365,8 @@ mod tests {
             ])
             .env(PROBE_WORKER_ENV, "sleep");
         let error = output_finalized_with_timeout_and_limit(
-            &mut command,
+            &test_process_host(),
+            command,
             "sleeping migration probe fixture",
             Duration::from_secs(2),
             1024 * 1024,
@@ -1422,7 +1390,8 @@ mod tests {
             ])
             .env(PROBE_WORKER_ENV, "runaway-output");
         let error = output_finalized_with_timeout_and_limit(
-            &mut command,
+            &test_process_host(),
+            command,
             "runaway migration probe fixture",
             Duration::from_secs(5),
             4 * 1024,
@@ -1448,7 +1417,8 @@ mod tests {
             .env(PROBE_WORKER_ENV, "spawn-descendant")
             .env(PROBE_DESCENDANT_MARKER_ENV, &marker);
         let output = output_finalized_with_timeout_and_limit(
-            &mut command,
+            &test_process_host(),
+            command,
             "migration probe tree fixture",
             Duration::from_secs(10),
             1024 * 1024,
@@ -1547,7 +1517,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_quiescence_does_not_release_the_guardian() {
+    fn failed_empty_proof_does_not_discard_the_guardian_handle() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -1560,7 +1530,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let (mut child, mut tree) = ProbeProcessTree::spawn(&mut command).unwrap();
+        let (mut child, mut tree) = ProbeProcessTree::spawn(&test_process_host(), command).unwrap();
         tree.terminate().unwrap();
         let failed_quiescence = Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -1575,13 +1545,13 @@ mod tests {
         assert!(error.to_string().contains("reap skipped"), "{error}");
         assert!(
             tree.guardian.is_some(),
-            "failed quiescence released the stable guardian"
+            "failed empty proof discarded the guardian status handle"
         );
 
         let _ = child.kill();
         let _ = child.wait();
         confirm_tree_empty_until(
-            &tree,
+            &mut tree,
             Instant::now() + REAP_GRACE,
             "failed-quiescence fixture cleanup",
         )

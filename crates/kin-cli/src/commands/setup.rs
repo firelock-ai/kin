@@ -2231,7 +2231,7 @@ fn git_authority_output_with_resolution_policy_from(
         .arg(&repo_root)
         .args(args);
     run_git_authority_command(
-        &mut command,
+        command,
         args,
         &host_path,
         timeout,
@@ -2262,7 +2262,7 @@ fn absolute_setup_host_search_path(
 }
 
 fn run_git_authority_command(
-    command: &mut Command,
+    mut command: Command,
     args: &[&str],
     host_path: &OsStr,
     timeout: Duration,
@@ -2270,7 +2270,7 @@ fn run_git_authority_command(
     deadline_start: SetupGitDeadlineStart,
 ) -> Result<String> {
     let label = format!("Git workspace authority query {args:?}");
-    finalize_setup_git_authority_process(command, host_path);
+    finalize_setup_git_authority_process(&mut command, host_path);
     let output = match deadline_start {
         SetupGitDeadlineStart::Immediate => {
             crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
@@ -13438,7 +13438,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             ])
             .env(WORKER_PATH, dir.path());
         let output = crate::commands::test_subprocess::output_with_timeout(
-            &mut command,
+            command,
             "restrictive private-directory chain worker",
             crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
         )
@@ -13509,7 +13509,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             .env(WORKER_ROOT, dir.path())
             .env("TMPDIR", dir.path());
         let output = crate::commands::test_subprocess::output_with_timeout(
-            &mut command,
+            command,
             "restrictive transaction-directory worker",
             crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
         )

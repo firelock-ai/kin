@@ -10,7 +10,11 @@ description = "Exact Git migration and projection boundary for Kin"
 repository.workspace = true
 
 [features]
-test-support = ["dep:libc", "dep:sysinfo", "dep:which"]
+test-support = [
+    "dep:kin-daemon-spawn",
+    "dep:libc",
+    "dep:which",
+]
 
 [dependencies]
 kin-model = { workspace = true }
@@ -29,8 +33,8 @@ which = { version = "8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 cap-std = "=4.0.2"
+kin-daemon-spawn = { workspace = true, optional = true }
 libc = { version = "0.2", optional = true }
-sysinfo = { version = "0.39", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -47,5 +51,7 @@ windows-sys = { version = "0.61", features = [
 libc = "0.2"
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
-sysinfo = "0.39"
 which = "8"
+
+[target.'cfg(unix)'.dev-dependencies]
+kin-daemon-spawn = { workspace = true }

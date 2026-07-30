@@ -25,8 +25,6 @@ use std::process::{Child, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-#[cfg(unix)]
-use sysinfo::ProcessStatus;
 use sysinfo::System;
 
 static BUILD_DAEMON: OnceLock<()> = OnceLock::new();
@@ -51,197 +49,145 @@ const COMMAND_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 const COMMAND_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMAND_DIAGNOSTIC_MARKER: &str = "\n[bounded capture truncated]";
 const RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
-const RUNTIME_CONTAINMENT_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_GUARDIAN";
-const RUNTIME_CONTAINMENT_READY_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_READY";
-const RUNTIME_CONTAINMENT_PARENT_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PARENT_PID";
 const RUNTIME_CONTAINMENT_GROUP_ENV: &str = "KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP";
 
 #[cfg(unix)]
 struct RuntimeContainment {
     process_group: libc::pid_t,
-    guardian: Option<Child>,
+    guardian: Mutex<Option<kin_daemon_spawn::ProcessGroupGuardian>>,
     termination_requested: AtomicBool,
 }
 
 #[cfg(unix)]
 impl RuntimeContainment {
     fn new(runtime_root: &Path, owner_token: &str) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt as _;
-
         std::fs::create_dir_all(runtime_root)?;
         let ready = runtime_root.join(format!("guardian-{owner_token}.ready"));
-        let mut command = std::process::Command::new(std::env::current_exe()?);
-        scrub_inherited_kin_authority(&mut command);
-        command
-            .args([
-                "--exact",
-                "common::runtime_containment_guardian_worker",
-                "--nocapture",
-            ])
-            .env(RUNTIME_CONTAINMENT_ENV, "1")
-            .env(RUNTIME_CONTAINMENT_READY_ENV, &ready)
-            .env(
-                RUNTIME_CONTAINMENT_PARENT_ENV,
-                std::process::id().to_string(),
-            )
-            .env(RUNTIME_OWNER_ENV, owner_token)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut guardian = command.spawn()?;
-        let process_group = libc::pid_t::try_from(guardian.id())
-            .map_err(|_| std::io::Error::other("guardian PID does not fit process-group id"))?;
-        let deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
-        while !ready.is_file() && Instant::now() < deadline {
-            match guardian.try_wait() {
-                Ok(Some(status)) => {
-                    return Err(std::io::Error::other(format!(
-                        "runtime containment guardian exited before readiness: {status}"
-                    )));
-                }
-                Ok(None) => {}
-                Err(probe_error) => {
-                    let group_kill = signal_process_group(process_group, libc::SIGKILL);
-                    let direct_kill = guardian.kill();
-                    let reap = poll_child_until(
-                        &mut guardian,
-                        Instant::now() + PROCESS_REAP_TIMEOUT,
-                        "uninspectable runtime containment guardian",
-                    );
-                    return Err(std::io::Error::other(format!(
-                        "inspect runtime containment guardian readiness: {probe_error}; \
-                         group_kill={group_kill:?}; direct_kill={direct_kill:?}; reap={reap:?}"
-                    )));
-                }
-            }
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        if !ready.is_file() {
-            let group_kill = signal_process_group(process_group, libc::SIGKILL);
-            let direct_kill = guardian.kill();
-            let reap = poll_child_until(
-                &mut guardian,
-                Instant::now() + PROCESS_REAP_TIMEOUT,
-                "unready runtime containment guardian",
-            );
-            return Err(std::io::Error::other(format!(
-                "runtime containment guardian did not become ready; group_kill={group_kill:?}; \
-                 direct_kill={direct_kill:?}; reap={reap:?}"
-            )));
-        }
-        let _ = std::fs::remove_file(ready);
+        let launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+            std::env::current_exe()?,
+            "common::kin_process_group_guardian_worker",
+        )
+        .with_env(RUNTIME_OWNER_ENV, owner_token);
+        let guardian = launcher.spawn_with(
+            &ready,
+            Instant::now() + PROCESS_REAP_TIMEOUT,
+            scrub_inherited_kin_guardian_authority,
+        )?;
+        let process_group = guardian.process_group();
         Ok(Self {
             process_group,
-            guardian: Some(guardian),
+            guardian: Mutex::new(Some(guardian)),
             termination_requested: AtomicBool::new(false),
         })
     }
 
-    fn spawn(&self, command: &mut std::process::Command, _label: &str) -> std::io::Result<Child> {
-        use std::os::unix::process::CommandExt as _;
-
-        if self.guardian.is_none() || self.termination_requested.load(Ordering::Acquire) {
+    fn spawn(&self, command: std::process::Command, _label: &str) -> std::io::Result<Child> {
+        if self.termination_requested.load(Ordering::Acquire) {
             return Err(std::io::Error::other(
                 "runtime containment was already terminated",
             ));
         }
-        command.process_group(self.process_group);
-        command.spawn()
+        let mut guardian = self
+            .guardian
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime containment guardian lock poisoned"))?;
+        let Some(guardian_handle) = guardian.as_mut() else {
+            return Err(std::io::Error::other(
+                "runtime containment was already terminated",
+            ));
+        };
+        if guardian_handle.try_reap()?.is_some() {
+            guardian.take();
+            return Err(std::io::Error::other(
+                "runtime containment guardian exited before child spawn",
+            ));
+        }
+        guardian_handle.spawn(command)
     }
 
     fn terminate(&self) -> std::io::Result<()> {
         if self.termination_requested.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        if self.guardian.is_none() {
-            return Err(std::io::Error::other(
-                "runtime containment lost its guardian before termination",
-            ));
-        }
-        signal_process_group(self.process_group, libc::SIGKILL)
+        let mut guardian = self
+            .guardian
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime containment guardian lock poisoned"))?;
+        let guardian = guardian.as_mut().ok_or_else(|| {
+            std::io::Error::other("runtime containment lost its guardian before termination")
+        })?;
+        guardian.request_cleanup();
+        Ok(())
     }
 
     fn is_empty(&self) -> std::io::Result<bool> {
-        if self.guardian.is_none() {
-            Ok(true)
-        } else {
-            process_group_is_empty(self.process_group)
+        let mut guardian = self
+            .guardian
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime containment guardian lock poisoned"))?;
+        let Some(guardian_handle) = guardian.as_mut() else {
+            return Ok(true);
+        };
+        if guardian_handle.try_reap()?.is_some() {
+            guardian.take();
+            return Ok(true);
         }
+        Ok(false)
     }
 
     fn terminate_and_confirm(&mut self) -> Result<(), String> {
-        if self.guardian.is_none() {
+        if self
+            .guardian
+            .get_mut()
+            .map_err(|_| "runtime containment guardian lock poisoned".to_string())?
+            .is_none()
+        {
             return Ok(());
         }
         let terminate_error = self.terminate().err();
         let tree_result = confirm_containment_empty(self, Instant::now() + PROCESS_REAP_TIMEOUT);
-        let reap_result = if tree_result.is_ok() {
-            match poll_child_until(
-                self.guardian
-                    .as_mut()
-                    .expect("guardian remains present until quiescence permits reaping"),
-                Instant::now() + PROCESS_REAP_TIMEOUT,
-                "runtime containment guardian",
-            ) {
-                Ok(Some(_)) => {
-                    self.guardian.take();
-                    Ok(())
-                }
-                Ok(None) => Err("runtime containment guardian was not reaped".to_string()),
-                Err(error) => Err(error),
-            }
-        } else {
+        let reap_result = if tree_result.is_err() {
             Err(
                 "runtime containment guardian retained because quiescence was not proven"
                     .to_string(),
             )
+        } else {
+            Ok(())
         };
         combine_containment_results(terminate_error, tree_result, reap_result)
+    }
+
+    fn take_guardian(&self) -> Option<kin_daemon_spawn::ProcessGroupGuardian> {
+        match self.guardian.lock() {
+            Ok(mut guardian) => guardian.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for RuntimeContainment {
     fn drop(&mut self) {
-        let _ = self.terminate_and_confirm();
+        // The owning runtime must reap every direct child before the guardian
+        // can complete its final process-group proof. CommandContainment and
+        // IsolatedDaemonRuntime perform that ordered finalization explicitly;
+        // this catastrophic fallback seals admission and intentionally leaks
+        // the exact guardian handle so its own Drop cannot finalize first.
+        let _ = self.terminate();
+        if let Some(mut guardian) = self.take_guardian() {
+            guardian.request_cleanup();
+            std::mem::forget(guardian);
+        }
     }
 }
 
 #[cfg(unix)]
 #[test]
-fn runtime_containment_guardian_worker() {
-    if std::env::var_os(RUNTIME_CONTAINMENT_ENV).is_none() {
-        return;
-    }
-    for forbidden in [
-        "GIT_DIR",
-        "GIT_CONFIG_COUNT",
-        "GIT_DEFAULT_HASH",
-        "LD_CUSTOM_INJECTION",
-    ] {
-        assert!(
-            std::env::var_os(forbidden).is_none(),
-            "{forbidden} reached the runtime containment guardian"
-        );
-    }
-    let expected_parent = std::env::var(RUNTIME_CONTAINMENT_PARENT_ENV)
-        .expect("runtime guardian parent PID")
-        .parse::<libc::pid_t>()
-        .expect("valid runtime guardian parent PID");
-    let ready = std::env::var_os(RUNTIME_CONTAINMENT_READY_ENV)
-        .map(PathBuf::from)
-        .expect("runtime guardian readiness path");
-    std::fs::write(ready, std::process::id().to_string())
-        .expect("write runtime guardian readiness");
-    loop {
-        if unsafe { libc::getppid() } != expected_parent {
-            let group = unsafe { libc::getpgrp() };
-            let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
-            std::process::abort();
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run exact process-group guardian worker");
+    assert_eq!(dispatched, requested);
 }
 
 #[cfg(unix)]
@@ -251,7 +197,7 @@ struct CommandContainment {
 
 #[cfg(unix)]
 impl CommandContainment {
-    fn spawn(command: &mut std::process::Command, label: &str) -> std::io::Result<(Child, Self)> {
+    fn spawn(mut command: std::process::Command, label: &str) -> std::io::Result<(Child, Self)> {
         let root = tempfile::tempdir()?;
         let owner_token = uuid::Uuid::new_v4().to_string();
         let runtime = RuntimeContainment::new(root.path(), &owner_token)?;
@@ -274,44 +220,36 @@ impl CommandContainment {
     fn terminate_and_confirm(&mut self) -> Result<(), String> {
         self.runtime.terminate_and_confirm()
     }
+
+    fn retain_unreaped_child(&mut self, child: Child, label: String) -> Result<(), String> {
+        let Some(guardian) = self.runtime.take_guardian() else {
+            std::mem::forget(child);
+            return Err(
+                "command containment lost its guardian; exact direct-child handle intentionally \
+                 leaked"
+                    .to_string(),
+            );
+        };
+        retain_unreaped_process_group(
+            guardian,
+            vec![Arc::new(Mutex::new(RuntimeOwnedChildState {
+                child: Some(child),
+                status: None,
+                label,
+            }))],
+            "command containment",
+        )
+    }
 }
 
 #[cfg(unix)]
 impl Drop for CommandContainment {
     fn drop(&mut self) {
-        let _ = self.terminate_and_confirm();
+        // Explicit command cleanup reaps the direct child before final proof.
+        // RuntimeContainment's fallback intentionally retains the guardian if
+        // an unwind reaches field destruction before that proof.
+        let _ = self.terminate();
     }
-}
-
-#[cfg(unix)]
-fn signal_process_group(process_group: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
-    if unsafe { libc::kill(-process_group, signal) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH)
-        || (error.raw_os_error() == Some(libc::EPERM) && process_group_is_empty(process_group)?)
-    {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-#[cfg(unix)]
-fn process_group_is_empty(process_group: libc::pid_t) -> std::io::Result<bool> {
-    let system = System::new_all();
-    Ok(system.processes().iter().all(|(pid, process)| {
-        let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-            return true;
-        };
-        let group = unsafe { libc::getpgid(pid) };
-        group != process_group
-            || matches!(
-                process.status(),
-                ProcessStatus::Dead | ProcessStatus::Zombie
-            )
-    }))
 }
 
 #[cfg(windows)]
@@ -360,7 +298,7 @@ impl WindowsJob {
         self.handle.as_raw_handle()
     }
 
-    fn spawn(&self, command: &mut std::process::Command, label: &str) -> std::io::Result<Child> {
+    fn spawn(&self, command: std::process::Command, label: &str) -> std::io::Result<Child> {
         spawn_in_windows_job(command, self.raw_handle(), label)
     }
 
@@ -422,7 +360,7 @@ impl Drop for WindowsOwnedHandle {
 
 #[cfg(windows)]
 fn spawn_in_windows_job(
-    command: &mut std::process::Command,
+    mut command: std::process::Command,
     job: windows_sys::Win32::Foundation::HANDLE,
     label: &str,
 ) -> std::io::Result<Child> {
@@ -570,7 +508,7 @@ impl RuntimeContainment {
         })
     }
 
-    fn spawn(&self, command: &mut std::process::Command, label: &str) -> std::io::Result<Child> {
+    fn spawn(&self, command: std::process::Command, label: &str) -> std::io::Result<Child> {
         self.job.spawn(command, label)
     }
 
@@ -596,7 +534,7 @@ struct CommandContainment {
 
 #[cfg(windows)]
 impl CommandContainment {
-    fn spawn(command: &mut std::process::Command, label: &str) -> std::io::Result<(Child, Self)> {
+    fn spawn(command: std::process::Command, label: &str) -> std::io::Result<(Child, Self)> {
         let containment = Self {
             job: WindowsJob::new()?,
         };
@@ -617,6 +555,11 @@ impl CommandContainment {
         let quiescence = confirm_containment_empty(self, Instant::now() + PROCESS_REAP_TIMEOUT);
         combine_containment_results(terminate_error, quiescence, Ok(()))
     }
+
+    fn retain_unreaped_child(&mut self, child: Child, _label: String) -> Result<(), String> {
+        std::mem::forget(child);
+        Err("unreaped Windows command child handle intentionally retained".to_string())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -628,7 +571,7 @@ impl RuntimeContainment {
         Ok(Self)
     }
 
-    fn spawn(&self, command: &mut std::process::Command, _label: &str) -> std::io::Result<Child> {
+    fn spawn(&self, mut command: std::process::Command, _label: &str) -> std::io::Result<Child> {
         command.spawn()
     }
 
@@ -650,7 +593,7 @@ struct CommandContainment;
 
 #[cfg(not(any(unix, windows)))]
 impl CommandContainment {
-    fn spawn(command: &mut std::process::Command, _label: &str) -> std::io::Result<(Child, Self)> {
+    fn spawn(mut command: std::process::Command, _label: &str) -> std::io::Result<(Child, Self)> {
         Ok((command.spawn()?, Self))
     }
 
@@ -664,6 +607,11 @@ impl CommandContainment {
 
     fn terminate_and_confirm(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn retain_unreaped_child(&mut self, child: Child, _label: String) -> Result<(), String> {
+        std::mem::forget(child);
+        Err("unreaped command child handle intentionally retained".to_string())
     }
 }
 
@@ -731,6 +679,228 @@ struct CleanupCommand {
     env: Vec<(OsString, OsString)>,
 }
 
+struct RuntimeOwnedChildState {
+    child: Option<Child>,
+    status: Option<ExitStatus>,
+    label: String,
+}
+
+impl RuntimeOwnedChildState {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("runtime-owned child lost its process handle"))?;
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+        self.status = Some(status);
+        self.child.take();
+        Ok(Some(status))
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let status = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("runtime-owned child lost its process handle"))?
+            .wait()?;
+        self.status = Some(status);
+        self.child.take();
+        Ok(status)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        self.child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("runtime-owned child lost its process handle"))?
+            .kill()
+    }
+
+    fn terminate_and_reap_until(&mut self, deadline: Instant) -> Result<ExitStatus, String> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let initial = self
+            .try_wait()
+            .map_err(|error| format!("inspect {} before cleanup: {error}", self.label))?;
+        if let Some(status) = initial {
+            return Ok(status);
+        }
+
+        // A kill can race a natural exit. Reaping is the authority: if a
+        // status is obtained, preserve and return it even if the preceding
+        // kill observed that the process had already gone away.
+        let kill_error = self.kill().err();
+        loop {
+            match self.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+                Ok(None) => {
+                    return Err(format!(
+                        "{} was not reaped within {PROCESS_REAP_TIMEOUT:?}; kill={kill_error:?}",
+                        self.label
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!("reap {}: {error}; kill={kill_error:?}", self.label));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RuntimeOwnedChildState {
+    fn drop(&mut self) {
+        if self.status.is_some() || self.child.is_none() {
+            return;
+        }
+        if let Err(error) = self.terminate_and_reap_until(Instant::now() + PROCESS_REAP_TIMEOUT) {
+            if let Some(child) = self.child.take() {
+                // The exact wait handle must outlive the unreaped status. The
+                // owning containment is retained separately and may not run
+                // its final guardian proof while this catastrophic fallback
+                // remains unresolved.
+                std::mem::forget(child);
+            }
+            if std::thread::panicking() {
+                eprintln!("runtime-owned child state cleanup failed: {error}");
+            } else {
+                panic!("runtime-owned child state cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct RetainedProcessGroupCleanup {
+    guardian: kin_daemon_spawn::ProcessGroupGuardian,
+    children: Vec<Arc<Mutex<RuntimeOwnedChildState>>>,
+}
+
+#[cfg(unix)]
+impl RetainedProcessGroupCleanup {
+    fn run(mut self) {
+        self.guardian.request_cleanup();
+        loop {
+            let mut all_reaped = true;
+            for child in &self.children {
+                let mut state = match child.try_lock() {
+                    Ok(state) => state,
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        all_reaped = false;
+                        continue;
+                    }
+                };
+                if state
+                    .terminate_and_reap_until(Instant::now() + PROCESS_REAP_TIMEOUT)
+                    .is_err()
+                {
+                    all_reaped = false;
+                }
+            }
+            if all_reaped {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        // Every direct status is now cached. Only now may the guardian run its
+        // irreversible sentinel reap and exact empty-group proof.
+        let _ = self
+            .guardian
+            .reap_until(Instant::now() + PROCESS_REAP_TIMEOUT);
+    }
+}
+
+#[cfg(unix)]
+fn retain_unreaped_process_group(
+    guardian: kin_daemon_spawn::ProcessGroupGuardian,
+    children: Vec<Arc<Mutex<RuntimeOwnedChildState>>>,
+    label: &str,
+) -> Result<(), String> {
+    let retained = std::mem::ManuallyDrop::new(RetainedProcessGroupCleanup { guardian, children });
+    std::thread::Builder::new()
+        .name("kin-test-retained-process-group".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            retained.run();
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "spawn retained cleanup owner for {label}: {error}; exact guardian and child \
+                 handles intentionally leaked"
+            )
+        })
+}
+
+/// A direct child whose wait status is shared with its owning runtime.
+///
+/// The runtime can therefore terminate and reap this child before finalizing
+/// guardian containment even when a test deliberately keeps the handle alive
+/// across `drop(runtime)`. The cached status remains observable afterward.
+pub struct RuntimeOwnedChild {
+    pid: u32,
+    state: Arc<Mutex<RuntimeOwnedChildState>>,
+}
+
+impl RuntimeOwnedChild {
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.state
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime-owned child lock poisoned"))?
+            .try_wait()
+    }
+
+    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.state
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime-owned child lock poisoned"))?
+            .wait()
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime-owned child lock poisoned"))?
+            .kill()
+    }
+}
+
+impl Drop for RuntimeOwnedChild {
+    fn drop(&mut self) {
+        let cleanup = self
+            .state
+            .lock()
+            .map_err(|_| "runtime-owned child lock poisoned".to_string())
+            .and_then(|mut state| {
+                state.terminate_and_reap_until(Instant::now() + PROCESS_REAP_TIMEOUT)
+            });
+        if let Err(error) = cleanup {
+            if std::thread::panicking() {
+                eprintln!("runtime-owned child cleanup failed: {error}");
+            } else {
+                panic!("runtime-owned child cleanup failed: {error}");
+            }
+        }
+    }
+}
+
 /// Per-test supervisor and registry state with fail-closed lifecycle cleanup.
 ///
 /// Daemon-backed integration tests must never discover the user's real Kin
@@ -741,12 +911,15 @@ struct CleanupCommand {
 /// CLI to stop every process, then terminates the stable OS containment created
 /// before any child was launched. A final owner-token scan is verification only:
 /// it never signals a PID, so PID reuse cannot authorize killing an unrelated
-/// process.
+/// process. Direct child wait authority is registered with the runtime: Drop
+/// terminates containment, reaps and caches every direct status, and only then
+/// permits the guardian's irreversible final empty-group proof.
 pub struct IsolatedDaemonRuntime {
     repository: PathBuf,
     registry_path: PathBuf,
     home_path: PathBuf,
     owner_token: String,
+    owned_children: Mutex<Vec<Arc<Mutex<RuntimeOwnedChildState>>>>,
     containment: RuntimeContainment,
     cleanup_command: Option<CleanupCommand>,
     cleanup_timeout: Duration,
@@ -768,6 +941,7 @@ impl IsolatedDaemonRuntime {
             registry_path: runtime_root.path().join("registry.toml"),
             home_path,
             owner_token,
+            owned_children: Mutex::new(Vec::new()),
             containment,
             cleanup_command: None,
             cleanup_timeout: Duration::from_secs(15),
@@ -814,20 +988,24 @@ impl IsolatedDaemonRuntime {
     }
 
     #[cfg(unix)]
-    pub fn mark_owned_process_for_test(&self, command: &mut std::process::Command) {
+    pub fn spawn_owned_process_for_test(
+        &self,
+        mut command: std::process::Command,
+    ) -> std::io::Result<RuntimeOwnedChild> {
         command.env(RUNTIME_OWNER_ENV, &self.owner_token).env(
             RUNTIME_CONTAINMENT_GROUP_ENV,
             self.containment.process_group.to_string(),
         );
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(self.containment.process_group);
+        let label = "runtime-owned test process";
+        let child = self.containment.spawn(command, label)?;
+        self.register_owned_child(child, label)
     }
 
     fn command<S: AsRef<OsStr>>(&self, program: S) -> Command<'_> {
         let mut command = std::process::Command::new(program);
         self.apply_isolated_environment(&mut command);
         Command {
-            inner: command,
+            inner: Some(command),
             runtime: Some(self),
             intentional_env: Vec::new(),
         }
@@ -862,6 +1040,124 @@ impl IsolatedDaemonRuntime {
             RUNTIME_CONTAINMENT_GROUP_ENV,
             self.containment.process_group.to_string(),
         );
+    }
+
+    fn register_owned_child(
+        &self,
+        child: Child,
+        label: impl Into<String>,
+    ) -> std::io::Result<RuntimeOwnedChild> {
+        let pid = child.id();
+        let state = Arc::new(Mutex::new(RuntimeOwnedChildState {
+            child: Some(child),
+            status: None,
+            label: label.into(),
+        }));
+        let mut registry = match self.owned_children.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => {
+                // The caller cannot safely receive a wrapper from a poisoned
+                // registry, but the exact child handle still belongs to the
+                // runtime. Retain it so Drop can reap or transfer it with the
+                // guardian instead of losing wait authority on this error.
+                poisoned.into_inner().push(state);
+                return Err(std::io::Error::other(
+                    "runtime-owned child registry lock poisoned; direct child retained",
+                ));
+            }
+        };
+        registry.push(Arc::clone(&state));
+        Ok(RuntimeOwnedChild { pid, state })
+    }
+
+    fn retain_unreaped_direct_child(&self, child: Child, label: String) -> Result<(), String> {
+        let state = Arc::new(Mutex::new(RuntimeOwnedChildState {
+            child: Some(child),
+            status: None,
+            label,
+        }));
+        match self.owned_children.lock() {
+            Ok(mut registry) => {
+                registry.push(state);
+                Ok(())
+            }
+            Err(poisoned) => {
+                // Poison does not invalidate the owned handles. Recover the
+                // registry and retain the exact child so runtime Drop can
+                // retry or transfer it with the guardian.
+                poisoned.into_inner().push(state);
+                Err(
+                    "runtime-owned child registry was poisoned; unreaped handle retained"
+                        .to_string(),
+                )
+            }
+        }
+    }
+
+    fn terminate_and_reap_owned_children(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
+        let mut failures = Vec::new();
+        let children = match self.owned_children.get_mut() {
+            Ok(children) => children,
+            Err(poisoned) => {
+                failures.push("runtime-owned child registry lock poisoned".to_string());
+                poisoned.into_inner()
+            }
+        };
+        for child in children {
+            let mut state = match child.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    failures.push("runtime-owned child lock poisoned".to_string());
+                    poisoned.into_inner()
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    failures.push(
+                        "runtime-owned child was concurrently borrowed during cleanup".to_string(),
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = state.terminate_and_reap_until(deadline) {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    #[cfg(unix)]
+    fn retain_failed_owned_children(&mut self) -> Result<(), String> {
+        let children = match self.owned_children.get_mut() {
+            Ok(children) => std::mem::take(children),
+            Err(poisoned) => std::mem::take(poisoned.into_inner()),
+        };
+        let Some(guardian) = self.containment.take_guardian() else {
+            for child in children {
+                std::mem::forget(child);
+            }
+            return Err(
+                "runtime containment lost its guardian; exact direct-child states intentionally \
+                 leaked"
+                    .to_string(),
+            );
+        };
+        retain_unreaped_process_group(guardian, children, "runtime containment")
+    }
+
+    #[cfg(not(unix))]
+    fn retain_failed_owned_children(&mut self) -> Result<(), String> {
+        let children = match self.owned_children.get_mut() {
+            Ok(children) => std::mem::take(children),
+            Err(poisoned) => std::mem::take(poisoned.into_inner()),
+        };
+        for child in children {
+            std::mem::forget(child);
+        }
+        Err("unreaped runtime child handles intentionally retained".to_string())
     }
 
     fn cleanup_invocation(&self) -> Command<'_> {
@@ -920,7 +1216,25 @@ impl Drop for IsolatedDaemonRuntime {
             Ok(Err(error)) => Some(format!("isolated daemon cleanup could not run: {error}")),
             Err(_) => Some("isolated daemon cleanup exceeded its wall-clock bound".to_string()),
         };
-        let containment_failure = self.containment.terminate_and_confirm().err();
+        let containment_termination_failure = self
+            .containment
+            .terminate()
+            .err()
+            .map(|error| format!("terminate runtime containment: {error}"));
+        let owned_child_failure = self.terminate_and_reap_owned_children().err();
+        let retained_cleanup_failure = if owned_child_failure.is_some() {
+            self.retain_failed_owned_children().err()
+        } else {
+            None
+        };
+        let containment_failure = if owned_child_failure.is_none() {
+            self.containment.terminate_and_confirm().err()
+        } else {
+            Some(
+                "runtime containment final proof transferred with unreaped direct children"
+                    .to_string(),
+            )
+        };
         let quiescence_failure = wait_for_owned_process_quiescence(
             RUNTIME_OWNER_ENV,
             &self.owner_token,
@@ -929,11 +1243,18 @@ impl Drop for IsolatedDaemonRuntime {
         .err();
         self.remove_stale_endpoint_files();
 
-        let failure = [graceful_failure, containment_failure, quiescence_failure]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("; ");
+        let failure = [
+            graceful_failure,
+            containment_termination_failure,
+            owned_child_failure,
+            retained_cleanup_failure,
+            containment_failure,
+            quiescence_failure,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
         if !failure.is_empty() {
             if std::thread::panicking() {
                 eprintln!("{failure}");
@@ -958,7 +1279,7 @@ impl Drop for IsolatedDaemonRuntime {
 ///   killed and the test fails naming the command, instead of leaving a silent,
 ///   idle process the developer has to notice and kill by hand.
 pub struct Command<'runtime> {
-    inner: std::process::Command,
+    inner: Option<std::process::Command>,
     runtime: Option<&'runtime IsolatedDaemonRuntime>,
     intentional_env: Vec<(OsString, Option<OsString>)>,
 }
@@ -966,7 +1287,7 @@ pub struct Command<'runtime> {
 impl Command<'static> {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
         Self {
-            inner: std::process::Command::new(program),
+            inner: Some(std::process::Command::new(program)),
             runtime: None,
             intentional_env: Vec::new(),
         }
@@ -975,7 +1296,7 @@ impl Command<'static> {
 
 impl<'runtime> Command<'runtime> {
     pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
-        self.inner.arg(arg);
+        self.inner_mut().arg(arg);
         self
     }
 
@@ -984,14 +1305,14 @@ impl<'runtime> Command<'runtime> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.inner.args(args);
+        self.inner_mut().args(args);
         self
     }
 
     pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, value: V) -> &mut Self {
         let key = key.as_ref();
         let value = value.as_ref();
-        self.inner.env(key, value);
+        self.inner_mut().env(key, value);
         if is_allowed_test_override(self.runtime.is_some(), key) {
             upsert_intentional_env(
                 &mut self.intentional_env,
@@ -1012,7 +1333,7 @@ impl<'runtime> Command<'runtime> {
     pub fn fixture_git_commit_dates<V: AsRef<OsStr>>(&mut self, value: V) -> &mut Self {
         let value = value.as_ref().to_os_string();
         for key in ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"] {
-            self.inner.env(key, &value);
+            self.inner_mut().env(key, &value);
             upsert_intentional_env(
                 &mut self.intentional_env,
                 OsString::from(key),
@@ -1036,7 +1357,7 @@ impl<'runtime> Command<'runtime> {
         );
         let key = OsString::from("KIN_DAEMON_URL");
         let value = value.as_ref().to_os_string();
-        self.inner.env(&key, &value);
+        self.inner_mut().env(&key, &value);
         upsert_intentional_env(&mut self.intentional_env, key, Some(value));
         self
     }
@@ -1055,7 +1376,7 @@ impl<'runtime> Command<'runtime> {
 
     pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
         let key = key.as_ref();
-        self.inner.env_remove(key);
+        self.inner_mut().env_remove(key);
         if is_allowed_test_override(self.runtime.is_some(), key) {
             upsert_intentional_env(&mut self.intentional_env, key.to_os_string(), None);
         }
@@ -1063,27 +1384,27 @@ impl<'runtime> Command<'runtime> {
     }
 
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
-        self.inner.current_dir(dir);
+        self.inner_mut().current_dir(dir);
         self
     }
 
     pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
-        self.inner.stdin(cfg);
+        self.inner_mut().stdin(cfg);
         self
     }
 
     pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
-        self.inner.stdout(cfg);
+        self.inner_mut().stdout(cfg);
         self
     }
 
     pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Self {
-        self.inner.stderr(cfg);
+        self.inner_mut().stderr(cfg);
         self
     }
 
     pub fn configured_env_for_test(&self, key: &OsStr) -> Option<Option<OsString>> {
-        self.inner
+        self.inner_ref()
             .get_envs()
             .find(|(configured, _)| env_os_names_equal(configured, key))
             .map(|(_, value)| value.map(OsStr::to_os_string))
@@ -1121,15 +1442,17 @@ impl<'runtime> Command<'runtime> {
         readiness: Option<(&Path, Duration)>,
         timeout: Duration,
     ) -> std::io::Result<Output> {
+        if self.inner.is_none() {
+            return Err(Self::consumed_error());
+        }
         self.prepare_for_launch();
-        let label = self.inner.get_program().to_string_lossy().into_owned();
-        run_bounded_within(
-            &mut self.inner,
-            &label,
-            self.runtime.map(|runtime| &runtime.containment),
-            readiness,
-            timeout,
-        )
+        let label = self
+            .inner_ref()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        let command = self.take_inner()?;
+        run_bounded_within(command, &label, self.runtime, readiness, timeout)
     }
 
     /// Spawn a long-lived child inside this runtime's stable OS containment.
@@ -1139,35 +1462,67 @@ impl<'runtime> Command<'runtime> {
     /// protected runtime capability, Unix process group, and Windows Job
     /// Object as bounded commands while leaving the direct child handle with
     /// the test.
-    pub fn spawn_owned(&mut self) -> std::io::Result<Child> {
+    pub fn spawn_owned(&mut self) -> std::io::Result<RuntimeOwnedChild> {
         let runtime = self.runtime.ok_or_else(|| {
             std::io::Error::other("spawn_owned requires a command from IsolatedDaemonRuntime")
         })?;
+        if self.inner.is_none() {
+            return Err(Self::consumed_error());
+        }
         self.prepare_for_launch();
-        let label = self.inner.get_program().to_string_lossy().into_owned();
-        runtime.containment.spawn(&mut self.inner, &label)
+        let label = self
+            .inner_ref()
+            .get_program()
+            .to_string_lossy()
+            .into_owned();
+        let child = runtime.containment.spawn(self.take_inner()?, &label)?;
+        runtime.register_owned_child(child, label)
     }
 
     fn prepare_for_launch(&mut self) {
-        scrub_inherited_kin_authority(&mut self.inner);
+        let command = self
+            .inner
+            .as_mut()
+            .expect("bounded test command was already consumed");
+        scrub_inherited_kin_authority(command);
         if let Some(runtime) = self.runtime {
-            runtime.apply_isolated_environment(&mut self.inner);
+            runtime.apply_isolated_environment(command);
         }
         // This must be the final general authority transform. In particular,
         // `apply_isolated_environment` scrubs every GIT_* key, so applying it
         // after fixture isolation would silently remove the null-config,
         // no-prompt, and protocol guards installed here.
-        kin_git::test_support::isolate_fixture_git(&mut self.inner);
+        kin_git::test_support::isolate_fixture_git(command);
         for (key, value) in &self.intentional_env {
             match value {
                 Some(value) => {
-                    self.inner.env(key, value);
+                    command.env(key, value);
                 }
                 None => {
-                    self.inner.env_remove(key);
+                    command.env_remove(key);
                 }
             }
         }
+    }
+
+    fn inner_mut(&mut self) -> &mut std::process::Command {
+        self.inner
+            .as_mut()
+            .expect("bounded test command was already consumed")
+    }
+
+    fn inner_ref(&self) -> &std::process::Command {
+        self.inner
+            .as_ref()
+            .expect("bounded test command was already consumed")
+    }
+
+    fn take_inner(&mut self) -> std::io::Result<std::process::Command> {
+        self.inner.take().ok_or_else(Self::consumed_error)
+    }
+
+    fn consumed_error() -> std::io::Error {
+        std::io::Error::other("bounded test command was already consumed")
     }
 }
 
@@ -1208,15 +1563,10 @@ fn is_allowed_test_override(runtime_bound: bool, key: &OsStr) -> bool {
 }
 
 fn is_internal_runtime_capability(key: &OsStr) -> bool {
-    [
-        RUNTIME_OWNER_ENV,
-        RUNTIME_CONTAINMENT_ENV,
-        RUNTIME_CONTAINMENT_READY_ENV,
-        RUNTIME_CONTAINMENT_PARENT_ENV,
-        RUNTIME_CONTAINMENT_GROUP_ENV,
-    ]
-    .iter()
-    .any(|protected| env_os_name_eq(key, protected))
+    env_os_name_starts_with(key, "KIN_INTERNAL_PROCESS_GROUP_GUARDIAN_")
+        || [RUNTIME_OWNER_ENV, RUNTIME_CONTAINMENT_GROUP_ENV]
+            .iter()
+            .any(|protected| env_os_name_eq(key, protected))
 }
 
 fn is_kin_environment_name(key: &OsStr) -> bool {
@@ -1238,6 +1588,25 @@ fn scrub_inherited_kin_authority(command: &mut std::process::Command) {
         command.env_remove(key);
     }
     command.env("KIN_VFS_DISABLE", "1");
+}
+
+#[cfg(unix)]
+fn scrub_inherited_kin_guardian_authority(
+    environment: &mut kin_daemon_spawn::ProcessGroupGuardianEnvironment,
+) {
+    let explicit_authority = environment
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_kin_authority(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_kin_authority(key))
+        .chain(explicit_authority)
+    {
+        environment.env_remove(key);
+    }
+    environment.env("KIN_VFS_DISABLE", "1");
 }
 
 fn is_kin_authority(key: &OsStr) -> bool {
@@ -1423,9 +1792,22 @@ impl BoundedCommandCapture {
     }
 
     fn finish_with_timeout(
+        self,
+        descendants_were_closed: bool,
+        reap_timeout: Duration,
+    ) -> std::io::Result<CapturedCommandOutput> {
+        self.finish_with_timeout_and_quiet_threshold_hook(
+            descendants_were_closed,
+            reap_timeout,
+            None,
+        )
+    }
+
+    fn finish_with_timeout_and_quiet_threshold_hook(
         mut self,
         descendants_were_closed: bool,
         reap_timeout: Duration,
+        mut quiet_threshold_hook: Option<std::sync::mpsc::SyncSender<()>>,
     ) -> std::io::Result<CapturedCommandOutput> {
         let join_deadline = Instant::now() + reap_timeout;
         let mut quiescence_error = None;
@@ -1489,6 +1871,9 @@ impl BoundedCommandCapture {
                     }
                     let quiet_since = quiet_since.expect("quiet interval was initialized");
                     if now >= quiet_since + PROCESS_QUIESCENCE {
+                        if let Some(hook) = quiet_threshold_hook.take() {
+                            let _ = hook.send(());
+                        }
                         if let Some(probe_baseline) = quiet_probe_baseline {
                             // A reader can be descheduled for the whole quiet
                             // interval after its first empty probe. Require a
@@ -2159,8 +2544,7 @@ fn bounded_capture_requires_post_exit_pipe_quiescence_after_data() {
     assert_eq!(captured.stdout.bytes, b"first chunk second chunk");
 }
 
-#[test]
-fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
+pub(super) fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     let stdout_state = Arc::new(Mutex::new(CapturedCommandStream::default()));
     let stdout_reader_state = stdout_state.clone();
     let stdout_cancel = Arc::new(AtomicBool::new(false));
@@ -2173,6 +2557,7 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     let (entered_continuous_data, wait_for_continuous_data) = std::sync::mpsc::sync_channel(0);
     let (release_continuous_data, wait_for_continuous_data_release) =
         std::sync::mpsc::sync_channel(0);
+    let (crossed_quiet_threshold, wait_for_quiet_threshold) = std::sync::mpsc::sync_channel(0);
     let stdout_thread = std::thread::Builder::new()
         .name("kin-integration-continuous-stdout-capture".to_string())
         .spawn(move || {
@@ -2219,12 +2604,14 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     let started = Instant::now();
     let release_thread = std::thread::spawn(move || {
         wait_for_continuous_data
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(2))
             .expect("reader reached the continuous-data gate within its deadline");
-        std::thread::sleep(PROCESS_QUIESCENCE.saturating_mul(2));
+        wait_for_quiet_threshold
+            .recv_timeout(Duration::from_secs(2))
+            .expect("capture coordinator crossed the quiet threshold");
         release_continuous_data
             .send(())
-            .expect("release continuous capture data");
+            .expect("release continuous data");
     });
     let capture = BoundedCommandCapture {
         stdout,
@@ -2233,10 +2620,14 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
     };
     let (finish_result_tx, finish_result_rx) = std::sync::mpsc::sync_channel(1);
     let finish_thread = std::thread::spawn(move || {
-        let result = capture.finish_with_timeout(false, Duration::from_millis(500));
+        let result = capture.finish_with_timeout_and_quiet_threshold_hook(
+            false,
+            Duration::from_secs(3),
+            Some(crossed_quiet_threshold),
+        );
         let _ = finish_result_tx.send(result);
     });
-    let finish_result = match finish_result_rx.recv_timeout(Duration::from_secs(2)) {
+    let finish_result = match finish_result_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(result) => {
             finish_thread.join().expect("join bounded capture finish");
             result
@@ -2265,7 +2656,7 @@ fn bounded_capture_deadline_cannot_be_bypassed_by_continuous_output() {
         .expect_err("continuous descendant output must not bypass the capture deadline");
 
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(5),
         "continuous output bypassed the bounded capture deadline"
     );
     assert!(
@@ -2340,13 +2731,14 @@ fn render_command_captures(capture: &CapturedCommandOutput) -> String {
 }
 
 fn run_bounded_within(
-    command: &mut std::process::Command,
+    mut command: std::process::Command,
     label: &str,
-    runtime_containment: Option<&RuntimeContainment>,
+    runtime: Option<&IsolatedDaemonRuntime>,
     readiness: Option<(&Path, Duration)>,
     timeout: Duration,
 ) -> std::io::Result<Output> {
-    BoundedCommandCapture::configure(command);
+    BoundedCommandCapture::configure(&mut command);
+    let runtime_containment = runtime.map(|runtime| &runtime.containment);
 
     let (mut child, mut command_containment) = match runtime_containment {
         Some(containment) => (containment.spawn(command, label)?, None),
@@ -2358,17 +2750,8 @@ fn run_bounded_within(
     let mut capture = Some(match BoundedCommandCapture::start(&mut child, label) {
         Ok(capture) => capture,
         Err(error) => {
-            let cleanup = terminate_spawned_process(
-                &mut child,
-                label,
-                command_containment
-                    .as_ref()
-                    .map(|containment| containment as &dyn ProcessContainment)
-                    .or_else(|| {
-                        runtime_containment
-                            .map(|containment| containment as &dyn ProcessContainment)
-                    }),
-            );
+            let cleanup =
+                terminate_spawned_process(child, label, command_containment.as_mut(), runtime);
             return Err(std::io::Error::other(format!(
                 "initialize bounded capture for {label}: {error}; cleanup={cleanup:?}"
             )));
@@ -2381,17 +2764,8 @@ fn run_bounded_within(
                 .as_ref()
                 .is_some_and(BoundedCommandCapture::overflowed)
             {
-                let cleanup = terminate_spawned_process(
-                    &mut child,
-                    label,
-                    command_containment
-                        .as_ref()
-                        .map(|containment| containment as &dyn ProcessContainment)
-                        .or_else(|| {
-                            runtime_containment
-                                .map(|containment| containment as &dyn ProcessContainment)
-                        }),
-                );
+                let cleanup =
+                    terminate_spawned_process(child, label, command_containment.as_mut(), runtime);
                 let captured = capture
                     .take()
                     .expect("capture remains owned")
@@ -2425,15 +2799,10 @@ fn run_bounded_within(
                 }
                 Ok(None) => {
                     let cleanup = terminate_spawned_process(
-                        &mut child,
+                        child,
                         label,
-                        command_containment
-                            .as_ref()
-                            .map(|containment| containment as &dyn ProcessContainment)
-                            .or_else(|| {
-                                runtime_containment
-                                    .map(|containment| containment as &dyn ProcessContainment)
-                            }),
+                        command_containment.as_mut(),
+                        runtime,
                     );
                     let captured = capture
                         .take()
@@ -2448,15 +2817,10 @@ fn run_bounded_within(
                 }
                 Err(error) => {
                     let cleanup = terminate_spawned_process(
-                        &mut child,
+                        child,
                         label,
-                        command_containment
-                            .as_ref()
-                            .map(|containment| containment as &dyn ProcessContainment)
-                            .or_else(|| {
-                                runtime_containment
-                                    .map(|containment| containment as &dyn ProcessContainment)
-                            }),
+                        command_containment.as_mut(),
+                        runtime,
                     );
                     let captured = capture
                         .take()
@@ -2477,17 +2841,8 @@ fn run_bounded_within(
             .as_ref()
             .is_some_and(BoundedCommandCapture::overflowed)
         {
-            let cleanup = terminate_spawned_process(
-                &mut child,
-                label,
-                command_containment
-                    .as_ref()
-                    .map(|containment| containment as &dyn ProcessContainment)
-                    .or_else(|| {
-                        runtime_containment
-                            .map(|containment| containment as &dyn ProcessContainment)
-                    }),
-            );
+            let cleanup =
+                terminate_spawned_process(child, label, command_containment.as_mut(), runtime);
             let captured = capture
                 .take()
                 .expect("capture remains owned")
@@ -2518,17 +2873,8 @@ fn run_bounded_within(
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             Ok(None) => {
-                let cleanup = terminate_spawned_process(
-                    &mut child,
-                    label,
-                    command_containment
-                        .as_ref()
-                        .map(|containment| containment as &dyn ProcessContainment)
-                        .or_else(|| {
-                            runtime_containment
-                                .map(|containment| containment as &dyn ProcessContainment)
-                        }),
-                );
+                let cleanup =
+                    terminate_spawned_process(child, label, command_containment.as_mut(), runtime);
                 let captured = capture
                     .take()
                     .expect("capture remains owned")
@@ -2538,17 +2884,8 @@ fn run_bounded_within(
                 panic!("{label} did not exit within {timeout:?}; cleanup={cleanup:?}; {captured}");
             }
             Err(error) => {
-                let cleanup = terminate_spawned_process(
-                    &mut child,
-                    label,
-                    command_containment
-                        .as_ref()
-                        .map(|containment| containment as &dyn ProcessContainment)
-                        .or_else(|| {
-                            runtime_containment
-                                .map(|containment| containment as &dyn ProcessContainment)
-                        }),
-                );
+                let cleanup =
+                    terminate_spawned_process(child, label, command_containment.as_mut(), runtime);
                 let captured = capture
                     .take()
                     .expect("capture remains owned")
@@ -2593,25 +2930,55 @@ fn poll_child_until(
 }
 
 fn terminate_spawned_process(
-    child: &mut Child,
+    mut child: Child,
     label: &str,
-    containment: Option<&dyn ProcessContainment>,
+    mut command_containment: Option<&mut CommandContainment>,
+    runtime: Option<&IsolatedDaemonRuntime>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
+    let runtime_containment = runtime.map(|runtime| &runtime.containment);
+    let containment = command_containment
+        .as_deref()
+        .map(|tree| tree as &dyn ProcessContainment)
+        .or_else(|| runtime_containment.map(|tree| tree as &dyn ProcessContainment));
     let containment_termination = containment.and_then(|tree| tree.terminate().err());
     let direct_kill = child.kill().err();
-    let direct_reap = poll_child_until(child, deadline, label);
-    let containment_quiescence =
-        containment.map(|tree| confirm_containment_empty_dyn(tree, deadline));
+    let direct_reap = poll_child_until(&mut child, deadline, label);
+    let direct_reap_succeeded = matches!(&direct_reap, Ok(Some(_)));
+    // A command-scoped containment can be finalized as soon as its one direct
+    // child is reaped. A shared runtime containment cannot: its owning runtime
+    // must first reap every registered direct child before the guardian's
+    // irreversible final proof.
+    let containment_quiescence = match (command_containment.is_some(), direct_reap_succeeded) {
+        (true, true) => containment.map(|tree| confirm_containment_empty_dyn(tree, deadline)),
+        (true, false) => Some(Err(
+            "command containment final proof skipped because the direct child was not reaped"
+                .to_string(),
+        )),
+        (false, _) => None,
+    };
+    let failed_reap_retention = if direct_reap_succeeded {
+        None
+    } else if let Some(command_containment) = command_containment.as_deref_mut() {
+        Some(command_containment.retain_unreaped_child(child, label.to_string()))
+    } else if let Some(runtime) = runtime {
+        Some(runtime.retain_unreaped_direct_child(child, label.to_string()))
+    } else {
+        std::mem::forget(child);
+        Some(Err(
+            "unreaped uncontained direct child handle intentionally leaked".to_string(),
+        ))
+    };
     match (
         containment_termination,
         direct_kill,
         direct_reap,
         containment_quiescence,
+        failed_reap_retention,
     ) {
-        (None, None, Ok(Some(_)), None | Some(Ok(()))) => Ok(()),
-        (termination, kill, reap, quiescence) => Err(format!(
-            "{label} cleanup failed: containment termination={termination:?}; direct kill={kill:?}; direct reap={reap:?}; containment quiescence={quiescence:?}"
+        (None, None, Ok(Some(_)), None | Some(Ok(())), None) => Ok(()),
+        (termination, kill, reap, quiescence, retention) => Err(format!(
+            "{label} cleanup failed: containment termination={termination:?}; direct kill={kill:?}; direct reap={reap:?}; containment quiescence={quiescence:?}; failed-reap retention={retention:?}"
         )),
     }
 }
@@ -2731,7 +3098,7 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         // this checkout. Cargo waits on that lock forever and prints only to
         // the stderr this call captures, so the wait is bounded here.
         let mut build = Command::new(env!("CARGO"));
-        scrub_inherited_kin_authority(&mut build.inner);
+        scrub_inherited_kin_authority(build.inner_mut());
         let output = build
             .args(["build", "-p", "kin-daemon", "--bin", "kin-daemon"])
             .current_dir(workspace_root)

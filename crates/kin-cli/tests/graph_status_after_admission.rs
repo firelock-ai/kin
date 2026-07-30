@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ const NULL_GIT_CONFIG: &str = "NUL";
 const NULL_GIT_CONFIG: &str = "/dev/null";
 
 struct IsolatedDaemon {
-    child: Option<Child>,
+    child: Option<common::RuntimeOwnedChild>,
 }
 
 impl IsolatedDaemon {

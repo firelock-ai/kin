@@ -33,14 +33,14 @@ enum DeadlineStart {
 }
 
 pub(super) fn output_with_timeout(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
     timeout: Duration,
 ) -> std::io::Result<Output> {
     // This is the last command mutation before stdio is attached and the
     // process is spawned, so daemon authority cannot be reintroduced after
     // the scrub.
-    kin_daemon_spawn::scrub_daemon_process_authority(command);
+    kin_daemon_spawn::scrub_daemon_process_authority(&mut command);
     output_finalized_with_timeout_and_limit(command, label, timeout, MAX_CAPTURE_BYTES_PER_STREAM)
 }
 
@@ -50,7 +50,7 @@ pub(super) fn output_with_timeout(
 /// boundary. This function installs owned stdio before spawning; on Windows the
 /// containment spawn also adds `CREATE_SUSPENDED` until Job ownership is bound.
 pub(crate) fn output_finalized_with_timeout_and_limit(
-    command: &mut Command,
+    command: Command,
     label: &str,
     timeout: Duration,
     max_capture_bytes_per_stream: u64,
@@ -68,7 +68,7 @@ pub(crate) fn output_finalized_with_timeout_and_limit(
 /// has atomically published a parseable PID marker.
 #[cfg(test)]
 pub(crate) fn output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
-    command: &mut Command,
+    command: Command,
     label: &str,
     readiness_marker: &std::path::Path,
     readiness_timeout: Duration,
@@ -88,7 +88,7 @@ pub(crate) fn output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
 }
 
 fn output_finalized_with_timeout_and_limit_from(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
     timeout: Duration,
     max_capture_bytes_per_stream: u64,
@@ -103,7 +103,7 @@ fn output_finalized_with_timeout_and_limit_from(
     let capture = match BoundedCapturePair::start(&mut child, max_capture_bytes_per_stream, label) {
         Ok(capture) => capture,
         Err(error) => {
-            let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+            let cleanup = terminate_tree_and_reap(child, tree, label);
             return Err(contextual_io(
                 error,
                 format!(
@@ -125,7 +125,7 @@ fn output_finalized_with_timeout_and_limit_from(
                 std::thread::sleep(POLL_INTERVAL);
             }
             if !pid_marker_is_parseable(&marker) {
-                let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                let cleanup = terminate_tree_and_reap(child, tree, label);
                 let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -147,7 +147,7 @@ fn output_finalized_with_timeout_and_limit_from(
         if let Some(event) = capture.try_event() {
             match event {
                 CaptureEvent::LimitExceeded { stream } => {
-                    let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                    let cleanup = terminate_tree_and_reap(child, tree, label);
                     let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                     return Err(contextual_io(
                         capture_limit_error(
@@ -160,7 +160,7 @@ fn output_finalized_with_timeout_and_limit_from(
                     ));
                 }
                 CaptureEvent::ReadFailed { stream, error } => {
-                    let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                    let cleanup = terminate_tree_and_reap(child, tree, label);
                     let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                     return Err(std::io::Error::other(format!(
                         "read {label} {stream} capture: {error}; cleanup={}; capture={}",
@@ -194,7 +194,7 @@ fn output_finalized_with_timeout_and_limit_from(
                 std::thread::sleep(POLL_INTERVAL);
             }
             Ok(None) => {
-                let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                let cleanup = terminate_tree_and_reap(child, tree, label);
                 let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -209,7 +209,7 @@ fn output_finalized_with_timeout_and_limit_from(
                 ));
             }
             Err(error) => {
-                let cleanup = terminate_tree_and_reap(&mut child, &mut tree, label);
+                let cleanup = terminate_tree_and_reap(child, tree, label);
                 let captured = capture.finish_until(Instant::now() + REAP_GRACE);
                 return Err(std::io::Error::new(
                     error.kind(),
@@ -716,7 +716,7 @@ fn poll_child_until(
 }
 
 fn confirm_tree_empty_until(
-    tree: &ProbeProcessTree,
+    tree: &mut ProbeProcessTree,
     deadline: Instant,
     label: &str,
 ) -> std::io::Result<()> {
@@ -742,8 +742,8 @@ fn terminate_descendants(tree: &mut ProbeProcessTree, label: &str) -> std::io::R
 }
 
 fn terminate_tree_and_reap(
-    child: &mut Child,
-    tree: &mut ProbeProcessTree,
+    mut child: Child,
+    mut tree: ProbeProcessTree,
     label: &str,
 ) -> std::io::Result<()> {
     let terminate = tree.terminate();
@@ -752,7 +752,10 @@ fn terminate_tree_and_reap(
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
         Err(error) => Err(contextual_io(error, format!("kill direct {label} process"))),
     };
-    let reap = match poll_child_until(child, Instant::now() + REAP_GRACE, label) {
+    let direct_status = poll_child_until(&mut child, Instant::now() + REAP_GRACE, label);
+    #[cfg(unix)]
+    let direct_reaped = matches!(&direct_status, Ok(Some(_)));
+    let reap = match direct_status {
         Ok(Some(_)) => direct_kill,
         Ok(None) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -760,11 +763,24 @@ fn terminate_tree_and_reap(
         )),
         Err(error) => Err(error),
     };
-    // Even a direct-child polling error must not skip the independent
-    // containment proof. Give descendant cleanup its own grace window rather
-    // than consuming it while waiting for the direct process.
-    let empty = confirm_tree_empty_until(tree, Instant::now() + REAP_GRACE, label);
-    let auxiliary_reap = reap_auxiliary_after_confirmed_empty(tree, &empty, label);
+
+    #[cfg(unix)]
+    if !direct_reaped {
+        let terminate_detail = render_result(&terminate);
+        let reap_detail = render_result(&reap);
+        let retention = retain_unreaped_probe_process(child, tree, label);
+        return Err(std::io::Error::other(format!(
+            "containment terminate={terminate_detail}; direct reap={reap_detail}; containment \
+             empty=skipped until exact child status is reaped; auxiliary reap=skipped until exact \
+             child status is reaped; {retention}"
+        )));
+    }
+
+    // Unix guardian finalization is permitted only after the exact direct
+    // status above. Other platforms retain their existing independent
+    // containment cleanup after a polling failure.
+    let empty = confirm_tree_empty_until(&mut tree, Instant::now() + REAP_GRACE, label);
+    let auxiliary_reap = reap_auxiliary_after_confirmed_empty(&mut tree, &empty, label);
     combine_cleanup(terminate, reap, empty, auxiliary_reap)
 }
 
@@ -812,128 +828,47 @@ fn contextual_io(error: std::io::Error, context: String) -> std::io::Error {
 
 #[cfg(unix)]
 struct ProbeProcessTree {
-    process_group: libc::pid_t,
-    guardian: Option<Child>,
-    guardian_stdin: Option<std::process::ChildStdin>,
+    guardian: Option<kin_daemon_spawn::ProcessGroupGuardian>,
     termination_requested: bool,
 }
 
 #[cfg(unix)]
 impl ProbeProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
-        use std::os::unix::process::CommandExt as _;
-
+    fn spawn(command: Command) -> std::io::Result<(Child, Self)> {
         // Keep a stable process-group owner alive until every member is proven
         // dead. The pipe is an ownership capability: normal cleanup closes it,
         // and OS close-on-parent-death gives the guardian EOF if the CLI is
         // killed before Rust Drop can run.
         let readiness_root = tempfile::tempdir()?;
         let ready_path = readiness_root.path().join("guardian.ready");
-        let mut guardian_command = Command::new("/bin/sh");
-        guardian_command
-            .args([
-                "-c",
-                "set -eu\n\
-                 ready=$1\n\
-                 printf '%s\\n' \"$$\" > \"$ready\"\n\
-                 IFS= read -r _ || true\n\
-                 kill -KILL 0",
-                "kin-daemon-probe-guardian",
-            ])
-            .arg(&ready_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        kin_daemon_spawn::scrub_daemon_process_authority(&mut guardian_command);
-        let mut guardian = guardian_command.spawn().map_err(|error| {
-            contextual_io(
-                error,
-                "spawn daemon-probe parent-death guardian".to_string(),
+        let executable = std::env::current_exe()?;
+        let launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+            executable,
+            "kin_process_group_guardian_worker",
+        );
+        let guardian = launcher
+            .spawn_with(
+                &ready_path,
+                Instant::now() + REAP_GRACE,
+                kin_daemon_spawn::scrub_daemon_guardian_environment,
             )
-        })?;
-        let process_group = libc::pid_t::try_from(guardian.id()).map_err(|_| {
-            let _ = guardian.kill();
-            let _ = guardian.wait();
-            std::io::Error::other("daemon-probe guardian id does not fit a native process-group id")
-        })?;
-        let guardian_stdin = match guardian.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = guardian.kill();
-                let _ = guardian.wait();
-                return Err(std::io::Error::other(
-                    "daemon-probe guardian did not expose its ownership pipe",
-                ));
-            }
-        };
+            .map_err(|error| {
+                contextual_io(
+                    error,
+                    "spawn daemon-probe parent-death guardian".to_string(),
+                )
+            })?;
         let mut tree = Self {
-            process_group,
             guardian: Some(guardian),
-            guardian_stdin: Some(guardian_stdin),
             termination_requested: false,
         };
 
-        let expected_ready = process_group.to_string();
-        let deadline = Instant::now() + REAP_GRACE;
-        loop {
-            let ready = std::fs::read_to_string(&ready_path)
-                .is_ok_and(|value| value.trim() == expected_ready);
-            if ready {
-                break;
-            }
-            match tree
-                .guardian
-                .as_mut()
-                .expect("guardian remains owned during readiness")
-                .try_wait()
-            {
-                Ok(Some(status)) => {
-                    tree.guardian.take();
-                    tree.guardian_stdin.take();
-                    return Err(std::io::Error::other(format!(
-                        "daemon-probe guardian exited before readiness: {status}"
-                    )));
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Ok(None) => {
-                    let cleanup = terminate_descendants(&mut tree, "unready daemon-probe guardian");
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "daemon-probe guardian did not become ready; cleanup={}",
-                            render_result(&cleanup)
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    let cleanup =
-                        terminate_descendants(&mut tree, "uninspectable daemon-probe guardian");
-                    return Err(contextual_io(
-                        error,
-                        format!(
-                            "inspect daemon-probe guardian readiness; cleanup={}",
-                            render_result(&cleanup)
-                        ),
-                    ));
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&ready_path);
-        let observed_group = unsafe { libc::getpgid(process_group) };
-        if observed_group != process_group {
-            let cleanup = terminate_descendants(&mut tree, "misbound daemon-probe guardian");
-            return Err(std::io::Error::other(format!(
-                "daemon-probe guardian group changed: expected {process_group}, observed \
-                 {observed_group}; cleanup={}",
-                render_result(&cleanup)
-            )));
-        }
-
-        command.process_group(process_group);
-        match command.spawn() {
+        match tree
+            .guardian
+            .as_mut()
+            .expect("new daemon-probe guardian remains owned")
+            .spawn(command)
+        {
             Ok(child) => Ok((child, tree)),
             Err(error) => {
                 let cleanup = terminate_descendants(&mut tree, "unlaunched daemon probe");
@@ -953,71 +888,33 @@ impl ProbeProcessTree {
             return Ok(());
         }
         self.termination_requested = true;
-        let signal = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
-        // Closing the pipe is the parent-death path and a fallback if the
-        // direct signal failed. This is the only place either termination
-        // capability is consumed, so Drop cannot signal a recycled PGID.
-        self.guardian_stdin.take();
-        if signal == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(contextual_io(
-                error,
-                "terminate daemon-probe process group".to_string(),
-            ))
-        }
+        self.guardian
+            .as_mut()
+            .expect("guardian presence checked before cleanup")
+            .request_cleanup();
+        Ok(())
     }
 
-    fn is_empty(&self) -> std::io::Result<bool> {
-        if self.guardian.is_none() {
+    fn is_empty(&mut self) -> std::io::Result<bool> {
+        let Some(guardian) = self.guardian.as_mut() else {
             return Ok(true);
+        };
+        let reaped = guardian.try_reap()?.is_some();
+        if reaped {
+            self.guardian.take();
         }
-        let system = sysinfo::System::new_all();
-        for (pid, process) in system.processes() {
-            let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-                continue;
-            };
-            if unsafe { libc::getpgid(pid) } == self.process_group
-                && !matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(reaped)
     }
 
     fn reap_auxiliary_until(&mut self, deadline: Instant, label: &str) -> std::io::Result<()> {
-        loop {
-            let Some(guardian) = self.guardian.as_mut() else {
-                return Ok(());
-            };
-            match guardian.try_wait() {
-                Ok(Some(_)) => {
-                    self.guardian.take();
-                    self.guardian_stdin.take();
-                    return Ok(());
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Ok(None) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("{label} guardian was not reaped"),
-                    ));
-                }
-                Err(error) => {
-                    return Err(contextual_io(error, format!("reap {label} guardian")));
-                }
-            }
-        }
+        let Some(guardian) = self.guardian.as_mut() else {
+            return Ok(());
+        };
+        guardian
+            .reap_until(deadline)
+            .map_err(|error| contextual_io(error, format!("reap {label} guardian")))?;
+        self.guardian.take();
+        Ok(())
     }
 }
 
@@ -1028,13 +925,52 @@ impl Drop for ProbeProcessTree {
         let empty = confirm_tree_empty_until(self, Instant::now() + REAP_GRACE, "daemon probe");
         if empty.is_ok() {
             let _ = self.reap_auxiliary_until(Instant::now() + REAP_GRACE, "daemon probe");
-            if let Some(mut guardian) = self.guardian.take() {
-                // Quiescence has been proven, so releasing this exact
-                // still-owned PID cannot hide a live process-group member.
-                let _ = guardian.kill();
-                let _ = guardian.wait();
-            }
         }
+    }
+}
+
+#[cfg(unix)]
+struct RetainedProbeProcessCleanup {
+    child: Child,
+    tree: ProbeProcessTree,
+}
+
+#[cfg(unix)]
+impl RetainedProbeProcessCleanup {
+    fn run(mut self) -> ExitStatus {
+        let _ = self.tree.terminate();
+        let _ = self.child.kill();
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+        };
+
+        // The direct wait handle has delivered status. Guardian finalization,
+        // including sentinel reap, is safe only after that point.
+        let _ = terminate_descendants(&mut self.tree, "retained daemon probe");
+        status
+    }
+}
+
+#[cfg(unix)]
+fn retain_unreaped_probe_process(child: Child, tree: ProbeProcessTree, label: &str) -> String {
+    let retained = std::mem::ManuallyDrop::new(RetainedProbeProcessCleanup { child, tree });
+    match std::thread::Builder::new()
+        .name("kin-retained-daemon-probe".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            let _ = retained.run();
+        }) {
+        Ok(_) => format!("retained exact child and guardian for asynchronous cleanup of {label}"),
+        Err(error) => format!(
+            "failed to spawn retained cleanup owner for {label}: {error}; exact child and \
+             guardian intentionally leaked"
+        ),
     }
 }
 
@@ -1059,7 +995,7 @@ impl Drop for OwnedHandle {
 
 #[cfg(windows)]
 impl ProbeProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+    fn spawn(mut command: Command) -> std::io::Result<(Child, Self)> {
         use std::os::windows::io::AsRawHandle as _;
         use std::os::windows::process::CommandExt as _;
         use windows_sys::Win32::Foundation::{
@@ -1289,7 +1225,7 @@ struct ProbeProcessTree;
 
 #[cfg(not(any(unix, windows)))]
 impl ProbeProcessTree {
-    fn spawn(command: &mut Command) -> std::io::Result<(Child, Self)> {
+    fn spawn(mut command: Command) -> std::io::Result<(Child, Self)> {
         Ok((command.spawn()?, Self))
     }
 
@@ -1422,7 +1358,7 @@ mod tests {
                 .env(PROBE_WORKER_ENV, "descendant")
                 .env(PROBE_DESCENDANT_MARKER_ENV, marker);
             let result = output_with_timeout(
-                &mut nested_probe,
+                nested_probe,
                 "parent-death daemon probe fixture",
                 Duration::from_secs(30),
             );
@@ -1457,6 +1393,29 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_cleanup_reaps_exact_child_before_guardian_finalization() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "daemon_client::probe_process::tests::probe_worker",
+                "--nocapture",
+            ])
+            .env(PROBE_WORKER_ENV, "sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (child, tree) = ProbeProcessTree::spawn(command).unwrap();
+
+        let status = RetainedProbeProcessCleanup { child, tree }.run();
+        assert!(
+            !status.success(),
+            "retained cleanup did not terminate its exact direct child"
+        );
+    }
+
     #[test]
     fn bounded_probe_closes_stdin_and_captures_output() {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -1468,8 +1427,7 @@ mod tests {
             ])
             .env(PROBE_WORKER_ENV, "complete");
         let output =
-            output_with_timeout(&mut command, "daemon probe fixture", Duration::from_secs(5))
-                .unwrap();
+            output_with_timeout(command, "daemon probe fixture", Duration::from_secs(5)).unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("probe stdout"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("probe stderr"));
@@ -1490,7 +1448,7 @@ mod tests {
             .env(PROBE_DESCENDANT_MARKER_ENV, &marker);
 
         let output = output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
-            &mut command,
+            command,
             "delayed-ready daemon probe fixture",
             &marker,
             Duration::from_secs(2),
@@ -1514,7 +1472,7 @@ mod tests {
             ])
             .env(PROBE_WORKER_ENV, "sleep");
         let error = output_with_timeout(
-            &mut command,
+            command,
             "sleeping daemon probe fixture",
             Duration::from_secs(2),
         )
@@ -1538,7 +1496,7 @@ mod tests {
             .env(PROBE_WORKER_ENV, "runaway-output");
         kin_daemon_spawn::scrub_daemon_process_authority(&mut command);
         let error = output_finalized_with_timeout_and_limit(
-            &mut command,
+            command,
             "runaway daemon probe fixture",
             Duration::from_secs(5),
             4 * 1024,
@@ -1564,7 +1522,7 @@ mod tests {
             .env(PROBE_WORKER_ENV, "spawn-descendant")
             .env(PROBE_DESCENDANT_MARKER_ENV, &marker);
         let output = output_with_timeout(
-            &mut command,
+            command,
             "daemon probe tree fixture",
             Duration::from_secs(10),
         )
@@ -1676,7 +1634,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let (mut child, mut tree) = ProbeProcessTree::spawn(&mut command).unwrap();
+        let (mut child, mut tree) = ProbeProcessTree::spawn(command).unwrap();
         tree.terminate().unwrap();
         let failed_quiescence = Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -1697,7 +1655,7 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         confirm_tree_empty_until(
-            &tree,
+            &mut tree,
             Instant::now() + REAP_GRACE,
             "failed-quiescence fixture cleanup",
         )

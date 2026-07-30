@@ -279,7 +279,6 @@
       ],
       "allow_match": [
         "use std::process::{Child, Command, ExitStatus, Output, Stdio};",
-        "guardian_stdin: Option<std::process::ChildStdin>,",
         "let _ = std::fs::remove_file(&self.path);",
         "file: std::fs::File,"
       ]
@@ -363,7 +362,7 @@
         },
         {
           "expr": "process::exit(1);",
-          "count": 8
+          "count": 9
         },
         "process::exit(exit_code);",
         "if path.file_name().and_then(|name| name.to_str()) == Some(\".kin\") && path.is_dir() {"

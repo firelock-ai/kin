@@ -37,13 +37,6 @@ const TEST_SUBPROCESS_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
 /// Maximum rendered UTF-8 bytes, including any truncation marker.
 const TEST_SUBPROCESS_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const TEST_SUBPROCESS_DIAGNOSTIC_MARKER: &str = "\n[bounded capture truncated]";
-#[cfg(unix)]
-const TEST_SUBPROCESS_GUARDIAN: &str = "TEST_BOUNDED_SUBPROCESS_GUARDIAN";
-#[cfg(unix)]
-const TEST_SUBPROCESS_GUARDIAN_READY: &str = "TEST_BOUNDED_SUBPROCESS_GUARDIAN_READY";
-#[cfg(unix)]
-const TEST_SUBPROCESS_GUARDIAN_EXIT_BEFORE_READY: &str =
-    "TEST_BOUNDED_SUBPROCESS_GUARDIAN_EXIT_BEFORE_READY";
 
 fn env_name_eq(actual: &str, expected: &str) -> bool {
     if cfg!(windows) {
@@ -127,6 +120,27 @@ fn prepare_test_subprocess_command(command: &mut Command, replay_worker_inputs: 
     command.env("KIN_VFS_DISABLE", "1");
 }
 
+#[cfg(unix)]
+fn prepare_test_subprocess_guardian_environment(
+    environment: &mut kin_daemon_spawn::ProcessGroupGuardianEnvironment,
+) {
+    let explicit_authority = environment
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_test_subprocess_authority(key))
+        .collect::<Vec<_>>();
+    for key in std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_test_subprocess_authority(key))
+        .chain(explicit_authority)
+    {
+        environment.env_remove(key);
+    }
+
+    kin_git::test_support::isolate_fixture_guardian_environment(environment);
+    environment.env("KIN_VFS_DISABLE", "1");
+}
+
 /// Build a Git command through the workspace's single fixture-isolation
 /// boundary. Production Git commands intentionally do not use this helper.
 pub(crate) fn fixture_git(repository: &Path) -> kin_git::test_support::FixtureGitCommand {
@@ -136,110 +150,61 @@ pub(crate) fn fixture_git(repository: &Path) -> kin_git::test_support::FixtureGi
 #[cfg(unix)]
 struct TestProcessTree {
     process_group: Option<UnixTestProcessGroup>,
-    guardian: Option<Child>,
-    guardian_stdin: Option<std::process::ChildStdin>,
+    guardian: Option<kin_daemon_spawn::ProcessGroupGuardian>,
     _guardian_root: tempfile::TempDir,
 }
 
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 enum UnixTestProcessGroup {
-    Armed(libc::pid_t),
-    TerminationRequested(libc::pid_t),
-}
-
-#[cfg(unix)]
-impl UnixTestProcessGroup {
-    fn id(self) -> libc::pid_t {
-        match self {
-            Self::Armed(process_group) | Self::TerminationRequested(process_group) => process_group,
-        }
-    }
+    Armed,
+    TerminationRequested,
 }
 
 #[cfg(unix)]
 impl TestProcessTree {
-    fn spawn(command: &mut Command, label: &str) -> Result<(Child, Self)> {
-        use std::os::unix::process::CommandExt as _;
-
+    fn spawn(mut command: Command, label: &str) -> Result<(Child, Self)> {
         let guardian_root = tempfile::Builder::new()
             .prefix("kin-test-subprocess-guardian-")
             .tempdir()
             .context("failed to create bounded test guardian root")?;
         let ready = guardian_root.path().join("ready");
-        let mut guardian_command =
-            Command::new(std::env::current_exe().context("resolve current test executable")?);
-        guardian_command
-            .args([
-                "--exact",
-                "commands::test_subprocess::tests::process_tree_guardian_worker",
-                "--nocapture",
-            ])
-            .env(TEST_SUBPROCESS_GUARDIAN, "1")
-            .env(TEST_SUBPROCESS_GUARDIAN_READY, &ready)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
+        let executable = std::env::current_exe().context("resolve current test executable")?;
+        let mut launcher = kin_daemon_spawn::ProcessGroupGuardianLauncher::exact_test(
+            executable,
+            "kin_process_group_guardian_worker",
+        );
         if command.get_envs().any(|(key, value)| {
             env_name_eq(
                 &key.to_string_lossy(),
-                TEST_SUBPROCESS_GUARDIAN_EXIT_BEFORE_READY,
+                kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY_ENV,
             ) && value == Some(OsStr::new("1"))
         }) {
-            guardian_command.env(TEST_SUBPROCESS_GUARDIAN_EXIT_BEFORE_READY, "1");
-        }
-        prepare_test_subprocess_command(&mut guardian_command, false);
-        let mut guardian = guardian_command
-            .spawn()
-            .with_context(|| format!("failed to spawn parent-death guardian for {label}"))?;
-        let guardian_pid = guardian.id();
-        let process_group = libc::pid_t::try_from(guardian_pid)
-            .context("test guardian id does not fit a native process-group id")?;
-        let guardian_stdin = guardian.stdin.take().ok_or_else(|| {
-            let _ = guardian.kill();
-            let _ = poll_child_until(
-                &mut guardian,
-                Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
-                "guardian missing ownership pipe",
+            launcher = launcher.with_env(
+                kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY_ENV,
+                "1",
             );
-            anyhow::anyhow!("bounded test guardian did not expose its ownership pipe")
-        })?;
+        }
+        let guardian = launcher
+            .spawn_with(
+                &ready,
+                Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
+                prepare_test_subprocess_guardian_environment,
+            )
+            .with_context(|| format!("failed to spawn parent-death guardian for {label}"))?;
         let mut tree = Self {
-            process_group: Some(UnixTestProcessGroup::Armed(process_group)),
+            process_group: Some(UnixTestProcessGroup::Armed),
             guardian: Some(guardian),
-            guardian_stdin: Some(guardian_stdin),
             _guardian_root: guardian_root,
         };
 
-        let readiness_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
-        while !ready.is_file() {
-            if Instant::now() >= readiness_deadline {
-                let cleanup = terminate_and_confirm_tree(&mut tree).err();
-                anyhow::bail!(
-                    "bounded test guardian did not publish readiness for {label}; \
-                     cleanup={cleanup:?}"
-                );
-            }
-            std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
-        }
-        let readiness = std::fs::read_to_string(&ready)
-            .with_context(|| format!("read bounded test guardian readiness for {label}"))?;
-        let expected_readiness = format!("{guardian_pid} {process_group}");
-        if readiness != expected_readiness
-            || unsafe { libc::getpgid(process_group) } != process_group
+        prepare_test_subprocess_command(&mut command, true);
+        match tree
+            .guardian
+            .as_mut()
+            .expect("new bounded test guardian remains owned")
+            .spawn(command)
         {
-            let cleanup = terminate_and_confirm_tree(&mut tree).err();
-            anyhow::bail!(
-                "bounded test guardian published invalid readiness for {label}: \
-                 expected {expected_readiness:?}, observed {readiness:?}; cleanup={cleanup:?}"
-            );
-        }
-        let _ = std::fs::remove_file(&ready);
-
-        prepare_test_subprocess_command(command, true);
-        command.process_group(process_group);
-        match command.spawn() {
             Ok(child) => Ok((child, tree)),
             Err(error) => {
                 let cleanup = terminate_and_confirm_tree(&mut tree).err();
@@ -251,66 +216,45 @@ impl TestProcessTree {
     }
 
     fn terminate(&mut self) -> Result<()> {
-        self.guardian_stdin.take();
-        let Some(UnixTestProcessGroup::Armed(process_group)) = self.process_group else {
+        let Some(UnixTestProcessGroup::Armed) = self.process_group else {
             return Ok(());
         };
-        self.process_group = Some(UnixTestProcessGroup::TerminationRequested(process_group));
-        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error).context("failed to terminate bounded test process group")
-        }
+        let guardian = self.guardian.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("bounded test containment lost its process-group guardian")
+        })?;
+        self.process_group = Some(UnixTestProcessGroup::TerminationRequested);
+        guardian.request_cleanup();
+        Ok(())
     }
 
-    fn is_empty(&self) -> Result<bool> {
-        let Some(process_group) = self.process_group else {
+    fn is_empty(&mut self) -> Result<bool> {
+        if self.process_group.is_none() {
+            return Ok(true);
+        }
+        let Some(guardian) = self.guardian.as_mut() else {
             return Ok(true);
         };
-        if self.guardian.is_none() {
-            anyhow::bail!(
-                "cannot inspect bounded test process group after releasing its stable guardian"
-            );
+        let reaped = guardian
+            .try_reap()
+            .context("failed to poll bounded test process-group guardian")?
+            .is_some();
+        if reaped {
+            self.guardian.take();
         }
-        let system = sysinfo::System::new_all();
-        for (pid, process) in system.processes() {
-            let Ok(pid) = libc::pid_t::try_from(pid.as_u32()) else {
-                continue;
-            };
-            if unsafe { libc::getpgid(pid) } == process_group.id()
-                && !matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(reaped)
     }
 
     fn reap_auxiliary_until(&mut self, deadline: Instant) -> Result<bool> {
-        loop {
-            let reaped = match self.guardian.as_mut() {
-                Some(guardian) => guardian
-                    .try_wait()
-                    .context("failed to poll bounded test guardian")?
-                    .is_some(),
-                None => true,
-            };
-            if reaped {
+        let Some(guardian) = self.guardian.as_mut() else {
+            return Ok(true);
+        };
+        match guardian.reap_until(deadline) {
+            Ok(_) => {
                 self.guardian.take();
-                return Ok(true);
+                Ok(true)
             }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(false),
+            Err(error) => Err(error).context("failed to reap bounded test guardian"),
         }
     }
 
@@ -330,18 +274,62 @@ impl Drop for TestProcessTree {
         )
         .is_err()
         {
-            // `Child` has deliberately non-reaping Drop semantics. Leaving the
-            // guardian handle here preserves the zombie group leader instead
-            // of releasing a numeric PGID after failed quiescence proof.
+            // Dropping the ownership pipe still leaves the external watcher
+            // responsible for the pinned-PGID cleanup proof.
             return;
         }
         match self.reap_auxiliary_until(Instant::now() + TEST_SUBPROCESS_REAP_GRACE) {
             Ok(true) => self.disarm_after_confirmed_cleanup(),
             Ok(false) | Err(_) => {
-                // Do not disarm the numeric identity if the stable guardian
-                // could not be reaped under its independent grace window.
+                // Do not disarm the numeric identity if the watcher could not
+                // finish its pinned-PGID proof under the independent grace.
             }
         }
+    }
+}
+
+#[cfg(unix)]
+struct RetainedTestProcessCleanup {
+    child: Child,
+    tree: TestProcessTree,
+}
+
+#[cfg(unix)]
+impl RetainedTestProcessCleanup {
+    fn run(mut self) -> ExitStatus {
+        let _ = self.tree.terminate();
+        let _ = self.child.kill();
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
+                }
+            }
+        };
+
+        // The exact direct-child status is reaped. Only now may guardian
+        // finalization consume the sentinel PGID pin.
+        let _ = terminate_and_confirm_tree(&mut self.tree);
+        status
+    }
+}
+
+#[cfg(unix)]
+fn retain_unreaped_test_process(child: Child, tree: TestProcessTree, label: &str) -> String {
+    let retained = std::mem::ManuallyDrop::new(RetainedTestProcessCleanup { child, tree });
+    match std::thread::Builder::new()
+        .name("kin-test-retained-subprocess".to_string())
+        .spawn(move || {
+            let retained = std::mem::ManuallyDrop::into_inner(retained);
+            let _ = retained.run();
+        }) {
+        Ok(_) => format!("retained exact child and guardian for asynchronous cleanup of {label}"),
+        Err(error) => format!(
+            "failed to spawn retained cleanup owner for {label}: {error}; exact child and \
+             guardian intentionally leaked"
+        ),
     }
 }
 
@@ -364,7 +352,7 @@ impl Drop for TestOwnedHandle {
 
 #[cfg(windows)]
 impl TestProcessTree {
-    fn spawn(command: &mut Command, label: &str) -> Result<(Child, Self)> {
+    fn spawn(mut command: Command, label: &str) -> Result<(Child, Self)> {
         use std::os::windows::io::AsRawHandle as _;
         use std::os::windows::process::CommandExt as _;
         use windows_sys::Win32::Foundation::{
@@ -405,7 +393,7 @@ impl TestProcessTree {
         }
 
         command.creation_flags(CREATE_SUSPENDED);
-        prepare_test_subprocess_command(command, true);
+        prepare_test_subprocess_command(&mut command, true);
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn {label}"))?;
@@ -610,8 +598,8 @@ struct TestProcessTree;
 
 #[cfg(not(any(unix, windows)))]
 impl TestProcessTree {
-    fn spawn(command: &mut Command, label: &str) -> Result<(Child, Self)> {
-        prepare_test_subprocess_command(command, true);
+    fn spawn(mut command: Command, label: &str) -> Result<(Child, Self)> {
+        prepare_test_subprocess_command(&mut command, true);
         let child = command
             .spawn()
             .with_context(|| format!("failed to spawn {label}"))?;
@@ -653,7 +641,7 @@ fn poll_child_until(
 }
 
 fn confirm_tree_empty_until(
-    tree: &TestProcessTree,
+    tree: &mut TestProcessTree,
     deadline: Instant,
     terminate_error: Option<anyhow::Error>,
 ) -> Result<()> {
@@ -689,6 +677,66 @@ fn confirm_reap_and_disarm_tree(
 fn terminate_and_confirm_tree(tree: &mut TestProcessTree) -> Result<()> {
     let terminate_error = tree.terminate().err();
     confirm_reap_and_disarm_tree(tree, terminate_error)
+}
+
+struct FailedTestProcessCleanup {
+    detail: String,
+    quiescence_proven: bool,
+}
+
+fn cleanup_failed_test_process(
+    mut child: Child,
+    mut tree: TestProcessTree,
+    label: &str,
+) -> FailedTestProcessCleanup {
+    let deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
+    let tree_terminate_error = tree.terminate().err();
+    let direct_kill_error = child.kill().err();
+    let (status, reap_error) = match poll_child_until(&mut child, deadline, label) {
+        Ok(status) => (status, None),
+        Err(error) => (None, Some(error)),
+    };
+    let direct_child_reaped = status.is_some();
+
+    #[cfg(unix)]
+    let (tree_error, retention) = if direct_child_reaped {
+        (
+            confirm_reap_and_disarm_tree(&mut tree, tree_terminate_error).err(),
+            None,
+        )
+    } else {
+        (None, Some(retain_unreaped_test_process(child, tree, label)))
+    };
+
+    #[cfg(not(unix))]
+    let (tree_error, retention) = (
+        confirm_reap_and_disarm_tree(&mut tree, tree_terminate_error).err(),
+        None::<String>,
+    );
+
+    let quiescence_proven = direct_child_reaped && tree_error.is_none();
+    FailedTestProcessCleanup {
+        detail: format!(
+            "direct-kill error: {direct_kill_error:?}; reap error: {}; containment-cleanup error: {}; \
+             direct child reaped: {direct_child_reaped}; retained cleanup: {}",
+            reap_error
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "none".to_string()),
+            tree_error
+                .as_ref()
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| {
+                    if direct_child_reaped {
+                        "none".to_string()
+                    } else {
+                        "skipped until exact child status is reaped".to_string()
+                    }
+                }),
+            retention.as_deref().unwrap_or("not required"),
+        ),
+        quiescence_proven,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1098,49 +1146,27 @@ fn captured_test_output(
 }
 
 pub(crate) fn output_with_timeout(
-    command: &mut Command,
+    mut command: Command,
     label: &str,
     timeout: Duration,
 ) -> Result<Output> {
-    BoundedTestCapture::configure(command);
+    BoundedTestCapture::configure(&mut command);
 
     let (mut child, mut tree) = TestProcessTree::spawn(command, label)?;
     let capture = match BoundedTestCapture::start(&mut child, label) {
         Ok(capture) => capture,
         Err(error) => {
-            let tree_terminate_error = tree.terminate().err();
-            let direct_kill_error = child.kill().err();
-            let direct_reaped = poll_child_until(
-                &mut child,
-                Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
-                label,
-            )
-            .ok()
-            .flatten()
-            .is_some();
-            let tree_error = confirm_reap_and_disarm_tree(&mut tree, tree_terminate_error).err();
+            let cleanup = cleanup_failed_test_process(child, tree, label);
             return Err(error).with_context(|| {
-                format!(
-                    "failed to initialize {label} capture; direct-kill error: \
-                     {direct_kill_error:?}; containment-cleanup error: {tree_error:?}; \
-                     direct child reaped: {direct_reaped}"
-                )
+                format!("failed to initialize {label} capture; {}", cleanup.detail)
             });
         }
     };
     let deadline = Instant::now() + timeout;
     loop {
         if capture.overflowed() {
-            let tree_terminate_error = tree.terminate().err();
-            let direct_kill_error = child.kill().err();
-            let direct_reaped = poll_child_until(
-                &mut child,
-                Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
-                label,
-            )?
-            .is_some();
-            let tree_error = confirm_reap_and_disarm_tree(&mut tree, tree_terminate_error).err();
-            let capture_detail = if direct_reaped && tree_error.is_none() {
+            let cleanup = cleanup_failed_test_process(child, tree, label);
+            let capture_detail = if cleanup.quiescence_proven {
                 match capture.finish_until(Instant::now() + TEST_SUBPROCESS_REAP_GRACE) {
                     Ok((stdout, stderr)) => format!(
                         "stdout-bytes={} stderr-bytes={} stdout={} stderr={}",
@@ -1157,14 +1183,9 @@ pub(crate) fn output_with_timeout(
             };
             anyhow::bail!(
                 "{label} exceeded the {}-byte per-stream capture limit; \
-                 direct-kill error: {direct_kill_error:?}; \
-                 containment-cleanup error: {}; direct child reaped: {direct_reaped}; \
-                 {capture_detail}",
+                 {}; {capture_detail}",
                 TEST_SUBPROCESS_CAPTURE_LIMIT,
-                tree_error
-                    .as_ref()
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "none".to_string()),
+                cleanup.detail,
             );
         }
         match child.try_wait() {
@@ -1177,18 +1198,8 @@ pub(crate) fn output_with_timeout(
                 std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
             }
             Ok(None) => {
-                let cleanup_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
-                let tree_terminate_error = tree.terminate().err();
-                let direct_kill_error = child.kill().err();
-                let (status, reap_error) =
-                    match poll_child_until(&mut child, cleanup_deadline, label) {
-                        Ok(status) => (status, None),
-                        Err(error) => (None, Some(error)),
-                    };
-                let tree_error =
-                    confirm_reap_and_disarm_tree(&mut tree, tree_terminate_error).err();
-                let direct_child_reaped = status.is_some();
-                let capture_detail = if direct_child_reaped && tree_error.is_none() {
+                let cleanup = cleanup_failed_test_process(child, tree, label);
+                let capture_detail = if cleanup.quiescence_proven {
                     match capture.finish_until(Instant::now() + TEST_SUBPROCESS_REAP_GRACE) {
                         Ok((stdout, stderr)) => format!(
                             "stdout={} stderr={}",
@@ -1202,41 +1213,13 @@ pub(crate) fn output_with_timeout(
                     "capture unavailable because process-tree quiescence was not proven".to_string()
                 };
                 anyhow::bail!(
-                    "{label} timed out after {timeout:?}; direct-kill error: {direct_kill_error:?}; reap error: {}; containment-cleanup error: {}; direct child reaped: {}; {capture_detail}",
-                    reap_error
-                        .as_ref()
-                        .map(|error| format!("{error:#}"))
-                        .unwrap_or_else(|| "none".to_string()),
-                    tree_error
-                        .as_ref()
-                        .map(|error| format!("{error:#}"))
-                        .unwrap_or_else(|| "none".to_string()),
-                    direct_child_reaped,
+                    "{label} timed out after {timeout:?}; {}; {capture_detail}",
+                    cleanup.detail,
                 );
             }
             Err(error) => {
-                let cleanup_deadline = Instant::now() + TEST_SUBPROCESS_REAP_GRACE;
-                let tree_terminate_error = tree.terminate().err();
-                let direct_kill_error = child.kill().err();
-                let (reaped, reap_error) =
-                    match poll_child_until(&mut child, cleanup_deadline, label) {
-                        Ok(status) => (status, None),
-                        Err(error) => (None, Some(error)),
-                    };
-                let tree_error =
-                    confirm_reap_and_disarm_tree(&mut tree, tree_terminate_error).err();
-                anyhow::bail!(
-                    "failed to poll {label}: {error}; direct-kill error: {direct_kill_error:?}; reap error: {}; containment-cleanup error: {}; direct child reaped: {}",
-                    reap_error
-                        .as_ref()
-                        .map(|cleanup| format!("{cleanup:#}"))
-                        .unwrap_or_else(|| "none".to_string()),
-                    tree_error
-                        .as_ref()
-                        .map(|cleanup| format!("{cleanup:#}"))
-                        .unwrap_or_else(|| "none".to_string()),
-                    reaped.is_some()
-                );
+                let cleanup = cleanup_failed_test_process(child, tree, label);
+                anyhow::bail!("failed to poll {label}: {error}; {}", cleanup.detail,);
             }
         }
     }
@@ -1358,44 +1341,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn process_tree_guardian_worker() {
-        let Some(ready) = std::env::var_os(TEST_SUBPROCESS_GUARDIAN_READY) else {
-            return;
-        };
-        assert_eq!(
-            std::env::var_os(TEST_SUBPROCESS_GUARDIAN).as_deref(),
-            Some(OsStr::new("1"))
-        );
-        for key in HOSTILE_AUTHORITY_KEYS {
-            assert!(
-                std::env::var_os(key).is_none(),
-                "guardian inherited hostile authority {key}"
-            );
-        }
-        for (key, _) in ALLOWED_WORKER_INPUTS {
-            assert!(
-                std::env::var_os(key).is_none(),
-                "guardian inherited worker-only input {key}"
-            );
-        }
-        if std::env::var_os(TEST_SUBPROCESS_GUARDIAN_EXIT_BEFORE_READY).is_some() {
-            return;
-        }
-
-        let process_group = unsafe { libc::getpgrp() };
-        let readiness = format!("{} {process_group}", std::process::id());
-        let ready = PathBuf::from(ready);
-        let staged_ready = ready.with_extension("staged");
-        fs_write(staged_ready.clone(), readiness.as_bytes());
-        std::fs::rename(staged_ready, ready).unwrap();
-        let mut ownership = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut ownership);
-        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-        std::process::abort();
-    }
-
     #[test]
     fn sleep_worker() {
         let Some(marker) = std::env::var_os(SLEEP_WORKER) else {
@@ -1409,6 +1354,30 @@ mod tests {
         fs_write(
             PathBuf::from(marker).with_extension("finished"),
             b"finished",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_cleanup_reaps_exact_child_before_guardian_finalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::test_subprocess::tests::sleep_worker",
+                "--nocapture",
+            ])
+            .env(SLEEP_WORKER, temp.path().join("retained-cleanup"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (child, tree) = TestProcessTree::spawn(command, "retained cleanup fixture").unwrap();
+
+        let status = RetainedTestProcessCleanup { child, tree }.run();
+        assert!(
+            !status.success(),
+            "retained cleanup did not terminate its exact direct child"
         );
     }
 
@@ -1427,7 +1396,7 @@ mod tests {
 
         let started = Instant::now();
         let timeout = Duration::from_secs(5);
-        let error = output_with_timeout(&mut command, "bounded sleep-worker fixture", timeout)
+        let error = output_with_timeout(command, "bounded sleep-worker fixture", timeout)
             .expect_err("the bounded helper must terminate the sleeping worker");
 
         let message = format!("{error:#}");
@@ -1449,10 +1418,13 @@ mod tests {
         if let Some(marker) = std::env::var_os(DESCENDANT_MARKER) {
             println!("descendant inherited stdout");
             std::io::stdout().flush().unwrap();
+            let pid_marker = PathBuf::from(&marker).with_extension("pid");
+            let staged_pid_marker = PathBuf::from(&marker).with_extension("pid.staged");
             fs_write(
-                PathBuf::from(&marker).with_extension("pid"),
+                staged_pid_marker.clone(),
                 std::process::id().to_string().as_bytes(),
             );
+            std::fs::rename(staged_pid_marker, pid_marker).unwrap();
             std::thread::sleep(Duration::from_secs(30));
             fs_write(
                 PathBuf::from(marker).with_extension("finished"),
@@ -1473,12 +1445,20 @@ mod tests {
             .env(DESCENDANT_MARKER, &marker)
             .spawn()
             .unwrap();
+        let pid_marker = marker.with_extension("pid");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.with_extension("pid").is_file() && Instant::now() < deadline {
+        let mut descendant_pid = None;
+        while descendant_pid.is_none() && Instant::now() < deadline {
             assert!(descendant.try_wait().unwrap().is_none());
             std::thread::sleep(TEST_SUBPROCESS_POLL_INTERVAL);
+            descendant_pid = std::fs::read_to_string(&pid_marker)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok());
         }
-        assert!(marker.with_extension("pid").is_file());
+        assert!(
+            descendant_pid.is_some(),
+            "descendant never published a parseable PID marker"
+        );
         drop(descendant);
     }
 
@@ -1497,7 +1477,7 @@ mod tests {
 
         let started = Instant::now();
         let output = output_with_timeout(
-            &mut command,
+            command,
             "inherited-output descendant fixture",
             Duration::from_secs(10),
         )
@@ -1507,6 +1487,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("descendant inherited stdout"));
         let pid = std::fs::read_to_string(marker.with_extension("pid"))
             .unwrap()
+            .trim()
             .parse::<u32>()
             .unwrap();
         assert!(
@@ -1526,17 +1507,17 @@ mod tests {
             "--nocapture",
         ]);
         let (mut child, mut tree) =
-            TestProcessTree::spawn(&mut command, "one-shot process-group worker").unwrap();
+            TestProcessTree::spawn(command, "one-shot process-group worker").unwrap();
         assert!(matches!(
             tree.process_group,
-            Some(UnixTestProcessGroup::Armed(_))
+            Some(UnixTestProcessGroup::Armed)
         ));
         assert!(child.wait().unwrap().success());
 
         tree.terminate().unwrap();
         assert!(matches!(
             tree.process_group,
-            Some(UnixTestProcessGroup::TerminationRequested(_))
+            Some(UnixTestProcessGroup::TerminationRequested)
         ));
         tree.terminate()
             .expect("a repeated terminate request must not signal the numeric PGID again");
@@ -1565,26 +1546,27 @@ mod tests {
                 "commands::test_subprocess::tests::sleep_worker",
                 "--nocapture",
             ])
-            .env(TEST_SUBPROCESS_GUARDIAN_EXIT_BEFORE_READY, "1");
-        let error = match TestProcessTree::spawn(
-            &mut command,
-            "guardian early-exit process-group worker",
-        ) {
-            Ok((mut child, mut tree)) => {
-                let _ = child.kill();
-                let _ = poll_child_until(
-                    &mut child,
-                    Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
-                    "unexpected early-exit worker",
-                );
-                let _ = terminate_and_confirm_tree(&mut tree);
-                panic!("guardian unexpectedly published readiness");
-            }
-            Err(error) => error,
-        };
+            .env(
+                kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY_ENV,
+                "1",
+            );
+        let error =
+            match TestProcessTree::spawn(command, "guardian early-exit process-group worker") {
+                Ok((mut child, mut tree)) => {
+                    let _ = child.kill();
+                    let _ = poll_child_until(
+                        &mut child,
+                        Instant::now() + TEST_SUBPROCESS_REAP_GRACE,
+                        "unexpected early-exit worker",
+                    );
+                    let _ = terminate_and_confirm_tree(&mut tree);
+                    panic!("guardian unexpectedly published readiness");
+                }
+                Err(error) => error,
+            };
         let message = format!("{error:#}");
         assert!(
-            message.contains("did not publish readiness"),
+            message.contains("readiness"),
             "unexpected early-guardian-exit error: {message}"
         );
     }
@@ -1621,7 +1603,7 @@ mod tests {
             .env_remove(PARENT_DEATH_OWNER)
             .env(PARENT_DEATH_DESCENDANT, &marker);
         let output = output_with_timeout(
-            &mut command,
+            command,
             "parent-death guarded descendant",
             Duration::from_secs(30),
         );
@@ -1768,7 +1750,7 @@ mod tests {
                 command.env(key, value);
             }
             let output = output_with_timeout(
-                &mut command,
+                command,
                 "authority-isolated nested worker",
                 Duration::from_secs(10),
             )
@@ -1788,7 +1770,7 @@ mod tests {
             ])
             .env(AUTHORITY_OUTER, &marker);
         let output = output_with_timeout(
-            &mut command,
+            command,
             "ambient-authority isolation owner",
             Duration::from_secs(20),
         )

@@ -620,7 +620,7 @@ fn run_git_output(root: &Path, git_dir: Option<&Path>, args: &[&str]) -> Result<
     command.args(args.iter().map(OsStr::new));
     finalize_eject_git_process(&mut command, &host_path);
     crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
-        &mut command,
+        command,
         &format!("Git interoperability proof {args:?}"),
         eject_git_timeout(args),
         EJECT_GIT_CAPTURE_LIMIT,

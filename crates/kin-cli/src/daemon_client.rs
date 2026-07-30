@@ -2738,8 +2738,7 @@ fn daemon_binary_supports_supervisor(path: &Path) -> bool {
     command.arg("--help");
     let label = format!("{} --help", path.display());
     let output =
-        match probe_process::output_with_timeout(&mut command, &label, DAEMON_BINARY_PROBE_TIMEOUT)
-        {
+        match probe_process::output_with_timeout(command, &label, DAEMON_BINARY_PROBE_TIMEOUT) {
             Ok(output) => output,
             Err(error) => {
                 warn!(
@@ -2792,9 +2791,8 @@ fn daemon_binary_matches_cli_graph(path: &Path) -> Result<(), String> {
     let mut command = Command::new(path);
     command.arg("--compat-json");
     let label = format!("{} --compat-json", path.display());
-    let output =
-        probe_process::output_with_timeout(&mut command, &label, DAEMON_BINARY_PROBE_TIMEOUT)
-            .map_err(|error| format!("compat probe failed to execute: {error}"))?;
+    let output = probe_process::output_with_timeout(command, &label, DAEMON_BINARY_PROBE_TIMEOUT)
+        .map_err(|error| format!("compat probe failed to execute: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "compat probe exited with {} ({})",

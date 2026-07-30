@@ -402,13 +402,7 @@ fn runtime_command_rebinds_git_and_kin_authority_at_launch() {
         .env("KIN_REGISTRY_PATH", "/command-local/registry.toml")
         .env("KIN_TEST_RUNTIME_OWNER_TOKEN", "hostile-owner")
         .env("KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP", "1");
-    let output = command.output().expect("run runtime authority probe");
-    assert!(
-        output.status.success(),
-        "kin --version failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    command.prepare_for_launch_for_test();
     for removed in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -453,6 +447,13 @@ fn runtime_command_rebinds_git_and_kin_authority_at_launch() {
         )),
         Some(Some(OsString::from("1"))),
         "isolated runtime lost its bounded tokio shutdown grace"
+    );
+    let output = command.output().expect("run runtime authority probe");
+    assert!(
+        output.status.success(),
+        "kin --version failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -646,15 +647,7 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         .env("LD_AUDIT", "/hostile/libaudit.so")
         .env("LD_CUSTOM_INJECTION", "/hostile/custom-loader")
         .env("KIN_DAEMON_BIN", "/intentional/test-daemon");
-    let version = launch_bound
-        .output()
-        .expect("run launch-time authority regression");
-    assert!(
-        version.status.success(),
-        "kin --version failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&version.stdout),
-        String::from_utf8_lossy(&version.stderr)
-    );
+    launch_bound.prepare_for_launch_for_test();
     assert_eq!(
         launch_bound.configured_env_for_test(std::ffi::OsStr::new("KIN_REGISTRY_PATH")),
         Some(Some(runtime.registry_path().as_os_str().to_os_string())),
@@ -696,6 +689,15 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         launch_bound.configured_env_for_test(std::ffi::OsStr::new("KIN_DAEMON_BIN")),
         Some(Some(OsString::from("/intentional/test-daemon"))),
         "intentional safe daemon override was not preserved"
+    );
+    let version = launch_bound
+        .output()
+        .expect("run launch-time authority regression");
+    assert!(
+        version.status.success(),
+        "kin --version failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr)
     );
     let init = runtime
         .kin_command()
@@ -865,14 +867,14 @@ fn parent_death_runtime_worker() {
     std::fs::create_dir_all(repository.join(".kin")).expect("create Kin control dir");
     let runtime = common::IsolatedDaemonRuntime::new(&repository);
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    runtime.mark_owned_process_for_test(&mut command);
-    let _descendant = command
+    command
         .args(["--exact", "containment_process_tree_worker", "--nocapture"])
         .env(TREE_DESCENDANT, &descendant_marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let _descendant = runtime
+        .spawn_owned_process_for_test(command)
         .expect("spawn parent-death descendant");
     let descendant = recorded_pid(&descendant_marker);
     publish_marker_atomically(&ready, descendant.to_string());
@@ -927,17 +929,17 @@ fn hard_parent_death_terminates_the_guarded_process_group() {
 fn spawn_contained_process_tree(
     root: &Path,
     runtime: &common::IsolatedDaemonRuntime,
-) -> (Child, u32) {
+) -> (common::RuntimeOwnedChild, u32) {
     let marker = root.join("descendant.pid");
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    runtime.mark_owned_process_for_test(&mut command);
-    let child = command
+    command
         .args(["--exact", "containment_process_tree_worker", "--nocapture"])
         .env(TREE_PARENT, &marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let child = runtime
+        .spawn_owned_process_for_test(command)
         .expect("spawn contained process tree");
     let descendant = recorded_pid(&marker);
     (child, descendant)
@@ -1078,16 +1080,16 @@ fn descendant_spawned_during_graceful_cleanup_is_still_reaped() {
         Duration::from_secs(1),
     );
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    runtime.mark_owned_process_for_test(&mut command);
-    let mut parent = command
+    command
         .args(["--exact", "containment_process_tree_worker", "--nocapture"])
         .env(TREE_PARENT, &descendant_marker)
         .env(TREE_PARENT_READY, &parent_ready)
         .env(TREE_WAIT_FOR_TRIGGER, &trigger)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    let mut parent = runtime
+        .spawn_owned_process_for_test(command)
         .expect("spawn delayed contained process tree");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !parent_ready.is_file() && Instant::now() < deadline {
