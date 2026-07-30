@@ -8,6 +8,7 @@
 //! views: they agree immediately after admission, while daemon routing tests
 //! separately pin that later live-only enrichment does not rewrite authority.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
@@ -143,6 +144,34 @@ fn seed_repository(repo: &Path) {
     .expect("write semantic add/modify/remove transition");
     run_git(repo, &["add", "--all"]);
     run_git(repo, &["commit", "-m", "advance semantic identities"]);
+}
+
+/// A repository whose cross-file facts are two imports of one symbol name from
+/// two different external modules. This is what an ordinary repository looks
+/// like part way through a migration, `use log::info` in one file beside
+/// `use tracing::info` in another, and the same shape arises from
+/// `anyhow::Result` beside `std::io::Result`, or `useState` imported from both
+/// `react` and `preact/hooks`.
+fn seed_repository_with_same_named_external_imports(repo: &Path) {
+    fs::create_dir_all(repo.join("src")).expect("create source directory");
+    run_git(repo, &["init", "--initial-branch=main"]);
+    run_git(repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(repo, &["config", "user.name", "Kin"]);
+    fs::write(
+        repo.join("src/legacy.rs"),
+        b"extern crate log;\n\nuse log::info;\n\npub fn legacy() {\n    info();\n}\n",
+    )
+    .expect("write the importer on the old logger");
+    fs::write(
+        repo.join("src/current.rs"),
+        b"extern crate tracing;\n\nuse tracing::info;\n\npub fn current() {\n    info();\n}\n",
+    )
+    .expect("write the importer on the new logger");
+    run_git(repo, &["add", "--all"]);
+    run_git(
+        repo,
+        &["commit", "-m", "two external modules, one symbol name"],
+    );
 }
 
 struct AdmittedRepository {
@@ -281,6 +310,61 @@ fn graph_validate_reports_pending_enrichment_and_agrees_with_status() {
         note_lines(&validate),
         note_lines(&status),
         "validate and status must agree on note presence for one repo state"
+    );
+}
+
+/// Admission binds one external reference target per unresolved import source,
+/// and two imports of one symbol name produce two of them. Both carry that
+/// symbol as their name, no file, no span, and the same uniform kind, so a
+/// duplicate check that keys on name and declaration position alone sees one
+/// entity recorded twice. Validate would then print a corruption report and exit
+/// non-zero on a graph Kin had just written correctly, on any repository that
+/// imports a common name such as `Error`, `Result`, or `info` from two modules.
+#[test]
+fn graph_validate_accepts_same_named_external_targets_from_different_modules() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repository_with_same_named_external_imports(&repo);
+    let result = kin_core::init_from_git(&repo).expect("admit exact Git repository authority");
+    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&result.layout)
+        .expect("bind published repository authority");
+    let graph = workspace_query_graph(&binding);
+
+    // The shape under test has to be present, or passing proves nothing.
+    let targets: Vec<_> = graph
+        .list_all_entities()
+        .expect("list entities")
+        .into_iter()
+        .filter(|entity| entity.name == "info" && entity.file_origin.is_none())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        2,
+        "admission binds one external target per import source: {targets:?}"
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .map(|entity| entity.id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2,
+        "the two targets are distinct entities, not one recorded twice"
+    );
+
+    let validate = graph_validate(&binding, &graph);
+
+    assert!(
+        !validate.lines.iter().any(|line| line.contains("duplicate")),
+        "two distinct external targets are not a duplicated entity: {}",
+        validate.lines.join("\n")
+    );
+    assert!(
+        validate.error.is_none(),
+        "a healthy graph must not fail validate: {:?}\n{}",
+        validate.error,
+        validate.lines.join("\n")
     );
 }
 

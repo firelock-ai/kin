@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A daemon that refuses to start can no longer take the running daemon's
+  endpoint down with it. `.kin/daemon.pid` and `.kin/daemon.port` are now
+  attributed by a `.kin/daemon.owner` record naming the exact process
+  incarnation that published them, a process may retire only an endpoint it can
+  prove it owns, and a daemon whose endpoint files are removed by something else
+  republishes them and keeps serving rather than shutting down. Retrying a
+  failing MCP call while a daemon was warming used to kill the daemon being
+  waited on.
+- The daemon publishes only a real bound port. Port `0` is refused on
+  publication and read as unpublished, so a daemon started with `--port 0` can
+  no longer leave behind an endpoint record nothing can connect to while it goes
+  on owning the repository.
+- The derived ingestion CAS is committed at the points that need it rather than
+  relying on its self-drain. `kin-blobs` 0.1.3 amortizes the directory barrier
+  that makes a blob's name durable, so a write returning successfully no longer
+  implies the name survives a crash; the barrier is now issued before each graph
+  snapshot records those names, and again on graceful daemon shutdown. A
+  force-escalated shutdown, which exists to end a wedged process, still skips
+  it, and the store re-hydrates on open.
+- The ingestion CAS is hydrated from repository authority on the storage-backend
+  open path as well as the local one, so projection reads on a freshly opened
+  hosted graph find the source bodies they reference. Hydration consults the
+  local cache before fetching, and an instance whose cache already covers the
+  tree does no remote work at all, where every open previously re-fetched every
+  body before checking.
+
 ## [0.3.6] - 2026-07-26
 
 ### Added

@@ -254,15 +254,20 @@ async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result
 //    hydration is a blocking task rather than a drained handle, but the API
 //    server's graceful shutdown waits on in-flight requests, so a hydrating
 //    daemon rides this full 10s;
-// 3. the final storage flush and endpoint-file removal run (fast on the local
-//    backend);
+// 3. the final storage flush, the derived-CAS directory barrier, and
+//    endpoint-file removal run (all fast on the local backend; the barrier is
+//    bounded at one fsync per shard directory touched, so at most 256);
 // 4. `runtime.shutdown_timeout(runtime_shutdown_grace())` waits up to 8s for
 //    the blocking pool, then abandons whatever is still running;
 // 5. the process exits.
 //
 // That normal path is ~18s. Independently, the escalation watchdog force-exits
 // DEFAULT_SHUTDOWN_ESCALATION_GRACE after shutdown is signalled, so the hard
-// bound is ~25s. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
+// bound is ~25s. A force-escalated exit skips step 3 entirely: neither the
+// barrier nor endpoint retirement runs, which is the deliberate trade of a
+// backstop that exists to end a wedged process. Both are recoverable, since
+// the derived CAS re-hydrates on open and a stale endpoint is swept by the
+// next liveness probe. Owner death costs at most one OWNER_WATCH_CHECK_INTERVAL of
 // detection on top of the same bound: ~27s from owner exit to process gone,
 // with no signal ever sent.
 //
@@ -347,20 +352,76 @@ pub fn runtime_shutdown_grace() -> Duration {
     )
 }
 
-fn endpoint_files_missing(state: &DaemonState) -> bool {
+/// What the on-disk control plane says about this daemon's right to keep
+/// serving.
+///
+/// Endpoint files disappearing is not, on its own, a reason for a healthy
+/// daemon to die. The two cases that are — the repository was removed, or
+/// another daemon took the repo over — are distinguishable from a third party
+/// deleting `daemon.pid`/`daemon.port` out from under a running incumbent, and
+/// conflating them is how a refused second start killed the daemon it lost to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlane {
+    /// `.kin` is present and the published endpoint names this process.
+    Ours,
+    /// The `.kin` root itself is gone: `kin eject` or doctor removed the repo.
+    RootGone,
+    /// The endpoint names a different daemon that is still running, so this
+    /// process is no longer the one serving the repo.
+    Superseded { pid: u32 },
+    /// `.kin` is present, but this daemon's endpoint is missing, incomplete, or
+    /// attributed to a process that is gone. The daemon still owns the repo
+    /// singleton, so the endpoint is repairable rather than fatal.
+    EndpointLost,
+}
+
+/// How often the control plane is re-examined when no idle timeout paces the
+/// monitor. Cheap: three `exists` checks and, at most, one small read.
+const CONTROL_PLANE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether the `.kin` directory this daemon serves has been removed. The only
+/// condition under which a flush must be skipped: there is nowhere to write.
+fn repository_root_missing(state: &DaemonState) -> bool {
+    !state.layout.root().exists()
+}
+
+fn classify_control_plane(state: &DaemonState) -> ControlPlane {
     let root = state.layout.root();
-    !root.join("daemon.pid").exists() || !root.join("daemon.port").exists()
+    if !root.exists() {
+        return ControlPlane::RootGone;
+    }
+    // Yielding is gated on proof, not on a PID. This daemon holds the
+    // repository singleton for its whole lifetime, so no legitimate successor
+    // can exist; a foreign endpoint that cannot prove a live owner is debris,
+    // and treating debris as an eviction notice is what killed the incumbent.
+    if let Some(pid) = crate::lifecycle::proven_live_other_endpoint_owner(root) {
+        return ControlPlane::Superseded { pid };
+    }
+    match crate::lifecycle::endpoint_ownership(root) {
+        crate::lifecycle::EndpointOwnership::CurrentProcess
+            if crate::lifecycle::read_port_file(root).is_some() =>
+        {
+            ControlPlane::Ours
+        }
+        _ => ControlPlane::EndpointLost,
+    }
 }
 
-fn control_plane_missing(state: &DaemonState) -> bool {
-    !state.layout.root().exists() || endpoint_files_missing(state)
-}
-
-fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool {
+fn ready_for_idle_shutdown(
+    state: &DaemonState,
+    idle_timeout: Duration,
+    control_plane: ControlPlane,
+) -> bool {
     if state.active_request_count() > 0 {
         return false;
     }
-    if endpoint_files_missing(state) {
+    if control_plane == ControlPlane::EndpointLost {
+        // Rare by construction: the control-plane check earlier in this same
+        // tick repairs a lost endpoint, so reaching here means republication
+        // itself failed. Kept because that is exactly when it matters: the
+        // daemon is unreachable by new clients, so the usual initialization and
+        // session gates cannot be waiting on anything, and it should be allowed
+        // to idle out rather than linger unreachable.
         return state.idle_duration() >= idle_timeout;
     }
     if !state
@@ -473,15 +534,87 @@ fn watched_process_is_alive(_pid: i32) -> bool {
     true
 }
 
+/// Watch the control plane for the two states that end this daemon, repairing
+/// the one that does not.
+///
+/// Returns `true` when the daemon must shut down. A lost endpoint is
+/// republished instead: this process holds the repository singleton, so it is
+/// the only legitimate publisher, and restoring its own record is the exact
+/// truth rather than a guess. Republication also makes the failure
+/// self-healing, because the clients that lost the endpoint find it again on
+/// their next poll.
+fn control_plane_demands_shutdown(
+    state: &DaemonState,
+    bound_port: u16,
+    shutting_down: bool,
+) -> bool {
+    match classify_control_plane(state) {
+        ControlPlane::Ours => false,
+        ControlPlane::RootGone => {
+            warn!(
+                root = %state.layout.root().display(),
+                "Kin control directory disappeared; shutting down daemon"
+            );
+            true
+        }
+        ControlPlane::Superseded { pid } => {
+            warn!(
+                root = %state.layout.root().display(),
+                successor_pid = pid,
+                "another daemon now owns this repository endpoint; shutting down"
+            );
+            true
+        }
+        ControlPlane::EndpointLost if shutting_down => {
+            // Retirement is already running or about to. Republishing now
+            // would race it and could land after it, leaving an endpoint
+            // advertising a daemon that is about to exit. Task drain is
+            // bounded and does not abort this monitor, and publication can
+            // block on the coordination lock, so the window is real.
+            false
+        }
+        ControlPlane::EndpointLost => {
+            match crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port) {
+                Ok(()) => info!(
+                    root = %state.layout.root().display(),
+                    port = bound_port,
+                    "daemon endpoint files were removed by another process; republished them"
+                ),
+                Err(error) => warn!(
+                    root = %state.layout.root().display(),
+                    port = bound_port,
+                    %error,
+                    "daemon endpoint files are missing and could not be republished"
+                ),
+            }
+            false
+        }
+    }
+}
+
 async fn run_idle_monitor(
     state: Arc<DaemonState>,
     idle_timeout: Option<Duration>,
+    bound_port: u16,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let Some(idle_timeout) = idle_timeout else {
-        let _ = cancel_rx.changed().await;
-        return;
+        // Endpoint repair is the idle monitor's other job, so it must keep
+        // running even for a daemon that never idles out.
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(CONTROL_PLANE_CHECK_INTERVAL) => {}
+                _ = cancel_rx.changed() => return,
+            }
+            if *cancel_rx.borrow() {
+                return;
+            }
+            if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
+                let _ = cancel_tx.send(true);
+                return;
+            }
+        }
     };
     let check_interval = idle_check_interval(idle_timeout);
     // Start the idle window from when monitoring begins, not from process
@@ -504,17 +637,14 @@ async fn run_idle_monitor(
         if *cancel_rx.borrow() {
             return;
         }
-        if control_plane_missing(&state) {
-            warn!(
-                root = %state.layout.root().display(),
-                "Kin control directory disappeared; shutting down daemon"
-            );
+        if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
             let _ = cancel_tx.send(true);
             return;
         }
-        if ready_for_idle_shutdown(&state, idle_timeout) {
+        let control_plane = classify_control_plane(&state);
+        if ready_for_idle_shutdown(&state, idle_timeout, control_plane) {
             if state.is_dirty() {
-                if control_plane_missing(&state) {
+                if repository_root_missing(&state) {
                     warn!(
                         root = %state.layout.root().display(),
                         "skipping dirty graph flush before idle shutdown because Kin control directory is gone"
@@ -522,7 +652,7 @@ async fn run_idle_monitor(
                 } else {
                     info!("flushing dirty graph before idle shutdown");
                     if let Err(error) = save_snapshot_blocking(Arc::clone(&state)).await {
-                        if control_plane_missing(&state) {
+                        if repository_root_missing(&state) {
                             warn!(
                                 error = %error,
                                 root = %state.layout.root().display(),
@@ -737,7 +867,14 @@ pub async fn run_with_authority(
     let idle_cancel_tx = cancel_tx.clone();
     let idle_cancel = cancel_rx.clone();
     let idle_handle = tokio::spawn(async move {
-        run_idle_monitor(idle_state, idle_timeout, idle_cancel_tx, idle_cancel).await
+        run_idle_monitor(
+            idle_state,
+            idle_timeout,
+            bound_port,
+            idle_cancel_tx,
+            idle_cancel,
+        )
+        .await
     });
 
     // Opt-in owner-death watchdog. A harness (e.g. the benchmark driver) sets
@@ -1972,11 +2109,32 @@ pub async fn run_with_authority(
     )
     .await;
 
+    // The derived ingestion CAS defers its directory barriers and commits them
+    // on an explicit sync, on drop, or on a self-drain. This process ends in
+    // `process::exit`, which runs no destructor, so the barrier has to be
+    // issued here or the only one that ever fires is the self-drain.
+    sync_blob_store_blocking(Arc::clone(&state)).await;
+
     // Remove PID and port files after final flush work finishes, so a successor
     // daemon cannot start while this process is still draining persistent state.
     crate::lifecycle::remove_daemon_files_if_current_process(state.layout.root());
 
     result
+}
+
+/// Issue the ingestion CAS barrier off the async workers: it is a run of
+/// `fsync` calls on directories, one per shard touched since the last commit.
+async fn sync_blob_store_blocking(state: Arc<DaemonState>) {
+    let outcome = tokio::task::spawn_blocking(move || state.sync_blob_store()).await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(%error, "ingestion CAS barrier failed on shutdown")
+        }
+        Err(error) => {
+            warn!(%error, "ingestion CAS barrier task failed on shutdown")
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2204,7 +2362,7 @@ mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
         parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
-        shutdown_signalled, watched_process_is_alive, DaemonConfig, DaemonState,
+        shutdown_signalled, watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
         DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2256,6 +2414,152 @@ mod tests {
                 && !repo_b_kin_root.join("daemon.port").exists(),
             "authority mismatch must fail before endpoint publication"
         );
+    }
+
+    // ── Control-plane classification ──────────────────────────────────────
+    //
+    // A healthy daemon used to read "my endpoint files are gone" as "the
+    // repository is gone" and shut itself down, which is how a refused second
+    // start killed the incumbent it lost to. The two states that genuinely end
+    // a daemon are distinguishable from the one that is repairable.
+
+    #[tokio::test]
+    async fn a_published_endpoint_reads_as_this_daemons_own() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+
+        assert_eq!(super::classify_control_plane(&state), ControlPlane::Ours);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_endpoint_is_repairable_rather_than_fatal() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+
+        std::fs::remove_file(kin_root.join("daemon.pid")).unwrap();
+        std::fs::remove_file(kin_root.join("daemon.port")).unwrap();
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::EndpointLost
+        );
+        assert!(
+            !super::control_plane_demands_shutdown(&state, 51234, false),
+            "a daemon that still owns the repo must repair its endpoint, not exit"
+        );
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::Ours,
+            "the repair must republish this daemon's own endpoint"
+        );
+        assert_eq!(
+            crate::lifecycle::read_port_file(&kin_root),
+            Some(51234),
+            "republication must restore the port this daemon actually bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_endpoint_is_not_republished_once_shutdown_is_signalled() {
+        // Task drain is bounded and does not abort this monitor, and
+        // publication can block on the coordination lock, so a repair that
+        // started late could land after retirement and advertise an endpoint
+        // for a process that is exiting.
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+        std::fs::remove_file(kin_root.join("daemon.pid")).unwrap();
+        std::fs::remove_file(kin_root.join("daemon.port")).unwrap();
+
+        assert!(
+            !super::control_plane_demands_shutdown(&state, 51234, true),
+            "a lost endpoint is still not a reason to shut down"
+        );
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::EndpointLost,
+            "a shutting-down daemon must not republish an endpoint it is about to retire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removed_repository_root_ends_the_daemon() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        crate::lifecycle::publish_daemon_endpoint(&kin_root, 51234).unwrap();
+
+        std::fs::remove_dir_all(&kin_root).unwrap();
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::RootGone
+        );
+        assert!(super::control_plane_demands_shutdown(&state, 51234, false));
+    }
+
+    #[tokio::test]
+    async fn a_proven_live_successor_endpoint_ends_the_daemon() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        let mut successor = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in successor");
+        let identity = kin_cli::daemon_client::process_identity(successor.id())
+            .expect("read the successor's identity")
+            .expect("the successor is running");
+        crate::lifecycle::publish_foreign_endpoint_for_test(&kin_root, identity, 51234);
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::Superseded {
+                pid: successor.id()
+            }
+        );
+        assert!(super::control_plane_demands_shutdown(&state, 4219, false));
+        assert_eq!(
+            std::fs::read_to_string(kin_root.join("daemon.port")).unwrap(),
+            "51234",
+            "yielding to a successor must not disturb the endpoint it published"
+        );
+
+        let _ = successor.kill();
+        let _ = successor.wait();
+    }
+
+    #[tokio::test]
+    async fn a_foreign_endpoint_that_proves_nothing_is_repaired_not_obeyed() {
+        // PID 1 is alive and is not this process, but a bare-PID record cannot
+        // prove that number still names a daemon. This process holds the
+        // repository singleton, so no successor can legitimately exist and the
+        // record is debris — the exact debris a refusing starter used to leave.
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let kin_root = initialized.layout.root().to_path_buf();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        std::fs::write(kin_root.join("daemon.pid"), "1").unwrap();
+        std::fs::write(kin_root.join("daemon.port"), "51234").unwrap();
+
+        assert_eq!(
+            super::classify_control_plane(&state),
+            ControlPlane::EndpointLost
+        );
+        assert!(!super::control_plane_demands_shutdown(&state, 4219, false));
+        assert_eq!(super::classify_control_plane(&state), ControlPlane::Ours);
+        assert_eq!(crate::lifecycle::read_port_file(&kin_root), Some(4219));
     }
 
     #[test]

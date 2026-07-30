@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use kin_model::{Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, RelationKind};
+use kin_model::{
+    Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, Hash256, RelationKind,
+};
 use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
@@ -194,17 +196,32 @@ fn build_graph_status_response(
     let health = inspect_graph(binding, graph)?;
 
     let entities = graph.list_all_entities()?;
-    let entity_count = entities.len();
 
-    // Role counts
+    // An external reference target is a node this repository references without
+    // owning: no file, no span, no signature, and a uniform kind. Counting it
+    // among the entities this repository holds would report documentation
+    // coverage falling with no change to documentation, put a fabricated bucket
+    // in the kind histogram, and make the entity and file totals stop
+    // corresponding. It is counted on its own line instead, so it is disclosed
+    // rather than either hidden or folded into a claim about this repository's
+    // own code.
+    let (defined, external_targets): (Vec<&Entity>, Vec<&Entity>) = entities
+        .iter()
+        .partition(|e| !kin_index::is_external_reference_target(e));
+    let entity_count = defined.len();
+
+    // Role counts, over the entities this repository defines. Role
+    // classification is a statement about a repository's own files, and the
+    // warning below reads these counts to decide whether the classifier ran at
+    // all.
     let mut role_counts: HashMap<EntityRole, usize> = HashMap::new();
-    for e in &entities {
+    for e in &defined {
         *role_counts.entry(e.role).or_insert(0) += 1;
     }
 
     // Kind counts
     let mut kind_counts: HashMap<EntityKind, usize> = HashMap::new();
-    for e in &entities {
+    for e in &defined {
         *kind_counts.entry(e.kind).or_insert(0) += 1;
     }
 
@@ -235,7 +252,7 @@ fn build_graph_status_response(
     let embed_status = graph.embedding_status();
 
     // Doc summary coverage
-    let with_docs = entities.iter().filter(|e| e.doc_summary.is_some()).count();
+    let with_docs = defined.iter().filter(|e| e.doc_summary.is_some()).count();
 
     let mut lines = Vec::new();
     lines.push("=== Graph Health ===".to_string());
@@ -253,6 +270,10 @@ fn build_graph_status_response(
         } else {
             total_relations as f64 / entity_count as f64
         }
+    ));
+    lines.push(format!(
+        "External reference targets: {}",
+        external_targets.len()
     ));
     lines.push(String::new());
 
@@ -405,24 +426,42 @@ fn build_graph_validate_response(
 
     // Check for duplicate entities (same name + file + kind + byte position).
     // Using byte position distinguishes legitimate overloads (Python @overload,
-    // Rust impl From<X>, C++ template specializations) from true duplicates.
-    // Two entities at different positions in the same file are never duplicates.
-    let mut seen: HashMap<(String, Option<String>, EntityKind, usize), Vec<kin_model::EntityId>> =
-        HashMap::new();
+    // Rust impl From<X>, C++ template specializations) from true duplicates: two
+    // entities declared at different positions in one file are never duplicates.
+    //
+    // An entity with no span has no position to be distinguished by, and
+    // collapsing that to byte zero makes the position discriminate nothing. An
+    // external reference target is exactly that shape: it stands for a symbol
+    // another repository owns, so it carries no file and no span, and its kind
+    // is uniform. Name alone would then report two legitimately distinct
+    // targets as one duplicated entity, which is what `use log::info` beside
+    // `use tracing::info` produces on an ordinary repository. Its fingerprint
+    // is derived from the facts that do identify it, the import source and the
+    // symbol, so it stands in for the absent position and keeps the check
+    // meaningful: two targets naming different import sources stay distinct,
+    // while two entities claiming the same import source and symbol are still
+    // reported. Entities that do carry a span keep the position key exactly as
+    // before, so nothing this check used to catch stops being caught.
+    let mut seen: HashMap<
+        (String, Option<String>, EntityKind, usize, Option<Hash256>),
+        Vec<kin_model::EntityId>,
+    > = HashMap::new();
     for e in &entities {
         let start_byte = e.span.as_ref().map(|s| s.start_byte).unwrap_or(0);
+        let placeless_identity = e.span.is_none().then_some(e.fingerprint.ast_hash);
         let key = (
             e.name.clone(),
             e.file_origin.as_ref().map(|f| f.0.clone()),
             e.kind,
             start_byte,
+            placeless_identity,
         );
         seen.entry(key).or_default().push(e.id);
     }
     let duplicates: Vec<_> = seen.iter().filter(|(_, ids)| ids.len() > 1).collect();
     if !duplicates.is_empty() {
         issues.push(format!(
-            "{} true duplicate entities (same name+file+kind+position)",
+            "{} true duplicate entities (same name+file+kind, same position or same identity)",
             duplicates.len()
         ));
     }
@@ -1789,6 +1828,61 @@ mod tests {
             .iter()
             .filter(|line| line.starts_with('ℹ'))
             .collect()
+    }
+
+    /// The shape admission binds for a symbol another repository owns. Two of
+    /// them differ only in the fingerprint derived from their import source and
+    /// symbol, which is what makes that fingerprint the identity the duplicate
+    /// check has to read.
+    fn external_target_entity(name: &str, import_identity: u8) -> Entity {
+        let mut entity = test_entity(name);
+        entity.kind = EntityKind::Module;
+        entity.role = EntityRole::External;
+        entity.signature = String::new();
+        entity.fingerprint.ast_hash = Hash256::from_bytes([import_identity; 32]);
+        entity
+    }
+
+    fn duplicate_line(response: &GraphCommandResponse) -> Option<&String> {
+        response
+            .lines
+            .iter()
+            .find(|line| line.contains("duplicate"))
+    }
+
+    /// Two external targets naming one symbol through different import sources
+    /// are two entities, and reporting them as one duplicated entity makes
+    /// validate assert corruption against a graph Kin wrote correctly. The
+    /// converse still has to hold: two entities that make the same claim about
+    /// one external target are a real duplicate, and the check that stops
+    /// false-positiving must not stop detecting.
+    #[test]
+    fn graph_validate_separates_distinct_external_targets_from_duplicated_ones() {
+        let (_temp, _layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        graph
+            .upsert_entity(&external_target_entity("info", 0x11))
+            .unwrap();
+        graph
+            .upsert_entity(&external_target_entity("info", 0x22))
+            .unwrap();
+
+        let distinct = build_graph_validate_response(&binding, &graph).unwrap();
+        assert!(
+            duplicate_line(&distinct).is_none(),
+            "distinct import sources are distinct entities: {}",
+            distinct.lines.join("\n")
+        );
+
+        // A third entity repeating the second one's claim: same name, same
+        // import identity, its own entity id.
+        graph
+            .upsert_entity(&external_target_entity("info", 0x22))
+            .unwrap();
+
+        let duplicated = build_graph_validate_response(&binding, &graph).unwrap();
+        let line = duplicate_line(&duplicated)
+            .expect("two entities claiming one external target is a duplicate");
+        assert!(line.contains('1'), "{line}");
     }
 
     /// Notes describe a healthy graph rather than a defect, so a surface that

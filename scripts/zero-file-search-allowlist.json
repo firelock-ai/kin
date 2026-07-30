@@ -225,7 +225,7 @@
     },
     {
       "file": "crates/kin-daemon/src/lifecycle.rs",
-      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Five classes, all excused per function. Singleton coordination: the lock file, its owner stamp, and the guards that decide whether this process may become the daemon. Endpoint publication: the pid and port components, each written atomically, read back, and removed only by their owning process. Binary resolution and liveness: locating and validating the exact kin-daemon executable and probing whether an endpoint is answering before spawning another. Bounded macOS process ownership: the private launchctl capture, stable process-group guardian, deadline, and cleanup helpers. Platform registration and migration: the digest-addressed LaunchAgent plist, exact legacy-authority inspection, staged replacement, rollback, and non-macOS no-op counterparts, which is why two public names carry a count of two. Every path here reaches, supervises, or registers the authority and answers no repository query. The expression pins are process/file handle declarations and the capture file's Drop cleanup; none produces an answer. Function-scoped so the remainder of the module stays scanned.",
+      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Five classes, all excused per function. Singleton coordination: the lock file, its owner stamp, and the guards that decide whether this process may become the daemon. Endpoint publication and ownership: the pid, port, and owner components are written atomically, read back, and removed only after owner-bound proof; the named ownership helpers make that proof independently testable without adding query authority. Binary resolution and liveness: locating and validating the exact kin-daemon executable and probing whether an endpoint is answering before spawning another. Bounded macOS process ownership: the private launchctl capture, stable process-group guardian, deadline, and cleanup helpers. Platform registration and migration: the digest-addressed LaunchAgent plist, exact legacy-authority inspection, staged replacement, rollback, and non-macOS no-op counterparts, which is why two public names carry a count of two. Every path here reaches, supervises, or registers the authority and answers no repository query. The expression pins are process/file handle declarations and the capture file's Drop cleanup; none produces an answer. Function-scoped so the remainder of the module stays scanned.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -269,7 +269,13 @@
         {
           "fn": "unregister_launch_agent",
           "count": 2
-        }
+        },
+        "read_endpoint_owner_record",
+        "endpoint_ownership_with_probe",
+        "proven_live_other_endpoint_owner_with_probe",
+        "publish_foreign_endpoint_for_test",
+        "remove_endpoint_components",
+        "publish_daemon_endpoint_under_authority_with_probe"
       ],
       "allow_match": [
         "use std::process::{Child, Command, ExitStatus, Output, Stdio};",
@@ -329,18 +335,20 @@
     },
     {
       "file": "crates/kin-daemon/src/daemon.rs",
-      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own endpoint records and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify.",
+      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own endpoint records and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify. Those two liveness pins named expressions that no longer exist: endpoint_files_missing and control_plane_missing were replaced by a classifier that verifies who owns an endpoint before treating its absence as an eviction notice. The successors are exempted per function rather than by snippet, because a pinned expression is exactly what went stale here.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_match": [
-        "!root.join(\"daemon.pid\").exists() || !root.join(\"daemon.port\").exists()",
-        "!state.layout.root().exists() || endpoint_files_missing(state)",
         {
           "expr": ".canonicalize()",
           "count": 2
         },
         "std::process::id(),",
         "std::process::exit(0);"
+      ],
+      "allow_fn": [
+        "repository_root_missing",
+        "classify_control_plane"
       ]
     },
     {

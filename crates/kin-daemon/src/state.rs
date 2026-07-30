@@ -874,6 +874,13 @@ pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
     pub blobs: Arc<BlobStore>,
+    /// Why the derived ingestion CAS could not be hydrated from graph
+    /// authority when this state was opened, if it could not.
+    ///
+    /// Projection reads name this instead of surfacing a bare missing-blob
+    /// error, so an un-hydrated store is reported as the authority gap it is
+    /// rather than as a mysteriously absent object.
+    ingest_cas_hydration_gap: Option<String>,
     pub reconciler: RwLock<Reconciler>,
     /// Cached FileLayouts for all tracked files.
     /// Populated on init, updated on commits.
@@ -1384,29 +1391,35 @@ impl DaemonState {
             if !hydrated.insert(hash) {
                 continue;
             }
+            // Consult the local cache before reaching for authority. Both sides
+            // verify content addresses -- `BlobStore::read` re-digests what it
+            // read and `load_source_blob` verifies what it fetched -- so a
+            // successful local read already proves the cached bytes are the
+            // authoritative bytes, and comparing them would only be comparing a
+            // value to itself.
+            //
+            // The ordering is not a micro-optimization. On a hosted backend
+            // every `load_source_blob` is a HEAD plus a GET, serialized, and
+            // this runs before the listener binds, so fetching first cost two
+            // round trips per blob on every open even when the cache was
+            // already complete. At ten thousand bodies that is long enough for
+            // a readiness probe to kill a daemon that is working correctly, and
+            // the restart repeats it: a crash loop that never converges.
+            match blobs.read(&hash) {
+                Ok(_) => continue,
+                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
+                    // HashMismatch quarantines the corrupt derived object, so
+                    // the write below can atomically heal it from authority.
+                }
+                Err(error) => return Err(DaemonError::Blob(error)),
+            }
+
             let authoritative = authority.load_source_blob(hash)?.ok_or_else(|| {
                 DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
                     "workspace artifact {} references source body {} absent from repository authority",
                     artifact.path, hash
                 )))
             })?;
-
-            match blobs.read(&hash) {
-                Ok(cached) if cached == authoritative => continue,
-                Ok(_) => {
-                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                        format!(
-                            "derived ingestion CAS body {} differs from repository authority despite matching its content address",
-                            hash
-                        ),
-                    )))
-                }
-                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
-                    // HashMismatch quarantines the corrupt derived object, so
-                    // this write can atomically heal it from authority.
-                }
-                Err(error) => return Err(DaemonError::Blob(error)),
-            }
 
             let installed_hash = blobs.write(&authoritative)?;
             if installed_hash != hash {
@@ -1427,7 +1440,72 @@ impl DaemonState {
                 )));
             }
         }
+        // Hydration is a bulk import: the store defers each blob's directory
+        // barrier and amortizes them across shards, so one commit point here
+        // makes every name it just installed durable for the cost of at most
+        // one barrier per shard touched.
+        blobs.sync().map_err(DaemonError::from)?;
         Ok(hydrated.len())
+    }
+
+    /// Hydrate the derived ingestion CAS for a graph opened through a storage
+    /// backend.
+    ///
+    /// The local path hydrates from repository authority so every blob the
+    /// projection later reads is present before the daemon serves anything.
+    /// The backend path reads the same store through `rebuild_projection` and
+    /// `refresh_projection` but used to open against whatever happened to be
+    /// on local disk, which on a fresh hosted instance is nothing.
+    ///
+    /// Returns the number of source bodies hydrated, or the reason the hosted
+    /// backend could not supply them. A graph with no resolved artifacts needs
+    /// no authority at all, which is the ordinary empty-hosted-graph case.
+    ///
+    /// Opening the authority is itself expensive on a hosted backend: it
+    /// re-downloads the repository snapshot that `open_with_backend` has
+    /// already loaded, and kin-db may replay the whole history to validate it.
+    /// So the cheap local question is asked first, and an instance whose
+    /// derived cache already covers the tree never opens authority at all.
+    fn hydrate_backend_ingest_cas(
+        repo_id: &str,
+        backend: &Arc<dyn StorageBackend>,
+        graph: &kin_db::InMemoryGraph,
+        blobs: &BlobStore,
+    ) -> std::result::Result<usize, String> {
+        let tree = graph.resolved_tree();
+        if tree.is_empty() {
+            return Ok(0);
+        }
+        if Self::ingest_cas_covers_tree(&tree, blobs).map_err(|error| error.to_string())? {
+            return Ok(0);
+        }
+        let repository_id = RepositoryId::new(repo_id.to_string())
+            .map_err(|error| format!("invalid repository identity {repo_id}: {error}"))?;
+        let authority = RepositoryAuthorityManager::open(repository_id, Arc::clone(backend))
+            .map_err(|error| {
+                format!("hosted backend carries no usable repository authority: {error}")
+            })?;
+        Self::hydrate_ingest_cas(&authority, &tree, blobs).map_err(|error| error.to_string())
+    }
+
+    /// Whether every source body the tree names is already readable from the
+    /// derived cache. Purely local: `BlobStore::read` verifies what it read
+    /// against the requested content address, so a clean pass is proof the
+    /// cache holds the authoritative bodies and no authority is needed.
+    fn ingest_cas_covers_tree(tree: &ResolvedTree, blobs: &BlobStore) -> Result<bool> {
+        for artifact in tree.artifacts() {
+            let Some(hash) = artifact.entry.blob_identity() else {
+                continue;
+            };
+            match blobs.read(&hash) {
+                Ok(_) => {}
+                Err(BlobError::NotFound { .. } | BlobError::HashMismatch { .. }) => {
+                    return Ok(false)
+                }
+                Err(error) => return Err(DaemonError::Blob(error)),
+            }
+        }
+        Ok(true)
     }
 
     /// Freeze local sibling authority capabilities before the daemon becomes
@@ -1724,6 +1802,7 @@ impl DaemonState {
             layout,
             graph,
             blobs: Arc::new(blobs),
+            ingest_cas_hydration_gap: None,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1867,6 +1946,33 @@ impl DaemonState {
             };
 
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
+        let backend: Arc<dyn StorageBackend> = Arc::from(backend);
+        // Rehydrating the derived CAS on every open is what makes it safe to
+        // treat as a cache. That was true of the local path only; a hosted
+        // instance opened against an empty local disk and every projection read
+        // failed on a blob nothing had put there.
+        let ingest_cas_hydration_gap =
+            match Self::hydrate_backend_ingest_cas(repo_id, &backend, graph.as_ref(), &blobs) {
+                Ok(hydrated_source_bodies) => {
+                    info!(
+                        repo_id,
+                        hydrated_source_bodies,
+                        "hydrated derived ingestion CAS from hosted repository authority"
+                    );
+                    None
+                }
+                Err(reason) => {
+                    // Not fatal: a hosted graph whose backend carries no
+                    // repository authority still serves every query that does
+                    // not need source bodies. Recorded so the reads that DO
+                    // need them report this instead of a bare missing blob.
+                    warn!(
+                        repo_id,
+                        reason, "derived ingestion CAS was not hydrated on the backend open path"
+                    );
+                    Some(reason)
+                }
+            };
         // The backend path builds the graph via `from_snapshot_with_text_index`,
         // which does NOT load the vector-index sidecar — do the validated load
         // here (no-ops if no/stale sidecar).
@@ -1892,6 +1998,7 @@ impl DaemonState {
             layout,
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
+            ingest_cas_hydration_gap,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -1907,7 +2014,7 @@ impl DaemonState {
             started_at: Instant::now(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
-            storage_backend: Some(Arc::from(backend)),
+            storage_backend: Some(backend),
             local_repository_backend: None,
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
@@ -3686,6 +3793,23 @@ impl DaemonState {
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
+        // Make the derived CAS names durable before persisting a graph that
+        // references them.
+        //
+        // kin-blobs defers the directory barrier that makes a blob's *name*
+        // durable and amortizes it across shards, so a write returning Ok does
+        // not yet mean the rename survives a crash. Its contract puts the
+        // obligation on the caller: sync is the commit point for anyone about
+        // to record those names somewhere that outlives a crash. This is that
+        // point. Skipping it would let a snapshot name bodies whose renames are
+        // still only in the page cache.
+        //
+        // Cheap in the steady state: sync returns immediately when nothing is
+        // pending, and otherwise costs one fsync per shard directory touched
+        // since the last barrier, which two-hex sharding caps at 256 no matter
+        // how many blobs were written.
+        self.blobs.sync().map_err(DaemonError::from)?;
+
         let force_full = mode == SnapshotSaveMode::Full;
 
         let repo_id = self.cached_repo_id.as_str();
@@ -4107,6 +4231,35 @@ impl DaemonState {
             .unwrap_or(0)
     }
 
+    /// Name the open-path hydration gap on an error that a hydrated ingestion
+    /// CAS would not have produced.
+    ///
+    /// Without this a hosted daemon reports "cannot load graph-owned blob X",
+    /// which reads as graph corruption. The blob is fine; nothing ever put it
+    /// in this instance's derived store, and that is a different problem with a
+    /// different fix.
+    fn attribute_ingest_cas_gap(&self, error: DaemonError) -> DaemonError {
+        match &self.ingest_cas_hydration_gap {
+            Some(reason) => exact_source_storage_error(format!(
+                "{error}; the derived ingestion CAS was never hydrated on this open path: {reason}"
+            )),
+            None => error,
+        }
+    }
+
+    /// Issue the derived ingestion CAS's deferred directory barriers.
+    ///
+    /// The store defers the barrier that makes a blob's *name* durable and
+    /// amortizes it across shard directories, with three commit points:
+    /// an explicit sync, `Drop`, and a self-drain once enough renames pile up.
+    /// The daemon ends in `process::exit`, which runs no destructor, so without
+    /// an explicit call the only operative barrier is the self-drain — leaving
+    /// up to a full drain threshold of un-barriered renames behind every
+    /// shutdown, including clean ones.
+    pub fn sync_blob_store(&self) -> Result<()> {
+        self.blobs.sync().map_err(DaemonError::from)
+    }
+
     /// Rebuild projection state from the current graph.
     ///
     /// Loads every persisted [`FileLayout`] and its blob-backed base content
@@ -4121,7 +4274,7 @@ impl DaemonState {
         let tree = self.graph.resolved_tree();
         let state =
             ProjectionState::from_resolved_tree(self.graph.as_ref(), self.blobs.as_ref(), &tree)
-                .map_err(DaemonError::from)?;
+                .map_err(|error| self.attribute_ingest_cas_gap(DaemonError::from(error)))?;
         let registered = state.file_ids().len();
         *projection = state;
         info!(
@@ -4181,10 +4334,10 @@ impl DaemonState {
                 .blobs
                 .read(&kin_blobs::Hash256(*hash.as_bytes()))
                 .map_err(|error| {
-                    exact_source_storage_error(format!(
+                    self.attribute_ingest_cas_gap(exact_source_storage_error(format!(
                         "projection refresh for {file_id} cannot load graph-owned blob {}: {error}",
                         hash
-                    ))
+                    )))
                 })?;
             projection.register_file(layout, content);
             loaded += 1;
@@ -7118,5 +7271,211 @@ mod tests {
         let layout = KinLayout::new(dir.path().to_path_buf());
         std::fs::write(mcp_transactions_disk_path(&layout), b"{not valid json").unwrap();
         assert!(load_persisted_mcp_transactions(&layout).is_empty());
+    }
+
+    /// Publish one blob as the repository's exact workspace tree and return its
+    /// content address. The published body lives in repository authority, which
+    /// is the only source an ingest-CAS hydration is allowed to read from.
+    fn publish_single_blob_workspace(layout: &KinLayout, body: &[u8]) -> Hash256 {
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let hash = Hash256::from_bytes(blobs.write(body).unwrap().0);
+        let desired = ResolvedTree::from_artifacts(vec![ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("service.yaml").unwrap(),
+            TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                layout,
+            )
+            .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            ResolvedTree::default(),
+            desired,
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("ingest-cas-hydration-test"),
+        )
+        .unwrap()
+        .expect("exact workspace admission must advance authority");
+        hash
+    }
+
+    #[test]
+    fn backend_hydration_installs_every_body_the_graph_names() {
+        // "Rehydrated on every daemon open" used to be true of the local path
+        // only. The backend path reads the same derived store through
+        // `rebuild_projection`, keyed on exactly this resolved tree, and used to
+        // open against whatever happened to be on local disk.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let body = b"services:\n  api:\n    image: kin:dev\n";
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let hash = publish_single_blob_workspace(&init.layout, body);
+
+        let ingest_cas = init.layout.ingest_cas_dir();
+        let kindb_dir = init.layout.kindb_dir();
+        let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
+        // Take the graph a hosted snapshot of this repository would carry, then
+        // release every local authority handle before hydrating through the
+        // backend seam.
+        let graph = {
+            let local = DaemonState::open(init.layout).expect("local open");
+            Arc::clone(&local.graph)
+        };
+        assert!(
+            !graph.resolved_tree().is_empty(),
+            "the fixture must carry the tree the projection would read"
+        );
+
+        std::fs::remove_dir_all(&ingest_cas).unwrap();
+        let blobs = BlobStore::new(ingest_cas).unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(LocalFileBackend::new(kindb_dir));
+
+        let hydrated =
+            DaemonState::hydrate_backend_ingest_cas(&repo_id, &backend, graph.as_ref(), &blobs)
+                .expect("repository authority must supply every body the graph names");
+
+        assert_eq!(hydrated, 1);
+        assert_eq!(
+            blobs.read(&hash).unwrap(),
+            body,
+            "hydration must install the exact repository-authority body"
+        );
+    }
+
+    #[test]
+    fn a_covered_cache_needs_no_authority_at_all() {
+        // The hosted cost this closes: opening authority re-downloads the
+        // repository snapshot and can replay the whole history, and the old
+        // ordering fetched every body before consulting the cache, so a warm
+        // instance paid the full price on every open. Point the backend at a
+        // directory holding no authority whatsoever: hydration must still
+        // succeed, which is only possible if it never opened one.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let body = b"already cached\n";
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        publish_single_blob_workspace(&init.layout, body);
+
+        let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
+        let graph = {
+            let local = DaemonState::open(init.layout).expect("local open");
+            Arc::clone(&local.graph)
+        };
+        let cache_dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(cache_dir.path().to_path_buf()).unwrap();
+        blobs.write(body).unwrap();
+
+        let empty = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(LocalFileBackend::new(empty.path().to_path_buf()));
+
+        assert_eq!(
+            DaemonState::hydrate_backend_ingest_cas(&repo_id, &backend, graph.as_ref(), &blobs),
+            Ok(0),
+            "a cache that already covers the tree must not open repository authority"
+        );
+    }
+
+    #[test]
+    fn the_local_open_path_hydrates_the_ingest_cas() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let body = b"local authority body\n";
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let hash = publish_single_blob_workspace(&init.layout, body);
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+
+        let state = DaemonState::open(init.layout).expect("local open");
+
+        assert_eq!(state.blobs.read(&hash).unwrap(), body);
+        assert!(state.ingest_cas_hydration_gap.is_none());
+    }
+
+    #[test]
+    fn an_empty_hosted_graph_needs_no_repository_authority() {
+        // A graph with no resolved artifacts references no source bodies, so
+        // there is nothing to hydrate and no authority to demand. This is the
+        // ordinary first-boot hosted case and must not be reported as a gap.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let kindb_dir = init.layout.kindb_dir();
+        let repo_id = kin_core::manifest::resolve_repo_id(&init.layout, None).unwrap();
+
+        let state = DaemonState::open_with_backend(
+            init.layout,
+            Box::new(LocalFileBackend::new(kindb_dir)),
+            &repo_id,
+            None,
+        )
+        .expect("backend open");
+
+        assert!(
+            state.ingest_cas_hydration_gap.is_none(),
+            "an empty tree is not an authority gap: {:?}",
+            state.ingest_cas_hydration_gap
+        );
+    }
+
+    #[test]
+    fn a_recorded_hydration_gap_is_named_in_projection_errors() {
+        // A hosted graph whose backend carries no repository authority still
+        // serves every query that needs no source body, so an un-hydratable
+        // store is recorded rather than fatal. The reads that DO need one must
+        // then report the authority gap instead of a bare missing blob, which
+        // reads as graph corruption.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let mut state = DaemonState::open(init.layout).expect("local open");
+        state.ingest_cas_hydration_gap = Some("hosted backend carries no authority".to_string());
+
+        let reported = state
+            .attribute_ingest_cas_gap(exact_source_storage_error("cannot load graph-owned blob"))
+            .to_string();
+        assert!(
+            reported.contains("never hydrated on this open path")
+                && reported.contains("hosted backend carries no authority"),
+            "the error must name the hydration gap: {reported}"
+        );
+    }
+
+    #[test]
+    fn a_hydrated_state_reports_blob_errors_unchanged() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).expect("local open");
+
+        let reported = state
+            .attribute_ingest_cas_gap(exact_source_storage_error("cannot load graph-owned blob"))
+            .to_string();
+        assert!(
+            !reported.contains("never hydrated"),
+            "a hydrated store must not blame a gap it does not have: {reported}"
+        );
+    }
+
+    #[test]
+    fn syncing_the_blob_store_commits_pending_barriers() {
+        // The store defers each blob's directory barrier and commits it on an
+        // explicit sync, on Drop, or on a self-drain. The daemon exits through
+        // `process::exit`, so this is the only commit point it can actually
+        // reach on a clean shutdown.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).expect("local open");
+
+        let hash = state.blobs.write(b"pending rename\n").unwrap();
+        state
+            .sync_blob_store()
+            .expect("the shutdown commit point must succeed on a healthy store");
+        assert_eq!(state.blobs.read(&hash).unwrap(), b"pending rename\n");
+        state
+            .sync_blob_store()
+            .expect("a second barrier with nothing pending is a no-op, not an error");
     }
 }

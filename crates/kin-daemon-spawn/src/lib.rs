@@ -462,12 +462,23 @@ pub fn port_record_is_orphaned(kin_root: &Path) -> bool {
     kin_root.join(PORT_FILE_NAME).exists() && !kin_root.join(PID_FILE_NAME).exists()
 }
 
+/// File the daemon writes its publishing incarnation into beside the endpoint.
+///
+/// Read by nothing here; named so this repair retires it with the endpoint it
+/// attributes, rather than leaving an attribution behind for a record that no
+/// longer exists.
+pub const OWNER_FILE_NAME: &str = "daemon.owner";
+
 /// Clear an orphaned port record so a fresh spawn is not read against a dead
 /// predecessor's port. Returns whether anything was removed.
 pub fn clear_orphaned_port_record(kin_root: &Path) -> bool {
     if !port_record_is_orphaned(kin_root) {
         return false;
     }
+    // The PID file is already gone, so the sidecar attributes nothing. Retire
+    // it with the port rather than leaving the two repair surfaces disagreeing
+    // about what an endpoint is made of.
+    let _ = std::fs::remove_file(kin_root.join(OWNER_FILE_NAME));
     match std::fs::remove_file(kin_root.join(PORT_FILE_NAME)) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,

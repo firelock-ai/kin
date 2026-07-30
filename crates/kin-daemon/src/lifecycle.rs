@@ -638,6 +638,209 @@ where
 
 // ── Daemon State Files ──────────────────────────────────────────────────
 
+/// Name of the sidecar that attributes a published endpoint to one process
+/// incarnation.
+const ENDPOINT_OWNER_FILE: &str = "daemon.owner";
+
+/// Schema tag carried by [`ENDPOINT_OWNER_FILE`].
+const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
+
+/// Who published the endpoint currently on disk.
+///
+/// `daemon.pid` holds a bare PID because every version of every Kin surface
+/// reads it that way, and a PID alone cannot survive reuse: after the recorded
+/// daemon exits, that number starts naming whatever the kernel handed it to
+/// next, and a reader comparing PIDs either preserves a dead endpoint forever
+/// or deletes a live one. This sidecar records the same process incarnation the
+/// singleton lock stamps, so ownership can be *proved* rather than inferred
+/// from a number.
+/// The record carries identity and nothing else. A port field was tempting and
+/// is deliberately absent: `daemon.port` is the port, nothing would read a
+/// second copy, and two records of the same fact can only ever disagree.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct EndpointOwnerRecord {
+    schema: String,
+    identity: kin_cli::daemon_client::ProcessIdentity,
+}
+
+impl EndpointOwnerRecord {
+    fn current() -> Option<Self> {
+        Some(Self {
+            schema: ENDPOINT_OWNER_SCHEMA.to_string(),
+            identity: kin_cli::daemon_client::current_process_identity().ok()?,
+        })
+    }
+}
+
+/// What the on-disk endpoint says about its owner.
+///
+/// The distinction that matters is between an endpoint this process may
+/// destroy and one it may not. Only [`EndpointOwnership::CurrentProcess`]
+/// authorizes removal; every other variant means the files belong to somebody
+/// else, or to nobody this build can identify, and must be left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointOwnership {
+    /// No endpoint is published: `daemon.pid` is absent.
+    Absent,
+    /// The endpoint names this exact process incarnation.
+    CurrentProcess,
+    /// The endpoint names a different owner. `live` is decided against the
+    /// recorded incarnation when an owner record exists, and against the bare
+    /// PID otherwise; an indeterminate probe reads as live, because an
+    /// uninspectable owner is not a dead one.
+    OtherProcess { pid: u32, live: bool },
+    /// An endpoint exists but names nobody: `daemon.pid` is unparseable and
+    /// there is no owner record to fall back on.
+    Unattributed,
+}
+
+impl EndpointOwnership {
+    /// Whether the calling process may delete these endpoint files.
+    pub fn authorizes_removal(self) -> bool {
+        matches!(self, Self::CurrentProcess)
+    }
+}
+
+fn read_endpoint_owner_record(kin_root: &Path) -> Option<EndpointOwnerRecord> {
+    let raw = std::fs::read_to_string(kin_root.join(ENDPOINT_OWNER_FILE)).ok()?;
+    let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
+    (record.schema == ENDPOINT_OWNER_SCHEMA).then_some(record)
+}
+
+/// Classify the published endpoint's owner.
+///
+/// `daemon.pid` is what makes an endpoint *published*: a stray owner record
+/// with no PID file beside it attributes nothing, and the next publication
+/// overwrites it.
+pub fn endpoint_ownership(kin_root: &Path) -> EndpointOwnership {
+    endpoint_ownership_with_probe(
+        kin_root,
+        kin_cli::daemon_client::process_identity_is_current,
+    )
+}
+
+/// The probe is injectable for the same reason publication's is: the
+/// indeterminate arm is a decision, not an accident, and a decision that cannot
+/// be exercised in a test is one a later change can silently invert.
+fn endpoint_ownership_with_probe(
+    kin_root: &Path,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> EndpointOwnership {
+    if !kin_root.join("daemon.pid").exists() {
+        return EndpointOwnership::Absent;
+    }
+    if let Some(record) = read_endpoint_owner_record(kin_root) {
+        // Answer the "is it mine" case from this process's own identity rather
+        // than from a probe of a foreign PID. Retirement used to be
+        // `read(daemon.pid) == process::id()`, which cannot fail; routing the
+        // self case through a fallible probe would let a transient error
+        // refuse a daemon permission to retire its own endpoint and strand it.
+        if record.identity.pid() == std::process::id() {
+            return match kin_cli::daemon_client::current_process_identity() {
+                Ok(current) if current == record.identity => EndpointOwnership::CurrentProcess,
+                // Our PID, a different incarnation: the publisher is gone and
+                // the kernel handed us its number.
+                Ok(_) => EndpointOwnership::OtherProcess {
+                    pid: record.identity.pid(),
+                    live: false,
+                },
+                Err(_) => EndpointOwnership::OtherProcess {
+                    pid: record.identity.pid(),
+                    live: true,
+                },
+            };
+        }
+        return match probe(&record.identity) {
+            Ok(is_current) => EndpointOwnership::OtherProcess {
+                pid: record.identity.pid(),
+                live: is_current,
+            },
+            // An identity that cannot be read at all (another user's process)
+            // is indeterminate. `live` governs removal, and refusing to delete
+            // what cannot be inspected is the safe direction, so it reads as
+            // live here. Publication asks a different question and must not
+            // reuse this answer: see [`proven_live_other_endpoint_owner`].
+            Err(_) => EndpointOwnership::OtherProcess {
+                pid: record.identity.pid(),
+                live: true,
+            },
+        };
+    }
+    match recorded_daemon_pid(kin_root) {
+        Some(pid) if pid == std::process::id() => EndpointOwnership::CurrentProcess,
+        Some(pid) => EndpointOwnership::OtherProcess {
+            pid,
+            live: is_process_alive(pid),
+        },
+        None => EndpointOwnership::Unattributed,
+    }
+}
+
+/// The PID of a *different* incarnation that the endpoint record **proves** is
+/// still running, if there is one.
+///
+/// This answers the question that governs yielding, not the one that governs
+/// deleting, and the two fail in opposite directions.
+///
+/// Refusing to delete what cannot be inspected is safe: the worst case is a
+/// stale file. Refusing to *publish* over what cannot be inspected is not,
+/// because the caller already holds the repository singleton, so no legitimate
+/// owner can exist and the refusal is fatal at startup. An indeterminate probe
+/// there wedges the repo permanently: a SIGKILLed daemon leaves the record
+/// behind, the kernel later hands its PID to a process owned by another user,
+/// every probe of that PID returns `PermissionDenied` rather than an answer,
+/// and nothing in the system clears the record. The daemon exits 1 forever and
+/// the error names an unrelated process the operator has no reason to touch.
+///
+/// So "not proven" is the answer for an unreadable probe here, which is also
+/// what the name and the legacy-record rule already say: a claim that cannot be
+/// verified must not keep a repo's rightful owner from advertising itself.
+pub(crate) fn proven_live_other_endpoint_owner(kin_root: &Path) -> Option<u32> {
+    proven_live_other_endpoint_owner_with_probe(
+        kin_root,
+        kin_cli::daemon_client::process_identity_is_current,
+    )
+}
+
+fn proven_live_other_endpoint_owner_with_probe(
+    kin_root: &Path,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> Option<u32> {
+    if !kin_root.join("daemon.pid").exists() {
+        return None;
+    }
+    let record = read_endpoint_owner_record(kin_root)?;
+    if record.identity.pid() == std::process::id() {
+        return None;
+    }
+    probe(&record.identity)
+        .unwrap_or(false)
+        .then(|| record.identity.pid())
+}
+
+/// Publish an endpoint attributed to a process other than this one, so tests
+/// can build the state a real successor would leave behind without running a
+/// second daemon.
+#[cfg(test)]
+pub(crate) fn publish_foreign_endpoint_for_test(
+    kin_root: &Path,
+    identity: kin_cli::daemon_client::ProcessIdentity,
+    port: u16,
+) {
+    let pid = identity.pid();
+    let record = EndpointOwnerRecord {
+        schema: ENDPOINT_OWNER_SCHEMA.to_string(),
+        identity,
+    };
+    std::fs::write(kin_root.join("daemon.pid"), pid.to_string()).unwrap();
+    std::fs::write(kin_root.join("daemon.port"), port.to_string()).unwrap();
+    std::fs::write(
+        kin_root.join(ENDPOINT_OWNER_FILE),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+}
+
 fn write_atomic_endpoint_component(
     kin_root: &Path,
     name: &str,
@@ -649,32 +852,124 @@ fn write_atomic_endpoint_component(
     std::fs::rename(tmp, dst)
 }
 
+/// Remove every component of an endpoint the caller has already proved it may
+/// destroy — its own, or one whose recorded owner is verifiably gone.
+///
+/// Order matters on a crash: `daemon.pid` goes first because it is what makes
+/// an endpoint published, so an interrupted retirement leaves no record any
+/// reader will act on.
+fn remove_endpoint_components(kin_root: &Path) {
+    let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
+}
+
 /// Publish the daemon's complete endpoint while holding lifecycle authority.
 ///
 /// Current endpoint retirement takes the same never-unlinked lock, so a
 /// successor publication cannot land between a predecessor comparison and
-/// deletion. Both temporary files are prepared before either visible component
-/// changes; on any publication failure the incomplete endpoint is removed
-/// before authority is released.
+/// deletion. Every temporary file is prepared before any visible component
+/// changes, and a failed publication rolls back only the components this call
+/// actually installed — an endpoint belonging to a process that is still
+/// running is never in that set.
 pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()> {
-    let _authority = acquire_singleton_coordination_guard(kin_root)?;
+    // Waiting out the coordination lock is a synchronous sleep reached from
+    // async contexts, and holding a worker hostage here is what once starved
+    // the liveness routes a client was polling before it clobbered the very
+    // endpoint being published.
+    without_blocking_runtime_worker(|| {
+        let _authority = acquire_singleton_coordination_guard(kin_root)?;
+        publish_daemon_endpoint_under_authority(kin_root, port)
+    })
+}
+
+/// Publish under an injectable ownership probe, so a test can drive the
+/// indeterminate case that the host's own permissions decide otherwise.
+#[cfg(test)]
+fn publish_daemon_endpoint_with_probe(
+    kin_root: &Path,
+    port: u16,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    without_blocking_runtime_worker(|| {
+        let _authority = acquire_singleton_coordination_guard(kin_root)?;
+        publish_daemon_endpoint_under_authority_with_probe(kin_root, port, probe)
+    })
+}
+
+fn publish_daemon_endpoint_under_authority(kin_root: &Path, port: u16) -> std::io::Result<()> {
+    publish_daemon_endpoint_under_authority_with_probe(
+        kin_root,
+        port,
+        kin_cli::daemon_client::process_identity_is_current,
+    )
+}
+
+fn publish_daemon_endpoint_under_authority_with_probe(
+    kin_root: &Path,
+    port: u16,
+    probe: impl FnOnce(&kin_cli::daemon_client::ProcessIdentity) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    // Port 0 means "the OS will pick one", never "connect here". Publishing it
+    // strands every reader on an endpoint nothing can dial, and the daemon that
+    // published it keeps refusing successors because it still owns the repo.
+    if port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to publish an unbound daemon port",
+        ));
+    }
+    // A starter that lost the singleton must never reach this, but publication
+    // overwrites files by design, so the guarantee is asserted here rather than
+    // assumed from the call graph.
+    if let Some(pid) = proven_live_other_endpoint_owner_with_probe(kin_root, probe) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "daemon endpoint for {} is owned by live pid {pid}",
+                kin_root.display()
+            ),
+        ));
+    }
+
+    let owner =
+        EndpointOwnerRecord::current().and_then(|record| serde_json::to_string(&record).ok());
     let pid = std::process::id().to_string();
     let port = port.to_string();
+
+    let mut installed: Vec<&str> = Vec::new();
     let result: std::io::Result<()> = (|| {
+        if let Some(owner) = &owner {
+            std::fs::write(kin_root.join("daemon.owner.tmp"), owner.as_bytes())?;
+        }
         std::fs::write(kin_root.join("daemon.pid.tmp"), pid.as_bytes())?;
         std::fs::write(kin_root.join("daemon.port.tmp"), port.as_bytes())?;
+        // Attribution lands before the endpoint it attributes, so the instant
+        // `daemon.pid` names this process the proof that it does is already
+        // readable.
+        if owner.is_some() {
+            std::fs::rename(
+                kin_root.join("daemon.owner.tmp"),
+                kin_root.join(ENDPOINT_OWNER_FILE),
+            )?;
+            installed.push(ENDPOINT_OWNER_FILE);
+        }
         std::fs::rename(kin_root.join("daemon.pid.tmp"), kin_root.join("daemon.pid"))?;
+        installed.push("daemon.pid");
         std::fs::rename(
             kin_root.join("daemon.port.tmp"),
             kin_root.join("daemon.port"),
         )?;
+        installed.push("daemon.port");
         Ok(())
     })();
     if result.is_err() {
+        let _ = std::fs::remove_file(kin_root.join("daemon.owner.tmp"));
         let _ = std::fs::remove_file(kin_root.join("daemon.pid.tmp"));
         let _ = std::fs::remove_file(kin_root.join("daemon.port.tmp"));
-        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-        let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+        for name in installed {
+            let _ = std::fs::remove_file(kin_root.join(name));
+        }
     }
     result
 }
@@ -685,6 +980,10 @@ pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()
 /// PID and bound port together with [`publish_daemon_endpoint`].
 pub fn write_pid_file(kin_root: &Path) {
     if let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) {
+        // A partial publication carries no port, so it cannot write an owner
+        // record. Drop any predecessor's record rather than let it attribute
+        // this PID to the wrong incarnation.
+        let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
         let _ =
             write_atomic_endpoint_component(kin_root, "daemon.pid", std::process::id().to_string());
     }
@@ -695,16 +994,27 @@ pub fn write_pid_file(kin_root: &Path) {
 /// Written atomically (temp + rename) so a CLI polling the port file during the
 /// daemon→CLI port handshake never parses a torn or partial value.
 pub fn write_port_file(kin_root: &Path, port: u16) {
+    if port == 0 {
+        // Never a reachable endpoint: it is the bind-time request for an
+        // OS-assigned port, and recording it advertises an address nothing can
+        // dial while the daemon that wrote it keeps owning the repo.
+        return;
+    }
     if let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) {
         let _ = write_atomic_endpoint_component(kin_root, "daemon.port", port.to_string());
     }
 }
 
 /// Read port from `.kin/daemon.port`.
+///
+/// Zero is not a port anything can connect to: it is the bind-time request for
+/// an OS-assigned port, and a record carrying it names no endpoint. Treated as
+/// unpublished, exactly as the shared spawn contract treats it.
 pub fn read_port_file(kin_root: &Path) -> Option<u16> {
     std::fs::read_to_string(kin_root.join("daemon.port"))
         .ok()
-        .and_then(|s| s.trim().parse().ok())
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
 }
 
 /// Remove PID file, but only if it's ours (prevents removing a successor's).
@@ -712,37 +1022,41 @@ pub fn remove_pid_file(kin_root: &Path) {
     let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
         return;
     };
-    let path = kin_root.join("daemon.pid");
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if content.trim().parse::<u32>().ok() == Some(std::process::id()) {
-            let _ = std::fs::remove_file(&path);
-        }
+    if endpoint_ownership(kin_root).authorizes_removal() {
+        let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
+        let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
     }
 }
 
-/// Remove daemon endpoint files, but only if the recorded PID is this process.
+/// Remove daemon endpoint files, but only when this process can prove it
+/// published them.
 ///
-/// This avoids a shutdown race where an older daemon removes the port file for
-/// a newer successor that already replaced `daemon.pid`.
+/// Proof is the recorded process incarnation, not the PID: an endpoint whose
+/// number happens to match a recycled PID belongs to a daemon that already
+/// exited, and one whose number differs may belong to a successor that
+/// republished while this process was draining.
 pub fn remove_daemon_files_if_current_process(kin_root: &Path) {
-    let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
-        tracing::warn!(
-            repo = %kin_root.display(),
-            "preserving daemon endpoint because lifecycle authority is unavailable"
-        );
-        return;
-    };
-    let pid_path = kin_root.join("daemon.pid");
-    let belongs_to_current = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|content| content.trim().parse::<u32>().ok())
-        == Some(std::process::id());
-    if !belongs_to_current {
-        return;
-    }
-
-    let _ = std::fs::remove_file(pid_path);
-    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    without_blocking_runtime_worker(|| {
+        let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+            tracing::warn!(
+                repo = %kin_root.display(),
+                "preserving daemon endpoint because lifecycle authority is unavailable"
+            );
+            return;
+        };
+        let ownership = endpoint_ownership(kin_root);
+        if !ownership.authorizes_removal() {
+            if !matches!(ownership, EndpointOwnership::Absent) {
+                tracing::warn!(
+                    repo = %kin_root.display(),
+                    ?ownership,
+                    "preserving daemon endpoint published by another process"
+                );
+            }
+            return;
+        }
+        remove_endpoint_components(kin_root);
+    })
 }
 
 /// Is the process with this PID alive?
@@ -751,21 +1065,29 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 /// Is the daemon running for this repo? Checks PID file + port reachable.
+///
+/// A dead owner's endpoint is cleared, but only against proof: the recorded
+/// incarnation is re-read under lifecycle authority and must still be the same
+/// dead owner the first read saw. A live owner — including one this process
+/// cannot inspect — keeps its files.
 pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
-    let pid: u32 = std::fs::read_to_string(kin_root.join("daemon.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if !is_process_alive(pid) {
-        // Stale — clean up only while publication is excluded and this PID is
-        // still the endpoint owner.
-        let _authority = acquire_singleton_coordination_guard(kin_root).ok()?;
-        if recorded_daemon_pid(kin_root) == Some(pid) && !is_process_alive(pid) {
-            let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-            let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+    match endpoint_ownership(kin_root) {
+        EndpointOwnership::Absent | EndpointOwnership::Unattributed => return None,
+        EndpointOwnership::CurrentProcess | EndpointOwnership::OtherProcess { live: true, .. } => {}
+        stale @ EndpointOwnership::OtherProcess { live: false, .. } => {
+            // Stale — clean up only while publication is excluded and the
+            // endpoint still names the same dead owner the verdict was formed
+            // about.
+            without_blocking_runtime_worker(|| {
+                let Ok(_authority) = acquire_singleton_coordination_guard(kin_root) else {
+                    return;
+                };
+                if endpoint_ownership(kin_root) == stale {
+                    remove_endpoint_components(kin_root);
+                }
+            });
+            return None;
         }
-        return None;
     }
     let port = read_port_file(kin_root)?;
     if is_port_open(port) {
@@ -3964,5 +4286,392 @@ mod tests {
         remove_daemon_files_if_current_process(dir.path());
         assert!(dir.path().join("daemon.pid").exists());
         assert!(dir.path().join("daemon.port").exists());
+    }
+
+    // ── Endpoint ownership ────────────────────────────────────────────────
+    //
+    // The failure these close: a daemon that lost the singleton lock deleted
+    // the incumbent's endpoint files on its way out, and the incumbent — which
+    // keyed its own liveness on those files existing — shut itself down. Every
+    // destructive endpoint decision now needs proof of ownership, and the proof
+    // is a process incarnation rather than a reusable PID.
+
+    /// Rewrite a serialized identity's birth token so it names a different
+    /// incarnation of the same live PID: exactly the shape PID reuse produces.
+    fn forge_other_incarnation(encoded: &str) -> String {
+        let forged = encoded
+            .replace("start-time:", "start-time:9")
+            .replace("start-ticks:", "start-ticks:9")
+            .replace("created-100ns:", "created-100ns:9");
+        assert_ne!(forged, encoded, "the birth token must have been altered");
+        forged
+    }
+
+    #[test]
+    fn publication_attributes_the_endpoint_to_its_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        publish_daemon_endpoint(root, 51234).expect("publish endpoint");
+
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::CurrentProcess);
+        assert!(
+            root.join(ENDPOINT_OWNER_FILE).exists(),
+            "publication must record who published"
+        );
+        let record = read_endpoint_owner_record(root).expect("owner record parses");
+        assert_eq!(record.identity.pid(), std::process::id());
+    }
+
+    #[test]
+    fn a_recycled_pid_cannot_claim_a_published_endpoint() {
+        // The endpoint names this live PID, but a different incarnation of it.
+        // A bare-PID comparison would authorize this process to delete files it
+        // never published.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        publish_daemon_endpoint(root, 51234).expect("publish endpoint");
+
+        let record = std::fs::read_to_string(root.join(ENDPOINT_OWNER_FILE)).unwrap();
+        std::fs::write(
+            root.join(ENDPOINT_OWNER_FILE),
+            forge_other_incarnation(&record),
+        )
+        .unwrap();
+
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::OtherProcess {
+                pid: std::process::id(),
+                live: false,
+            },
+            "an incarnation that is gone does not own this endpoint, whatever its PID resolves to"
+        );
+
+        remove_daemon_files_if_current_process(root);
+        assert!(
+            root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
+            "an endpoint this process cannot prove it published must survive"
+        );
+    }
+
+    #[test]
+    fn retirement_clears_the_owner_record_with_the_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        publish_daemon_endpoint(root, 51234).expect("publish endpoint");
+
+        remove_daemon_files_if_current_process(root);
+
+        assert!(!root.join("daemon.pid").exists());
+        assert!(!root.join("daemon.port").exists());
+        assert!(
+            !root.join(ENDPOINT_OWNER_FILE).exists(),
+            "a retired endpoint must leave no attribution behind for the next reader"
+        );
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::Absent);
+    }
+
+    #[test]
+    fn a_legacy_endpoint_without_an_owner_record_is_still_attributed() {
+        // A repo whose endpoint was published by an older daemon has no
+        // sidecar. Refusing to read the bare PID would make every such endpoint
+        // permanently unremovable, including by the daemon that owns it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("daemon.pid"), std::process::id().to_string()).unwrap();
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::CurrentProcess);
+
+        std::fs::write(root.join("daemon.pid"), "1").unwrap();
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::OtherProcess { pid: 1, live: true }
+        );
+
+        std::fs::write(root.join("daemon.pid"), "not-a-pid").unwrap();
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::Unattributed);
+    }
+
+    #[test]
+    fn a_stray_owner_record_alone_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        publish_daemon_endpoint(root, 51234).expect("publish endpoint");
+        std::fs::remove_file(root.join("daemon.pid")).unwrap();
+
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::Absent,
+            "daemon.pid is what makes an endpoint published; attribution alone is not one"
+        );
+    }
+
+    #[test]
+    fn publication_refuses_an_unbound_port() {
+        // `--port 0` means "the OS will pick one". Publishing it strands every
+        // reader on an endpoint nothing can dial while the publisher keeps
+        // owning the repo and refusing successors.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let error = publish_daemon_endpoint(root, 0).expect_err("zero is not an endpoint");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::Absent);
+        assert!(!root.join("daemon.port").exists());
+    }
+
+    #[test]
+    fn a_zero_port_record_reads_as_unpublished() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.port"), "0").unwrap();
+        assert_eq!(read_port_file(dir.path()), None);
+        assert!(daemon_is_up(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_refuses_to_replace_a_proven_live_owners_endpoint() {
+        // A real other process, so the record names an incarnation that really
+        // is running rather than a PID that might mean anything.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut incumbent = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in incumbent");
+        let identity = kin_cli::daemon_client::process_identity(incumbent.id())
+            .expect("read the incumbent's identity")
+            .expect("the incumbent is running");
+
+        std::fs::write(root.join("daemon.pid"), incumbent.id().to_string()).unwrap();
+        std::fs::write(root.join("daemon.port"), "51234").unwrap();
+        std::fs::write(
+            root.join(ENDPOINT_OWNER_FILE),
+            serde_json::to_string(&EndpointOwnerRecord {
+                schema: ENDPOINT_OWNER_SCHEMA.to_string(),
+                identity,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error =
+            publish_daemon_endpoint(root, 4219).expect_err("a live owner's endpoint is not ours");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.pid")).unwrap(),
+            incumbent.id().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.port")).unwrap(),
+            "51234"
+        );
+
+        let _ = incumbent.kill();
+        let _ = incumbent.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_owner_probe_is_not_proof_of_a_live_owner() {
+        // The wedge this closes. A daemon is SIGKILLed, so its endpoint and
+        // owner record survive. The kernel later hands its PID to a process
+        // owned by another user, where every identity probe returns
+        // PermissionDenied rather than an answer. Treating that as proof of a
+        // live owner refused publication, and publication refusal is fatal at
+        // startup, so the repo's daemon could never start again: no sweep
+        // clears the record either, because they all preserve what they cannot
+        // inspect. Only a human deleting the file recovered it.
+        //
+        // Both the record's owner and the probe are supplied by the test. An
+        // earlier version seeded the record from pid 1 and fell back to this
+        // process's own identity when that could not be read, which made the
+        // outcome depend on whether the host lets you inspect pid 1: on macOS
+        // it passed through the owner-is-self shortcut without touching the
+        // indeterminate path at all, and on Linux pid 1 was readable, so
+        // publication saw a genuinely live owner and correctly refused.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in foreign owner");
+        let identity = kin_cli::daemon_client::process_identity(foreign.id())
+            .expect("read the foreign owner's identity")
+            .expect("the foreign owner is running");
+        publish_foreign_endpoint_for_test(root, identity, 51234);
+
+        let unreadable = |_: &kin_cli::daemon_client::ProcessIdentity| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot read birth identity for a foreign process",
+            ))
+        };
+        assert_eq!(
+            proven_live_other_endpoint_owner_with_probe(root, unreadable),
+            None,
+            "an unreadable probe is not proof, so it must not block publication"
+        );
+
+        publish_daemon_endpoint_with_probe(root, 4219, unreadable)
+            .expect("the rightful owner must still be able to advertise itself");
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::CurrentProcess);
+        assert_eq!(read_port_file(root), Some(4219));
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_owner_probe_still_protects_the_endpoint_from_removal() {
+        // The other half of the split: failing closed is right for deleting.
+        // The same indeterminate probe that must not block publication must
+        // still stop this process from retiring an endpoint it cannot prove is
+        // dead.
+        //
+        // This drives a real owner record for a real foreign process and
+        // injects the unreadable probe, so the indeterminate arm is actually
+        // executed. An earlier version wrote a bare `daemon.pid` and reached
+        // the legacy branch instead, testing something else entirely under this
+        // name.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in foreign owner");
+        let identity = kin_cli::daemon_client::process_identity(foreign.id())
+            .expect("read the foreign owner's identity")
+            .expect("the foreign owner is running");
+        publish_foreign_endpoint_for_test(root, identity, 51234);
+
+        let unreadable = |_: &kin_cli::daemon_client::ProcessIdentity| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot read birth identity for a foreign process",
+            ))
+        };
+        let ownership = endpoint_ownership_with_probe(root, unreadable);
+
+        assert_eq!(
+            ownership,
+            EndpointOwnership::OtherProcess {
+                pid: foreign.id(),
+                live: true,
+            },
+            "an owner that cannot be inspected must read as live for the removal decision"
+        );
+        assert!(
+            !ownership.authorizes_removal(),
+            "never delete an endpoint whose owner cannot be inspected"
+        );
+
+        // And end to end, through the real probe: the endpoint survives.
+        remove_daemon_files_if_current_process(root);
+        assert!(
+            root.join("daemon.pid").exists() && root.join("daemon.port").exists(),
+            "an endpoint owned by another live process must survive retirement"
+        );
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    #[test]
+    fn a_legacy_endpoint_naming_a_live_pid_is_not_removed() {
+        // The legacy branch the test above used to reach by accident, kept
+        // deliberately and named for what it is: no owner record, a bare PID
+        // that resolves to something alive, so removal is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.pid"), "1").unwrap();
+        std::fs::write(root.join("daemon.port"), "51234").unwrap();
+
+        assert_eq!(
+            endpoint_ownership(root),
+            EndpointOwnership::OtherProcess { pid: 1, live: true }
+        );
+        remove_daemon_files_if_current_process(root);
+        assert!(root.join("daemon.pid").exists() && root.join("daemon.port").exists());
+    }
+
+    #[test]
+    fn a_daemon_can_always_retire_its_own_endpoint() {
+        // Retirement used to be `read(daemon.pid) == process::id()`, which
+        // cannot fail. Identity must not make it fallible: a daemon that
+        // cannot retire its own endpoint leaves a stale one behind, which
+        // other surfaces assert never happens.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        publish_daemon_endpoint(root, 4219).expect("publish");
+
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::CurrentProcess);
+        remove_daemon_files_if_current_process(root);
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::Absent);
+        assert!(!root.join(ENDPOINT_OWNER_FILE).exists());
+    }
+
+    #[test]
+    fn publication_replaces_a_legacy_endpoint_whose_pid_proves_nothing() {
+        // PID 1 is alive and is not this process, but a bare-PID record cannot
+        // prove that number still names the daemon that wrote it. The publisher
+        // holds the repository singleton, so refusing here would leave the
+        // repo's rightful owner permanently unable to advertise itself.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.pid"), "1").unwrap();
+        std::fs::write(root.join("daemon.port"), "51234").unwrap();
+
+        publish_daemon_endpoint(root, 4219)
+            .expect("an unprovable claim must not block publication");
+
+        assert_eq!(endpoint_ownership(root), EndpointOwnership::CurrentProcess);
+        assert_eq!(read_port_file(root), Some(4219));
+    }
+
+    #[test]
+    fn a_failed_publication_rolls_back_only_what_it_installed() {
+        // Force the port rename to fail by parking a non-empty directory on the
+        // destination. The rollback must remove the components this call
+        // installed and nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("daemon.port")).unwrap();
+        std::fs::write(root.join("daemon.port").join("occupant"), b"x").unwrap();
+
+        publish_daemon_endpoint(root, 51234).expect_err("renaming onto a directory must fail");
+
+        assert!(
+            !root.join("daemon.pid").exists(),
+            "the pid this call installed must be rolled back"
+        );
+        assert!(
+            !root.join(ENDPOINT_OWNER_FILE).exists(),
+            "the attribution this call installed must be rolled back"
+        );
+        assert!(
+            root.join("daemon.port").join("occupant").exists(),
+            "a path this call never installed must be left exactly as found"
+        );
+        assert!(!root.join("daemon.pid.tmp").exists());
+        assert!(!root.join("daemon.port.tmp").exists());
+        assert!(!root.join("daemon.owner.tmp").exists());
+    }
+
+    #[test]
+    fn a_live_owners_endpoint_survives_the_liveness_probe() {
+        // The probe answers "is it serving", and the answer for an unreachable
+        // port is no — but that is not a licence to delete a live daemon's
+        // endpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.pid"), "1").unwrap();
+        std::fs::write(root.join("daemon.port"), "1").unwrap();
+
+        assert!(daemon_is_up(root).is_none());
+        assert!(root.join("daemon.pid").exists());
+        assert!(root.join("daemon.port").exists());
     }
 }

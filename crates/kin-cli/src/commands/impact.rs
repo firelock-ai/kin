@@ -296,6 +296,15 @@ fn resolve_entities(
             ..Default::default()
         };
         let mut matches = graph.query_entities(&filter)?;
+        // An external reference target carries the imported symbol's name, so a
+        // name query returns it beside the local declaration that shares that
+        // name. It is never a subject of impact analysis: this repository holds
+        // no definition, no file, and no relations out of it, so nothing can be
+        // said about what changing it would reach. Leaving it in the match set
+        // inflates the count, and under a structured caller's fail-closed
+        // resolution it turns a repository's own `Error` or `Result` into an
+        // ambiguous query answered with no analysis at all.
+        matches.retain(|entity| !kin_index::is_external_reference_target(entity));
         // The human surface preserves Kin's broad name matching. Structured
         // callers explicitly opt into exact, fail-closed identity resolution.
         if request.require_unique {

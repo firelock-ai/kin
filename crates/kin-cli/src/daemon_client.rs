@@ -2029,6 +2029,12 @@ pub fn repo_daemon_port_path(kin_root: &Path) -> PathBuf {
     kin_root.join("daemon.port")
 }
 
+/// Path to the sidecar attributing a published endpoint to one process
+/// incarnation. Written by the daemon alongside the endpoint it describes.
+pub fn repo_daemon_owner_path(kin_root: &Path) -> PathBuf {
+    kin_root.join("daemon.owner")
+}
+
 /// Remove a repo worker daemon's pid/port endpoint files. The daemon deletes
 /// these itself on graceful shutdown; `kin daemon stop` also calls this after a
 /// confirmed stop so a later `status` never reports the dead endpoint as stale.
@@ -2128,13 +2134,17 @@ where
 
 fn remove_stale_daemon_files_uncoordinated_with<F>(
     kin_root: &Path,
-    remove_file: F,
+    mut remove_file: F,
 ) -> std::io::Result<()>
 where
     F: FnMut(&Path) -> std::io::Result<()>,
 {
     let pid_path = repo_daemon_pid_path(kin_root);
     let port_path = repo_daemon_port_path(kin_root);
+    // The owner sidecar attributes the endpoint being retired, so it goes with
+    // it. It is not part of the retirement verdict: `daemon.pid` is what makes
+    // an endpoint published, and a leftover attribution names nothing.
+    let _ = remove_file(&repo_daemon_owner_path(kin_root));
     remove_endpoint_files_with(&pid_path, &port_path, remove_file)
 }
 

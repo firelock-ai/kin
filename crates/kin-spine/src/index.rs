@@ -563,6 +563,18 @@ impl SpineIndex {
 
     /// Resolve an entity by name and kind across all repos.
     /// Returns matches sorted by fingerprint similarity if a reference fingerprint is provided.
+    ///
+    /// External reference targets are never returned. Such an entry stands for a
+    /// symbol its repository references without owning, which is what a graph
+    /// binds for an unresolved import, so returning one would answer "where is
+    /// this defined" with another repository's import and hand back a definition
+    /// site that does not exist.
+    ///
+    /// The test is the conjunction of [`EntityRole::External`] and the absent
+    /// path, because neither half identifies the shape alone. That role is also
+    /// carried by real entities a repository vendors under `third_party/` and its
+    /// siblings, which own their source and are legitimate targets, while an
+    /// absent path on its own only means no path was recorded.
     pub fn resolve(
         &self,
         name: &str,
@@ -573,17 +585,20 @@ impl SpineIndex {
 
         let mut results = Vec::new();
 
+        let owns_definition = |entry: &&EntityEntry| {
+            entry.role != Some(EntityRole::External) || entry.file_path.is_some()
+        };
         if let Some(kind) = kind {
             let key = (name.to_lowercase(), kind);
             if let Some(entries) = inner.by_name.get(&key) {
-                results.extend(entries.iter().cloned());
+                results.extend(entries.iter().filter(owns_definition).cloned());
             }
         } else {
             // Search across all kinds
             let name_lower = name.to_lowercase();
             for ((n, _), entries) in &inner.by_name {
                 if *n == name_lower {
-                    results.extend(entries.iter().cloned());
+                    results.extend(entries.iter().filter(owns_definition).cloned());
                 }
             }
         }
@@ -1082,6 +1097,17 @@ mod tests {
         }
     }
 
+    /// The shape admission binds for a symbol another repository owns: the
+    /// imported name, no file, and the uniform kind that says only that the
+    /// symbol is reached through a module this repository does not own.
+    fn external_target_entry(repo: &str, name: &str) -> EntityEntry {
+        let mut entry = test_entry(repo, name, EntityKind::Module);
+        entry.file_path = None;
+        entry.signature = String::new();
+        entry.role = Some(EntityRole::External);
+        entry
+    }
+
     fn test_entry_with_id(repo: &str, id: EntityId, name: &str) -> EntityEntry {
         let mut entry = test_entry(repo, name, EntityKind::Function);
         entry.entity_id = id;
@@ -1398,6 +1424,54 @@ mod tests {
         let results = index.resolve("parse", Some(EntityKind::Function), None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].repo_id, "repo-a");
+    }
+
+    /// An external reference target is registered under the repository that
+    /// imports the symbol, not the one that defines it. Two repositories
+    /// importing the same symbol from the same third party is the ordinary case,
+    /// `useState` from `react` being the obvious one, and neither repository is
+    /// the registry entry the other should resolve against: binding one would
+    /// assert the symbol is defined in a repository that only references it.
+    ///
+    /// Nothing else narrows this. Named-repo resolution never reaches it,
+    /// because the import source is not a registered repository, so resolution
+    /// falls through to name matching across every candidate repo, where the two
+    /// importers see each other.
+    #[test]
+    fn resolve_refuses_entries_that_hold_no_definition() {
+        let index = SpineIndex::new();
+        index.register_repo(
+            "repo-a",
+            vec![external_target_entry("repo-a", "useState")],
+            "hash-a",
+        );
+        index.register_repo(
+            "repo-b",
+            vec![external_target_entry("repo-b", "useState")],
+            "hash-b",
+        );
+
+        assert!(
+            index.resolve("useState", None, None).is_empty(),
+            "a repository that only imports a symbol is not where it is defined"
+        );
+        assert!(
+            index
+                .resolve("useState", Some(EntityKind::Module), None)
+                .is_empty(),
+            "the kind-narrowed path must refuse it too"
+        );
+
+        // The repository that owns the declaration is still resolved, and is the
+        // only result even though two other repositories carry the name.
+        index.register_repo(
+            "repo-c",
+            vec![test_entry("repo-c", "useState", EntityKind::Function)],
+            "hash-c",
+        );
+        let results = index.resolve("useState", None, None);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].repo_id, "repo-c");
     }
 
     #[test]
