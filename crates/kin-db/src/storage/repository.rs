@@ -54,15 +54,67 @@ use crate::storage::history_replay::{validate_first_parent_history, ReplayProgre
 /// Persisted repository-envelope schema.
 pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 
+/// Revision of what `open`'s full validation path accepts and rejects.
+///
+/// This has to move independently of the envelope schema, because coverage
+/// changes without the persisted shape changing. A durable record binds the
+/// exact bytes that were validated, not the set of questions that was asked
+/// about them, so a store can be byte-identical under two validators that
+/// disagree about whether it is admissible. Deriving the record's version from
+/// the envelope schema alone made every such change invisible: the schema stayed
+/// at 3 while external-reference entry admission and Git projection tree replay
+/// were added to the skipped path, and records minted before either check
+/// existed still verified against the validator that added them.
+///
+/// Bump this when a check reachable from `open`'s full validation path is added,
+/// removed, or changes what it admits. Records minted by an earlier revision are
+/// then refused, each affected store pays one full validation, and that open
+/// rebinds a record at the current revision.
+///
+/// The rule tracks the **accept/reject set**, not the shape of the code that
+/// computes it. What a record has to stand for is the verdict a validator would
+/// reach about those exact bytes, so a change that reorganizes, consolidates, or
+/// speeds up the checks without changing which histories are admitted does
+/// **not** bump this, and bumping it anyway costs every existing store a full
+/// revalidation for no integrity gain.
+///
+/// Read literally, "added, removed, or changes what it admits" invites the wrong
+/// answer for a refactor that deletes call sites: replacing a per-target replay
+/// loop with one equivalent pass removes calls while removing no check. That is
+/// not a coverage change. The test to apply is whether some history's verdict
+/// moves, and the standard of evidence is a differential harness showing the old
+/// and new paths accept and refuse the same inputs.
+///
+/// One caveat, because this constant also gates a validator *implementation*: a
+/// value must never be minted by two binaries whose validation differs. If a
+/// coverage-neutral rewrite of that path lands **after** a release already
+/// minting this revision, records from the earlier binary are honored by the
+/// later one, so the two must land in the order that keeps each value
+/// unambiguous, or the revision must move to separate them.
+const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 2;
+
 /// Version of the complete open-time validation a durable history-validation
 /// record stands for.
 ///
-/// Bump this whenever anything reachable from `open`'s full validation path
-/// changes what it accepts or rejects. Every record minted by an earlier
-/// version is then refused, and one full validation re-establishes the proof.
-/// The envelope schema is folded in so an envelope change cannot silently
-/// inherit a proof minted against the old shape.
-pub const HISTORY_VALIDATION_VERSION: u32 = 1_000 + REPOSITORY_AUTHORITY_SCHEMA_VERSION;
+/// Composed from the envelope schema and the coverage revision so that either
+/// moving refuses every earlier record. The schema is folded in so an envelope
+/// change cannot silently inherit a proof minted against the old shape, and the
+/// coverage revision is folded in so a validation change cannot silently inherit
+/// a proof minted against weaker checks.
+pub const HISTORY_VALIDATION_VERSION: u32 = 1_000
+    + REPOSITORY_AUTHORITY_SCHEMA_VERSION * HISTORY_VALIDATION_SCHEMA_STRIDE
+    + HISTORY_VALIDATION_COVERAGE_REVISION;
+
+/// Spacing between envelope schemas in [`HISTORY_VALIDATION_VERSION`].
+const HISTORY_VALIDATION_SCHEMA_STRIDE: u32 = 100;
+
+// Keep the two terms in distinct decimal ranges. If the coverage revision could
+// reach the stride, a coverage bump and a schema bump would compose to the same
+// version, and a record minted under one would verify under the other.
+const _: () = assert!(
+    HISTORY_VALIDATION_COVERAGE_REVISION < HISTORY_VALIDATION_SCHEMA_STRIDE,
+    "the coverage revision must stay inside its slot so it cannot alias a schema bump"
+);
 
 /// Shared admission policy resolved at one exact semantic change.
 ///
@@ -10722,6 +10774,86 @@ mod tests {
         assert!(
             !reopen(&directory).opened_by_history_validation(),
             "a record from another validator version proves nothing about this one"
+        );
+    }
+
+    #[test]
+    fn history_validation_version_moves_with_coverage_and_not_only_with_the_schema() {
+        // Pinned so a change to what open's full validation path accepts cannot
+        // reuse a version that stood for weaker checks. If a check reachable
+        // from that path was added, removed, or retightened, bump
+        // HISTORY_VALIDATION_COVERAGE_REVISION and update this expectation
+        // together; if nothing about coverage moved, leave both alone.
+        assert_eq!(
+            HISTORY_VALIDATION_VERSION, 1_302,
+            "envelope schema 3 and coverage revision 2 compose to 1302"
+        );
+        // That literal is the whole test. The rest of this comment exists so
+        // nobody reads the test as stronger than it is, or pads it with
+        // assertions that cannot fail.
+        //
+        // Restating the composition here, or adding one to a single term of it,
+        // asserts nothing: both restate arithmetic the compiler already did, and
+        // neither can fail while the constants are referenced at all. Sweeping
+        // (schema, coverage) pairs for collisions is the same trap one level up,
+        // because `1_000 + schema * STRIDE + coverage` over `coverage < STRIDE` is
+        // positional encoding and cannot collide by construction. The property
+        // those reach for, that neither term can alias the other, is enforced
+        // where it belongs: a compile-time assertion beside the constants.
+        //
+        // What this test does catch is a revert to schema-only derivation, and
+        // either constant moving without this expectation moving with it.
+        //
+        // What it cannot catch is the failure that motivated the change:
+        // validation coverage moving while the revision stays put. The version is
+        // then still 1302, this assertion still passes, and stores reopen against
+        // checks their record never stood for. Closing that needs the covered
+        // checks enumerated or dispatched so that adding one fails to compile,
+        // not another assertion here.
+    }
+
+    #[test]
+    fn reopen_refuses_a_record_minted_before_the_current_validation_coverage() {
+        let directory = TempDir::new().unwrap();
+        drop(committed_local_repository(&directory));
+
+        // The exact version stores admitted by the build that introduced these
+        // records carry. Its validator did not yet admit external-reference
+        // entries or replay the Git projection tree, so its record cannot vouch
+        // for a store against the checks that came after it. This is a literal
+        // rather than a computed value on purpose: it is a historical fact about
+        // bytes already on disk, and it must keep failing to verify even after
+        // the composition of the current version changes again.
+        const PRE_COVERAGE_VALIDATOR_VERSION: u32 = 1_003;
+        assert_ne!(
+            PRE_COVERAGE_VALIDATOR_VERSION, HISTORY_VALIDATION_VERSION,
+            "a record minted before the current coverage must not verify against it"
+        );
+
+        let mut record = read_authority_json(directory.path());
+        record["history_validation"]["validator_version"] =
+            serde_json::json!(PRE_COVERAGE_VALIDATOR_VERSION);
+        write_authority_json(directory.path(), &record);
+
+        assert!(
+            !reopen(&directory).opened_by_history_validation(),
+            "a record minted by an earlier validation coverage must pay full validation"
+        );
+
+        // One full validation, not full validation forever: the open that paid
+        // it rebinds the record at the current version so the next open is fast
+        // again.
+        let rebound = read_authority_json(directory.path());
+        assert_eq!(
+            rebound["history_validation"]["validator_version"]
+                .as_u64()
+                .expect("the rebound record carries a validator version"),
+            u64::from(HISTORY_VALIDATION_VERSION),
+            "the open that revalidated must rebind at the current version"
+        );
+        assert!(
+            reopen(&directory).opened_by_history_validation(),
+            "the rebound record must make the next open fast"
         );
     }
 
