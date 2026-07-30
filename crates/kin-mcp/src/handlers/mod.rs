@@ -187,6 +187,7 @@ mod tests {
         file_hashes: HashMap<FilePathId, Hash256>,
         repository_refs: Vec<(kin_model::RefName, SemanticChangeId)>,
         changes_by_id: HashMap<SemanticChangeId, SemanticChange>,
+        change_reads: std::sync::atomic::AtomicUsize,
         actors_by_id: HashMap<kin_model::provenance::ActorId, kin_model::provenance::Actor>,
         approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
     }
@@ -1044,6 +1045,8 @@ mod tests {
             &self,
             id: &SemanticChangeId,
         ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
+            self.change_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.changes_by_id.get(id).cloned())
         }
         fn get_changes_since(
@@ -2272,6 +2275,61 @@ mod tests {
         assert!(excerpt.contains("return value <= maxVal;"));
         assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
         assert_eq!(object.get("start_line").unwrap(), 1);
+    }
+
+    #[test]
+    fn multi_hit_source_request_replays_deep_history_once() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let content = "export function validate(value: number): number {\n  return value;\n}\n";
+        let source = make_source_backed_entity(content);
+
+        let mut store = EmptyStore::default();
+        let mut entities = Vec::new();
+        for index in 0..24 {
+            let mut entity = source.entity.clone();
+            entity.id = EntityId::new();
+            entity.name = format!("validate_{index}");
+            entity.signature = format!("export function validate_{index}(value: number): number");
+            store.entities_by_id.insert(entity.id, entity.clone());
+            entities.push(entity);
+        }
+        store
+            .file_hashes
+            .insert(source.entity.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let mut head = *store.changes_by_id.keys().next().unwrap();
+        for index in 0..512 {
+            let change = exact_test_change(
+                vec![head],
+                &format!("deep source history {index}"),
+                Vec::new(),
+                Vec::new(),
+            );
+            head = change.id;
+            store.changes_by_id.insert(change.id, change);
+        }
+        let history_len = store.changes_by_id.len();
+        let authority = test_repository_authority(source._dir.path());
+        let mut request =
+            EntitySourceRequest::new(&store, Some(&authority), EntitySourceScope::At(head));
+
+        for entity in &entities {
+            let excerpt = request
+                .read_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
+                .unwrap()
+                .unwrap();
+            assert!(excerpt.body.contains("return value;"));
+        }
+        assert_eq!(
+            store
+                .change_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            history_len,
+            "one multi-hit request must replay each history node once, not once per entity"
+        );
     }
 
     #[test]
