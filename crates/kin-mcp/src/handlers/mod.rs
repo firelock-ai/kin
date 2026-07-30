@@ -191,6 +191,81 @@ mod tests {
         approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
     }
 
+    impl EmptyStore {
+        pub(super) fn insert_test_entity(&mut self, entity: Entity) {
+            self.live_entity_ids.insert(entity.id);
+            if let Some(file) = entity.file_origin.as_ref() {
+                self.entities_by_file
+                    .entry(file.0.clone())
+                    .or_default()
+                    .push(entity.clone());
+            }
+            self.entities_by_id.insert(entity.id, entity);
+        }
+
+        /// Wire `caller` as calling `callee`, indexed under BOTH endpoints so an
+        /// impact walk finds it from either direction.
+        pub(super) fn insert_test_calls_relation(&mut self, caller: &Entity, callee: &Entity) {
+            let relation = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(caller.id),
+                dst: kin_model::GraphNodeId::Entity(callee.id),
+                confidence: 1.0,
+                origin: kin_model::relation::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: vec![],
+            };
+            self.relations_by_entity
+                .entry(callee.id)
+                .or_default()
+                .push(relation.clone());
+            self.relations_by_entity
+                .entry(caller.id)
+                .or_default()
+                .push(relation);
+        }
+    }
+
+    /// A minimal entity for impact-presentation fixtures. `start_row` is a GRAPH
+    /// row (0-based); `None` leaves the entity spanless.
+    pub(super) fn impact_probe_entity(name: &str, start_row: Option<u32>) -> Entity {
+        let file_id = FilePathId::new(format!("src/{name}.ts"));
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([3; 32]),
+                signature_hash: Hash256::from_bytes([3; 32]),
+                behavior_hash: Hash256::from_bytes([3; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(file_id.clone()),
+            span: start_row.map(|row| kin_model::entity::SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte: 40,
+                start_line: row,
+                start_col: 0,
+                end_line: row + 2,
+                end_col: 1,
+            }),
+            signature: format!("export function {name}()"),
+            visibility: Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
     thread_local! {
         static TEST_FILE_HASHES: std::cell::RefCell<HashMap<FilePathId, Hash256>> =
             std::cell::RefCell::new(HashMap::new());
@@ -458,6 +533,153 @@ mod tests {
             .unwrap();
     }
 
+    /// Advance the workspace's exact graph-owned tree at one path WITHOUT
+    /// committing: the shape `publish_workspace_tree` produces on every editor
+    /// save the daemon admits. Generation and tree hash move; `base_target` and
+    /// `base_tree_hash` stay pinned; no change is recorded and no ref moves.
+    ///
+    /// This exists because `advance_test_repository` cannot express it. That
+    /// helper sets `new_base_tree_hash == new_tree_hash`, so the workspace it
+    /// leaves is always CLEAN, and a head read of a clean workspace is
+    /// indistinguishable from a read at base. Every fixture in this family was
+    /// built that way, which is why a head read could be pointed back at the base
+    /// tree and the whole suite still passed.
+    ///
+    /// Returns the new blob digest so a caller can stamp it as an entity's
+    /// recorded source provenance (or deliberately not stamp it).
+    fn admit_test_workspace_tree(
+        root: &std::path::Path,
+        path: &kin_model::RepoPath,
+        new_bytes: &[u8],
+    ) -> Hash256 {
+        let (repository_id, workspace_id, authority) = open_test_repository_authority(root);
+        let legacy = kin_blobs::BlobStore::new(root.join(".kin/objects")).unwrap();
+        let new_hash = model_blob_hash(&legacy, new_bytes);
+        authority.save_source_blob(new_hash, new_bytes).unwrap();
+
+        let lease = authority.read_authority();
+        let roots = lease.roots().clone();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .cloned()
+            .unwrap();
+        drop(lease);
+
+        let old = workspace.tree.artifact_at_path(path).cloned().unwrap();
+        let kin_model::change::TreeEntry::Blob { executable, .. } = old.entry else {
+            panic!("test fixture path {path} is not a blob");
+        };
+        let deltas = vec![kin_model::TreeDelta::Updated {
+            artifact_id: old.artifact_id,
+            old: kin_model::LocatedEntry::new(old.path.clone(), old.entry.clone()),
+            new: kin_model::LocatedEntry::new(
+                old.path.clone(),
+                kin_model::change::TreeEntry::Blob {
+                    hash: new_hash,
+                    executable,
+                },
+            ),
+        }];
+        let desired = workspace.tree.apply(&deltas).unwrap();
+        let new_tree_hash = kin_model::compute_resolved_tree_hash(&desired).unwrap();
+
+        let transaction = kin_model::RepositoryTransaction {
+            schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id,
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("kin-mcp-test"),
+            reason: "admit exact workspace tree without committing".into(),
+            external_objects: vec![],
+            git_authority_delta: None,
+            // No history node and no ref movement: this is the whole point of the
+            // shape. The tree moves past base and nothing commits it.
+            changes: Vec::new(),
+            aliases: vec![],
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(kin_model::WorkspaceMutation {
+                workspace_id,
+                expected: kin_model::WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: workspace.head.clone(),
+                new_base_target: workspace.base_target.clone(),
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas: deltas,
+                new_tree_hash,
+                // The admission path publishes an empty semantic delta: entity
+                // spans are re-derived by a LATER transaction, which is exactly
+                // the window a head read has to cope with.
+                semantic_delta: kin_model::WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: workspace.shared_admission_policy.clone(),
+                new_admission_policy: workspace.admission_policy,
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+        };
+        authority
+            .commit_repository_transaction(transaction)
+            .unwrap();
+        new_hash
+    }
+
+    /// One source-backed entity spanning a whole file, for the divergent-tree
+    /// fixtures below. `digest` becomes the entity's recorded source provenance
+    /// when supplied; `None` leaves it unstamped.
+    fn whole_file_entity(file_id: &FilePathId, content: &str, digest: Option<Hash256>) -> Entity {
+        let mut metadata = kin_model::entity::EntityMetadata::default();
+        if let Some(digest) = digest {
+            metadata.extra.insert(
+                "blob_hash".into(),
+                serde_json::Value::String(digest.to_string()),
+            );
+        }
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "alpha".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([7; 32]),
+                signature_hash: Hash256::from_bytes([7; 32]),
+                behavior_hash: Hash256::from_bytes([7; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id.clone(),
+                start_byte: 0,
+                end_byte: content.len(),
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: content.len() as u32,
+            }),
+            signature: "export function alpha()".into(),
+            visibility: Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata,
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
     fn initialize_release_test_repository(root: &std::path::Path, store: &EmptyStore) {
         if store.repository_refs.is_empty() {
             kin_core::init(root).unwrap();
@@ -560,7 +782,7 @@ mod tests {
             .unwrap();
     }
 
-    fn tool_result_json(result: ToolCallResult) -> serde_json::Value {
+    pub(super) fn tool_result_json(result: ToolCallResult) -> serde_json::Value {
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text,
         };
@@ -2061,11 +2283,6 @@ mod tests {
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
-        let entry = kin_model::ContextEntry {
-            entity_id: entity.id,
-            projection_level: kin_model::ProjectionLevel::FullBody,
-            content: entity.signature.clone(),
-        };
 
         let mut store = EmptyStore::default();
         store.entities_by_id.insert(entity.id, entity.clone());
@@ -2075,7 +2292,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        let value = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -2096,11 +2313,6 @@ mod tests {
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
         let source = make_source_backed_entity(content);
         let entity = &source.entity;
-        let entry = kin_model::ContextEntry {
-            entity_id: entity.id,
-            projection_level: kin_model::ProjectionLevel::FullBody,
-            content: entity.signature.clone(),
-        };
 
         let mut store = EmptyStore::default();
         store.entities_by_id.insert(entity.id, entity.clone());
@@ -2110,7 +2322,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        let value = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
 
         let marker = object.get("source").and_then(|v| v.as_str()).unwrap();
@@ -2118,9 +2330,15 @@ mod tests {
             marker, "graph",
             "focal source marker must reflect the graph read path, got: {marker}"
         );
-        assert!(
-            object.get("stale").map(|v| v.is_boolean()).unwrap_or(false),
-            "focal payload must include a boolean stale flag"
+        // This fixture's entity carries no recorded source digest, so the read
+        // cannot prove the span was cut from these bytes and says exactly that.
+        // The field it replaces (`stale`) was hardcoded false at every site and
+        // had no `set(true)` anywhere in the tree, so it asserted freshness the
+        // read never established.
+        assert_eq!(
+            object.get("span_coherence").and_then(|v| v.as_str()),
+            Some("unverified"),
+            "focal payload must report how coherent the span/bytes pair is"
         );
     }
 
@@ -2160,12 +2378,7 @@ mod tests {
             "get_entity must present row 0 as line 1"
         );
 
-        let entry = kin_model::ContextEntry {
-            entity_id: entity.id,
-            projection_level: kin_model::ProjectionLevel::FullBody,
-            content: entity.signature.clone(),
-        };
-        let focal = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
         assert_eq!(
             focal["start_line"], 1,
             "get_context_pack focal must agree with get_entity"
@@ -2338,7 +2551,7 @@ mod tests {
             projection_level: kin_model::ProjectionLevel::FullBody,
             content: project_full_body_stub(entity),
         };
-        let focal = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
         let focal_body = focal["body"]
             .as_str()
             .expect("focal body must be a string, never null, when the graph has the source");
@@ -2388,12 +2601,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let entry = kin_model::ContextEntry {
-            entity_id: spanless.id,
-            projection_level: kin_model::ProjectionLevel::FullBody,
-            content: project_full_body_stub(&spanless),
-        };
-        let focal = focal_context_json(&store, &entry, &spanless, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, &spanless, false, Some(&authority)).unwrap();
 
         assert!(
             focal["body"].is_null(),
@@ -2510,12 +2718,7 @@ mod tests {
             "the body must be the post-commit source: {excerpt}"
         );
 
-        let entry = kin_model::ContextEntry {
-            entity_id: moved.id,
-            projection_level: kin_model::ProjectionLevel::FullBody,
-            content: project_full_body_stub(&moved),
-        };
-        let focal = focal_context_json(&store, &entry, &moved, false, Some(&authority)).unwrap();
+        let focal = focal_context_json(&store, &moved, false, Some(&authority)).unwrap();
         assert_eq!(
             focal["start_line"], 3,
             "the context pack must not serve the pre-commit position"
@@ -2557,43 +2760,45 @@ mod tests {
             serde_json::json!(entity.id.to_string()),
         )]);
 
-        // Every body-shaped tool the profile carries, driven for real.
+        // Membership is ASSERTED, not used as a guard.
+        //
+        // These were `if profile.contains(...)` blocks, which made the test pass
+        // on revert: `get_context_pack` was already in the base profile and its
+        // focal body already returned real source, so dropping the newly added
+        // `get_entity_source` left the other block running and the test green. A
+        // guard that skips the assertion when the thing under test is missing
+        // cannot fail when the thing under test is missing.
         let profile: std::collections::HashSet<&str> = crate::tools::agent_default_tool_names()
             .iter()
             .copied()
             .collect();
-        let mut served: Vec<&str> = Vec::new();
-
-        if profile.contains("get_entity_source") {
-            let value = tool_result_json(
-                entities::handle_get_entity_source(&args, &store, Some(&authority)).unwrap(),
-            );
-            assert!(
-                value["body"]
-                    .as_str()
-                    .is_some_and(|body| body.contains("return value <= maxVal;")),
-                "get_entity_source must serve the real body: {value}"
-            );
-            served.push("get_entity_source");
-        }
-
-        if profile.contains("get_context_pack") {
-            let value = tool_result_json(
-                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
-                    .unwrap(),
-            );
-            assert!(
-                value["focal_entity"]["body"]
-                    .as_str()
-                    .is_some_and(|body| body.contains("return value <= maxVal;")),
-                "get_context_pack focal body must serve the real body: {value}"
-            );
-            served.push("get_context_pack");
-        }
-
         assert!(
-            !served.is_empty(),
-            "the agent-default profile must expose at least one working body read"
+            profile.contains("get_entity_source"),
+            "the agent-default profile must carry a direct entity-body read"
+        );
+        assert!(
+            profile.contains("get_context_pack"),
+            "the agent-default profile must carry the context pack"
+        );
+
+        let value = tool_result_json(
+            entities::handle_get_entity_source(&args, &store, Some(&authority)).unwrap(),
+        );
+        assert!(
+            value["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("return value <= maxVal;")),
+            "get_entity_source must serve the real body: {value}"
+        );
+
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+        assert!(
+            value["focal_entity"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("return value <= maxVal;")),
+            "get_context_pack focal body must serve the real body: {value}"
         );
     }
 
@@ -2615,11 +2820,6 @@ mod tests {
         let content = "def validate_probe_range_f0cc1f1d(value: float, min_val: float, max_val: float) -> bool:\n    return min_val <= value and value <= max_val\n";
         let source = make_signature_only_python_entity(content);
         let entity = &source.entity;
-        let entry = kin_model::ContextEntry {
-            entity_id: entity.id,
-            projection_level: kin_model::ProjectionLevel::FullBody,
-            content: entity.signature.clone(),
-        };
 
         let mut store = EmptyStore::default();
         store.entities_by_id.insert(entity.id, entity.clone());
@@ -2629,7 +2829,7 @@ mod tests {
         install_empty_store_exact_tree(&mut store, source._dir.path());
         let authority = test_repository_authority(source._dir.path());
 
-        let value = focal_context_json(&store, &entry, entity, false, Some(&authority)).unwrap();
+        let value = focal_context_json(&store, entity, false, Some(&authority)).unwrap();
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -4677,8 +4877,432 @@ mod tests {
             .unwrap();
 
         assert_eq!(excerpt, content);
-        assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), false);
+        assert_eq!(
+            object.get("span_coherence").and_then(|v| v.as_str()),
+            Some("unverified"),
+            "an entity with no recorded source digest must not claim a verified span"
+        );
         assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
+    }
+
+    /// Which source digest the live entity records, relative to a workspace tree
+    /// that has moved past its base.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SpanStamp {
+        /// The reconciler has caught up: the span was derived from the bytes now
+        /// in the tree.
+        Current,
+        /// The tree was admitted and the span has not been re-derived yet. This is
+        /// the real window between the daemon's two transactions.
+        Stale,
+        /// No recorded provenance, so coherence cannot be checked either way.
+        Absent,
+    }
+
+    /// Set up a repository whose exact tree has moved past its base at one path.
+    ///
+    /// Returns the entity (span covering the whole file), the graph store, the
+    /// authority binding, and the digest now living at that path.
+    fn divergent_tree_fixture(
+        dir: &std::path::Path,
+        before: &str,
+        after: &str,
+        stamp: SpanStamp,
+    ) -> (
+        Entity,
+        EmptyStore,
+        kin_core::LocalRepositoryAuthorityBinding,
+        Hash256,
+    ) {
+        let kin_dir = dir.join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+        let before_hash = blob_store.write(before.as_bytes()).unwrap();
+
+        let file_path = "src/alpha.ts";
+        let file_id = FilePathId::new(file_path);
+        let mut entity = whole_file_entity(&file_id, before, Some(before_hash));
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(entity.id, entity.clone());
+        store.file_hashes.insert(file_id.clone(), before_hash);
+        install_empty_store_exact_tree(&mut store, dir);
+
+        // The tree moves. Whether the entity's recorded provenance moves with it
+        // is what each caller varies, because that is the difference between a
+        // read that can prove its span describes these bytes and one that cannot.
+        let repo_path = kin_model::RepoPath::from_utf8(file_path.to_string()).unwrap();
+        let after_hash = admit_test_workspace_tree(dir, &repo_path, after.as_bytes());
+
+        match stamp {
+            SpanStamp::Current => {
+                entity.metadata.extra.insert(
+                    "blob_hash".into(),
+                    serde_json::Value::String(after_hash.to_string()),
+                );
+            }
+            SpanStamp::Stale => {}
+            SpanStamp::Absent => {
+                entity.metadata.extra.remove("blob_hash");
+            }
+        }
+        store.entities_by_id.insert(entity.id, entity.clone());
+        let authority = test_repository_authority(dir);
+        (entity, store, authority, after_hash)
+    }
+
+    /// A head read must serve the LIVE workspace tree, and must say the bytes are
+    /// uncommitted when they are.
+    ///
+    /// This is the test the byte-source change never had. Both halves fail if the
+    /// head arm is pointed back at the tree at `base_target`: the body comes back
+    /// as the pre-admission content, and the provenance claims a committed change.
+    ///
+    /// The provenance half is the one that matters for truthfulness. These bytes
+    /// exist in no change: `publish_workspace_tree` advances the tree without
+    /// creating a history node or moving a ref, so stamping the base change id on
+    /// them attests committed provenance for state no commit contains.
+    #[test]
+    fn head_read_serves_live_tree_bytes_and_marks_them_uncommitted() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        // Same length on purpose: the span still covers the whole file, so the
+        // body is exactly one of the two contents and nothing is clipped. That
+        // makes the assertion a clean discriminator between the two trees rather
+        // than a statement about bounds.
+        let before = "export function alpha() { return 1; }\n";
+        let after = "export function alpha() { return 2; }\n";
+        assert_eq!(before.len(), after.len(), "fixture must isolate content");
+
+        let (entity, store, authority, after_hash) =
+            divergent_tree_fixture(dir.path(), before, after, SpanStamp::Current);
+
+        let source = read_entity_source_excerpt_detailed(
+            &store,
+            &entity,
+            64,
+            4096,
+            Some(&authority),
+            EntitySourceScope::WorkspaceHead,
+        )
+        .expect("head read must succeed against a workspace past its base")
+        .expect("entity has source coordinates");
+
+        // Compared on the distinguishing token rather than byte-for-byte: the
+        // excerpt projection normalizes the trailing newline, and the assertion is
+        // about WHICH tree was read, not about line endings.
+        assert!(
+            source.body.contains("return 2"),
+            "a head read must serve the live workspace tree, got: {}",
+            source.body
+        );
+        assert!(
+            !source.body.contains("return 1"),
+            "serving the tree at base is the defect this pins, got: {}",
+            source.body
+        );
+
+        match &source.provenance {
+            common::SourceProvenance::Workspace {
+                base_change_id,
+                generation,
+                ..
+            } => {
+                assert!(
+                    *generation >= 1,
+                    "the admission advanced the workspace generation"
+                );
+                // The base change still exists and is still named -- it is just
+                // named as the BASE, not as the source of these bytes.
+                assert!(!base_change_id.to_string().is_empty());
+            }
+            other => {
+                panic!("uncommitted tree bytes must not report committed provenance: {other:?}")
+            }
+        }
+        assert_eq!(
+            source.provenance.committed_change_id(),
+            None,
+            "no committed change contains these bytes, so none may be offered as containing them"
+        );
+
+        // And the emitted shape must not carry `source_change_id` at all, so a
+        // consumer reading that key can never receive an id that excludes the body.
+        let fields = common::source_provenance_fields(&source);
+        assert_eq!(
+            fields.get("source_state").and_then(|v| v.as_str()),
+            Some("workspace")
+        );
+        assert!(
+            !fields.contains_key("source_change_id"),
+            "uncommitted bytes must not be stamped with a change id: {fields:?}"
+        );
+        assert!(fields.contains_key("base_change_id"));
+        assert!(fields.contains_key("workspace_tree_hash"));
+        assert_eq!(
+            fields.get("span_coherence").and_then(|v| v.as_str()),
+            Some("digest_verified")
+        );
+        let _ = after_hash;
+    }
+
+    /// A span derived from one source must never be used to cut a different one.
+    ///
+    /// The graph and repository authority are separate stores updated by separate
+    /// transactions: the daemon admits the exact tree first and re-derives entity
+    /// spans afterwards. In between, the tree holds a path's new bytes and the
+    /// graph holds the old offsets into it. Slicing one with the other returns
+    /// text that is syntactically plausible and is not the entity's source, and a
+    /// bounds check cannot see it because stale offsets still land inside the file.
+    ///
+    /// So the read refuses. Without the digest comparison this test gets a body
+    /// back -- the wrong one -- and passes silently, which is precisely the
+    /// failure mode that makes an agent restate someone else's code as this
+    /// entity's implementation.
+    #[test]
+    fn head_read_refuses_a_span_that_was_derived_from_different_bytes() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        // The replacement is LONGER, so the recorded span stays comfortably in
+        // bounds and the existing bounds check passes. That is the point: the
+        // mis-slice this catches is invisible to a length test.
+        let before = "export function alpha() { return 1; }\n";
+        let after = "export function alpha() {\n  const extra = compute();\n  return extra;\n}\n";
+        assert!(after.len() > before.len());
+
+        // The entity still records the digest of `before` while the tree holds
+        // `after`: the daemon has admitted the new source and not yet re-derived
+        // this entity's span.
+        let (entity, store, authority, _) =
+            divergent_tree_fixture(dir.path(), before, after, SpanStamp::Stale);
+
+        let outcome = read_entity_source_excerpt_detailed(
+            &store,
+            &entity,
+            64,
+            4096,
+            Some(&authority),
+            EntitySourceScope::WorkspaceHead,
+        );
+
+        let error = outcome.expect_err(
+            "a span derived from other bytes must fail loudly, never serve a mis-sliced body",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("does not describe these bytes"),
+            "the refusal must name the incoherence, got: {message}"
+        );
+        assert!(
+            message.contains("re-derived"),
+            "the refusal must tell the caller this is transient and retryable, got: {message}"
+        );
+    }
+
+    /// The digest check must not reject a read it cannot verify.
+    ///
+    /// Entities legitimately arrive without recorded source provenance, and a
+    /// fresh clone whose admission populated the live graph is the exact case the
+    /// head read exists to serve. Refusing those would re-close the body reads
+    /// this whole change opened, so an unstamped entity is served and the response
+    /// states that the pair was not checked rather than implying it was.
+    #[test]
+    fn head_read_serves_an_unstamped_entity_and_reports_the_span_unverified() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let before = "export function alpha() { return 1; }\n";
+        let after = "export function alpha() { return 2; }\n";
+        let (entity, store, authority, _) =
+            divergent_tree_fixture(dir.path(), before, after, SpanStamp::Absent);
+
+        let source = read_entity_source_excerpt_detailed(
+            &store,
+            &entity,
+            64,
+            4096,
+            Some(&authority),
+            EntitySourceScope::WorkspaceHead,
+        )
+        .expect("an unstamped entity must still be readable")
+        .expect("entity has source coordinates");
+
+        assert!(
+            source.body.contains("return 2"),
+            "still the live tree, got: {}",
+            source.body
+        );
+        assert_eq!(
+            source.span_coherence,
+            common::SpanCoherence::Unverified,
+            "an unverifiable pair must be reported as unverified, not as coherent"
+        );
+    }
+
+    /// Drive the PRODUCTION impact handler, not just its private helper.
+    ///
+    /// `annotate_impact_presentation_lines` had exactly two callers:
+    /// `handle_impact_analysis` and a test that called the private helper
+    /// directly. Deleting the production call broke nothing, so the wiring that
+    /// actually reaches an agent was unpinned while the conversion itself looked
+    /// well covered.
+    ///
+    /// It lives here rather than beside the helper because a handler test needs a
+    /// `SessionRegistry`, and the runtime-boundary guard allows that only in files
+    /// it has cleared; this module is entirely test code and is already on that
+    /// list.
+    #[tokio::test]
+    async fn impact_analysis_handler_emits_one_based_lines_for_affected_callers() {
+        let callee = impact_probe_entity("callee_probe_4c21", None);
+        let caller = impact_probe_entity("caller_probe_4c21", Some(41));
+
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(callee.clone());
+        store.insert_test_entity(caller.clone());
+        store.insert_test_calls_relation(&caller, &callee);
+
+        let args = HashMap::from([
+            (
+                "entity_ids".to_string(),
+                serde_json::json!([callee.id.to_string()]),
+            ),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let sessions = SessionRegistry::new();
+
+        let value = tool_result_json(
+            review::handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .unwrap(),
+        );
+
+        let rows = value["affected_callers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("impact analysis must report callers: {value}"));
+        assert!(
+            !rows.is_empty(),
+            "the fixture wires one caller, so the handler must report it: {value}"
+        );
+        assert_eq!(
+            rows[0]["start_line"], 42,
+            "graph row 41 must reach the agent as line 42: {}",
+            rows[0]
+        );
+        // The nested raw span stays graph truth, the established convention.
+        assert_eq!(rows[0]["span"]["start_line"], 41);
+    }
+
+    /// The artifact-identity binding is SKIPPED for an entity committed history
+    /// has no revision for, and that skip is the fresh-clone case this read exists
+    /// to serve.
+    ///
+    /// Only committed history knows which artifact introduced an entity, so a
+    /// live-only entity has no prior binding to contradict and the check cannot
+    /// run. That was argued but never tested: the existing rename/path-reuse test
+    /// exercises only the `Some(introduced_by)` branch.
+    ///
+    /// Both halves are asserted here, because the skip is only defensible if
+    /// something still guards the read. The recorded source digest is that guard:
+    /// an entity whose span was derived from the bytes now at the path is served,
+    /// and one whose span was not is refused, with no committed revision involved
+    /// in either outcome.
+    #[test]
+    fn live_only_entity_skips_identity_binding_but_not_the_digest_check() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        let content = "export function orphan() { return 7; }\n";
+        let hash = blob_store.write(content.as_bytes()).unwrap();
+        let file_id = FilePathId::new("src/orphan.ts");
+
+        // The tree carries the path; the initial change carries NO entity for it,
+        // so committed history records no revision and the binding is skipped.
+        let mut store = EmptyStore::default();
+        store.file_hashes.insert(file_id.clone(), hash);
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+
+        let entity = whole_file_entity(&file_id, content, Some(hash));
+        store.entities_by_id.insert(entity.id, entity.clone());
+        assert!(
+            committed_introducing_change_is_absent(&store, &entity),
+            "the fixture must leave this entity out of committed history"
+        );
+
+        let source = read_entity_source_excerpt_detailed(
+            &store,
+            &entity,
+            64,
+            4096,
+            Some(&authority),
+            EntitySourceScope::WorkspaceHead,
+        )
+        .expect("a live-only entity must be readable; rejecting it was the original defect")
+        .expect("entity has source coordinates");
+        assert!(source.body.contains("return 7"));
+        assert_eq!(source.span_coherence, common::SpanCoherence::DigestVerified);
+
+        // Same entity, same skipped binding, but its span was derived from other
+        // bytes: the read must still refuse.
+        let mut stale = entity.clone();
+        stale.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::Value::String(Hash256::from_bytes([9; 32]).to_string()),
+        );
+        let error = read_entity_source_excerpt_detailed(
+            &store,
+            &stale,
+            64,
+            4096,
+            Some(&authority),
+            EntitySourceScope::WorkspaceHead,
+        )
+        .expect_err("a skipped identity binding must not mean an unguarded read");
+        assert!(error.to_string().contains("does not describe these bytes"));
+    }
+
+    /// True when committed history records no active revision for `entity`, which
+    /// is the condition that skips the artifact-identity binding.
+    fn committed_introducing_change_is_absent(store: &EmptyStore, entity: &Entity) -> bool {
+        let authority_change = store
+            .repository_refs
+            .first()
+            .map(|(_, change_id)| *change_id);
+        let Some(change_id) = authority_change else {
+            return true;
+        };
+        store
+            .resolve_graph_at(&change_id)
+            .map(|graph| {
+                !graph
+                    .entity_revisions
+                    .get(&entity.id)
+                    .is_some_and(|revisions| {
+                        revisions.iter().any(|revision| revision.ended_by.is_none())
+                    })
+            })
+            .unwrap_or(true)
     }
 
     #[test]

@@ -246,6 +246,19 @@ pub struct LocateRequest {
     /// otherwise). Only meaningful when `snippets` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet_lines: Option<usize>,
+    /// When true, project the graph-native `entities[]` ranking even though
+    /// `snippets` is false.
+    ///
+    /// `snippets` cannot express this on its own: it means "carry source
+    /// bodies", and the daemon used it to gate the entity projection as well, so
+    /// an agent asking for the structured surface WITHOUT bodies
+    /// (`kin locate --json --no-snippets`) received an empty `entities[]`. Its
+    /// results were removed in answer to a request to spend fewer tokens, which
+    /// is the same defect `include_snippet: false` had on `semantic_locate`.
+    /// Defaults to false so the human CLI path and any older client stay
+    /// coordinates-only.
+    #[serde(default)]
+    pub entity_surface: bool,
     /// Opaque paging cursor (`<key>.<page>`) from a prior locate's `next_cursor`.
     /// When set and the daemon still holds the matching ranking, the next page of
     /// ENTITIES is sliced from cache with NO retrieval re-run; on a cache miss or

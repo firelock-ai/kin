@@ -1287,6 +1287,9 @@ pub async fn run(
         max_files_explicit,
         reference,
         snippets,
+        // `--json` IS the structured/agent surface, so it gets the graph-native
+        // entity ranking whether or not it asked for bodies.
+        json,
         paging,
     )
     .await?;
@@ -1297,6 +1300,13 @@ pub async fn run(
     Ok(())
 }
 
+/// Run a locate and return the structured result.
+///
+/// `snippets` requests source bodies on hits; `entity_surface` requests the
+/// graph-native `entities[]` ranking. They are separate because a caller can
+/// legitimately want the ranking without the source, and collapsing them made
+/// `--json --no-snippets` return no results at all. A caller emitting JSON should
+/// pass `entity_surface: true` whether or not it wants bodies.
 #[allow(clippy::too_many_arguments)]
 pub async fn capture(
     text: &str,
@@ -1306,6 +1316,7 @@ pub async fn capture(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    entity_surface: bool,
     paging: LocatePaging,
 ) -> Result<LocateResult> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -1325,6 +1336,7 @@ pub async fn capture(
         max_files_explicit,
         reference,
         snippets,
+        entity_surface,
         paging,
     )
     .await?;
@@ -1411,6 +1423,7 @@ async fn try_locate_via_daemon(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    entity_surface: bool,
     paging: LocatePaging,
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
@@ -1431,6 +1444,7 @@ async fn try_locate_via_daemon(
         reference,
         snippets,
         snippet_lines: None,
+        entity_surface,
         cursor: paging.cursor,
         page_size: paging.page_size,
     };
@@ -15432,10 +15446,34 @@ pub fn build_entity_view(
 }
 
 /// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
-/// ran against, and the graph version. Embedding the graph version means any
-/// edit (a `vfs_version` bump) yields a different key, so a stale cursor can
-/// never page a ranking built against different graph truth.
-pub fn locate_cursor_key(text: &str, reference: Option<&str>, graph_version: u64) -> String {
+/// ran against, the graph version, and whether the cached hits carry source
+/// bodies. Embedding the graph version means any edit (a `vfs_version` bump)
+/// yields a different key, so a stale cursor can never page a ranking built
+/// against different graph truth.
+///
+/// `bodies` is part of the key because a cached ranking IS the paged answer, so
+/// the mode it was built in decides what every later page returns. Two ways that
+/// bites when the mode is left out, both reachable on one query at one graph
+/// version:
+///
+/// - a ranking cached WITH bodies, paged by a caller that declined them, returns
+///   the source that caller asked not to receive, silently ignoring the flag it
+///   set to bound its token spend;
+/// - a ranking cached WITHOUT bodies, paged by a caller that asked for them,
+///   returns hits carrying no snippet at all -- the "set `include_snippet` and
+///   found no snippet key" defect, relocated from page 0 to page 1.
+///
+/// A mode mismatch must therefore miss the cache and re-run the ranking, which is
+/// what a distinct key produces. It is a required parameter rather than
+/// something callers fold into `reference` themselves because every paging
+/// surface has to make the same decision, and a convention that lives in three
+/// call sites and is enforced in none is how the two defects above arrived.
+pub fn locate_cursor_key(
+    text: &str,
+    reference: Option<&str>,
+    graph_version: u64,
+    bodies: bool,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
     text.hash(&mut hasher);
@@ -15443,6 +15481,8 @@ pub fn locate_cursor_key(text: &str, reference: Option<&str>, graph_version: u64
     reference.unwrap_or("").hash(&mut hasher);
     0xff_u8.hash(&mut hasher);
     graph_version.hash(&mut hasher);
+    0xff_u8.hash(&mut hasher);
+    bodies.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -16313,16 +16353,45 @@ mod tests {
 
     #[test]
     fn locate_cursor_key_is_deterministic_and_version_scoped() {
-        let a = locate_cursor_key("find the parser", Some("HEAD"), 42);
-        let b = locate_cursor_key("find the parser", Some("HEAD"), 42);
+        let a = locate_cursor_key("find the parser", Some("HEAD"), 42, true);
+        let b = locate_cursor_key("find the parser", Some("HEAD"), 42, true);
         assert_eq!(a, b, "same inputs must yield the same key");
         // A graph edit bumps the version → a different key, so a stale cursor can
         // never page a ranking built against different graph truth.
-        let c = locate_cursor_key("find the parser", Some("HEAD"), 43);
+        let c = locate_cursor_key("find the parser", Some("HEAD"), 43, true);
         assert_ne!(a, c);
         // Query and ref are part of the identity.
-        assert_ne!(a, locate_cursor_key("other query", Some("HEAD"), 42));
-        assert_ne!(a, locate_cursor_key("find the parser", Some("main"), 42));
+        assert_ne!(a, locate_cursor_key("other query", Some("HEAD"), 42, true));
+        assert_ne!(
+            a,
+            locate_cursor_key("find the parser", Some("main"), 42, true)
+        );
+    }
+
+    /// The body mode joins the cursor key, so one query at one graph version
+    /// cannot serve both modes from a single cached ranking.
+    ///
+    /// Without this, the cached ranking's mode silently overrides the flag the
+    /// paging caller set: a bodies-carrying ranking returns source to a caller
+    /// that declined it, and a bodies-less ranking returns hits with no snippet
+    /// to a caller that asked for one. The second is the `include_snippet`
+    /// field-absence defect moved from page 0 to page 1, which is why the key,
+    /// not the payload, is where this has to be fixed: a mismatch must miss the
+    /// cache and re-rank rather than be papered over on emit.
+    #[test]
+    fn locate_cursor_key_separates_the_body_mode() {
+        let with_bodies = locate_cursor_key("find the parser", Some("HEAD"), 42, true);
+        let without_bodies = locate_cursor_key("find the parser", Some("HEAD"), 42, false);
+        assert_ne!(
+            with_bodies, without_bodies,
+            "include_snippet true/false must not collide on one cache entry"
+        );
+        // The mode is the ONLY difference; everything else held equal.
+        assert_eq!(
+            without_bodies,
+            locate_cursor_key("find the parser", Some("HEAD"), 42, false),
+            "the key must still be deterministic within a mode"
+        );
     }
 
     fn fusion_entity(id: &str, path: &str, score: f32) -> LocateEntity {

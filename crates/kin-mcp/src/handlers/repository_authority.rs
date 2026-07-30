@@ -71,6 +71,24 @@ pub(crate) struct ActiveRepositoryAuthority {
     pub workspace_id: WorkspaceId,
 }
 
+/// One instant of workspace authority: the exact graph-owned tree, its identity
+/// and generation, and the committed change its base resolves to.
+///
+/// Every field is read out of a single `AuthorityReadLease`, which is an `Arc`
+/// snapshot of the whole published authority state, so these facts describe one
+/// generation by construction. That is the property a source read needs and the
+/// reason this type exists: calling `workspace()` for the tree and then a second
+/// accessor for the change id takes two independent snapshots, and a concurrent
+/// admission between them pairs one generation's bytes with another generation's
+/// provenance. Nothing serializes those two reads, so the only fix is to stop
+/// taking two.
+pub(crate) struct WorkspaceReadSample {
+    pub workspace: WorkspaceState,
+    /// The committed change `workspace.base_target` resolves to, resolved
+    /// against the same snapshot the workspace was read from.
+    pub base_change_id: SemanticChangeId,
+}
+
 impl ActiveRepositoryAuthority {
     pub(crate) fn open(binding: &LocalRepositoryAuthorityBinding) -> Result<Self> {
         let manager = binding.open_manager().map_err(|error| {
@@ -86,9 +104,35 @@ impl ActiveRepositoryAuthority {
     }
 
     pub(crate) fn workspace(&self) -> Result<WorkspaceState> {
-        self.manager
-            .read_authority()
-            .authority_metadata()
+        let lease = self.manager.read_authority();
+        self.workspace_in(lease.authority_metadata())
+    }
+
+    /// One coherent instant of workspace authority.
+    ///
+    /// Prefer this over `workspace()` plus a separate change-id accessor
+    /// anywhere both the tree and its provenance feed one answer: a single
+    /// snapshot cannot straddle an admission, two snapshots can. See
+    /// [`WorkspaceReadSample`].
+    pub(crate) fn workspace_sample(&self) -> Result<WorkspaceReadSample> {
+        let lease = self.manager.read_authority();
+        let metadata = lease.authority_metadata();
+        let workspace = self.workspace_in(metadata)?;
+        let target = workspace.base_target.clone().ok_or_else(|| {
+            McpError::Context(format!(
+                "graph authority gap: workspace {} has an unborn head",
+                workspace.workspace_id
+            ))
+        })?;
+        let base_change_id = self.resolve_target_in(metadata, target)?;
+        Ok(WorkspaceReadSample {
+            workspace,
+            base_change_id,
+        })
+    }
+
+    fn workspace_in(&self, metadata: &PersistedRepositoryAuthority) -> Result<WorkspaceState> {
+        metadata
             .workspaces
             .iter()
             .find(|workspace| workspace.workspace_id == self.workspace_id)
@@ -131,7 +175,22 @@ impl ActiveRepositoryAuthority {
     }
 
     pub(crate) fn resolve_target(&self, target: &RefTarget) -> Result<SemanticChangeId> {
-        let mut target = target.clone();
+        let lease = self.manager.read_authority();
+        self.resolve_target_in(lease.authority_metadata(), target.clone())
+    }
+
+    /// Resolve a ref target against ONE authority snapshot.
+    ///
+    /// Symbolic hops and external-commit aliases are followed inside the same
+    /// `metadata` the caller sampled, so a chain can never be walked across two
+    /// generations of ref state and land on a change that no single generation
+    /// pointed at.
+    fn resolve_target_in(
+        &self,
+        metadata: &PersistedRepositoryAuthority,
+        target: RefTarget,
+    ) -> Result<SemanticChangeId> {
+        let mut target = target;
         let mut visited = BTreeSet::new();
         loop {
             match target {
@@ -143,10 +202,7 @@ impl ActiveRepositoryAuthority {
                             object.oid, object.kind
                         )));
                     }
-                    return self
-                        .manager
-                        .read_authority()
-                        .authority_metadata()
+                    return metadata
                         .aliases
                         .iter()
                         .find(|alias| alias.oid == object.oid)
@@ -164,9 +220,12 @@ impl ActiveRepositoryAuthority {
                             "graph authority gap: symbolic repository ref cycle reaches {name}"
                         )));
                     }
-                    target = self
-                        .repository_ref(&name)
-                        .map(|repository_ref| repository_ref.target)
+                    target = metadata
+                        .ref_state
+                        .refs
+                        .iter()
+                        .find(|repository_ref| repository_ref.name == name)
+                        .map(|repository_ref| repository_ref.target.clone())
                         .ok_or_else(|| {
                             McpError::Context(format!(
                                 "graph authority gap: symbolic repository ref {name} is absent"
@@ -182,17 +241,6 @@ impl ActiveRepositoryAuthority {
             McpError::InvalidParams(format!("repository ref '{name}' was not found"))
         })?;
         self.resolve_target(&repository_ref.target)
-    }
-
-    pub(crate) fn current_source_change_id(&self) -> Result<SemanticChangeId> {
-        let workspace = self.workspace()?;
-        let target = workspace.base_target.as_ref().ok_or_else(|| {
-            McpError::Context(format!(
-                "graph authority gap: workspace {} has an unborn head",
-                workspace.workspace_id
-            ))
-        })?;
-        self.resolve_target(target)
     }
 
     pub(crate) fn resolve_git_oid(&self, oid: GitObjectId) -> Result<SemanticChangeId> {

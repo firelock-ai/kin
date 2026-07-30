@@ -2207,6 +2207,10 @@ fn main() -> Result<()> {
                             max_files_explicit,
                             reference,
                             want_snippets,
+                            // Diagnose prints the structured payload, so it wants
+                            // the graph-native entity ranking even though it stays
+                            // lean on bodies unless --snippets is explicit.
+                            true,
                             paging,
                         )
                         .await?;

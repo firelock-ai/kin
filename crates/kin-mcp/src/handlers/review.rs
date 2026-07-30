@@ -198,6 +198,13 @@ pub fn handle_semantic_review<G: GraphStore>(
 
     if format.eq_ignore_ascii_case("json") {
         let mut result = serde_json::to_value(&review).map_err(McpError::Json)?;
+        // `semantic_review format=json` carries the same impact buckets
+        // `impact_analysis` returns, so it gets the same 1-based presentation
+        // lines. Annotating one and not the other left two agent surfaces
+        // reporting the same entity's position under two conventions.
+        if let Some(impact) = result.get_mut("impact") {
+            annotate_impact_presentation_lines(impact, &review.impact);
+        }
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "summary".into(),

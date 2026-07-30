@@ -3940,8 +3940,17 @@ async fn locate(
     // Resolve the bounded-snippet projection for this request. Off by default
     // (CLI human path, legacy clients); the agent JSON surface sets it so each
     // located definition symbol carries inline code from graph-owned content.
+    //
+    // The middle case is the one that was missing: a structured caller that
+    // declined bodies still wants the graph-native `entities[]` ranking. Falling
+    // through to the default options switched the whole projection off, so
+    // `kin locate --json --no-snippets` answered a request to spend fewer tokens
+    // by returning no results -- the same defect `include_snippet: false` had on
+    // the `semantic_locate` arm.
     let snippet_opts = if req.snippets {
         kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines)
+    } else if req.entity_surface {
+        kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines).without_bodies()
     } else {
         kin_cli::commands::locate::SnippetOptions::default()
     };
@@ -3955,7 +3964,10 @@ async fn locate(
         .unwrap_or_else(kin_cli::commands::locate::entity_page_size);
 
     // Paging fast path: a valid cursor whose ranking is still cached at the
-    // current graph version is windowed straight from cache — NO retrieval.
+    // current graph version AND in this request's body mode is windowed straight
+    // from cache, with NO retrieval. The mode is checked and not merely keyed:
+    // the cursor token carries the key, so a caller can present the other mode's
+    // key and would otherwise be served that mode's ranking.
     if let Some(cursor_token) = req.cursor.as_deref() {
         if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
             let cached = {
@@ -3963,6 +3975,7 @@ async fn locate(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    .filter(|entry| entry.bodies == snippet_opts.bodies)
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -4084,9 +4097,10 @@ async fn locate(
 
     // Cache the full entity ranking and window page 0 so a follow-up `--next`
     // pages it from cache without re-running retrieval. Keyed by
-    // (query, ref/scope, graph-version) so any edit invalidates the page. A
-    // multi-query ranking keys off the joined variants so it cannot collide with
-    // any single-variant cursor.
+    // (query, ref/scope, graph-version, body-mode) so any edit invalidates the
+    // page and a caller paging in one body mode never receives a ranking built in
+    // the other. A multi-query ranking keys off the joined variants so it cannot
+    // collide with any single-variant cursor.
     let key_text = if multi_query {
         multiquery_cursor_text(&variants)
     } else {
@@ -4096,8 +4110,15 @@ async fn locate(
         &key_text,
         scope_token.as_deref(),
         graph_version,
+        snippet_opts.bodies,
     );
-    cache_locate_ranking(&state, &key, &result.entities, graph_version);
+    cache_locate_ranking(
+        &state,
+        &key,
+        &result.entities,
+        graph_version,
+        snippet_opts.bodies,
+    );
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
 }
@@ -4382,6 +4403,7 @@ fn cache_locate_ranking(
     key: &str,
     entities: &[kin_cli::commands::locate::LocateEntity],
     graph_version: u64,
+    bodies: bool,
 ) {
     let mut cache = state.locate_rankings.lock().unwrap();
     if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
@@ -4398,6 +4420,7 @@ fn cache_locate_ranking(
         CachedLocateRanking {
             entities: entities.to_vec(),
             graph_version,
+            bodies,
             created: std::time::Instant::now(),
         },
     );
@@ -5570,6 +5593,10 @@ fn build_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    // Cached rows already carry (or omit) `snippet`, and the
+                    // cursor supplies the key, so a mode mismatch has to miss the
+                    // cache and re-search rather than replay the other mode.
+                    .filter(|entry| entry.bodies == include_snippet)
                     .map(|entry| entry.rows.clone())
             };
             if let Some(rows) = cached {
@@ -5762,6 +5789,7 @@ fn build_semantic_locate_result(
         &query,
         Some(granularity_token.as_str()),
         graph_version,
+        include_snippet,
     );
     {
         let mut cache = state.semantic_locate_pages.lock().unwrap();
@@ -5779,6 +5807,7 @@ fn build_semantic_locate_result(
             CachedSemanticPage {
                 rows: rows.clone(),
                 graph_version,
+                bodies: include_snippet,
                 created: std::time::Instant::now(),
             },
         );
@@ -5933,6 +5962,21 @@ async fn build_fused_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // `entities[]` is the graph-native surface this tool answers with, so it is
+    // projected either way. Only the body text follows `include_snippet`. The
+    // default options would switch the whole projection off, which turned "omit
+    // snippets" into "omit the results".
+    //
+    // Resolved BEFORE the paging fast path below rather than after it: the fast
+    // path answers straight from a cached ranking, and a body mode decided after
+    // that point leaves the cursor path unable to tell which mode the caller
+    // actually asked for.
+    let snippet_opts = if include_snippet {
+        kin_cli::commands::locate::SnippetOptions::enabled(None)
+    } else {
+        kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
+    };
+
     // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
     // so a stale cursor can never page a ranking built against different truth.
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
@@ -5958,6 +6002,10 @@ async fn build_fused_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    // The cursor carries the cache key, so a caller can present a
+                    // key minted in the other body mode. Keying is not enough;
+                    // the held ranking's mode has to match this request's.
+                    .filter(|entry| entry.bodies == snippet_opts.bodies)
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -5984,16 +6032,6 @@ async fn build_fused_semantic_locate_result(
         // Cache miss / stale / undecodable cursor: fall through to a fresh run
         // (returns page 0) rather than silently failing the page.
     }
-
-    // `entities[]` is the graph-native surface this tool answers with, so it is
-    // projected either way. Only the body text follows `include_snippet`. The
-    // default options would switch the whole projection off, which turned "omit
-    // snippets" into "omit the results".
-    let snippet_opts = if include_snippet {
-        kin_cli::commands::locate::SnippetOptions::enabled(None)
-    } else {
-        kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
-    };
 
     // Multi-query fan-out: `query` plus any additional `queries` variants,
     // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
@@ -6055,8 +6093,15 @@ async fn build_fused_semantic_locate_result(
         &key_text,
         scope_token.as_deref(),
         graph_version,
+        snippet_opts.bodies,
     );
-    cache_locate_ranking(state, &key, &locate_result.entities, graph_version);
+    cache_locate_ranking(
+        state,
+        &key,
+        &locate_result.entities,
+        graph_version,
+        snippet_opts.bodies,
+    );
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
     fused_semantic_locate_payload(locate_result, &query, file_granularity)
@@ -21714,6 +21759,7 @@ mod tests {
                             reference: None,
                             snippets: false,
                             snippet_lines: None,
+                            entity_surface: false,
                             cursor: None,
                             page_size: None,
                         })
@@ -21993,6 +22039,7 @@ mod tests {
                             reference: None,
                             snippets: true,
                             snippet_lines: None,
+                            entity_surface: true,
                             cursor: None,
                             page_size: None,
                         })

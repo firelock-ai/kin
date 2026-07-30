@@ -1094,13 +1094,23 @@ pub struct DaemonState {
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
-/// FULL ranked entity list once per (query, ref/scope, graph-version) so a
-/// follow-up page (`kin locate --next`) windows the next slice with no retrieval
-/// re-run. `graph_version` is checked on lookup so a stale page (the graph moved
-/// under the cursor) is rejected rather than served.
+/// FULL ranked entity list once per (query, ref/scope, graph-version, body-mode)
+/// so a follow-up page (`kin locate --next`) windows the next slice with no
+/// retrieval re-run. `graph_version` is checked on lookup so a stale page (the
+/// graph moved under the cursor) is rejected rather than served.
 pub struct CachedLocateRanking {
     pub entities: Vec<kin_cli::commands::locate::LocateEntity>,
     pub graph_version: u64,
+    /// Whether the cached hits carry source bodies.
+    ///
+    /// Checked on lookup, because a cursor token carries the cache KEY and the
+    /// client hands it back verbatim: folding the body mode into the key stops
+    /// the two modes from overwriting each other's slot, but it cannot stop a
+    /// caller from presenting the other mode's key. Without this check, paging a
+    /// bodies-carrying ranking with bodies declined returns source the caller
+    /// asked not to receive, and paging a bodies-less ranking with bodies
+    /// requested returns hits with no snippet at all.
+    pub bodies: bool,
     pub created: Instant,
 }
 
@@ -1110,6 +1120,10 @@ pub struct CachedLocateRanking {
 pub struct CachedSemanticPage {
     pub rows: Vec<serde_json::Value>,
     pub graph_version: u64,
+    /// Whether the cached rows carry `snippet`. Same reason as
+    /// [`CachedLocateRanking::bodies`]: the cursor supplies the key, so the mode
+    /// has to be verified on lookup rather than only keyed.
+    pub bodies: bool,
     pub created: Instant,
 }
 

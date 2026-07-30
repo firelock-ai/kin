@@ -206,9 +206,8 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 EntitySourceScope::WorkspaceHead,
             )?
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
-            let is_stale = LAST_READ_STALE.with(|f| f.get());
             let source = LAST_READ_SOURCE.with(|f| f.get());
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": entity.id,
                 "name": entity.name,
                 "kind": entity.kind,
@@ -219,13 +218,11 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 "end_line": entity_presentation_end_line(&entity),
                 "signature": entity.signature,
                 "body": exact_source.body,
-                "source_change_id": exact_source.source_change_id,
-                "artifact_id": exact_source.artifact_id,
-                "artifact_path": exact_source.path,
-                "artifact_entry": exact_source.entry,
-                "stale": is_stale,
                 "source": source,
             });
+            if let Some(map) = value.as_object_mut() {
+                map.extend(source_provenance_fields(&exact_source));
+            }
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
@@ -598,12 +595,14 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
         .map_err(|e| McpError::Context(e.to_string()))?;
 
-    // Build structured response JSON.
+    // Build structured response JSON. The pack still has to have projected a
+    // focal entry for the focal entity to be worth serializing, but the body
+    // comes from graph truth rather than from that entry.
     let focal_entry = pack.focal_entities.first();
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
-    let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entry, entity, compact, repository_authority)?
+    let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
+        focal_context_json(store, entity, compact, repository_authority)?
     } else {
         serde_json::json!(null)
     };
@@ -634,16 +633,19 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     repository_authority,
                     EntitySourceScope::WorkspaceHead,
                 )?;
-                let is_stale = LAST_READ_STALE.with(|f| f.get());
                 let source = LAST_READ_SOURCE.with(|f| f.get());
-                obj["stale"] = serde_json::json!(is_stale);
                 obj["source"] = serde_json::json!(source);
                 // Same rule as the focal body: a dependency's `body` is the
                 // graph-owned projection or null. The pack's own `entry.content`
                 // is a token-accounting stub, and serving it here would hand an
                 // agent signature text shaped like an implementation.
                 match body {
-                    Some(source) => obj["body"] = serde_json::json!(source.body),
+                    Some(source) => {
+                        obj["body"] = serde_json::json!(source.body);
+                        if let Some(map) = obj.as_object_mut() {
+                            map.extend(source_provenance_fields(&source));
+                        }
+                    }
                     None => {
                         obj["body"] = serde_json::Value::Null;
                         obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(&e));
