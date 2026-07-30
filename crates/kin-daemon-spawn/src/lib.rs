@@ -818,8 +818,9 @@ fn validate_process_group_guardian_readiness(
 /// explicit cleanup the launcher stops the whole group as a kernel-enforced
 /// fork barrier, kills it repeatedly, then hands completion to the watcher. The
 /// watcher performs that barrier only for owner death or failed parent cleanup.
-/// The launcher reaps its sentinel and performs the final exact empty-group
-/// check after callers wait their owned direct children.
+/// The launcher reaps its sentinel and then establishes that nothing left in
+/// the group can still execute, which an already-exited member satisfies whether
+/// or not its process-table slot has been collected yet.
 ///
 /// This is intentionally a same-credential, group-preserving cooperative
 /// contract, not a security sandbox. A child that changes credentials or
@@ -965,8 +966,9 @@ impl ProcessGroupGuardian {
     /// Poll and reap a completed watcher.
     ///
     /// A successful result combines the completed launcher-or-watcher
-    /// STOP/repeated-KILL barrier with launcher-side sentinel reap and one
-    /// exact final `kill(-pgid, 0) == ESRCH` emptiness check.
+    /// STOP/repeated-KILL barrier with launcher-side sentinel reap and one final
+    /// containment check, which requires every process still in the group to
+    /// have exited and is satisfied trivially when the group is empty.
     pub fn try_reap(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.observe_watcher_exit()?;
         if self.watcher.is_some() {
@@ -1473,9 +1475,11 @@ fn log_reaper_group_finalization(
     let sentinel_was_killed = sentinel_exit_was_sigkill(sentinel_status);
     // The sentinel handle was just reaped and consumed. This is the one final
     // group probe; no reaper path may signal the numeric PGID after this call.
-    let empty_probe = unsafe { libc::kill(-process_group, 0) };
-    let group_empty =
-        empty_probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    // It asks the same containment question the launcher path asks, because an
+    // observable group holding nothing but uncollected corpses is contained, and
+    // logging that benign state as an error trained operators to ignore the log
+    // line that reports a real escape.
+    let containment = process_group_containment(process_group);
     if !sentinel_was_killed {
         tracing::error!(
             %sentinel_status,
@@ -1483,11 +1487,18 @@ fn log_reaper_group_finalization(
             "durable reaper observed unexpected sentinel exit"
         );
     }
-    if !group_empty {
-        tracing::error!(
+    match containment {
+        ProcessGroupContainment::Empty | ProcessGroupContainment::OnlyExited => {}
+        ProcessGroupContainment::LiveMember { pid } => tracing::error!(
             process_group,
-            "durable reaper final probe found the process group still observable"
-        );
+            live_pid = pid,
+            "durable reaper final probe found a live process in the process group"
+        ),
+        ProcessGroupContainment::Indeterminate { detail } => tracing::warn!(
+            process_group,
+            %detail,
+            "durable reaper could not establish process-group containment"
+        ),
     }
 }
 
@@ -1831,6 +1842,41 @@ fn process_group_containment(process_group: libc::pid_t) -> ProcessGroupContainm
 #[cfg(target_os = "macos")]
 const PROC_PGRP_ONLY: u32 = 2;
 
+/// Bytes reported by one `proc_listpids` call, with failure kept distinct from
+/// an empty answer.
+///
+/// `proc_listpids` does not use the -1/errno convention the rest of this module
+/// reads. libproc turns a failed `__proc_info` into a return of 0, and rejects
+/// an unknown selector the same way, leaving the reason in errno. So the return
+/// value alone cannot separate "this group has no members" from "this query
+/// failed", and a `< 0` test never fires. Clearing errno first is what makes the
+/// two distinguishable.
+///
+/// That distinction is the point of the call. An unreadable group reported as an
+/// empty one classifies as [`ProcessGroupContainment::Empty`], which
+/// finalization accepts, so anything that denies `proc_info` would silently
+/// disable the containment check for the lifetime of the process while
+/// reporting success.
+#[cfg(target_os = "macos")]
+fn list_process_group_bytes(
+    group: u32,
+    buffer: *mut libc::c_void,
+    byte_len: i32,
+) -> std::io::Result<usize> {
+    unsafe { *libc::__error() = 0 };
+    let written = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, buffer, byte_len) };
+    if written > 0 {
+        return Ok(written as usize);
+    }
+    let failure = std::io::Error::last_os_error();
+    // Only a failing call writes errno here, so an untouched errno is the one
+    // reading under which zero means the group is genuinely empty.
+    if written == 0 && failure.raw_os_error() == Some(0) {
+        return Ok(0);
+    }
+    Err(failure)
+}
+
 /// PIDs currently reported as members of a process group.
 #[cfg(target_os = "macos")]
 fn process_group_members(process_group: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
@@ -1839,23 +1885,16 @@ fn process_group_members(process_group: libc::pid_t) -> std::io::Result<Vec<libc
     // Ask for the size first, then read with headroom: the group can only be
     // shrinking here, so a buffer sized for the earlier answer cannot truncate a
     // later one, and the headroom absorbs the case where it somehow grew.
-    let needed = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, std::ptr::null_mut(), 0) };
-    if needed < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let needed = list_process_group_bytes(group, std::ptr::null_mut(), 0)?;
     if needed == 0 {
         return Ok(Vec::new());
     }
-    let slots = needed as usize / std::mem::size_of::<u32>() + 8;
+    let slots = needed / std::mem::size_of::<u32>() + 8;
     let mut buffer = vec![0u32; slots];
     let byte_len = i32::try_from(buffer.len() * std::mem::size_of::<u32>())
         .map_err(|_| std::io::Error::other("process group member buffer exceeds a c_int"))?;
-    let written =
-        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, buffer.as_mut_ptr().cast(), byte_len) };
-    if written < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let count = written as usize / std::mem::size_of::<u32>();
+    let written = list_process_group_bytes(group, buffer.as_mut_ptr().cast(), byte_len)?;
+    let count = written / std::mem::size_of::<u32>();
     Ok(buffer
         .into_iter()
         .take(count)
