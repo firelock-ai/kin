@@ -48,11 +48,16 @@ fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
 
 /// Coherent repository-v6 authority for the daemon's primary workspace.
 ///
-/// Every request opens the durable publication and then holds one immutable
-/// lease while resolving refs, workspace tree state, and source identities.
-/// The raw checkout and Git object database are never consulted.
+/// Opening one reads the durable publication in full and then holds one
+/// immutable lease while resolving refs, workspace tree state, and source
+/// identities. The raw checkout and Git object database are never consulted.
+///
+/// The manager is shared rather than owned so a caller that has already paid
+/// for one open can hand the same coherent authority to another reader; see
+/// [`ProjectionAuthorityCache`].
+#[derive(Clone)]
 struct ActiveApiRepositoryAuthority {
-    manager: RepositoryAuthorityManager<LocalFileBackend>,
+    manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
     repository_id: RepositoryId,
     workspace_id: WorkspaceId,
 }
@@ -63,8 +68,12 @@ impl ActiveApiRepositoryAuthority {
             .local_repository_authority_binding()
             .map_err(repository_authority_error)?;
         let manager = binding.open_manager().map_err(repository_authority_error)?;
+        state
+            .projection_authority
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
-            manager,
+            manager: Arc::new(manager),
             repository_id: binding.repository_id().clone(),
             workspace_id: binding.workspace_id(),
         })
@@ -76,7 +85,7 @@ impl ActiveApiRepositoryAuthority {
             .map_err(repository_authority_error)?;
         let manager = binding.open_manager().map_err(repository_authority_error)?;
         Ok(Self {
-            manager,
+            manager: Arc::new(manager),
             repository_id: binding.repository_id().clone(),
             workspace_id: binding.workspace_id(),
         })
@@ -103,6 +112,217 @@ fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, Str
         StatusCode::FAILED_DEPENDENCY,
         format!("repository-v6 authority unavailable: {error}"),
     )
+}
+
+/// KinDB's commit record for one local repository's durable publication.
+///
+/// KinDB stages snapshot and delta bodies, fsyncs them, and then atomically
+/// replaces this one record; that rename is the commit point. The record
+/// content-binds the snapshot digest and every acknowledged delta digest under
+/// deterministic serialization, so identical record bytes mean identical
+/// durable state by construction, and a record that reads identically twice
+/// cannot have moved and returned in between. The converse does not hold: a
+/// rewrite is not always a new publication, because opening a legacy store can
+/// re-mint this record once while binding validation state. With the label read
+/// before the load it describes, that costs one spurious reload and never a
+/// stale serve.
+const AUTHORITY_PUBLICATION_RECORD: &str = "authority.json";
+
+/// KinDB reads its own record under a 1 MiB bound. A larger file at that path
+/// is not a record it wrote, and is reported rather than loaded.
+const MAX_AUTHORITY_PUBLICATION_RECORD_BYTES: u64 = 1024 * 1024;
+
+/// Which durable publication a repository's local storage currently holds.
+///
+/// This is storage-commit metadata, never a semantic answer: it decides only
+/// whether an already-loaded authority may be reused, and every answer served
+/// still comes from repository-v6 graph truth.
+#[derive(Clone, PartialEq, Eq)]
+enum LocalPublicationIdentity {
+    /// The repository has persisted no authority yet, so its authority is the
+    /// unpublished generation-zero state.
+    Unpublished,
+    Published([u8; 32]),
+}
+
+/// Read which publication local storage holds, without loading it.
+///
+/// The full load this labels reads, hashes, and deserializes the entire graph
+/// snapshot. This reads one small record, so a reader can revalidate on every
+/// request and pay the full load only when the publication has actually moved
+/// — including when it moved under a separate process such as a CLI ingest or
+/// commit running beside the daemon.
+fn read_local_publication_identity(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
+    use std::io::Read as _;
+
+    let record = backend
+        .base_path()
+        .join(repository_id.as_str())
+        .join(AUTHORITY_PUBLICATION_RECORD);
+    let record_error = |error: std::io::Error| {
+        repository_authority_error(format!(
+            "cannot read local publication record {}: {error}",
+            record.display()
+        ))
+    };
+    // One handle answers both the bound and the contents, so a commit landing
+    // mid-check cannot bound one record and return the bytes of another. The
+    // bound is enforced by reading a single byte past it rather than by a
+    // separate size probe, so nothing measures a record it did not then read,
+    // and rejecting an oversized file costs one byte beyond the limit.
+    let file = match std::fs::File::open(&record) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LocalPublicationIdentity::Unpublished);
+        }
+        Err(error) => return Err(record_error(error)),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTHORITY_PUBLICATION_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(record_error)?;
+    if bytes.len() as u64 > MAX_AUTHORITY_PUBLICATION_RECORD_BYTES {
+        return Err(repository_authority_error(format!(
+            "local publication record {} is past the {MAX_AUTHORITY_PUBLICATION_RECORD_BYTES}-byte bound",
+            record.display()
+        )));
+    }
+    Ok(LocalPublicationIdentity::Published(
+        Sha256::digest(&bytes).into(),
+    ))
+}
+
+/// One repository-v6 authority shared across the daemon's projection routes.
+///
+/// Opening authority is a full snapshot read, SHA-256, and deserialize under an
+/// exclusive repository lock. Paying that per projected read makes every VFS
+/// request proportional to whole-repository size. Holding one open authority
+/// and revalidating it against the durable publication record keeps the answer
+/// exactly as fresh while making the common request a small metadata read.
+#[derive(Default)]
+pub(crate) struct ProjectionAuthorityCache {
+    held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
+    /// Serializes misses so a burst of concurrent cold requests pays for one
+    /// full load rather than one per request.
+    load_gate: std::sync::Mutex<()>,
+    loads: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct HeldProjectionAuthority {
+    /// The publication this authority is known to be at least as new as.
+    ///
+    /// Read strictly before the authority it labels was loaded, never after.
+    /// A label taken afterwards could name a publication that landed during
+    /// the load, which would mark older bytes as current and serve them past
+    /// the commit that replaced them.
+    published: LocalPublicationIdentity,
+    authority: ActiveApiRepositoryAuthority,
+}
+
+impl ProjectionAuthorityCache {
+    /// Complete durable-authority loads this daemon state has paid for.
+    ///
+    /// Every [`ActiveApiRepositoryAuthority::open`] counts, whichever route
+    /// asked for it. One load per publication rather than one per request is
+    /// the property this cache exists to make true.
+    pub(crate) fn loads(&self) -> u64 {
+        self.loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reuse(&self, published: &LocalPublicationIdentity) -> Option<ActiveApiRepositoryAuthority> {
+        lock_recover(&self.held)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| held.authority.clone())
+    }
+
+    fn install(
+        &self,
+        published: LocalPublicationIdentity,
+        authority: ActiveApiRepositoryAuthority,
+    ) {
+        *lock_recover(&self.held) = Some(HeldProjectionAuthority {
+            published,
+            authority,
+        });
+    }
+
+    fn invalidate(&self) {
+        *lock_recover(&self.held) = None;
+    }
+}
+
+/// Refuse a storage namespace that is no longer the one this daemon pinned.
+///
+/// Opening authority performs this check itself, so reusing a held authority
+/// has to perform it too; otherwise a `.kin/kindb` namespace replaced under the
+/// daemon would keep being answered from the authority of the store it
+/// replaced. The probe decodes no snapshot and takes no repository lock.
+fn confirm_pinned_projection_namespace(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> Result<(), (StatusCode, String)> {
+    match backend.probe_pinned_repository_namespace(repository_id.as_str()) {
+        kin_db::LocalNamespaceProbe::Retained => Ok(()),
+        kin_db::LocalNamespaceProbe::Absent => Err(repository_authority_error(format!(
+            "local storage authority does not hold repository namespace {repository_id}"
+        ))),
+        kin_db::LocalNamespaceProbe::IdentityLost(fault) => Err(repository_authority_error(fault)),
+        kin_db::LocalNamespaceProbe::Unavailable(error) => Err(repository_authority_error(error)),
+    }
+}
+
+/// Resolve the repository-v6 authority the projection routes answer from.
+///
+/// Blocking: reads storage metadata and, on a publication change, loads the
+/// complete durable authority. Callers run it on a blocking thread.
+fn projection_repository_authority(
+    state: &DaemonState,
+) -> Result<ActiveApiRepositoryAuthority, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let repository_id = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?
+        .repository_id()
+        .clone();
+
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse(&published) {
+        return Ok(authority);
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    // Re-read under the gate: the publication may have moved while this
+    // request waited, and the label installed below must be the one taken
+    // before the load it describes.
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse(&published) {
+        return Ok(authority);
+    }
+    let authority = ActiveApiRepositoryAuthority::open(state)?;
+    state
+        .projection_authority
+        .install(published, authority.clone());
+    // Whether reuse is actually holding is not visible from request latency
+    // alone, and a count that climbs with request volume rather than with
+    // publications is the signal that it is not.
+    tracing::debug!(
+        repository = %authority.repository_id,
+        loads = state.projection_authority.loads(),
+        "projection repository authority loaded"
+    );
+    Ok(authority)
 }
 
 /// Fail closed when an explicit filesystem-admission command is unavailable.
@@ -7863,14 +8083,29 @@ async fn repo_provenance_verify(
 // VFS endpoints — serve the committed file tree and blob content
 // ---------------------------------------------------------------------------
 
+/// Run one projection route's storage work off the async runtime.
+///
+/// Resolving authority reads storage metadata, and a publication change reads,
+/// hashes, and deserializes the whole durable snapshot under an exclusive
+/// repository lock. None of that belongs on a runtime worker.
+async fn projection_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, (StatusCode, String)> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| internal_error(format!("projection authority task failed: {error}")))
+}
+
 /// Load one complete repository-v6 workspace projection.
 ///
 /// The manager constructs the wire snapshot from one authority lease and
 /// verifies every blob/symlink body against repository-owned immutable CAS.
+///
+/// Blocking: callers run this through [`projection_blocking`].
 fn active_workspace_tree(
     state: &DaemonState,
 ) -> Result<(ActiveApiRepositoryAuthority, WorkspaceTreeSnapshot), (StatusCode, String)> {
-    let authority = ActiveApiRepositoryAuthority::open(state)?;
+    let authority = projection_repository_authority(state)?;
     let snapshot = authority.workspace_tree_snapshot()?;
     Ok((authority, snapshot))
 }
@@ -7879,7 +8114,7 @@ fn active_workspace_tree(
 async fn vfs_version(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     Ok(Json(json!({
         "version": snapshot.binding.roots.generation,
         "workspace_generation": snapshot.binding.workspace_generation,
@@ -7900,7 +8135,7 @@ fn validate_vfs_tree_path(path: &str) -> Result<(), String> {
 /// generation, exact tree entries (including executable/symlink/gitlink
 /// identity), sizes, and projection mtimes.
 async fn vfs_tree(State(state): State<Arc<DaemonState>>) -> Result<Response, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     let identity = snapshot.identity().map_err(repository_authority_error)?;
     let mut response = Json(snapshot).into_response();
     response.headers_mut().insert(
@@ -7915,7 +8150,7 @@ async fn vfs_stat(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     if !path.is_empty() && path != "." {
         validate_vfs_tree_path(&path).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
         let repo_path = RepoPath::from_utf8(path.clone())
@@ -8057,56 +8292,63 @@ async fn vfs_read(
 ) -> Result<Response, (StatusCode, HeaderMap, String)> {
     validate_vfs_tree_path(&path)
         .map_err(|message| vfs_read_error(StatusCode::BAD_REQUEST, message))?;
-    let (authority, snapshot) = active_workspace_tree(&state)
-        .map_err(|(status, message)| vfs_read_error(status, message))?;
-    let repo_path = RepoPath::from_utf8(path.clone())
-        .map_err(|error| vfs_read_error(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let artifact = snapshot
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.path == repo_path)
-        .ok_or_else(|| {
-            vfs_read_error(
-                StatusCode::NOT_FOUND,
-                format!("file not found in repository-v6 workspace tree: {path}"),
-            )
-        })?;
-    let digest = artifact.entry.blob_identity().ok_or_else(|| {
-        vfs_read_error(
-            StatusCode::FAILED_DEPENDENCY,
-            format!("gitlink {path} has no local source body"),
-        )
-    })?;
-    let blob_data = authority
-        .manager
-        .load_source_blob(digest)
-        .map_err(|error| {
+    let requested = path.clone();
+    let (digest, blob_data, total_size) = projection_blocking(move || {
+        let (authority, snapshot) = active_workspace_tree(&state)
+            .map_err(|(status, message)| vfs_read_error(status, message))?;
+        let path = requested;
+        let repo_path = RepoPath::from_utf8(path.clone())
+            .map_err(|error| vfs_read_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        let artifact = snapshot
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == repo_path)
+            .ok_or_else(|| {
+                vfs_read_error(
+                    StatusCode::NOT_FOUND,
+                    format!("file not found in repository-v6 workspace tree: {path}"),
+                )
+            })?;
+        let digest = artifact.entry.blob_identity().ok_or_else(|| {
             vfs_read_error(
                 StatusCode::FAILED_DEPENDENCY,
-                format!("repository CAS read failed for {path} at {digest}: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            vfs_read_error(
-                StatusCode::FAILED_DEPENDENCY,
-                format!("repository CAS body missing for {path} at {digest}"),
+                format!("gitlink {path} has no local source body"),
             )
         })?;
-    let total_size = u64::try_from(blob_data.len()).map_err(|_| {
-        vfs_read_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("repository CAS blob size exceeds u64 for {path}"),
-        )
-    })?;
-    if total_size != artifact.size {
-        return Err(vfs_read_error(
-            StatusCode::FAILED_DEPENDENCY,
-            format!(
-                "repository-v6 workspace metadata says {path} has {} bytes but CAS returned {total_size}",
-                artifact.size
-            ),
-        ));
-    }
+        let blob_data = authority
+            .manager
+            .load_source_blob(digest)
+            .map_err(|error| {
+                vfs_read_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!("repository CAS read failed for {path} at {digest}: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                vfs_read_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!("repository CAS body missing for {path} at {digest}"),
+                )
+            })?;
+        let total_size = u64::try_from(blob_data.len()).map_err(|_| {
+            vfs_read_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("repository CAS blob size exceeds u64 for {path}"),
+            )
+        })?;
+        if total_size != artifact.size {
+            return Err(vfs_read_error(
+                StatusCode::FAILED_DEPENDENCY,
+                format!(
+                    "repository-v6 workspace metadata says {path} has {} bytes but CAS returned {total_size}",
+                    artifact.size
+                ),
+            ));
+        }
+        Ok((digest, blob_data, total_size))
+    })
+    .await
+    .map_err(|(status, message)| vfs_read_error(status, message))??;
 
     let byte_range = match parse_vfs_byte_range(&headers, total_size) {
         Ok(range) => range,
@@ -8209,29 +8451,34 @@ async fn vfs_blob(
             Some(error.to_string()),
         )
     })?;
-    let authority = ActiveApiRepositoryAuthority::open(&state)?;
-    let blob_data = authority
-        .manager
-        .load_source_blob(digest)
-        .map_err(|error| {
-            vfs_blob_error(
-                StatusCode::FAILED_DEPENDENCY,
-                "repository_cas_read_failed",
-                &hash,
-                Some(error.to_string()),
-            )
-        })?
-        .ok_or_else(|| {
-            vfs_blob_error(
-                StatusCode::NOT_FOUND,
-                "graph_blob_missing",
-                &hash,
-                Some(format!(
-                    "repository {} owns no immutable source body at this content address",
-                    authority.repository_id
-                )),
-            )
-        })?;
+    let requested = hash.clone();
+    let blob_data = projection_blocking(move || {
+        let hash = requested;
+        let authority = projection_repository_authority(&state)?;
+        authority
+            .manager
+            .load_source_blob(digest)
+            .map_err(|error| {
+                vfs_blob_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "repository_cas_read_failed",
+                    &hash,
+                    Some(error.to_string()),
+                )
+            })?
+            .ok_or_else(|| {
+                vfs_blob_error(
+                    StatusCode::NOT_FOUND,
+                    "graph_blob_missing",
+                    &hash,
+                    Some(format!(
+                        "repository {} owns no immutable source body at this content address",
+                        authority.repository_id
+                    )),
+                )
+            })
+    })
+    .await??;
 
     let mut response = blob_data.into_response();
     response.headers_mut().insert(
@@ -8257,7 +8504,7 @@ async fn vfs_readdir(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     let prefix = if path.is_empty() || path == "." {
         String::new()
     } else {
@@ -19265,6 +19512,106 @@ mod tests {
         assert_eq!(json["error"], "graph_blob_missing");
         assert_eq!(json["hash"], unowned);
         assert_eq!(json["authority"], "repository_v6");
+    }
+
+    /// Repository paths the projection currently advertises.
+    async fn advertised_workspace_paths(app: Router) -> Vec<String> {
+        let response = app
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let snapshot: WorkspaceTreeSnapshot = serde_json::from_slice(&body).unwrap();
+        snapshot
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.path.as_utf8().map(str::to_string))
+            .collect()
+    }
+
+    /// Opening repository authority reads, hashes, and deserializes the entire
+    /// durable snapshot under an exclusive repository lock. Paying that per
+    /// projected read makes every read cost whole-repository work, so reads
+    /// arriving at one publication have to share a single load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_projected_reads_share_one_authority_load() {
+        const BODY: &[u8] = b"one authority serves many projected reads\n";
+        let state = test_state();
+        install_repository_file(&state, "src/shared.rs", BODY);
+        let digest = Hash256::from_bytes(state.blobs.write(BODY).unwrap().0);
+        let url = format!("/vfs/blob/{digest}");
+        let loads_before = state.projection_authority.loads();
+
+        let app = router(Arc::clone(&state));
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let app = app.clone();
+                let url = url.clone();
+                tokio::spawn(async move {
+                    app.oneshot(Request::get(url).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .status()
+                })
+            })
+            .collect();
+        for read in reads {
+            assert_eq!(read.await.unwrap(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            state.projection_authority.loads() - loads_before,
+            1,
+            "eight projected reads at one publication must load repository authority once"
+        );
+    }
+
+    /// A held authority may never outlive the publication it was loaded from.
+    ///
+    /// The commit here goes through the ordinary repository write path, which
+    /// opens its own authority exactly as a CLI ingest or commit running beside
+    /// the daemon does. The next projected read has to serve what that commit
+    /// published, not the publication the previous read loaded.
+    #[tokio::test]
+    async fn projected_reads_serve_a_publication_committed_while_serving() {
+        const FIRST: &[u8] = b"first published body\n";
+        const SECOND: &[u8] = b"second published body\n";
+        let state = test_state();
+        install_repository_file(&state, "src/first.rs", FIRST);
+        let app = router(Arc::clone(&state));
+
+        let advertised = advertised_workspace_paths(app.clone()).await;
+        assert!(advertised.contains(&"src/first.rs".to_string()));
+        assert!(!advertised.contains(&"src/second.rs".to_string()));
+        assert!(
+            state.projection_authority.loads() > 0,
+            "the first projected read must have loaded repository authority"
+        );
+
+        install_repository_file(&state, "src/second.rs", SECOND);
+
+        let advertised = advertised_workspace_paths(app.clone()).await;
+        assert!(
+            advertised.contains(&"src/second.rs".to_string()),
+            "a projected read must serve the publication that replaced the one it last loaded, got {advertised:?}"
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/vfs/read/src/second.rs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), SECOND);
     }
 
     #[tokio::test]
