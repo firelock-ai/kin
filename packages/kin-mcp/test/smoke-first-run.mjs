@@ -31,6 +31,50 @@ function log(message) {
   process.stderr.write(`[smoke] ${message}\n`);
 }
 
+function productEnv() {
+  const env = { ...process.env };
+  delete env.KIN_BIN;
+  delete env.KIN_DAEMON_BIN;
+  return env;
+}
+
+function gitFixtureEnv() {
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: os.devNull,
+    GIT_CONFIG_NOSYSTEM: '1'
+  };
+  for (const key of [
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_COMMON_DIR',
+    'GIT_DIR',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_WORK_TREE'
+  ]) {
+    delete env[key];
+  }
+  return env;
+}
+
+function runGit(repoDir, args) {
+  cp.execFileSync('git', args, {
+    cwd: repoDir,
+    env: gitFixtureEnv(),
+    stdio: 'inherit'
+  });
+}
+
+function initializeGitFixture(repoDir) {
+  runGit(repoDir, ['init', '--initial-branch=main', '.']);
+  runGit(repoDir, ['config', '--local', 'user.name', 'Kin MCP Smoke']);
+  runGit(repoDir, ['config', '--local', 'user.email', 'kin-mcp-smoke@localhost']);
+  runGit(repoDir, ['config', '--local', 'commit.gpgSign', 'false']);
+  runGit(repoDir, ['config', '--local', 'core.autocrlf', 'false']);
+  runGit(repoDir, ['add', '--', 'main.rs']);
+  runGit(repoDir, ['commit', '-m', 'Seed Kin MCP smoke fixture']);
+}
+
 async function isFile(candidate) {
   try {
     const stat = await fs.stat(candidate);
@@ -178,6 +222,7 @@ async function main() {
     path.join(repoDir, 'main.rs'),
     'fn greet() -> &\'static str {\n    "hello kin"\n}\n'
   );
+  initializeGitFixture(repoDir);
 
   await stageCache(cacheRoot, kinBin, daemonBin);
 
@@ -186,11 +231,15 @@ async function main() {
     env: { KIN_MCP_CACHE_DIR: cacheRoot }
   });
   log('kin init . (explicit first-run)');
-  cp.execFileSync(cachedKin, ['init', '.'], { cwd: repoDir, stdio: 'inherit' });
+  cp.execFileSync(cachedKin, ['init', '.'], {
+    cwd: repoDir,
+    env: productEnv(),
+    stdio: 'inherit'
+  });
 
   const wrapperBin = path.join(packageDir, 'bin', 'kin-mcp.js');
   const env = {
-    ...process.env,
+    ...productEnv(),
     KIN_MCP_CACHE_DIR: cacheRoot,
     KIN_DAEMON_IDLE_TIMEOUT_SECS: '30',
     KIN_SUPERVISOR_IDLE_TIMEOUT_SECS: '30'
