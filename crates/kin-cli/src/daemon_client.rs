@@ -2239,6 +2239,181 @@ pub fn repo_daemon_owner_path(kin_root: &Path) -> PathBuf {
     kin_root.join("daemon.owner")
 }
 
+/// Schema tag carried by the endpoint owner sidecar.
+pub const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
+
+/// Who published the endpoint currently on disk.
+///
+/// `daemon.pid` holds a bare PID because every version of every Kin surface
+/// reads it that way, and a PID alone cannot survive reuse: after the recorded
+/// daemon exits, that number starts naming whatever the kernel handed it to
+/// next, and a reader comparing PIDs either preserves a dead endpoint forever
+/// or deletes a live one. This sidecar records the same process incarnation the
+/// singleton lock stamps, so ownership can be *proved* rather than inferred
+/// from a number.
+///
+/// The record carries identity and nothing else. A port field was tempting and
+/// is deliberately absent: `daemon.port` is the port, nothing would read a
+/// second copy, and two records of the same fact can only ever disagree.
+///
+/// The definition lives here rather than beside the daemon that writes it for
+/// the same reason. The daemon publishes the record and the CLI start path
+/// reads it to decide whether an endpoint may be replaced; a second declaration
+/// of one schema is a second thing to keep in step, and the schema tag exists
+/// precisely so a reader can refuse a record it does not understand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointOwnerRecord {
+    schema: String,
+    identity: ProcessIdentity,
+}
+
+impl EndpointOwnerRecord {
+    /// A record attributing an endpoint to this process incarnation, or `None`
+    /// on a target that cannot describe one.
+    pub fn current() -> Option<Self> {
+        Some(Self {
+            schema: ENDPOINT_OWNER_SCHEMA.to_string(),
+            identity: current_process_identity().ok()?,
+        })
+    }
+
+    /// The incarnation this record names.
+    pub fn identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+
+    /// Attribute an endpoint to an incarnation other than this process, so a
+    /// test can build the state a predecessor or a successor would leave behind
+    /// without running a second daemon.
+    ///
+    /// Hidden rather than `#[cfg(test)]`: the daemon crate's tests need it too,
+    /// and a `cfg(test)` item is invisible across a crate boundary.
+    #[doc(hidden)]
+    pub fn for_identity(identity: ProcessIdentity) -> Self {
+        Self {
+            schema: ENDPOINT_OWNER_SCHEMA.to_string(),
+            identity,
+        }
+    }
+}
+
+/// Read the endpoint owner sidecar, if one exists and this build understands it.
+pub fn read_endpoint_owner_record(kin_root: &Path) -> Option<EndpointOwnerRecord> {
+    let raw = std::fs::read_to_string(repo_daemon_owner_path(kin_root)).ok()?;
+    let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
+    (record.schema == ENDPOINT_OWNER_SCHEMA).then_some(record)
+}
+
+/// What could be established about the owner of a published endpoint, and
+/// whether the answer came from a verified incarnation or only from a PID.
+///
+/// The two travel together because the honest diagnostic differs: a bare PID
+/// that stopped responding says only that a number is gone, while a verified
+/// identity mismatch says the daemon that published this endpoint is gone and
+/// its PID now names something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointOwnerLiveness {
+    liveness: ProcessLiveness,
+    identity_verified: bool,
+}
+
+impl EndpointOwnerLiveness {
+    /// Whether the endpoint may be retired: only affirmative death qualifies.
+    pub fn authorizes_cleanup(self) -> bool {
+        self.liveness.authorizes_cleanup()
+    }
+
+    /// Whether the verdict was decided against a recorded incarnation rather
+    /// than a bare PID.
+    pub fn identity_verified(self) -> bool {
+        self.identity_verified
+    }
+
+    fn from_identity(liveness: ProcessLiveness) -> Self {
+        Self {
+            liveness,
+            identity_verified: true,
+        }
+    }
+
+    fn from_pid(liveness: ProcessLiveness) -> Self {
+        Self {
+            liveness,
+            identity_verified: false,
+        }
+    }
+}
+
+/// Judge the owner of this repo's published endpoint, preferring the recorded
+/// incarnation over the bare PID.
+///
+/// This is the client-side twin of `kin_daemon::lifecycle::endpoint_ownership`
+/// and answers the same question in the same direction: it governs whether an
+/// endpoint may be *deleted*, so an indeterminate probe is ownership-preserving.
+/// Refusing to retire what cannot be inspected costs a stale file; retiring a
+/// live daemon's endpoint strands the repo.
+///
+/// Deciding from the bare PID is what wedged autostart. A SIGKILLed daemon
+/// leaves its endpoint behind, the kernel hands that PID to an unrelated
+/// process, `kill(pid, 0)` reports it alive, and the start path concludes
+/// forever that a live daemon it cannot reach owns the repo: never `Invalid`,
+/// never retired, never respawned.
+pub fn endpoint_owner_liveness(kin_root: &Path, recorded_pid: u32) -> EndpointOwnerLiveness {
+    endpoint_owner_liveness_with_probes(
+        kin_root,
+        recorded_pid,
+        process_identity_is_current,
+        process_liveness,
+    )
+}
+
+/// Both probes are injectable for the same reason the daemon's are: the
+/// indeterminate arm and the legacy arm are decisions, and a decision that
+/// cannot be exercised in a test is one a later change can silently invert.
+fn endpoint_owner_liveness_with_probes(
+    kin_root: &Path,
+    recorded_pid: u32,
+    identity_probe: impl FnOnce(&ProcessIdentity) -> std::io::Result<bool>,
+    pid_probe: impl FnOnce(u32) -> ProcessLiveness,
+) -> EndpointOwnerLiveness {
+    let Some(record) = read_endpoint_owner_record(kin_root) else {
+        // A legacy endpoint published before attribution existed, or by a
+        // compatible older daemon. A bare PID is all there is to go on.
+        return EndpointOwnerLiveness::from_pid(pid_probe(recorded_pid));
+    };
+    if record.identity.pid != recorded_pid {
+        // Attribution and endpoint disagree, so the record does not describe
+        // the endpoint being judged. Publication installs the record before the
+        // PID file it attributes, so this is a torn write or a mixed-version
+        // writer rather than a generation this reader can reason about. Judge
+        // the PID the endpoint actually names, which can only ever be more
+        // conservative than acting on a statement about a different process.
+        return EndpointOwnerLiveness::from_pid(pid_probe(recorded_pid));
+    }
+    if record.identity.pid == std::process::id() {
+        // Answer the "is it mine" case from this process's own identity rather
+        // than from a probe of its PID: routing the self case through a
+        // fallible probe would let a transient error report this process as
+        // gone.
+        return EndpointOwnerLiveness::from_identity(match current_process_identity() {
+            Ok(current) if current == record.identity => ProcessLiveness::Alive,
+            // Our PID, a different incarnation: the publisher exited and the
+            // kernel handed us its number.
+            Ok(_) => ProcessLiveness::Dead,
+            Err(_) => ProcessLiveness::Unknown,
+        });
+    }
+    EndpointOwnerLiveness::from_identity(match identity_probe(&record.identity) {
+        Ok(true) => ProcessLiveness::Alive,
+        // The PID resolves to a different incarnation than the one that
+        // published this endpoint, so the publisher is gone.
+        Ok(false) => ProcessLiveness::Dead,
+        // An identity that cannot be read at all (another user's process) is
+        // indeterminate, and an uninspectable owner is not a dead one.
+        Err(_) => ProcessLiveness::Unknown,
+    })
+}
+
 /// Remove a repo worker daemon's pid/port endpoint files. The daemon deletes
 /// these itself on graceful shutdown; `kin daemon stop` also calls this after a
 /// confirmed stop so a later `status` never reports the dead endpoint as stale.
@@ -2881,6 +3056,10 @@ fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
     live_daemon_endpoint_with_probe(kin_root, process_liveness)
 }
 
+/// `probe` is the *legacy* arm: it decides only for an endpoint published with
+/// no owner record beside it. An attributed endpoint is judged against the
+/// recorded incarnation, because that is the only reading that survives PID
+/// reuse.
 fn live_daemon_endpoint_with_probe(
     kin_root: &Path,
     probe: impl FnOnce(u32) -> ProcessLiveness,
@@ -2892,7 +3071,16 @@ fn live_daemon_endpoint_with_probe(
     // to a same-PID successor's newly published port, making the final
     // compare-and-retire accept the wrong endpoint generation.
     let port = recorded.port;
-    if probe(pid).authorizes_cleanup() {
+    // Read attribution *after* the endpoint it attributes, which is the order
+    // that can only ever make this more conservative. Publication installs the
+    // owner record before the PID file, so a snapshot showing a successor's
+    // endpoint is always accompanied by a readable successor record; reading
+    // the record first would instead pair a predecessor's dead identity with a
+    // successor's live endpoint, and the compare-and-retire below would then
+    // find the successor's files unchanged and delete them.
+    if endpoint_owner_liveness_with_probes(kin_root, pid, process_identity_is_current, probe)
+        .authorizes_cleanup()
+    {
         // Compare-and-delete even here, where the window is only as wide as this
         // function: a successor that republished between the read and the
         // liveness check would otherwise lose its endpoint to a true statement
@@ -4274,11 +4462,22 @@ async fn probe_daemon_endpoint_with_warming_signal(
     let mut warming = false;
 
     loop {
-        if !is_process_alive(endpoint.pid) {
-            return EndpointVerdict::Invalid(format!(
-                "recorded daemon process {} is not alive",
-                endpoint.pid
-            ));
+        // Judged against the recorded incarnation, not the bare PID. `Invalid`
+        // authorizes the caller to clear this endpoint and respawn, so it needs
+        // positive evidence of death; a recycled PID that merely *exists* is
+        // not a live daemon, and treating it as one is what left autostart
+        // reporting LiveNotReady forever with nothing able to clear the record.
+        let owner = endpoint_owner_liveness(kin_root, endpoint.pid);
+        if owner.authorizes_cleanup() {
+            return EndpointVerdict::Invalid(if owner.identity_verified() {
+                format!(
+                    "the daemon that published this endpoint is gone; pid {} now names \
+                     a different process",
+                    endpoint.pid
+                )
+            } else {
+                format!("recorded daemon process {} is not alive", endpoint.pid)
+            });
         }
 
         let probe_error = match client.get(format!("{base_url}/readiness")).send().await {

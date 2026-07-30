@@ -642,35 +642,13 @@ where
 /// incarnation.
 const ENDPOINT_OWNER_FILE: &str = "daemon.owner";
 
-/// Schema tag carried by [`ENDPOINT_OWNER_FILE`].
-const ENDPOINT_OWNER_SCHEMA: &str = "kin.daemon.endpoint-owner.v1";
-
-/// Who published the endpoint currently on disk.
+/// The record written into [`ENDPOINT_OWNER_FILE`].
 ///
-/// `daemon.pid` holds a bare PID because every version of every Kin surface
-/// reads it that way, and a PID alone cannot survive reuse: after the recorded
-/// daemon exits, that number starts naming whatever the kernel handed it to
-/// next, and a reader comparing PIDs either preserves a dead endpoint forever
-/// or deletes a live one. This sidecar records the same process incarnation the
-/// singleton lock stamps, so ownership can be *proved* rather than inferred
-/// from a number.
-/// The record carries identity and nothing else. A port field was tempting and
-/// is deliberately absent: `daemon.port` is the port, nothing would read a
-/// second copy, and two records of the same fact can only ever disagree.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct EndpointOwnerRecord {
-    schema: String,
-    identity: kin_cli::daemon_client::ProcessIdentity,
-}
-
-impl EndpointOwnerRecord {
-    fn current() -> Option<Self> {
-        Some(Self {
-            schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-            identity: kin_cli::daemon_client::current_process_identity().ok()?,
-        })
-    }
-}
+/// Declared once, beside the process identity it carries, and shared with the
+/// CLI start path that reads it: the daemon publishes attribution and the CLI
+/// decides from it whether an endpoint may be replaced, and two declarations of
+/// one schema are two things to keep in step.
+use kin_cli::daemon_client::EndpointOwnerRecord;
 
 /// What the on-disk endpoint says about its owner.
 ///
@@ -701,11 +679,7 @@ impl EndpointOwnership {
     }
 }
 
-fn read_endpoint_owner_record(kin_root: &Path) -> Option<EndpointOwnerRecord> {
-    let raw = std::fs::read_to_string(kin_root.join(ENDPOINT_OWNER_FILE)).ok()?;
-    let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
-    (record.schema == ENDPOINT_OWNER_SCHEMA).then_some(record)
-}
+use kin_cli::daemon_client::read_endpoint_owner_record;
 
 /// Classify the published endpoint's owner.
 ///
@@ -735,24 +709,24 @@ fn endpoint_ownership_with_probe(
         // `read(daemon.pid) == process::id()`, which cannot fail; routing the
         // self case through a fallible probe would let a transient error
         // refuse a daemon permission to retire its own endpoint and strand it.
-        if record.identity.pid() == std::process::id() {
+        if record.identity().pid() == std::process::id() {
             return match kin_cli::daemon_client::current_process_identity() {
-                Ok(current) if current == record.identity => EndpointOwnership::CurrentProcess,
+                Ok(current) if current == *record.identity() => EndpointOwnership::CurrentProcess,
                 // Our PID, a different incarnation: the publisher is gone and
                 // the kernel handed us its number.
                 Ok(_) => EndpointOwnership::OtherProcess {
-                    pid: record.identity.pid(),
+                    pid: record.identity().pid(),
                     live: false,
                 },
                 Err(_) => EndpointOwnership::OtherProcess {
-                    pid: record.identity.pid(),
+                    pid: record.identity().pid(),
                     live: true,
                 },
             };
         }
-        return match probe(&record.identity) {
+        return match probe(record.identity()) {
             Ok(is_current) => EndpointOwnership::OtherProcess {
-                pid: record.identity.pid(),
+                pid: record.identity().pid(),
                 live: is_current,
             },
             // An identity that cannot be read at all (another user's process)
@@ -761,7 +735,7 @@ fn endpoint_ownership_with_probe(
             // live here. Publication asks a different question and must not
             // reuse this answer: see [`proven_live_other_endpoint_owner`].
             Err(_) => EndpointOwnership::OtherProcess {
-                pid: record.identity.pid(),
+                pid: record.identity().pid(),
                 live: true,
             },
         };
@@ -810,12 +784,12 @@ fn proven_live_other_endpoint_owner_with_probe(
         return None;
     }
     let record = read_endpoint_owner_record(kin_root)?;
-    if record.identity.pid() == std::process::id() {
+    if record.identity().pid() == std::process::id() {
         return None;
     }
-    probe(&record.identity)
+    probe(record.identity())
         .unwrap_or(false)
-        .then(|| record.identity.pid())
+        .then(|| record.identity().pid())
 }
 
 /// Publish an endpoint attributed to a process other than this one, so tests
@@ -828,10 +802,7 @@ pub(crate) fn publish_foreign_endpoint_for_test(
     port: u16,
 ) {
     let pid = identity.pid();
-    let record = EndpointOwnerRecord {
-        schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-        identity,
-    };
+    let record = EndpointOwnerRecord::for_identity(identity);
     std::fs::write(kin_root.join("daemon.pid"), pid.to_string()).unwrap();
     std::fs::write(kin_root.join("daemon.port"), port.to_string()).unwrap();
     std::fs::write(
@@ -4388,7 +4359,7 @@ mod tests {
             "publication must record who published"
         );
         let record = read_endpoint_owner_record(root).expect("owner record parses");
-        assert_eq!(record.identity.pid(), std::process::id());
+        assert_eq!(record.identity().pid(), std::process::id());
     }
 
     #[test]
@@ -4516,11 +4487,7 @@ mod tests {
         std::fs::write(root.join("daemon.port"), "51234").unwrap();
         std::fs::write(
             root.join(ENDPOINT_OWNER_FILE),
-            serde_json::to_string(&EndpointOwnerRecord {
-                schema: ENDPOINT_OWNER_SCHEMA.to_string(),
-                identity,
-            })
-            .unwrap(),
+            serde_json::to_string(&EndpointOwnerRecord::for_identity(identity)).unwrap(),
         )
         .unwrap();
 
