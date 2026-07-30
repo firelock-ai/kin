@@ -6959,6 +6959,33 @@ mod tests {
         }
     }
 
+    /// Take supervisor startup authority immediately after a previous holder
+    /// released it, waiting out a contended acquire.
+    ///
+    /// `try_acquire_supervisor_startup_lock_in_dir` is the non-waiting
+    /// primitive, and one non-blocking `flock` can report contention on a lock
+    /// whose holder has already dropped. Production never sees this because it
+    /// reaches the primitive through
+    /// `acquire_supervisor_startup_lock_in_dir_with_timeout`, which already
+    /// retries within a deadline. A test that takes the authority as a setup
+    /// step needs the same rule, or it fails on the release window while
+    /// asserting something else entirely.
+    fn take_supervisor_startup_authority_after_release(dir: &Path) -> SupervisorStartupLock {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match try_acquire_supervisor_startup_lock_in_dir(dir) {
+                Ok(authority) => return authority,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("supervisor startup authority at {dir:?}: {error}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn supervisor_startup_authority_serializes_a_b_c_and_drop_never_unlinks() {
         let dir = tempfile::tempdir().unwrap();
@@ -6984,7 +7011,7 @@ mod tests {
         let generation_a = launcher_a.generation().to_string();
         drop(launcher_a);
 
-        let launcher_b = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let launcher_b = take_supervisor_startup_authority_after_release(dir.path());
         assert_ne!(generation_a, launcher_b.generation());
         assert!(
             launcher_b.authorizes(dir.path()),
@@ -7005,7 +7032,7 @@ mod tests {
         assert!(launcher_b.authorizes(dir.path()));
 
         drop(launcher_b);
-        let launcher_c = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let launcher_c = take_supervisor_startup_authority_after_release(dir.path());
         assert!(launcher_c.authorizes(dir.path()));
         drop(launcher_c);
         assert!(
@@ -7438,8 +7465,7 @@ mod tests {
         );
 
         drop(legacy_startup_authority);
-        let current_startup_authority =
-            try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let current_startup_authority = take_supervisor_startup_authority_after_release(dir.path());
         let final_decision =
             wait_for_existing_supervisor_in_dir(dir.path(), Some(&current_startup_authority)).await;
 
