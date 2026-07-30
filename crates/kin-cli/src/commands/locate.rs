@@ -3624,24 +3624,17 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
-    attach_snippets(
-        &mut result,
+    let mut source_request = kin_mcp::handlers::common::EntitySourceRequest::new(
         graph,
-        &snippet_opts,
         repository_authority,
         source_scope,
-    )?;
+    );
+    attach_snippets_with_request(&mut result, graph, &snippet_opts, &mut source_request)?;
     // Re-project the ranked symbols into the graph-native PRIMARY surface: a
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(
-        &mut result,
-        graph,
-        &snippet_opts,
-        repository_authority,
-        source_scope,
-    )?;
+    build_entity_view_with_request(&mut result, graph, &snippet_opts, &mut source_request)?;
     Ok(result)
 }
 
@@ -15260,6 +15253,24 @@ pub fn attach_snippets(
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
+    attach_snippets_with_request(
+        result,
+        graph,
+        opts,
+        &mut kin_mcp::handlers::common::EntitySourceRequest::new(
+            graph,
+            repository_authority,
+            source_scope,
+        ),
+    )
+}
+
+fn attach_snippets_with_request(
+    result: &mut LocateResult,
+    graph: &kin_db::InMemoryGraph,
+    opts: &SnippetOptions,
+    source_request: &mut kin_mcp::handlers::common::EntitySourceRequest<'_, kin_db::InMemoryGraph>,
+) -> Result<()> {
     if !opts.enabled || !opts.bodies {
         return Ok(());
     }
@@ -15287,14 +15298,9 @@ pub fn attach_snippets(
             let Some(entity) = match_symbol_entity(&entities, sym) else {
                 continue;
             };
-            if let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
-                graph,
-                entity,
-                opts.max_lines,
-                opts.max_chars,
-                repository_authority,
-                source_scope,
-            )? {
+            if let Some(source) =
+                source_request.read_excerpt(entity, opts.max_lines, opts.max_chars)?
+            {
                 sym.snippet = Some(source.body);
                 filled += 1;
             }
@@ -15315,9 +15321,9 @@ fn match_symbol_entity<'a>(
         .iter()
         .find(|e| {
             e.name == sym.name
-                && start_line
-                    .zip(e.span.as_ref())
-                    .is_some_and(|(sl, es)| es.start_line == sl)
+                && start_line.zip(e.span.as_ref()).is_some_and(|(sl, es)| {
+                    kin_mcp::handlers::common::presentation_line(es.start_line) == sl
+                })
         })
         .or_else(|| entities.iter().find(|e| e.name == sym.name))
 }
@@ -15330,22 +15336,12 @@ fn match_symbol_entity<'a>(
 /// agent surface uses — never a working-tree read. `None` means the entity has
 /// no source coordinates; graph/tree/blob gaps are errors.
 fn bounded_entity_body_with_note(
-    graph: &kin_db::InMemoryGraph,
+    source_request: &mut kin_mcp::handlers::common::EntitySourceRequest<'_, kin_db::InMemoryGraph>,
     entity: &kin_model::Entity,
     max_lines: usize,
     max_chars: usize,
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
-    source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<Option<String>> {
-    let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
-        graph,
-        entity,
-        max_lines,
-        max_chars,
-        repository_authority,
-        source_scope,
-    )?
-    else {
+    let Some(source) = source_request.read_excerpt(entity, max_lines, max_chars)? else {
         return Ok(None);
     };
     let body = source.body;
@@ -15386,6 +15382,24 @@ pub fn build_entity_view(
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
+    build_entity_view_with_request(
+        result,
+        graph,
+        opts,
+        &mut kin_mcp::handlers::common::EntitySourceRequest::new(
+            graph,
+            repository_authority,
+            source_scope,
+        ),
+    )
+}
+
+fn build_entity_view_with_request(
+    result: &mut LocateResult,
+    graph: &kin_db::InMemoryGraph,
+    opts: &SnippetOptions,
+    source_request: &mut kin_mcp::handlers::common::EntitySourceRequest<'_, kin_db::InMemoryGraph>,
+) -> Result<()> {
     if !opts.enabled {
         return Ok(());
     }
@@ -15418,12 +15432,10 @@ pub fn build_entity_view(
             // still projected.
             let body = if opts.bodies && sym.definition {
                 bounded_entity_body_with_note(
-                    graph,
+                    source_request,
                     entity,
                     opts.max_lines,
                     opts.max_chars,
-                    repository_authority,
-                    source_scope,
                 )?
                 .or_else(|| sym.snippet.clone())
             } else {
@@ -16018,15 +16030,16 @@ mod tests {
         repository_name: &str,
         changes: Vec<SemanticChange>,
         bodies: &[(Hash256, &[u8])],
-    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+    ) -> (
+        RepositoryAuthorityManager<LocalFileBackend>,
+        kin_core::LocalRepositoryAuthorityBinding,
+    ) {
         let repository_id = RepositoryId::new(repository_name).unwrap();
         let kindb = root.join("kindb");
         std::fs::create_dir(&kindb).unwrap();
-        let manager = RepositoryAuthorityManager::open(
-            repository_id.clone(),
-            Arc::new(LocalFileBackend::new(kindb)),
-        )
-        .unwrap();
+        let backend = Arc::new(LocalFileBackend::new(kindb));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id.clone(), backend.clone()).unwrap();
         for (digest, body) in bodies {
             manager.save_source_blob(*digest, body).unwrap();
         }
@@ -16119,7 +16132,12 @@ mod tests {
             previous_target = Some(target);
             previous_tree_hash = Some(tree_hash);
         }
-        manager
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_parts(
+            repository_id,
+            workspace_id,
+            backend,
+        );
+        (manager, binding)
     }
 
     trait TestArtifactAdmission {
@@ -17703,6 +17721,122 @@ mod tests {
             span.end_col = 7;
         }
         assert_eq!(entity_span_pair(&mid_line), vec![[11, 22]]);
+    }
+
+    #[test]
+    fn overload_binding_matches_presented_lines_to_exact_graph_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = "src/a.py";
+        let first_body = "def convert(value: str):\n    return \"text\"";
+        let second_body = "def convert(value: int):\n    return value + 1";
+        let source = format!("{first_body}\n\n{second_body}");
+        let source_hash = kin_blobs::digest(source.as_bytes());
+
+        let mut first = test_entity("convert", path, 0, 1);
+        first.signature = "def convert(value: str)".to_string();
+        first.span = Some(SourceSpan {
+            file: FilePathId::new(path),
+            start_byte: 0,
+            end_byte: first_body.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: u32::try_from(first_body.lines().last().unwrap().len()).unwrap(),
+        });
+        let mut second = test_entity("convert", path, 3, 4);
+        second.signature = "def convert(value: int)".to_string();
+        second.fingerprint.signature_hash = Hash256::from_bytes([3; 32]);
+        let second_start = source.find(second_body).unwrap();
+        second.span = Some(SourceSpan {
+            file: FilePathId::new(path),
+            start_byte: second_start,
+            end_byte: second_start + second_body.len(),
+            start_line: 3,
+            start_col: 0,
+            end_line: 4,
+            end_col: u32::try_from(second_body.lines().last().unwrap().len()).unwrap(),
+        });
+
+        let add = native_change(
+            Vec::new(),
+            "add overloads",
+            vec![
+                EntityDelta::Added { new: first.clone() },
+                EntityDelta::Added {
+                    new: second.clone(),
+                },
+            ],
+            vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: located(path, source_hash),
+            }],
+        );
+        let head = add.id;
+        let (authority, binding) = persist_test_history(
+            temp.path(),
+            "locate-overload-bodies",
+            vec![add],
+            &[(source_hash, source.as_bytes())],
+        );
+        let graph = kin_core::build_graph_at_ref(&authority, &head).unwrap();
+
+        let symbol = |span| LocateSymbol {
+            name: "convert".to_string(),
+            span: Some(span),
+            score: 1.0,
+            kind: "function".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let mut result = LocateResult {
+            files: vec![LocateFileEntry {
+                path: path.to_string(),
+                score: 1.0,
+                signals: Vec::new(),
+                spans: Vec::new(),
+                symbols: vec![symbol([1, 2]), symbol([4, 5])],
+                explain: Vec::new(),
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let opts = SnippetOptions::enabled(None);
+        let mut source_request = kin_mcp::handlers::common::EntitySourceRequest::new(
+            &graph,
+            Some(&binding),
+            kin_mcp::handlers::common::EntitySourceScope::At(head),
+        );
+        attach_snippets_with_request(&mut result, &graph, &opts, &mut source_request).unwrap();
+        build_entity_view_with_request(&mut result, &graph, &opts, &mut source_request).unwrap();
+
+        assert_eq!(
+            result.files[0].symbols[0].snippet.as_deref(),
+            Some(first_body)
+        );
+        assert_eq!(
+            result.files[0].symbols[1].snippet.as_deref(),
+            Some(second_body)
+        );
+        assert_eq!(result.entities.len(), 2);
+        let first_hit = result
+            .entities
+            .iter()
+            .find(|entity| entity.entity_id == first.id.to_string())
+            .unwrap();
+        let second_hit = result
+            .entities
+            .iter()
+            .find(|entity| entity.entity_id == second.id.to_string())
+            .unwrap();
+        assert_eq!(first_hit.signature, first.signature);
+        assert_eq!(first_hit.body.as_deref(), Some(first_body));
+        assert_eq!(second_hit.signature, second.signature);
+        assert_eq!(second_hit.body.as_deref(), Some(second_body));
     }
 
     #[test]
@@ -22241,7 +22375,7 @@ mod tests {
         }];
         enrichment.id = kin_core::compute_semantic_change_id(&enrichment).unwrap();
         let head_id = enrichment.id;
-        let authority = persist_test_history(
+        let (authority, _) = persist_test_history(
             temp.path(),
             "locate-cochange-history",
             vec![genesis, cochange_source, enrichment],
@@ -23541,7 +23675,7 @@ mod tests {
         );
         let add_id = add.id;
         let modify_id = modify.id;
-        let authority = persist_test_history(
+        let (authority, _) = persist_test_history(
             temp.path(),
             "locate-ref-history",
             vec![genesis, add, modify],

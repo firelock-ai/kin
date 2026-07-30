@@ -487,8 +487,8 @@ pub fn assemble_entity_sources_response(
 /// file path) so the row shape is identical whichever path resolved it.
 fn resolve_entity_source_generic<G: GraphStore>(
     store: &G,
+    source_request: &mut EntitySourceRequest<'_, G>,
     id: &str,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> ResolvedEntitySource {
     let entity_id = match parse_entity_id(id) {
         Ok(entity_id) => entity_id,
@@ -501,13 +501,10 @@ fn resolve_entity_source_generic<G: GraphStore>(
     };
     match store.get_entity(&entity_id) {
         Ok(Some(entity)) => {
-            match read_entity_source_excerpt_detailed(
-                store,
+            match source_request.read_excerpt(
                 &entity,
                 DEFAULT_SOURCE_MAX_LINES,
                 DEFAULT_SOURCE_MAX_BYTES,
-                repository_authority,
-                EntitySourceScope::WorkspaceHead,
             ) {
                 Ok(Some(source)) => ResolvedEntitySource::Found(EntitySourceRow {
                     id: entity.id.to_string(),
@@ -557,11 +554,130 @@ pub fn handle_get_entity_sources<G: GraphStore>(
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let (entity_ids, opts) = parse_batch_source_args(args)?;
+    let mut source_request = EntitySourceRequest::new(
+        store,
+        repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    );
     let resolved = entity_ids
         .iter()
-        .map(|id| resolve_entity_source_generic(store, id, repository_authority))
+        .map(|id| resolve_entity_source_generic(store, &mut source_request, id))
         .collect();
     Ok(assemble_entity_sources_response(resolved, &opts))
+}
+
+const CONTEXT_BODY_PROVENANCE_FIELDS: &[&str] = &[
+    "body",
+    "body_unavailable",
+    "source_state",
+    "source_change_id",
+    "workspace_tree_hash",
+    "workspace_generation",
+    "base_change_id",
+    "span_coherence",
+    "artifact_id",
+    "artifact_path",
+    "artifact_entry",
+];
+
+fn rendered_context_tokens(result: &mut serde_json::Value) -> Result<usize> {
+    // The token counter is itself part of the rendered response. Both zero and
+    // the final count are one numeric token under the shared estimator, so
+    // measuring with zero breaks the self-reference without under-reporting.
+    result["tokens_used"] = serde_json::json!(0);
+    let rendered = serde_json::to_string_pretty(result).map_err(McpError::Json)?;
+    let measured = kin_context::estimate_tokens(&rendered);
+    result["tokens_used"] = serde_json::json!(measured);
+    let verified = kin_context::estimate_tokens(
+        &serde_json::to_string_pretty(result).map_err(McpError::Json)?,
+    );
+    if verified != measured {
+        return Err(McpError::Context(format!(
+            "context-pack token accounting did not converge: measured {measured}, rendered \
+             {verified}"
+        )));
+    }
+    Ok(verified)
+}
+
+fn demote_one_context_body(result: &mut serde_json::Value) -> bool {
+    // Preserve the focal body. Lowest-value neighborhood bodies are demoted
+    // first; their signature, identity, coordinates, and relation-derived
+    // inclusion remain in the pack.
+    for section in ["transitive_deps", "contracts", "tests", "dependencies"] {
+        let Some(entries) = result
+            .get_mut(section)
+            .and_then(|value| value.as_array_mut())
+        else {
+            continue;
+        };
+        for entry in entries.iter_mut().rev() {
+            let Some(object) = entry.as_object_mut() else {
+                continue;
+            };
+            if !object.contains_key("body") {
+                continue;
+            }
+            for field in CONTEXT_BODY_PROVENANCE_FIELDS {
+                object.remove(*field);
+            }
+            object.insert("projection".to_string(), serde_json::json!("SignatureOnly"));
+            return true;
+        }
+    }
+    false
+}
+
+fn drop_one_optional_context_entry(result: &mut serde_json::Value) -> bool {
+    // The builder already ranks each section. Removing from the tail keeps that
+    // order while making JSON/provenance overhead obey the same final budget as
+    // the projected content.
+    for section in [
+        "nearby_traffic",
+        "annotations",
+        "work_items",
+        "transitive_deps",
+        "contracts",
+        "tests",
+        "dependencies",
+    ] {
+        let Some(entries) = result
+            .get_mut(section)
+            .and_then(|value| value.as_array_mut())
+        else {
+            continue;
+        };
+        if entries.pop().is_some() {
+            if entries.is_empty() && section != "dependencies" {
+                result
+                    .as_object_mut()
+                    .expect("context response is an object")
+                    .remove(section);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn finalize_context_pack_budget(
+    result: &mut serde_json::Value,
+    token_budget: usize,
+) -> Result<usize> {
+    loop {
+        let tokens = rendered_context_tokens(result)?;
+        if tokens <= token_budget {
+            return Ok(tokens);
+        }
+        result["budget_truncated"] = serde_json::json!(true);
+        if demote_one_context_body(result) || drop_one_optional_context_entry(result) {
+            continue;
+        }
+        return Err(McpError::Context(format!(
+            "the focal entity and required context-pack metadata require {tokens} tokens, \
+             exceeding the {token_budget}-token budget"
+        )));
+    }
 }
 
 pub const GET_CONTEXT_PACK_DESC: &str = "\
@@ -619,6 +735,11 @@ pub fn handle_get_context_pack<G: GraphStore>(
 
     let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
         .map_err(|e| McpError::Context(e.to_string()))?;
+    let mut source_request = EntitySourceRequest::new(
+        store,
+        repository_authority,
+        EntitySourceScope::WorkspaceHead,
+    );
 
     // Build structured response JSON. The pack still has to have projected a
     // focal entry for the focal entity to be worth serializing, but the body
@@ -627,12 +748,12 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
     let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entity, compact, repository_authority)?
+        focal_context_json_with_request(&mut source_request, entity, compact)?
     } else {
         serde_json::json!(null)
     };
 
-    let project_dep = |entry: &kin_model::context::ContextEntry| -> Result<serde_json::Value> {
+    let mut project_dep = |entry: &kin_model::context::ContextEntry| -> Result<serde_json::Value> {
         // Look up the entity for structured fields.
         if let Some(e) = store
             .get_entity(&entry.entity_id)
@@ -650,14 +771,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                let body = read_entity_source_excerpt_detailed(
-                    store,
-                    &e,
-                    MCP_SOURCE_MAX_LINES,
-                    MCP_SOURCE_MAX_CHARS,
-                    repository_authority,
-                    EntitySourceScope::WorkspaceHead,
-                )?;
+                let body =
+                    source_request.read_excerpt(&e, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)?;
                 let source = LAST_READ_SOURCE.with(|f| f.get());
                 obj["source"] = serde_json::json!(source);
                 // Same rule as the focal body: a dependency's `body` is the
@@ -689,12 +804,12 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let dependencies: Vec<_> = pack
         .dependency_signatures
         .iter()
-        .map(&project_dep)
+        .map(&mut project_dep)
         .collect::<Result<Vec<_>>>()?;
     let transitive: Vec<_> = pack
         .transitive_deps
         .iter()
-        .map(&project_dep)
+        .map(&mut project_dep)
         .collect::<Result<Vec<_>>>()?;
 
     let mut result = serde_json::json!({
@@ -711,7 +826,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         let tests: Vec<_> = pack
             .tests
             .iter()
-            .map(&project_dep)
+            .map(&mut project_dep)
             .collect::<Result<Vec<_>>>()?;
         if !tests.is_empty() {
             result["tests"] = serde_json::json!(tests);
@@ -719,7 +834,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         let contracts: Vec<_> = pack
             .contracts
             .iter()
-            .map(&project_dep)
+            .map(&mut project_dep)
             .collect::<Result<Vec<_>>>()?;
         if !contracts.is_empty() {
             result["contracts"] = serde_json::json!(contracts);
@@ -738,6 +853,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         result["nearby_traffic"] = serde_json::to_value(&pack.traffic).map_err(McpError::Json)?;
     }
 
+    finalize_context_pack_budget(&mut result, budget.max_tokens())?;
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
@@ -1653,6 +1769,11 @@ pub fn handle_explore_codebase<G: GraphStore>(
             }
         }
         "trace" => {
+            let mut source_request = EntitySourceRequest::new(
+                store,
+                repository_authority,
+                EntitySourceScope::WorkspaceHead,
+            );
             let trace_query = parse_trace_query(&query);
             let filter = EntityFilter {
                 name_pattern: Some(trace_query.symbol.clone()),
@@ -1719,7 +1840,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
 
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let step_body = trace_body(store, step, repository_authority)?;
+                        let step_body = trace_body_with_request(&mut source_request, step)?;
                         let constants = trace_constants_for_step(store, step, &step_body)?;
 
                         if !push_with_budget(
@@ -1780,7 +1901,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
                                     break;
                                 }
                                 let constant_body =
-                                    trace_body(store, constant, repository_authority)?;
+                                    trace_body_with_request(&mut source_request, constant)?;
                                 if !push_indented_body(
                                     &mut output,
                                     &mut tokens_used,
@@ -1796,9 +1917,12 @@ pub fn handle_explore_codebase<G: GraphStore>(
                 }
 
                 if let Some(input_literal) = trace_query.input_literal {
-                    if let Some(evaluation) =
-                        evaluate_trace_chain(store, &chain, input_literal, repository_authority)?
-                    {
+                    if let Some(evaluation) = evaluate_trace_chain_with_request(
+                        store,
+                        &chain,
+                        input_literal,
+                        &mut source_request,
+                    )? {
                         if push_with_budget(
                             &mut output,
                             &mut tokens_used,
@@ -2963,6 +3087,62 @@ mod tests {
             compact: false,
             max_lines_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_LINES,
             max_bytes_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_BYTES,
+        }
+    }
+
+    #[test]
+    fn context_pack_final_projection_obeys_every_budget_tier_exactly() {
+        for budget in [8_000usize, 16_000, 32_000, 48_000] {
+            let dependencies = (0..96)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": format!("entity-{index}"),
+                        "name": format!("dependency_{index}"),
+                        "kind": "Function",
+                        "signature": format!("fn dependency_{index}(input: usize) -> usize"),
+                        "projection": "SignatureOnly",
+                        "body": format!(
+                            "fn dependency_{index}(input: usize) -> usize {{ {} input }}",
+                            "(input + 1) * ".repeat(96)
+                        ),
+                        "source": "graph",
+                        "source_state": "committed",
+                        "source_change_id": "a".repeat(64),
+                        "span_coherence": "digest_verified",
+                        "artifact_id": format!("artifact-{index}"),
+                        "artifact_path": format!("src/dependency_{index}.rs"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut response = serde_json::json!({
+                "focal_entity": {
+                    "id": "focal",
+                    "name": "focal",
+                    "signature": "fn focal()",
+                    "body": "fn focal() { dependency_0(1); }",
+                },
+                "dependencies": dependencies,
+                "token_budget": budget,
+                "tokens_used": 1,
+            });
+
+            let reported = finalize_context_pack_budget(&mut response, budget).unwrap();
+            let rendered = serde_json::to_string_pretty(&response).unwrap();
+            let exact = kin_context::estimate_tokens(&rendered);
+            assert_eq!(reported, exact, "budget tier {budget} under-reported");
+            assert_eq!(response["tokens_used"], exact);
+            assert!(
+                exact <= budget,
+                "budget tier {budget} rendered {exact} tokens"
+            );
+            assert!(
+                response["focal_entity"]["body"].is_string(),
+                "focal body must survive final budgeting"
+            );
+            assert_eq!(
+                response["budget_truncated"], true,
+                "every tier fixture starts over budget and must record final trimming"
+            );
         }
     }
 
