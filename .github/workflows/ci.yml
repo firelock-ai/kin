@@ -8,6 +8,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
   repository_dispatch:
     types: [dependency-updated]
 
@@ -288,6 +289,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && github.event_name != 'pull_request'
+      && github.event_name != 'merge_group'
       && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 60
