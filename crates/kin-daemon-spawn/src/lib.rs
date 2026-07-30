@@ -5,9 +5,9 @@
 //! learned.
 //!
 //! Two callers start a daemon and wait for it: the CLI autostart path and the
-//! MCP revival path. They cannot share code through either of their own crates
-//! — `kin-cli` depends on `kin-mcp`, and `kin-mcp` cannot depend on `kin-daemon`
-//! because `kin-daemon` already depends on `kin-mcp`. So each grew its own copy
+//! MCP revival path. They cannot share code through either of their own crates,
+//! because `kin-cli` depends on `kin-mcp` and `kin-mcp` cannot depend on
+//! `kin-daemon`, which already depends on `kin-mcp`. So each grew its own copy
 //! of the contract, and the MCP copy twice regressed to a weaker version of a
 //! rule the CLI copy already enforced.
 //!
