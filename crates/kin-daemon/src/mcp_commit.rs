@@ -797,16 +797,17 @@ fn plan_exact_transaction(
                 // body.
                 //
                 // Scoped to `doc_summary` and deliberately not extended to the
-                // whole `metadata` bag. That bag holds keys the daemon's own
-                // workers maintain, `embedding_body_preview` from the embed
-                // pipeline and `blob_hash` from indexing, and they move
-                // asynchronously with respect to any caller. An agent that
-                // reads an entity, thinks, and then commits can therefore hold
-                // a metadata bag that authority has since moved on from, and
-                // comparing the bag would refuse it for a difference it neither
-                // caused nor can control. `doc_summary` is a single named field
-                // whose value a caller either changed on purpose or did not, so
-                // a difference there is real evidence of intent.
+                // whole `metadata` bag. That bag carries values derived from the
+                // entity's own source: `kin-parser` writes
+                // `embedding_body_preview` out of the source bytes at extraction
+                // time, so any commit that changes a body necessarily changes it
+                // too. An agent that reads an entity once and then makes two
+                // edits therefore holds, on the second, a bag that its own first
+                // commit already moved authority past, and comparing the bag
+                // would refuse it for a difference it caused by succeeding.
+                // `doc_summary` is a single named field whose value a caller
+                // either changed on purpose or did not, so a difference there is
+                // real evidence of intent.
                 if payload_entity.doc_summary != existing.doc_summary {
                     return Err(format!(
                         "staged doc summary for entity {} differs from repository authority; \
