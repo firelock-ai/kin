@@ -10568,14 +10568,8 @@ mod tests {
 
     #[cfg(unix)]
     fn run_test_git<const N: usize>(repository: &FsPath, args: [&str; N]) {
-        let output = std::process::Command::new("git")
+        let output = kin_git::test_support::fixture_git_in(repository)
             .args(args)
-            .current_dir(repository)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
             .output()
             .unwrap();
         assert!(
@@ -10740,17 +10734,10 @@ mod tests {
     #[cfg(unix)]
     fn test_state_with_verified_gitlink() -> Arc<DaemonState> {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
-        use std::process::Command;
 
         fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
-            let output = Command::new("git")
+            let output = kin_git::test_support::fixture_git_in(repository)
                 .args(args)
-                .current_dir(repository)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env(
-                    "GIT_CONFIG_GLOBAL",
-                    if cfg!(windows) { "NUL" } else { "/dev/null" },
-                )
                 .output()
                 .unwrap();
             assert!(
@@ -12521,17 +12508,10 @@ mod tests {
     #[tokio::test]
     async fn command_checkout_projects_universal_selected_tree_and_replays_exactly() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
-        use std::process::Command;
 
         fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
-            let output = Command::new("git")
+            let output = kin_git::test_support::fixture_git_in(repository)
                 .args(args)
-                .current_dir(repository)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env(
-                    "GIT_CONFIG_GLOBAL",
-                    if cfg!(windows) { "NUL" } else { "/dev/null" },
-                )
                 .output()
                 .unwrap();
             assert!(

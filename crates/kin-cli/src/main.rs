@@ -1947,6 +1947,9 @@ enum HostedReleaseAction {
 }
 
 fn main() -> Result<()> {
+    if kin_migrate::run_migration_process_host_if_requested()? {
+        return Ok(());
+    }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let cli = Cli::parse();
     let command_name = current_command_name();

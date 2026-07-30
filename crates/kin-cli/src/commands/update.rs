@@ -10132,7 +10132,7 @@ mod tests {
         }
     }
 
-    fn test_subprocess_output(command: &mut Command, label: &str) -> Result<std::process::Output> {
+    fn test_subprocess_output(command: Command, label: &str) -> Result<std::process::Output> {
         output_with_timeout(command, label, DEFAULT_TEST_SUBPROCESS_TIMEOUT)
     }
 
@@ -10736,8 +10736,7 @@ mod tests {
             .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
             .env("KIN_UPDATE_TEST_CRASH_POINT", point);
         let output =
-            test_subprocess_output(&mut command, &format!("crash recovery worker at {point}"))
-                .unwrap();
+            test_subprocess_output(command, &format!("crash recovery worker at {point}")).unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -10868,8 +10867,7 @@ cwd = {:?}
             command.env("KIN_UPDATE_TEST_UMASK", umask);
         }
         let output =
-            test_subprocess_output(&mut command, &format!("crash update worker at {point}"))
-                .unwrap();
+            test_subprocess_output(command, &format!("crash update worker at {point}")).unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -11655,7 +11653,7 @@ cwd = {:?}
             .env("KIN_UPDATE_TEST_WORKER_RECOVER", "1")
             .env("KIN_UPDATE_TEST_CRASH_POINT", "after-rollback-remove-kin");
         let output = test_subprocess_output(
-            &mut command,
+            command,
             "crash recovery worker at after-rollback-remove-kin",
         )
         .unwrap();
@@ -14903,8 +14901,7 @@ cwd = {:?}
             ])
             .env("KIN_UPDATE_TEMP_LEASE_CRASH_PARENT", parent)
             .env("KIN_UPDATE_TEMP_LEASE_CRASH_MARKER", &marker);
-        let output =
-            test_subprocess_output(&mut command, "private temp lease crash worker").unwrap();
+        let output = test_subprocess_output(command, "private temp lease crash worker").unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -14949,7 +14946,7 @@ cwd = {:?}
                 .env("KIN_UPDATE_TEMP_CLEANUP_CRASH_PARENT", temp.path())
                 .env("KIN_UPDATE_TEST_TEMP_CLEANUP_CRASH_POINT", point);
             let output = test_subprocess_output(
-                &mut command,
+                command,
                 &format!("private temp cleanup crash worker at {point}"),
             )
             .unwrap();

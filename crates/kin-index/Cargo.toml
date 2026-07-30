@@ -29,7 +29,10 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 kin-spine = { workspace = true }
-kin-git = { workspace = true }
+kin-git = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+kin-daemon-spawn = { workspace = true }

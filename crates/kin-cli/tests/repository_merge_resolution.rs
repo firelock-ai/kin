@@ -36,13 +36,16 @@ fn run_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
@@ -70,8 +73,11 @@ fn initialize_git_repo(repo: &Path) {
     run_git(repo, &["commit", "-m", "base"]);
 }
 
-fn initialize_kin_repo(repo: &Path, home: &Path) -> kin_core::KinLayout {
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+fn initialize_kin_repo(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+) -> kin_core::KinLayout {
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     ok(&init, "kin init");
     kin_core::KinLayout::discover(repo).expect("discover exact layout")
 }
@@ -137,8 +143,8 @@ fn change_parents(
     found.parents
 }
 
-fn conflicts_report(repo: &Path, home: &Path) -> Value {
-    let output = run_kin(repo, home, &["conflicts", "--json"]);
+fn conflicts_report(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
+    let output = run_kin(runtime, repo, &["conflicts", "--json"]);
     let stdout = ok(&output, "kin conflicts --json");
     serde_json::from_str(&stdout).expect("conflicts report is JSON")
 }
@@ -150,16 +156,17 @@ fn record_hash(report: &Value) -> String {
         .to_string()
 }
 
-fn stop_daemon(repo: &Path, home: &Path) {
-    ok(&run_kin(repo, home, &["daemon", "stop"]), "kin daemon stop");
+fn stop_daemon(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    ok(
+        &run_kin(runtime, repo, &["daemon", "stop"]),
+        "kin daemon stop",
+    );
 }
 
 /// Both branches edit one shared artifact and one shared entity, so the merge
 /// has exactly the conflicts every test here settles.
-fn conflicting_repository(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let home = root.join("home");
+fn conflicting_repository(root: &Path) -> std::path::PathBuf {
     let repo = root.join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
 
     run_git(&repo, &["switch", "-c", "feature"]);
@@ -175,7 +182,7 @@ fn conflicting_repository(root: &Path) -> (std::path::PathBuf, std::path::PathBu
         .expect("edit source on main");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
-    (repo, home)
+    repo
 }
 
 /// A parked merge is graph truth, not process state. Stopping the daemon and
@@ -184,11 +191,15 @@ fn conflicting_repository(root: &Path) -> (std::path::PathBuf, std::path::PathBu
 #[test]
 fn a_parked_merge_survives_a_daemon_restart() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
 
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
-    let before = conflicts_report(&repo, &home);
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let before = conflicts_report(&runtime, &repo);
     let before_hash = record_hash(&before);
     assert!(
         before["unresolved_count"].as_u64().expect("a count") >= 2,
@@ -200,9 +211,9 @@ fn a_parked_merge_survives_a_daemon_restart() {
     let persisted = persisted_record(&layout).expect("the parked merge is persisted");
     assert_eq!(hex::encode(persisted.hash.as_bytes()), before_hash);
 
-    stop_daemon(&repo, &home);
+    stop_daemon(&runtime, &repo);
 
-    let after = conflicts_report(&repo, &home);
+    let after = conflicts_report(&runtime, &repo);
     assert_eq!(
         record_hash(&after),
         before_hash,
@@ -218,21 +229,29 @@ fn a_parked_merge_survives_a_daemon_restart() {
 #[test]
 fn resolving_against_a_stale_record_identity_is_refused() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
-
-    let stale = record_hash(&conflicts_report(&repo, &home));
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     ok(
-        &run_kin(&repo, &home, &["resolve", "--all-ours", "--expect", &stale]),
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+
+    let stale = record_hash(&conflicts_report(&runtime, &repo));
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["resolve", "--all-ours", "--expect", &stale],
+        ),
         "first resolution",
     );
-    let current = record_hash(&conflicts_report(&repo, &home));
+    let current = record_hash(&conflicts_report(&runtime, &repo));
     assert_ne!(current, stale, "settling entries advances the record");
 
     let refused = run_kin(
+        &runtime,
         &repo,
-        &home,
         &["resolve", "--all-theirs", "--expect", &stale],
     );
     assert!(
@@ -247,7 +266,7 @@ fn resolving_against_a_stale_record_identity_is_refused() {
     );
 
     // The refused resolution changed nothing.
-    assert_eq!(record_hash(&conflicts_report(&repo, &home)), current);
+    assert_eq!(record_hash(&conflicts_report(&runtime, &repo)), current);
     let persisted = persisted_record(&layout).expect("the merge is still parked");
     assert_eq!(hex::encode(persisted.hash.as_bytes()), current);
 }
@@ -257,18 +276,27 @@ fn resolving_against_a_stale_record_identity_is_refused() {
 #[test]
 fn concurrent_resolutions_from_one_view_leave_one_winner() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
 
-    let view = record_hash(&conflicts_report(&repo, &home));
+    let view = record_hash(&conflicts_report(&runtime, &repo));
     let first = std::thread::scope(|scope| {
-        let ours =
-            scope.spawn(|| run_kin(&repo, &home, &["resolve", "--all-ours", "--expect", &view]));
+        let ours = scope.spawn(|| {
+            run_kin(
+                &runtime,
+                &repo,
+                &["resolve", "--all-ours", "--expect", &view],
+            )
+        });
         let theirs = scope.spawn(|| {
             run_kin(
+                &runtime,
                 &repo,
-                &home,
                 &["resolve", "--all-theirs", "--expect", &view],
             )
         });
@@ -290,7 +318,18 @@ fn concurrent_resolutions_from_one_view_leave_one_winner() {
 
     // The record advanced exactly once, and both entries carry one side.
     let record = persisted_record(&layout).expect("the merge is still parked");
-    assert_ne!(hex::encode(record.hash.as_bytes()), view);
+    let current = hex::encode(record.hash.as_bytes());
+    assert_ne!(current, view);
+    let loser = [&first.0, &first.1]
+        .into_iter()
+        .find(|output| !output.status.success())
+        .expect("one concurrent resolution loses");
+    let loser_stderr = String::from_utf8_lossy(&loser.stderr);
+    assert!(
+        loser_stderr.contains(&view) && loser_stderr.contains(&current),
+        "the losing resolution must be a stale-record refusal, not a transport failure: \
+         {loser_stderr}"
+    );
     assert!(
         record.is_fully_resolved(),
         "the winning resolution settled every entry"
@@ -318,22 +357,26 @@ fn concurrent_resolutions_from_one_view_leave_one_winner() {
 #[test]
 fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
 
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
 
     let parked = persisted_record(&layout).expect("the merge is parked");
     assert_eq!(parked.binding.ours_change, main_before);
     assert_eq!(parked.binding.theirs_change, feature_before);
 
     ok(
-        &run_kin(&repo, &home, &["resolve", "--all-theirs"]),
+        &run_kin(&runtime, &repo, &["resolve", "--all-theirs"]),
         "settle every conflict",
     );
-    let completed = run_kin(&repo, &home, &["resolve", "--continue", "--json"]);
+    let completed = run_kin(&runtime, &repo, &["resolve", "--continue", "--json"]);
     let stdout = ok(&completed, "kin resolve --continue");
     let report: Value = serde_json::from_str(&stdout).expect("resolve report is JSON");
     assert_eq!(report["record"]["state"]["state"], "committed");
@@ -355,7 +398,7 @@ fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref()
     // The record terminated, and terminated once.
     let record = persisted_record(&layout).expect("the record is retained as the merge's account");
     assert!(record.state.is_terminal());
-    let again = run_kin(&repo, &home, &["resolve", "--continue"]);
+    let again = run_kin(&runtime, &repo, &["resolve", "--continue"]);
     assert!(
         !again.status.success(),
         "a terminated merge does not publish twice: stdout={}",
@@ -379,16 +422,20 @@ fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref()
 #[test]
 fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
 
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
 
     let parked = persisted_record(&layout).expect("the merge is parked");
     ok(
-        &run_kin(&repo, &home, &["resolve", "--abort"]),
+        &run_kin(&runtime, &repo, &["resolve", "--abort"]),
         "kin resolve --abort",
     );
 
@@ -418,10 +465,10 @@ fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
     // The workspace is free, so the same merge opens again over the terminated
     // record rather than being refused as in progress.
     ok(
-        &run_kin(&repo, &home, &["merge", "feature"]),
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
         "merge again after aborting",
     );
-    let reopened = conflicts_report(&repo, &home);
+    let reopened = conflicts_report(&runtime, &repo);
     assert_eq!(reopened["record"]["state"]["state"], "in_progress");
     assert_ne!(
         record_hash(&reopened),
@@ -436,12 +483,16 @@ fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
 #[test]
 fn a_second_merge_while_one_is_in_progress_is_refused() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
-    let parked = record_hash(&conflicts_report(&repo, &home));
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let parked = record_hash(&conflicts_report(&runtime, &repo));
 
-    let refused = run_kin(&repo, &home, &["merge", "feature"]);
+    let refused = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
         !refused.status.success(),
         "a second merge must fail closed: stdout={}",
@@ -454,7 +505,7 @@ fn a_second_merge_while_one_is_in_progress_is_refused() {
     );
 
     assert_eq!(
-        record_hash(&conflicts_report(&repo, &home)),
+        record_hash(&conflicts_report(&runtime, &repo)),
         parked,
         "the refused merge left the parked record untouched"
     );
@@ -467,19 +518,23 @@ fn a_second_merge_while_one_is_in_progress_is_refused() {
 #[test]
 fn settling_one_named_conflict_leaves_the_others_outstanding() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    let layout = initialize_kin_repo(&repo, &home);
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
 
-    let before = conflicts_report(&repo, &home);
+    let before = conflicts_report(&runtime, &repo);
     let outstanding = before["unresolved_count"].as_u64().expect("a count");
     assert!(outstanding >= 2, "the fixture has more than one conflict");
 
     ok(
-        &run_kin(&repo, &home, &["resolve", "--ours", "shared.txt"]),
+        &run_kin(&runtime, &repo, &["resolve", "--ours", "shared.txt"]),
         "settle the shared artifact",
     );
-    let after = conflicts_report(&repo, &home);
+    let after = conflicts_report(&runtime, &repo);
     assert_eq!(
         after["unresolved_count"].as_u64().expect("a count"),
         outstanding - 1,
@@ -487,7 +542,7 @@ fn settling_one_named_conflict_leaves_the_others_outstanding() {
     );
     assert_eq!(after["resolved_count"], 1);
 
-    let unknown = run_kin(&repo, &home, &["resolve", "--theirs", "not-a-conflict"]);
+    let unknown = run_kin(&runtime, &repo, &["resolve", "--theirs", "not-a-conflict"]);
     assert!(
         !unknown.status.success(),
         "an unmatched selector must fail closed: stdout={}",
@@ -501,7 +556,7 @@ fn settling_one_named_conflict_leaves_the_others_outstanding() {
 
     // Publishing before every conflict is settled is refused and names what is
     // still outstanding.
-    let early = run_kin(&repo, &home, &["resolve", "--continue"]);
+    let early = run_kin(&runtime, &repo, &["resolve", "--continue"]);
     assert!(
         !early.status.success(),
         "an unresolved merge does not publish: stdout={}",
@@ -523,11 +578,15 @@ fn settling_one_named_conflict_leaves_the_others_outstanding() {
 #[test]
 fn settling_and_publishing_cannot_be_one_request() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = conflicting_repository(root.path());
-    initialize_kin_repo(&repo, &home);
-    ok(&run_kin(&repo, &home, &["merge", "feature"]), "kin merge");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
 
-    let both = run_kin(&repo, &home, &["resolve", "--all-ours", "--continue"]);
+    let both = run_kin(&runtime, &repo, &["resolve", "--all-ours", "--continue"]);
     assert!(
         !both.status.success(),
         "settling and publishing in one request must fail closed: stdout={}",

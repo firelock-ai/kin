@@ -15863,8 +15863,6 @@ mod tests {
 
     use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
     use kin_model::ArtifactId;
-    #[cfg(unix)]
-    use kin_model::ChangeStore;
     use kin_model::{
         AdmissionCase, AdmissionPolicyDelta, AuthorId, ChangeOrigin, DefaultRefExpectation,
         DefaultRefMutation, EffectiveAdmissionPolicyStamp, Entity, EntityDelta, EntityId,

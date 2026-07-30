@@ -13,13 +13,15 @@ pub async fn run(source: Option<String>, target: Option<PathBuf>) -> Result<()> 
 
     println!("Scanning repository at {}...", source_path.display());
 
-    let scan = kin_migrate::scan_repo(&source_path).map_err(|error| match error {
-        kin_migrate::MigrateError::NotAGitRepo(_) => anyhow::anyhow!(
-            "not a Git repository: {}\nhint: use `kin init` for non-Git directories",
-            source_path.display()
-        ),
-        error => anyhow::anyhow!("scan failed: {error}"),
-    })?;
+    let process_host = kin_migrate::MigrationProcessHost::product(std::env::current_exe()?);
+    let scan =
+        kin_migrate::scan_repo(&source_path, &process_host).map_err(|error| match error {
+            kin_migrate::MigrateError::NotAGitRepo(_) => anyhow::anyhow!(
+                "not a Git repository: {}\nhint: use `kin init` for non-Git directories",
+                source_path.display()
+            ),
+            error => anyhow::anyhow!("scan failed: {error}"),
+        })?;
 
     println!(
         "  Default branch: {}",

@@ -961,7 +961,6 @@ mod tests {
         SemanticFingerprint, SourceSpan, TreeEntry, Visibility,
     };
     use std::fs;
-    use std::process::Command;
 
     #[test]
     fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
@@ -1513,19 +1512,14 @@ mod tests {
     fn graph_source_fixture(source: Option<&[u8]>) -> GraphSourceFixture {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
-        let git_global_config = temp.path().join("git-global-config");
-        fs::write(&git_global_config, b"").unwrap();
         fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(&repo)
                 // This fixture consumes the committed repository immediately.
-                // Prevent user-level maintenance settings from detaching work
-                // that can leave transient pack locks after `git commit` exits.
+                // Prevent maintenance from detaching work that can leave
+                // transient pack locks after `git commit` exits.
                 .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                 .args(args)
-                .current_dir(&repo)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", &git_global_config)
                 .output()
                 .unwrap();
             assert!(

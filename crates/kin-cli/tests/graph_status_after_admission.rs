@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,24 +33,23 @@ const NULL_GIT_CONFIG: &str = "NUL";
 const NULL_GIT_CONFIG: &str = "/dev/null";
 
 struct IsolatedDaemon {
-    child: Option<Child>,
+    child: Option<common::RuntimeOwnedChild>,
 }
 
 impl IsolatedDaemon {
-    fn spawn(repo: &Path, home: &Path) -> Self {
-        let child = ProcessCommand::new(common::fresh_daemon_bin())
+    fn spawn(repo: &Path, runtime: &common::IsolatedDaemonRuntime) -> Self {
+        let mut command = runtime.daemon_command();
+        let child = command
             .arg("--repo")
             .arg(repo)
             .arg("--port")
             .arg("0")
-            .env("HOME", home)
-            .env("USERPROFILE", home)
             .env("KIN_DAEMON_DISABLE_LSP", "1")
             .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_owned()
             .expect("spawn isolated kin-daemon");
         Self { child: Some(child) }
     }
@@ -542,7 +541,8 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
         "durable_repository_authority"
     );
 
-    let mut daemon = IsolatedDaemon::spawn(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let mut daemon = IsolatedDaemon::spawn(&repo, &runtime);
     let port = daemon.wait_until_serving(&repo.join(".kin"));
     let graph_status = Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["graph", "status"])

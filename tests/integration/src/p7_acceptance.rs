@@ -221,14 +221,8 @@ fn traffic_aware_context_pack_includes_traffic() {
 // -----------------------------------------------------------------------
 
 fn run_git(repo: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
+    let output = kin_git::test_support::fixture_git_in(repo)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
-        .current_dir(repo)
         .output()
         .expect("run Git");
     assert!(
@@ -298,7 +292,11 @@ fn brownfield_full_migration_publishes_repository_authority() {
     run_git(dir.path(), &["add", "--all"]);
     run_git(dir.path(), &["commit", "-m", "initial commit"]);
 
-    let scan = kin_migrate::scan_repo(dir.path()).expect("scan Git repository");
+    let process_host = kin_migrate::MigrationProcessHost::exact_test(
+        std::env::current_exe().expect("resolve Kin integration test executable"),
+        "kin_process_group_guardian_worker",
+    );
+    let scan = kin_migrate::scan_repo(dir.path(), &process_host).expect("scan Git repository");
     let plan = kin_migrate::plan_migration(&scan, kin_migrate::MigrationStrategy::Full, None);
     let result =
         kin_migrate::execute_migration_persisted(&plan).expect("admit exact Git repository");
@@ -374,7 +372,12 @@ fn brownfield_full_migration_preserves_mixed_repo_shape_and_bytes() {
     run_git(dir.path(), &["add", "--all"]);
     run_git(dir.path(), &["commit", "-m", "initial mixed commit"]);
 
-    let scan = kin_migrate::scan_repo(dir.path()).expect("scan mixed Git repository");
+    let process_host = kin_migrate::MigrationProcessHost::exact_test(
+        std::env::current_exe().expect("resolve Kin integration test executable"),
+        "kin_process_group_guardian_worker",
+    );
+    let scan =
+        kin_migrate::scan_repo(dir.path(), &process_host).expect("scan mixed Git repository");
     let plan = kin_migrate::plan_migration(&scan, kin_migrate::MigrationStrategy::Full, None);
     let result =
         kin_migrate::execute_migration_persisted(&plan).expect("admit mixed Git repository");

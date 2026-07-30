@@ -102,10 +102,10 @@ const EXPORT_OUT_OF_SCOPE: &[&str] = &[
     "per-change spec_link, evidence, risk_summary, entity/relation deltas",
 ];
 
-fn kin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));
+fn kin(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
+    let mut cmd = runtime.kin_command();
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
@@ -133,8 +133,12 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
-fn run_kin(repo: &Path, args: &[&str]) -> std::process::Output {
-    let out = kin()
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    let out = kin(runtime)
         .args(args)
         .current_dir(repo)
         .output()
@@ -251,12 +255,14 @@ fn git_export_round_trips_to_plain_git() {
         &repo,
         &["commit", "-q", "-m", "edit greet and add farewell"],
     );
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
 
     // Admit the complete exact history as graph-owned repository authority.
-    run_kin(&repo, &["init", "."]);
+    run_kin(&runtime, &repo, &["init", "."]);
 
     // Export Kin's semantic history out to a plain Git repository.
     run_kin(
+        &runtime,
         &repo,
         &["git", "export", "--output", export.to_str().unwrap()],
     );

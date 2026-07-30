@@ -3123,6 +3123,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit",
@@ -3163,6 +3164,7 @@ dependencies = [
  "fs2",
  "gix",
  "kin-blobs",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-index",
@@ -3235,6 +3237,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "which 8.0.4",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
@@ -3304,7 +3307,9 @@ dependencies = [
  "gix",
  "hex",
  "kin-blobs",
+ "kin-daemon-spawn",
  "kin-model",
+ "libc",
  "pretty_assertions",
  "rayon",
  "rustix",
@@ -3314,6 +3319,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+ "which 8.0.4",
  "windows-sys 0.61.2",
 ]
 
@@ -3323,6 +3329,7 @@ version = "0.3.6"
 dependencies = [
  "hex",
  "kin-blobs",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-model",
@@ -3376,7 +3383,9 @@ dependencies = [
  "kin-context",
  "kin-core",
  "kin-daemon",
+ "kin-daemon-spawn",
  "kin-db",
+ "kin-git",
  "kin-index",
  "kin-migrate",
  "kin-model",
@@ -3438,6 +3447,7 @@ dependencies = [
  "chrono",
  "kin-blobs",
  "kin-core",
+ "kin-daemon-spawn",
  "kin-db",
  "kin-git",
  "kin-index",
@@ -3445,14 +3455,18 @@ dependencies = [
  "kin-model",
  "kin-parser",
  "kin-projection",
+ "libc",
  "pretty_assertions",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "which 8.0.4",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

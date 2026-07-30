@@ -31,13 +31,16 @@ fn run_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
@@ -57,8 +60,11 @@ fn initialize_git_repo(repo: &Path) {
     run_git(repo, &["commit", "-m", "base"]);
 }
 
-fn initialize_kin_repo(repo: &Path, home: &Path) -> kin_core::KinLayout {
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+fn initialize_kin_repo(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+) -> kin_core::KinLayout {
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -166,9 +172,7 @@ fn merge_report(output: &std::process::Output) -> Value {
 #[test]
 fn merge_composes_disjoint_semantic_and_tree_work_into_one_merge_change() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
 
     run_git(&repo, &["switch", "-c", "feature"]);
@@ -184,12 +188,13 @@ fn merge_composes_disjoint_semantic_and_tree_work_into_one_merge_change() {
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
 
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let ours_before = branch_change(&layout, "main");
     let theirs = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "feature", "--json"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "feature", "--json"]);
     assert!(
         merged.status.success(),
         "stdout={} stderr={}",
@@ -331,20 +336,19 @@ fn merge_composes_disjoint_semantic_and_tree_work_into_one_merge_change() {
 #[test]
 fn merge_of_an_ancestor_branch_is_already_up_to_date_and_publishes_nothing() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     run_git(&repo, &["branch", "stable"]);
     fs::write(repo.join("ours.txt"), b"main ours\n").expect("edit ours on main");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
 
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let main_before = branch_change(&layout, "main");
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "stable", "--json"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "stable", "--json"]);
     assert!(
         merged.status.success(),
         "stdout={} stderr={}",
@@ -360,9 +364,7 @@ fn merge_of_an_ancestor_branch_is_already_up_to_date_and_publishes_nothing() {
 #[test]
 fn merge_of_a_descendant_branch_fast_forwards_the_active_branch() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     run_git(&repo, &["switch", "-c", "feature"]);
     fs::write(repo.join("theirs.txt"), b"feature theirs\n").expect("edit theirs on feature");
@@ -371,10 +373,11 @@ fn merge_of_a_descendant_branch_fast_forwards_the_active_branch() {
     run_git(&repo, &["commit", "-m", "feature work"]);
     run_git(&repo, &["switch", "main"]);
 
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let feature = branch_change(&layout, "feature");
 
-    let merged = run_kin(&repo, &home, &["merge", "feature", "--json"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "feature", "--json"]);
     assert!(
         merged.status.success(),
         "stdout={} stderr={}",
@@ -398,15 +401,13 @@ fn merge_of_a_descendant_branch_fast_forwards_the_active_branch() {
     );
 }
 
-/// Both branches changed the same artifact and the same entity. There is no
-/// durable merge transaction to park the conflict in, so the whole merge is
-/// refused and nothing is published.
+/// Both branches changed the same artifact and the same entity. The merge is
+/// parked as a durable transaction while refs and working-copy state remain
+/// unchanged.
 #[test]
 fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicted() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
 
     run_git(&repo, &["switch", "-c", "feature"]);
@@ -423,32 +424,33 @@ fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicte
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
 
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "feature"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
         merged.status.success(),
         "a conflicting merge is parked, not refused: stderr={}",
         String::from_utf8_lossy(&merged.stderr)
     );
-    let stderr = String::from_utf8_lossy(&merged.stdout);
+    let stdout = String::from_utf8_lossy(&merged.stdout);
     assert!(
-        stderr.contains("unresolved conflict"),
-        "the listing names the conflict set: {stderr}"
+        stdout.contains("unresolved conflict"),
+        "the listing names the conflict set: {stdout}"
     );
     // Each dimension is asserted on its own. An `artifact || entity` check
     // would stay green with the entity detector deleted, because divergent
     // bytes report an artifact conflict for the same file either way.
     assert!(
-        stderr.contains("artifact shared.txt"),
-        "the listing names the conflicting artifact: {stderr}"
+        stdout.contains("artifact shared.txt"),
+        "the listing names the conflicting artifact: {stdout}"
     );
     assert!(
-        stderr.contains("entity "),
-        "the listing names the conflicting entity: {stderr}"
+        stdout.contains("entity "),
+        "the listing names the conflicting entity: {stdout}"
     );
 
     // No ref moved and the working copy is untouched. The authority generation
@@ -478,9 +480,7 @@ fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicte
 #[test]
 fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     fs::write(
         repo.join("src/lib.rs"),
@@ -508,12 +508,13 @@ fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
 
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "feature"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
         merged.status.success(),
         "disjoint edits to one file are parked, not refused: stderr={}",
@@ -552,9 +553,7 @@ fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
 #[test]
 fn merge_of_a_move_against_an_edit_is_parked_atomically() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
 
     run_git(&repo, &["switch", "-c", "feature"]);
@@ -567,12 +566,13 @@ fn merge_of_a_move_against_an_edit_is_parked_atomically() {
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
 
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "feature"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
     assert!(
         merged.status.success(),
         "a move against an edit is parked, not refused: stderr={}",
@@ -613,14 +613,13 @@ fn merge_of_a_move_against_an_edit_is_parked_atomically() {
 #[test]
 fn merging_the_active_branch_into_itself_is_refused() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "main"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "main"]);
     assert!(
         !merged.status.success(),
         "stdout={}",
@@ -638,14 +637,13 @@ fn merging_the_active_branch_into_itself_is_refused() {
 #[test]
 fn merging_an_unknown_branch_is_refused_without_mutation() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let generation_before = authority_generation(&layout);
 
-    let merged = run_kin(&repo, &home, &["merge", "no-such-branch"]);
+    let merged = run_kin(&runtime, &repo, &["merge", "no-such-branch"]);
     assert!(
         !merged.status.success(),
         "stdout={}",
@@ -665,13 +663,12 @@ fn merging_an_unknown_branch_is_refused_without_mutation() {
 #[test]
 fn merge_conflict_commands_report_no_merge_on_a_clean_workspace() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let listed = run_kin(&repo, &home, &["conflicts"]);
+    let listed = run_kin(&runtime, &repo, &["conflicts"]);
     assert!(
         listed.status.success(),
         "listing an unmerged workspace is not an error: stderr={}",
@@ -683,7 +680,7 @@ fn merge_conflict_commands_report_no_merge_on_a_clean_workspace() {
         "the listing says there is no merge: {stdout}"
     );
 
-    let resolved = run_kin(&repo, &home, &["resolve", "--all-ours"]);
+    let resolved = run_kin(&runtime, &repo, &["resolve", "--all-ours"]);
     assert!(
         !resolved.status.success(),
         "resolving without a merge must fail closed: stdout={}",

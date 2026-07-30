@@ -9,7 +9,7 @@ mod common;
 
 use common::Command;
 
-fn kin_command(home: &std::path::Path) -> Command {
+fn kin_command(home: &std::path::Path) -> Command<'static> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
     command.env("HOME", home);
     command

@@ -68,6 +68,15 @@ sysinfo = "0.39"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 # macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
 # Additive via feature unification; absent on Linux so the Linux build stays green.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -76,7 +85,7 @@ kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 
 [dev-dependencies]
 base64 = "0.22"
-kin-git = { workspace = true }
+kin-git = { workspace = true, features = ["test-support"] }
 http-body = "1"
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

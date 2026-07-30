@@ -45,21 +45,23 @@ fn initialize_git_repo(repo: &Path) {
     run_git(repo, &["commit", "-m", "base"]);
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn initialize_kin_repo(repo: &Path, home: &Path) {
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+fn initialize_kin_repo(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -68,8 +70,8 @@ fn initialize_kin_repo(repo: &Path, home: &Path) {
     );
 }
 
-fn drift_report(repo: &Path, home: &Path) -> Value {
-    let output = run_kin(repo, home, &["doctor", "--drift", "--json"]);
+fn drift_report(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
+    let output = run_kin(runtime, repo, &["doctor", "--drift", "--json"]);
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -81,8 +83,8 @@ fn drift_report(repo: &Path, home: &Path) -> Value {
 
 /// Stop this repository's daemon so a working-copy edit made next is not
 /// observed by a live watcher.
-fn stop_daemon(repo: &Path, home: &Path) {
-    let output = run_kin(repo, home, &["daemon", "stop"]);
+fn stop_daemon(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let output = run_kin(runtime, repo, &["daemon", "stop"]);
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
@@ -108,13 +110,12 @@ fn drift_paths(report: &Value) -> Vec<String> {
 #[test]
 fn drift_reads_graph_truth_and_never_answers_from_untracked_host_files() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let clean = drift_report(&repo, &home);
+    let clean = drift_report(&runtime, &repo);
     assert_eq!(clean["schema"], "kin.projection-drift.v1");
     assert_eq!(clean["authority"], "repository-v6");
     assert_eq!(clean["clean"], true);
@@ -139,7 +140,7 @@ fn drift_reads_graph_truth_and_never_answers_from_untracked_host_files() {
     fs::write(repo.join("untracked.rs"), b"pub fn ghost() {}\n").expect("write untracked source");
     fs::create_dir_all(repo.join("scratch")).expect("create untracked directory");
     fs::write(repo.join("scratch/notes.txt"), b"scratch\n").expect("write untracked note");
-    let with_untracked = drift_report(&repo, &home);
+    let with_untracked = drift_report(&runtime, &repo);
     assert_eq!(
         with_untracked["clean"], true,
         "untracked host files must never be reported as drift"
@@ -159,7 +160,7 @@ fn drift_reads_graph_truth_and_never_answers_from_untracked_host_files() {
         .expect("hide admitted Git metadata");
     fs::create_dir_all(repo.join(".git/refs/heads")).expect("create misleading Git refs");
     fs::write(repo.join(".git/refs/heads/fake"), b"not an oid\n").expect("write fake Git ref");
-    let without_git = drift_report(&repo, &home);
+    let without_git = drift_report(&runtime, &repo);
     assert_eq!(
         without_git["clean"], true,
         "Git files influenced the repository-v6 drift answer"
@@ -170,13 +171,12 @@ fn drift_reads_graph_truth_and_never_answers_from_untracked_host_files() {
 #[test]
 fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let clean = drift_report(&repo, &home);
+    let clean = drift_report(&runtime, &repo);
     assert_eq!(clean["clean"], true);
     let generation = clean["authority_generation"]
         .as_u64()
@@ -190,9 +190,9 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     // authority, which would make the divergence real but transient; this test
     // is about what drift reports while the divergence still exists, so the
     // window is made deterministic rather than raced.
-    stop_daemon(&repo, &home);
+    stop_daemon(&runtime, &repo);
     fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
-    let dirty = drift_report(&repo, &home);
+    let dirty = drift_report(&runtime, &repo);
     assert_eq!(dirty["clean"], false);
     assert_eq!(dirty["drift_count"], 1);
     let details = drift_paths(&dirty);
@@ -223,9 +223,9 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     );
 
     // A removed tracked member is drift the report also must not repair.
-    stop_daemon(&repo, &home);
+    stop_daemon(&runtime, &repo);
     fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
-    let deleted = drift_report(&repo, &home);
+    let deleted = drift_report(&runtime, &repo);
     assert!(
         deleted["drift_count"].as_u64().expect("drift count") >= 1,
         "drift did not report a removed tracked member"
@@ -239,13 +239,14 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
 #[test]
 fn drift_refuses_outside_a_kin_repository_instead_of_scanning_files() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let plain = root.path().join("plain");
-    fs::create_dir_all(&home).expect("create home");
+    let runtime_anchor = root.path().join("runtime-anchor");
+    fs::create_dir_all(&runtime_anchor).expect("create runtime anchor");
     fs::create_dir_all(&plain).expect("create plain directory");
     fs::write(plain.join("main.rs"), b"fn main() {}\n").expect("write host source");
+    let runtime = common::IsolatedDaemonRuntime::new(&runtime_anchor);
 
-    let output = run_kin(&plain, &home, &["doctor", "--drift", "--json"]);
+    let output = run_kin(&runtime, &plain, &["doctor", "--drift", "--json"]);
     assert!(
         !output.status.success(),
         "drift answered without repository-v6 authority: stdout={}",
@@ -261,13 +262,12 @@ fn drift_refuses_outside_a_kin_repository_instead_of_scanning_files() {
 #[test]
 fn heal_stays_fail_closed_and_names_its_open_gate() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
 
-    let output = run_kin(&repo, &home, &["doctor", "--heal"]);
+    let output = run_kin(&runtime, &repo, &["doctor", "--heal"]);
     assert!(
         !output.status.success(),
         "healing a projection is not implemented and must not report success"

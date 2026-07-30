@@ -167,6 +167,12 @@
       ]
     },
     {
+      "file": "crates/kin-cli/src/daemon_client/probe_process.rs",
+      "reason": "Daemon process-boundary module end to end: bounded compatibility probes and their process-tree containment, capture, cancellation, and cleanup. It reaches and validates the daemon that owns graph authority and never derives a semantic query answer from filesystem or subprocess output. The file is dedicated to this boundary, so a whole-file exemption is reviewable; any future answer logic belongs elsewhere and requires removing or narrowing this exemption.",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
+    },
+    {
       "file": "crates/kin-daemon-spawn/src/lib.rs",
       "reason": "Daemon process lifecycle IO boundary end to end (spawn plan, port record, disposition, registrar); zero answer-authority surface. Every filesystem and subprocess primitive here reaches or supervises the daemon that holds graph authority, never answers in its place, and no query result derives from any of them. Exempt whole-file rather than pinned because the process handle signatures repeat, which an exactly-once allow_match cannot express. lib.rs is the crate's only module, so a later-added module is scanned by default: re-review this exemption when a second .rs file joins the crate",
       "owner": "kin-daemon-spawn",
@@ -219,7 +225,7 @@
     },
     {
       "file": "crates/kin-daemon/src/lifecycle.rs",
-      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Four classes, all excused per function. Singleton coordination: the lock file, its owner stamp, and the guards that decide whether this process may become the daemon. Endpoint publication: the pid and port components, each written atomically, read back, and removed only by their owning process. Binary resolution and liveness: locating the kin-daemon executable and probing whether an endpoint is answering before spawning another. Platform registration: the macOS launch agent plist and its non-macOS no-op counterpart, which is why two names carry a count of two. Every path here reaches or supervises the authority and answers no query. The two expression pins are a Stdio import and the struct field holding the lock file handle. Function-scoped so the remainder of the module stays scanned. The publication and ownership paths were split into named helpers so the proof that an endpoint may be removed can be exercised independently of the process that publishes it; those helpers carry the same endpoint control-plane IO the enclosing functions already carried, not new authority.",
+      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Five classes, all excused per function. Singleton coordination: the lock file, its owner stamp, and the guards that decide whether this process may become the daemon. Endpoint publication and ownership: the pid, port, and owner components are written atomically, read back, and removed only after owner-bound proof; the named ownership helpers make that proof independently testable without adding query authority. Binary resolution and liveness: locating and validating the exact kin-daemon executable and probing whether an endpoint is answering before spawning another. Bounded macOS process ownership: the private launchctl capture, stable process-group guardian, deadline, and cleanup helpers. Platform registration and migration: the digest-addressed LaunchAgent plist, exact legacy-authority inspection, staged replacement, rollback, and non-macOS no-op counterparts, which is why two public names carry a count of two. Every path here reaches, supervises, or registers the authority and answers no repository query. The expression pins are process/file handle declarations and the capture file's Drop cleanup; none produces an answer. Function-scoped so the remainder of the module stays scanned.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -239,6 +245,22 @@
         "remove_daemon_files_if_current_process",
         "daemon_is_up",
         "find_daemon_binary",
+        "resolve_launch_agent_daemon_binary",
+        "validate_launch_agent_daemon_binary",
+        "create",
+        "len",
+        "spawn",
+        "cap_command_capture_files",
+        "launchctl_action",
+        "unload_then_remove_launch_agent",
+        "launch_agent_label",
+        "read_plist_program_arguments",
+        "legacy_program_arguments_target_repository",
+        "inspect_legacy_launch_agent",
+        "install_with_actions",
+        "rollback_with_actions",
+        "read_bounded_launch_agent_plist",
+        "write_launch_agent_stage",
         "ensure_daemon_running_with_idle_timeout",
         {
           "fn": "register_launch_agent",
@@ -256,7 +278,8 @@
         "publish_daemon_endpoint_under_authority_with_probe"
       ],
       "allow_match": [
-        "use std::process::Stdio;",
+        "use std::process::{Child, Command, ExitStatus, Output, Stdio};",
+        "let _ = std::fs::remove_file(&self.path);",
         "file: std::fs::File,"
       ]
     },
@@ -339,7 +362,7 @@
         },
         {
           "expr": "process::exit(1);",
-          "count": 8
+          "count": 9
         },
         "process::exit(exit_code);",
         "if path.file_name().and_then(|name| name.to_str()) == Some(\".kin\") && path.is_dir() {"

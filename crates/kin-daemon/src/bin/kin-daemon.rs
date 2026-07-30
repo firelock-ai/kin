@@ -270,6 +270,15 @@ fn embed_batch_size_from_env() -> Result<Option<usize>, String> {
 }
 
 fn main() {
+    match kin_daemon_spawn::run_process_group_guardian_if_requested() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("kin-daemon: process-group guardian failed: {error}");
+            process::exit(1);
+        }
+    }
+
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
     // we own its teardown. The embedding worker dispatches batches onto the
@@ -299,6 +308,16 @@ fn main() {
     // blocking thread that was abandoned above. SIGTERM always ends in real
     // termination; no zombie survives.
     process::exit(exit_code);
+}
+
+/// Exact test-harness entrypoint for the shared process-group guardian.
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run daemon binary process-group guardian worker");
+    assert_eq!(dispatched, requested);
 }
 
 /// Default tracing directive when `RUST_LOG` is unset.
