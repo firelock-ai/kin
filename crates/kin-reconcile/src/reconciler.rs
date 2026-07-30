@@ -1492,11 +1492,19 @@ impl MergePreview {
 /// Validate an entity for semantic correctness.
 ///
 /// Returns `Some(reason)` if the entity is malformed, `None` if valid.
+///
+/// An empty signature is malformed for a declaration this repository parsed, and
+/// correct for an external reference target: that target stands for a symbol
+/// another repository owns, so no signature was ever observed and none can be.
+/// Today only freshly parsed entities reach here, so the distinction is not
+/// exercised, but the rule is stated over graph truth rather than over one
+/// caller. Rejecting an external target would fail reconcile on every repository
+/// with a cross-repo import.
 fn validate_entity(entity: &Entity) -> Option<String> {
     if entity.name.is_empty() {
         return Some("entity name is empty".to_string());
     }
-    if entity.signature.is_empty() {
+    if entity.signature.is_empty() && !kin_index::is_external_reference_target(entity) {
         return Some(format!("entity '{}' has an empty signature", entity.name));
     }
     None
@@ -2850,6 +2858,29 @@ mod tests {
     fn validate_entity_accepts_valid() {
         let entity = make_entity("test", "src/lib.rs");
         assert!(super::validate_entity(&entity).is_none());
+    }
+
+    /// An external reference target has no signature by construction, so the
+    /// empty-signature rule must be stated about declarations this repository
+    /// parsed rather than about every entity. A target still has to satisfy every
+    /// other rule.
+    #[test]
+    fn validate_entity_accepts_an_external_reference_target_without_a_signature() {
+        let mut entity = make_entity("do_work", "src/lib.rs");
+        entity.signature = String::new();
+        entity.file_origin = None;
+        entity.role = kin_model::EntityRole::External;
+        assert!(
+            kin_index::is_external_reference_target(&entity),
+            "the fixture must be the shape admission binds"
+        );
+        assert!(super::validate_entity(&entity).is_none());
+
+        entity.name = String::new();
+        assert!(
+            super::validate_entity(&entity).is_some(),
+            "an external target is not exempt from the other rules"
+        );
     }
 
     // ---------------------------------------------------------------
