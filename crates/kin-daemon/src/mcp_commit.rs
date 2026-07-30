@@ -15,10 +15,13 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use kin_model::graph::ProvenanceStore;
+use kin_model::provenance::{Actor, ActorId, ActorKind, AuditEvent, AuditEventId};
+use kin_model::work::WorkScope;
 use kin_model::{
-    Entity, EntityDelta, EntityStore, FileLayout, FilePathId, GraphNodeId, Hash256, LocatedEntry,
-    OperationId, Relation, RelationDelta, RelationOrigin, RepoPath, SourceRegion, TransactionDelta,
-    TreeDelta, TreeEntry,
+    Entity, EntityDelta, EntityId, EntityStore, FileLayout, FilePathId, GraphNodeId, Hash256,
+    LocatedEntry, OperationId, Relation, RelationDelta, RelationOrigin, RepoPath, SemanticChangeId,
+    SourceRegion, TransactionDelta, TreeDelta, TreeEntry,
 };
 use sha2::{Digest, Sha256};
 
@@ -73,17 +76,40 @@ fn commit_exact_transaction_inner(
         .ok_or_else(|| "missing required parameter: transaction_id".to_string())?
         .to_string();
 
-    if let Some(inline) = arguments.get("operations") {
-        let operations = kin_mcp::session::parse_staged_operations(inline)?;
-        kin_mcp::session::validate_staged_operations(&operations)?;
-        sessions
-            .stage_transaction(&transaction_id, operations)
-            .map_err(|error| format!("cannot stage inline transaction operations: {error}"))?;
-    }
-
     let mut transaction = sessions
         .get_transaction(&transaction_id)
         .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+
+    // Operations handed to the commit call itself stage and publish in one
+    // step. Once the transaction is fenced they are read as a restatement of
+    // what is already fenced instead: `kin_transaction_commit` documents
+    // re-entry as an idempotent resume, and staging onto a fenced transaction
+    // would fail on the state check and strand a caller whose only published
+    // recovery is to re-send the identical call.
+    if let Some(inline) = arguments.get("operations") {
+        let operations = kin_mcp::session::parse_staged_operations(inline)?;
+        kin_mcp::session::validate_staged_operations(&operations)?;
+        if matches!(transaction.state.as_str(), "committing" | "committed") {
+            if !kin_mcp::session::staged_operations_match(
+                &transaction.staged_operations,
+                &operations,
+            ) {
+                return Err(format!(
+                    "Cannot commit transaction {transaction_id}: the inline operations differ from \
+                     the operations already fenced for publication, and a fenced payload cannot be \
+                     edited. Re-send this commit with no `operations` array at all to resume the \
+                     fenced payload as it stands, which is the exit that always works and the one \
+                     to use when the fenced set includes operations staged separately. Re-sending \
+                     the exact fenced operations also resumes it. Begin a new transaction with \
+                     kin_transaction_begin only for a genuinely different change."
+                ));
+            }
+        } else {
+            transaction = sessions
+                .stage_transaction(&transaction_id, operations)
+                .map_err(|error| format!("cannot stage inline transaction operations: {error}"))?;
+        }
+    }
     if !matches!(
         transaction.state.as_str(),
         "active" | "validated" | "committing" | "committed"
@@ -122,6 +148,10 @@ fn commit_exact_transaction_inner(
     let operation_id = OperationId::from_uuid(operation_uuid);
     let payload_hash = transaction_payload_hash(&transaction)?;
     let authority_context = authority_context(state)?;
+    // Resolved once, from the live registry, and used for both the change
+    // author and the durable attribution record. Resolving it twice could
+    // straddle the session ending and attribute one commit two ways.
+    let actor = resolve_commit_actor(sessions, &transaction.session_id);
 
     // A non-terminal committing marker means authority may already have moved.
     // Recover by the caller-stable operation ID before attempting any new plan.
@@ -138,6 +168,7 @@ fn commit_exact_transaction_inner(
                 state,
                 sessions,
                 transaction,
+                &actor,
                 recovered,
                 Vec::new(),
                 coordination,
@@ -167,6 +198,7 @@ fn commit_exact_transaction_inner(
         state,
         &authority_context,
         &transaction,
+        &actor,
         operation_id,
         &base,
     ) {
@@ -241,6 +273,7 @@ fn commit_exact_transaction_inner(
         state,
         sessions,
         transaction,
+        &actor,
         committed,
         plan.layouts,
         coordination,
@@ -325,6 +358,242 @@ fn describe_cleared_operation(operation: &kin_mcp::McpMutationOperation) -> Stri
         ("", _) => format!("{verb} (unnamed target)"),
         (target, _) => format!("{verb} {target}"),
     }
+}
+
+/// Who a committed MCP transaction is attributed to.
+///
+/// The actor is the agent session that opened the transaction. A raw session id
+/// identifies nobody once that session ends, and the session registry is
+/// in-memory, so the vendor and client name the session registered with are
+/// copied into the commit author and into a durable actor record at commit
+/// time. The session id stays inside the author so a live coordination lookup
+/// remains possible while the session is running, and so the two records can be
+/// tied together afterwards.
+struct CommitActor {
+    author: kin_model::AuthorId,
+    actor: Actor,
+    session_id: String,
+}
+
+fn resolve_commit_actor(sessions: &kin_mcp::SessionRegistry, session_id: &str) -> CommitActor {
+    let agent = uuid::Uuid::parse_str(session_id)
+        .ok()
+        .map(kin_model::SessionId)
+        .and_then(|id| sessions.get_agent_session(&id));
+    let display_name = match agent {
+        Some(agent) => format!(
+            "{}/{}",
+            provenance_label(&agent.vendor),
+            provenance_label(&agent.client_name)
+        ),
+        // A session registered through the legacy compatibility surface, or one
+        // that has already ended, has no vendor to name. The id it committed
+        // under is still an identity, and is better than an empty author.
+        None => provenance_label(session_id),
+    };
+    CommitActor {
+        author: kin_model::AuthorId::new(format!("{display_name} <mcp-agent:{session_id}>")),
+        actor: Actor {
+            actor_id: mcp_actor_id(session_id),
+            kind: ActorKind::Assistant,
+            display_name,
+            external_refs: Vec::new(),
+        },
+        session_id: session_id.to_string(),
+    }
+}
+
+/// One field of a provenance display name, made safe to render.
+///
+/// `kin history` reads everything before the first `<` as the author's name and
+/// prints one row per revision, so an angle bracket or a newline arriving from a
+/// client-supplied session name would truncate or break the row it appears in.
+/// `/` goes too, because it is the separator the vendor and client names are
+/// joined with: a vendor of `a/b` with client `c` would otherwise render
+/// identically to a vendor of `a` with client `b/c`.
+fn provenance_label(raw: &str) -> String {
+    /// Long enough for a real vendor and session name, short enough that a
+    /// pathological one cannot dominate a change record.
+    const MAX_LABEL: usize = 64;
+
+    let collapsed = raw
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '<' | '>' | '/') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return "unknown".to_string();
+    }
+    collapsed.chars().take(MAX_LABEL).collect()
+}
+
+/// A stable actor identity for one MCP session.
+///
+/// Derived rather than random so every commit a session makes resolves to the
+/// same actor, which is what lets `query_audit_events` filter by actor and what
+/// keeps a session's writes from reading as a crowd of one-commit strangers.
+fn mcp_actor_id(session_id: &str) -> ActorId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-mcp-session-actor-v1\0");
+    hasher.update(session_id.as_bytes());
+    ActorId::from_hash(Hash256::from_bytes(hasher.finalize().into()))
+}
+
+/// A stable audit-event identity for one scope within one committed change.
+///
+/// Derived so a commit that is resumed after a crash re-derives the identifiers
+/// it already wrote instead of appending a second attribution record for a
+/// single write. `None` names the change itself, which is what a commit that
+/// touched no entity is attributed to.
+fn mcp_audit_event_id(change: &SemanticChangeId, entity: Option<&EntityId>) -> AuditEventId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-mcp-commit-audit-v1\0");
+    hasher.update(change.to_string().as_bytes());
+    hasher.update([0]);
+    match entity {
+        Some(entity) => hasher.update(entity.to_string().as_bytes()),
+        None => hasher.update(b"change"),
+    }
+    AuditEventId::from_hash(Hash256::from_bytes(hasher.finalize().into()))
+}
+
+/// Record who committed, and what they touched, into the provenance surfaces.
+///
+/// Without this an MCP write is anonymous to every read surface that answers
+/// "who changed this": `kin_provenance_query` returns no audit context, and
+/// `kin-review`'s impact analysis, which resolves attribution and its
+/// unreviewed-agent-change signal entirely from audit events and the actor they
+/// name, treats an agent's commit as if nobody made it. The change author alone
+/// does not reach either, because both read the audit trail.
+///
+/// One event per changed entity, because that is the scope the review layer
+/// matches on, and one event scoped to the change itself when a transaction
+/// changed no entity at all: a relation-only commit is still an agent write,
+/// and leaving it out of the audit trail is the same silence this closes.
+/// Called only after the repository receipt exists, so nothing is attributed to
+/// a commit that did not land.
+fn record_commit_provenance(
+    graph: &kin_db::InMemoryGraph,
+    actor: &CommitActor,
+    transaction: &kin_mcp::McpTransaction,
+    committed: &NativeCommitResult,
+) -> Result<(), String> {
+    /// How far back a resume looks for the attribution it may already have
+    /// written.
+    ///
+    /// Queried without an actor filter deliberately. The store applies its
+    /// limit with `take`, after any filter, so a filtered query short-circuits
+    /// only once it has found that many matching events; a session with fewer
+    /// commits than the limit never reaches it and the traversal runs the whole
+    /// log. Unfiltered, the limit bounds the traversal itself, which is the
+    /// property this needs. The derived event ids do the matching.
+    ///
+    /// MCP commits are serialized behind the coordination gate, so a resume
+    /// sits within a handful of events of the attempt it is resuming, and the
+    /// window is wide enough to absorb an interleaved restart.
+    const DEDUP_WINDOW: usize = 1024;
+
+    graph
+        .create_actor(&actor.actor)
+        .map_err(|error| format!("record committing agent actor: {error}"))?;
+
+    let mut entities = committed
+        .change
+        .entity_deltas
+        .iter()
+        .map(|delta| match delta {
+            EntityDelta::Added { new } | EntityDelta::Modified { new, .. } => new.id,
+            EntityDelta::Removed { old } => old.id,
+        })
+        .collect::<Vec<_>>();
+    // A relation-only commit changed no entity, so it has no entity delta to
+    // scope to, but it is still an agent write against the entities the relation
+    // joins. Scoping it to the change alone made it unfindable: every reader
+    // that answers "who touched this entity" selects changes by scanning entity
+    // deltas, which a relation-only change has none of, so the commit was
+    // recorded and invisible. Its endpoints are the entities an operator would
+    // ask about, so they are what it is attributed to.
+    if entities.is_empty() {
+        entities.extend(
+            committed
+                .change
+                .relation_deltas
+                .iter()
+                .flat_map(|delta| match delta {
+                    RelationDelta::Added { new } | RelationDelta::Modified { new, .. } => {
+                        [new.src, new.dst]
+                    }
+                    RelationDelta::Removed { old } => [old.src, old.dst],
+                })
+                .filter_map(|endpoint| match endpoint {
+                    GraphNodeId::Entity(id) => Some(id),
+                    _ => None,
+                }),
+        );
+    }
+    entities.sort_unstable();
+    entities.dedup();
+    let scopes = if entities.is_empty() {
+        // Nothing entity-shaped to name, so the change itself carries the
+        // attribution rather than the write going unrecorded.
+        vec![(
+            mcp_audit_event_id(&committed.change.id, None),
+            WorkScope::Change(committed.change.id),
+        )]
+    } else {
+        entities
+            .into_iter()
+            .map(|entity| {
+                (
+                    mcp_audit_event_id(&committed.change.id, Some(&entity)),
+                    WorkScope::Entity(entity),
+                )
+            })
+            .collect()
+    };
+
+    let already_recorded = graph
+        .query_audit_events(None, DEDUP_WINDOW)
+        .map_err(|error| format!("read existing commit attribution: {error}"))?
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect::<HashSet<_>>();
+
+    let details = serde_json::json!({
+        "schema": "kin.mcp.commit_audit.v1",
+        "transaction_id": transaction.transaction_id,
+        "session_id": actor.session_id,
+        "actor": actor.actor.display_name,
+        "change_id": committed.change.id.to_string(),
+        "repository_generation": committed.receipt.generation,
+        "repository_operation_id": committed.receipt.operation_id.to_string(),
+    })
+    .to_string();
+
+    for (event_id, scope) in scopes {
+        if already_recorded.contains(&event_id) {
+            continue;
+        }
+        graph
+            .record_audit_event(&AuditEvent {
+                event_id,
+                actor_id: actor.actor.actor_id,
+                action: "kin_transaction_commit".to_string(),
+                target_scope: Some(scope.clone()),
+                timestamp: committed.change.timestamp.clone(),
+                details: Some(details.clone()),
+            })
+            .map_err(|error| format!("record commit attribution for {scope}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn transaction_payload_hash(transaction: &kin_mcp::McpTransaction) -> Result<String, String> {
@@ -418,6 +687,7 @@ fn plan_exact_transaction(
     state: &DaemonState,
     authority_context: &LocalRepositoryAuthorityContext,
     transaction: &kin_mcp::McpTransaction,
+    actor: &CommitActor,
     operation_id: OperationId,
     base: &NativeCommitBase,
 ) -> Result<ExactMcpPlan, String> {
@@ -516,6 +786,33 @@ fn plan_exact_transaction(
                 {
                     return Err(format!(
                         "staged source span for entity {} does not match repository authority",
+                        existing.id
+                    ));
+                }
+                // The commit publishes whatever reparsing the new bytes derives,
+                // so a doc summary the caller edited by hand cannot survive.
+                // Refusing an edited one is the same rule already applied to
+                // name, kind, origin, and span: keeping it would report a
+                // documentation edit as committed while publishing only the
+                // body.
+                //
+                // Scoped to `doc_summary` and deliberately not extended to the
+                // whole `metadata` bag. That bag carries values derived from the
+                // entity's own source: `kin-parser` writes
+                // `embedding_body_preview` out of the source bytes at extraction
+                // time, so any commit that changes a body necessarily changes it
+                // too. An agent that reads an entity once and then makes two
+                // edits therefore holds, on the second, a bag that its own first
+                // commit already moved authority past, and comparing the bag
+                // would refuse it for a difference it caused by succeeding.
+                // `doc_summary` is a single named field whose value a caller
+                // either changed on purpose or did not, so a difference there is
+                // real evidence of intent.
+                if payload_entity.doc_summary != existing.doc_summary {
+                    return Err(format!(
+                        "staged doc summary for entity {} differs from repository authority; \
+                         entity documentation is derived from the committed source, so send it \
+                         unchanged and put the new documentation in `body`",
                         existing.id
                     ));
                 }
@@ -677,7 +974,7 @@ fn plan_exact_transaction(
         authority_context,
         operation_id,
         kin_model::Timestamp::now(),
-        kin_model::AuthorId::new(format!("mcp:{}", transaction.session_id)),
+        actor.author.clone(),
         message,
         base,
     )
@@ -862,6 +1159,7 @@ fn finalize_committed_transaction(
     state: &Arc<DaemonState>,
     sessions: &kin_mcp::SessionRegistry,
     transaction: kin_mcp::McpTransaction,
+    actor: &CommitActor,
     committed: NativeCommitResult,
     planned_layouts: Vec<FileLayout>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
@@ -893,6 +1191,7 @@ fn finalize_committed_transaction(
             transaction.transaction_id
         ));
     }
+    record_commit_provenance(state.graph.as_ref(), actor, &transaction, &committed)?;
 
     let observed_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if observed_generation < committed.receipt.generation {
@@ -1429,6 +1728,1118 @@ mod tests {
         assert_ne!(
             reparsed.fingerprint, entity.fingerprint,
             "semantic fingerprint must come from reparsing the exact new bytes"
+        );
+    }
+
+    /// Operations handed to the commit call itself must land exactly like
+    /// staged ones.
+    ///
+    /// The tool advertises the inline array as the single-call convenience
+    /// form, so a caller that uses it is entitled to the same durability as
+    /// stage-then-commit. The failure this closes reported `status: committed`
+    /// with `ops_applied: 1` while `modified_files` stayed empty and the body
+    /// never reached the file: a success response for a change that never
+    /// happened, which is the one outcome an agent cannot detect or recover
+    /// from. Read-back is byte-exact against the working file, the repository
+    /// CAS blob, and the reparsed entity.
+    #[test]
+    fn inline_operations_commit_persists_the_body_byte_exact() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        // The exact shape reported as lost: an entity payload plus a body,
+        // passed on the commit call with no prior kin_transaction_stage.
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": {"Entity": entity},
+                    "body": "pub fn value() -> u8 { 2 }",
+                    "description": "inline entity body update",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "inline operations commit failed: {}",
+            result_text(&result)
+        );
+
+        let response: serde_json::Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(response["status"], "committed");
+        assert_eq!(response["ops_applied"], 1);
+        assert_eq!(
+            response["modified_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "a committed inline body must name the file it changed: {}",
+            result_text(&result)
+        );
+
+        let expected = b"pub fn value() -> u8 { 2 }\n";
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            expected,
+            "inline body must reach the working file byte-exact"
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let artifact = after
+            .tree
+            .artifact_at_path(&RepoPath::from_utf8("src/lib.rs").unwrap())
+            .unwrap();
+        assert_eq!(
+            load_native_source_blob(&state.layout, artifact.entry.blob_identity().unwrap())
+                .unwrap(),
+            expected,
+            "inline body must reach repository CAS byte-exact"
+        );
+        let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(
+            reparsed.fingerprint, entity.fingerprint,
+            "inline body must be reparsed into graph truth"
+        );
+    }
+
+    /// The payload-less inline form has to persist too.
+    #[test]
+    fn inline_payload_less_operations_commit_persists_the_body_byte_exact() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": "value",
+                    "body": "pub fn value() -> u8 { 3 }",
+                    "description": "inline payload-less body update",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "inline payload-less commit failed: {}",
+            result_text(&result)
+        );
+
+        let expected = b"pub fn value() -> u8 { 3 }\n";
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            expected
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(reparsed.fingerprint, entity.fingerprint);
+    }
+
+    /// An `operations` element carrying a key Kin does not model is refused
+    /// before anything commits.
+    ///
+    /// A caller improvising the shape reaches for `content`, `source`, or
+    /// `new_body` before it reaches for `body`. Serde ignores keys it does not
+    /// know, so the misspelled body vanished and the operation was planned as
+    /// if no body had been sent at all. Naming the unknown key is the whole
+    /// difference between a caller fixing one word and a caller concluding
+    /// that inline commits do not work.
+    #[test]
+    fn inline_operations_with_an_unmodelled_key_are_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "content": "pub fn value() -> u8 { 2 }",
+                    "description": "misspelled body key",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result_text(&result).contains("content"),
+            "the refusal must name the unknown key: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+    }
+
+    /// Re-sending an inline commit after its fence is a resume, not a restage.
+    ///
+    /// `kin_transaction_commit` documents itself as idempotent on re-entry: the
+    /// fenced payload resumes and the call reports whether it landed. Inline
+    /// callers were excluded from that contract, because the resume tried to
+    /// stage the same array onto a transaction no longer in `active` and died
+    /// on the staging error instead of resolving the commit. The identical
+    /// array now resumes; a different one is refused rather than appended to a
+    /// payload already fenced under a different digest.
+    #[test]
+    fn re_sent_inline_operations_resume_a_fenced_commit() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let operations = serde_json::json!([{
+            "verb": "update",
+            "target": entity.id.to_string(),
+            "body": "pub fn value() -> u8 { 2 }",
+            "description": "inline body update",
+        }]);
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            ("operations".to_string(), operations.clone()),
+        ]);
+
+        // Fail after the repository receipt exists, so the transaction is left
+        // fenced exactly as a crashed publication would leave it.
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(crashed.is_error, Some(true));
+        assert_eq!(
+            sessions
+                .get_transaction(&transaction.transaction_id)
+                .unwrap()
+                .state,
+            "committing"
+        );
+
+        let resumed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            resumed.is_error,
+            Some(true),
+            "re-sending the same inline array must resume the fenced commit: {}",
+            result_text(&resumed)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    /// A fenced transaction must not absorb a different inline payload.
+    #[test]
+    fn divergent_inline_operations_cannot_edit_a_fenced_commit() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let arguments = |body: &str| {
+            HashMap::from([
+                (
+                    "transaction_id".to_string(),
+                    serde_json::json!(transaction.transaction_id),
+                ),
+                (
+                    "operations".to_string(),
+                    serde_json::json!([{
+                        "verb": "update",
+                        "target": entity.id.to_string(),
+                        "body": body,
+                        "description": "inline body update",
+                    }]),
+                ),
+            ])
+        };
+
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments("pub fn value() -> u8 { 2 }"),
+            None,
+        );
+        assert_eq!(crashed.is_error, Some(true));
+
+        let diverged = commit_exact_transaction(
+            &state,
+            &sessions,
+            &arguments("pub fn value() -> u8 { 9 }"),
+            None,
+        );
+        assert_eq!(diverged.is_error, Some(true));
+        assert!(
+            result_text(&diverged).contains("differ from the operations already fenced"),
+            "a divergent resume must say so: {}",
+            result_text(&diverged)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n",
+            "the fenced body, not the divergent one, is what authority holds"
+        );
+    }
+
+    /// A live agent session, the way `kin_session_start` registers one.
+    fn start_agent_session(
+        sessions: &kin_mcp::SessionRegistry,
+        vendor: &str,
+        client_name: &str,
+    ) -> kin_model::session::AgentSession {
+        sessions.start_agent_session(
+            vendor,
+            client_name,
+            kin_model::session::SessionTransport::Mcp,
+            None,
+            PathBuf::from("/tmp"),
+            kin_model::session::SessionCapabilities {
+                can_write: true,
+                can_commit: true,
+                ..kin_model::session::SessionCapabilities::default()
+            },
+        )
+    }
+
+    fn commit_one_entity_edit(
+        state: &Arc<DaemonState>,
+        sessions: &kin_mcp::SessionRegistry,
+        session_id: &str,
+        entity: &Entity,
+        body: &str,
+    ) -> kin_mcp::ToolCallResult {
+        let transaction = sessions
+            .begin_transaction(session_id, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: entity.id.to_string(),
+                    payload: None,
+                    body: Some(body.to_string()),
+                    description: "attributed body update".to_string(),
+                }],
+            )
+            .unwrap();
+        commit_exact_transaction(
+            state,
+            sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        )
+    }
+
+    /// An agent's commit has to be attributable afterwards, by name.
+    ///
+    /// The pitch is that the graph knows who changed what, and an MCP write
+    /// used to leave nothing any read surface could answer that with: the audit
+    /// trail was empty, no actor existed, and the only identity anywhere was a
+    /// session id that lived in the live response and nowhere else. Sealing the
+    /// change later with `kin commit` then attributed the operator who ran the
+    /// CLI, not the agent that wrote the code. This asserts every surface an
+    /// operator would actually reach for.
+    #[test]
+    fn a_committed_transaction_is_attributable_to_the_agent_that_made_it() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "claude-code", "one-change-demo");
+        let session_id = session.session_id.to_string();
+
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &session_id,
+            &entity,
+            "pub fn value() -> u8 { 2 }",
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "attributed commit failed: {}",
+            result_text(&result)
+        );
+
+        // kin history: the agent's name, not an opaque id and not the operator.
+        let binding = state.local_repository_authority_binding().unwrap();
+        let history = kin_cli::commands::history::execute_history_request(
+            &binding,
+            state.graph.as_ref(),
+            &kin_cli::commands::history::HistoryRequest {
+                entity: "value".to_string(),
+                reference: None,
+            },
+        )
+        .unwrap();
+        // `kin history` gives the author column 20 characters and ellipsizes
+        // past that, so "claude-code/one-change-demo" (27) renders cut. Asserted
+        // in its rendered form rather than on a prefix, so the truncation is a
+        // stated property of this surface instead of an accident the assertion
+        // happens to survive.
+        assert!(
+            history
+                .lines
+                .iter()
+                .any(|line| line.contains("claude-code/one-cha\u{2026}")),
+            "history must name the committing agent, truncated to its column: {:#?}",
+            history.lines
+        );
+
+        // kin blame: the full author, so the session id is recoverable from a
+        // read surface after the session itself is gone.
+        let blame = kin_cli::commands::blame::execute_blame_request(
+            &binding,
+            state.graph.as_ref(),
+            &kin_cli::commands::blame::BlameRequest {
+                entity: "value".to_string(),
+                reference: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            blame
+                .lines
+                .iter()
+                .any(|line| line.contains(&format!("mcp-agent:{session_id}"))),
+            "blame must carry the committing session id: {:#?}",
+            blame.lines
+        );
+
+        // kin_provenance_query: change count, latest change, and audit context.
+        let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(entity.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(result_text(&provenance)).unwrap();
+        assert!(
+            provenance["change_count"].as_u64().unwrap() >= 1,
+            "provenance must count the MCP change: {provenance}"
+        );
+        assert!(!provenance["latest_change"].is_null());
+        let events = provenance["recent_audit_events"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "one commit of one entity is one attribution record: {provenance}"
+        );
+        assert_eq!(events[0]["action"], "kin_transaction_commit");
+        let details: serde_json::Value =
+            serde_json::from_str(events[0]["details"].as_str().unwrap()).unwrap();
+        assert_eq!(details["session_id"], session_id);
+        assert_eq!(details["actor"], "claude-code/one-change-demo");
+
+        // The actor the audit event names resolves, and resolves as an agent:
+        // this is what kin-review's impact analysis reads to decide an agent
+        // change went in unreviewed.
+        let actor_id = mcp_actor_id(&session_id);
+        let actor = state.graph.get_actor(&actor_id).unwrap().unwrap();
+        assert_eq!(actor.kind, ActorKind::Assistant);
+        assert_eq!(actor.display_name, "claude-code/one-change-demo");
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&actor_id), 16)
+                .unwrap()
+                .len(),
+            1,
+            "the audit trail must be queryable by the agent that wrote it"
+        );
+    }
+
+    /// Asking who touched one entity must not answer with another entity's writer.
+    ///
+    /// Every field of the provenance response is keyed to the entity asked
+    /// about, so an audit list filled from the repository's most recent activity
+    /// reads as that entity's history. Before anything wrote audit events the
+    /// list was always empty and the omission was invisible; once commits record
+    /// attribution it becomes a confident wrong answer. Two entities, two
+    /// sessions, and the later commit is the unrelated one, so an unfiltered
+    /// list would put the wrong agent at the top.
+    #[test]
+    fn provenance_answers_for_the_entity_asked_about_not_the_latest_commit() {
+        let (_dir, state) = test_state();
+        let (subject, _) = install_exact_source(
+            &state,
+            "src/subject.rs",
+            b"pub fn subject() -> u8 { 1 }\n",
+            "subject",
+        );
+        let (unrelated, _) = install_exact_source(
+            &state,
+            "src/unrelated.rs",
+            b"pub fn unrelated() -> u8 { 1 }\n",
+            "unrelated",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+
+        let author = start_agent_session(&sessions, "claude-code", "feature-work");
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &author.session_id.to_string(),
+            &subject,
+            "pub fn subject() -> u8 { 2 }",
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "subject commit failed: {}",
+            result_text(&result)
+        );
+
+        // A different session commits something else, afterwards, so it owns
+        // the most recent audit rows.
+        let other = start_agent_session(&sessions, "codex", "cleanup");
+        let result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &other.session_id.to_string(),
+            &unrelated,
+            "pub fn unrelated() -> u8 { 2 }",
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "unrelated commit failed: {}",
+            result_text(&result)
+        );
+
+        let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(subject.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(result_text(&provenance)).unwrap();
+        let events = provenance["recent_audit_events"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the subject's own write belongs in its provenance: {provenance}"
+        );
+        assert_eq!(
+            events[0]["target_scope"]["Entity"],
+            serde_json::json!(subject.id.to_string()),
+            "the surviving event must name the entity that was asked about"
+        );
+        let details: serde_json::Value =
+            serde_json::from_str(events[0]["details"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            details["actor"], "claude-code/feature-work",
+            "the answer must be the agent that wrote this entity, not the last agent to write anything"
+        );
+
+        // And the same query for the other entity answers with the other agent,
+        // so the filter narrows rather than simply returning the first event.
+        let other_provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(unrelated.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let other_provenance: serde_json::Value =
+            serde_json::from_str(result_text(&other_provenance)).unwrap();
+        let other_events = other_provenance["recent_audit_events"].as_array().unwrap();
+        assert_eq!(other_events.len(), 1);
+        let other_details: serde_json::Value =
+            serde_json::from_str(other_events[0]["details"].as_str().unwrap()).unwrap();
+        assert_eq!(other_details["actor"], "codex/cleanup");
+    }
+
+    /// A payload field the commit cannot honor is refused, not dropped.
+    ///
+    /// The commit publishes what reparsing the new bytes derives, so a
+    /// doc summary the caller edited by hand never lands. Committing the body
+    /// and discarding that edit reports `ops_applied: 1` for an operation only
+    /// half of which happened, which is the same defect this PR closes on the
+    /// other path, in the other half of the operation.
+    #[test]
+    fn an_edited_payload_field_the_commit_cannot_honor_is_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+
+        let mut edited = entity.clone();
+        edited.doc_summary = Some("returns the configured value".to_string());
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": {"Entity": edited},
+                    "body": "pub fn value() -> u8 { 2 }",
+                    "description": "body edit plus a hand-edited doc summary",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a metadata edit that cannot land must be refused: {}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains("doc summary"),
+            "the refusal must name the field it could not honor: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(
+            after.roots.generation, before.roots.generation,
+            "the body must not land on its own while the metadata half is refused"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n"
+        );
+    }
+
+    /// The payload an agent actually builds is what `get_entity` handed it,
+    /// decoded from the wire, and it has to commit.
+    ///
+    /// This is the shape the product uses: call `get_entity`, take the returned
+    /// object whole, add a `body`, commit. It is not the same as echoing the
+    /// in-memory struct, because `entity_response_json` injects ten
+    /// response-only keys at top level (read_path, start_line, end_line,
+    /// source_excerpt, source_change_id, artifact_id, artifact_path,
+    /// artifact_entry, stale, source) and `Entity` does not deny unknown
+    /// fields.
+    ///
+    /// What this pins is that the round trip is faithful: those keys are
+    /// discarded on the way back in and land nowhere, so an echoed payload
+    /// equals what authority holds. That is worth a test because it is not
+    /// obvious. `EntityMetadata` is `#[serde(flatten)] extra: HashMap`, so it
+    /// absorbs unknown keys found inside the `metadata` object; `Entity.metadata`
+    /// is a plain named field, so top-level decorations never reach it. Flip
+    /// either of those and every field-by-field check the commit planner makes
+    /// against authority starts refusing a caller that did nothing but echo.
+    #[test]
+    fn a_payload_decoded_from_a_real_get_entity_response_still_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+
+        // The exact bytes `get_entity` returns, then straight back in as the
+        // payload, which is the round trip nothing else in the workspace walks.
+        let binding = state.local_repository_authority_binding().unwrap();
+        let response = kin_mcp::handlers::common::entity_response_json(
+            state.graph.as_ref(),
+            &entity,
+            Some(&binding),
+        )
+        .expect("the read surface must render the entity");
+        for injected in ["read_path", "start_line", "source_excerpt", "stale"] {
+            assert!(
+                response.get(injected).is_some(),
+                "fixture must exercise a response carrying the injected key {injected}: {response}"
+            );
+        }
+        let echoed: Entity = serde_json::from_value(response)
+            .expect("a get_entity response must decode back into an Entity");
+        assert_eq!(
+            echoed.metadata, entity.metadata,
+            "response-only keys must be discarded on decode, not folded into metadata"
+        );
+        assert_eq!(
+            echoed.doc_summary, entity.doc_summary,
+            "an echoed payload must carry the doc summary authority holds"
+        );
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:src/lib.rs")
+            .unwrap();
+        let arguments = HashMap::from([
+            (
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            ),
+            (
+                "operations".to_string(),
+                serde_json::json!([{
+                    "verb": "update",
+                    "target": entity.id.to_string(),
+                    "payload": {"Entity": echoed},
+                    "body": "pub fn value() -> u8 { 2 }",
+                    "description": "echo the read response back as the payload",
+                }]),
+            ),
+        ]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a payload echoed from a real get_entity response must commit: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n",
+            "the body must land for the payload shape the product actually builds"
+        );
+    }
+
+    /// An unchanged payload beside a body still commits.
+    ///
+    /// The refusal above is scoped to a field the caller edited. Echoing back
+    /// the entity exactly as it was read is the documented shape and must keep
+    /// working.
+    #[test]
+    fn an_unedited_payload_beside_a_body_still_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (_tx, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "an unedited payload must still commit: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    /// Two commits by one session are two records by one actor.
+    #[test]
+    fn one_agent_session_keeps_one_actor_identity_across_commits() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "codex", "repeat-writer");
+        let session_id = session.session_id.to_string();
+
+        for body in ["pub fn value() -> u8 { 2 }", "pub fn value() -> u8 { 3 }"] {
+            let result = commit_one_entity_edit(&state, &sessions, &session_id, &entity, body);
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "commit failed: {}",
+                result_text(&result)
+            );
+        }
+
+        let actor_id = mcp_actor_id(&session_id);
+        assert_eq!(
+            state.graph.list_actors().unwrap().len(),
+            1,
+            "a session is one actor, not one per commit"
+        );
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&actor_id), 16)
+                .unwrap()
+                .len(),
+            2,
+            "each commit contributes its own attribution record"
+        );
+    }
+
+    /// A resumed commit must not double-count itself in the audit trail.
+    ///
+    /// Attribution is written after the repository receipt exists, and the
+    /// receipt path is re-entered on resume. A second record for one write
+    /// would read as an agent that committed twice.
+    #[test]
+    fn a_resumed_commit_records_its_attribution_once() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "claude-code", "resumed-writer");
+        let session_id = session.session_id.to_string();
+        let transaction = sessions
+            .begin_transaction(&session_id, "file:src/lib.rs")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: entity.id.to_string(),
+                    payload: None,
+                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                    description: "attributed body update".to_string(),
+                }],
+            )
+            .unwrap();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(transaction.transaction_id),
+        )]);
+
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(crashed.is_error, Some(true));
+
+        let resumed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            resumed.is_error,
+            Some(true),
+            "resume failed: {}",
+            result_text(&resumed)
+        );
+
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&mcp_actor_id(&session_id)), 16)
+                .unwrap()
+                .len(),
+            1,
+            "one write is one attribution record, however many attempts it took"
+        );
+    }
+
+    /// A relation-only commit must be answerable through the surface an
+    /// operator actually asks.
+    ///
+    /// Attribution keyed only to changed entities would leave a relation-only
+    /// transaction out of the audit trail entirely. Scoping it to the change
+    /// instead was no better in practice: every reader that answers "who touched
+    /// this entity" selects changes by scanning entity deltas, and a
+    /// relation-only change has none, so the record existed and no query could
+    /// reach it. Asserted through `kin_provenance_query` rather than through
+    /// `query_audit_events`, because querying the store directly is exactly what
+    /// hid the gap.
+    #[test]
+    fn a_relation_only_commit_is_attributed_to_the_entities_it_joined() {
+        let (_dir, state) = test_state();
+        let (caller, _) = install_exact_source(
+            &state,
+            "src/caller.rs",
+            b"pub fn caller() -> u8 { 1 }\n",
+            "caller",
+        );
+        let (callee, _) = install_exact_source(
+            &state,
+            "src/callee.rs",
+            b"pub fn callee() -> u8 { 2 }\n",
+            "callee",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+        let session = start_agent_session(&sessions, "gemini-cli", "relation-writer");
+        let session_id = session.session_id.to_string();
+        let transaction = sessions
+            .begin_transaction(&session_id, "relations")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "create".to_string(),
+                    target: String::new(),
+                    payload: Some(kin_mcp::McpMutationPayload::Relation {
+                        from: caller.id,
+                        to: callee.id,
+                        kind: kin_model::relation::RelationKind::Calls,
+                    }),
+                    body: None,
+                    description: "link the call".to_string(),
+                }],
+            )
+            .unwrap();
+
+        let result = commit_exact_transaction(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "relation-only commit failed: {}",
+            result_text(&result)
+        );
+
+        let events = state
+            .graph
+            .query_audit_events(Some(&mcp_actor_id(&session_id)), 16)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "a relation-only commit is attributed to both endpoints it joined"
+        );
+        let mut scoped = events
+            .iter()
+            .filter_map(|event| match event.target_scope {
+                Some(WorkScope::Entity(id)) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        scoped.sort_unstable();
+        let mut expected = vec![caller.id, callee.id];
+        expected.sort_unstable();
+        assert_eq!(scoped, expected, "both endpoints must be named");
+
+        // The surface that matters: asking about either endpoint returns the
+        // agent that created the relation.
+        for endpoint in [&caller, &callee] {
+            let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+                &HashMap::from([(
+                    "entity_id".to_string(),
+                    serde_json::json!(endpoint.id.to_string()),
+                )]),
+                state.graph.as_ref(),
+            )
+            .unwrap();
+            let provenance: serde_json::Value =
+                serde_json::from_str(result_text(&provenance)).unwrap();
+            let events = provenance["recent_audit_events"].as_array().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "provenance for {} must reach the relation write: {provenance}",
+                endpoint.name
+            );
+            let details: serde_json::Value =
+                serde_json::from_str(events[0]["details"].as_str().unwrap()).unwrap();
+            assert_eq!(details["actor"], "gemini-cli/relation-writer");
+        }
+    }
+
+    fn entity_span_by_name(state: &Arc<DaemonState>, name: &str) -> kin_model::SourceSpan {
+        state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some(name.to_string()),
+                ..EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|entity| entity.name == name)
+            .unwrap_or_else(|| panic!("graph must contain {name}"))
+            .span
+            .unwrap_or_else(|| panic!("{name} must carry a source span"))
+    }
+
+    /// A commit moves the positions of entities it did not edit.
+    ///
+    /// An edit that makes one entity taller pushes everything below it down. If
+    /// the graph keeps the pre-commit position for those neighbours, then a
+    /// graph-native read after a graph-native write hands back line anchors that
+    /// no longer describe the file, and an agent deriving anything from them
+    /// derives it wrong. Positions have to move with the bytes or not be served
+    /// at all.
+    ///
+    /// Asserted against the file rather than against a constant, and accepting
+    /// either line-numbering base, so this measures freshness only. Which base
+    /// `start_line` counts from is a separate question about the read boundary
+    /// and is not what this test pins.
+    #[test]
+    fn a_commit_repositions_the_entities_it_pushed_down() {
+        let (_dir, state) = test_state();
+        let (first, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn first() -> u8 { 1 }\n\npub fn second() -> u8 { 2 }\n",
+            "first",
+        );
+        let before = entity_span_by_name(&state, "second");
+
+        // Two lines taller than what it replaces.
+        let sessions = test_sessions();
+        let (_tx, arguments) =
+            stage_entity_edit(&sessions, &first, "pub fn first() -> u8 {\n    1\n}");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "commit failed: {}",
+            result_text(&result)
+        );
+
+        let after = entity_span_by_name(&state, "second");
+        assert_eq!(
+            after.start_line - before.start_line,
+            2,
+            "an untouched neighbour must move by exactly the lines inserted above it"
+        );
+
+        let file = std::fs::read_to_string(state.layout.working_dir().join("src/lib.rs")).unwrap();
+        let lines = file.lines().collect::<Vec<_>>();
+        let named = |index: u32| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| lines.get(index))
+                .is_some_and(|line| line.contains("fn second"))
+        };
+        assert!(
+            named(after.start_line) || named(after.start_line.saturating_sub(1)),
+            "start_line {} does not land on 'fn second' under either base:\n{file}",
+            after.start_line
+        );
+        assert!(
+            file[after.start_byte..].starts_with("pub fn second"),
+            "start_byte {} must index the post-commit bytes of the entity it names",
+            after.start_byte
+        );
+    }
+
+    /// A session with no registration still commits under an identity.
+    #[test]
+    fn a_session_without_an_agent_registration_still_names_an_author() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (_tx, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+        let binding = state.local_repository_authority_binding().unwrap();
+        let history = kin_cli::commands::history::execute_history_request(
+            &binding,
+            state.graph.as_ref(),
+            &kin_cli::commands::history::HistoryRequest {
+                entity: "value".to_string(),
+                reference: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            history.lines.iter().any(|line| line.contains(TEST_SESSION)),
+            "an unregistered session still commits under the id it used: {:#?}",
+            history.lines
+        );
+        assert_eq!(
+            state
+                .graph
+                .query_audit_events(Some(&mcp_actor_id(TEST_SESSION)), 16)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
