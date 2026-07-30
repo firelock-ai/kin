@@ -99,14 +99,19 @@ jobs:
       # nightly for the same reason that file pins stable: an unpinned @nightly
       # lets a green build turn red with no change to this repository, and the
       # failure then has to be told apart from a real one. Bump DELIBERATELY.
-      # The action itself is sha-pinned, same commit the release workflow pins.
-      # Its ref used to be @master, which is a branch: the action could change
-      # under a job whose whole purpose is a fixed toolchain. The trailing
-      # comment names the action tag that sha carries, matching release.yml; the
-      # Rust version this job installs comes from the explicit input below, so
-      # the ref never had to spell it.
+      # The action is sha-pinned rather than referenced by a branch, because a
+      # branch could change under a job whose whole purpose is a fixed toolchain.
+      # The sha has to come from the default branch, which is the only revision
+      # declaring a `toolchain` input. This action also publishes a branch per
+      # toolchain (`1.96.0`, `stable`, and so on) whose action hardcodes that
+      # version and accepts only `targets`, `target`, and `components`. Pinning
+      # one of those shas here made `toolchain` an unexpected input, so the step
+      # installed 1.96.0, and the nightly named below arrived only when rustup
+      # resolved it on the first `cargo +nightly-2026-06-17` call. release.yml
+      # pins a per-toolchain sha deliberately: it wants stable and passes only
+      # `targets`.
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@c0e9df88980754dd93e5833b8dcb1b304c1fe173 # action tag 1.96.0
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # default branch
         with:
           toolchain: nightly-2026-06-17
 
