@@ -16,7 +16,9 @@
 use std::collections::HashSet;
 
 use crate::index::{fingerprint_match_score, CrossRepoEdge, EntityEntry, SpineIndex};
-use kin_model::{Entity, EntityId, EntityKind, Relation, RelationKind, SemanticFingerprint};
+use kin_model::{
+    Entity, EntityId, EntityKind, EntityRole, Relation, RelationKind, SemanticFingerprint,
+};
 
 /// A detected cross-repo import that can potentially be resolved.
 #[derive(Debug, Clone)]
@@ -361,9 +363,23 @@ fn symbol_leaf(token: &str) -> Option<String> {
 }
 
 /// Walk a repo's entity relations looking for Calls/References where:
-/// - The dst entity doesn't exist in the local entity set (external reference)
+/// - The dst is an external reference target rather than a local definition
 /// - `import_source` is set on the relation
 /// - The relation carries a real imported-symbol token in its evidence
+///
+/// A destination counts as external when the repo's graph binds it as an
+/// external reference target, which is what admission enrichment writes for a
+/// symbol another repository owns, or when the repo's graph does not bind it at
+/// all, which is the shape graphs written before external targets were bound
+/// still carry.
+///
+/// A target is identified by carrying [`kin_model::EntityRole::External`] *and*
+/// no file of its own. Neither half identifies it alone: that role is also
+/// carried by real entities a repository vendors under `third_party/` and its
+/// siblings, which hold their own source and are local definitions for this
+/// purpose, while an absent file on its own only means no path was recorded.
+/// Either half used by itself reports a resolved local call as an unresolved
+/// cross-repo import.
 ///
 /// The imported symbol name is taken from the relation's parser/linker evidence
 /// (the symbol actually called/imported), never from the graph node label. When
@@ -377,7 +393,11 @@ pub fn collect_unresolved_imports(
     repo_id: &str,
     registry_repo_ids: &[String],
 ) -> Vec<UnresolvedImport> {
-    let local_ids: HashSet<EntityId> = entities.iter().map(|e| e.id).collect();
+    let local_ids: HashSet<EntityId> = entities
+        .iter()
+        .filter(|e| e.role != EntityRole::External || e.file_origin.is_some())
+        .map(|e| e.id)
+        .collect();
     let entity_map: std::collections::HashMap<EntityId, &Entity> =
         entities.iter().map(|e| (e.id, e)).collect();
 
