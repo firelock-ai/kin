@@ -3147,10 +3147,20 @@ const PROGRESS_REPORTING_COMMANDS: [&str; 2] = ["init", "clone"];
 ///   is pre-wired and inert.
 ///
 /// So a long admission does **not** report mid-flight progress at this version.
-/// It begins to the moment this workspace consumes a KinDB shipping
+/// It begins the moment this workspace consumes a KinDB shipping
 /// `storage::history_replay`, with no change here. Anyone diagnosing an
 /// apparently stalled `kin init` before then should not read silence as
 /// evidence that the instrumentation ran.
+///
+/// `kin_db::storage::snapshot` is deliberately not here, despite carrying three
+/// live conditional `info!` sites. They belong to `SnapshotManager`, which the
+/// admission path never opens: `commands/init.rs` reaches for
+/// `RepositoryAuthorityManager` instead, so naming the module would add a
+/// fourth directive that matches nothing on either of these two commands. Where
+/// those events do fire, the daemon already runs at `info` and records them, and
+/// on ordinary graph-reading commands they report finished counts rather than
+/// progress, so raising them there would restate the mistake this allowlist
+/// exists to avoid.
 const ADMISSION_PROGRESS_TARGETS: [&str; 3] = [
     "kin_core::init",
     "kin_core::git_init",
@@ -3266,6 +3276,178 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Behavioral probes for the default log filter.
+    //
+    // The assertions above check the shape of the directive string, and a string
+    // can be correct while admitting nothing. `EnvFilter` resolves directives
+    // against a callsite at runtime, so a reordered list, an added global
+    // directive, or a target shadowed by a broader one all leave the string
+    // intact and every assertion above green while the event is dropped. These
+    // probes install what production installs and assert on what actually
+    // reaches a writer.
+    //
+    // They build the filter from `default_filter_directives` rather than calling
+    // `default_env_filter`, deliberately: that function consults `RUST_LOG`, and
+    // a probe inheriting the developer's or the runner's environment would fail
+    // or pass vacuously depending on it. `EnvFilter::new` over the pure
+    // directive string is exactly what production installs when `RUST_LOG` is
+    // unset.
+
+    /// Collects everything a subscriber writes, standing in for the terminal.
+    #[derive(Clone)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The filter a plain run of `command` installs, absent `RUST_LOG`.
+    fn installed_filter(command: &str) -> EnvFilter {
+        EnvFilter::new(default_filter_directives(command))
+    }
+
+    /// Run `emit` under `filter` and report whether anything reached the writer.
+    ///
+    /// The caller emits rather than naming a target, because `tracing`'s macros
+    /// build a static callsite and so require a literal target. A helper taking
+    /// `&'static str` does not compile, which is why the probes below are spelled
+    /// out one per target instead of looping over the const list.
+    fn survives(filter: EnvFilter, emit: impl FnOnce()) -> bool {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(CapturedLog(buffer.clone())));
+        tracing::subscriber::with_default(subscriber, emit);
+        let captured = buffer.lock().expect("log buffer poisoned").len();
+        captured > 0
+    }
+
+    /// The probes cannot iterate the const list, so couple them to it by count.
+    /// Adding a target without adding its probe fails here rather than shipping
+    /// an entry nothing has been shown to admit.
+    #[test]
+    fn every_admission_target_has_a_probe() {
+        assert_eq!(
+            ADMISSION_PROGRESS_TARGETS.len(),
+            3,
+            "add a probe below when adding an admission target"
+        );
+    }
+
+    #[test]
+    fn an_admission_command_admits_every_progress_target() {
+        assert!(
+            survives(installed_filter("init"), || tracing::info!(
+                target: "kin_core::init",
+                "probe"
+            )),
+            "kin init must admit its own admission receipt"
+        );
+        assert!(
+            survives(installed_filter("init"), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "kin init must admit Git admission output"
+        );
+        // Pre-wired rather than live: no module of this name exists in the KinDB
+        // this workspace pins, so nothing emits on it yet. Probing it proves the
+        // directive carries such events the moment one does, which is the only
+        // thing pre-wiring can be held to.
+        assert!(
+            survives(installed_filter("clone"), || tracing::info!(
+                target: "kin_db::storage::history_replay",
+                "probe"
+            )),
+            "the pre-wired replay target must already be admitted"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_command_denies_the_progress_targets() {
+        assert!(
+            !survives(installed_filter("locate"), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "a short command must not gain admission output"
+        );
+        assert!(
+            !survives(installed_filter("locate"), || tracing::info!(
+                target: "kin_core::init",
+                "probe"
+            )),
+            "a short command must not gain the admission receipt"
+        );
+    }
+
+    #[test]
+    fn the_quiet_floor_holds_for_every_target_not_named() {
+        // Why the raised set is an allowlist rather than a crate-wide or global
+        // level: unnamed info stays exactly as silent as it was, the embedding
+        // hot path most of all, and warnings still reach the user from anywhere.
+        assert!(
+            !survives(installed_filter("init"), || tracing::info!(
+                target: "kin_db::embed",
+                "probe"
+            )),
+            "the embedding hot path must not become visible by default"
+        );
+        assert!(
+            !survives(installed_filter("init"), || tracing::info!(
+                target: "reqwest::connect",
+                "probe"
+            )),
+            "dependency info must not become visible by default"
+        );
+        assert!(
+            survives(installed_filter("init"), || tracing::warn!(
+                target: "kin_db::embed",
+                "probe"
+            )),
+            "warnings must still reach the user from every target"
+        );
+    }
+
+    #[test]
+    fn a_bare_warn_default_drops_the_admission_targets() {
+        // Root cause, and the guard against vacuity. Without it the probes above
+        // would pass just as well against a directive that admitted everything,
+        // and would say nothing about the behavior they exist to pin.
+        assert!(
+            !survives(EnvFilter::new("warn"), || tracing::info!(
+                target: "kin_core::git_init",
+                "probe"
+            )),
+            "the bare warn default this replaced must be shown to drop admission output"
+        );
+        assert!(
+            !survives(EnvFilter::new("warn"), || tracing::info!(
+                target: "kin_core::init",
+                "probe"
+            )),
+            "the bare warn default this replaced must be shown to drop the receipt"
+        );
     }
 
     fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
