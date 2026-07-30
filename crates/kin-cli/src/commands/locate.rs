@@ -16006,6 +16006,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         change
@@ -16111,6 +16112,7 @@ mod tests {
                 local_overlay_delta: (index == 0)
                     .then(|| FrozenLocalOverlayDelta::initialize(overlay.clone())),
                 merge_transaction_delta: None,
+                sealed_observation: None,
             };
             drop(lease);
             manager.commit_repository_transaction(transaction).unwrap();
@@ -16150,6 +16152,7 @@ mod tests {
                     relation_deltas: Vec::new(),
                     tree_deltas: vec![tree_delta],
                     admission_policy_delta: None,
+                    external_reference_deltas: Vec::new(),
                 })?;
             }
             EntityStore::upsert_opaque_artifact(self, artifact)

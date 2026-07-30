@@ -201,6 +201,7 @@ fn publish(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     let (receipt, authority_freeze) = commit_and_freeze_exact(&authority.manager, transaction)
         .with_context(|| format!("publish repository-v6 tag {}", request.name))?;
@@ -429,6 +430,7 @@ fn replay(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     if transaction.transaction_hash()? != receipt.transaction_hash {
         return Err(tag_conflict(format!(

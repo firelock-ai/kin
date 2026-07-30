@@ -82,7 +82,7 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "build_semantic_git_import_plan",
-      "digest": "sha256:7a40b21ecef701fbbaaad7639ef2bcb070bca479d06bc440cf86b392eb78ae1e",
+      "digest": "sha256:ed32076e2e329bb714b10d8de562d262ee5a29a794a4b0d203a6268bbb863bb8",
       "reason": "Builds the parent-first change sequence and tree map replay consumes. Its ordering and tree selection decide the baseline every historical delta is computed against.",
       "owner": "kin-git"
     },

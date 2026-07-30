@@ -340,6 +340,7 @@ fn build_semantic_git_import_plan(
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change)?;
         validate_semantic_change_id(&change)?;

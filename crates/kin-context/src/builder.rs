@@ -1152,6 +1152,7 @@ mod tests {
                     new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .expect("test fixture admission must use the repository tree transaction");
         artifact_id
@@ -1873,6 +1874,7 @@ mod tests {
                     ),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
 
