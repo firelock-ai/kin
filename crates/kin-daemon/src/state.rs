@@ -3018,12 +3018,27 @@ impl DaemonState {
     /// Returns the cached graph if already loaded, otherwise loads from
     /// the storage backend and caches it. Only usable when a storage
     /// backend is configured (cloud / multi-repo mode).
+    ///
+    /// Three outcomes leave here and they are all typed, so a caller routes on
+    /// what happened rather than on how it was worded. An id outside the
+    /// configured key space is [`DaemonError::RepoNotServed`], decided before
+    /// any load. A key space that admits the id but a backend holding nothing
+    /// under it is [`DaemonError::RepoAbsentFromStorage`]. Anything else is a
+    /// genuine fault carrying its underlying error.
+    ///
+    /// The refusal used to flatten into
+    /// [`Graph`](DaemonError::Graph)`(StorageError(..))`, which made an
+    /// addressing answer indistinguishable from a storage failure at every
+    /// route that did not pre-empt it with [`Self::serves_repo_id`], and left
+    /// the ingest path reporting a request sent to the wrong pod as a broken
+    /// daemon.
     pub async fn get_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
         if let Some(allowed_repo_ids) = &self.allowed_repo_ids {
             if !allowed_repo_ids.contains(repo_id) {
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!("repo '{}' is not configured for this daemon", repo_id),
-                )));
+                return Err(DaemonError::RepoNotServed {
+                    served: self.cached_repo_id.clone(),
+                    requested: repo_id.to_string(),
+                });
             }
         }
         // Fast path: check if already loaded.

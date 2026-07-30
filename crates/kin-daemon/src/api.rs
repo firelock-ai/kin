@@ -6825,9 +6825,37 @@ async fn repo_scoped_graph(
             ),
         ));
     }
-    match state.get_repo_graph(repo_id).await {
-        Ok(graph) => Ok(graph),
-        Err(crate::error::DaemonError::RepoAbsentFromStorage(absent)) => Err((
+    state
+        .get_repo_graph(repo_id)
+        .await
+        .map_err(|error| repo_addressed_error(state, error))
+}
+
+/// Classify a repository-addressed [`DaemonError`] into an HTTP answer.
+///
+/// Every route that resolves a repository by id owes the caller the same three
+/// answers, so they are decided once here rather than re-decided per route. An
+/// id outside the served key space and a served id storage holds nothing for
+/// are both "not here" and answer 404 naming the served and the requested
+/// identity; everything else is a daemon that could not answer and keeps its
+/// underlying error behind a 500.
+///
+/// Sharing the classification is what keeps the surfaces consistent with each
+/// other. The spine ingest route used to flatten all three into a single 500,
+/// so a control plane posting to the wrong pod read an addressing refusal as an
+/// outage and retried something no retry could fix, while a `/repos/{repo_id}`
+/// route on that same daemon named the mismatch precisely.
+fn repo_addressed_error(
+    state: &DaemonState,
+    error: crate::error::DaemonError,
+) -> (StatusCode, String) {
+    match error {
+        // The refusal already carries both identities, so it is rendered from
+        // the error rather than rebuilt here: one sentence, one definition.
+        crate::error::DaemonError::RepoNotServed { .. } => {
+            (StatusCode::NOT_FOUND, error.to_string())
+        }
+        crate::error::DaemonError::RepoAbsentFromStorage(ref absent) => (
             StatusCode::NOT_FOUND,
             format!(
                 "this daemon serves repository {} and is configured for {absent}, \
@@ -6835,8 +6863,8 @@ async fn repo_scoped_graph(
                  GET /repos lists the repositories storage actually holds",
                 state.cached_repo_id
             ),
-        )),
-        Err(error) => Err(internal_error(error)),
+        ),
+        _ => internal_error(error),
     }
 }
 
@@ -8624,7 +8652,7 @@ async fn spine_ingest_repo(
     let outcome = state
         .ingest_repo_into_spine(&repo_id, body.refresh_cross_repo_edges)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| repo_addressed_error(&state, error))?;
 
     Ok(Json(json!({
         "repoId": outcome.repo_id,
