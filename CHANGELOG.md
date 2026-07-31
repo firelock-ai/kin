@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.3] - 2026-07-31
+## [0.4.4] - 2026-07-31
 
 v0.4.0 was never published. Its release commit was refused by the mint gate
 because the release rail read the repository merge policy through a token that
@@ -25,6 +25,17 @@ slice had already replaced, and that check runs only on the landing push, so no
 pull request could have caught it. This release aligns the assertion with the
 behavior that shipped and mirrors it into a job that runs before a change can
 land.
+
+v0.4.3 was never published either, and it is the first of these that reached its
+tag. What refused it was the Linux artifact build. Kin's Linux binaries link
+against musl so that one archive runs on every distribution, and the pinned
+graph engine published local directory namespaces through a rename entry point
+that the libc bindings declare only for glibc, so both Linux legs stopped at a
+compile error and the release published nothing. This release moves to a graph
+engine that performs the same no-replace publication through the raw kernel
+syscall on musl, and it compiles the release targets on every pull request so
+that a target the artifacts need can no longer break where only a tag can see
+it.
 
 ### Breaking
 
