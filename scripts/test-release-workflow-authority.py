@@ -29,6 +29,9 @@ RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
+PREPARE_RELEASE = ROOT / "scripts" / "prepare-release.mjs"
+# A repo-relative file path as the release generator writes it.
+GENERATED_PATH_LITERAL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*\.[A-Za-z0-9]+$")
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 ABANDONED_TAGS = ROOT / "scripts" / "abandoned-release-tags.json"
@@ -1779,6 +1782,63 @@ def assert_merge_policy_gate(release_train: str) -> None:
         )
 
 
+def release_branch_allowlist(release_train: str) -> str:
+    """Return the regex the train uses to admit its own generated branch."""
+
+    match = re.search(r"^\s*allowed='(?P<pattern>[^']+)'", release_train, re.M)
+    if match is None:
+        raise AssertionError(
+            "release train no longer carries the generated-path allowlist that "
+            "admits its own release branch"
+        )
+    return match.group("pattern")
+
+
+def prepared_release_paths(generator: str) -> set[str]:
+    """Return every repo path the release generator writes."""
+
+    bindings = dict(re.findall(r"const\s+(\w+)\s*=\s*'([^']+)'\s*;", generator))
+    paths: set[str] = set()
+    # Array literals of paths, which is how the npm manifests are carried.
+    for block in re.findall(r"const\s+\w+\s*=\s*\[([^\]]*)\]\s*;", generator):
+        for literal in re.findall(r"'([^']+)'", block):
+            if GENERATED_PATH_LITERAL.match(literal):
+                paths.add(literal)
+    # Direct writes, whether the destination is a literal or a bound constant.
+    for argument in re.findall(r"fs\.writeFile\(\s*([^,\s]+)\s*,", generator):
+        candidate = argument[1:-1] if argument.startswith("'") else bindings.get(argument)
+        if candidate and GENERATED_PATH_LITERAL.match(candidate):
+            paths.add(candidate)
+    return paths
+
+
+def assert_release_branch_allowlist_covers_generator(release_train: str) -> None:
+    """The train must admit every path its own generator writes.
+
+    These two drifted apart once already: the generator learned to bump a
+    second lockfile and the allowlist did not, so the train refused the branch
+    it had just written and no release could be prepared at all. Neither side
+    is authority over the other, so the gate is that they agree.
+    """
+
+    allowed = re.compile(release_branch_allowlist(release_train))
+    generated = prepared_release_paths(
+        PREPARE_RELEASE.read_text(encoding="utf-8")
+    )
+    if not generated:
+        raise AssertionError(
+            "no generated release path could be resolved from "
+            "prepare-release.mjs, so this cross-check proves nothing"
+        )
+    refused = sorted(path for path in generated if not allowed.match(path))
+    if refused:
+        raise AssertionError(
+            "the release branch guard refuses paths the release generator "
+            "writes, so the train cannot open the bump it just prepared: "
+            f"{', '.join(refused)}"
+        )
+
+
 def release_check_gate_source(release_tag: str) -> str:
     """Extract the exact Python gate executed by the release-tag workflow."""
 
@@ -2983,6 +3043,7 @@ def main() -> None:
     ):
         require(release_train, policy, "coalescing protected release train")
     assert_merge_policy_gate(release_train)
+    assert_release_branch_allowlist_covers_generator(release_train)
     assert_abandoned_tag_admission(release_tag, release_train)
     # The release bump must never be resolvable from anything a merged pull
     # request can still change.
