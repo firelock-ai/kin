@@ -2125,23 +2125,40 @@ def assert_admission_step_order(
 
 
 def selector_invocation(workflow: str, content: str) -> tuple[str, ...]:
-    """Return the exact argument list a workflow hands the admission selector."""
+    """Return the exact argument list a workflow hands the admission selector.
 
-    anchor = 'python3 "$selector" \\\n'
-    if anchor not in content:
+    Every invocation is read, not the first. A second one is what would defeat
+    this pin: it can re-run the selector with any argument at all and overwrite
+    the file the workflow then adopts as the highest admissible tag, so pinning
+    only the first would leave the guard describing bytes that no longer decide
+    the outcome.
+    """
+
+    anchor = 'python3 "$selector"'
+    invocations: list[tuple[str, ...]] = []
+    for match in re.finditer(re.escape(anchor), content):
+        tail = content[match.end() :]
+        if not tail.startswith(" \\\n"):
+            raise AssertionError(
+                f"{workflow} invokes the admission selector without a "
+                "reviewable multi-line argument list"
+            )
+        arguments: list[str] = []
+        for line in tail[len(" \\\n") :].splitlines():
+            argument = line.strip()
+            if argument.endswith("\\"):
+                arguments.append(argument[:-1].strip())
+                continue
+            arguments.append(argument)
+            break
+        invocations.append(tuple(arguments))
+    if len(invocations) != 1:
         raise AssertionError(
-            f"{workflow} no longer invokes the admission selector as a "
-            "reviewable multi-line argument list"
+            f"{workflow} must invoke the admission selector exactly once, so "
+            "one reviewed argument list decides the highest admissible tag: "
+            f"found {len(invocations)}"
         )
-    arguments: list[str] = []
-    for line in content[content.index(anchor) + len(anchor) :].splitlines():
-        argument = line.strip()
-        if argument.endswith("\\"):
-            arguments.append(argument[:-1].strip())
-            continue
-        arguments.append(argument)
-        break
-    return tuple(arguments)
+    return invocations[0]
 
 
 def assert_selector_arguments(release_tag: str, release_train: str) -> None:
@@ -2870,6 +2887,15 @@ def main() -> None:
         "organization-level copy visible",
         "gh api --method POST repos/firelock-ai/kin/dispatches --input -",
         '{event_type:"release_tag",client_payload:{tag:$tag,sha:$sha}}',
+        # The abandonment operating rule has to live where an operator editing
+        # the record will read it. JSON carries no comments, so the record file
+        # itself cannot hold it, and a Python module docstring is not where the
+        # person writing an entry is looking.
+        "## Abandoning a release tag",
+        "record the abandonment and leave the tag in place",
+        "The only exit from that state is a hand-landed version bump",
+        "a tag that has since moved refuses loudly",
+        "fails the rail closed rather",
     ):
         require(
             release_bot_doc,

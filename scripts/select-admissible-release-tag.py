@@ -27,9 +27,11 @@ the repository. The mint-intent refusal below still applies, because it reads th
 record rather than the listing: a version declared abandoned stays refused even
 if its tag is removed, which is the point. Deleting an abandoned tag while the
 workspace version still equals it therefore leaves the version itself burned and
-no tag to advance past, and the only way out is the version bump that drift
-resolution proposes. Record the abandonment and leave the tag in place unless a
-bump is landing with it.
+no tag to advance past. Nothing automatic recovers from there: the mint refuses
+the burned version, and drift resolution defers rather than proposing a bump,
+because it finds no base tag to measure from and hands the transition to the
+mint that is refusing. The version bump has to be landed by hand. Record the
+abandonment and leave the tag in place unless a bump is landing with it.
 
 Usage:
   select-admissible-release-tag.py MANIFEST CANDIDATES MINTING_TAG OUTPUT
