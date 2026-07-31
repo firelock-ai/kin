@@ -111,6 +111,10 @@ jobs:
             exit 1
           fi
           merge_policy="$(GH_TOKEN="$MERGE_POLICY_TOKEN" gh api "repos/${REPO}")"
+          if ! jq -e 'type == "object"' <<< "$merge_policy" > /dev/null; then
+            echo "::error::repository merge policy response was not a JSON object, so the policy was never read"
+            exit 1
+          fi
           absent="$(jq -r '
             . as $repo
             | [

@@ -1559,42 +1559,79 @@ def assert_rust_cache_steps(workflows: dict[Path, str]) -> None:
 def release_train_merge_policy_source(release_train: str) -> str:
     """Extract the exact merge-policy gate executed by the release train."""
 
-    step_start = release_train.index(
-        "      - name: Resolve releasable drift and SemVer intent"
-    )
+    step_anchor = "      - name: Resolve releasable drift and SemVer intent"
+    if step_anchor not in release_train:
+        raise AssertionError(
+            "release train no longer carries the step that owns the "
+            f"merge-policy gate: {step_anchor.strip()}"
+        )
+    step_start = release_train.index(step_anchor)
+    if "\n      - name:" not in release_train[step_start + 1 :]:
+        raise AssertionError(
+            "release train merge-policy step is no longer followed by another "
+            "step, so its boundary cannot be resolved"
+        )
     step_end = release_train.index("\n      - name:", step_start + 1)
     step = release_train[step_start:step_end]
-    source_start = step.index('          if [ -z "$MERGE_POLICY_TOKEN" ]; then')
-    source_end = step.index("\n          git fetch origin", source_start)
+    open_anchor = '          if [ -z "$MERGE_POLICY_TOKEN" ]; then'
+    if open_anchor not in step:
+        raise AssertionError(
+            "release train merge-policy gate no longer opens with its "
+            "installation-token guard, so the executed gate cannot be extracted"
+        )
+    source_start = step.index(open_anchor)
+    close_anchor = "\n          git fetch origin"
+    if close_anchor not in step[source_start:]:
+        raise AssertionError(
+            "release train merge-policy gate no longer ends before the origin "
+            "fetch, so the executed gate cannot be extracted"
+        )
+    source_end = step.index(close_anchor, source_start)
     return textwrap.dedent(step[source_start:source_end])
 
 
 def execute_merge_policy_gate(
     source: str,
-    repository: dict[str, object],
+    repository: dict[str, object] | None,
     *,
     token: str = "fixture-installation-token",
+    raw: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute the real merge-policy gate against a fixture API response."""
 
+    if (repository is None) == (raw is None):
+        raise AssertionError(
+            "merge-policy fixture needs exactly one of a repository object or "
+            "a raw response body"
+        )
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         gate = root / "merge-policy-gate.sh"
         gate.write_text(source, encoding="utf-8")
         fixture = root / "repository.json"
-        fixture.write_text(json.dumps(repository), encoding="utf-8")
+        fixture.write_text(
+            json.dumps(repository) if raw is None else raw, encoding="utf-8"
+        )
         binaries = root / "bin"
         binaries.mkdir()
         shim = binaries / "gh"
         shim.write_text(
-            '#!/usr/bin/env bash\nset -euo pipefail\ncat "$MERGE_POLICY_FIXTURE"\n',
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [ "${GH_TOKEN:-}" != "$MERGE_POLICY_EXPECTED_TOKEN" ]; then\n'
+            '  echo "policy read presented the wrong token" >&2\n'
+            "  exit 77\n"
+            "fi\n"
+            'cat "$MERGE_POLICY_FIXTURE"\n',
             encoding="utf-8",
         )
         shim.chmod(0o755)
         environment = dict(os.environ)
+        environment.pop("GH_TOKEN", None)
         environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
         environment["MERGE_POLICY_FIXTURE"] = str(fixture)
         environment["MERGE_POLICY_TOKEN"] = token
+        environment["MERGE_POLICY_EXPECTED_TOKEN"] = token
         environment["REPO"] = "firelock-ai/kin"
         return subprocess.run(
             ["bash", "-euo", "pipefail", str(gate)],
@@ -1622,6 +1659,33 @@ def assert_merge_policy_gate(release_train: str) -> None:
             "release train merge-policy gate refused the enforced squash "
             f"policy: {accepted.stdout}{accepted.stderr}"
         )
+
+    # Both refusals below read the emptiness of a jq result, and jq emits
+    # nothing at all for a body that is not a JSON object, so a gate that
+    # judged only those results would pass having read no policy whatsoever.
+    for label, body in (
+        ("an empty", ""),
+        ("a whitespace-only", "   \n"),
+        ("a JSON array", "[]"),
+        ("a bare JSON string", '"not-an-object"'),
+    ):
+        unread = execute_merge_policy_gate(gate, None, raw=body)
+        if unread.returncode == 0:
+            raise AssertionError(
+                f"release train merge-policy gate accepted {label} API "
+                "response, so it passed without reading any policy"
+            )
+        if "was not a JSON object" not in unread.stdout:
+            raise AssertionError(
+                f"release train merge-policy gate must refuse {label} API "
+                f"response by naming the response shape: "
+                f"{unread.stdout}{unread.stderr}"
+            )
+        if "immutable PR-body release intent" in unread.stdout:
+            raise AssertionError(
+                "release train merge-policy gate blamed the repository "
+                f"settings for {label} response it could not read"
+            )
 
     # A response carrying none of the policy fields is exactly what a token
     # without push-level repository access receives. It cannot disprove the
@@ -2298,6 +2362,7 @@ def main() -> None:
         "MERGE_POLICY_TOKEN: ${{ steps.app-token.outputs.token }}",
         'GH_TOKEN="$MERGE_POLICY_TOKEN" gh api "repos/${REPO}"',
         "absent from the API response",
+        "repository merge policy response was not a JSON object",
     ):
         require(release_train, policy, "coalescing protected release train")
     assert_merge_policy_gate(release_train)
