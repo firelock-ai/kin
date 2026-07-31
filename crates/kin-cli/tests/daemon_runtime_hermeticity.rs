@@ -15,28 +15,7 @@ use tempfile::tempdir;
 mod common;
 
 use common::Command;
-
-struct EnvGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
+use kin_core::test_env::EnvVarGuard;
 
 struct KillAndReapChild {
     child: Child,
@@ -219,12 +198,13 @@ fn generic_authority_worker() {
 fn generic_command_scrubs_ambient_and_command_local_authority() {
     let root = tempdir().expect("temp root");
     let marker = root.path().join("generic-authority.marker");
-    let _ambient_git = EnvGuard::set("GIT_DIR", std::ffi::OsStr::new("/ambient/git"));
-    let _ambient_kin = EnvGuard::set(
+    let _ambient_git = EnvVarGuard::set("GIT_DIR", std::ffi::OsStr::new("/ambient/git"));
+    let _ambient_kin = EnvVarGuard::set(
         "KIN_GCS_BUCKET",
         std::ffi::OsStr::new("ambient-production-bucket"),
     );
-    let _ambient_loader = EnvGuard::set("LD_AUDIT", std::ffi::OsStr::new("/ambient/libaudit.so"));
+    let _ambient_loader =
+        EnvVarGuard::set("LD_AUDIT", std::ffi::OsStr::new("/ambient/libaudit.so"));
 
     let output = Command::new(std::env::current_exe().expect("current test executable"))
         .args(["--exact", "generic_authority_worker", "--nocapture"])
@@ -330,10 +310,10 @@ fn isolated_runtime_lifecycle_does_not_claim_product_control_state() {
     let root = tempdir().expect("temp root");
     let repository = root.path().join("repository");
     std::fs::create_dir_all(&repository).expect("create fresh repository");
-    let _git_dir = EnvGuard::set("GIT_DIR", std::ffi::OsStr::new("/hostile/git-dir"));
-    let _git_config_count = EnvGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
-    let _git_default_hash = EnvGuard::set("GIT_DEFAULT_HASH", std::ffi::OsStr::new("sha256"));
-    let _ld_custom = EnvGuard::set(
+    let _git_dir = EnvVarGuard::set("GIT_DIR", std::ffi::OsStr::new("/hostile/git-dir"));
+    let _git_config_count = EnvVarGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
+    let _git_default_hash = EnvVarGuard::set("GIT_DEFAULT_HASH", std::ffi::OsStr::new("sha256"));
+    let _ld_custom = EnvVarGuard::set(
         "LD_CUSTOM_INJECTION",
         std::ffi::OsStr::new("/hostile/custom-loader"),
     );
@@ -367,16 +347,16 @@ fn runtime_command_rebinds_git_and_kin_authority_at_launch() {
     let root = tempdir().expect("temp root");
     let repository = root.path().join("repository");
     std::fs::create_dir_all(repository.join(".kin")).expect("create Kin control dir");
-    let _ambient_git = EnvGuard::set("GIT_DIR", std::ffi::OsStr::new("/ambient/git"));
+    let _ambient_git = EnvVarGuard::set("GIT_DIR", std::ffi::OsStr::new("/ambient/git"));
     let _ambient_worktree =
-        EnvGuard::set("GIT_WORK_TREE", std::ffi::OsStr::new("/ambient/worktree"));
-    let _ambient_config = EnvGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
-    let _ambient_ceiling = EnvGuard::set(
+        EnvVarGuard::set("GIT_WORK_TREE", std::ffi::OsStr::new("/ambient/worktree"));
+    let _ambient_config = EnvVarGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
+    let _ambient_ceiling = EnvVarGuard::set(
         "GIT_CEILING_DIRECTORIES",
         std::ffi::OsStr::new("/ambient/ceiling"),
     );
     let _ambient_discovery =
-        EnvGuard::set("GIT_DISCOVERY_ACROSS_FILESYSTEM", std::ffi::OsStr::new("0"));
+        EnvVarGuard::set("GIT_DISCOVERY_ACROSS_FILESYSTEM", std::ffi::OsStr::new("0"));
     let runtime = common::IsolatedDaemonRuntime::with_cleanup_command_for_test(
         &repository,
         std::env::current_exe().expect("current test executable"),
@@ -530,62 +510,65 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
 
     // These values model a developer shell already bound to real runtime and
     // VFS authority. The fixture launcher must remove them from every child.
-    let _home = EnvGuard::set("HOME", sentinel_home.as_os_str());
-    let _registry = EnvGuard::set("KIN_REGISTRY_PATH", sentinel_registry.as_os_str());
-    let _daemon_url = EnvGuard::set("KIN_DAEMON_URL", std::ffi::OsStr::new("http://127.0.0.1:9"));
-    let _supervisor_url = EnvGuard::set(
+    let _home = EnvVarGuard::set("HOME", sentinel_home.as_os_str());
+    let _registry = EnvVarGuard::set("KIN_REGISTRY_PATH", sentinel_registry.as_os_str());
+    let _daemon_url =
+        EnvVarGuard::set("KIN_DAEMON_URL", std::ffi::OsStr::new("http://127.0.0.1:9"));
+    let _supervisor_url = EnvVarGuard::set(
         "KIN_SUPERVISOR_URL",
         std::ffi::OsStr::new("http://127.0.0.1:9"),
     );
     let _daemon_bind_host =
-        EnvGuard::set("KIN_DAEMON_BIND_HOST", std::ffi::OsStr::new("192.0.2.1"));
-    let _daemon_auth = EnvGuard::set(
+        EnvVarGuard::set("KIN_DAEMON_BIND_HOST", std::ffi::OsStr::new("192.0.2.1"));
+    let _daemon_auth = EnvVarGuard::set(
         "KIN_DAEMON_AUTH_TOKEN",
         std::ffi::OsStr::new("ambient-token"),
     );
     let _daemon_require_token =
-        EnvGuard::set("KIN_DAEMON_REQUIRE_TOKEN", std::ffi::OsStr::new("true"));
-    let _supervisor_bind_host = EnvGuard::set(
+        EnvVarGuard::set("KIN_DAEMON_REQUIRE_TOKEN", std::ffi::OsStr::new("true"));
+    let _supervisor_bind_host = EnvVarGuard::set(
         "KIN_SUPERVISOR_BIND_HOST",
         std::ffi::OsStr::new("192.0.2.1"),
     );
-    let _supervisor_auth = EnvGuard::set(
+    let _supervisor_auth = EnvVarGuard::set(
         "KIN_SUPERVISOR_AUTH_TOKEN",
         std::ffi::OsStr::new("ambient-token"),
     );
     let _supervisor_require_token =
-        EnvGuard::set("KIN_SUPERVISOR_REQUIRE_TOKEN", std::ffi::OsStr::new("true"));
-    let _vfs_workspace = EnvGuard::set("KIN_VFS_WORKSPACE", sentinel_home.as_os_str());
-    let _storage = EnvGuard::set("KIN_STORAGE", std::ffi::OsStr::new("gcs"));
-    let _gcs_bucket = EnvGuard::set(
+        EnvVarGuard::set("KIN_SUPERVISOR_REQUIRE_TOKEN", std::ffi::OsStr::new("true"));
+    let _vfs_workspace = EnvVarGuard::set("KIN_VFS_WORKSPACE", sentinel_home.as_os_str());
+    let _storage = EnvVarGuard::set("KIN_STORAGE", std::ffi::OsStr::new("gcs"));
+    let _gcs_bucket = EnvVarGuard::set(
         "KIN_GCS_BUCKET",
         std::ffi::OsStr::new("must-never-be-contacted"),
     );
-    let _gcs_prefix = EnvGuard::set("KIN_GCS_PREFIX", std::ffi::OsStr::new("hostile-prefix"));
-    let _unknown_kin = EnvGuard::set(
+    let _gcs_prefix = EnvVarGuard::set("KIN_GCS_PREFIX", std::ffi::OsStr::new("hostile-prefix"));
+    let _unknown_kin = EnvVarGuard::set(
         "KIN_TEST_HOSTILE_UNKNOWN_AUTHORITY",
         std::ffi::OsStr::new("must-be-scrubbed"),
     );
-    let _git_dir = EnvGuard::set("GIT_DIR", std::ffi::OsStr::new("/hostile/git-dir"));
-    let _git_config_count = EnvGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
-    let _git_config_key = EnvGuard::set("GIT_CONFIG_KEY_0", std::ffi::OsStr::new("core.hooksPath"));
+    let _git_dir = EnvVarGuard::set("GIT_DIR", std::ffi::OsStr::new("/hostile/git-dir"));
+    let _git_config_count = EnvVarGuard::set("GIT_CONFIG_COUNT", std::ffi::OsStr::new("1"));
+    let _git_config_key =
+        EnvVarGuard::set("GIT_CONFIG_KEY_0", std::ffi::OsStr::new("core.hooksPath"));
     let _git_config_value =
-        EnvGuard::set("GIT_CONFIG_VALUE_0", std::ffi::OsStr::new("/hostile/hooks"));
-    let _git_default_hash = EnvGuard::set("GIT_DEFAULT_HASH", std::ffi::OsStr::new("sha256"));
-    let _dyld = EnvGuard::set(
+        EnvVarGuard::set("GIT_CONFIG_VALUE_0", std::ffi::OsStr::new("/hostile/hooks"));
+    let _git_default_hash = EnvVarGuard::set("GIT_DEFAULT_HASH", std::ffi::OsStr::new("sha256"));
+    let _dyld = EnvVarGuard::set(
         "DYLD_INSERT_LIBRARIES",
         std::ffi::OsStr::new("/hostile/libkin_vfs.dylib"),
     );
     let _dyld_library_path =
-        EnvGuard::set("DYLD_LIBRARY_PATH", std::ffi::OsStr::new("/hostile/dyld"));
-    let _ld_preload = EnvGuard::set("LD_PRELOAD", std::ffi::OsStr::new("/hostile/libkin_vfs.so"));
-    let _ld_audit = EnvGuard::set("LD_AUDIT", std::ffi::OsStr::new("/hostile/libaudit.so"));
-    let _ld_library_path = EnvGuard::set("LD_LIBRARY_PATH", std::ffi::OsStr::new("/hostile/ld"));
-    let _ld_custom = EnvGuard::set(
+        EnvVarGuard::set("DYLD_LIBRARY_PATH", std::ffi::OsStr::new("/hostile/dyld"));
+    let _ld_preload =
+        EnvVarGuard::set("LD_PRELOAD", std::ffi::OsStr::new("/hostile/libkin_vfs.so"));
+    let _ld_audit = EnvVarGuard::set("LD_AUDIT", std::ffi::OsStr::new("/hostile/libaudit.so"));
+    let _ld_library_path = EnvVarGuard::set("LD_LIBRARY_PATH", std::ffi::OsStr::new("/hostile/ld"));
+    let _ld_custom = EnvVarGuard::set(
         "LD_CUSTOM_INJECTION",
         std::ffi::OsStr::new("/hostile/custom-loader"),
     );
-    let _last_vfs_dir = EnvGuard::set(
+    let _last_vfs_dir = EnvVarGuard::set(
         "_KIN_VFS_LAST_DIR",
         std::ffi::OsStr::new("/hostile/workspace/src"),
     );

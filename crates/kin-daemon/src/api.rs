@@ -11060,7 +11060,7 @@ mod tests {
             path
         });
 
-        std::env::set_var("KIN_REGISTRY_PATH", path);
+        kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
     }
 
     #[test]
@@ -17970,7 +17970,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        let _daemon_url =
+            kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
 
         let projection =
             kin_cli::commands::session_run::materialize(state.layout.clone(), None, None)
@@ -18106,7 +18107,6 @@ mod tests {
             .artifact_at_path(&RepoPath::from_utf8("partial.txt").unwrap())
             .is_none());
 
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
@@ -18135,20 +18135,22 @@ mod tests {
         /// A guard puts them back even when an assertion unwinds.
         struct ProcessScope {
             working_dir: PathBuf,
-            path: Option<std::ffi::OsString>,
+            _search_path: kin_core::test_env::EnvVarGuard,
         }
 
         impl ProcessScope {
             fn enter(working_dir: &FsPath, editor_dir: &FsPath) -> Self {
+                let mut search = vec![editor_dir.to_path_buf()];
+                if let Some(existing) = std::env::var_os("PATH") {
+                    search.extend(std::env::split_paths(&existing));
+                }
                 let scope = Self {
                     working_dir: std::env::current_dir().unwrap(),
-                    path: std::env::var_os("PATH"),
+                    _search_path: kin_core::test_env::EnvVarGuard::set(
+                        "PATH",
+                        std::env::join_paths(search).unwrap(),
+                    ),
                 };
-                let mut search = vec![editor_dir.to_path_buf()];
-                if let Some(existing) = scope.path.as_ref() {
-                    search.extend(std::env::split_paths(existing));
-                }
-                std::env::set_var("PATH", std::env::join_paths(search).unwrap());
                 std::env::set_current_dir(working_dir).unwrap();
                 scope
             }
@@ -18157,10 +18159,6 @@ mod tests {
         impl Drop for ProcessScope {
             fn drop(&mut self) {
                 let _ = std::env::set_current_dir(&self.working_dir);
-                match self.path.take() {
-                    Some(path) => std::env::set_var("PATH", path),
-                    None => std::env::remove_var("PATH"),
-                }
             }
         }
 
@@ -18186,7 +18184,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        let _daemon_url =
+            kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
 
         // `kin open` launches an allowlisted editor by name, so the stand-in
         // has to be reachable exactly the way the real one is.
@@ -18262,7 +18261,6 @@ mod tests {
             "the delta the editor left must reach repository authority"
         );
 
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
@@ -18369,7 +18367,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        let _daemon_url =
+            kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
 
         let mut projection =
             kin_cli::commands::session_run::materialize(state.layout.clone(), None, None)
@@ -18433,7 +18432,6 @@ mod tests {
             "closing a session releases its lease"
         );
 
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
@@ -21763,7 +21761,7 @@ mod tests {
             let _ = axum::serve(listener, router(state)).await;
         });
         let base = format!("http://{addr}");
-        std::env::set_var("KIN_DAEMON_URL", &base);
+        let mut daemon_url = kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", &base);
 
         let run_task_str = run_task_id.to_string();
         let do_work_str = do_work_id.to_string();
@@ -21890,7 +21888,7 @@ mod tests {
         // The agent-facing production route must project that real incoming
         // edge without looping back through KIN_DAEMON_URL. A foreign request
         // argument must not override DaemonState's repo binding.
-        std::env::remove_var("KIN_DAEMON_URL");
+        daemon_url.apply::<_, &str>("KIN_DAEMON_URL", None);
         let result: kin_mcp::ToolCallResult = http
             .post(format!("{base}/mcp/tools/call"))
             .json(&serde_json::json!({
@@ -21931,7 +21929,6 @@ mod tests {
             })
         }));
 
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
@@ -22268,7 +22265,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, Router::new().fallback(always_unavailable)).await;
         });
-        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+        let _daemon_url =
+            kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_URL", format!("http://{addr}"));
 
         let layout = test_state().layout.clone();
         let repo = "consumer";
@@ -22312,12 +22310,18 @@ mod tests {
             other => panic!("MCP impact must be Unavailable on 503, got {other:?}"),
         }
 
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
+    /// Names its repository and spine endpoint by argument on purpose. An
+    /// earlier version set `KIN_REPO_ID` and `KIN_DAEMON_URL`, which are
+    /// process-global, and under `cargo test` this binary's ~600 tests are
+    /// threads in one process, so every test that opened a daemon state while
+    /// this one held `KIN_REPO_ID=provider` was refused against its own
+    /// manifest authority. `#[serial]` cannot prevent that: it orders a test
+    /// only against other serial tests. Under nextest, which gives each test
+    /// its own process, the defect is structurally invisible.
     #[tokio::test]
-    #[serial_test::serial]
     async fn mcp_find_references_reports_legacy_xref_payload_as_unavailable() {
         async fn legacy_xref() -> Json<serde_json::Value> {
             Json(serde_json::json!({
@@ -22336,8 +22340,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
         });
-        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
-        std::env::set_var("KIN_REPO_ID", "provider");
+        let binding = kin_mcp::handlers::entities::AmbientCrossRepoBinding::new(
+            Some("provider"),
+            Some(&format!("http://{addr}")),
+        );
 
         let target = test_entity("do_work", "src/lib.rs");
         let graph = kin_db::InMemoryGraph::new();
@@ -22346,9 +22352,11 @@ mod tests {
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
-            .await
-            .unwrap();
+        let result = kin_mcp::handlers::entities::handle_find_references_with_ambient_binding(
+            &args, &graph, binding, None,
+        )
+        .await
+        .unwrap();
         let kin_mcp::types::ContentBlock::Text { text } = result
             .content
             .first()
@@ -22360,13 +22368,12 @@ mod tests {
             .is_some_and(|reason| reason.contains("malformed spine xref response")));
         assert_eq!(body["total_upstream"], 0);
 
-        std::env::remove_var("KIN_REPO_ID");
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
+    /// Names its binding by argument for the reason given on
+    /// `mcp_find_references_reports_legacy_xref_payload_as_unavailable`.
     #[tokio::test]
-    #[serial_test::serial]
     async fn mcp_find_references_rejects_unanchored_xref_as_inconclusive() {
         async fn legacy_xref() -> Json<serde_json::Value> {
             Json(serde_json::json!({
@@ -22380,8 +22387,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, Router::new().fallback(legacy_xref)).await;
         });
-        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
-        std::env::set_var("KIN_REPO_ID", "provider");
+        let binding = kin_mcp::handlers::entities::AmbientCrossRepoBinding::new(
+            Some("provider"),
+            Some(&format!("http://{addr}")),
+        );
 
         let target = test_entity("do_work", "src/lib.rs");
         let graph = kin_db::InMemoryGraph::new();
@@ -22390,9 +22399,11 @@ mod tests {
             "entity_id".to_string(),
             serde_json::json!(target.id.to_string()),
         )]);
-        let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
-            .await
-            .unwrap();
+        let result = kin_mcp::handlers::entities::handle_find_references_with_ambient_binding(
+            &args, &graph, binding, None,
+        )
+        .await
+        .unwrap();
         let result = kin_mcp::finalize_with_envelope(
             result,
             kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
@@ -22416,13 +22427,12 @@ mod tests {
             .as_str()
             .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
 
-        std::env::remove_var("KIN_REPO_ID");
-        std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
     }
 
+    /// Names its binding by argument for the reason given on
+    /// `mcp_find_references_reports_legacy_xref_payload_as_unavailable`.
     #[tokio::test]
-    #[serial_test::serial]
     async fn mcp_find_references_requires_nonblank_repo_binding() {
         let target = test_entity("do_work", "src/lib.rs");
         let graph = kin_db::InMemoryGraph::new();
@@ -22433,13 +22443,12 @@ mod tests {
         )]);
 
         for repo_id in [None, Some("   ")] {
-            match repo_id {
-                Some(value) => std::env::set_var("KIN_REPO_ID", value),
-                None => std::env::remove_var("KIN_REPO_ID"),
-            }
-            let result = kin_mcp::handlers::entities::handle_find_references(&args, &graph, None)
-                .await
-                .unwrap();
+            let binding = kin_mcp::handlers::entities::AmbientCrossRepoBinding::new(repo_id, None);
+            let result = kin_mcp::handlers::entities::handle_find_references_with_ambient_binding(
+                &args, &graph, binding, None,
+            )
+            .await
+            .unwrap();
             let result = kin_mcp::finalize_with_envelope(
                 result,
                 kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
@@ -22463,8 +22472,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("cross_repo_unavailable")));
         }
-
-        std::env::remove_var("KIN_REPO_ID");
     }
 
     // -----------------------------------------------------------------------
@@ -22708,15 +22715,8 @@ mod tests {
     // is process-global and read by `router_with_auth` at construction, so the
     // env-touching publish test serializes on this `tokio::sync::Mutex` (held
     // across `.await`, so a std guard would trip `clippy::await_holding_lock`)
-    // and restores the var via `RegistryEnvGuard`.
+    // and restores the var through the shared test-env guard.
     static REGISTRY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    struct RegistryEnvGuard(&'static str);
-    impl Drop for RegistryEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
 
     /// Build a minimal valid `.crate` blob (gzip-tar containing
     /// `{name}-{version}/Cargo.toml`) so the cargo publish path passes coordinate
@@ -22847,7 +22847,7 @@ mod tests {
 
         // (1) No KIN_REGISTRY_CARGO_TOKEN configured -> publish fails closed
         // (503) even with a daemon token set and a Bearer header present.
-        std::env::remove_var("KIN_REGISTRY_CARGO_TOKEN");
+        let mut cargo_token = kin_core::test_env::EnvVarGuard::unset("KIN_REGISTRY_CARGO_TOKEN");
         let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
         let disabled = app
             .oneshot(
@@ -22862,8 +22862,7 @@ mod tests {
 
         // (2) KIN_REGISTRY_CARGO_TOKEN configured: publish without the matching
         // bearer -> 401 (the daemon token does NOT satisfy the registry gate).
-        let _env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
-        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "cargo-secret");
+        cargo_token.apply("KIN_REGISTRY_CARGO_TOKEN", Some("cargo-secret"));
         let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
         let unauthorized = app
             .oneshot(
@@ -22893,9 +22892,9 @@ mod tests {
     async fn oci_writes_require_their_own_token_while_pulls_stay_public() {
         let _lock = REGISTRY_ENV_LOCK.lock().await;
 
-        std::env::remove_var("KIN_REGISTRY_OCI_WRITE_TOKEN");
-        let _cargo_env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
-        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "cargo-secret");
+        let mut registry_tokens =
+            kin_core::test_env::EnvVarGuard::unset("KIN_REGISTRY_OCI_WRITE_TOKEN")
+                .with("KIN_REGISTRY_CARGO_TOKEN", "cargo-secret");
         let disabled = router_with_auth(test_state(), Some("daemon-token".to_string()))
             .oneshot(
                 Request::post("/v2/demo/blobs/uploads/")
@@ -22907,8 +22906,7 @@ mod tests {
             .unwrap();
         assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let _oci_env = RegistryEnvGuard("KIN_REGISTRY_OCI_WRITE_TOKEN");
-        std::env::set_var("KIN_REGISTRY_OCI_WRITE_TOKEN", "registry-secret");
+        registry_tokens.apply("KIN_REGISTRY_OCI_WRITE_TOKEN", Some("registry-secret"));
         let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
 
         // The Cargo credential is deliberately not accepted on the OCI scope.
@@ -23414,8 +23412,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_serve_auth_token_gates_enforcement() {
         let _env = env_test_lock();
-        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
-        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
+        let mut tokens = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_AUTH_TOKEN")
+            .without("KIN_DAEMON_REQUIRE_TOKEN");
 
         let dir = std::env::temp_dir().join(format!("kin-daemon-serve-token-{}", Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".kin")).unwrap();
@@ -23432,30 +23430,27 @@ mod tests {
         // Escape hatch: an explicit falsy value opts back out of enforcement —
         // for a local client that cannot yet send the header — while the file
         // stays provisioned.
-        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "0");
+        tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("0"));
         assert!(resolve_serve_auth_token(&layout).is_none());
-        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "false");
+        tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("false"));
         assert!(resolve_serve_auth_token(&layout).is_none());
 
         // Explicit truthy values are equivalent to the default.
-        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "1");
+        tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("1"));
         assert_eq!(
             resolve_serve_auth_token(&layout).as_deref(),
             Some(provisioned.trim())
         );
-        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
+        tokens.apply::<_, &str>("KIN_DAEMON_REQUIRE_TOKEN", None);
 
         // An explicit KIN_DAEMON_AUTH_TOKEN override always wins over the gate,
         // even while the gate is opted out.
-        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "0");
-        std::env::set_var("KIN_DAEMON_AUTH_TOKEN", "explicit-override");
+        tokens.apply("KIN_DAEMON_REQUIRE_TOKEN", Some("0"));
+        tokens.apply("KIN_DAEMON_AUTH_TOKEN", Some("explicit-override"));
         assert_eq!(
             resolve_serve_auth_token(&layout).as_deref(),
             Some("explicit-override")
         );
-
-        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
-        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
     }
 
     /// Round-trip proof of the default-on posture through the real production
@@ -23468,8 +23463,8 @@ mod tests {
     #[tokio::test]
     async fn daemon_enforces_loopback_token_by_default_end_to_end() {
         let _env = env_test_lock();
-        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
-        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
+        let _tokens = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_AUTH_TOKEN")
+            .without("KIN_DAEMON_REQUIRE_TOKEN");
 
         let state = test_state();
         // Pre-provision deterministically so this test does not race the
@@ -23518,8 +23513,6 @@ mod tests {
         );
 
         server.abort();
-        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
-        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
     }
 
     #[tokio::test]

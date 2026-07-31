@@ -3272,13 +3272,13 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut driver = driver.spawn().unwrap();
-        wait_for_test_path(&report_path, Duration::from_secs(5));
-        wait_for_test_path(&stalled_path, Duration::from_secs(5));
-        let ids = std::fs::read_to_string(&report_path)
-            .unwrap()
-            .split_whitespace()
+        // Both fields, not merely the file: a partially written report reads
+        // back short and the parse below would fail on a loaded host.
+        let ids = wait_for_test_report_fields(&report_path, 2, Duration::from_secs(5))
+            .iter()
             .map(|value| value.parse::<libc::pid_t>().unwrap())
             .collect::<Vec<_>>();
+        wait_for_test_path(&stalled_path, Duration::from_secs(5));
         assert_eq!(ids.len(), 2, "malformed pre-exec stall report");
 
         driver.kill().unwrap();
@@ -3611,12 +3611,13 @@ mod tests {
             .stderr(Stdio::null());
         let mut relay = guardian.spawn(relay_command).unwrap();
         std::fs::write(&trigger_path, b"fork\n").unwrap();
-        wait_for_test_path(&report_path, Duration::from_secs(5));
-        let late_member_pid = std::fs::read_to_string(&report_path)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
+        // Wait for the field, not merely for the file. A report the worker has
+        // created but not yet written reads back empty, and on a loaded host the
+        // reader wins that race often enough to fail the suite.
+        let late_member_pid = wait_for_test_report_fields(&report_path, 1, Duration::from_secs(5))
+            [0]
+        .parse::<libc::pid_t>()
+        .unwrap();
 
         guardian.request_cleanup();
         let status = relay.wait().unwrap();
@@ -3666,12 +3667,13 @@ mod tests {
             .stderr(Stdio::null());
         let mut relay = guardian.spawn(relay_command).unwrap();
         std::fs::write(&trigger_path, b"fork\n").unwrap();
-        wait_for_test_path(&report_path, Duration::from_secs(5));
-        let late_member_pid = std::fs::read_to_string(&report_path)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
+        // Wait for the field, not merely for the file. A report the worker has
+        // created but not yet written reads back empty, and on a loaded host the
+        // reader wins that race often enough to fail the suite.
+        let late_member_pid = wait_for_test_report_fields(&report_path, 1, Duration::from_secs(5))
+            [0]
+        .parse::<libc::pid_t>()
+        .unwrap();
         assert!(relay.wait().unwrap().success());
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while unsafe { libc::getpgid(late_member_pid) } == target_group {
@@ -3889,13 +3891,14 @@ mod tests {
         let mut driver = driver.spawn().unwrap();
         let status = driver.wait().unwrap();
         assert!(status.success(), "owner-death driver failed: {status}");
-        wait_for_test_path(&report_path, Duration::from_secs(5));
-        let report = std::fs::read_to_string(&report_path).unwrap();
-        let pids = report
-            .split_whitespace()
+        // All three fields, not merely the file: a partially written report
+        // reads back short and the parse below would fail on a loaded host.
+        let fields = wait_for_test_report_fields(&report_path, 3, Duration::from_secs(5));
+        let pids = fields
+            .iter()
             .map(|value| value.parse::<libc::pid_t>().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(pids.len(), 3, "malformed owner-death report: {report:?}");
+        assert_eq!(pids.len(), 3, "malformed owner-death report: {fields:?}");
 
         wait_for_test_pid_gone(pids[0], Duration::from_secs(5));
         wait_for_test_pid_gone(pids[1], Duration::from_secs(5));

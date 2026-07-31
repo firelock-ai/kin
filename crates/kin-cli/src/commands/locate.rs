@@ -16882,7 +16882,7 @@ mod tests {
     #[test]
     fn entity_page_size_honors_env_override() {
         // Default when unset; floor of 1 when set to 0.
-        std::env::remove_var("KIN_LOCATE_ENTITY_CAP");
+        let _cap = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_ENTITY_CAP");
         assert_eq!(entity_page_size(), DEFAULT_ENTITY_PAGE_SIZE);
     }
 
@@ -17535,10 +17535,10 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
-        std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
-        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let _coverage =
+            kin_core::test_env::EnvVarGuard::set("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1")
+                .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
         let result = run_with_graph_capture(&graph, "handler failure", true, 10, true);
-        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
 
         let err = match result {
             Ok(_) => panic!("strict mode should reject incomplete embeddings"),
@@ -17559,11 +17559,11 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
-        std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
-        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let _coverage =
+            kin_core::test_env::EnvVarGuard::set("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1")
+                .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
         let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
             .expect("a vector-free build must still serve lexical and graph locate");
-        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
 
         let coverage = result
             .semantic_coverage
@@ -17591,8 +17591,8 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
-        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
-        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let _coverage = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
+            .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
         let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
             .expect("default locate must degrade gracefully, not error");
 
@@ -17618,8 +17618,8 @@ mod tests {
         // RRF ties on the rank term and breaks by name (the competitor sorts
         // first); a >1.0 embedding rank weight lifts the semantic-only gold above
         // its lexical peer — the buried-gold rank-lift lever.
-        let old_weight = std::env::var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT").ok();
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
+        let _weight =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
 
         let mut lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
         lists[8] = vec![("src/aaa_comp.rs".to_string(), 1.0)];
@@ -17632,12 +17632,6 @@ mod tests {
         weights[9] = 2.0;
         let weighted = reciprocal_rank_fusion_weighted(&lists, 60.0, &weights, &[]);
         let first_weighted = weighted.first().map(|(p, _)| p.as_str());
-
-        if let Some(val) = old_weight {
-            std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", val);
-        } else {
-            std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
-        }
 
         assert_eq!(
             first_unweighted,
@@ -17736,9 +17730,9 @@ mod tests {
         // The gated lever extends class-like head-truncation to any over-threshold
         // entity. Default OFF keeps the span byte-identical (no regression risk);
         // the precision↔recall trade is a ContextBench line-F1 call before flip.
-        std::env::remove_var("KIN_LOCATE_SPAN_FULL_EXTENT");
-        std::env::remove_var("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD");
-        std::env::remove_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
+        let mut span = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_SPAN_FULL_EXTENT")
+            .without("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD")
+            .without("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
 
         let mut coarse = test_entity("whole_module", "src/big.rs", 0, 1500);
         coarse.kind = EntityKind::File;
@@ -17749,9 +17743,9 @@ mod tests {
             "default OFF: a coarse File-kind entity emits its full extent (unchanged)"
         );
 
-        std::env::set_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", "1");
+        span.apply("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", Some("1"));
         let tightened = entity_span_pair(&coarse);
-        std::env::remove_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
+        span.apply::<_, &str>("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", None);
         assert_eq!(
             tightened,
             vec![[1, 5]],
@@ -18091,7 +18085,7 @@ mod tests {
     #[serial_test::serial]
     fn declaration_cutoff_env_gate_defaults_off_is_byte_identical() {
         use crate::retrieval_profile::RetrievalProfile;
-        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF");
+        let _cutoff = kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_DECLARATION_CUTOFF");
         // A decisive single-winner distribution the cutoff WOULD trim if enabled.
         let results = cutoff_list(&[10.0, 0.2, 0.1]);
         for profile in [RetrievalProfile::CompatV0, RetrievalProfile::AccuracyV1] {
@@ -18119,9 +18113,9 @@ mod tests {
     fn declaration_cutoff_env_override_forces_the_trim() {
         // The A/B path: an explicit env var wins over the (dark) profile default
         // and drives the trim, using the registered gap/min_keep defaults.
-        std::env::set_var("KIN_LOCATE_DECLARATION_CUTOFF", "1");
-        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF_GAP");
-        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP");
+        let _cutoff = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_DECLARATION_CUTOFF", "1")
+            .without("KIN_LOCATE_DECLARATION_CUTOFF_GAP")
+            .without("KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP");
         let enabled = locate_env_bool("KIN_LOCATE_DECLARATION_CUTOFF", false);
         assert!(
             enabled,
@@ -18131,7 +18125,6 @@ mod tests {
         let min_keep = locate_env_usize("KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP", 1);
         let results = cutoff_list(&[10.0, 0.2, 0.1]);
         assert_eq!(declaration_cutoff_len(&results, gap, min_keep), 1);
-        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF");
     }
 
     #[test]
@@ -21078,7 +21071,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rerank_semantic_phase_paths_leaves_phase_anchors_dark_by_default() {
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
         let mut fused = vec![
             ("src/libponyc/pass/expr.h".to_string(), 0.158),
             ("src/libponyc/expr/reference.c".to_string(), 0.123),
@@ -21118,7 +21112,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn semantic_phase_anchor_floors_dark_by_default_even_with_full_signal_support() {
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
         let source_files = HashSet::from([String::from("engine/pass/typecheck.rs")]);
         let all_hits = vec![HashMap::from([(
             "engine/pass/typecheck.rs".to_string(),
@@ -21140,7 +21135,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn semantic_phase_anchor_floors_ranks_signal_supported_bucket_files_when_enabled() {
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
 
         // A fictional, non-Pony corpus: the mechanism must work from bucket +
         // cross-signal support alone, not from any hardcoded name or path.
@@ -21210,14 +21206,13 @@ mod tests {
                 ("engine/expr/closure_capture.rs", 6.4),
             ],
         );
-
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
     }
 
     #[test]
     #[serial_test::serial]
     fn semantic_phase_anchor_floors_is_deterministic() {
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
         let source_files = HashSet::from([
             String::from("engine/pass/typecheck.rs"),
             String::from("engine/pass/lower.rs"),
@@ -21237,14 +21232,13 @@ mod tests {
             "identical inputs must yield identical output"
         );
         assert!(!first.is_empty());
-
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
     }
 
     #[test]
     #[serial_test::serial]
     fn semantic_phase_distractor_cap_dark_by_default_even_with_zero_signal_support() {
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::unset("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
 
         let cap = semantic_phase_distractor_cap(
             "Fix return checking in constructors.",
@@ -21258,7 +21252,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn semantic_phase_distractor_cap_caps_unsupported_bucket_files_when_enabled() {
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
 
         // A fictional, non-Pony corpus: the mechanism must work from bucket +
         // cross-signal support alone, not from any hardcoded name or path.
@@ -21343,14 +21338,13 @@ mod tests {
             None,
             "a lambda query must never cap the pass bucket"
         );
-
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
     }
 
     #[test]
     #[serial_test::serial]
     fn semantic_phase_distractor_cap_is_deterministic() {
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let _anchors =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![];
         let text = "Fix return checking in constructors with lambda captures.";
         let path = "engine/expr/closure.rs";
@@ -21362,8 +21356,6 @@ mod tests {
             "identical inputs must yield identical output"
         );
         assert!(first.is_some());
-
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
     }
 
     #[test]
@@ -22066,21 +22058,12 @@ mod tests {
             },
         )]);
 
-        let old_frontier = std::env::var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER").ok();
-        let old_graph_floor = std::env::var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR").ok();
-        std::env::set_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", "1");
-        std::env::set_var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", "0.25");
-        let result = resolve_entities_to_files(&seeds, &graph, true, "text");
-        if let Some(value) = old_frontier {
-            std::env::set_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", value);
-        } else {
-            std::env::remove_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER");
-        }
-        if let Some(value) = old_graph_floor {
-            std::env::set_var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", value);
-        } else {
-            std::env::remove_var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR");
-        }
+        let result = {
+            let _frontier =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", "1")
+                    .with("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", "0.25");
+            resolve_entities_to_files(&seeds, &graph, true, "text")
+        };
         let (resolved, _, _, _, candidate_stages) = result.unwrap();
 
         assert!(
@@ -23671,7 +23654,8 @@ mod tests {
         // Several files tie on the rank term (each appears once at rank 0 in a
         // distinct list with equal score). Fusing repeatedly must yield exactly
         // the same ordering every time.
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
+        let _weight =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
         let lists: Vec<Vec<(String, f32)>> = vec![
             vec![("src/d.rs".to_string(), 1.0)],
             vec![("src/a.rs".to_string(), 1.0)],
@@ -23686,7 +23670,6 @@ mod tests {
                 "RRF output must be byte-identical across runs"
             );
         }
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
         // All-tied scores: ordering must be the canonical path-ascending order.
         let order: Vec<&str> = first.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(order, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
@@ -23697,7 +23680,8 @@ mod tests {
         // The same tied candidates presented in different per-list orders (a
         // stand-in for HashMap iteration variance upstream) must fuse to the
         // same final ordering — the path tie-break, not arrival order, decides.
-        std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
+        let _weight =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
         let forward: Vec<Vec<(String, f32)>> = vec![vec![
             ("src/a.rs".to_string(), 5.0),
             ("src/b.rs".to_string(), 5.0),
@@ -23710,7 +23694,6 @@ mod tests {
         ]];
         let a = reciprocal_rank_fusion_weighted(&forward, 60.0, &[], &[]);
         let b = reciprocal_rank_fusion_weighted(&reversed, 60.0, &[], &[]);
-        std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
         // Same RANK positions tie within one list, so the rank term is equal for
         // all three; only the within-list rank differs. The fused set and its
         // tie-broken order must be stable regardless of how the list was ordered.

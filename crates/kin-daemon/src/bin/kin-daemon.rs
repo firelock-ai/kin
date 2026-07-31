@@ -613,13 +613,9 @@ mod tests {
     }
 
     fn with_repo_ids<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
-        match value {
-            Some(value) => env::set_var("KIN_REPO_IDS", value),
-            None => env::remove_var("KIN_REPO_IDS"),
-        }
-        let outcome = body();
-        env::remove_var("KIN_REPO_IDS");
-        outcome
+        let mut allowlist = kin_core::test_env::EnvVarGuard::new();
+        allowlist.apply("KIN_REPO_IDS", value);
+        body()
     }
 
     /// The identity a daemon advertises must be one it will route, in every

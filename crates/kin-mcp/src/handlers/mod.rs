@@ -163,6 +163,7 @@ mod tests {
     use super::common::*;
     use super::*;
     use base64::Engine as _;
+    use kin_core::test_env::EnvVarGuard;
     use kin_db::{InMemoryGraph, KinDbError, LocalFileBackend, RepositoryAuthorityManager};
     use kin_model::change::SemanticChange;
     use kin_model::entity::Entity;
@@ -4269,29 +4270,6 @@ mod tests {
             err.to_string().contains("missing payload"),
             "actionable stage-time message expected, got: {err}"
         );
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        old_val: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, val: &std::path::Path) -> Self {
-            let old_val = std::env::var_os(key);
-            std::env::set_var(key, val);
-            Self { key, old_val }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(ref val) = self.old_val {
-                std::env::set_var(self.key, val);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
     }
 
     use std::sync::{Mutex, OnceLock};

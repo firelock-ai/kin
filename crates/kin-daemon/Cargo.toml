@@ -85,6 +85,7 @@ kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 
 [dev-dependencies]
 base64 = "0.22"
+kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }
 http-body = "1"
 tempfile = { workspace = true }

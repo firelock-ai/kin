@@ -3295,7 +3295,7 @@ mod tests {
     #[test]
     fn supervisor_is_host_allowed_honors_bind_host_env() {
         let _env = env_test_lock();
-        std::env::remove_var("KIN_SUPERVISOR_BIND_HOST");
+        let mut bind_host = kin_core::test_env::EnvVarGuard::unset("KIN_SUPERVISOR_BIND_HOST");
 
         // Loopback always allowed; arbitrary hosts rejected by default.
         assert!(is_host_allowed("127.0.0.1"));
@@ -3305,15 +3305,13 @@ mod tests {
         assert!(!is_host_allowed("10.0.0.5"));
 
         // An explicit non-loopback bind host is allowed only for that host.
-        std::env::set_var("KIN_SUPERVISOR_BIND_HOST", "10.0.0.5");
+        bind_host.apply("KIN_SUPERVISOR_BIND_HOST", Some("10.0.0.5"));
         assert!(is_host_allowed("10.0.0.5"));
         assert!(!is_host_allowed("attacker.com"));
 
         // A wildcard bind allows any host (operator opted into exposure).
-        std::env::set_var("KIN_SUPERVISOR_BIND_HOST", "0.0.0.0");
+        bind_host.apply("KIN_SUPERVISOR_BIND_HOST", Some("0.0.0.0"));
         assert!(is_host_allowed("attacker.com"));
-
-        std::env::remove_var("KIN_SUPERVISOR_BIND_HOST");
     }
 
     #[test]
@@ -3327,8 +3325,8 @@ mod tests {
     #[tokio::test]
     async fn supervisor_loopback_token_provisioned_persisted_and_enforced() {
         let _env = env_test_lock();
-        std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
-        std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
+        let mut tokens = kin_core::test_env::EnvVarGuard::unset("KIN_SUPERVISOR_AUTH_TOKEN")
+            .without("KIN_SUPERVISOR_REQUIRE_TOKEN");
 
         // Hermetic per-test supervisor directory, passed explicitly to the token
         // helpers so the assertions never depend on the process-global
@@ -3359,21 +3357,18 @@ mod tests {
         assert!(resolve_serve_auth_token(&dir).is_none());
 
         // Opt-in via KIN_SUPERVISOR_REQUIRE_TOKEN returns the provisioned token.
-        std::env::set_var("KIN_SUPERVISOR_REQUIRE_TOKEN", "1");
+        tokens.apply("KIN_SUPERVISOR_REQUIRE_TOKEN", Some("1"));
         assert_eq!(
             resolve_serve_auth_token(&dir).as_deref(),
             Some(token.as_str())
         );
 
         // An explicit KIN_SUPERVISOR_AUTH_TOKEN override always wins.
-        std::env::set_var("KIN_SUPERVISOR_AUTH_TOKEN", "explicit-override");
+        tokens.apply("KIN_SUPERVISOR_AUTH_TOKEN", Some("explicit-override"));
         assert_eq!(
             resolve_serve_auth_token(&dir).as_deref(),
             Some("explicit-override")
         );
-
-        std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
-        std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
     }
 
     #[test]

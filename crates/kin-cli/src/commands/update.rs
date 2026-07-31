@@ -10107,30 +10107,8 @@ fn is_newer(latest: &str, current: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::commands::test_subprocess::{output_with_timeout, DEFAULT_TEST_SUBPROCESS_TIMEOUT};
+    use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
-    use std::ffi::{OsStr, OsString};
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value.as_ref());
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     fn test_subprocess_output(command: Command, label: &str) -> Result<std::process::Output> {
         output_with_timeout(command, label, DEFAULT_TEST_SUBPROCESS_TIMEOUT)
@@ -11321,8 +11299,8 @@ cwd = {:?}
         let stage = tmp.path().join("stage");
         let home = tmp.path().join("home");
         fs::create_dir(&home).unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", &custom_home);
-        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &custom_home);
+        let _home = EnvVarGuard::set("HOME", &home);
         let _cwd = CwdGuard::set(tmp.path());
         write_bundle(&custom_home, LINUX_COMPONENTS, b"old-");
 
@@ -11540,8 +11518,8 @@ cwd = {:?}
             let stage = tmp.path().join("stage");
             let home = tmp.path().join("home");
             fs::create_dir(&home).unwrap();
-            let _home = EnvGuard::set("HOME", &home);
-            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+            let _home = EnvVarGuard::set("HOME", &home);
+            let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
             write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
             let expected = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
             stage_archive(
@@ -12814,8 +12792,8 @@ cwd = {:?}
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&kin_home).unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
         let stage = tmp.path().join("stage");
         write_bundle(&kin_home, WINDOWS_COMPONENTS, b"old-");
         let archive = make_zip(&[("kin.exe", b"new-kin"), ("kin-daemon.exe", b"new-daemon")]);
@@ -12864,8 +12842,8 @@ cwd = {:?}
             .map(|entry| entry.unwrap().file_name())
             .collect();
         before.sort();
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _registry = EnvGuard::set("KIN_REGISTRY_PATH", &registry);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _registry = EnvVarGuard::set("KIN_REGISTRY_PATH", &registry);
 
         let error = run(false, None, None, None, None, true, true, false, Vec::new())
             .await
@@ -12903,7 +12881,7 @@ cwd = {:?}
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
         let before_registry = fs::read(&registry).unwrap();
         let before_lock = fs::read(&lock).unwrap();
-        let _registry = EnvGuard::set("KIN_REGISTRY_PATH", &registry);
+        let _registry = EnvVarGuard::set("KIN_REGISTRY_PATH", &registry);
 
         let error = registry_authority_preflight()
             .expect_err("updater must refuse unsafe registry authority");
@@ -12951,9 +12929,9 @@ cwd = {:?}
             ),
         )
         .unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _kin_dir = EnvGuard::set("KIN_DIR", tmp.path().join("wrong-install"));
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::set("KIN_DIR", tmp.path().join("wrong-install"));
 
         let repaired = crate::commands::setup::remerge_existing_mcp_configs();
         let normalized_config = crate::commands::setup::ConfigLock::normalized_path(&config)
@@ -13000,9 +12978,9 @@ cwd = {:?}
             let home = state.mcp_home.as_ref().unwrap();
             let repo = state.mcp_repo.as_ref().unwrap();
             let config = state.mcp_config.as_ref().unwrap();
-            let _home = EnvGuard::set("HOME", home);
-            let _kin_home = EnvGuard::set("KIN_HOME", &state.kin_home);
-            let _kin_dir = EnvGuard::set("KIN_DIR", state._tmp.path().join("wrong-install"));
+            let _home = EnvVarGuard::set("HOME", home);
+            let _kin_home = EnvVarGuard::set("KIN_HOME", &state.kin_home);
+            let _kin_dir = EnvVarGuard::set("KIN_DIR", state._tmp.path().join("wrong-install"));
             let _cwd = CwdGuard::set(&home);
 
             let lock = InstallRootLock::acquire_existing(&state.kin_home).unwrap();
@@ -13055,8 +13033,8 @@ cwd = {:?}
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         let malformed = b"\xff\xfe[mcp_servers.kin\ncommand =";
         fs::write(&config, malformed).unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &state.kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &state.kin_home);
         let _cwd = CwdGuard::set(&home);
         enqueue_mcp_repair_targets(&[crate::commands::setup::McpRepairTarget {
             id: "codex".to_string(),
@@ -13095,8 +13073,8 @@ cwd = {:?}
             "[mcp_servers.kin]\ncommand = \"/stale/kin\"\nargs = [\"mcp\", \"start\"]\n",
         )
         .unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         enqueue_mcp_repair_targets(&[crate::commands::setup::McpRepairTarget {
             id: "codex".to_string(),
             path: config.clone(),
@@ -13169,8 +13147,8 @@ cwd = {:?}
             fs::write(&marker, &bytes).unwrap();
             let home = tmp.path().join("home");
             fs::create_dir_all(&home).unwrap();
-            let _home = EnvGuard::set("HOME", &home);
-            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+            let _home = EnvVarGuard::set("HOME", &home);
+            let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
 
             let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
             assert!(attempt_pending_mcp_repair(&lock).is_err());
@@ -13216,8 +13194,8 @@ cwd = {:?}
         }))
         .unwrap();
         fs::write(&marker, &marker_bytes).unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
 
         let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
         let error = attempt_pending_mcp_repair(&lock)
@@ -13271,8 +13249,8 @@ cwd = {:?}
         }))
         .unwrap();
         fs::write(&marker, &marker_bytes).unwrap();
-        let _home = EnvGuard::set("HOME", tmp.path().join("home"));
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
 
         let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
         let error = attempt_pending_mcp_repair(&lock)
@@ -13295,8 +13273,8 @@ cwd = {:?}
             write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
             let home = tmp.path().join("home");
             fs::create_dir_all(home.join(".cursor")).unwrap();
-            let _home = EnvGuard::set("HOME", &home);
-            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+            let _home = EnvVarGuard::set("HOME", &home);
+            let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
             let victim = match victim_kind {
                 "arbitrary_json" => home.join("victim.json"),
                 "restart_marker" => restart_pending_path(&kin_home),
@@ -13348,8 +13326,8 @@ cwd = {:?}
         let marker = mcp_repair_pending_path(&kin_home);
         let marker_bytes = br#"{"schema_version":99,"installed_version":"0.2.21","recorded_at":"2026-07-16T00:00:00Z","repair_required":true,"targets":[]}"#;
         fs::write(&marker, marker_bytes).unwrap();
-        let _home = EnvGuard::set("HOME", tmp.path().join("home"));
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
 
         let error = install_staged_bundle(
             &kin_home,
@@ -13495,8 +13473,8 @@ cwd = {:?}
         let config_bytes =
             br#"{"mcpServers":{"kin":{"command":"/stale/kin","args":["mcp","start"]}}}"#;
         fs::write(&config, config_bytes).unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let target = crate::commands::setup::McpRepairTarget {
             id: "cursor".to_string(),
             path: config,
@@ -13558,8 +13536,8 @@ cwd = {:?}
             path: existing_path,
             repo_root: None,
         };
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
         persist_mcp_repair_record_at(
             lock.install().unwrap(),
@@ -13592,8 +13570,8 @@ cwd = {:?}
         fs::remove_file(&managed).unwrap();
         fs::hard_link(std::env::current_exe().unwrap(), &managed).unwrap();
         fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _home = EnvGuard::set("HOME", tmp.path().join("home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", tmp.path().join("home"));
 
         assert!(UpdaterStartAuthority::capture(&kin_home, LINUX_COMPONENTS).is_ok());
         let replacement = kin_home.join("bin/.kin-identical-replacement");
@@ -13630,8 +13608,8 @@ cwd = {:?}
         )
         .into_bytes();
         fs::write(&config, &config_bytes).unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         enqueue_mcp_repair_targets(&[crate::commands::setup::McpRepairTarget {
             id: "codex".to_string(),
             path: config.clone(),
@@ -13725,8 +13703,8 @@ cwd = {:?}
         )
         .unwrap();
         let marker = mcp_repair_pending_path(&state.kin_home);
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &state.kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &state.kin_home);
         let _cwd = CwdGuard::set(&home);
         enqueue_mcp_repair_targets(&[crate::commands::setup::McpRepairTarget {
             id: "codex".to_string(),
@@ -13790,8 +13768,8 @@ cwd = {:?}
         mark_restart_record_committed(&mut record, &kin_home, LINUX_COMPONENTS).unwrap();
         persist_restart_record_at(lock.install().unwrap(), &record).unwrap();
         drop(lock);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _home = EnvGuard::set("HOME", tmp.path().join("home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", tmp.path().join("home"));
 
         acknowledge_runtime_restart(&[]).unwrap();
 
@@ -13868,8 +13846,8 @@ cwd = {:?}
             fs::write(&marker, &marker_bytes).unwrap();
             fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
             drop(lock);
-            let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-            let _home = EnvGuard::set("HOME", tmp.path().join("home"));
+            let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+            let _home = EnvVarGuard::set("HOME", tmp.path().join("home"));
 
             let error = acknowledge_runtime_restart(&[])
                 .expect_err("unknown restart lifecycle fields must fail closed");
@@ -14286,8 +14264,8 @@ cwd = {:?}
         record.dependency_provenance = build.dependency_provenance.to_string();
         persist_restart_record_at(lock.install().unwrap(), &record).unwrap();
         drop(lock);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _home = EnvGuard::set("HOME", tmp.path().join("home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", tmp.path().join("home"));
 
         let error = acknowledge_runtime_restart(&[])
             .expect_err("a different running build cannot acknowledge the marker");
@@ -14302,8 +14280,8 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let fallback = tmp.path().join("fallback");
         let preferred = tmp.path().join("preferred");
-        let _kin_dir = EnvGuard::set("KIN_DIR", &fallback);
-        let _kin_home = EnvGuard::set("KIN_HOME", &preferred);
+        let _kin_dir = EnvVarGuard::set("KIN_DIR", &fallback);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &preferred);
 
         assert_eq!(UpdateConfig::path().unwrap(), preferred.join("update.toml"));
     }
@@ -14312,7 +14290,7 @@ cwd = {:?}
     #[serial]
     fn check_only_channel_override_does_not_persist_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", tmp.path());
+        let _kin_home = EnvVarGuard::set("KIN_HOME", tmp.path());
 
         assert_eq!(
             resolve_channel(tmp.path(), Some(Channel::Alpha), true, false),
@@ -15015,36 +14993,65 @@ cwd = {:?}
         assert!(format!("{error:#}").contains("inspection bound"));
     }
 
+    /// A permissive umask must not widen the private updater root.
+    ///
+    /// The observation runs in a worker process because the file-creation mask
+    /// is process-global, exactly like the environment table: every directory
+    /// any concurrently running test creates while this one holds `umask(0)`
+    /// comes out world-writable, and Kin's own namespace-safety checks then
+    /// refuse those directories. The failures land on whatever test happened to
+    /// be creating a temporary directory in that window, which is why the set
+    /// moved run to run. `#[serial]` cannot prevent it: it orders a test only
+    /// against other serial tests, not against the thousand running beside it.
+    /// The restrictive-umask tests in `setup.rs` already take this shape.
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn private_root_is_atomically_0700_even_with_umask_zero() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                // SAFETY: umask accepts every mode value and has no pointer arguments.
-                unsafe { libc::umask(self.0) };
-            }
+        const WORKER_ROOT: &str = "KIN_UPDATE_TEST_PRIVATE_ROOT_UMASK_ROOT";
+
+        if let Some(root) = std::env::var_os(WORKER_ROOT) {
+            let root = PathBuf::from(root);
+            // SAFETY: umask accepts every mode value and has no pointer
+            // arguments. This process exists only to hold the permissive mask.
+            unsafe { libc::umask(0) };
+            let private =
+                PrivateUpdaterTempDir::create(&root, PREFLIGHT_TEMP_PREFIX, "atomic-mode-test")
+                    .unwrap();
+            assert_eq!(
+                fs::symlink_metadata(private.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            return;
         }
 
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("observed-mode");
-        let _observe = EnvGuard::set("KIN_UPDATE_TEST_PRIVATE_CREATE_OBSERVE", &marker);
-        // SAFETY: umask accepts every mode value and has no pointer arguments.
-        let _umask = UmaskGuard(unsafe { libc::umask(0) });
-        let root =
-            PrivateUpdaterTempDir::create(temp.path(), PREFLIGHT_TEMP_PREFIX, "atomic-mode-test")
-                .unwrap();
-        assert_eq!(fs::read_to_string(&marker).unwrap(), "700");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::update::tests::private_root_is_atomically_0700_even_with_umask_zero",
+                "--nocapture",
+            ])
+            .env(WORKER_ROOT, temp.path())
+            .env("KIN_UPDATE_TEST_PRIVATE_CREATE_OBSERVE", &marker);
+        let output = test_subprocess_output(command, "private updater root under umask 0").unwrap();
+        assert!(
+            output.status.success(),
+            "worker output: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
-            fs::symlink_metadata(root.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
+            fs::read_to_string(&marker).unwrap(),
+            "700",
+            "creation must request 0700 atomically rather than widen and repair"
         );
     }
 

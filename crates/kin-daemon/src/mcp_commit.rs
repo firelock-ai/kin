@@ -1440,7 +1440,7 @@ mod tests {
                 .unwrap();
             path
         });
-        std::env::set_var("KIN_REGISTRY_PATH", path);
+        kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
     }
 
     fn test_state() -> (tempfile::TempDir, Arc<DaemonState>) {

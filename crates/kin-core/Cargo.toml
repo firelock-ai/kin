@@ -12,6 +12,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Test-only fixtures other workspace crates consume from their dev-dependencies.
+# Never enabled by a product dependency edge.
+test-support = []
+
 [dependencies]
 kin-model = { workspace = true }
 kin-db = { workspace = true }

@@ -1481,7 +1481,7 @@ mod tests {
     #[test]
     #[serial]
     fn precise_mode_rejects_broad_show_body_searches() {
-        std::env::set_var("KIN_SEARCH_MODE", "precise");
+        let _mode = kin_core::test_env::EnvVarGuard::set("KIN_SEARCH_MODE", "precise");
         let err = enforce_precise_search_mode(
             "parse|parseStrict|_parse|run",
             &["parse", "parseStrict", "_parse", "run"],
@@ -1492,13 +1492,12 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("limited to `--limit 5`") || msg.contains("too many OR terms"));
-        std::env::remove_var("KIN_SEARCH_MODE");
     }
 
     #[test]
     #[serial]
     fn precise_mode_accepts_small_exact_or_searches() {
-        std::env::set_var("KIN_SEARCH_MODE", "precise");
+        let _mode = kin_core::test_env::EnvVarGuard::set("KIN_SEARCH_MODE", "precise");
         let result = enforce_precise_search_mode(
             "$MyType|$MyTypeInternals",
             &["$MyType", "$MyTypeInternals"],
@@ -1507,7 +1506,6 @@ mod tests {
             Some(5),
         );
         assert!(result.is_ok());
-        std::env::remove_var("KIN_SEARCH_MODE");
     }
 
     #[test]

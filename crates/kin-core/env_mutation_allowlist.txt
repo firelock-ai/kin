@@ -1,0 +1,13 @@
+# Sources allowed to write the process environment table directly, checked by
+# `kin_core::test_env` tests::no_source_outside_the_sanctioned_guard_writes_the_environment.
+#
+# One workspace-relative path per line. An entry belongs here only when the write
+# is product behavior. Test setup does not qualify: it goes through
+# `kin_core::test_env::EnvVarGuard`, or the configuration is taken by argument.
+#
+# `crates/kin-core/src/test_env.rs` is the guard itself and is exempt in code.
+
+# `kin mcp start` binds the process to the daemon it resolved, and drops the pin
+# when the workspace moves off the bound repository. The variable is the
+# published interface the MCP daemon delegate reads, so the write is the feature.
+crates/kin-cli/src/commands/mcp.rs

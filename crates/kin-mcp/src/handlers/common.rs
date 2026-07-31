@@ -162,6 +162,23 @@ pub async fn fetch_spine_impact_typed(
     let Ok(daemon_url) = daemon_url_from_env() else {
         return SpineQuery::NotConfigured;
     };
+    fetch_spine_impact_typed_at(&daemon_url, repo_id, entity_id, depth).await
+}
+
+/// Query an explicitly named daemon for federated impact analysis.
+///
+/// The endpoint is an argument so a caller that already knows it does not have
+/// to publish it through `KIN_DAEMON_URL`. That variable is process-global, and
+/// under `cargo test` a binary's tests are threads in one process, so a test
+/// setting it to reach its own stub server also repoints every other test that
+/// resolves a daemon. Endpoint resolution belongs at the entry boundary, where
+/// it happens once, rather than inside a request that other code shares.
+pub async fn fetch_spine_impact_typed_at(
+    daemon_url: &str,
+    repo_id: &str,
+    entity_id: &EntityId,
+    depth: u32,
+) -> SpineQuery<kin_spine::FederatedImpact> {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -207,6 +224,17 @@ pub async fn fetch_spine_xref(
     let Ok(daemon_url) = daemon_url_from_env() else {
         return SpineQuery::NotConfigured;
     };
+    fetch_spine_xref_at(&daemon_url, repo_id, entity_id).await
+}
+
+/// Query an explicitly named daemon for cross-repo edges.
+///
+/// See [`fetch_spine_impact_typed_at`] for why the endpoint is an argument.
+pub async fn fetch_spine_xref_at(
+    daemon_url: &str,
+    repo_id: &str,
+    entity_id: &EntityId,
+) -> SpineQuery<kin_spine::SpineXrefResponse> {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()

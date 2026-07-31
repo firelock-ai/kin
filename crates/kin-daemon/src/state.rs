@@ -5655,10 +5655,8 @@ mod tests {
         kin_core::registry::KinRegistry { repos: Vec::new() }
             .save_to(&registry_path)
             .unwrap();
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5681,15 +5679,6 @@ mod tests {
             None => (false, None, false),
         };
 
-        match prev_registry {
-            Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
-            None => std::env::remove_var("KIN_REGISTRY_PATH"),
-        }
-        match prev_disable {
-            Some(value) => std::env::set_var("KIN_DISABLE_SPINE", value),
-            None => std::env::remove_var("KIN_DISABLE_SPINE"),
-        }
-
         assert!(deferred, "an active writer must defer spine initialization");
         assert!(
             once_lock_unpublished,
@@ -5710,10 +5699,8 @@ mod tests {
         kin_core::registry::KinRegistry { repos: Vec::new() }
             .save_to(&registry_path)
             .unwrap();
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5761,15 +5748,6 @@ mod tests {
             "second caller must reuse the published spine"
         );
 
-        match prev_registry {
-            Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
-            None => std::env::remove_var("KIN_REGISTRY_PATH"),
-        }
-        match prev_disable {
-            Some(value) => std::env::set_var("KIN_DISABLE_SPINE", value),
-            None => std::env::remove_var("KIN_DISABLE_SPINE"),
-        }
-
         assert_eq!(
             calls_while_blocked, 1,
             "OnceLock publication alone must not allow duplicate O(graph) initializers"
@@ -5789,10 +5767,8 @@ mod tests {
         kin_core::registry::KinRegistry { repos: Vec::new() }
             .save_to(&registry_path)
             .unwrap();
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
 
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
@@ -5833,15 +5809,6 @@ mod tests {
             ),
             None => (false, None, false),
         };
-
-        match prev_registry {
-            Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
-            None => std::env::remove_var("KIN_REGISTRY_PATH"),
-        }
-        match prev_disable {
-            Some(value) => std::env::set_var("KIN_DISABLE_SPINE", value),
-            None => std::env::remove_var("KIN_DISABLE_SPINE"),
-        }
 
         assert!(
             stale_backend_unpublished,
@@ -5945,10 +5912,8 @@ mod tests {
         }
         .save_to(&registry_path)
         .unwrap();
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
 
         // The primary repo: a caller entity plus an unresolved cross-repo call
         // tagged with the sibling repo as its import source.
@@ -5989,13 +5954,6 @@ mod tests {
 
         // Restore the process-global env before asserting so a failure can never
         // leak the override into other tests.
-        match prev_registry {
-            Some(v) => std::env::set_var("KIN_REGISTRY_PATH", v),
-            None => std::env::remove_var("KIN_REGISTRY_PATH"),
-        }
-        if let Some(v) = prev_disable {
-            std::env::set_var("KIN_DISABLE_SPINE", v);
-        }
 
         assert!(
             repo_count >= 2,
@@ -6113,10 +6071,8 @@ mod tests {
         kin_core::registry::KinRegistry { repos: Vec::new() }
             .save_to(&registry_path)
             .unwrap();
-        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
-        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
-        std::env::remove_var("KIN_DISABLE_SPINE");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
 
         // ── Drive the production ingest route logic ───────────────────────
         // Sibling first (metadata only), then the anchor with edge refresh —
@@ -6138,13 +6094,6 @@ mod tests {
             .expect("primary ingest retries onto stable capture + cross-repo edge refresh");
 
         // Restore env before asserting so a failure cannot leak the override.
-        if let Some(v) = prev_disable {
-            std::env::set_var("KIN_DISABLE_SPINE", v);
-        }
-        match prev_registry {
-            Some(v) => std::env::set_var("KIN_REGISTRY_PATH", v),
-            None => std::env::remove_var("KIN_REGISTRY_PATH"),
-        }
 
         // The sibling was loaded purely from storage (it has no local `.kndb`).
         assert_eq!(

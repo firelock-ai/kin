@@ -102,7 +102,7 @@ mod tests {
         // timeout, so a `kin` process holding that lock would block this test
         // forever.
         let registry_path = tmp.path().join("registry-home/registry.toml");
-        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
+        let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
 
         update_registry(tmp.path(), 42).unwrap();
 
@@ -110,6 +110,5 @@ mod tests {
             registry_path.exists(),
             "the registry authority must be created under the missing home"
         );
-        std::env::remove_var("KIN_REGISTRY_PATH");
     }
 }

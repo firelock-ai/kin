@@ -504,20 +504,14 @@ mod tests {
         })
         .unwrap();
 
-        std::env::set_var("KINLAB_AUTH_PASSPHRASE", "test-passphrase");
-        let previous_hostname = std::env::var("HOSTNAME").ok();
-        std::env::set_var("HOSTNAME", "workstation");
+        let _env =
+            kin_core::test_env::EnvVarGuard::set("KINLAB_AUTH_PASSPHRASE", "test-passphrase")
+                .with("HOSTNAME", "workstation");
         write_encrypted_file(&path, &payload).unwrap();
 
         let actor_id = default_cli_actor_id(base_url);
         assert_eq!(actor_id, "cli:troy@firelock.ai:workstation");
 
         fs::remove_file(path).unwrap();
-        if let Some(hostname) = previous_hostname {
-            std::env::set_var("HOSTNAME", hostname);
-        } else {
-            std::env::remove_var("HOSTNAME");
-        }
-        std::env::remove_var("KINLAB_AUTH_PASSPHRASE");
     }
 }

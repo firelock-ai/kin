@@ -1723,14 +1723,15 @@ mod tests {
         }
 
         if let Some(marker) = std::env::var_os(AUTHORITY_OUTER) {
+            let mut ambient = kin_core::test_env::EnvVarGuard::new();
             for key in HOSTILE_AUTHORITY_KEYS {
-                std::env::set_var(key, "ambient-hostile");
+                ambient.apply(key, Some("ambient-hostile"));
             }
             for (key, _) in ALLOWED_WORKER_INPUTS {
-                std::env::set_var(key, "ambient-hostile");
+                ambient.apply(key, Some("ambient-hostile"));
             }
-            std::env::set_var("KIN_DIR", "/ambient/legacy-home");
-            std::env::set_var("KIN_MCP_REPO", "/ambient/repository");
+            ambient.apply("KIN_DIR", Some("/ambient/legacy-home"));
+            ambient.apply("KIN_MCP_REPO", Some("/ambient/repository"));
 
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
