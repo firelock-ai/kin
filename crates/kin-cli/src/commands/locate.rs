@@ -17786,6 +17786,12 @@ mod tests {
         );
     }
 
+    /// Vector-gated: the counts asserted below describe a build that HAS an
+    /// embedding pipeline and has not run it. A vector-free build reports
+    /// `supported = false` and counts different targets, which is correct
+    /// behaviour and not partial coverage, so the featureless contract is a
+    /// separate assertion rather than a looser version of this one.
+    #[cfg(feature = "vector")]
     #[test]
     #[serial_test::serial]
     fn locate_degrades_gracefully_on_incomplete_embeddings() {
@@ -17822,6 +17828,48 @@ mod tests {
         assert!(
             coverage.note.is_some(),
             "partial coverage must carry a degradation note"
+        );
+    }
+
+    /// The featureless half of the graceful-degradation contract. The
+    /// vector-gated case above covers the strict knob; this covers the default
+    /// path, where a build with no embedding pipeline must still answer and
+    /// must say plainly that the semantic signal is unavailable rather than
+    /// reporting it as merely incomplete.
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    #[serial_test::serial]
+    fn vector_free_locate_degrades_gracefully_on_the_default_path() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
+
+        let _coverage = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
+            .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let result = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            true,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        )
+        .expect("a vector-free build must degrade gracefully, not error");
+
+        let coverage = result
+            .semantic_coverage
+            .expect("semantic_coverage must be reported");
+        assert!(
+            !coverage.supported,
+            "a vector-free build must report semantic ranking as unsupported"
+        );
+        assert_eq!(coverage.indexed, 0, "no embeddings indexed in this graph");
+        assert!(!coverage.complete, "coverage must be marked incomplete");
+        assert!(
+            coverage.note.is_some(),
+            "unsupported coverage must carry its explanation"
         );
     }
 
