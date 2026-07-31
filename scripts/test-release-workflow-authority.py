@@ -36,6 +36,22 @@ TAG_SELECTOR = ROOT / "scripts" / "select-admissible-release-tag.py"
 ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
 TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
 TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
+TAG_LISTING_FORMAT = (
+    "--format='%(refname:strip=2) "
+    "%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)'"
+)
+# Which tag each workflow declares it is about to create. Only the mint creates
+# one, so only the mint names it. The train resolves drift from a base tag it
+# never mints, and handing that base over as mint intent refuses exactly when a
+# record covers it, which is always the moment a record is written: the mint
+# only ever creates `v$(workspace version)`, so main's version equals the stuck
+# tag until the train opens the bump the record exists to unblock. The empty
+# argument is spelled as a literal rather than an expanded variable so that
+# refilling it is a visible diff here and not a silent assignment upstream.
+EXPECTED_SELECTOR_INVOCATIONS = {
+    "release-tag": ('"$abandoned"', '"$candidate_tags"', '"$TAG"', '"$admissible"'),
+    "release-train": ('"$abandoned"', '"$candidate_tags"', '""', '"$admissible"'),
+}
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
@@ -2108,8 +2124,49 @@ def assert_admission_step_order(
         )
 
 
+def selector_invocation(workflow: str, content: str) -> tuple[str, ...]:
+    """Return the exact argument list a workflow hands the admission selector."""
+
+    anchor = 'python3 "$selector" \\\n'
+    if anchor not in content:
+        raise AssertionError(
+            f"{workflow} no longer invokes the admission selector as a "
+            "reviewable multi-line argument list"
+        )
+    arguments: list[str] = []
+    for line in content[content.index(anchor) + len(anchor) :].splitlines():
+        argument = line.strip()
+        if argument.endswith("\\"):
+            arguments.append(argument[:-1].strip())
+            continue
+        arguments.append(argument)
+        break
+    return tuple(arguments)
+
+
+def assert_selector_arguments(release_tag: str, release_train: str) -> None:
+    """Pin which tag each workflow declares it is about to mint."""
+
+    actual = {
+        "release-tag": selector_invocation("release-tag", release_tag),
+        "release-train": selector_invocation("release-train", release_train),
+    }
+    if actual != EXPECTED_SELECTOR_INVOCATIONS:
+        raise AssertionError(
+            "each release workflow must hand the admission selector its own "
+            "reviewed arguments. The mint-intent argument names the tag that "
+            "workflow is about to create, and only the mint creates one. The "
+            "train resolves drift from a base tag it never mints, so naming "
+            "that base as mint intent refuses exactly when a record covers it, "
+            f"which is every abandonment: expected={EXPECTED_SELECTOR_INVOCATIONS} "
+            f"actual={actual}"
+        )
+
+
 def assert_abandoned_tag_admission(release_tag: str, release_train: str) -> None:
     """Only a reviewed record may waive release-lane serialization."""
+
+    assert_selector_arguments(release_tag, release_train)
 
     for workflow, content, step_anchor, comparison in (
         (
@@ -2205,12 +2262,27 @@ def assert_abandoned_tag_admission(release_tag: str, release_train: str) -> None
         candidates,
         "",
     )
+    # The mint-intent contract, in the state that actually occurs. A record is
+    # written the moment a release is stuck, and main's version still equals the
+    # stuck tag then, because the mint only ever creates `v$(workspace version)`
+    # and the bump that moves main past it is the thing being unblocked. So the
+    # tag under a fresh record IS the tag both workflows are holding. Naming it
+    # as mint intent must refuse, and resolving drift without naming it must
+    # walk past it. Getting this backwards turns the record's own scenario into
+    # a permanently failing scheduled workflow.
     assert_tag_selection_refused(
         "minting a tag that is itself recorded as abandoned",
         abandonment_manifest(record),
         candidates,
         "v0.4.3 is recorded as an abandoned release tag and must not be released",
         minting_tag="v0.4.3",
+    )
+    assert_admissible_tag(
+        "resolving drift in the same state, declaring no mint intent",
+        abandonment_manifest(record),
+        candidates,
+        "v0.3.6",
+        minting_tag="",
     )
 
     for label, manifest, expected_error in (
@@ -2615,6 +2687,7 @@ def main() -> None:
         "refs/remotes/origin/main:scripts/abandoned-release-tags.json",
         "refs/remotes/origin/main:scripts/select-admissible-release-tag.py",
         "git for-each-ref",
+        TAG_LISTING_FORMAT,
         'python3 "$selector"',
         'highest_tag="$(cat "$admissible")"',
         "REQUIRED_CHECKS:",
@@ -2730,6 +2803,7 @@ def main() -> None:
         "refs/remotes/origin/main:scripts/abandoned-release-tags.json",
         "refs/remotes/origin/main:scripts/select-admissible-release-tag.py",
         "git for-each-ref",
+        TAG_LISTING_FORMAT,
         'python3 "$selector"',
         'highest_tag="$(cat "$admissible")"',
         "git merge --signoff --no-edit -X ours refs/remotes/origin/main",

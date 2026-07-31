@@ -18,9 +18,18 @@ precisely the case the predicate exists to serialize.
 
 A record is honoured only while it still describes the repository. It names the
 exact commit its tag pointed at, so a tag that has since moved refuses loudly
-instead of silently waiving a different object than the one that was reviewed. A
-record naming a tag that no longer exists is inert, because a deleted tag
-already blocks nothing.
+instead of silently waiving a different object than the one that was reviewed.
+
+A record outlives the tag it names, and it is not inert when the tag is deleted.
+Ranking stops being affected, because nothing in the listing can match it and so
+nothing is skipped, and the recorded commit can no longer be validated against
+the repository. The mint-intent refusal below still applies, because it reads the
+record rather than the listing: a version declared abandoned stays refused even
+if its tag is removed, which is the point. Deleting an abandoned tag while the
+workspace version still equals it therefore leaves the version itself burned and
+no tag to advance past, and the only way out is the version bump that drift
+resolution proposes. Record the abandonment and leave the tag in place unless a
+bump is landing with it.
 
 Usage:
   select-admissible-release-tag.py MANIFEST CANDIDATES MINTING_TAG OUTPUT

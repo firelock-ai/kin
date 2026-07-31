@@ -161,6 +161,15 @@ jobs:
           # from ever opening, so the version never moves and the mint has
           # nothing new to tag. Only a reviewed abandonment record skips a tag,
           # read from protected main together with the selector that reads it.
+          #
+          # The selector's mint-intent argument is empty here on purpose. This
+          # step resolves drift and opens a version bump PR; it never creates a
+          # tag, and $tag below is the pre-existing base it measures drift from.
+          # Handing that base over as mint intent would refuse precisely when a
+          # record covers it, and a record always covers it: the mint only
+          # creates v$(workspace version), so main's version equals the stuck
+          # tag and cannot move until this step opens the bump that a record is
+          # written to unblock.
           train_policy="$RUNNER_TEMP/release-train-policy"
           mkdir -p "$train_policy"
           abandoned="$train_policy/abandoned-release-tags.json"
@@ -182,7 +191,7 @@ jobs:
           python3 "$selector" \
             "$abandoned" \
             "$candidate_tags" \
-            "$tag" \
+            "" \
             "$admissible"
           highest_tag="$(cat "$admissible")"
           latest_tag="$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)"
