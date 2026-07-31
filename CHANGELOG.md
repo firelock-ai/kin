@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-31
+
+### Changed
+
+- Publish repository config through a capability Windows actually has (#535)
+- Create a replica that adopts the repository identity a remote publishes (#536)
+- Stop test code mutating the shared process environment and umask (#537)
+- Give each main commit its own CI concurrency group and take coverage off the merge queue (#540)
+- Give each main-branch push its own CI concurrency group (#543)
+- Let a reviewed abandonment record retire a release tag that can never finish (#542)
+- Admit the macOS notification bundle into the release archive shape (#546)
+- Prove the state a test depends on instead of assuming a signal, a budget, or a feature (#547)
+- Record v0.4.4 as an abandoned release tag (#548)
+- Give the release container two registries and compile both musl release targets before landing (#545)
+
+
 ## [0.4.4] - 2026-07-31
 
 v0.4.0 was never published. Its release commit was refused by the mint gate
