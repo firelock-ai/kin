@@ -646,43 +646,82 @@ struct LocateBudget {
     warnings: Vec<String>,
 }
 
+/// The budget-gated phases of the locate pipeline, with the environment knob
+/// and default that size each one. Named once so a budget built for a test
+/// covers exactly the phases a real query is gated on, rather than falling
+/// through to `phase_remaining`'s generic default for a phase this table
+/// forgot.
+const LOCATE_PHASE_BUDGETS: [(&str, &str, f64); 6] = [
+    (
+        "entity_discovery",
+        "KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS",
+        20.0,
+    ),
+    (
+        "entity_resolution",
+        "KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS",
+        20.0,
+    ),
+    ("multihop", "KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0),
+    ("text_search", "KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0),
+    ("source_text", "KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0),
+    ("scoring", "KIN_LOCATE_PHASE_SCORING_SECS", 10.0),
+];
+
 impl LocateBudget {
-    fn new() -> Self {
+    /// The budget a real query runs under, resolved from the environment.
+    fn from_env() -> Self {
         // Timeout/budget knobs: `0` means unbounded (disable the budget) rather
         // than a real 0 s deadline that would skip every phase and gut retrieval.
         // The unbounded sentinel (`f64::INFINITY`) flows harmlessly through the
         // `elapsed > total_secs` / `remaining_total` comparisons below.
         use kin_core::env_registry::env_secs_bound_f64 as secs_budget;
-        let total = secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0);
-        let mut phase_budgets = HashMap::new();
-        phase_budgets.insert(
-            "entity_discovery",
-            secs_budget("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 20.0),
-        );
-        phase_budgets.insert(
-            "entity_resolution",
-            secs_budget("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 20.0),
-        );
-        phase_budgets.insert(
-            "multihop",
-            secs_budget("KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0),
-        );
-        phase_budgets.insert(
-            "text_search",
-            secs_budget("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0),
-        );
-        phase_budgets.insert(
-            "source_text",
-            secs_budget("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0),
-        );
-        phase_budgets.insert(
-            "scoring",
-            secs_budget("KIN_LOCATE_PHASE_SCORING_SECS", 10.0),
-        );
         Self {
             start: std::time::Instant::now(),
-            total_secs: total,
-            phase_budgets,
+            total_secs: secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0),
+            phase_budgets: LOCATE_PHASE_BUDGETS
+                .iter()
+                .map(|(phase, knob, default)| (*phase, secs_budget(knob, *default)))
+                .collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A budget that never truncates retrieval.
+    ///
+    /// Every budget-gated phase is a wall-clock decision, so a test that
+    /// asserts on WHAT locate finds is otherwise asserting on how much CPU the
+    /// host granted it. A stall long enough to exhaust the total budget makes
+    /// the pipeline skip entity discovery outright and return `Ok` with no
+    /// files, which is indistinguishable from a retrieval regression at the
+    /// assertion. Tests that mean to describe retrieval semantics take this and
+    /// leave scheduling out of the result.
+    #[cfg(test)]
+    fn unbounded() -> Self {
+        Self::uniform(f64::INFINITY)
+    }
+
+    /// A budget that is already spent before the pipeline starts.
+    ///
+    /// Deterministic where a small positive budget is not: the total is behind
+    /// the start instant, so the first phase gate is over budget however fast
+    /// the host is. This exists so the budget-truncation contract can be
+    /// asserted directly instead of being waited for.
+    #[cfg(test)]
+    fn already_exhausted() -> Self {
+        Self::uniform(-1.0)
+    }
+
+    /// Every gate in the pipeline, total and per phase, set to `secs`.
+    #[cfg(test)]
+    fn uniform(secs: f64) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            total_secs: secs,
+            phase_budgets: LOCATE_PHASE_BUDGETS
+                .iter()
+                .map(|(phase, _, _)| (*phase, secs))
+                .collect(),
             warnings: Vec::new(),
         }
     }
@@ -1578,6 +1617,75 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<LocateResult> {
+    run_with_graph_capture_budgeted(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        extra_priority_files,
+        vector_source,
+        snippet_opts,
+        repository_authority,
+        source_scope,
+        LocateBudget::from_env(),
+    )
+}
+
+/// Locate over a workspace graph under an explicit retrieval budget.
+///
+/// The shape tests use when the assertion is about what retrieval returns. The
+/// production wrappers resolve the budget from the environment, which makes
+/// their results a function of how much wall clock the host granted; a test
+/// that asserts on found files and inherits that is asserting on scheduling.
+#[cfg(test)]
+fn run_with_graph_capture_in_workspace_budgeted(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    budget: LocateBudget,
+) -> Result<LocateResult> {
+    run_with_graph_capture_budgeted(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        Vec::new(),
+        None,
+        SnippetOptions::default(),
+        None,
+        kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        budget,
+    )
+}
+
+/// The locate pipeline, with its retrieval budget taken by argument.
+///
+/// The budget decides whether a phase runs at all, so it is an input to
+/// retrieval and not an ambient property of the process. Passing it in is what
+/// lets a caller that cares about WHAT locate finds separate that question from
+/// how much wall clock the host granted the query.
+#[allow(clippy::too_many_arguments)]
+fn run_with_graph_capture_budgeted(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    extra_priority_files: Vec<(String, f32)>,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+    snippet_opts: SnippetOptions,
+    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    mut budget: LocateBudget,
+) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
         text_len = text.len(),
@@ -1603,7 +1711,6 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Per-stage prune attribution, recorded only under --explain.
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
 
-    let mut budget = LocateBudget::new();
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
     // Surface a hardware-driven quality downgrade in-band: on a sub-Performance
@@ -3518,6 +3625,24 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             warnings = ?budget.warnings,
             "locate pipeline completed with budget warnings"
         );
+        // A budget that truncated discovery returns FEWER results, not an error,
+        // so without this the caller cannot tell "nothing matched" from "the
+        // pipeline stopped looking". The early scoring-skip return already
+        // reports this; a phase skipped mid-pipeline has to report it as well
+        // or the same silence returns through the other door.
+        record_degradation(
+            &mut degradations,
+            RetrievalDegradation {
+                component: "pipeline".to_string(),
+                reason: "budget_exhausted".to_string(),
+                detail: format!(
+                    "locate budget exhausted after {:.1}s; {}",
+                    budget.elapsed_secs(),
+                    budget.warnings.join("; ")
+                ),
+                remediation: "raise KIN_LOCATE_TOTAL_TIMEOUT_SECS for this repo size".to_string(),
+            },
+        );
     }
 
     // D_empty lever (default ON — measurement-backed: 51/51 official scorer,
@@ -3669,6 +3794,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files,
         max_files_explicit,
         snippet_opts,
+        LocateBudget::from_env(),
     )
 }
 
@@ -3683,6 +3809,7 @@ fn run_with_repository_authority_capture_at_ref<B>(
     max_files: usize,
     max_files_explicit: bool,
     snippet_opts: SnippetOptions,
+    budget: LocateBudget,
 ) -> Result<LocateResult>
 where
     B: kin_db::StorageBackend + ?Sized + 'static,
@@ -3699,7 +3826,7 @@ where
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
         discover_historical_test_artifact_priority_files(&historical, reference, text);
-    run_with_graph_capture_with_priority_files_and_vector_source(
+    run_with_graph_capture_budgeted(
         &historical,
         None,
         text,
@@ -3711,6 +3838,7 @@ where
         snippet_opts,
         repository_authority,
         kin_mcp::handlers::common::EntitySourceScope::At(*head),
+        budget,
     )
 }
 
@@ -17102,13 +17230,14 @@ mod tests {
         // `workspace_root = None` is a scoped-session daemon locate: the
         // workspace is off-limits, so every source-text resolution must be
         // satisfied from graph-owned bodies or reported as a gap.
-        let result = run_with_graph_capture_in_workspace(
+        let result = run_with_graph_capture_in_workspace_budgeted(
             &graph,
             None,
             "where is parse_config defined",
             true,
             10,
             true,
+            LocateBudget::unbounded(),
         )
         .unwrap();
 
@@ -17235,12 +17364,20 @@ mod tests {
         let renamed = tempfile::TempDir::new().unwrap();
 
         let answer = |root: Option<&std::path::Path>| {
-            run_with_graph_capture_in_workspace(&graph, root, query, false, 10, false)
-                .unwrap()
-                .files
-                .into_iter()
-                .map(|entry| entry.path)
-                .collect::<Vec<_>>()
+            run_with_graph_capture_in_workspace_budgeted(
+                &graph,
+                root,
+                query,
+                false,
+                10,
+                false,
+                LocateBudget::unbounded(),
+            )
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>()
         };
 
         let present_answer = answer(Some(present.path()));
@@ -17538,7 +17675,15 @@ mod tests {
         let _coverage =
             kin_core::test_env::EnvVarGuard::set("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1")
                 .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
-        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true);
+        let result = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            true,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        );
 
         let err = match result {
             Ok(_) => panic!("strict mode should reject incomplete embeddings"),
@@ -17562,8 +17707,16 @@ mod tests {
         let _coverage =
             kin_core::test_env::EnvVarGuard::set("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1")
                 .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
-        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
-            .expect("a vector-free build must still serve lexical and graph locate");
+        let result = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            true,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        )
+        .expect("a vector-free build must still serve lexical and graph locate");
 
         let coverage = result
             .semantic_coverage
@@ -17580,6 +17733,59 @@ mod tests {
         assert!(!vector_degradations[0].remediation.contains("kin embed"));
     }
 
+    /// A budget that truncated retrieval must say so on the result.
+    ///
+    /// Over budget the pipeline skips discovery and returns `Ok` with fewer
+    /// files, so "found nothing" and "stopped looking" are the same value at
+    /// the assertion. That is what made a wall-clock stall read as a retrieval
+    /// regression. The degradation ledger is what tells them apart, and it has
+    /// to be populated on the completing path and not only on the early return.
+    #[test]
+    fn budget_truncated_locate_reports_the_truncation_rather_than_an_empty_result() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+        admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
+
+        let starved = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            false,
+            10,
+            true,
+            LocateBudget::already_exhausted(),
+        )
+        .expect("an exhausted budget truncates retrieval, it does not error");
+        assert!(
+            starved.degradations.iter().any(|degradation| {
+                degradation.component == "pipeline" && degradation.reason == "budget_exhausted"
+            }),
+            "a truncated locate must carry its budget_exhausted degradation, got {:?}",
+            starved.degradations
+        );
+
+        // The control: the same query under a budget that cannot truncate must
+        // NOT claim truncation, or the marker means nothing.
+        let whole = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            false,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        )
+        .expect("an unbounded budget runs the whole pipeline");
+        assert!(
+            !whole.degradations.iter().any(|degradation| {
+                degradation.component == "pipeline" && degradation.reason == "budget_exhausted"
+            }),
+            "an untruncated locate must not claim a budget was exhausted, got {:?}",
+            whole.degradations
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn locate_degrades_gracefully_on_incomplete_embeddings() {
@@ -17593,8 +17799,16 @@ mod tests {
 
         let _coverage = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
             .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
-        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
-            .expect("default locate must degrade gracefully, not error");
+        let result = run_with_graph_capture_in_workspace_budgeted(
+            &graph,
+            None,
+            "handler failure",
+            true,
+            10,
+            true,
+            LocateBudget::unbounded(),
+        )
+        .expect("default locate must degrade gracefully, not error");
 
         let coverage = result
             .semantic_coverage
@@ -23540,6 +23754,10 @@ mod tests {
         #[cfg(feature = "vector")]
         load_complete_test_vectors(&current_graph, &[entity_v2.clone()]);
 
+        // Unbounded on purpose: this asserts which files historical locate
+        // surfaces, and under the environment budget a slow enough host skips
+        // entity discovery outright and returns zero files, which reads at the
+        // assertion exactly like a retrieval regression.
         let historical = run_with_repository_authority_capture_at_ref(
             None,
             &authority,
@@ -23551,6 +23769,7 @@ mod tests {
             10,
             true,
             SnippetOptions::default(),
+            LocateBudget::unbounded(),
         )
         .unwrap();
         assert_eq!(
@@ -23574,6 +23793,7 @@ mod tests {
             10,
             true,
             SnippetOptions::default(),
+            LocateBudget::unbounded(),
         )
         .unwrap();
         assert!(
