@@ -40,14 +40,30 @@ use thiserror::Error;
 /// guard an exception that a real filesystem probe could later hide behind.
 pub(crate) trait RepositoryAuthorityMetadata {
     fn authority_metadata(&self) -> &PersistedRepositoryAuthority;
+
+    /// The same state, read where the caller can refuse instead of abort.
+    ///
+    /// The envelope is a kin-db invariant rather than a local one: opening
+    /// authority refuses a persisted snapshot that carries none, constructs one
+    /// for a store that has never been written, and every commit re-sets it. So
+    /// this returns `None` only if that invariant is broken, and no test here
+    /// can produce that state.
+    ///
+    /// Adoption verification reads this anyway. It runs against a replica this
+    /// process just created, it is the one caller whose whole job is deciding
+    /// whether an adoption is recorded, and a refusal naming the replica is
+    /// strictly more useful there than a panic in the middle of a clone.
+    fn committed_authority_metadata(&self) -> Option<&PersistedRepositoryAuthority>;
 }
 
 impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
     fn authority_metadata(&self) -> &PersistedRepositoryAuthority {
-        self.snapshot()
-            .repository_authority
-            .as_ref()
+        self.committed_authority_metadata()
             .expect("repository authority lease always carries authority metadata")
+    }
+
+    fn committed_authority_metadata(&self) -> Option<&PersistedRepositoryAuthority> {
+        self.snapshot().repository_authority.as_ref()
     }
 }
 

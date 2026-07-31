@@ -208,6 +208,9 @@
         "kin_remote::repository_transfer_negotiation::tests::an_adoption_verifies_once_the_advertised_head_is_admitted",
         "kin_remote::repository_transfer_negotiation::tests::an_adoption_that_admitted_no_history_is_refused_by_name",
         "kin_remote::repository_transfer_negotiation::tests::a_replica_whose_authority_records_another_repository_is_refused",
+        "kin_remote::repository_transfer_negotiation::tests::an_identity_naming_another_repository_is_refused",
+        "kin_remote::repository_transfer_negotiation::tests::a_transfer_that_ran_against_another_repository_is_refused",
+        "kin_remote::repository_transfer_negotiation::tests::a_receipt_binding_another_repository_is_refused",
         "kin_core::init::tests::an_adopting_replica_takes_the_remote_identity_and_mints_only_its_workspace",
         "kin_core::init::tests::adopting_over_an_existing_replica_names_both_identities",
         "kin_core::init::tests::a_remote_identity_that_is_not_a_uuid_v4_is_refused_before_anything_is_created"

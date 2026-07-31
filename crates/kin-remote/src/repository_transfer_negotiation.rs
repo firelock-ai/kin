@@ -464,10 +464,16 @@ where
     }
 
     let lease = local.read_authority();
-    if &lease.authority_metadata().repository_id != adopted {
+    let committed = lease.committed_authority_metadata().ok_or_else(|| {
+        conflict(format!(
+            "this replica's authority carries no repository envelope, so nothing records it \
+             adopting {adopted}"
+        ))
+    })?;
+    if &committed.repository_id != adopted {
         return Err(conflict(format!(
             "this replica committed its authority under repository {}, not the adopted {adopted}",
-            lease.authority_metadata().repository_id
+            committed.repository_id
         )));
     }
 
@@ -2635,6 +2641,112 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(other_id.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// The identity a replica adopted and the identity a caller passes in have
+    /// to be the same repository. They disagree exactly when a caller verified
+    /// one adoption against another's advertisement, and reporting that as
+    /// verified would claim a peer said something it never said.
+    #[test]
+    fn an_identity_naming_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let mut identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+        identity.repository_id = other.clone();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &up_to_date_outcome(&fixture.repository_id, &fixture.main, None),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Invalid(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// A transfer that ran against another repository proves nothing about this
+    /// adoption, however it was reached. Accepting it would let a replica
+    /// report itself cloned on the strength of a transfer that never touched
+    /// the repository it adopted.
+    #[test]
+    fn a_transfer_that_ran_against_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &up_to_date_outcome(&other, &fixture.main, None),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Invalid(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// The receipts are what bind admitted history to the adopted identity, so
+    /// a receipt naming another repository is the one arm where the transfer
+    /// really did move history and it landed bound to something else. The
+    /// outcome here is a real pull's, mutated in one field, so nothing but the
+    /// binding can be what refuses it.
+    #[test]
+    fn a_receipt_binding_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let mut outcome = pull_from_remote(
+            &fixture.destination,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            AuthorId::new("clone-identity-test"),
+        )
+        .unwrap();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+        outcome
+            .receipts
+            .first_mut()
+            .expect("a pull that moved history returns a receipt")
+            .repository_id = other.clone();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &outcome,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Conflict(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
         assert!(
             message.contains(fixture.repository_id.as_str()),
             "{message}"
