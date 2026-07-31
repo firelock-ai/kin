@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use kin_cli::commands::branch::{
     BranchListEntry, BranchListReport, BranchRequest, BranchResponse, BRANCH_LIST_SCHEMA,
 };
+use kin_cli::commands::transfer::WorkspaceFollow;
 use kin_db::{LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager};
 use kin_model::{
     compute_resolved_tree_hash, AuthorId, ChangeStore, EffectiveAdmissionPolicyStamp, EntityStore,
@@ -25,6 +26,35 @@ use crate::state::{DaemonEvent, DaemonState};
 const CREATE_REASON: &str = "create exact repository branch";
 const DELETE_REASON: &str = "delete exact repository branch";
 const SWITCH_REASON: &str = "switch exact repository workspace branch";
+const FOLLOW_REASON: &str = "follow exact repository ref admitted by transfer";
+
+/// Internal discriminator for "this workspace stands on another ref".
+///
+/// It never reaches a client. `follow_moved_ref` is the only caller that can
+/// raise the condition and the only one that reads this back, so the status is
+/// a typed channel between them rather than a wire contract.
+const WORKSPACE_TRACKS_ANOTHER_REF: StatusCode = StatusCode::NO_CONTENT;
+
+/// Why a workspace is being transitioned onto a ref's current target.
+///
+/// Both transitions publish the same workspace mutation against the same
+/// compare-and-swap; they differ in what a caller asked for, and therefore in
+/// which refusal is the honest one.
+///
+/// A switch is a request to leave the current head, so uncommitted graph-owned
+/// state is a reason to refuse before anything is resolved: the caller can
+/// commit and ask again, and nothing has happened in the meantime. A follow is
+/// the second half of a transfer whose history is already durable, so the same
+/// state is not a reason to refuse the transfer that already landed. It is
+/// reported once the transition is known to be needed, which is why the
+/// already-at-target case is settled first here and last there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransitionPolicy {
+    /// A caller named the ref to stand on.
+    Switch,
+    /// A transfer moved the ref this workspace already tracks.
+    FollowMovedRef,
+}
 
 struct BranchExecution {
     response: BranchResponse,
@@ -51,6 +81,22 @@ impl std::fmt::Display for BranchConflict {
 }
 
 impl std::error::Error for BranchConflict {}
+
+/// The workspace stands on a different ref than the one a transfer moved.
+///
+/// Distinct from a conflict on purpose: nothing is wrong and nothing needs
+/// resolving, so a follow reports it as inapplicable rather than as a working
+/// tree that fell behind.
+#[derive(Debug)]
+struct WorkspaceTracksAnotherRef(String);
+
+impl std::fmt::Display for WorkspaceTracksAnotherRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkspaceTracksAnotherRef {}
 
 #[derive(Debug)]
 struct BranchBadRequest(String);
@@ -93,6 +139,82 @@ pub(crate) fn execute(
         return list(&authority).map_err(internal_branch_error);
     }
 
+    run_workspace_mutation(state, |state, authority| match request {
+        BranchRequest::List => unreachable!("list returned before mutation gates"),
+        BranchRequest::Create {
+            name,
+            operation_id,
+            actor,
+        } => create(state, authority, name, *operation_id, actor).map(BranchCommandOutcome::Commit),
+        BranchRequest::Delete {
+            name,
+            operation_id,
+            actor,
+        } => delete(state, authority, name, *operation_id, actor).map(BranchCommandOutcome::Commit),
+        BranchRequest::Switch {
+            name,
+            operation_id,
+            actor,
+        } => switch(
+            state,
+            authority,
+            name,
+            *operation_id,
+            actor,
+            TransitionPolicy::Switch,
+        ),
+    })
+}
+
+/// Move the graph-owned workspace onto the current target of the ref it already
+/// tracks, after a transfer admitted history onto that ref.
+///
+/// Publication and the workspace transition are two repository transactions on
+/// purpose. The first is atomic per pack and is already durable when this runs,
+/// so this cannot revoke it and never reports a transition failure as a failed
+/// transfer. It answers only what the working tree did.
+pub(crate) fn follow_moved_ref(
+    state: &DaemonState,
+    name: &RefName,
+    actor: &AuthorId,
+) -> WorkspaceFollow {
+    // A fresh operation id every time is deliberate. Idempotence here is a
+    // property of state, not of a caller-stable identifier: the already-current
+    // check settles a repeated pull, and the workspace compare-and-swap settles
+    // a concurrent one. A retried pull is a new negotiation, so there is no
+    // earlier operation for it to replay.
+    let outcome = run_workspace_mutation(state, |state, authority| {
+        switch(
+            state,
+            authority,
+            name,
+            OperationId::new(),
+            actor,
+            TransitionPolicy::FollowMovedRef,
+        )
+    });
+    match outcome {
+        Ok(response) if response.mutated => WorkspaceFollow::Advanced {
+            detail: response.lines.join("; "),
+            authority_generation: response.authority_generation.unwrap_or_default(),
+        },
+        Ok(response) => WorkspaceFollow::AlreadyCurrent {
+            authority_generation: response.authority_generation.unwrap_or_default(),
+        },
+        Err((WORKSPACE_TRACKS_ANOTHER_REF, detail)) => WorkspaceFollow::NotApplicable { detail },
+        Err((_, detail)) => WorkspaceFollow::Behind { detail },
+    }
+}
+
+/// Run one planned workspace mutation under the daemon's authority, persistence,
+/// and graph-mutation gates, then finalize every view derived from it.
+fn run_workspace_mutation<Plan>(
+    state: &DaemonState,
+    plan: Plan,
+) -> std::result::Result<BranchResponse, (StatusCode, String)>
+where
+    Plan: FnOnce(&DaemonState, &ActiveLocalRepositoryAuthority) -> Result<BranchCommandOutcome>,
+{
     let graph_mutation = state.begin_graph_authority_mutation();
     let persistence = state.persist_lock.lock().map_err(|_| {
         (
@@ -103,28 +225,7 @@ pub(crate) fn execute(
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
     let authority =
         ActiveLocalRepositoryAuthority::open_bound(state).map_err(branch_bind_refusal)?;
-    let outcome =
-        match request {
-            BranchRequest::List => unreachable!("list returned before mutation gates"),
-            BranchRequest::Create {
-                name,
-                operation_id,
-                actor,
-            } => create(state, &authority, name, *operation_id, actor)
-                .map(BranchCommandOutcome::Commit),
-            BranchRequest::Delete {
-                name,
-                operation_id,
-                actor,
-            } => delete(state, &authority, name, *operation_id, actor)
-                .map(BranchCommandOutcome::Commit),
-            BranchRequest::Switch {
-                name,
-                operation_id,
-                actor,
-            } => switch(state, &authority, name, *operation_id, actor),
-        }
-        .map_err(classify_branch_error)?;
+    let outcome = plan(state, &authority).map_err(classify_branch_error)?;
     let execution = match outcome {
         BranchCommandOutcome::Commit(execution) => execution,
         BranchCommandOutcome::ReadOnly(response) => {
@@ -529,6 +630,7 @@ fn switch(
     name: &RefName,
     operation_id: OperationId,
     actor: &AuthorId,
+    policy: TransitionPolicy,
 ) -> Result<BranchCommandOutcome> {
     require_branch_ref(name)?;
     let lease = authority.manager.read_authority();
@@ -547,8 +649,21 @@ fn switch(
     // its base. Admission only ever moves members the workspace already
     // tracks, so untracked host content can never reach this refusal, and the
     // wording never describes bytes that have not crossed the compare-and-swap.
-    if workspace.is_dirty() {
+    //
+    // A follow defers this until the transition is known to be needed, because
+    // the history it would refuse over is already durable and a workspace that
+    // is already at the moved ref has nothing to refuse about.
+    if policy == TransitionPolicy::Switch && workspace.is_dirty() {
         return Err(graph_owned_changes(&workspace));
+    }
+    if policy == TransitionPolicy::FollowMovedRef
+        && !matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name)
+    {
+        return Err(anyhow::Error::new(WorkspaceTracksAnotherRef(format!(
+            "workspace {} does not track {name}, so a head admitted onto that ref moves no working \
+             tree here",
+            workspace.workspace_id
+        ))));
     }
     let target = lease
         .resolve_ref_target(name)
@@ -657,6 +772,13 @@ fn switch(
             idempotent: true,
         }));
     }
+    // The workspace is genuinely behind the ref, so a follow now has to decide
+    // what to do with graph-owned state the caller never committed. Moving the
+    // tree out from under it would discard work the compare-and-swap already
+    // owns, so the transition stops here and the transfer reports it.
+    if policy == TransitionPolicy::FollowMovedRef && workspace.is_dirty() {
+        return Err(graph_owned_changes(&workspace));
+    }
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
         operation_id,
@@ -664,7 +786,11 @@ fn switch(
         expected_generation: roots.generation,
         expected_roots: roots,
         actor: actor.clone(),
-        reason: SWITCH_REASON.to_string(),
+        reason: match policy {
+            TransitionPolicy::Switch => SWITCH_REASON,
+            TransitionPolicy::FollowMovedRef => FOLLOW_REASON,
+        }
+        .to_string(),
         external_objects: Vec::new(),
         git_authority_delta: None,
         changes: Vec::new(),
@@ -736,8 +862,15 @@ fn switch(
     Ok(BranchCommandOutcome::Commit(BranchExecution {
         response: BranchResponse {
             lines: vec![format!(
-                "Switched to {} at change {} ({} projected entries, authority generation {})",
-                name, target_change_id, materialized, receipt.generation
+                "{} {} at change {} ({} projected entries, authority generation {})",
+                match policy {
+                    TransitionPolicy::Switch => "Switched to",
+                    TransitionPolicy::FollowMovedRef => "Followed",
+                },
+                name,
+                target_change_id,
+                materialized,
+                receipt.generation
             )],
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
             report: None,
@@ -1067,6 +1200,13 @@ fn render_target(target: &RefTarget) -> String {
 }
 
 fn classify_branch_error(error: anyhow::Error) -> (StatusCode, String) {
+    // Nothing to do is not a failure, and a follow tells the two apart by this
+    // status rather than by reading the message it would otherwise have to
+    // pattern-match. No branch command can produce it: the marker type is
+    // raised only under `TransitionPolicy::FollowMovedRef`.
+    if error.downcast_ref::<WorkspaceTracksAnotherRef>().is_some() {
+        return (WORKSPACE_TRACKS_ANOTHER_REF, format!("{error:#}"));
+    }
     if error.downcast_ref::<BranchBadRequest>().is_some() {
         return (StatusCode::BAD_REQUEST, format!("{error:#}"));
     }
