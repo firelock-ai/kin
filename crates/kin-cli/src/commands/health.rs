@@ -451,15 +451,22 @@ fn check_supervisor_startup_protocol() -> HealthCheck {
     // Enumerating and probing installs is boundary IO and belongs to
     // daemon_client. Probing costs a subprocess per install, so it is requested
     // only in the state whose answer can change the verdict.
-    let installed: Vec<InstalledKin> =
-        if matches!(sentinel, SupervisorStartupSentinel::ProtocolDirectory) {
-            crate::daemon_client::installed_kin_startup_protocols()
-                .into_iter()
-                .map(|(path, protocol)| InstalledKin { path, protocol })
-                .collect()
-        } else {
-            Vec::new()
-        };
+    //
+    // Never under test. This runs inside the unit suite through
+    // `run_health_checks`, where spawning the host's installed kin-daemon would
+    // make a unit test depend on whatever is installed on the machine and add
+    // subprocesses to a thousand-test parallel run. The verdict logic is
+    // exercised directly against constructed inputs instead.
+    let probe_installs =
+        matches!(sentinel, SupervisorStartupSentinel::ProtocolDirectory) && !cfg!(test);
+    let installed: Vec<InstalledKin> = if probe_installs {
+        crate::daemon_client::installed_kin_startup_protocols()
+            .into_iter()
+            .map(|(path, protocol)| InstalledKin { path, protocol })
+            .collect()
+    } else {
+        Vec::new()
+    };
     supervisor_startup_protocol_check(sentinel, &sentinel_path, &installed)
 }
 

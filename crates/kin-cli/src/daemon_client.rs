@@ -4490,7 +4490,18 @@ pub enum SupervisorStartupSentinel {
 
 /// Classify the shared startup sentinel without taking any authority.
 pub fn supervisor_startup_sentinel() -> SupervisorStartupSentinel {
-    match std::fs::symlink_metadata(supervisor_startup_sentinel_path()) {
+    supervisor_startup_sentinel_in_dir(&supervisor_dir())
+}
+
+/// Classify the startup sentinel under an explicit supervisor directory.
+///
+/// Split out so a test can point at a temporary directory by argument. Reaching
+/// the same behavior by setting the registry-path variable would mutate
+/// process-global state that every other test in the binary shares, which under
+/// `cargo test` (threads in one process, unlike nextest's process per test) is
+/// visible to unrelated tests resolving the Kin home.
+fn supervisor_startup_sentinel_in_dir(dir: &Path) -> SupervisorStartupSentinel {
+    match std::fs::symlink_metadata(dir.join(SUPERVISOR_STARTUP_FILE)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             SupervisorStartupSentinel::Absent
         }
@@ -7531,47 +7542,43 @@ mod tests {
 
     /// The doctor's sentinel classification decides which diagnosis it prints,
     /// so a directory must never read as a legacy marker or the reverse.
+    /// Takes its directory by argument on purpose. An earlier version set
+    /// `KIN_REGISTRY_PATH` instead, and because environment variables are
+    /// process-global while `cargo test` runs the binary's tests as threads in
+    /// one process, unrelated tests resolving the Kin home saw the temporary
+    /// path and failed. `#[serial]` does not help: it orders a test only against
+    /// other serial tests, not against the rest of the suite running in
+    /// parallel. Under nextest, which gives each test its own process, the same
+    /// bug is invisible.
     #[test]
-    #[serial_test::serial]
     fn sentinel_classification_separates_the_protocol_directory_from_a_legacy_marker() {
-        struct RegistryPathGuard(Option<std::ffi::OsString>);
-        impl Drop for RegistryPathGuard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("KIN_REGISTRY_PATH", value),
-                    None => std::env::remove_var("KIN_REGISTRY_PATH"),
-                }
-            }
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("kin-home");
         std::fs::create_dir_all(&home).unwrap();
-        let _guard = RegistryPathGuard(std::env::var_os("KIN_REGISTRY_PATH"));
-        std::env::set_var("KIN_REGISTRY_PATH", home.join("registry.toml"));
+        let sentinel = home.join(SUPERVISOR_STARTUP_FILE);
 
-        let sentinel = supervisor_startup_sentinel_path();
         assert_eq!(
-            sentinel,
-            home.join(SUPERVISOR_STARTUP_FILE),
-            "the classifier must read the same sentinel the launcher writes"
-        );
-        assert_eq!(
-            supervisor_startup_sentinel(),
+            supervisor_startup_sentinel_in_dir(&home),
             SupervisorStartupSentinel::Absent
         );
 
         std::fs::write(&sentinel, "legacy v1 marker").unwrap();
         assert_eq!(
-            supervisor_startup_sentinel(),
+            supervisor_startup_sentinel_in_dir(&home),
             SupervisorStartupSentinel::LegacyMarker,
             "only a launcher older than this protocol writes a regular file here"
         );
 
         std::fs::remove_file(&sentinel).unwrap();
-        drop(try_acquire_supervisor_startup_lock_in_dir(&home).unwrap());
+        let launcher = try_acquire_supervisor_startup_lock_in_dir(&home).unwrap();
         assert_eq!(
-            supervisor_startup_sentinel(),
+            launcher.path(),
+            sentinel,
+            "the classifier must read the same sentinel the launcher writes"
+        );
+        drop(launcher);
+        assert_eq!(
+            supervisor_startup_sentinel_in_dir(&home),
             SupervisorStartupSentinel::ProtocolDirectory
         );
         assert_eq!(supervisor_startup_protocol(), SUPERVISOR_STARTUP_PROTOCOL);
