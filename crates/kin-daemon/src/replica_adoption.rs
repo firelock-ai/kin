@@ -95,6 +95,14 @@ pub enum NativeCloneError {
         #[source]
         source: RepositoryTransferError,
     },
+
+    /// A blocking step did not run to completion, so nothing is claimed about
+    /// what is on disk: the step that would have said so is the one that
+    /// failed. Kept separate from every other arm rather than folded into the
+    /// nearest one, because attributing a panic to the step before it would
+    /// name a cause nobody observed.
+    #[error("the {step} step of a native clone did not run to completion: {detail}")]
+    Interrupted { step: &'static str, detail: String },
 }
 
 /// One completed native clone.
@@ -181,8 +189,9 @@ pub async fn clone_native_replica(
         Ok::<_, NativeCloneError>((identity, Arc::new(state)))
     })
     .await
-    .map_err(|error| {
-        NativeCloneError::Identity(RepositoryTransferError::Storage(error.to_string()))
+    .map_err(|error| NativeCloneError::Interrupted {
+        step: "identity and replica creation",
+        detail: error.to_string(),
     })??;
 
     let adopted = identity.repository_id.clone();
@@ -219,8 +228,10 @@ pub async fn clone_native_replica(
         )
     })
     .await
-    .map_err(|error| RepositoryTransferError::Storage(error.to_string()))
-    .and_then(|verified| verified)
+    .map_err(|error| NativeCloneError::Interrupted {
+        step: "adoption verification",
+        detail: error.to_string(),
+    })?
     .map_err(|source| NativeCloneError::Adoption {
         repository_id: adopted.to_string(),
         source,
