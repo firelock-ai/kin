@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Resume the post-publication stages for the version main currently carries.
+# The controller proves the exact non-yanked registry row, resolves the commit
+# that introduced that version, requires a successful CI push run at it, runs a
+# fresh registry-only consumer build, mints the absent v<version> tag at that
+# exact commit, waits for the tag-triggered Release workflow, and dispatches
+# downstreams. It never publishes a crate and never moves, deletes, or
+# force-updates a tag; a same-name tag at another commit is terminal.
+#
+# Dispatch only, deliberately. Recovery reconciles whatever version main carries
+# at the moment it runs, so a schedule would silently retarget after a bump.
+#
+# The reusable workflow is pinned by commit sha because no kin-actions release
+# tag contains this controller yet. Repin to that tag once it is minted.
+
+name: Release Recovery
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recovery:
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-release-recovery.yml@d2d03399307cb39b6cd34df1c9f0e672d63177d8
+    with:
+      package: kin-model
+      manifest: Cargo.toml
+      required-workflow: CI
+      release-workflow: Release
+    # The credential-bearing job binds the registry-publish environment, whose
+    # secrets outrank same-named values mapped here. Repository scope stays the
+    # compatibility path while environment scope is the authority.
+    secrets:
+      KIN_RELEASE_BOT_APP_ID: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+      KIN_RELEASE_BOT_PRIVATE_KEY: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+      KIN_DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
