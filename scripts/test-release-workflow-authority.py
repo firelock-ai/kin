@@ -48,6 +48,17 @@ TAG_LISTING_FORMAT = (
 # tag until the train opens the bump the record exists to unblock. The empty
 # argument is spelled as a literal rather than an expanded variable so that
 # refilling it is a visible diff here and not a silent assignment upstream.
+# Third-party actions inside the workflows that produce presence-required release
+# contexts. A required context is release evidence, so whatever can write into it
+# is release supply chain and has to be pinned to an immutable object rather than
+# a tag anyone upstream can move. `actions/*` are first-party and governed
+# separately; these are the ones outside that trust boundary.
+EXPECTED_REQUIRED_CONTEXT_ACTION_PINS = {
+    ".github/workflows/sast.yml": {
+        "dtolnay/rust-toolchain": "191af2e1955bbe165f9bbacff2d2438002dff4d4",
+        "taiki-e/install-action": "6a1bd70eaac3c8bdf093356838d7ee09fda951cf",
+    },
+}
 EXPECTED_SELECTOR_INVOCATIONS = {
     "release-tag": ('"$abandoned"', '"$candidate_tags"', '"$TAG"', '"$admissible"'),
     "release-train": ('"$abandoned"', '"$candidate_tags"', '""', '"$admissible"'),
@@ -2159,6 +2170,38 @@ def selector_invocation(workflow: str, content: str) -> tuple[str, ...]:
             f"found {len(invocations)}"
         )
     return invocations[0]
+
+
+def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
+    """Pin the supply chain of anything that can write a required release context.
+
+    A required context is the evidence a release is minted from, so an action
+    running inside its producer can decide what that evidence says. A floating
+    tag leaves that decision with whoever can move the tag upstream.
+    """
+
+    for path, expected in EXPECTED_REQUIRED_CONTEXT_ACTION_PINS.items():
+        content = workflows.get(ROOT / path)
+        if content is None:
+            raise AssertionError(f"required-context producer is missing: {path}")
+        actual: dict[str, str] = {}
+        for reference in re.findall(r"uses:\s*(\S+)", content):
+            if reference.startswith("actions/"):
+                continue
+            action, _, version = reference.partition("@")
+            actual[action] = version
+        if actual != expected:
+            raise AssertionError(
+                f"{path} produces a presence-required release context, so every "
+                "third-party action in it must stay pinned to its exact reviewed "
+                f"commit: expected={expected} actual={actual}"
+            )
+        for action, sha in actual.items():
+            if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                raise AssertionError(
+                    f"{path} uses {action} at '{sha}', which is a movable ref "
+                    "rather than an immutable commit"
+                )
 
 
 def assert_selector_arguments(release_tag: str, release_train: str) -> None:
@@ -4749,6 +4792,7 @@ def main() -> None:
     # qualifying pull request. This is not a repository-wide no-PR-writes
     # invariant.
     assert_rust_cache_steps(workflow_sources)
+    assert_required_context_action_pins(workflow_sources)
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)
