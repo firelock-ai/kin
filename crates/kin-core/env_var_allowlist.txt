@@ -12,6 +12,7 @@
 # conscious decision to keep a name out of the registry, not a place to silence a
 # real gap.
 #
+KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
 KIN_REAL_REPOSITORY
 KIN_TEST_RUNTIME_OWNER_TOKEN
 KIN_UPDATE_TEMP_CLEANUP_CRASH_PARENT
