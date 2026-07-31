@@ -288,6 +288,7 @@ pub(crate) fn plan_session_workspace_admission(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction.validate()?;
     let transaction_hash = transaction.transaction_hash()?;
@@ -555,6 +556,7 @@ pub(crate) fn publish_workspace_tree(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction.validate()?;
 
@@ -756,6 +758,7 @@ fn plan_native_commit_inner(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
+        external_reference_deltas: Vec::new(),
     };
     change.id = compute_semantic_change_id(&change)?;
 
@@ -818,6 +821,7 @@ fn plan_native_commit_inner(
         workspace_mutation: Some(workspace_mutation),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction.validate()?;
 
@@ -1196,6 +1200,7 @@ mod tests {
                     new: LocatedEntry::new(artifact.path.clone(), artifact.entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         artifact
@@ -1874,6 +1879,7 @@ mod tests {
                     new: LocatedEntry::new(artifact.path, artifact.entry),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         let plan = plan_native_commit(

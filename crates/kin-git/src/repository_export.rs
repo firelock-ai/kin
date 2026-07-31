@@ -1255,6 +1255,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         native.id = compute_semantic_change_id(&native).unwrap();
         let expected_tree = base_tree.apply(&native.tree_deltas).unwrap();
@@ -1609,6 +1610,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         change

@@ -824,6 +824,7 @@ mod tests {
             spec_link: None,
             evidence: Vec::new(),
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = compute_semantic_change_id(&change).unwrap();
         change
@@ -908,6 +909,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();

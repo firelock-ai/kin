@@ -1190,6 +1190,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
 
         let plan = build_change_verification_plan(graph.as_ref(), &change, 1).unwrap();

@@ -415,6 +415,7 @@ fn fast_forward(
         relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: tree_deltas.clone(),
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     preflight_merge_delta(
         state,
@@ -455,6 +456,7 @@ fn fast_forward(
         )?),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     publish(
         state,
@@ -601,6 +603,7 @@ fn three_way(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
+        external_reference_deltas: Vec::new(),
     };
     change.id = compute_semantic_change_id(&change).context("hash exact merge change")?;
     let merge_target = RefTarget::change(change.id);
@@ -644,6 +647,7 @@ fn three_way(
         relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: workspace_tree_deltas.clone(),
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     preflight_merge_delta(
         state,
@@ -688,6 +692,7 @@ fn three_way(
         )?),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     let mut execution = publish(
         state,
@@ -945,6 +950,7 @@ pub(crate) fn publish_resolved_merge(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
+        external_reference_deltas: Vec::new(),
     };
     change.id = compute_semantic_change_id(&change).context("hash exact merge change")?;
     let merge_target = RefTarget::change(change.id);
@@ -982,6 +988,7 @@ pub(crate) fn publish_resolved_merge(
         relation_deltas: daemon_semantic_delta.relation_deltas().to_vec(),
         tree_deltas: workspace_tree_deltas.clone(),
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     preflight_merge_delta(
         state,
@@ -1033,6 +1040,7 @@ pub(crate) fn publish_resolved_merge(
             record.clone(),
             terminated.clone(),
         )),
+        sealed_observation: None,
     };
     transaction
         .validate()
@@ -1704,6 +1712,7 @@ fn open_conflicted_merge(
         workspace_mutation: None,
         local_overlay_delta: None,
         merge_transaction_delta: Some(delta),
+        sealed_observation: None,
     };
     transaction
         .validate()

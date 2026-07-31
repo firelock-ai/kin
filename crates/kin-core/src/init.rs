@@ -1220,6 +1220,7 @@ fn build_repository_bootstrap_transaction(
         workspace_mutation: Some(workspace_mutation),
         local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(local_overlay)),
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
 
     if let Some(change_id) = initial_change_id {
@@ -2900,6 +2901,7 @@ mod tests {
             risk_summary: None,
             origin: ChangeOrigin::Native,
             admission_policy_delta: Some(AdmissionPolicyDelta::initialize(shared_policy.clone())),
+            external_reference_deltas: Vec::new(),
         };
         initial_change.id = compute_semantic_change_id(&initial_change).unwrap();
 

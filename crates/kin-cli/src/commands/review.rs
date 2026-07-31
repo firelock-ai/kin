@@ -1313,6 +1313,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         base.id = kin_model::compute_semantic_change_id(&base).unwrap();
         let base_id = base.id;
@@ -1333,6 +1334,7 @@ mod tests {
             evidence: vec![],
             risk_summary: None,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         head.id = kin_model::compute_semantic_change_id(&head).unwrap();
         let head_id = head.id;

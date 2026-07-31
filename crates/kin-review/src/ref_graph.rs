@@ -440,6 +440,7 @@ mod tests {
                     ),
                 }],
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .expect("test artifact admission");
         artifact_id
@@ -709,6 +710,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

@@ -329,6 +329,7 @@ mod tests {
             risk_summary: None,
             origin: kin_model::ChangeOrigin::Native,
             admission_policy_delta,
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change
@@ -527,6 +528,7 @@ mod tests {
             }),
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         authority
             .commit_repository_transaction(transaction)
@@ -628,6 +630,7 @@ mod tests {
             }),
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         authority
             .commit_repository_transaction(transaction)
@@ -776,6 +779,7 @@ mod tests {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         authority
             .commit_repository_transaction(transaction)
@@ -2075,6 +2079,7 @@ mod tests {
                     relation_deltas: vec![],
                     tree_deltas: change.tree_deltas.clone(),
                     admission_policy_delta: None,
+                    external_reference_deltas: Vec::new(),
                 })
                 .unwrap();
             store.create_change(&change).unwrap();
@@ -5547,6 +5552,7 @@ mod tests {
                     kin_model::SharedAdmissionPolicy::empty(0),
                 )
             }),
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_model::compute_semantic_change_id(&change).unwrap();
         change

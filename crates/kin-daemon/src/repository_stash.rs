@@ -383,6 +383,7 @@ fn push(
         spec_link: None,
         evidence: Vec::new(),
         risk_summary: None,
+        external_reference_deltas: Vec::new(),
     };
     change.id = compute_semantic_change_id(&change).context("identify the exact sealed change")?;
     let sealed_change_id = change.id;
@@ -453,6 +454,7 @@ fn push(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     seal.validate()
         .context("validate the exact stash seal transaction")?;
@@ -576,6 +578,7 @@ fn return_to_base(
         )
         .context("plan the exact workspace return tree transition for the daemon view")?,
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -613,6 +616,7 @@ fn return_to_base(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction
         .validate()
@@ -780,6 +784,7 @@ fn pop(
         tree_deltas: kin_core::exact_tree_correction(&daemon_snapshot.resolved_tree, &sealed_tree)
             .context("plan the exact stash restore tree transition for the daemon view")?,
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -823,6 +828,7 @@ fn pop(
         }),
         local_overlay_delta: None,
         merge_transaction_delta: None,
+        sealed_observation: None,
     };
     transaction
         .validate()

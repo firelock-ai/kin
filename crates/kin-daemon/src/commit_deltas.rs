@@ -84,6 +84,7 @@ pub fn compute_deltas_vs_repository_authority(
             tree: ResolvedTree::default(),
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
+            external_references: HashMap::new(),
         },
     };
     compute_deltas_from_resolved_state(graph, committed)
@@ -232,6 +233,7 @@ pub fn compute_selected_checkout_delta(
         relation_deltas: semantic_delta.relation_deltas().to_vec(),
         tree_deltas: kin_core::exact_tree_correction(&current.resolved_tree, desired_tree)?,
         admission_policy_delta: None,
+        external_reference_deltas: Vec::new(),
     };
 
     let preflight = InMemoryGraph::from_snapshot(current).map_err(DaemonError::Graph)?;
@@ -412,6 +414,13 @@ fn checkout_node_exists(
         GraphNodeId::Contract(contract_id) => current.contracts.contains_key(&contract_id),
         GraphNodeId::Work(work_id) => current.work_items.contains_key(&work_id),
         GraphNodeId::VerificationRun(run_id) => current.verification_runs.contains_key(&run_id),
+        // External references are not scoped by a path selection, and this
+        // delta adds none, so the desired set equals the current one. An edge
+        // to a reference the graph does not hold is dropped exactly like any
+        // other absent endpoint rather than inventing the reference.
+        GraphNodeId::ExternalReference(reference_id) => {
+            current.external_references.contains_key(&reference_id)
+        }
     }
 }
 
@@ -886,6 +895,7 @@ mod tests {
                 )
                 .unwrap(),
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .unwrap();
         let target = ResolvedGraphState {
@@ -898,6 +908,7 @@ mod tests {
             tree: target_tree,
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
+            external_references: HashMap::new(),
         };
 
         let delta = compute_selected_checkout_delta(
@@ -978,6 +989,7 @@ mod tests {
             tree: tree.clone(),
             entity_tombstones: Default::default(),
             relation_tombstones: Default::default(),
+            external_references: HashMap::new(),
         };
 
         let delta =
@@ -988,6 +1000,88 @@ mod tests {
         graph.apply_transaction_delta(&delta).unwrap();
         assert_eq!(graph.get_entity(&selected_id).unwrap(), Some(target_entity));
         assert!(graph.to_snapshot().relations.is_empty());
+    }
+
+    /// A path selection does not scope the external-reference domain, so a
+    /// spliced edge to an external endpoint survives exactly when the graph
+    /// already holds that reference. The absent case must drop the edge rather
+    /// than fabricate the endpoint, because the resulting delta is applied
+    /// against a graph that rejects a relation to a reference it does not hold.
+    #[test]
+    fn selected_checkout_keeps_external_reference_edges_only_when_the_reference_exists() {
+        fn checkout_delta_for_external_edge(
+            reference: &kin_model::ExternalReference,
+            present_in_graph: bool,
+        ) -> TransactionDelta {
+            let selected = RepoPath::from_utf8("src").unwrap();
+            let selected_id = EntityId::new();
+            let artifact_id = ArtifactId::new();
+            let entry = TreeEntry::blob(Hash256::from_bytes([0x41; 32]), false);
+            let tree = resolved_tree(vec![(
+                artifact_id,
+                RepoPath::from_utf8("src/lib.rs").unwrap(),
+                entry,
+            )]);
+            let target_entity = make_entity_with_id(
+                selected_id,
+                "selected",
+                "src/lib.rs",
+                LanguageId::Rust,
+                [0x42; 32],
+            );
+            let edge = relation(
+                RelationId::new(),
+                GraphNodeId::Entity(selected_id),
+                GraphNodeId::ExternalReference(reference.id),
+                RelationKind::Calls,
+            );
+            let graph = InMemoryGraph::new();
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: kin_core::exact_tree_correction(&ResolvedTree::default(), &tree)
+                        .unwrap(),
+                    external_reference_deltas: if present_in_graph {
+                        vec![kin_model::ExternalReferenceDelta::Added {
+                            new: reference.clone(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..TransactionDelta::default()
+                })
+                .unwrap();
+            let target = ResolvedGraphState {
+                entities: HashMap::from([(selected_id, target_entity)]),
+                relations: HashMap::from([(edge.id, edge)]),
+                entity_revisions: Default::default(),
+                tree: tree.clone(),
+                entity_tombstones: Default::default(),
+                relation_tombstones: Default::default(),
+                external_references: HashMap::from([(reference.id, reference.clone())]),
+            };
+
+            let delta =
+                compute_selected_checkout_delta(&graph, &selected, &target, &tree, &tree).unwrap();
+            graph
+                .apply_transaction_delta(&delta)
+                .expect("a checkout delta must apply to the graph it was computed against");
+            delta
+        }
+
+        let reference = kin_model::ExternalReference::new_resolved(
+            "kin.checkout-fixture-v1",
+            "fixture-source",
+            "fixture::symbol",
+        )
+        .unwrap();
+
+        let absent = checkout_delta_for_external_edge(&reference, false);
+        assert!(absent.relation_deltas.is_empty());
+        assert!(absent.external_reference_deltas.is_empty());
+
+        let present = checkout_delta_for_external_edge(&reference, true);
+        assert_eq!(present.relation_deltas.len(), 1);
+        assert!(present.external_reference_deltas.is_empty());
     }
 
     fn genesis_change() -> kin_model::SemanticChange {
@@ -1006,6 +1100,7 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         change
@@ -1035,6 +1130,7 @@ mod tests {
             spec_link: None,
             evidence: vec![],
             risk_summary: None,
+            external_reference_deltas: Vec::new(),
         };
         change.id = kin_core::compute_semantic_change_id(&change).unwrap();
         let change_id = change.id;
@@ -1050,6 +1146,7 @@ mod tests {
                 relation_deltas: Vec::new(),
                 tree_deltas: correction,
                 admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
             })
             .expect("publish committed tree as live test authority");
         change_id
@@ -1093,6 +1190,7 @@ mod tests {
             relation_deltas: Vec::new(),
             tree_deltas,
             admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
         })?;
         Ok(())
     }

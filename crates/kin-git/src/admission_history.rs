@@ -157,6 +157,7 @@ impl AdmittedSemanticGitImportPlan {
             workspace_mutation: None,
             local_overlay_delta: None,
             merge_transaction_delta: None,
+            sealed_observation: None,
         };
         transaction.validate()?;
         Ok(transaction)
