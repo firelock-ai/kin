@@ -2632,13 +2632,53 @@ def main() -> None:
     ):
         require(release, policy, "Kin and pinned kin-vfs release compatibility gate")
 
+    # Windows admission refusals are stated once and asserted from one script.
+    # The installer leg proves them on the landing push, which is the commit
+    # release proof reads. The authority job proves the same assertions against
+    # the same command on every pull request and merge group, which is the only
+    # place an admission change is still reviewable. Pin both invocations and
+    # the assertions themselves: dropping the pull-request half restores a
+    # behavior change no one can see until it fails a required check on a
+    # release commit, and letting the two legs carry their own copies restores
+    # the drift that made the copies disagree.
+    windows_admission = (ROOT / "scripts" / "assert-windows-init-refusals.sh").read_text(
+        encoding="utf-8"
+    )
     for policy in (
-        "Reopen a fresh Windows graph through the daemon",
-        'grep -q "byte-exact executable-mode proof is unsupported"',
-        'grep -q "atomic repository config replacement is unsupported"',
-        'test ! -e "$boot_dir/.kin/kindb/head-generation"',
+        '"$kin_bin" init',
+        'CONFIG_REFUSAL="cannot publish repository config"',
+        'CONFIG_CAUSE="an atomic exchanging or no-replace directory rename"',
+        'SOURCE_PROOF_STAGE="prove mutable Git workspace"',
+        'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
+        'require_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
+        'require_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
+        'fail "$label unexpectedly succeeded" "$log"',
+        'if [ -e "$dir/.kin" ]; then',
     ):
-        require(ci_workflow, policy, "Windows daemon reopen regression")
+        require(windows_admission, policy, "Windows admission refusal assertions")
+
+    ci_jobs = workflow_job_blocks(ci_workflow)
+    for job_id in ("windows-authority-tests", "windows-installer"):
+        for policy in (
+            "- name: Assert Windows admission refusals",
+            "bash ./scripts/assert-windows-init-refusals.sh",
+        ):
+            require(ci_jobs[job_id], policy, f"shared Windows admission proof in {job_id}")
+    require(
+        ci_jobs["windows-authority-tests"],
+        "target/x86_64-pc-windows-msvc/debug/kin.exe",
+        "pull-request Windows admission proof",
+    )
+    require(
+        ci_jobs["windows-installer"],
+        "target/x86_64-pc-windows-msvc/release/kin.exe",
+        "landing-push Windows admission proof",
+    )
+    if re.search(r"(?m)^    if:", ci_jobs["windows-authority-tests"]) is not None:
+        raise AssertionError(
+            "the Windows authority job must stay on every event, so admission "
+            "refusals are asserted before a release commit can carry them"
+        )
 
     for policy in (
         'workflows: ["Release"]',

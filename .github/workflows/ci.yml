@@ -92,6 +92,7 @@ jobs:
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
+          bash -n ./scripts/assert-windows-init-refusals.sh
 
   windows-authority-tests:
     name: Windows authority tests
@@ -99,7 +100,7 @@ jobs:
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Preserve tracked bytes on Windows
         shell: bash
@@ -278,6 +279,27 @@ jobs:
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test repository_merge_resolution
 
+      # The two steps below are the pull-request half of the Windows admission
+      # contract. The installer leg asserts the same refusals against the
+      # release binary, but it runs only on the landing push, so on its own it
+      # can report an admission change no earlier than a required check
+      # failing on a release commit. The feature set matches the installer
+      # leg's so both legs drive the same build of the command.
+      - name: Build the Windows CLI the admission assertions drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --bin kin
+
+      - name: Assert Windows admission refusals
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./scripts/assert-windows-init-refusals.sh \
+            "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/debug/kin.exe" \
+            "$RUNNER_TEMP/kin-windows-admission"
+
   windows-installer:
     name: Windows installer + vector-free release build
     needs: changes
@@ -410,44 +432,19 @@ jobs:
           }
           NODE
 
-      - name: Reopen a fresh Windows graph through the daemon
+      # Both admission boundaries still refuse on Windows, and the shared
+      # script is the only statement of what they refuse. The pull-request
+      # authority job runs the same assertions against a debug binary, so an
+      # admission change that moves the refusal turns a pull request red
+      # instead of first turning a release commit red here. Daemon reopen
+      # assertions live in the Linux daemon smoke until the Windows ports land.
+      - name: Assert Windows admission refusals
         shell: bash
         run: |
           set -euo pipefail
-          trap 'taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true' EXIT
-          bin_dir="$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release"
-          export PATH="$bin_dir:$PATH"
-          repo_dir="$RUNNER_TEMP/kin-windows-daemon-reopen"
-          mkdir -p "$repo_dir"
-          cd "$repo_dir"
-          git init -q
-          git config user.email ci@firelock.ai
-          git config user.name ci
-          printf 'fn probe() {}\n' > probe.rs
-          git add probe.rs
-          git commit -qm "probe"
-          # Exact Git admission needs the byte-exact executable-mode proof,
-          # which is a unix capability; Windows must refuse loudly, naming
-          # the gate, instead of admitting without the proof.
-          if kin.exe init > "$RUNNER_TEMP/kin-init-git.txt" 2>&1; then
-            echo "::error::Windows exact Git admission unexpectedly succeeded"
-            exit 1
-          fi
-          grep -q "byte-exact executable-mode proof is unsupported" "$RUNNER_TEMP/kin-init-git.txt"
-          # Fresh non-Git bootstrap is also gated off Windows today: repository
-          # config publication requires capability-owned atomic replacement,
-          # a unix capability. The refusal must be loud and name that gate;
-          # daemon reopen assertions live in the Linux daemon smoke until the
-          # Windows ports land.
-          boot_dir="$RUNNER_TEMP/kin-windows-daemon-boot"
-          mkdir -p "$boot_dir"
-          cd "$boot_dir"
-          if kin.exe init > "$RUNNER_TEMP/kin-init.txt" 2>&1; then
-            echo "::error::Windows non-Git bootstrap unexpectedly succeeded"
-            exit 1
-          fi
-          grep -q "atomic repository config replacement is unsupported" "$RUNNER_TEMP/kin-init.txt"
-          test ! -e "$boot_dir/.kin/kindb/head-generation"
+          bash ./scripts/assert-windows-init-refusals.sh \
+            "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/kin.exe" \
+            "$RUNNER_TEMP/kin-windows-admission"
 
   # Classify the PR diff so documentation-only and workflow-only changes can
   # satisfy the heavy required checks without a toolchain or registry
