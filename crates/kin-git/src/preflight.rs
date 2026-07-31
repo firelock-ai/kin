@@ -797,9 +797,26 @@ enum ExecutableModeAuthority {
 enum SymlinkMaterialization {
     /// The worktree carries a real symbolic link.
     Link,
-    /// `core.symlinks=false`: Git materializes a tracked symlink as a regular
-    /// file whose bytes are the link target.
-    TargetTextFile,
+    /// Git materializes a tracked symlink as a regular file whose bytes are
+    /// the link target, because this worktree cannot hold real links.
+    TargetTextFile(SymlinkCapabilitySource),
+}
+
+/// Who decided that a tracked symlink is materialized as target text.
+///
+/// A repository that recorded `core.symlinks=false` stated something; one that
+/// recorded nothing stated nothing and had a platform default applied to it.
+/// Both end at the same materialization, and a refusal that blames the
+/// repository for a value it never wrote is describing the wrong party. This
+/// is the same distinction [`LocalGitHookExecutability`] draws between an
+/// observation and its absence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SymlinkCapabilitySource {
+    /// The repository recorded `core.symlinks=false`.
+    RepositoryRecorded,
+    /// The repository recorded no value, so Git's compiled-in default for this
+    /// platform decides.
+    PlatformDefault,
 }
 
 /// Resolve how this host and repository materialize modes and symbolic links.
@@ -840,10 +857,28 @@ fn worktree_materialization(
              mode",
         ));
     }
-    let materialization = if config.boolean("core.symlinks") == Some(true) {
-        SymlinkMaterialization::Link
-    } else {
-        SymlinkMaterialization::TargetTextFile
+    let materialization = match config.boolean("core.symlinks") {
+        Some(true) => SymlinkMaterialization::Link,
+        Some(false) => {
+            SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded)
+        }
+        // `boolean` answers `None` both for a key that is absent and for one
+        // holding a value Git cannot read as a boolean. Those are different
+        // repository states and only the first has a defensible default, so a
+        // recorded value that is not a boolean is refused by name rather than
+        // silently resolving to off.
+        None => match config.string("core.symlinks") {
+            Some(recorded) => {
+                return Err(preflight_error(format!(
+                    "repository records core.symlinks={recorded:?}, which Git cannot resolve as a \
+                     boolean, so whether this worktree holds real symbolic links or the target \
+                     text Git writes in their place is unstated. Record true or false"
+                )));
+            }
+            None => {
+                SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::PlatformDefault)
+            }
+        },
     };
     Ok((ExecutableModeAuthority::IndexMode, materialization))
 }
@@ -895,11 +930,7 @@ fn walk_directory(
         .map_err(|error| GitError::io(absolute, error))?;
     // Names are resolved before ordering so a name this host cannot represent
     // exactly fails the walk rather than sorting under a repaired substitute.
-    let mut entries = entries
-        .into_iter()
-        .map(|entry| Ok((os_bytes(&entry.file_name())?, entry)))
-        .collect::<Result<Vec<_>>>()?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = exact_directory_names(absolute, entries)?;
 
     for (name, directory_entry) in entries {
         if root && name == b".git" {
@@ -1026,13 +1057,24 @@ fn prove_tracked_entry(
                 // that file's bytes against the committed target blob. Reading
                 // those bytes is the same observation Git makes, not a
                 // filesystem fallback for a missing link.
-                SymlinkMaterialization::TargetTextFile => {
+                SymlinkMaterialization::TargetTextFile(source) => {
                     if metadata.file_type().is_symlink() {
-                        return Err(preflight_error(format!(
-                            "tracked symlink {path} is a real symbolic link, but core.symlinks is \
-                             off, so Git writes and compares the target as a regular file here; \
-                             the worktree disagrees with the repository's own configuration"
-                        )));
+                        return Err(preflight_error(match source {
+                            SymlinkCapabilitySource::RepositoryRecorded => format!(
+                                "tracked symlink {path} is a real symbolic link, but the \
+                                 repository records core.symlinks=false, so Git writes and \
+                                 compares the target as a regular file here; the worktree \
+                                 disagrees with the repository's own configuration"
+                            ),
+                            SymlinkCapabilitySource::PlatformDefault => format!(
+                                "tracked symlink {path} is a real symbolic link, but this \
+                                 repository records no core.symlinks value and Git's default on \
+                                 this platform writes and compares the target as a regular file; \
+                                 the worktree holds a link the Git that reads it would not have \
+                                 created. Record core.symlinks=true if this worktree really does \
+                                 carry real links"
+                            ),
+                        }));
                     }
                     if !metadata.is_file() {
                         return Err(preflight_error(format!(
@@ -1142,11 +1184,7 @@ fn find_lock_file(root: &Path) -> Result<Option<PathBuf>> {
         .map_err(|error| GitError::io(root, error))?
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| GitError::io(root, error))?;
-    let mut entries = entries
-        .into_iter()
-        .map(|entry| Ok((os_bytes(&entry.file_name())?, entry)))
-        .collect::<Result<Vec<_>>>()?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = exact_directory_names(root, entries)?;
     for (name, entry) in entries {
         let metadata = fs::symlink_metadata(entry.path())
             .map_err(|error| GitError::io(entry.path(), error))?;
@@ -1231,10 +1269,12 @@ fn local_hook_facts(repo: &gix::Repository) -> Result<(bool, Vec<LocalGitHookFac
         }
         Err(error) => return Err(GitError::io(&hooks_dir, error)),
     };
+    let entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| GitError::io(&hooks_dir, error))?;
+    let entries = exact_directory_names(&hooks_dir, entries)?;
     let mut hooks = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| GitError::io(&hooks_dir, error))?;
-        let name = os_bytes(&entry.file_name())?;
+    for (name, entry) in entries {
         if name.ends_with(b".sample") {
             continue;
         }
@@ -2070,6 +2110,62 @@ fn preflight_error(reason: impl Into<String>) -> GitError {
     GitError::MigrationPreflight(reason.into())
 }
 
+/// Exact names for one directory listing, ordered by those exact bytes.
+///
+/// Resolving into a `Result` collection would stop at the first name this host
+/// cannot represent, so a worktree holding three of them would report one and
+/// the operator would discover the next only by re-running. Admission refuses
+/// with every non-representable entry named instead, which is what makes one
+/// refusal enough to act on.
+fn exact_directory_names(
+    directory: &Path,
+    entries: Vec<fs::DirEntry>,
+) -> Result<Vec<(Vec<u8>, fs::DirEntry)>> {
+    exact_directory_names_resolved_by(directory, entries, os_bytes)
+}
+
+/// The body above, with the name resolver supplied.
+///
+/// On Unix `os_bytes` cannot fail, so the gathering behaviour would otherwise
+/// have no execution anywhere except Windows. Taking the resolver as an
+/// argument lets both platforms run the same code against a chosen set of
+/// unrepresentable names.
+fn exact_directory_names_resolved_by(
+    directory: &Path,
+    entries: Vec<fs::DirEntry>,
+    mut resolve: impl FnMut(&std::ffi::OsStr) -> Result<Vec<u8>>,
+) -> Result<Vec<(Vec<u8>, fs::DirEntry)>> {
+    let mut named = Vec::with_capacity(entries.len());
+    let mut unrepresentable = Vec::new();
+    for entry in entries {
+        let name = entry.file_name();
+        match resolve(&name) {
+            Ok(bytes) => named.push((bytes, entry)),
+            // Debug rendering of an OS string escapes ill-formed units rather
+            // than repairing them, so two distinct names this host cannot
+            // represent do not print alike in the refusal that names both.
+            Err(_) => unrepresentable.push(format!("{name:?}")),
+        }
+    }
+    if !unrepresentable.is_empty() {
+        unrepresentable.sort();
+        let (subject, verb, object) = if unrepresentable.len() == 1 {
+            ("entry", "is", "it")
+        } else {
+            ("entries", "are", "them")
+        };
+        return Err(preflight_error(format!(
+            "{} {subject} under {} {verb} not well-formed Unicode, so this platform cannot name \
+             {object} exactly: {}",
+            unrepresentable.len(),
+            directory.display(),
+            unrepresentable.join(", ")
+        )));
+    }
+    named.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(named)
+}
+
 /// Exact bytes of one filesystem entry name.
 ///
 /// Unix names are already byte strings, so they are exact as read.
@@ -2287,14 +2383,19 @@ mod platform_materialization_tests {
         // privilege this host granted it, so pin the resolution against what
         // the repository actually says rather than against one host's default.
         let recorded = repository.config_snapshot().boolean("core.symlinks");
-        let expected = if recorded == Some(true) {
-            SymlinkMaterialization::Link
-        } else {
-            SymlinkMaterialization::TargetTextFile
+        let expected = match recorded {
+            Some(true) => SymlinkMaterialization::Link,
+            Some(false) => {
+                SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded)
+            }
+            None => {
+                SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::PlatformDefault)
+            }
         };
         assert_eq!(
             symlinks, expected,
-            "core.symlinks resolved to {recorded:?}, which must decide the materialization"
+            "core.symlinks resolved to {recorded:?}, which must decide both the materialization \
+             and who decided it"
         );
     }
 
@@ -2395,7 +2496,7 @@ mod platform_materialization_tests {
             TreeEntry::Symlink { target_blob },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
-            SymlinkMaterialization::TargetTextFile,
+            SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
         .expect("the target text file matches the committed target");
 
@@ -2405,7 +2506,7 @@ mod platform_materialization_tests {
             TreeEntry::Symlink { target_blob },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
-            SymlinkMaterialization::TargetTextFile,
+            SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
         .expect_err("a different target is not the committed one");
         assert!(
@@ -2416,36 +2517,81 @@ mod platform_materialization_tests {
         );
     }
 
+    /// Create a real symbolic link, or say why this host could not.
+    ///
+    /// A test that returns early when the privilege is missing reports `ok`
+    /// for both "the refusal was proven" and "nothing ran", and the log cannot
+    /// tell them apart. The privilege is therefore asserted rather than
+    /// assumed: a host that genuinely cannot create links records that
+    /// deliberately by setting `KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE`, and prints a
+    /// skip marker instead of a silent pass. CI sets nothing, so a runner
+    /// without the privilege turns the leg red rather than green.
+    #[cfg(windows)]
+    fn create_real_symlink_or_skip(target: &str, link: &std::path::Path) -> bool {
+        let Err(error) = std::os::windows::fs::symlink_file(target, link) else {
+            return true;
+        };
+        assert!(
+            std::env::var_os("KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE").is_some(),
+            "this host cannot create a symbolic link ({error}), so the refusal that keeps Kin \
+             from reading through one was never exercised. Enable Developer Mode or grant \
+             SeCreateSymbolicLinkPrivilege, or set KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE=1 to record \
+             deliberately that this run proves nothing about it"
+        );
+        println!(
+            "SKIPPED: no symbolic-link privilege on this host, so the real-link refusal was not \
+             exercised"
+        );
+        false
+    }
+
+    #[cfg(unix)]
+    fn create_real_symlink_or_skip(target: &str, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        true
+    }
+
     #[test]
     fn a_real_link_where_links_are_off_is_refused_rather_than_read_through() {
         let temp = tempfile::tempdir().expect("tempdir");
         let blob_store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let target_blob = blob_store.write(b"src/main.rs").expect("target blob");
 
-        let tracked = temp.path().join("tracked");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("src/main.rs", &tracked).expect("symlink");
-        #[cfg(windows)]
-        {
-            // Requires the symlink privilege; without it there is nothing to
-            // build the case out of, and the refusal cannot arise either.
-            if std::os::windows::fs::symlink_file("src/main.rs", &tracked).is_err() {
+        // Both sources resolve to the same materialization and must produce
+        // the same refusal, but they must not blame the same party for it.
+        for (source, blamed) in [
+            (
+                SymlinkCapabilitySource::RepositoryRecorded,
+                "records core.symlinks=false",
+            ),
+            (
+                SymlinkCapabilitySource::PlatformDefault,
+                "records no core.symlinks value",
+            ),
+        ] {
+            let tracked = temp.path().join(format!("tracked-{source:?}"));
+            if !create_real_symlink_or_skip("src/main.rs", &tracked) {
                 return;
             }
-        }
 
-        let error = prove_one_entry(
-            &tracked,
-            TreeEntry::Symlink { target_blob },
-            &blob_store,
-            ExecutableModeAuthority::IndexMode,
-            SymlinkMaterialization::TargetTextFile,
-        )
-        .expect_err("a real link contradicts core.symlinks=off");
-        assert!(
-            error.to_string().contains("core.symlinks is off"),
-            "unexpected error: {error}"
-        );
+            let error = prove_one_entry(
+                &tracked,
+                TreeEntry::Symlink { target_blob },
+                &blob_store,
+                ExecutableModeAuthority::IndexMode,
+                SymlinkMaterialization::TargetTextFile(source),
+            )
+            .expect_err("a real link contradicts a worktree that cannot hold one");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("is a real symbolic link"),
+                "unexpected error: {rendered}"
+            );
+            assert!(
+                rendered.contains(blamed),
+                "the refusal must name who decided the materialization: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -2469,7 +2615,7 @@ mod platform_materialization_tests {
             },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
-            SymlinkMaterialization::TargetTextFile,
+            SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
         .expect("the index carries the exact mode");
 
@@ -2489,6 +2635,63 @@ mod platform_materialization_tests {
             rendered.contains("different executable mode")
                 || rendered.contains("records no executable bit"),
             "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn every_entry_this_host_cannot_name_is_reported_in_one_refusal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in ["first", "keeps", "second"] {
+            fs::write(temp.path().join(name), b"x").expect("entry");
+        }
+        let entries = fs::read_dir(temp.path())
+            .expect("read_dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("entries");
+
+        // `os_bytes` cannot fail on Unix, so the resolver is supplied here to
+        // give both platforms the same set of unrepresentable names to gather.
+        let error = exact_directory_names_resolved_by(temp.path(), entries, |name| {
+            if name == std::ffi::OsStr::new("keeps") {
+                Ok(b"keeps".to_vec())
+            } else {
+                Err(preflight_error("not well-formed Unicode"))
+            }
+        })
+        .expect_err("a host that cannot name an entry cannot walk the directory");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("\"first\"") && rendered.contains("\"second\""),
+            "the refusal must name every entry it could not represent, not the first: {rendered}"
+        );
+        assert!(
+            rendered.contains("2 entries"),
+            "the refusal must count what it found: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\"keeps\""),
+            "a representable entry is not a failure: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_directory_this_host_can_name_entirely_is_ordered_by_exact_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in ["b", "a", "c"] {
+            fs::write(temp.path().join(name), b"x").expect("entry");
+        }
+        let entries = fs::read_dir(temp.path())
+            .expect("read_dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("entries");
+
+        let named = exact_directory_names(temp.path(), entries).expect("all names representable");
+        let order: Vec<Vec<u8>> = named.into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            order,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "gathering the failures must not disturb the byte ordering the fingerprint depends on"
         );
     }
 

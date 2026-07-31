@@ -280,6 +280,12 @@ BOUNDARY_DIRS = [
     "crates/kin-core/src/assistant.rs",
     "crates/kin-core/src/assistant_sync.rs",
     "crates/kin-core/src/config.rs",
+    # The Windows half of the same config writer. It is the identical boundary
+    # as config.rs, split out because publishing a file atomically shares no
+    # code between the two platforms, and it answers no query: every call here
+    # writes or proves the repository's own config file at a path the caller
+    # already validated, never resolves one by searching.
+    "crates/kin-core/src/config/windows.rs",
     "crates/kin-core/src/dependencies.rs",
     "crates/kin-core/src/env_registry.rs",
     "crates/kin-core/src/federation.rs",

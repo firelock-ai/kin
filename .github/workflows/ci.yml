@@ -92,7 +92,7 @@ jobs:
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
-          bash -n ./scripts/assert-windows-init-refusals.sh
+          bash -n ./scripts/assert-windows-init-contract.sh
 
   windows-authority-tests:
     name: Windows authority tests
@@ -241,6 +241,22 @@ jobs:
           run_required_filter "kin-core registry authority" "registry::tests" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-core --lib
+          # Publishing repository config is the transaction `kin init` stops at
+          # if it is wrong, and the Windows arm shares no code with the Unix one
+          # below the namespace validation. These cases are the contract both
+          # arms answer to, so they run here rather than being compiled here.
+          run_required_filter "kin-core capability-owned config replacement" \
+            "config::capability_owned_config_replacement_tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
+          # What the retained directory handle excludes is a property of
+          # Windows' sharing rules, not of Kin's code, so it can only be
+          # settled here. The module doc states the exclusion; these cases are
+          # what entitle it to.
+          run_required_filter "retained config capability exclusion" \
+            "config::windows::capability_exclusion_tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
           run_nonempty_target "kin-git library" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-git --lib
@@ -292,11 +308,11 @@ jobs:
           cargo build --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --bin kin
 
-      - name: Assert Windows admission refusals
+      - name: Assert the Windows admission contract
         shell: bash
         run: |
           set -euo pipefail
-          bash ./scripts/assert-windows-init-refusals.sh \
+          bash ./scripts/assert-windows-init-contract.sh \
             "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/debug/kin.exe" \
             "$RUNNER_TEMP/kin-windows-admission"
 
@@ -438,11 +454,11 @@ jobs:
       # admission change that moves the refusal turns a pull request red
       # instead of first turning a release commit red here. Daemon reopen
       # assertions live in the Linux daemon smoke until the Windows ports land.
-      - name: Assert Windows admission refusals
+      - name: Assert the Windows admission contract
         shell: bash
         run: |
           set -euo pipefail
-          bash ./scripts/assert-windows-init-refusals.sh \
+          bash ./scripts/assert-windows-init-contract.sh \
             "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/kin.exe" \
             "$RUNNER_TEMP/kin-windows-admission"
 
