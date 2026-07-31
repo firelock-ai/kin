@@ -90,6 +90,7 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          MERGE_POLICY_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -97,16 +98,53 @@ jobs:
           # only reaches them because this repository merges by squash with the
           # pull-request body as the message. Assert that before trusting the
           # resolution rather than discovering a rewritten message later.
-          jq -e '
-            .allow_squash_merge == true and
-            .allow_merge_commit == false and
-            .allow_rebase_merge == false and
-            .squash_merge_commit_title == "PR_TITLE" and
-            .squash_merge_commit_message == "PR_BODY"
-          ' <<< "$(gh api "repos/${REPO}")" >/dev/null || {
-            echo "::error::immutable PR-body release intent requires enforced PR_TITLE + PR_BODY squash-only merging"
+          #
+          # GitHub returns the merge-policy fields only to a token that holds
+          # push-level repository access, and this workflow's GITHUB_TOKEN is
+          # deliberately read-scoped. Read the policy through the same
+          # repository-scoped App installation token that already writes the
+          # release branch, and keep the two failures apart: a response that
+          # never carried the fields cannot disprove the policy, so reporting it
+          # as a wrong setting sends recovery after a correct repository.
+          if [ -z "$MERGE_POLICY_TOKEN" ]; then
+            echo "::error::reading repository merge policy requires the release App installation token"
             exit 1
-          }
+          fi
+          merge_policy="$(GH_TOKEN="$MERGE_POLICY_TOKEN" gh api "repos/${REPO}")"
+          if ! jq -e 'type == "object"' <<< "$merge_policy" > /dev/null; then
+            echo "::error::repository merge policy response was not a JSON object, so the policy was never read"
+            exit 1
+          fi
+          absent="$(jq -r '
+            . as $repo
+            | [
+                "allow_squash_merge",
+                "allow_merge_commit",
+                "allow_rebase_merge",
+                "squash_merge_commit_title",
+                "squash_merge_commit_message"
+              ]
+            | map(. as $field | select(($repo | has($field)) | not))
+            | join(", ")
+          ' <<< "$merge_policy")"
+          if [ -n "$absent" ]; then
+            echo "::error::repository merge policy is unreadable, not disproven: ${absent} absent from the API response, which happens when the reading token lacks push-level repository access"
+            exit 1
+          fi
+          violations="$(jq -r '
+            [
+              (select(.allow_squash_merge == true | not) | "allow_squash_merge"),
+              (select(.allow_merge_commit == false | not) | "allow_merge_commit"),
+              (select(.allow_rebase_merge == false | not) | "allow_rebase_merge"),
+              (select(.squash_merge_commit_title == "PR_TITLE" | not) | "squash_merge_commit_title"),
+              (select(.squash_merge_commit_message == "PR_BODY" | not) | "squash_merge_commit_message")
+            ]
+            | join(", ")
+          ' <<< "$merge_policy")"
+          if [ -n "$violations" ]; then
+            echo "::error::immutable PR-body release intent requires enforced PR_TITLE + PR_BODY squash-only merging; offending repository settings: ${violations}"
+            exit 1
+          fi
           git fetch origin \
             "+refs/heads/main:refs/remotes/origin/main" \
             "+refs/tags/*:refs/tags/*"
