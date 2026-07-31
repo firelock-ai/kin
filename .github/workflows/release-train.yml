@@ -274,7 +274,11 @@ jobs:
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             existing=true
             git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
-            allowed='^(Cargo\.toml|Cargo\.lock|CHANGELOG\.md|crates/kin-cli/Cargo\.toml|packages/(kin-mcp|kin|boundary-contracts)/package\.json)$'
+            # Every path prepare-release.mjs writes has to be listed here, or
+            # the train refuses the branch it just generated. The authority
+            # suite cross-checks this against the generator rather than trusting
+            # the two to stay in step by hand.
+            allowed='^(Cargo\.toml|Cargo\.lock|fuzz/Cargo\.lock|CHANGELOG\.md|crates/kin-cli/Cargo\.toml|packages/(kin-mcp|kin|boundary-contracts)/package\.json)$'
             branch_paths="$(git diff \
               --name-only \
               "refs/remotes/origin/main...refs/remotes/origin/${BRANCH}")"
