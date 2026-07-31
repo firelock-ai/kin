@@ -19,8 +19,32 @@ kin_buildinfo::embed_update_build_identity!(
     kin_db::GraphSnapshot::CURRENT_VERSION
 );
 
+/// Orientation for the flat subcommand list. The command surface is wide
+/// because it spans version control, semantic query, sessions, and operations,
+/// and clap renders subcommands as one undifferentiated block with no grouping
+/// primitive. Naming the everyday path here is what separates it from the
+/// benchmarking, hosted-release, and diagnostic commands beside it.
+const AFTER_HELP: &str = "\
+Start here:
+  kin init            admit an existing or new repository
+  kin clone <source>  admit a repository from elsewhere
+  kin status          workspace, refs, and semantic enrichment state
+  kin commit          publish an exact semantic and artifact change
+  kin log / kin diff  read the immutable change log and exact changes
+
+Ask the graph:
+  kin locate / search / trace / impact / refs / context
+
+Commands marked [OPEN GATE] are fail-closed on repository-v6 and say why when
+run. `kin capabilities` prints the full readiness matrix, `--json` for machines.";
+
 #[derive(Parser)]
-#[command(name = "kin", version = kin_buildinfo::version(), about = "Kin semantic VCS")]
+#[command(
+    name = "kin",
+    version = kin_buildinfo::version(),
+    about = "Kin semantic VCS",
+    after_help = AFTER_HELP,
+)]
 struct Cli {
     /// Write a machine-readable execution profile to this JSON file
     #[arg(long, global = true, value_name = "FILE")]
@@ -545,7 +569,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// [OPEN GATE] Publish exact repository-v6 history to a native Kin remote
+    /// Publish exact repository-v6 history to a native Kin remote
     Push {
         /// Remote name (defaults to the configured default native-kin remote)
         #[arg(long)]
@@ -583,7 +607,7 @@ enum Command {
         /// Target directory (defaults to repo name)
         path: Option<String>,
     },
-    /// [OPEN GATE] Restore an exact path or subtree from immutable repository-v6 history
+    /// Restore an exact path or subtree from immutable repository-v6 history
     Checkout {
         /// UTF-8 repository path to restore
         path: Option<String>,
@@ -1946,12 +1970,139 @@ enum HostedReleaseAction {
     },
 }
 
+/// Command paths that Kin used to accept, mapped to the surface that replaced
+/// them.
+///
+/// These names stay unparseable: the table exists only to replace clap's
+/// "similar subcommand" tip, which ranks by edit distance and so answers
+/// `import` with `support` and `impact`. A caller arriving from Git types the
+/// retired name first, and a suggestion pointing at an unrelated command costs
+/// more than no suggestion at all.
+const RETIRED_COMMANDS: &[(&[&str], &str)] = &[
+    (
+        &["import"],
+        "`kin clone <source>` admits a repository from elsewhere, and `kin init` admits one in place.",
+    ),
+    (
+        &["git", "import"],
+        "`kin clone <source>` admits a repository from elsewhere, and `kin init` admits one in place. \
+         `kin git export` remains the only Git interoperability direction.",
+    ),
+    (
+        &["git", "sync"],
+        "`kin reconcile` republishes workspace changes into graph truth, and `kin git export` \
+         publishes an exact Git repository to a new destination.",
+    ),
+    (
+        &["workspace"],
+        "Session workspaces are graph-derived and command-scoped: `kin with`, `kin open`, \
+         `kin shell`, and `kin exec` each run against one.",
+    ),
+    (
+        &["run"],
+        "`kin exec` runs a command in an exact graph-derived session workspace.",
+    ),
+    (&["gc"], "`kin cache gc` reclaims embedding cache space."),
+];
+
+/// Leading command-path tokens of `args`, excluding flags and the values they take.
+///
+/// A global flag declared with a value consumes the token after it, so that
+/// token is a value and never a command a caller typed. Reading it as one names
+/// a retired command nobody asked for: `kin --profile-out run frobnicate` writes
+/// its profile to a file called `run`. Which flags take a value is read from the
+/// parser definition rather than restated, so a new global flag is accounted for
+/// where it is declared.
+fn typed_command_path(args: &[String]) -> Vec<&str> {
+    let cli = Cli::command();
+    // Arity is resolved when clap builds the command, so an unbuilt definition
+    // answers through the declared action instead. Both spellings carry the
+    // same fact, and reading the definition costs no parse.
+    let takes_value = |matches: &dyn Fn(&clap::Arg) -> bool| {
+        cli.get_arguments().any(|declared| {
+            matches(declared)
+                && declared.get_num_args().map_or_else(
+                    || declared.get_action().takes_values(),
+                    |arity| arity.takes_values(),
+                )
+        })
+    };
+
+    let mut typed = Vec::new();
+    let mut consumes_next = false;
+    for arg in args {
+        if consumes_next {
+            consumes_next = false;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if !long.is_empty() && !long.contains('=') {
+                consumes_next = takes_value(&|declared| declared.get_long() == Some(long));
+            }
+            continue;
+        }
+        if let Some(shorts) = arg.strip_prefix('-') {
+            if let Some(last) = shorts.chars().last() {
+                consumes_next = takes_value(&|declared| declared.get_short() == Some(last));
+            }
+            continue;
+        }
+        typed.push(arg.as_str());
+        if typed.len() == 2 {
+            break;
+        }
+    }
+    typed
+}
+
+/// Longest retired path matching the command path a caller typed.
+///
+/// Matching is longest-first so `git import` resolves to the Git interoperability
+/// guidance rather than the bare `import` entry. A caller whose tokens do not
+/// match any entry falls through to clap's own reporting.
+fn retired_command_signpost(args: &[String]) -> Option<(String, &'static str)> {
+    let typed = typed_command_path(args);
+    RETIRED_COMMANDS
+        .iter()
+        .filter(|(path, _)| path.len() <= typed.len() && typed[..path.len()] == **path)
+        .max_by_key(|(path, _)| path.len())
+        .map(|(path, guidance)| (path.join(" "), *guidance))
+}
+
+/// Parse the command line, answering a retired command path by name.
+///
+/// Anything clap reports that is not a retired path, including `--help` and
+/// `--version`, is handed back to clap so its exit codes and rendering stay
+/// exactly as they were.
+fn parse_cli_or_report_retired_command() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if err.kind() == clap::error::ErrorKind::InvalidSubcommand {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                if let Some((path, guidance)) = retired_command_signpost(&args) {
+                    eprintln!("error: `kin {path}` was retired.");
+                    eprintln!();
+                    eprintln!("  {guidance}");
+                    eprintln!();
+                    eprintln!(
+                        "Run `kin --help` for the current commands, or `kin capabilities` for \
+                         repository-v6 readiness."
+                    );
+                    std::process::exit(2);
+                }
+            }
+            err.exit()
+        }
+    }
+}
+
 fn main() -> Result<()> {
     if kin_migrate::run_migration_process_host_if_requested()? {
         return Ok(());
     }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
-    let cli = Cli::parse();
+    let cli = parse_cli_or_report_retired_command();
     let command_name = current_command_name();
     let cwd = std::env::current_dir()?.display().to_string();
     let profile_out = cli
@@ -3577,6 +3728,214 @@ mod tests {
                 } if output.as_path() == std::path::Path::new("../export.git")
             ));
             assert!(Cli::try_parse_from(["kin", "git", "export", "--in-place"]).is_err());
+        });
+    }
+
+    #[test]
+    fn every_retired_command_path_names_its_replacement() {
+        on_cli_test_stack(|| {
+            for (path, _) in RETIRED_COMMANDS {
+                let mut argv = vec!["kin"];
+                argv.extend_from_slice(path);
+                assert!(
+                    Cli::try_parse_from(&argv).is_err(),
+                    "a retired command path must stay unparseable: {path:?}"
+                );
+
+                let typed: Vec<String> = path.iter().map(|token| token.to_string()).collect();
+                let (matched, guidance) = retired_command_signpost(&typed)
+                    .unwrap_or_else(|| panic!("retired path {path:?} must be signposted"));
+                assert_eq!(matched, path.join(" "));
+                assert!(
+                    guidance.contains("kin "),
+                    "guidance for {path:?} must name a replacement command: {guidance}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn retired_signposting_prefers_the_longest_path_and_ignores_live_commands() {
+        on_cli_test_stack(|| {
+            let git_import = ["git".to_string(), "import".to_string()];
+            let (matched, guidance) =
+                retired_command_signpost(&git_import).expect("`kin git import` is retired");
+            assert_eq!(matched, "git import");
+            assert!(
+                guidance.contains("git export"),
+                "the Git path must name export as the remaining direction: {guidance}"
+            );
+
+            let bare_import = [
+                "import".to_string(),
+                "https://example.com/r.git".to_string(),
+            ];
+            let (matched, _) =
+                retired_command_signpost(&bare_import).expect("`kin import` is retired");
+            assert_eq!(matched, "import");
+
+            // Leading global flags precede the command path a caller typed.
+            let flagged = ["--profile-summary".to_string(), "gc".to_string()];
+            assert_eq!(
+                retired_command_signpost(&flagged).map(|(matched, _)| matched),
+                Some("gc".to_string())
+            );
+
+            // A flag that takes a value consumes the token after it, so that
+            // token names a file and not a command. The retired name here is
+            // the caller's profile path, and `frobnicate` is what they typed.
+            let value_named_after_a_retired_command = [
+                "--profile-out".to_string(),
+                "run".to_string(),
+                "frobnicate".to_string(),
+            ];
+            assert!(
+                retired_command_signpost(&value_named_after_a_retired_command).is_none(),
+                "a flag value must not be read as a command a caller typed"
+            );
+
+            // The command path still resolves past a consumed value, in both
+            // the separated and the inline spelling.
+            for spelling in [
+                vec![
+                    "--profile-out".to_string(),
+                    "/tmp/profile.json".to_string(),
+                    "import".to_string(),
+                ],
+                vec![
+                    "--profile-out=/tmp/profile.json".to_string(),
+                    "import".to_string(),
+                ],
+            ] {
+                assert_eq!(
+                    retired_command_signpost(&spelling).map(|(matched, _)| matched),
+                    Some("import".to_string()),
+                    "a retired command behind a flag value must still be signposted: {spelling:?}"
+                );
+            }
+
+            // A live command, and an unknown name with no replacement to name,
+            // both fall through to clap's own reporting.
+            for live in [
+                vec!["status".to_string()],
+                vec!["git".to_string(), "export".to_string()],
+                vec!["cache".to_string(), "gc".to_string()],
+                vec!["frobnicate".to_string()],
+            ] {
+                assert!(
+                    retired_command_signpost(&live).is_none(),
+                    "must not signpost {live:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn help_orients_a_caller_to_the_everyday_path() {
+        on_cli_test_stack(|| {
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            for anchor in [
+                "Start here:",
+                "kin init",
+                "kin status",
+                "kin commit",
+                "kin capabilities",
+                "[OPEN GATE]",
+            ] {
+                assert!(
+                    help.contains(anchor),
+                    "help must orient a caller with {anchor:?}"
+                );
+            }
+        });
+    }
+
+    const OPEN_GATE_MARKER: &str = "[OPEN GATE]";
+
+    /// Every help entry carrying the open-gate marker, keyed by the command path
+    /// a caller types to reach it.
+    ///
+    /// Flags are qualified by the command that owns them, matching how the
+    /// capability inventory names `doctor --heal`, so a marker on a flag and a
+    /// marker on a subcommand are comparable against the same inventory.
+    fn open_gate_marked_entries(
+        command: &clap::Command,
+        prefix: &str,
+        marked: &mut std::collections::BTreeSet<String>,
+    ) {
+        let qualify = |entry: &str| {
+            if prefix.is_empty() {
+                entry.to_string()
+            } else {
+                format!("{prefix} {entry}")
+            }
+        };
+        for arg in command.get_arguments() {
+            let Some(long) = arg.get_long() else { continue };
+            let carries = arg
+                .get_help()
+                .or_else(|| arg.get_long_help())
+                .is_some_and(|help| help.to_string().contains(OPEN_GATE_MARKER));
+            if carries {
+                marked.insert(qualify(&format!("--{long}")));
+            }
+        }
+        for subcommand in command.get_subcommands() {
+            let path = qualify(subcommand.get_name());
+            let carries = subcommand
+                .get_about()
+                .or_else(|| subcommand.get_long_about())
+                .is_some_and(|about| about.to_string().contains(OPEN_GATE_MARKER));
+            if carries {
+                marked.insert(path.clone());
+            }
+            open_gate_marked_entries(subcommand, &path, marked);
+        }
+    }
+
+    #[test]
+    fn open_gate_markers_name_exactly_the_fail_closed_commands() {
+        on_cli_test_stack(|| {
+            // The after-help sentence promises that a marked command is
+            // fail-closed on repository-v6, which makes the marker a contract
+            // against the capability inventory rather than decoration. A gate
+            // that opens without its marker coming off steers a caller away
+            // from a command that now runs, which is the misdirection the
+            // marker exists to prevent.
+            let mut marked = std::collections::BTreeSet::new();
+            open_gate_marked_entries(&Cli::command(), "", &mut marked);
+
+            let inventory =
+                commands::capabilities::inventory().expect("capability inventory must parse");
+            let fail_closed: std::collections::BTreeSet<String> = inventory
+                .commands
+                .iter()
+                .filter(|capability| {
+                    capability.status == commands::capabilities::CapabilityStatus::OpenGate
+                })
+                .map(|capability| capability.command.clone())
+                .collect();
+
+            assert_eq!(
+                marked, fail_closed,
+                "help must mark exactly the commands `kin capabilities` reports as open gates"
+            );
+
+            // The marker has to survive rendering, since the rendered surface
+            // is what the after-help sentence governs.
+            let mut command = Cli::command();
+            let rendered = command.render_long_help().to_string();
+            let flattened = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+            for subcommand in Cli::command().get_subcommands() {
+                let name = subcommand.get_name();
+                assert_eq!(
+                    flattened.contains(&format!("{name} {OPEN_GATE_MARKER}")),
+                    fail_closed.contains(name),
+                    "rendered help must mark `kin {name}` exactly when the inventory calls it \
+                     an open gate"
+                );
+            }
         });
     }
 
