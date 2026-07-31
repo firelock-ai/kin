@@ -2341,17 +2341,24 @@ fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&s
 /// the submitter.
 type InflightGate = Arc<(Mutex<u32>, Condvar)>;
 
-/// Shared byte gate for resident stack command buffers. This is deliberately a
-/// no-wait gate: stack paths can return `Ok(None)` and let the caller use the
-/// proven fallback path instead of parking after allocating large MTLBuffers.
+/// Shared byte gate for resident stack command buffers. `try_reserve` is
+/// deliberately a no-wait gate: a stack path that has committed nothing yet can
+/// return `Ok(None)` and let the caller use the proven fallback path instead of
+/// parking after allocating large MTLBuffers. `reserve_blocking` is the parking
+/// variant, for the one position where declining is no longer an option (a
+/// segment past the first, where earlier segments are already committed).
+///
+/// Either way the invariant is the same and is the reason the gate exists: the
+/// sum of live reservations never exceeds `budget_bytes`, so peak resident bytes
+/// stay under the jetsam-safe budget.
 #[derive(Clone)]
 struct ResidentStackMemoryGate {
     budget_bytes: usize,
-    active_bytes: Arc<Mutex<usize>>,
+    active: Arc<(Mutex<usize>, Condvar)>,
 }
 
 struct ResidentStackReservation {
-    active_bytes: Arc<Mutex<usize>>,
+    active: Arc<(Mutex<usize>, Condvar)>,
     bytes: usize,
 }
 
@@ -2359,7 +2366,7 @@ impl ResidentStackMemoryGate {
     fn new(budget_bytes: usize) -> Self {
         Self {
             budget_bytes,
-            active_bytes: Arc::new(Mutex::new(0)),
+            active: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
 
@@ -2367,14 +2374,51 @@ impl ResidentStackMemoryGate {
         if bytes > self.budget_bytes {
             return None;
         }
-        let mut active = self.active_bytes.lock();
+        let (lock, _) = &*self.active;
+        let mut active = lock.lock();
         let next = active.checked_add(bytes)?;
         if next > self.budget_bytes {
             return None;
         }
         *active = next;
         Some(ResidentStackReservation {
-            active_bytes: Arc::clone(&self.active_bytes),
+            active: Arc::clone(&self.active),
+            bytes,
+        })
+    }
+
+    /// Park until `bytes` fit under the budget, then reserve. Returns `None` only
+    /// for a request that can never be satisfied — one larger than the whole
+    /// budget — so a caller that still has a fallback can take it.
+    ///
+    /// Forward progress does not depend on the parked thread: every live
+    /// reservation is owned either by a caller that is not blocked here or by an
+    /// in-flight command buffer's completion handler, which releases it when the
+    /// GPU signals and wakes the parked caller. Peak resident bytes therefore
+    /// stay <= `budget_bytes` while several segments are committed at once,
+    /// instead of the caller having to drain the GPU between segments to prove it.
+    fn reserve_blocking(&self, bytes: usize) -> Option<ResidentStackReservation> {
+        if bytes > self.budget_bytes {
+            return None;
+        }
+        let (lock, cvar) = &*self.active;
+        let mut active = lock.lock();
+        while active.saturating_add(bytes) > self.budget_bytes {
+            let timed_out = cvar
+                .wait_for(&mut active, std::time::Duration::from_secs(30))
+                .timed_out();
+            if timed_out && active.saturating_add(bytes) > self.budget_bytes {
+                tracing::warn!(
+                    active_bytes = *active,
+                    request_bytes = bytes,
+                    budget_bytes = self.budget_bytes,
+                    "kin_infer.metal.resident_stack: reserve_blocking has been parked for 30s — a completion handler may have failed to release a segment reservation"
+                );
+            }
+        }
+        *active += bytes;
+        Some(ResidentStackReservation {
+            active: Arc::clone(&self.active),
             bytes,
         })
     }
@@ -2382,8 +2426,12 @@ impl ResidentStackMemoryGate {
 
 impl Drop for ResidentStackReservation {
     fn drop(&mut self) {
-        let mut active = self.active_bytes.lock();
+        let (lock, cvar) = &*self.active;
+        let mut active = lock.lock();
         *active = active.saturating_sub(self.bytes);
+        // Wake every parked reserver: they request different sizes, so the freed
+        // bytes may admit a waiter that is not the one at the head of the queue.
+        cvar.notify_all();
     }
 }
 
@@ -2830,6 +2878,41 @@ impl Drop for PooledBuffer {
     }
 }
 
+/// Scope guard for a segmented resident forward that commits its non-terminal
+/// segments without waiting. Those segments share one residual `PooledBuffer`
+/// across iterations, so it is the one pooled buffer that cannot be moved into a
+/// completion handler — which means an early return (an encode error mid-stack)
+/// would drop it, and recycle it into the pool, while the GPU may still be
+/// writing it. Waiting on the last committed command buffer before that drop
+/// keeps "a pooled buffer only recycles after the GPU is done with it" true on
+/// every exit path, not just the terminal one.
+///
+/// Waiting on the last commit is sufficient because `MetalCompute` owns a single
+/// `MTLCommandQueue`, which executes command buffers in commit order: once the
+/// last one this forward committed has completed, so have all the ones before it.
+///
+/// Declare this AFTER the residual buffer it protects, so it drops first.
+#[derive(Default)]
+struct PipelinedSegmentDrain<'a> {
+    last_committed: Option<&'a CommandBufferRef>,
+}
+
+impl<'a> PipelinedSegmentDrain<'a> {
+    fn track(&mut self, cmd: &'a CommandBufferRef) {
+        self.last_committed = Some(cmd);
+    }
+}
+
+impl Drop for PipelinedSegmentDrain<'_> {
+    fn drop(&mut self) {
+        if let Some(cmd) = self.last_committed.take() {
+            // Already-completed buffers return immediately, so the terminal path
+            // — which has waited — pays nothing here.
+            cmd.wait_until_completed();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metal compute context
 // ---------------------------------------------------------------------------
@@ -3272,6 +3355,28 @@ impl MetalCompute {
         reservation
     }
 
+    /// Reserve for segment `segment_index` of a segmented resident forward.
+    ///
+    /// Segment 0 has committed nothing, so it keeps the no-wait gate and the
+    /// existing decline-and-fall-back behaviour. Every later segment is past that
+    /// point: earlier segments of the same stack are already committed, so
+    /// declining would abandon executing GPU work and re-run the whole stack on
+    /// the fallback path. Those segments park instead. A parked caller holds no
+    /// reservation of its own — the previous segment's went into its command
+    /// buffer's completion handler — so nothing waits on the parked thread.
+    fn reserve_resident_segment(
+        &self,
+        segment_index: usize,
+        bytes: usize,
+        path: &'static str,
+    ) -> Option<ResidentStackReservation> {
+        if segment_index == 0 {
+            self.try_reserve_resident_segment(bytes, path)
+        } else {
+            self.resident_stack_memory.reserve_blocking(bytes)
+        }
+    }
+
     /// Replace the resident-stack memory budget on this live instance. Test-only
     /// (no env races): models the tiny-`KIN_INFER_METAL_RESIDENT_BUDGET_BYTES`
     /// case so the resident segment reservation declines and the caller takes the
@@ -3460,7 +3565,18 @@ impl MetalCompute {
     /// at most a few command buffers — and their resident intermediates — are
     /// outstanding at once. `retain` must hold every pooled buffer the command
     /// buffer reads or writes, so none is recycled while still GPU-resident.
-    fn commit_bounded(&self, cmd: &CommandBufferRef, retain: Vec<PooledBuffer>) {
+    ///
+    /// `reservation`, when present, is this buffer's slice of the resident-stack
+    /// byte budget. It is released by the completion handler for the same reason
+    /// `retain` is: the bytes stay resident until the GPU is done, so releasing
+    /// them any earlier would let the gate admit work that pushes peak resident
+    /// memory over the budget.
+    fn commit_bounded(
+        &self,
+        cmd: &CommandBufferRef,
+        retain: Vec<PooledBuffer>,
+        reservation: Option<ResidentStackReservation>,
+    ) {
         // Backpressure: park until an in-flight slot frees. parking_lot's Condvar
         // parks the OS thread (idle-detectable) rather than busy-spinning. A
         // 30s watchdog turns a leaked completion handler (which would otherwise
@@ -3500,6 +3616,7 @@ impl MetalCompute {
         // the retained buffers goes through a Mutex for interior mutability.
         let inflight = Arc::clone(&self.inflight);
         let retain = Mutex::new(Some(retain));
+        let reservation = Mutex::new(reservation);
         let handler = block::ConcreteBlock::new(move |cb: &CommandBufferRef| {
             if cb.status() == metal::MTLCommandBufferStatus::Error {
                 tracing::warn!(
@@ -3512,9 +3629,13 @@ impl MetalCompute {
             // attributed (the host never waits on it). Gated inside
             // `record_gpu_busy` so it is a no-op when profiling is off.
             record_gpu_busy(cb);
-            // Recycle retained buffers (drop returns them to the pool) before
-            // releasing the in-flight slot.
+            // Recycle retained buffers (drop returns them to the pool) and give
+            // this buffer's resident-stack bytes back to the gate — waking any
+            // caller parked in `reserve_blocking` — before releasing the
+            // in-flight slot. Both happen only now that the GPU is done, which is
+            // what makes the budget a bound on PEAK resident bytes.
             retain.lock().take();
+            reservation.lock().take();
             let (lock, cvar) = &*inflight;
             let mut depth = lock.lock();
             *depth = depth.saturating_sub(1);
@@ -3534,11 +3655,27 @@ impl MetalCompute {
     /// profiling is on, attribute the command buffer's *GPU-execution* window
     /// (`GPUStartTime`/`GPUEndTime`, valid only after completion) to the phase
     /// published by the enclosing `time_phase`. Behaviour is byte-identical to
-    /// the inlined `commit_bounded(cmd, Vec::new()); wait_until_completed()` it
-    /// replaces; the timestamp read is gated and side-effect-free.
+    /// the inlined `commit_bounded(cmd, Vec::new(), None); wait_until_completed()`
+    /// it replaces; the timestamp read is gated and side-effect-free.
     #[inline]
     fn commit_wait(&self, cmd: &CommandBufferRef) {
-        self.commit_bounded(cmd, Vec::new());
+        self.commit_wait_retaining(cmd, Vec::new(), None);
+    }
+
+    /// `commit_wait` for a command buffer that carries pooled buffers and/or a
+    /// resident-stack reservation: identical in every observable way, except that
+    /// `retain` and `reservation` are released by the completion handler rather
+    /// than by the caller's scope. The terminal segment of a pipelined resident
+    /// forward uses this — it must still wait before reading its output back, but
+    /// its predecessors were committed without waiting, so it owns state the
+    /// completion handler has to release.
+    fn commit_wait_retaining(
+        &self,
+        cmd: &CommandBufferRef,
+        retain: Vec<PooledBuffer>,
+        reservation: Option<ResidentStackReservation>,
+    ) {
+        self.commit_bounded(cmd, retain, reservation);
         let blocked_start = profile_enabled().then(std::time::Instant::now);
         if blocked_start.is_some() {
             ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
@@ -5206,30 +5343,35 @@ impl GpuCompute for MetalCompute {
         let total_rows = config.batch_size * config.max_len;
         let h = config.hidden_size;
         let out = autoreleasepool(|_| -> Result<Option<Vec<f32>>, InferError> {
+            // The residual buffer every segment reads and writes. It outlives the
+            // segment that produced it, so it is the one pooled buffer that cannot
+            // be handed to a completion handler; `drain` is declared after it so it
+            // drops — and waits — first. See `PipelinedSegmentDrain`.
             let mut current_hidden = None;
+            let mut drain = PipelinedSegmentDrain::default();
             for (segment_index, chunk) in layers.chunks(segment_layers).enumerate() {
                 let estimated_bytes = estimate_resident_segment_bytes(chunk, config, None, false);
-                let Some(_resident_reservation) = self.try_reserve_resident_segment(
+                let Some(reservation) = self.reserve_resident_segment(
+                    segment_index,
                     estimated_bytes,
                     "forward_layers_batched_segmented",
                 ) else {
                     return Ok(None);
                 };
-                let hidden_buf = if segment_index == 0 {
-                    self.buf_slice_pooled(hidden)?
-                } else {
-                    current_hidden.take().ok_or_else(|| {
-                        InferError::Internal(
-                            "segmented resident Metal path lost current hidden buffer".into(),
-                        )
-                    })?
-                };
+                if segment_index == 0 {
+                    current_hidden = Some(self.buf_slice_pooled(hidden)?);
+                }
+                let hidden_buf = current_hidden.as_ref().ok_or_else(|| {
+                    InferError::Internal(
+                        "segmented resident Metal path lost current hidden buffer".into(),
+                    )
+                })?;
                 let mut cmd = self.queue.new_command_buffer();
                 let mut retains = Vec::new();
                 for weights in chunk {
                     cmd = self.encode_layer_resident_into(
                         cmd,
-                        &hidden_buf,
+                        hidden_buf,
                         masks,
                         weights,
                         config,
@@ -5238,13 +5380,21 @@ impl GpuCompute for MetalCompute {
                         &mut retains,
                     )?;
                 }
-                self.commit_wait(cmd);
 
                 let is_last = segment_index + 1 == segment_count;
                 if is_last {
+                    // Terminal segment: still a synchronous boundary, because the
+                    // readback below needs the result.
+                    self.commit_wait_retaining(cmd, retains, Some(reservation));
                     return Ok(Some(Self::read_buf(hidden_buf.buffer(), total_rows * h)));
                 }
-                current_hidden = Some(hidden_buf);
+                // Non-terminal: commit without waiting so the host encodes segment
+                // N+1 while N executes. One MTLCommandQueue executes command
+                // buffers in commit order, so the next segment's reads of the
+                // shared residual still see this segment's writes without the host
+                // draining the GPU in between.
+                self.commit_bounded(cmd, retains, Some(reservation));
+                drain.track(cmd);
             }
 
             Err(InferError::Internal(
@@ -5336,13 +5486,18 @@ impl GpuCompute for MetalCompute {
         .entered();
         let h = config.hidden_size;
         let out = autoreleasepool(|_| -> Result<Option<Vec<f32>>, InferError> {
+            // See `forward_layers_batched_segmented`: `drain` is declared after the
+            // shared residual so it drops — and waits — before the residual can
+            // recycle.
             let mut current_hidden = None;
+            let mut drain = PipelinedSegmentDrain::default();
             for (segment_index, chunk) in layers.chunks(segment_layers).enumerate() {
                 let is_last = segment_index + 1 == segment_count;
                 let segment_embedding = (segment_index == 0).then_some(embedding);
                 let estimated_bytes =
                     estimate_resident_segment_bytes(chunk, config, segment_embedding, is_last);
-                let Some(_resident_reservation) = self.try_reserve_resident_segment(
+                let Some(reservation) = self.reserve_resident_segment(
+                    segment_index,
                     estimated_bytes,
                     "forward_layers_batched_pooled_segmented",
                 ) else {
@@ -5350,26 +5505,25 @@ impl GpuCompute for MetalCompute {
                 };
                 let mut cmd = self.queue.new_command_buffer();
                 let mut retains = Vec::new();
-                let hidden_buf = if segment_index == 0 {
-                    self.encode_embedding_prelude_into(
+                if segment_index == 0 {
+                    current_hidden = Some(self.encode_embedding_prelude_into(
                         cmd,
                         hidden,
                         embedding,
                         config,
                         &mut retains,
-                    )?
-                } else {
-                    current_hidden.take().ok_or_else(|| {
-                        InferError::Internal(
-                            "segmented pooled Metal path lost current hidden buffer".into(),
-                        )
-                    })?
-                };
+                    )?);
+                }
+                let hidden_buf = current_hidden.as_ref().ok_or_else(|| {
+                    InferError::Internal(
+                        "segmented pooled Metal path lost current hidden buffer".into(),
+                    )
+                })?;
 
                 for weights in chunk {
                     cmd = self.encode_layer_resident_into(
                         cmd,
-                        &hidden_buf,
+                        hidden_buf,
                         masks,
                         weights,
                         config,
@@ -5380,14 +5534,19 @@ impl GpuCompute for MetalCompute {
                 }
 
                 if is_last {
+                    // Terminal segment: pooling is fused in, then one synchronous
+                    // boundary before the readback.
                     let pooled =
-                        self.encode_pool_rows_into(cmd, &hidden_buf, masks, config, pooling)?;
-                    self.commit_wait(cmd);
+                        self.encode_pool_rows_into(cmd, hidden_buf, masks, config, pooling)?;
+                    self.commit_wait_retaining(cmd, retains, Some(reservation));
                     return Ok(Some(Self::read_buf(pooled.buffer(), config.batch_size * h)));
                 }
 
-                self.commit_wait(cmd);
-                current_hidden = Some(hidden_buf);
+                // Non-terminal: commit without waiting; commit-order execution on
+                // the single queue preserves the next segment's dependency on the
+                // shared residual.
+                self.commit_bounded(cmd, retains, Some(reservation));
+                drain.track(cmd);
             }
 
             Err(InferError::Internal(
@@ -7117,6 +7276,74 @@ mod tests {
         assert!(gate.try_reserve(101).is_none());
 
         drop(first);
+        assert!(gate.try_reserve(100).is_some());
+    }
+
+    /// `reserve_blocking` declines only what the budget can never satisfy. A
+    /// request that merely does not fit RIGHT NOW parks (covered below) — it must
+    /// not be turned into a decline, because a mid-stack segment has no fallback.
+    #[test]
+    fn reserve_blocking_declines_only_a_request_larger_than_the_whole_budget() {
+        let gate = ResidentStackMemoryGate::new(100);
+
+        assert!(gate.reserve_blocking(101).is_none());
+
+        let whole = gate
+            .reserve_blocking(100)
+            .expect("a request equal to the budget is satisfiable");
+        drop(whole);
+        assert!(gate.reserve_blocking(100).is_some());
+    }
+
+    /// The pipelining invariant, exercised without a GPU: a second segment that
+    /// does not fit beside an in-flight one parks instead of over-reserving, and
+    /// is woken by exactly the release the Metal completion handler performs —
+    /// `take()` on the `Mutex<Option<ResidentStackReservation>>` that
+    /// `commit_bounded` moves into the handler block.
+    #[test]
+    fn reserve_blocking_parks_until_the_completion_handler_releases() {
+        let gate = ResidentStackMemoryGate::new(100);
+
+        // Stands in for a committed segment: the reservation now lives where
+        // `commit_bounded` puts it, owned by the completion handler.
+        let in_flight = Mutex::new(Some(
+            gate.try_reserve(60).expect("first segment fits the budget"),
+        ));
+        // 60 + 60 > 100, so the gate must not admit the next segment yet.
+        assert!(gate.try_reserve(60).is_none());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting_gate = gate.clone();
+        let waiter = std::thread::spawn(move || {
+            let reservation = waiting_gate
+                .reserve_blocking(60)
+                .expect("60 <= budget, so this request is satisfiable");
+            tx.send(()).expect("receiver outlives the send");
+            reservation
+        });
+
+        // Nothing has completed, so the second segment is still parked.
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "reserve_blocking admitted a segment that does not fit the budget"
+        );
+
+        // The completion handler's release, verbatim.
+        in_flight.lock().take();
+
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("releasing the in-flight reservation must wake the parked reserver");
+        let reservation = waiter.join().expect("waiter thread must not panic");
+
+        // Exactly one 60-byte reservation is live: the wake reserved once, and
+        // did not leak the released 60 bytes back into the active total.
+        assert!(gate.try_reserve(41).is_none());
+        assert!(gate.try_reserve(40).is_some());
+
+        drop(reservation);
         assert!(gate.try_reserve(100).is_some());
     }
 
@@ -9094,8 +9321,9 @@ mod tests {
         );
         assert_eq!(
             profile_round_trips(),
-            2,
-            "segmented pooled stack should wait twice (one per segment) when profiled"
+            1,
+            "segmented pooled stack should wait exactly once — only the terminal \
+             segment is a synchronous boundary; the rest are pipelined"
         );
     }
 
@@ -9194,8 +9422,9 @@ mod tests {
         );
         assert_eq!(
             profile_round_trips(),
-            2,
-            "segmented resident stack should wait twice (one per segment) when profiled"
+            1,
+            "segmented resident stack should wait exactly once — only the terminal \
+             segment is a synchronous boundary; the rest are pipelined"
         );
     }
 
