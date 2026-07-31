@@ -2153,8 +2153,19 @@ def main() -> None:
         "--squash",
         "git commit --allow-empty --signoff",
         "Activate protected checks for the automated release PR",
+        'node "$intent_policy"',
+        'git show "refs/remotes/origin/main:scripts/resolve-release-intent.mjs"',
+        '--base-ref "$tag"',
+        "--head-ref refs/remotes/origin/main",
+        "unsupported immutable release intent",
+        '.squash_merge_commit_title == "PR_TITLE"',
+        '.squash_merge_commit_message == "PR_BODY"',
+        "immutable PR-body release intent requires enforced PR_TITLE + PR_BODY "
+        "squash-only merging",
     ):
         require(release_train, policy, "coalescing protected release train")
+    # The release bump must never be resolvable from anything a merged pull
+    # request can still change.
     for forbidden in (
         "workflow_dispatch:",
         "contents: write",
@@ -2162,6 +2173,11 @@ def main() -> None:
         "id-token: write",
         "git push --force",
         "git push -f",
+        "client_payload.bump",
+        "OVERRIDE_BUMP",
+        "/pulls\" \\",
+        "raise_bump",
+        "train_labels",
     ):
         if forbidden in release_train:
             raise AssertionError(

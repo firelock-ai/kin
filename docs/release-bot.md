@@ -46,9 +46,30 @@ never the workflow's
 
 The release train runs after successful `main` CI and on a staggered 15-minute
 reconcile. If `main` is ahead of its already-tagged workspace version, it opens
-or updates one automation-owned PR. Patch is the default; merged PR labels
-`release:minor` and `release:major` raise the bump to the highest declared
-intent.
+or updates one automation-owned PR.
+
+The SemVer bump is resolved only from `Kin-Release-Intent:` git trailers on the
+first-parent commits between the prior stable tag and `main`. Patch is the
+default, and the highest intent found in the range wins. Write the trailer as
+the last block of the pull-request body:
+
+```
+Kin-Release-Intent: minor
+```
+
+Because the repository merges by squash with the pull-request body as the
+commit message, that line becomes part of the immutable commit on `main`. The
+train asserts the squash-only PR_TITLE + PR_BODY policy before trusting the
+resolution, and refuses a mention of the key that git does not parse as a
+trailer, a duplicate trailer, or an unsupported value.
+
+Nothing editable resolves the bump. Labels are applied to describe the resolved
+intent and are never read back, and the reconcile dispatch carries no bump
+override. A merged pull request's labels can be changed afterwards, so reading
+them would let a later scheduled run resolve a lower bump than an earlier one
+and rewrite a prepared minor or major release back to a patch. A commit message
+on protected main cannot change, and the first-parent range only grows, so the
+resolution is stable and monotone.
 
 The release App has repository Contents permission but no `main` bypass. It can
 only update `automation/release-next`; the repository `GITHUB_TOKEN` opens the

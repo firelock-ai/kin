@@ -56,6 +56,10 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      # The release labels describe the resolved intent so the board reads
+      # correctly. They are never consulted to resolve it: a label can be
+      # changed after a merge, and the release intent must not move once its
+      # evidence is on protected main.
       - name: Ensure release intent labels exist
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,17 +73,17 @@ jobs:
           gh label create "release:patch" \
             --repo "$GITHUB_REPOSITORY" \
             --color "C5DEF5" \
-            --description "Request the next patch release" \
+            --description "Describes the immutable patch intent resolved for the next release" \
             --force
           gh label create "release:minor" \
             --repo "$GITHUB_REPOSITORY" \
             --color "FBCA04" \
-            --description "Request the next minor release" \
+            --description "Describes the immutable minor intent resolved for the next release" \
             --force
           gh label create "release:major" \
             --repo "$GITHUB_REPOSITORY" \
             --color "B60205" \
-            --description "Request the next major release" \
+            --description "Describes the immutable major intent resolved for the next release" \
             --force
 
       - name: Resolve releasable drift and SemVer intent
@@ -87,9 +91,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          OVERRIDE_BUMP: ${{ github.event.client_payload.bump }}
         run: |
           set -euo pipefail
+          # The release intent is read from immutable commit messages, and it
+          # only reaches them because this repository merges by squash with the
+          # pull-request body as the message. Assert that before trusting the
+          # resolution rather than discovering a rewritten message later.
+          jq -e '
+            .allow_squash_merge == true and
+            .allow_merge_commit == false and
+            .allow_rebase_merge == false and
+            .squash_merge_commit_title == "PR_TITLE" and
+            .squash_merge_commit_message == "PR_BODY"
+          ' <<< "$(gh api "repos/${REPO}")" >/dev/null || {
+            echo "::error::immutable PR-body release intent requires enforced PR_TITLE + PR_BODY squash-only merging"
+            exit 1
+          }
           git fetch origin \
             "+refs/heads/main:refs/remotes/origin/main" \
             "+refs/tags/*:refs/tags/*"
@@ -126,73 +143,29 @@ jobs:
             exit 0
           fi
 
-          bump="patch"
-          raise_bump() {
-            case "$1" in
-              major) bump="major" ;;
-              minor) [ "$bump" = major ] || bump="minor" ;;
-              patch) ;;
-              *)
-                echo "::error::unsupported release bump: $1"
-                exit 1
-                ;;
-            esac
-          }
-
-          while IFS= read -r commit; do
-            labels=""
-            resolved=false
-            for attempt in 1 2 3 4; do
-              if labels="$(gh api \
-                -H "Accept: application/vnd.github+json" \
-                "repos/${REPO}/commits/${commit}/pulls" \
-                --jq '.[].labels[].name')"; then
-                resolved=true
-                break
-              fi
-              sleep $(( attempt * 2 ))
-            done
-            if [ "$resolved" != true ]; then
-              echo "::error::could not resolve release labels for main commit ${commit}"
-              exit 1
-            fi
-            if grep -qx 'release:major' <<< "$labels"; then
-              raise_bump major
-              break
-            fi
-            if grep -qx 'release:minor' <<< "$labels"; then
-              raise_bump minor
-            fi
-          done < <(git rev-list --first-parent --reverse "${tag}..${main_sha}")
-
-          case "${OVERRIDE_BUMP:-}" in
-            "") ;;
-            patch|minor|major) raise_bump "$OVERRIDE_BUMP" ;;
+          # Resolve the bump from the immutable `Kin-Release-Intent` trailers on
+          # the first-parent range. Pull-request labels and the dispatch payload
+          # are deliberately not consulted: both remain editable after a merge,
+          # so a later scheduled run could resolve a lower bump than an earlier
+          # one and rewrite a prepared minor or major release back to a patch.
+          # Commit messages on protected main cannot be edited, so the same
+          # range always resolves to the same intent, and the range only grows.
+          intent_policy="$RUNNER_TEMP/resolve-release-intent.mjs"
+          git show "refs/remotes/origin/main:scripts/resolve-release-intent.mjs" \
+            > "$intent_policy"
+          bump="$(
+            node "$intent_policy" \
+              --base-ref "$tag" \
+              --head-ref refs/remotes/origin/main \
+              | jq -er .intent
+          )"
+          case "$bump" in
+            patch|minor|major) ;;
             *)
-              echo "::error::release-reconcile bump must be patch, minor, or major"
+              echo "::error::unsupported immutable release intent: $bump"
               exit 1
               ;;
           esac
-
-          # Never downgrade an already-open coalescing train. An operator can
-          # raise its intent, but later schedules cannot rewrite minor/major
-          # release preparation back to patch.
-          train_labels="$(gh pr list \
-            --repo "$REPO" \
-            --state open \
-            --head automation/release-next \
-            --json labels,headRepository,headRepositoryOwner \
-            --jq '.[] |
-              select(
-                .headRepositoryOwner.login == "firelock-ai" and
-                .headRepository.nameWithOwner == "firelock-ai/kin"
-              ) |
-              .labels[].name')"
-          if grep -qx 'release:major' <<< "$train_labels"; then
-            raise_bump major
-          elif grep -qx 'release:minor' <<< "$train_labels"; then
-            raise_bump minor
-          fi
 
           {
             echo "needed=true"
