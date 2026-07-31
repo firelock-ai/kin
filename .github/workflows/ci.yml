@@ -15,8 +15,17 @@ on:
 permissions:
   contents: read
 
+# The sha suffix is empty off main, so every pull request and merge-queue ref
+# keeps one group per ref and `cancel-in-progress` still supersedes an older
+# push exactly as before. On main it gives each commit its own group. That
+# matters because `cancel-in-progress: false` does not mean "never cancel":
+# GitHub holds at most one PENDING run per group and cancels the older one, so
+# consecutive pushes to main both serialised behind each other and deleted each
+# other. Four main-branch pushes in a 24h sample were cancelled having started
+# zero jobs, and release-tag.yml requires push-event provenance for every
+# required check, which left those four landed commits permanently unmintable.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -99,6 +108,12 @@ jobs:
     # Split out of the installer job: the debug test compile and the release
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
+    #
+    # This job stays on every event on purpose, and the authority test enforces
+    # that it carries no job-level `if:`. It is the merge group's only proof of
+    # the Windows admission refusals, so taking it off the queue to reclaim its
+    # runner minutes would trade a reviewable pre-landing signal for a required
+    # context that first fails on main.
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -659,6 +674,16 @@ jobs:
         run: bash scripts/zero_file_search_guard.sh
 
       - name: Falsify Zero File-Search guards
+        # Both guards above still run on both platforms. Only this meta-proof,
+        # that the guards are not vacuous, is single-legged. Falsifiability is
+        # a property of the guards' logic, and neither the Python checker nor
+        # the shell guard branches on platform: they carry no `sys.platform` /
+        # `os.name` / `darwin` / `linux` test and no GNU-only shell construct.
+        # The harness is self-contained, poisoning a `mktemp -d` copy of
+        # `crates` and `scripts` rather than the checkout, so skipping it
+        # leaves no state for later steps and does not reorder them. It costs
+        # 5.9 min of the macOS leg, which is the merge queue's critical path.
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           poisoned="$(mktemp -d)"
@@ -901,7 +926,15 @@ jobs:
     # Not the critical path (the Windows jobs are longer), so gating this off
     # PRs costs no wall clock and reclaims ~23 min of billed compute per PR.
     # Coverage still runs on every push to main, so it still gates what lands.
-    if: github.event_name != 'pull_request'
+    #
+    # Off the merge queue for a stronger reason than cost. This is not a
+    # required context, so the queue never waits for it: across seven sampled
+    # landings the merge completed a median 34s after the last required check
+    # while this job was still running, finishing up to 7.1 min PAST the merge.
+    # A merge_group check-run that concludes after the merge lands on the exact
+    # sha release-tag.yml sweeps, where a non-required failure is terminal even
+    # though nothing gated on it. A job that never starts cannot conclude.
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

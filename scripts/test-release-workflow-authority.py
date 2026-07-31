@@ -202,7 +202,7 @@ DOCS_ONLY_WORKFLOW_HEADER = textwrap.dedent(
     permissions:
       contents: read
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     env:
       CARGO_TERM_COLOR: always
