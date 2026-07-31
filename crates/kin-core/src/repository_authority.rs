@@ -13,7 +13,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use kin_db::{
-    LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState, StorageBackend,
+    AuthorityPayloadStats, LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState,
+    StorageBackend,
 };
 use kin_model::{
     EntityDelta, EntityId, RelationDelta, RelationId, RepositoryId, SemanticChangeId, WorkspaceId,
@@ -282,6 +283,34 @@ impl LocalRepositoryAuthorityBinding {
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
         RepositoryAuthorityManager::open(self.repository_id.clone(), Arc::clone(&self.backend))
     }
+
+    /// Open a coherent authority manager and keep the payload receipt that the
+    /// same recovery produced.
+    ///
+    /// The receipt names the exact persisted snapshot bytes and acknowledged
+    /// delta bytes this open selected, so a caller reports the payload it
+    /// actually read rather than measuring storage afterwards. It is fixed at
+    /// open and does not follow later commits.
+    ///
+    /// `None` means recovery found no persisted authority and generation zero
+    /// was constructed only in memory. A reopen of a repository that has
+    /// persisted authority always carries a receipt; treating `None` as an
+    /// ordinary outcome there would report an unmeasured payload as a
+    /// successful read.
+    pub fn open_manager_with_payload_stats(
+        &self,
+    ) -> std::result::Result<
+        (
+            RepositoryAuthorityManager<LocalFileBackend>,
+            Option<AuthorityPayloadStats>,
+        ),
+        kin_db::KinDbError,
+    > {
+        RepositoryAuthorityManager::open_with_payload_stats(
+            self.repository_id.clone(),
+            Arc::clone(&self.backend),
+        )
+    }
 }
 
 /// Refuse `repository_id` unless `backend` still reaches the exact storage root
@@ -313,6 +342,63 @@ pub fn revalidate_pinned_local_namespace(
         None => Err(kin_db::KinDbError::StorageError(format!(
             "local storage authority does not hold repository namespace {repository_id}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod payload_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn generation_zero_built_only_in_memory_reports_no_payload_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let kindb = directory.path().join("kindb");
+        std::fs::create_dir_all(&kindb).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_parts(
+            RepositoryId::new("payload-receipt-generation-zero").unwrap(),
+            WorkspaceId::from_uuid(uuid::Uuid::from_u128(1)),
+            Arc::new(LocalFileBackend::new(&kindb)),
+        );
+
+        let (_manager, receipt) = binding.open_manager_with_payload_stats().unwrap();
+
+        assert!(
+            receipt.is_none(),
+            "an authority never persisted has no serialized payload to receipt"
+        );
+    }
+
+    #[test]
+    fn reopening_persisted_authority_always_carries_a_payload_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        // A binding built from the layout after init is a genuine reopen: it
+        // recovers persisted bytes rather than inheriting the in-memory state
+        // of the process that wrote them.
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+
+        let (_manager, receipt) = binding.open_manager_with_payload_stats().unwrap();
+
+        // The only legal `None` is the memory-only generation-zero case above.
+        // A reopen that recovered persisted authority and still reported no
+        // receipt would be an unmeasured read reported as a successful one.
+        let receipt = receipt.expect(
+            "a successfully reopened persisted repository must receipt the payload it read",
+        );
+        assert!(
+            receipt.snapshot_bytes() > 0,
+            "a recovered snapshot cannot occupy zero serialized bytes"
+        );
+        assert_eq!(
+            receipt.acknowledged_delta_count(),
+            receipt.head_generation() - receipt.snapshot_generation(),
+            "the receipt must account for every generation between snapshot and head"
+        );
+        assert_eq!(
+            receipt.total_payload_bytes(),
+            receipt.snapshot_bytes() + receipt.acknowledged_delta_bytes(),
+            "total payload bytes must be the snapshot plus acknowledged deltas it names"
+        );
     }
 }
 
