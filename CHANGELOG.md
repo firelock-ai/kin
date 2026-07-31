@@ -116,6 +116,12 @@ land.
 
 ### Fixed
 
+- The Windows `kin` binary reserves a main thread large enough to parse its own
+  command tree. Windows reserves 1 MiB where Unix reserves 8, fixed at link
+  time, and building the command tree recurses over every subcommand, so an
+  unoptimized Windows build overflowed its stack before reaching any command at
+  all, `--version` included. Reserved address space is not committed memory, so
+  matching the 16 MiB the CLI's own tests already use costs nothing at runtime.
 - A daemon that refuses to start can no longer take the running daemon's
   endpoint down with it. `.kin/daemon.pid` and `.kin/daemon.port` are now
   attributed by a `.kin/daemon.owner` record naming the exact process
