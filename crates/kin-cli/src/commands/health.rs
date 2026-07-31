@@ -1454,36 +1454,8 @@ fn check_retrieval_profile() -> HealthCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
-    use std::ffi::{OsStr, OsString};
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = env::var_os(key);
-            env::set_var(key, value.as_ref());
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = env::var_os(key);
-            env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => env::set_var(self.key, value),
-                None => env::remove_var(self.key),
-            }
-        }
-    }
 
     fn write_file(path: &Path, bytes: &[u8]) {
         use std::io::Write;
@@ -1595,7 +1567,7 @@ mod tests {
         for path in [&registry, &lock] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        let _registry_path = EnvGuard::set("KIN_REGISTRY_PATH", &registry);
+        let _registry_path = EnvVarGuard::set("KIN_REGISTRY_PATH", &registry);
 
         let check = check_registry_authority();
         assert!(matches!(check.status, HealthStatus::Misconfigured));
@@ -1637,14 +1609,14 @@ mod tests {
         )
         .unwrap();
 
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _kin_dir = EnvGuard::remove("KIN_DIR");
-        let _shell = EnvGuard::set("SHELL", "/bin/zsh");
-        let _ps_module_path = EnvGuard::remove("PSModulePath");
-        let _ps_version_table = EnvGuard::remove("PSVersionTable");
-        let _profile = EnvGuard::remove("PROFILE");
-        let _path = EnvGuard::set("PATH", "/usr/bin");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _shell = EnvVarGuard::set("SHELL", "/bin/zsh");
+        let _ps_module_path = EnvVarGuard::unset("PSModulePath");
+        let _ps_version_table = EnvVarGuard::unset("PSVersionTable");
+        let _profile = EnvVarGuard::unset("PROFILE");
+        let _path = EnvVarGuard::set("PATH", "/usr/bin");
 
         let check = check_shell_path();
         assert_eq!(check.id, "shell_path");

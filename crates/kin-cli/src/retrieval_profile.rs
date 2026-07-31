@@ -232,23 +232,24 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn profile_resolves_from_env_with_aliases_and_default() {
-        std::env::remove_var("KIN_PROFILE");
+        let mut profile = kin_core::test_env::EnvVarGuard::unset("KIN_PROFILE");
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
-        std::env::set_var("KIN_PROFILE", "compat-v0");
+        profile.apply("KIN_PROFILE", Some("compat-v0"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
-        std::env::set_var("KIN_PROFILE", "compat");
+        profile.apply("KIN_PROFILE", Some("compat"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
-        std::env::set_var("KIN_PROFILE", "ACCURACY-V1");
+        profile.apply("KIN_PROFILE", Some("ACCURACY-V1"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV1);
 
         // Unknown values must not silently select a different serving shape.
-        std::env::set_var("KIN_PROFILE", "warp-speed");
+        profile.apply("KIN_PROFILE", Some("warp-speed"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
-        std::env::remove_var("KIN_PROFILE");
+        profile.apply::<_, &str>("KIN_PROFILE", None);
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
     }
 
     #[test]

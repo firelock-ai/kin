@@ -2327,7 +2327,8 @@ mod tests {
             "failure-cleanup" => {
                 KinRegistry::default().save_to(&registry_path).unwrap();
                 let before = std::fs::read(&registry_path).unwrap();
-                std::env::set_var("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC", "1");
+                let mut fail_after_temp_sync =
+                    crate::test_env::EnvVarGuard::set("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC", "1");
                 let mut changed = KinRegistry::default();
                 changed.repos.push(RegisteredRepo {
                     id: "must-not-land".to_string(),
@@ -2337,7 +2338,7 @@ mod tests {
                     dependencies: Vec::new(),
                 });
                 assert!(changed.save_to(&registry_path).is_err());
-                std::env::remove_var("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC");
+                fail_after_temp_sync.apply::<_, &str>("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC", None);
                 assert_eq!(std::fs::read(&registry_path).unwrap(), before);
                 assert!(std::fs::read_dir(&work).unwrap().all(|entry| !entry
                     .unwrap()

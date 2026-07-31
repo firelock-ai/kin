@@ -44,6 +44,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+kin-core = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 # The descendant-reap acceptance test is cross-platform even though production
 # process-group enumeration uses sysinfo only on Unix.

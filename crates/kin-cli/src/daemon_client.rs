@@ -6849,15 +6849,11 @@ mod tests {
         let layout = KinLayout::new(dir.path().join(".kin"));
         std::fs::create_dir_all(layout.root()).unwrap();
         std::fs::write(layout.root().join("daemon.token"), "layout-token\n").unwrap();
-        let previous = std::env::var_os("KIN_DAEMON_AUTH_TOKEN");
-        std::env::set_var("KIN_DAEMON_AUTH_TOKEN", "explicit-token");
+        let _token =
+            kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_AUTH_TOKEN", "explicit-token");
 
         let resolved = resolve_daemon_auth_token_for_layout(&layout);
 
-        match previous {
-            Some(value) => std::env::set_var("KIN_DAEMON_AUTH_TOKEN", value),
-            None => std::env::remove_var("KIN_DAEMON_AUTH_TOKEN"),
-        }
         assert_eq!(resolved.as_deref(), Some("explicit-token"));
     }
 
@@ -7746,13 +7742,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn runtime_reexec_requires_prior_adoption_and_survives_launcher_drop() {
-        let prior = std::env::var_os(SUPERVISOR_STARTUP_GENERATION_ENV);
-
         let adopted_dir = tempfile::tempdir().unwrap();
         let adopted_launcher =
             try_acquire_supervisor_startup_lock_in_dir(adopted_dir.path()).unwrap();
         let adopted_generation = adopted_launcher.generation().to_string();
-        std::env::set_var(SUPERVISOR_STARTUP_GENERATION_ENV, &adopted_generation);
+        let mut generation = kin_core::test_env::EnvVarGuard::set(
+            SUPERVISOR_STARTUP_GENERATION_ENV,
+            &adopted_generation,
+        );
         let first_runtime = validate_supervisor_runtime_startup(adopted_dir.path()).unwrap();
         first_runtime.acknowledge().unwrap();
         drop(adopted_launcher);
@@ -7768,17 +7765,12 @@ mod tests {
         let crashed_dir = tempfile::tempdir().unwrap();
         let crashed_launcher =
             try_acquire_supervisor_startup_lock_in_dir(crashed_dir.path()).unwrap();
-        std::env::set_var(
+        generation.apply(
             SUPERVISOR_STARTUP_GENERATION_ENV,
-            crashed_launcher.generation(),
+            Some(crashed_launcher.generation()),
         );
         drop(crashed_launcher);
         let error = validate_supervisor_runtime_startup(crashed_dir.path()).unwrap_err();
-
-        match prior {
-            Some(value) => std::env::set_var(SUPERVISOR_STARTUP_GENERATION_ENV, value),
-            None => std::env::remove_var(SUPERVISOR_STARTUP_GENERATION_ENV),
-        }
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(
@@ -7824,13 +7816,8 @@ mod tests {
             format!("pid={} acquired_at=legacy\n", std::process::id()),
         )
         .unwrap();
-        let prior = std::env::var_os(SUPERVISOR_STARTUP_GENERATION_ENV);
-        std::env::remove_var(SUPERVISOR_STARTUP_GENERATION_ENV);
+        let _generation = kin_core::test_env::EnvVarGuard::unset(SUPERVISOR_STARTUP_GENERATION_ENV);
         let error = validate_supervisor_runtime_startup(dir.path()).unwrap_err();
-        match prior {
-            Some(value) => std::env::set_var(SUPERVISOR_STARTUP_GENERATION_ENV, value),
-            None => std::env::remove_var(SUPERVISOR_STARTUP_GENERATION_ENV),
-        }
 
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         assert!(

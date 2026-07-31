@@ -303,40 +303,9 @@ mod tests {
         bind_daemon_for_repo_dir, bind_first_kin_repo_against, build_mcp_start_config,
         resolve_repo_override, session_authority_notice, start,
     };
+    use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
     use std::path::PathBuf;
-
-    /// RAII guard that saves and restores a single env var around a test, so
-    /// tests that mutate process-global env state (unavoidable — cwd/env are
-    /// how `kin mcp start` binds its repo) don't leak into other tests in this
-    /// binary.
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     #[test]
     fn daemon_available_notice_mentions_daemon_authority() {
@@ -385,7 +354,7 @@ mod tests {
     #[test]
     #[serial]
     fn repo_override_none_when_neither_flag_nor_env_set() {
-        let _guard = EnvVarGuard::remove("KIN_MCP_REPO");
+        let _guard = EnvVarGuard::unset("KIN_MCP_REPO");
         assert_eq!(resolve_repo_override(None), None);
     }
 
@@ -398,7 +367,7 @@ mod tests {
         // A directory with no .kin/ must produce an `Err` reason string for
         // the caller to log, never a panic or a process-killing error
         // propagated out of `start`.
-        let _daemon_guard = EnvVarGuard::remove("KIN_DAEMON_URL");
+        let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
         let tmp = tempfile::tempdir().unwrap();
         let reason = bind_daemon_for_repo_dir(tmp.path())
             .await
@@ -553,7 +522,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn roots_with_no_kin_repository_bind_nothing() {
-        let _daemon_guard = EnvVarGuard::remove("KIN_DAEMON_URL");
+        let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
         // No autostart: this test must never spawn a daemon process.
         let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
         let plain = tempfile::tempdir().unwrap();

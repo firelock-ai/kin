@@ -1542,7 +1542,7 @@ mod tests {
             }
             Err(error) => panic!("failed to establish Kin repo fixture: {error}"),
         };
-        std::env::remove_var("KIN_DAEMON_URL");
+        let _daemon_url = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
         let config = McpServerConfig::default();
         let sessions = SessionRegistry::new();
         let store = InMemoryGraph::default();

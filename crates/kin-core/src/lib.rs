@@ -32,6 +32,12 @@ pub mod repository_authority;
 pub mod resolver;
 pub mod shims;
 pub mod sync_state;
+/// Scoped, restoring, serialized environment mutation for test code.
+///
+/// Compiled only for this crate's own tests and for consumers that request the
+/// `test-support` feature from a dev-dependency, so no product build carries it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_env;
 pub mod tree;
 pub mod workspace_semantics;
 

@@ -825,14 +825,49 @@ fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String
         })
 }
 
-fn cross_repo_repo_id() -> std::result::Result<String, String> {
-    match std::env::var("KIN_REPO_ID") {
-        Ok(value) => normalize_cross_repo_repo_id(Some(&value)),
-        Err(std::env::VarError::NotPresent) => normalize_cross_repo_repo_id(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(
-            "KIN_REPO_ID is not valid Unicode; cross-repo authority cannot bind this graph to a repository"
-                .to_string(),
-        ),
+/// Cross-repository binding for a caller that has no daemon-owned authority.
+///
+/// The standalone MCP server resolves this from the process environment once,
+/// at its entry boundary. Holding the resolved values rather than re-reading
+/// `KIN_REPO_ID` and `KIN_DAEMON_URL` mid-request means one request cannot see
+/// two different bindings, and means a test can name a binding by argument
+/// instead of writing the process-global table that every thread in the binary
+/// shares.
+#[derive(Clone, Debug)]
+pub struct AmbientCrossRepoBinding {
+    repo_id: std::result::Result<String, String>,
+    daemon_url: Option<String>,
+}
+
+impl AmbientCrossRepoBinding {
+    /// Bind to an explicitly named repository and spine endpoint.
+    pub fn new(repo_id: Option<&str>, daemon_url: Option<&str>) -> Self {
+        Self {
+            repo_id: normalize_cross_repo_repo_id(repo_id),
+            daemon_url: daemon_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// Resolve the binding from the process environment.
+    pub fn from_env() -> Self {
+        let repo_id = match std::env::var("KIN_REPO_ID") {
+            Ok(value) => normalize_cross_repo_repo_id(Some(&value)),
+            Err(std::env::VarError::NotPresent) => normalize_cross_repo_repo_id(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(
+                "KIN_REPO_ID is not valid Unicode; cross-repo authority cannot bind this graph to a repository"
+                    .to_string(),
+            ),
+        };
+        Self {
+            repo_id,
+            daemon_url: std::env::var("KIN_DAEMON_URL")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+        }
     }
 }
 
@@ -850,7 +885,7 @@ pub struct FindReferencesAuthority<'a> {
 }
 
 enum FindReferencesAuthoritySource<'a> {
-    Environment,
+    Ambient(AmbientCrossRepoBinding),
     Daemon(FindReferencesAuthority<'a>),
 }
 
@@ -956,7 +991,29 @@ pub async fn handle_find_references<G: GraphStore>(
     handle_find_references_with_authority_source(
         args,
         store,
-        FindReferencesAuthoritySource::Environment,
+        FindReferencesAuthoritySource::Ambient(AmbientCrossRepoBinding::from_env()),
+        repository_authority,
+    )
+    .await
+}
+
+/// Serve `find_references` from an explicitly named ambient binding.
+///
+/// Same behavior as [`handle_find_references`], with the repository id and
+/// spine endpoint supplied rather than read from the process environment. A
+/// test covering the ambient path names its binding here instead of writing
+/// `KIN_REPO_ID` and `KIN_DAEMON_URL`, which are process-global and, under
+/// `cargo test`, visible to every other test in the binary.
+pub async fn handle_find_references_with_ambient_binding<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    binding: AmbientCrossRepoBinding,
+    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+) -> Result<ToolCallResult> {
+    handle_find_references_with_authority_source(
+        args,
+        store,
+        FindReferencesAuthoritySource::Ambient(binding),
         repository_authority,
     )
     .await
@@ -1028,9 +1085,12 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         collect_graph_reference_rows(store, &target.id, &relation_kinds, repository_authority)?;
     // ── Federated Xrefs via Spine ─────────────────────────────────────
     let cross_repo_query = match authority_source {
-        FindReferencesAuthoritySource::Environment => match cross_repo_repo_id() {
+        FindReferencesAuthoritySource::Ambient(binding) => match binding.repo_id {
             Ok(repo_id) => {
-                let query = fetch_spine_xref(&repo_id, &target.id).await;
+                let query = match binding.daemon_url.as_deref() {
+                    Some(daemon_url) => fetch_spine_xref_at(daemon_url, &repo_id, &target.id).await,
+                    None => kin_spine::SpineQuery::NotConfigured,
+                };
                 Ok((repo_id, query))
             }
             Err(reason) => Err(reason),

@@ -12193,36 +12193,8 @@ pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
-    use std::ffi::{OsStr, OsString};
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = env::var_os(key);
-            env::set_var(key, value.as_ref());
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = env::var_os(key);
-            env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => env::set_var(self.key, value),
-                None => env::remove_var(self.key),
-            }
-        }
-    }
 
     fn opts() -> WizardOptions {
         WizardOptions {
@@ -12584,8 +12556,8 @@ wait
         fs::create_dir_all(shim.parent().unwrap()).unwrap();
         fs::write(&shim, b"MANAGED_SHIM").unwrap();
 
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _kin_dir = EnvGuard::remove("KIN_DIR");
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
 
         assert_eq!(find_shim().as_deref(), Some(shim.as_path()));
     }
@@ -12884,15 +12856,14 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[test]
     #[serial]
     fn kin_dir_honors_kin_home_before_kin_dir() {
-        let _kin_home = EnvGuard::remove("KIN_HOME");
-        let _kin_dir = EnvGuard::remove("KIN_DIR");
+        let mut home = EnvVarGuard::unset("KIN_HOME").without("KIN_DIR");
         let fallback = PathBuf::from("/tmp/kin-dir-only");
         let preferred = PathBuf::from("/tmp/kin-home-preferred");
 
-        env::set_var("KIN_DIR", &fallback);
+        home.apply("KIN_DIR", Some(&fallback));
         assert_eq!(kin_dir().unwrap(), fallback);
 
-        env::set_var("KIN_HOME", &preferred);
+        home.apply("KIN_HOME", Some(&preferred));
         assert_eq!(kin_dir().unwrap(), preferred);
     }
 
@@ -12904,10 +12875,10 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let kin_home = tmp.path().join("kin-home");
         fs::create_dir_all(&home).unwrap();
 
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _kin_dir = EnvGuard::remove("KIN_DIR");
-        let _path = EnvGuard::set("PATH", "/usr/bin");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _path = EnvVarGuard::set("PATH", "/usr/bin");
 
         install_shell_hook("zsh").unwrap();
         install_shell_hook("zsh").unwrap();
@@ -13020,7 +12991,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn merge_mcp_config_refuses_to_overwrite_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let path = dir.path().join("config.json");
         std::fs::write(&path, b"this is not json {{{").unwrap();
 
@@ -13047,7 +13018,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn merge_mcp_config_merges_into_valid_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"existingKey": true}"#).unwrap();
 
@@ -13066,7 +13037,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn merge_mcp_config_toml_refuses_to_overwrite_corrupt_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".kin")).unwrap();
         let path = dir.path().join("config.toml");
@@ -13095,7 +13066,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn merge_mcp_config_toml_preserves_existing_codex_config() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".kin")).unwrap();
         let repo = repo.canonicalize().unwrap();
@@ -13143,7 +13114,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn merge_mcp_config_toml_creates_missing_file_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".kin")).unwrap();
         let repo = repo.canonicalize().unwrap();
@@ -13178,7 +13149,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn codex_merge_preserves_table_env_cwd_and_user_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".kin")).unwrap();
         let repo = repo.canonicalize().unwrap();
@@ -13209,7 +13180,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[serial]
     fn structurally_incompatible_configs_fail_closed_byte_for_byte() {
         let dir = tempfile::tempdir().unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let json = dir.path().join("config.json");
         let json_bytes = br#"{"mcpServers":{"kin":{"env":"user-owned"}}}"#;
         fs::write(&json, json_bytes).unwrap();
@@ -13235,8 +13206,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let config = client.join("mcp.json");
         fs::write(&config, b"{}").unwrap();
         let alias = client.join("..").join(".cursor").join("mcp.json");
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", dir.path().join("kin-home"));
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let digest = crate::commands::setup_ledger::sha256_hex(b"{}");
         let cursor = McpRepairTarget {
             id: "cursor".to_string(),
@@ -15416,8 +15387,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let kin_home = dir.path().join("kin-home");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::create_dir_all(kin_home.join("config")).unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let digest = crate::commands::setup_ledger::sha256_hex(b"{}");
 
         let primary = home.join(".claude.json");
@@ -15484,8 +15455,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             ),
         )
         .unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
 
         let captured = current_mcp_repair_targets().unwrap();
         let captured = captured
@@ -15525,8 +15496,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             r#"{"mcpServers":{"kin":{"command":"/stale/kin","args":["mcp","start"]}}}"#,
         )
         .unwrap();
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let captured = current_mcp_repair_targets().unwrap();
         assert_eq!(captured.len(), 1);
 
@@ -15627,9 +15598,10 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             .output()
             .unwrap();
         assert!(git.status.success());
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
-        let _scan_root = EnvGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &repo);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &repo);
         let previous = env::current_dir().unwrap();
         env::set_current_dir(&repo).unwrap();
         let _cwd = CurrentDirGuard(previous);
@@ -15704,10 +15676,10 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             br#"{"mcpServers":{"kin":{"command":"/enclosing/kin","args":["mcp","start"]}}}"#;
         fs::write(&decoy, decoy_bytes).unwrap();
 
-        let _home = EnvGuard::set("HOME", &home);
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let _scan_root =
-            EnvGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &inner);
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &inner);
         let previous = env::current_dir().unwrap();
         env::set_current_dir(&inner).unwrap();
         let _cwd = CurrentDirGuard(previous);
@@ -15742,7 +15714,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let outside = dir.path().join("outside");
         fs::create_dir_all(&fixture).unwrap();
         fs::create_dir_all(&outside).unwrap();
-        let _fixture_root = EnvGuard::set(
+        let _fixture_root = EnvVarGuard::set(
             crate::commands::managed_config_scope::FIXTURE_ROOT_ENV,
             &fixture,
         );
@@ -15771,7 +15743,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 }"#,
         )
         .unwrap();
-        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let target = McpRepairTarget {
             id: "antigravity".to_string(),
             path: config.clone(),

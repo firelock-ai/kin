@@ -2296,13 +2296,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn session_idle_ttl_is_configurable_and_rejects_nonsense() {
-        let restore = std::env::var(SESSION_IDLE_TTL_ENV).ok();
-
-        std::env::set_var(SESSION_IDLE_TTL_ENV, "60");
+        let mut ttl = kin_core::test_env::EnvVarGuard::set(SESSION_IDLE_TTL_ENV, "60");
         assert_eq!(configured_session_idle_ttl(), Duration::from_secs(60));
 
         for nonsense in ["0", "", "  ", "later", "-5"] {
-            std::env::set_var(SESSION_IDLE_TTL_ENV, nonsense);
+            ttl.apply(SESSION_IDLE_TTL_ENV, Some(nonsense));
             assert_eq!(
                 configured_session_idle_ttl(),
                 DEFAULT_SESSION_IDLE_TTL,
@@ -2310,13 +2308,13 @@ mod tests {
             );
         }
 
-        std::env::set_var(
+        ttl.apply(
             SESSION_IDLE_TTL_ENV,
-            MAX_SESSION_IDLE_TTL.as_secs().to_string(),
+            Some(MAX_SESSION_IDLE_TTL.as_secs().to_string()),
         );
         assert_eq!(configured_session_idle_ttl(), MAX_SESSION_IDLE_TTL);
         for past_ceiling in [MAX_SESSION_IDLE_TTL.as_secs() + 1, 18_000_000, u64::MAX] {
-            std::env::set_var(SESSION_IDLE_TTL_ENV, past_ceiling.to_string());
+            ttl.apply(SESSION_IDLE_TTL_ENV, Some(past_ceiling.to_string()));
             assert_eq!(
                 configured_session_idle_ttl(),
                 DEFAULT_SESSION_IDLE_TTL,
@@ -2324,11 +2322,8 @@ mod tests {
             );
         }
 
-        std::env::remove_var(SESSION_IDLE_TTL_ENV);
+        ttl.apply::<_, &str>(SESSION_IDLE_TTL_ENV, None);
         assert_eq!(configured_session_idle_ttl(), DEFAULT_SESSION_IDLE_TTL);
-        if let Some(restore) = restore {
-            std::env::set_var(SESSION_IDLE_TTL_ENV, restore);
-        }
     }
 
     /// A heartbeat extends the lease: the sweeper measures from the last

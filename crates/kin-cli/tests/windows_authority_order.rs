@@ -67,33 +67,13 @@ const COMMAND_REGISTRY: &str = "KIN_REGISTRY_PATH";
 #[cfg(windows)]
 const COMMAND_OWNER_TOKEN: &str = "kIn_TeSt_RuNtImE_oWnEr_ToKeN";
 #[cfg(not(windows))]
+use kin_core::test_env::EnvVarGuard;
+
 const COMMAND_OWNER_TOKEN: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
 #[cfg(windows)]
 const COMMAND_GIT_CONFIG_NOSYSTEM: &str = "gIt_cOnFiG_nOsYsTeM";
 #[cfg(not(windows))]
 const COMMAND_GIT_CONFIG_NOSYSTEM: &str = "GIT_CONFIG_NOSYSTEM";
-
-struct EnvGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &OsStr) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
 
 #[test]
 fn authority_order_worker() {
@@ -195,10 +175,12 @@ fn spawned_child_observes_case_insensitive_authority_order() {
     let git_date = "1600000000 +0000";
     let daemon_url = "http://127.0.0.1:9";
 
-    let _ambient_git = EnvGuard::set(AMBIENT_GIT_DIR, OsStr::new("ambient-git-authority"));
-    let _ambient_kin = EnvGuard::set(AMBIENT_KIN_BUCKET, OsStr::new("ambient-production-bucket"));
-    let _ambient_dyld = EnvGuard::set(AMBIENT_DYLD_INJECTION, OsStr::new("ambient-dyld-injection"));
-    let _ambient_ld = EnvGuard::set(AMBIENT_LD_INJECTION, OsStr::new("ambient-ld-injection"));
+    let _ambient_git = EnvVarGuard::set(AMBIENT_GIT_DIR, OsStr::new("ambient-git-authority"));
+    let _ambient_kin =
+        EnvVarGuard::set(AMBIENT_KIN_BUCKET, OsStr::new("ambient-production-bucket"));
+    let _ambient_dyld =
+        EnvVarGuard::set(AMBIENT_DYLD_INJECTION, OsStr::new("ambient-dyld-injection"));
+    let _ambient_ld = EnvVarGuard::set(AMBIENT_LD_INJECTION, OsStr::new("ambient-ld-injection"));
 
     let runtime = common::IsolatedDaemonRuntime::with_cleanup_command_for_test(
         &repository,
