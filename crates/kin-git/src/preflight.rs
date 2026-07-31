@@ -23,8 +23,8 @@ use kin_model::{
 };
 
 use crate::error::{
-    GitCheckoutFilterFact, GitError, LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact,
-    RegisteredGitWorktreeKind, Result,
+    GitCheckoutFilterFact, GitError, LocalGitHookExecutability, LocalGitHookFact, LocalGitHookKind,
+    RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result,
 };
 use crate::lossless::{
     capture_lossless_git_repository, open_repo, reject_shallow_repository, GitObjectFormat,
@@ -674,6 +674,7 @@ fn prove_worktree(
 ) -> Result<(GitTrackedWorktreeProof, IgnoredLocalWorktreeFact)> {
     let ignore_inputs = local_ignore_inputs(ignore_repo)?;
     let (mut excludes, ignore_case) = frozen_ignore_stack(ignore_repo, index, &ignore_inputs)?;
+    let (executable_authority, symlink_materialization) = worktree_materialization(ignore_repo)?;
     let mut tracked_hash = FramedHash::new(b"kin.git.preflight.worktree.v2");
     tracked_hash.u64(expected.len() as u64);
     let mut state = WorktreeWalk {
@@ -684,6 +685,8 @@ fn prove_worktree(
         gitlink_count: 0,
         host_unrepresentable_count: 0,
         ignored: Vec::new(),
+        executable_authority,
+        symlink_materialization,
     };
     let graph_only_paths = expected
         .iter()
@@ -770,6 +773,79 @@ struct WorktreeWalk<'a> {
     gitlink_count: usize,
     host_unrepresentable_count: usize,
     ignored: Vec<IgnoredLocalEntry>,
+    executable_authority: ExecutableModeAuthority,
+    symlink_materialization: SymlinkMaterialization,
+}
+
+/// Where the exact executable bit of a tracked blob is read from.
+///
+/// Git resolves this the same way: a worktree whose filesystem carries the bit
+/// is compared against it, and one that does not is trusted to the index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutableModeAuthority {
+    /// The worktree filesystem records the bit, so the materialized file is
+    /// compared against the committed mode directly.
+    WorktreeMode,
+    /// The filesystem records no executable bit, so the index carries the
+    /// exact mode. `prove_index` already proved every index entry's mode
+    /// equals its committed tree entry, so no worktree comparison remains.
+    IndexMode,
+}
+
+/// How a tracked symbolic link is materialized in the worktree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SymlinkMaterialization {
+    /// The worktree carries a real symbolic link.
+    Link,
+    /// `core.symlinks=false`: Git materializes a tracked symlink as a regular
+    /// file whose bytes are the link target.
+    TargetTextFile,
+}
+
+/// Resolve how this host and repository materialize modes and symbolic links.
+///
+/// A host whose filesystem carries the executable bit also carries real
+/// symbolic links, and the worktree is the exact authority for both. Nothing
+/// is read from configuration there, so a repository-local `core.fileMode` or
+/// `core.symlinks` override cannot change what an already materialized
+/// checkout physically holds.
+///
+/// A host whose filesystem carries neither is Windows. `core.fileMode=true`
+/// asks Git to compare against a mode it synthesizes from the file name or a
+/// `#!` prefix, which is not a byte-exact observation of anything and is
+/// refused rather than admitted as proof. `core.symlinks` decides the other
+/// half: Git for Windows probes the symlink privilege when it creates a
+/// repository and records the result, and its compiled-in default without a
+/// recorded value is off, which materializes a tracked symlink as a regular
+/// file holding the target text.
+///
+/// Both arms live in one body so every variant stays constructed on every
+/// target and the platform difference reads as one decision.
+fn worktree_materialization(
+    repo: &gix::Repository,
+) -> Result<(ExecutableModeAuthority, SymlinkMaterialization)> {
+    if filesystem_records_executable_bit() {
+        return Ok((
+            ExecutableModeAuthority::WorktreeMode,
+            SymlinkMaterialization::Link,
+        ));
+    }
+    let config = repo.config_snapshot();
+    if config.boolean("core.fileMode") == Some(true) {
+        return Err(preflight_error(
+            "repository sets core.fileMode=true, but this platform's filesystem records no \
+             executable bit; Git would compare a mode synthesized from the file name or a `#!` \
+             prefix, which proves nothing byte-exact. Set core.fileMode=false, the value Git \
+             records for a repository created on this platform, so the index carries the exact \
+             mode",
+        ));
+    }
+    let materialization = if config.boolean("core.symlinks") == Some(true) {
+        SymlinkMaterialization::Link
+    } else {
+        SymlinkMaterialization::TargetTextFile
+    };
+    Ok((ExecutableModeAuthority::IndexMode, materialization))
 }
 
 fn host_can_materialize_repo_path(path: &RepoPath) -> bool {
@@ -813,14 +889,19 @@ fn walk_directory(
     excludes: &mut gix::AttributeStack<'_>,
     state: &mut WorktreeWalk<'_>,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(absolute)
+    let entries = fs::read_dir(absolute)
         .map_err(|error| GitError::io(absolute, error))?
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| GitError::io(absolute, error))?;
-    entries.sort_by_key(|entry| os_bytes(&entry.file_name()));
+    // Names are resolved before ordering so a name this host cannot represent
+    // exactly fails the walk rather than sorting under a repaired substitute.
+    let mut entries = entries
+        .into_iter()
+        .map(|entry| Ok((os_bytes(&entry.file_name())?, entry)))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    for directory_entry in entries {
-        let name = os_bytes(&directory_entry.file_name());
+    for (name, directory_entry) in entries {
         if root && name == b".git" {
             continue;
         }
@@ -909,7 +990,9 @@ fn prove_tracked_entry(
                     "tracked blob {path} is not a regular file"
                 )));
             }
-            if filesystem_executable(metadata)? != executable {
+            if state.executable_authority == ExecutableModeAuthority::WorktreeMode
+                && filesystem_executable(metadata)? != executable
+            {
                 return Err(preflight_error(format!(
                     "tracked blob {path} has a different executable mode than the committed tree"
                 )));
@@ -927,14 +1010,33 @@ fn prove_tracked_entry(
             state.tracked_hash.u64(u64::from(executable));
         }
         TreeEntry::Symlink { target_blob } => {
-            if !metadata.file_type().is_symlink() {
-                return Err(preflight_error(format!(
-                    "tracked symlink {path} is not a symbolic link"
-                )));
-            }
-            let target =
-                fs::read_link(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
-            let target = path_bytes(&target)?;
+            let target = match state.symlink_materialization {
+                SymlinkMaterialization::Link => {
+                    if !metadata.file_type().is_symlink() {
+                        return Err(preflight_error(format!(
+                            "tracked symlink {path} is not a symbolic link"
+                        )));
+                    }
+                    let target = fs::read_link(absolute_path)
+                        .map_err(|error| GitError::io(absolute_path, error))?;
+                    path_bytes(&target)?
+                }
+                // Git materializes a tracked symlink as a regular file holding
+                // the target text when it cannot create links, and compares
+                // that file's bytes against the committed target blob. Reading
+                // those bytes is the same observation Git makes, not a
+                // filesystem fallback for a missing link.
+                SymlinkMaterialization::TargetTextFile => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(preflight_error(format!(
+                            "tracked symlink {path} is materialized as neither a symbolic link \
+                             nor the regular file holding its target, which is what Git writes \
+                             under core.symlinks=false"
+                        )));
+                    }
+                    fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?
+                }
+            };
             let committed = state.blob_store.read(&target_blob)?;
             if target != committed {
                 return Err(preflight_error(format!(
@@ -1030,13 +1132,16 @@ fn find_lock_file(root: &Path) -> Result<Option<PathBuf>> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(None);
     }
-    let mut entries = fs::read_dir(root)
+    let entries = fs::read_dir(root)
         .map_err(|error| GitError::io(root, error))?
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| GitError::io(root, error))?;
-    entries.sort_by_key(|entry| os_bytes(&entry.file_name()));
-    for entry in entries {
-        let name = os_bytes(&entry.file_name());
+    let mut entries = entries
+        .into_iter()
+        .map(|entry| Ok((os_bytes(&entry.file_name())?, entry)))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, entry) in entries {
         let metadata = fs::symlink_metadata(entry.path())
             .map_err(|error| GitError::io(entry.path(), error))?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -1123,7 +1228,7 @@ fn local_hook_facts(repo: &gix::Repository) -> Result<(bool, Vec<LocalGitHookFac
     let mut hooks = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| GitError::io(&hooks_dir, error))?;
-        let name = os_bytes(&entry.file_name());
+        let name = os_bytes(&entry.file_name())?;
         if name.ends_with(b".sample") {
             continue;
         }
@@ -1132,7 +1237,7 @@ fn local_hook_facts(repo: &gix::Repository) -> Result<(bool, Vec<LocalGitHookFac
         hooks.push(LocalGitHookFact {
             name,
             kind: hook_kind(&metadata),
-            executable: filesystem_executable(&metadata)?,
+            executable: hook_executability(&metadata)?,
             byte_len: metadata.len(),
         });
     }
@@ -1959,28 +2064,83 @@ fn preflight_error(reason: impl Into<String>) -> GitError {
     GitError::MigrationPreflight(reason.into())
 }
 
+/// Exact bytes of one filesystem entry name.
+///
+/// Unix names are already byte strings, so they are exact as read.
 #[cfg(unix)]
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+fn os_bytes(value: &std::ffi::OsStr) -> Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
-    value.as_bytes().to_vec()
+    Ok(value.as_bytes().to_vec())
 }
 
+/// Exact bytes of one filesystem entry name.
+///
+/// Windows names are UTF-16 and carry no byte encoding of their own, so the
+/// exact byte form of a well-formed name is its UTF-8 encoding, which is the
+/// encoding Git itself records. A name the filesystem holds as ill-formed
+/// UTF-16 has no exact byte form here and fails rather than being repaired
+/// with replacement characters: a lossy name would let two distinct entries
+/// collapse to the same bytes in the tracked fingerprint and in the sort that
+/// fingerprint depends on, which is a silent proof forgery rather than a
+/// missing feature.
 #[cfg(not(unix))]
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
-    value.to_string_lossy().into_owned().into_bytes()
+fn os_bytes(value: &std::ffi::OsStr) -> Result<Vec<u8>> {
+    value
+        .to_str()
+        .map(|name| name.as_bytes().to_vec())
+        .ok_or_else(|| {
+            preflight_error(format!(
+                "worktree entry {} is not well-formed Unicode, so this platform cannot name it \
+                 exactly",
+                value.to_string_lossy()
+            ))
+        })
 }
 
+/// Exact bytes of one symbolic-link target read back from the worktree.
 #[cfg(unix)]
 fn path_bytes(value: &Path) -> Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     Ok(value.as_os_str().as_bytes().to_vec())
 }
 
+/// Exact bytes of one symbolic-link target read back from the worktree.
+///
+/// Git stores link targets as UTF-8 with `/` separators. Windows returns a
+/// reparse point's substitute name as UTF-16, and may render the separators
+/// Git wrote as `\`. A backslash cannot occur literally inside a Windows path
+/// component, so one read back from the filesystem is unambiguously a
+/// separator and is restored to the form Git committed; a target that already
+/// uses `/` is unchanged by the same rewrite. A target the filesystem holds as
+/// ill-formed UTF-16 has no exact byte form and fails.
 #[cfg(not(unix))]
-fn path_bytes(_value: &Path) -> Result<Vec<u8>> {
-    Err(preflight_error(
-        "byte-exact symlink target proof is unsupported on this platform",
-    ))
+fn path_bytes(value: &Path) -> Result<Vec<u8>> {
+    value
+        .to_str()
+        .map(|target| target.replace('\\', "/").into_bytes())
+        .ok_or_else(|| {
+            preflight_error(format!(
+                "symbolic-link target {} is not well-formed Unicode, so this platform cannot \
+                 prove it exactly",
+                value.display()
+            ))
+        })
+}
+
+/// Whether the host filesystem records an executable bit at all.
+#[cfg(unix)]
+const fn filesystem_records_executable_bit() -> bool {
+    true
+}
+
+/// Whether the host filesystem records an executable bit at all.
+///
+/// Windows filesystems do not. Git for Windows detects this at repository
+/// creation and records `core.fileMode=false`, after which the index carries
+/// the exact mode and the worktree is never consulted for it.
+#[cfg(not(unix))]
+const fn filesystem_records_executable_bit() -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -1989,11 +2149,195 @@ fn filesystem_executable(metadata: &fs::Metadata) -> Result<bool> {
     Ok(metadata.permissions().mode() & 0o100 != 0)
 }
 
+/// Fail-closed backstop for a host with no executable bit to read.
+///
+/// `worktree_materialization` never selects [`ExecutableModeAuthority::
+/// WorktreeMode`] on such a host, so this is unreachable by construction; it
+/// refuses rather than inventing a bit if that ever stops being true.
 #[cfg(not(unix))]
 fn filesystem_executable(_metadata: &fs::Metadata) -> Result<bool> {
     Err(preflight_error(
-        "byte-exact executable-mode proof is unsupported on this platform",
+        "byte-exact executable-mode proof was requested from a filesystem that records no \
+         executable bit",
     ))
+}
+
+/// Executable-bit observation for one local hook file.
+fn hook_executability(metadata: &fs::Metadata) -> Result<LocalGitHookExecutability> {
+    if !filesystem_records_executable_bit() {
+        return Ok(LocalGitHookExecutability::Unrecorded);
+    }
+    Ok(if filesystem_executable(metadata)? {
+        LocalGitHookExecutability::Executable
+    } else {
+        LocalGitHookExecutability::NotExecutable
+    })
+}
+
+/// Platform materialization contracts, exercised on every target.
+///
+/// The suite below builds real repositories carrying symlinks, executable
+/// bits, and non-UTF-8 paths, so it is unix-only. These cases instead pin the
+/// decisions that differ per platform, and each asserts both arms, so the
+/// Windows leg proves the Windows behavior rather than compiling it.
+#[cfg(test)]
+mod platform_materialization_tests {
+    use std::ffi::OsString;
+
+    use super::*;
+    use crate::test_support::fixture_git;
+
+    fn git(repository: &std::path::Path, arguments: &[&str]) {
+        let output = fixture_git()
+            .current_dir(repository)
+            .args(arguments)
+            .output()
+            .expect("run fixture git");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn empty_repository(root: &std::path::Path) -> gix::Repository {
+        std::fs::create_dir_all(root).expect("repository directory");
+        git(root, &["init", "--initial-branch=main"]);
+        open_repo(root).expect("open fixture repository")
+    }
+
+    #[test]
+    fn entry_name_bytes_are_exact_for_a_representable_name() {
+        let name = OsString::from("ordinary-name.dat");
+        assert_eq!(os_bytes(&name).expect("exact name"), b"ordinary-name.dat");
+    }
+
+    #[test]
+    fn an_entry_name_this_host_cannot_represent_exactly_fails_rather_than_being_repaired() {
+        #[cfg(unix)]
+        {
+            // Unix names are bytes, so every name has an exact form.
+            use std::os::unix::ffi::OsStringExt as _;
+
+            let name = OsString::from_vec(b"raw-\xff-name.dat".to_vec());
+            assert_eq!(os_bytes(&name).expect("exact name"), b"raw-\xff-name.dat");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+
+            // A lone high surrogate is ill-formed UTF-16 and has no UTF-8
+            // encoding. Repairing it would let two distinct entries hash to
+            // the same bytes in the tracked fingerprint.
+            let name = OsString::from_wide(&[0x0072, 0xD800, 0x0074]);
+            let error = os_bytes(&name).expect_err("ill-formed name is refused");
+            assert!(
+                error.to_string().contains("not well-formed Unicode"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_target_bytes_use_the_encoding_git_committed() {
+        #[cfg(unix)]
+        {
+            // A backslash is an ordinary Unix filename byte and is preserved.
+            let target = std::path::PathBuf::from("dir\\odd/name");
+            assert_eq!(path_bytes(&target).expect("exact target"), b"dir\\odd/name");
+        }
+        #[cfg(windows)]
+        {
+            // Windows may return the separators Git wrote as backslashes; a
+            // backslash cannot occur literally inside a path component there,
+            // so restoring them is exact, and a target that already uses `/`
+            // is unchanged.
+            assert_eq!(
+                path_bytes(&std::path::PathBuf::from("dir\\name")).expect("exact target"),
+                b"dir/name"
+            );
+            assert_eq!(
+                path_bytes(&std::path::PathBuf::from("dir/name")).expect("exact target"),
+                b"dir/name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_repository_reads_modes_and_links_from_its_platform() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = empty_repository(&temp.path().join("source"));
+        let (executable, symlinks) =
+            worktree_materialization(&repository).expect("default materialization");
+
+        if filesystem_records_executable_bit() {
+            assert_eq!(executable, ExecutableModeAuthority::WorktreeMode);
+            assert_eq!(symlinks, SymlinkMaterialization::Link);
+        } else {
+            assert_eq!(executable, ExecutableModeAuthority::IndexMode);
+            assert_eq!(symlinks, SymlinkMaterialization::TargetTextFile);
+        }
+    }
+
+    #[test]
+    fn core_symlinks_selects_the_materialization_only_where_the_filesystem_needs_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("source");
+        let repository = empty_repository(&root);
+        git(&root, &["config", "core.symlinks", "true"]);
+        let repository = open_repo(repository.workdir().expect("workdir")).expect("reopen");
+
+        let (_, symlinks) = worktree_materialization(&repository).expect("materialization");
+        assert_eq!(
+            symlinks,
+            SymlinkMaterialization::Link,
+            "core.symlinks=true means a real link on every platform"
+        );
+    }
+
+    #[test]
+    fn core_file_mode_true_is_refused_only_where_no_executable_bit_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("source");
+        let repository = empty_repository(&root);
+        git(&root, &["config", "core.fileMode", "true"]);
+        let repository = open_repo(repository.workdir().expect("workdir")).expect("reopen");
+
+        let resolved = worktree_materialization(&repository);
+        if filesystem_records_executable_bit() {
+            let (executable, _) = resolved.expect("a filesystem mode is readable here");
+            assert_eq!(
+                executable,
+                ExecutableModeAuthority::WorktreeMode,
+                "the worktree stays the mode authority where the bit exists"
+            );
+        } else {
+            let error = resolved.expect_err("a synthesized mode is not a proof");
+            assert!(
+                error.to_string().contains("core.fileMode=true"),
+                "the refusal must name the setting that caused it: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_executability_reports_what_the_filesystem_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hook = temp.path().join("pre-commit");
+        std::fs::write(&hook, b"#!/bin/sh\nexit 0\n").expect("hook");
+        let metadata = std::fs::symlink_metadata(&hook).expect("hook metadata");
+
+        let observed = hook_executability(&metadata).expect("hook executability");
+        if filesystem_records_executable_bit() {
+            assert_eq!(observed, LocalGitHookExecutability::NotExecutable);
+        } else {
+            assert_eq!(
+                observed,
+                LocalGitHookExecutability::Unrecorded,
+                "a platform with no executable bit must not report a hook as non-executable"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2578,7 +2922,11 @@ mod tests {
                 assert_eq!(hook_count, 1);
                 assert_eq!(filter_count, 0);
                 assert_eq!(hooks[0].name, b"pre-commit");
-                assert!(hooks[0].executable);
+                assert_eq!(
+                    hooks[0].executable,
+                    LocalGitHookExecutability::Executable,
+                    "a chmod +x hook on a filesystem that records the bit is reported executable"
+                );
             }
             error => panic!("unexpected error: {error:?}"),
         }

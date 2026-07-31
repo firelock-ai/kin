@@ -23,7 +23,7 @@ pub enum RegisteredGitWorktreeKind {
 pub struct LocalGitHookFact {
     pub name: Vec<u8>,
     pub kind: LocalGitHookKind,
-    pub executable: bool,
+    pub executable: LocalGitHookExecutability,
     pub byte_len: u64,
 }
 
@@ -33,6 +33,19 @@ pub enum LocalGitHookKind {
     Symlink,
     Directory,
     Other,
+}
+
+/// Whether the host filesystem reports one local hook as executable.
+///
+/// A platform whose filesystem carries no executable bit is reported as such
+/// rather than as a non-executable hook: the two are different observations,
+/// and collapsing them would claim a mode nothing recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalGitHookExecutability {
+    Executable,
+    NotExecutable,
+    /// The host filesystem records no executable bit for this entry.
+    Unrecorded,
 }
 
 /// Presence-only description of a configured external checkout filter.
