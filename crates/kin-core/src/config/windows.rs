@@ -48,19 +48,30 @@
 //!   `MOVEFILE_REPLACE_EXISTING`**, which fails when the destination exists.
 //!   That is `RENAME_NOREPLACE`, so a config raced in during the write is
 //!   detected rather than overwritten.
-//! * **Durability of the namespace move is `MOVEFILE_WRITE_THROUGH` /
-//!   `REPLACEFILE_WRITE_THROUGH`**, which do not return until the move is
-//!   flushed. Windows exposes no directory `fsync`, so there is deliberately
-//!   no no-op `sync()` here pretending to be one; the flag is the flush, and
-//!   it is requested at each of the four namespace moves this module makes.
+//! * **Durability of a namespace move is `MOVEFILE_WRITE_THROUGH`**, which
+//!   Microsoft documents as not returning until the file is actually moved on
+//!   the disk. Windows exposes no directory `fsync`, so there is deliberately
+//!   no no-op `sync()` here pretending to be one; that flag is the flush, and
+//!   it is requested at the three moves this module makes through
+//!   `MoveFileExW`. The fourth move is `ReplaceFileW`, and it is the exception
+//!   rather than a fourth instance of the same guarantee:
+//!   `REPLACEFILE_WRITE_THROUGH` is documented as **not supported**. It is
+//!   still passed, because it costs nothing and records the intent should that
+//!   ever change, but no durability is derived from it. The replacement path
+//!   therefore carries no documented flush of its namespace move. That is a
+//!   real asymmetry with the first-publication path, and it is stated here
+//!   rather than glossed by listing the two flags together.
 //!
 //! What is checked after publication differs from Unix on purpose. Unix
 //! compares the published name's inode to the temp file's, because an inode is
 //! the cheapest exact statement that the very file it wrote is the one now
 //! published. Windows keeps that comparison where a rename makes it exact, and
-//! adds a read-back of the published bytes, which is a stronger statement of
-//! the same property and does not depend on whether `ReplaceFileW` preserves a
-//! file record number.
+//! adds a read-back of the published bytes. That is a stronger statement of the
+//! same property, and it is what lets this arm depend on no identity claim for
+//! `ReplaceFileW` at all: Microsoft's own documentation says both that the
+//! replacement file assumes the replaced file's identity and that the resulting
+//! file has the same file ID as the replacement file. Those cannot both
+//! describe the same object, so the bytes are read instead.
 //!
 //! Owner-private staging has no `0o600` equivalent here. The temp file is
 //! created with an empty share mode, so no other handle can open it at all
@@ -684,6 +695,10 @@ fn move_file(source: &Path, destination: &Path, flags: u32) -> std::io::Result<(
 /// post-publication check recoverable. No ignore flag is passed: a failure to
 /// carry the replaced file's attributes or ACL onto the replacement is a real
 /// failure of the publication, not something to skip past.
+///
+/// `REPLACEFILE_WRITE_THROUGH` is passed and is documented as **not
+/// supported**, so it is requested for intent and nothing is inferred from it.
+/// This is the one namespace move in the module with no documented flush.
 fn replace_file_with_backup(
     replaced: &Path,
     replacement: &Path,
