@@ -827,6 +827,33 @@ jobs:
       - name: Build
         run: cargo build --all-targets --locked
 
+      # Kin's Linux release binaries link against musl so a single archive runs
+      # on every distribution, and nothing else in CI compiles for that target.
+      # A `target_env` cfg is invisible to a glibc build, so a dependency that
+      # resolves a glibc-only libc entry point compiles clean through every
+      # required context, reaches a tag, and then fails in the release run,
+      # where the only remedy is another version cut. This compiles the exact
+      # packages the release builds, for the target it builds them for, so that
+      # break is a red pull request instead of a burned tag.
+      #
+      # Two deliberate bounds. It checks rather than builds, so it proves
+      # compilation and name resolution and not linking. And it covers
+      # x86_64 only: aarch64-unknown-linux-musl is also a release target, but
+      # its C dependencies need an aarch64 musl cross toolchain that musl-tools
+      # does not carry, and the gate that has broken selects on target_env
+      # rather than architecture, so one musl target exercises it.
+      - name: Check the Linux release target (musl)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          # ring, oniguruma, sqlite, and tree-sitter compile C against musl, so
+          # this needs the same musl-gcc the release legs install.
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          cargo check --locked --target x86_64-unknown-linux-musl \
+            -p kin-cli -p kin-daemon
+
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
