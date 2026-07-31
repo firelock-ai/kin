@@ -1982,8 +1982,6 @@ def assert_release_check_accepted(
             f"{check_name}={conclusion}: {result.stdout}{result.stderr}"
         )
 
-
-<<<<<<< HEAD
 def run_tag_selector(
     manifest: str,
     candidates: str,
