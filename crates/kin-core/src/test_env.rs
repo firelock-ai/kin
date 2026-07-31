@@ -86,6 +86,15 @@ fn leave_env_mutation_domain() {
 /// name had when the guard first touched it.
 pub struct EnvVarGuard {
     restore: BTreeMap<OsString, Option<OsString>>,
+    /// Binds the guard to the thread that created it.
+    ///
+    /// The domain's reentrancy count and the mutex guard behind it live in
+    /// thread-local storage, so a guard released on a different thread than the
+    /// one that took it would leave the mutex held forever and stall every
+    /// later env-mutating test. Being `!Send` makes that a compile error rather
+    /// than a hang, and it is also what stops a guard being held across an
+    /// `.await` in a future a runtime may move between threads.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl EnvVarGuard {
@@ -97,6 +106,7 @@ impl EnvVarGuard {
         enter_env_mutation_domain();
         Self {
             restore: BTreeMap::new(),
+            _not_send: std::marker::PhantomData,
         }
     }
 
