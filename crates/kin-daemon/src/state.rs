@@ -868,6 +868,52 @@ impl Drop for GraphAuthorityMutationGuard {
     }
 }
 
+/// The `(generation, live exact tree)` pair whose match against committed
+/// workspace authority has already been derived for a vector checkpoint.
+///
+/// A vector checkpoint is refused when the live exact tree diverges from
+/// committed authority. Deriving that answer costs a full authority reopen —
+/// recovering the snapshot, revalidating every semantic change id, and
+/// re-verifying every stored body — which is linear in store size, not in the
+/// batch being checkpointed. Paid once per embed batch, it dominates a long
+/// embed: on a 2 GB store it is minutes of reopen for seconds of inference,
+/// and it re-derives a conclusion about bytes that have not moved.
+///
+/// Both inputs to the conclusion are exact and cheap to compare. Committed
+/// authority is immutable at a generation, so the authority side is a function
+/// of `generation` alone; the live side is the tree itself. Retaining the
+/// derived pair therefore skips only re-derivation, never a real check: a
+/// generation bump or any live-tree mutation misses the retained pair and
+/// reopens authority in full.
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Default)]
+struct VectorCheckpointAuthorityMatch {
+    derived: Mutex<Option<(u64, ResolvedTree)>>,
+}
+
+#[cfg(feature = "embeddings")]
+impl VectorCheckpointAuthorityMatch {
+    /// True when this exact pair has already been derived. A poisoned lock
+    /// answers false, so the caller reopens authority rather than trusting an
+    /// unreadable record.
+    fn holds(&self, generation: u64, live_tree: &ResolvedTree) -> bool {
+        self.derived.lock().is_ok_and(|derived| {
+            derived
+                .as_ref()
+                .is_some_and(|(derived_generation, derived_tree)| {
+                    *derived_generation == generation && derived_tree == live_tree
+                })
+        })
+    }
+
+    /// Retain a freshly derived pair, replacing any earlier one.
+    fn record(&self, generation: u64, live_tree: ResolvedTree) {
+        if let Ok(mut derived) = self.derived.lock() {
+            *derived = Some((generation, live_tree));
+        }
+    }
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -1016,6 +1062,10 @@ pub struct DaemonState {
     /// entering this derived finalization path. Held only for the synchronous
     /// critical section — never across an `.await` or another lock.
     pub persist_lock: Mutex<()>,
+    /// Last `(generation, live exact tree)` pair proved to match committed
+    /// workspace authority for a vector checkpoint. Read under `persist_lock`.
+    #[cfg(feature = "embeddings")]
+    vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
     /// When the graph was last mutated (`mark_dirty`). The background
@@ -1878,6 +1928,8 @@ impl DaemonState {
             mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
+            #[cfg(feature = "embeddings")]
+            vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
@@ -2075,6 +2127,8 @@ impl DaemonState {
             mutation_epoch: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
+            #[cfg(feature = "embeddings")]
+            vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
@@ -4022,13 +4076,21 @@ impl DaemonState {
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
         let generation = self.snapshot_generation.load(Ordering::SeqCst);
-        let authority_graph = self.load_committed_authority_graph(generation)?;
-        if self.graph.resolved_tree() != authority_graph.resolved_tree() {
-            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                format!(
-                    "refusing vector checkpoint at repository generation {generation}: live exact tree does not match workspace authority"
-                ),
-            )));
+        let live_tree = self.graph.resolved_tree();
+        if !self
+            .vector_checkpoint_authority_match
+            .holds(generation, &live_tree)
+        {
+            let authority_graph = self.load_committed_authority_graph(generation)?;
+            if live_tree != authority_graph.resolved_tree() {
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!(
+                        "refusing vector checkpoint at repository generation {generation}: live exact tree does not match workspace authority"
+                    ),
+                )));
+            }
+            self.vector_checkpoint_authority_match
+                .record(generation, live_tree);
         }
         let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
         kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
@@ -4642,6 +4704,62 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         sync_directory_metadata(directory.path())
             .expect("directory metadata sync must not reject a valid host directory");
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn tree_with_path(path: &str) -> ResolvedTree {
+        ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::blob(Hash256::from_bytes([7u8; 32]), false),
+        )])
+        .unwrap()
+    }
+
+    /// The retained authority match must skip re-derivation for the exact pair
+    /// it derived, and for nothing else. An embed batch that changes neither the
+    /// committed generation nor the live exact tree is the whole reason a long
+    /// embed is not dominated by authority reopens; a batch that changes either
+    /// must still pay for a full reopen, because the retained answer is no
+    /// longer about the state being checkpointed.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn vector_checkpoint_authority_match_holds_only_for_the_derived_pair() {
+        let tree = tree_with_path("src/lib.rs");
+        let other_tree = tree_with_path("src/main.rs");
+        let retained = VectorCheckpointAuthorityMatch::default();
+
+        // Nothing derived yet: every pair reopens.
+        assert!(!retained.holds(1, &tree));
+
+        retained.record(1, tree.clone());
+        assert!(retained.holds(1, &tree));
+
+        // A generation bump invalidates: committed authority moved.
+        assert!(!retained.holds(2, &tree));
+        // A live-tree mutation invalidates: the checkpointed state moved.
+        assert!(!retained.holds(1, &other_tree));
+
+        // Re-deriving replaces rather than accumulates, so the superseded pair
+        // never keeps answering for a state that has moved on.
+        retained.record(2, other_tree.clone());
+        assert!(retained.holds(2, &other_tree));
+        assert!(!retained.holds(1, &tree));
+    }
+
+    /// An empty tree is a real repository state (a workspace with no admitted
+    /// artifacts), not a "nothing derived yet" sentinel, so it must be told
+    /// apart from the un-derived state above.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn vector_checkpoint_authority_match_distinguishes_empty_tree_from_no_record() {
+        let retained = VectorCheckpointAuthorityMatch::default();
+        let empty = ResolvedTree::default();
+
+        assert!(!retained.holds(0, &empty));
+        retained.record(0, empty.clone());
+        assert!(retained.holds(0, &empty));
+        assert!(!retained.holds(0, &tree_with_path("src/lib.rs")));
     }
 
     #[test]
