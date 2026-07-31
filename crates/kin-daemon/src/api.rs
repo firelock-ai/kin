@@ -7259,7 +7259,7 @@ struct RepositoryTransferReceiveRequest {
     pack: kin_remote::repository_transfer::RepositoryTransferPack,
 }
 
-fn repository_transfer_authority(
+pub(crate) fn repository_transfer_authority(
     state: &DaemonState,
     repo_id: &str,
 ) -> Result<(RepositoryId, RepositoryAuthorityManager<dyn StorageBackend>), (StatusCode, String)> {
@@ -7605,7 +7605,22 @@ async fn command_pull(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::transfer::CommandTransferRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let context = transfer_command_context(&state, &request)?;
+    pull_into_replica(&state, &request).await.map(Json)
+}
+
+/// Admit a remote replica's exact history into `state`'s replica, and report
+/// what followed it.
+///
+/// Separated from the route so a caller that already holds daemon state can run
+/// the same pull without a loopback request. A native clone is that caller: the
+/// replica it just created has no served endpoint yet, and its first pull must
+/// still take this exact path rather than a second implementation of it.
+pub(crate) async fn pull_into_replica(
+    state: &Arc<DaemonState>,
+    request: &kin_cli::commands::transfer::CommandTransferRequest,
+) -> Result<kin_cli::commands::transfer::CommandTransferResponse, (StatusCode, String)> {
+    let state = Arc::clone(state);
+    let context = transfer_command_context(&state, request)?;
     let repo_id = context.repo_id.clone();
     let repository_id = context.repository_id.clone();
     let requested_source_ref = context.source_ref.clone();
@@ -7722,11 +7737,11 @@ async fn command_pull(
         }
     };
 
-    Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
+    Ok(kin_cli::commands::transfer::CommandTransferResponse {
         outcome,
         derived_views,
         workspace,
-    }))
+    })
 }
 
 /// Name what a pull left durable when it failed partway through a multi-pack
@@ -11469,22 +11484,27 @@ mod tests {
     }
 
     /// Publish one exact native change onto `refs/heads/main` in `storage`.
+    ///
+    /// Takes the storage root rather than a temporary directory so it can also
+    /// seed a real repository's own `.kin/kindb`, which is what a peer a clone
+    /// pulls from has to be.
     fn seed_replica_change(
-        storage: &tempfile::TempDir,
+        storage: &FsPath,
         repository_id: &RepositoryId,
         previous: Option<kin_model::SemanticChangeId>,
         operation: u128,
         message: &str,
     ) -> kin_model::SemanticChangeId {
         use kin_model::{
-            compute_semantic_change_id, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
-            RefExpectation, RefMutation, RefTarget, RefUpdatePolicy, RepositoryTransaction,
-            SemanticChange, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            compute_semantic_change_id, AdmissionPolicyDelta, ChangeOrigin, DefaultRefExpectation,
+            DefaultRefMutation, RefExpectation, RefMutation, RefTarget, RefUpdatePolicy,
+            RepositoryTransaction, SemanticChange, SharedAdmissionPolicy,
+            REPOSITORY_TRANSACTION_SCHEMA_VERSION,
         };
 
         let manager = RepositoryAuthorityManager::open(
             repository_id.clone(),
-            Arc::new(kin_db::LocalFileBackend::new(storage.path().to_path_buf())),
+            Arc::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
         )
         .unwrap();
         let main = kin_model::RefName::branch(b"main").unwrap();
@@ -11498,7 +11518,14 @@ mod tests {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
-            admission_policy_delta: None,
+            // A change that roots a line establishes the shared admission
+            // policy, which is what a real root change carries and what every
+            // descendant resolves against. Without it the head is admissible
+            // but no workspace can stand on it, and a fixture that omitted it
+            // would manufacture that state rather than observe it.
+            admission_policy_delta: previous
+                .is_none()
+                .then(|| AdmissionPolicyDelta::initialize(SharedAdmissionPolicy::empty(0))),
             projected_files: Vec::new(),
             spec_link: None,
             evidence: Vec::new(),
@@ -11508,6 +11535,16 @@ mod tests {
         change.id = compute_semantic_change_id(&change).unwrap();
 
         let lease = manager.read_authority();
+        // A repository adopts its default ref once. Seeding into storage a
+        // `kin init` already bootstrapped must not try to claim it again, and
+        // deciding that from the lease rather than from "is this the first
+        // change" is what lets this seed both an empty backend and a real
+        // repository's own storage.
+        let adopts_default_ref = lease
+            .snapshot()
+            .repository_authority
+            .as_ref()
+            .is_some_and(|metadata| metadata.ref_state.default_ref.is_none());
         let transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
             operation_id: kin_model::OperationId::from_uuid(Uuid::from_u128(operation)),
@@ -11531,7 +11568,7 @@ mod tests {
                 new_target: Some(RefTarget::change(change.id)),
                 policy: RefUpdatePolicy::FastForwardOnly,
             }],
-            default_ref_mutation: previous.is_none().then_some(DefaultRefMutation {
+            default_ref_mutation: adopts_default_ref.then_some(DefaultRefMutation {
                 expected: DefaultRefExpectation::MustBeUnset,
                 new_default: Some(main),
             }),
@@ -11580,9 +11617,15 @@ mod tests {
             replica_state(&repo_id);
         let (third_state, _third_working, _third_storage) = replica_state(&repo_id);
 
-        let root = seed_replica_change(&source_storage, &repository_id, None, 1, "root the line");
+        let root = seed_replica_change(
+            source_storage.path(),
+            &repository_id,
+            None,
+            1,
+            "root the line",
+        );
         let source_head = seed_replica_change(
-            &source_storage,
+            source_storage.path(),
             &repository_id,
             Some(root),
             2,
@@ -11800,6 +11843,263 @@ mod tests {
             peer_head,
             _peer_storage: peer_storage,
         }
+    }
+
+    /// A repository served by its own daemon, so a clone reaches it the way a
+    /// real one does: over HTTP, knowing only where it lives and which
+    /// repository to ask for.
+    struct ClonePeer {
+        url: String,
+        repository_id: RepositoryId,
+        head: kin_model::SemanticChangeId,
+        _working: tempfile::TempDir,
+    }
+
+    /// A real Kin repository holding two exact native changes and no imported-
+    /// Git authority, served over HTTP.
+    ///
+    /// Deliberately a repository `kin init` bootstrapped, publishing into its
+    /// own `.kin/kindb`, rather than a daemon pointed at detached empty
+    /// storage as the other transfer fixtures here use. A clone's replica is
+    /// bootstrapped, so a peer that never was would leave the transferred head
+    /// carrying no resolvable admission policy and no workspace could stand on
+    /// it. That is a property of the fixture, not of a clone, and this fixture
+    /// must not manufacture it.
+    ///
+    /// The identity is a bare UUID v4, because that is what a repository a
+    /// local replica can adopt actually carries; the other transfer fixtures
+    /// use labelled ids only because nothing ever adopts them.
+    async fn native_clone_peer() -> ClonePeer {
+        install_test_registry_override();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let repository_id = RepositoryId::new(
+            kin_core::manifest::KinManifest::load(&layout.manifest_path())
+                .unwrap()
+                .repo_id,
+        )
+        .unwrap();
+        let storage = layout.kindb_dir();
+        let root = seed_replica_change(&storage, &repository_id, None, 1, "root the line");
+        let head = seed_replica_change(&storage, &repository_id, Some(root), 2, "advance the line");
+        let url = serve_replica(Arc::new(
+            DaemonState::open_with_repo_id(layout, None).unwrap(),
+        ))
+        .await;
+
+        ClonePeer {
+            url,
+            repository_id,
+            head,
+            _working: working,
+        }
+    }
+
+    fn clone_endpoint(
+        url: &str,
+    ) -> kin_remote::repository_transfer_http::RepositoryTransferEndpoint {
+        kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(url)
+    }
+
+    /// The gate this closes: a replica created from nothing but a remote
+    /// address adopts that remote's repository identity and admits its history.
+    ///
+    /// Before this, the only thing that established a shared identity was a raw
+    /// copy of one replica's storage, which is what every other transfer
+    /// fixture here does. This one copies nothing: the destination is an empty
+    /// directory and the peer is reachable only over HTTP.
+    #[tokio::test]
+    async fn a_native_clone_adopts_the_remote_identity_and_admits_its_history() {
+        let peer = native_clone_peer().await;
+        let destination = tempfile::tempdir().unwrap();
+
+        let cloned = crate::replica_adoption::clone_native_replica(
+            destination.path(),
+            clone_endpoint(&peer.url),
+            &peer.repository_id,
+        )
+        .await
+        .expect("a native clone of a served peer");
+
+        // Identity was adopted, not minted.
+        assert_eq!(cloned.identity.repository_id, peer.repository_id);
+        assert_eq!(cloned.state.cached_repo_id, peer.repository_id.to_string());
+        let manifest =
+            kin_core::manifest::KinManifest::load(&cloned.state.layout.manifest_path()).unwrap();
+        assert_eq!(manifest.repo_id, peer.repository_id.to_string());
+
+        // Workspace authority is this replica's own. Repository truth is
+        // shared between replicas; local workspace authority never is.
+        assert!(!manifest.workspace_id.is_empty());
+        assert_ne!(manifest.workspace_id, manifest.repo_id);
+
+        // The history the identity advertised is the history that arrived, and
+        // it arrived under the adopted identity.
+        assert_eq!(cloned.identity.default_ref_head, Some(peer.head));
+        assert!(cloned.transfer.outcome.moved_history());
+        let receipt = cloned
+            .transfer
+            .outcome
+            .final_receipt()
+            .expect("a moved head returns a receipt");
+        assert_eq!(receipt.destination_head, peer.head);
+        assert_eq!(receipt.repository_id, peer.repository_id);
+        assert_eq!(
+            cloned.transfer.derived_views,
+            kin_cli::commands::transfer::DerivedViewRefresh::Current
+        );
+
+        // The replica the clone created is a working repository, not just an
+        // authority: its graph-owned workspace stands on the head that arrived.
+        assert!(
+            matches!(
+                cloned.transfer.workspace,
+                kin_cli::commands::transfer::WorkspaceFollow::Advanced { .. }
+            ),
+            "a clone's workspace has to reach the admitted head, got {:?}",
+            cloned.transfer.workspace
+        );
+    }
+
+    /// Two replicas established this way can go on transferring, which is the
+    /// whole reason identity adoption exists: a second pull negotiates against
+    /// the same peer and reports itself already up to date rather than being
+    /// refused as a different repository.
+    #[tokio::test]
+    async fn a_natively_cloned_replica_can_pull_again_from_the_remote_it_adopted() {
+        let peer = native_clone_peer().await;
+        let destination = tempfile::tempdir().unwrap();
+        let cloned = crate::replica_adoption::clone_native_replica(
+            destination.path(),
+            clone_endpoint(&peer.url),
+            &peer.repository_id,
+        )
+        .await
+        .unwrap();
+
+        let request = pull_request(&peer.url, &cloned.state.cached_repo_id);
+        let (status, body) = transfer_command(Arc::clone(&cloned.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            pulled.outcome.plan,
+            kin_remote::repository_transfer_negotiation::RepositoryTransferPlan::UpToDate {
+                head: Some(peer.head)
+            }
+        );
+    }
+
+    /// A clone must never re-identify a replica that is already there. The
+    /// refusal names both repositories, because a caller who cloned into the
+    /// wrong directory cannot act on a bare path.
+    #[tokio::test]
+    async fn a_clone_over_an_existing_replica_refuses_and_names_both_repositories() {
+        let peer = native_clone_peer().await;
+        let destination = tempfile::tempdir().unwrap();
+        let existing = kin_core::init(destination.path()).unwrap();
+
+        let error = crate::replica_adoption::clone_native_replica(
+            destination.path(),
+            clone_endpoint(&peer.url),
+            &peer.repository_id,
+        )
+        .await
+        .expect_err("an occupied destination is never re-identified");
+
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                crate::replica_adoption::NativeCloneError::Initialize { .. }
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(&existing.repository_id.to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&peer.repository_id.to_string()),
+            "{message}"
+        );
+
+        let manifest =
+            kin_core::manifest::KinManifest::load(&existing.layout.manifest_path()).unwrap();
+        assert_eq!(manifest.repo_id, existing.repository_id.to_string());
+    }
+
+    /// The bound a native clone runs into first, recorded as a test rather than
+    /// as prose: repository-v6 transfer v1 carries a fast-forward only between
+    /// replicas with identical imported-Git authority, and a replica created
+    /// from nothing has none to match a Git-admitted remote's.
+    ///
+    /// Identity adoption is what makes this reachable at all, and it is what
+    /// makes the failure recoverable: the replica exists, holds the adopted
+    /// identity, and is what a later `kin pull` resumes into once the transfer
+    /// seam can bootstrap a Git baseline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_admitted_remote_refuses_the_history_half_of_a_clone() {
+        const PATH: &str = "service/compose.yaml";
+        install_test_registry_override();
+        let peer_working =
+            std::env::temp_dir().join(format!("kin-daemon-clone-git-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(peer_working.join("service")).unwrap();
+        run_test_git(&peer_working, ["init", "--initial-branch=main"]);
+        run_test_git(
+            &peer_working,
+            ["config", "user.email", "kin@example.invalid"],
+        );
+        run_test_git(
+            &peer_working,
+            ["config", "user.name", "Kin Clone Route Test"],
+        );
+        std::fs::write(peer_working.join(PATH), b"services:\n  api: {}\n").unwrap();
+        run_test_git(&peer_working, ["add", "--all"]);
+        run_test_git(&peer_working, ["commit", "-s", "-m", "projected baseline"]);
+        let peer_layout = kin_core::init_from_git(&peer_working).unwrap().layout;
+        let peer_repository_id = RepositoryId::new(
+            kin_core::manifest::KinManifest::load(&peer_layout.manifest_path())
+                .unwrap()
+                .repo_id,
+        )
+        .unwrap();
+        let peer_url = serve_replica(Arc::new(
+            DaemonState::open_with_repo_id(peer_layout, None).unwrap(),
+        ))
+        .await;
+        let destination = tempfile::tempdir().unwrap();
+
+        let error = crate::replica_adoption::clone_native_replica(
+            destination.path(),
+            clone_endpoint(&peer_url),
+            &peer_repository_id,
+        )
+        .await
+        .expect_err("transfer v1 cannot bootstrap an imported-Git baseline");
+
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                crate::replica_adoption::NativeCloneError::Transfer { .. }
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(&peer_repository_id.to_string()),
+            "{message}"
+        );
+        assert!(message.contains("kin pull"), "{message}");
+
+        // The replica is real and holds the adopted identity, so the clone is
+        // resumable rather than debris.
+        let layout = kin_core::KinLayout::new(destination.path().join(".kin"));
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path()).unwrap();
+        assert_eq!(manifest.repo_id, peer_repository_id.to_string());
+
+        std::fs::remove_dir_all(&peer_working).ok();
     }
 
     fn pull_request(
@@ -12226,7 +12526,7 @@ mod tests {
         let mut previous = None;
         for step in 0..5u128 {
             previous = Some(seed_replica_change(
-                &source_storage,
+                source_storage.path(),
                 &repository_id,
                 previous,
                 step + 1,
@@ -12332,9 +12632,15 @@ mod tests {
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
 
         let (source_state, _source_working, source_storage) = replica_state(&repo_id);
-        let root = seed_replica_change(&source_storage, &repository_id, None, 1, "root the line");
+        let root = seed_replica_change(
+            source_storage.path(),
+            &repository_id,
+            None,
+            1,
+            "root the line",
+        );
         let source_head = seed_replica_change(
-            &source_storage,
+            source_storage.path(),
             &repository_id,
             Some(root),
             2,
@@ -12437,10 +12743,15 @@ mod tests {
         let (destination_state, _destination_working, destination_storage) =
             replica_state(&repo_id);
 
-        let source_head =
-            seed_replica_change(&source_storage, &repository_id, None, 1, "the local line");
+        let source_head = seed_replica_change(
+            source_storage.path(),
+            &repository_id,
+            None,
+            1,
+            "the local line",
+        );
         let remote_head = seed_replica_change(
-            &destination_storage,
+            destination_storage.path(),
             &repository_id,
             None,
             9,

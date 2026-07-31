@@ -141,6 +141,26 @@ impl KinManifest {
         }
     }
 
+    /// Create a manifest for a replica that adopts an existing repository
+    /// identity rather than minting one.
+    ///
+    /// `repo_id` is written verbatim, because a replica that altered the
+    /// identity it was given would be unable to exchange history with the
+    /// repository it came from. The workspace identity is still minted: two
+    /// replicas share repository truth and must never share local
+    /// workspace/session authority.
+    ///
+    /// Shape is not validated here. `prepare_repository_layout_at` requires a
+    /// UUID v4 for both identities and refuses the pair when they are equal, so
+    /// an identity this build cannot serve is refused before any repository
+    /// layout is staged.
+    pub fn adopting(repo_id: impl Into<String>) -> Self {
+        Self {
+            repo_id: repo_id.into(),
+            ..Self::new()
+        }
+    }
+
     /// Load manifest from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;

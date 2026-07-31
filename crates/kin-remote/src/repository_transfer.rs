@@ -1300,7 +1300,7 @@ fn validate_status(status: &RepositoryTransferStatus) -> Result<()> {
 /// arrive in a request body rather than from a status this process built, so
 /// an exporter checks them too rather than trusting the sender to have asked
 /// for something it can answer.
-fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
+pub(crate) fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
     for (label, value) in [
         ("max_changes", u64::from(limits.max_changes)),
         ("max_trees", u64::from(limits.max_trees)),
@@ -1344,7 +1344,7 @@ fn required_features() -> Vec<String> {
         .collect()
 }
 
-fn require_negotiated_features(supported: &[String]) -> Result<()> {
+pub(crate) fn require_negotiated_features(supported: &[String]) -> Result<()> {
     let supported = supported
         .iter()
         .map(String::as_str)
@@ -1674,7 +1674,7 @@ fn storage(error: impl std::fmt::Display) -> RepositoryTransferError {
     RepositoryTransferError::Storage(error.to_string())
 }
 
-fn model(error: impl std::fmt::Display) -> RepositoryTransferError {
+pub(crate) fn model(error: impl std::fmt::Display) -> RepositoryTransferError {
     invalid(error.to_string())
 }
 
