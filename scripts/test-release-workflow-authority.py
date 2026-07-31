@@ -43,6 +43,10 @@ TAG_LISTING_FORMAT = (
     "--format='%(refname:strip=2) "
     "%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)'"
 )
+RELEASE_PR_STEP_ANCHOR = "      - name: Open the protected release PR"
+RELEASE_APP_TOKEN = "${{ steps.app-token.outputs.token }}"
+DEFAULT_WORKFLOW_TOKEN = "${{ github.token }}"
+STEP_ENV_TOKEN_BINDING = re.compile(r"(?m)^\s+GH_TOKEN:\s*(?P<token>\S.*?)\s*$")
 # Which tag each workflow declares it is about to create. Only the mint creates
 # one, so only the mint names it. The train resolves drift from a base tag it
 # never mints, and handing that base over as mint intent refuses exactly when a
@@ -1782,6 +1786,58 @@ def assert_merge_policy_gate(release_train: str) -> None:
         )
 
 
+def rebind_release_pr_token(release_train: str, token: str) -> str:
+    """Rewrite only the release-PR opener's own GH_TOKEN binding."""
+
+    step = workflow_step_source(
+        "release train", release_train, RELEASE_PR_STEP_ANCHOR
+    )
+    return release_train.replace(
+        step,
+        STEP_ENV_TOKEN_BINDING.sub(
+            lambda _: f"          GH_TOKEN: {token}", step, count=1
+        ),
+        1,
+    )
+
+
+def assert_release_pr_author_identity(release_train: str) -> None:
+    """The release pull request must be opened by the App, not by Actions.
+
+    GitHub refuses `createPullRequest` from an Actions token wherever the
+    organization withholds pull-request creation from workflows, so a train
+    reaching this step on GITHUB_TOKEN dies holding a prepared release branch
+    and no pull request to merge it. The App identity is load bearing a second
+    time: only an App-authored pull request emits the events that start its own
+    protected checks, which is what the activation fallback below it exists to
+    supply when nothing else does. The binding is therefore behavior under
+    test, not an incidental credential choice, and the alternative repair is
+    the repository-wide toggle that would let any workflow open pull requests.
+    """
+
+    step = workflow_step_source(
+        "release train", release_train, RELEASE_PR_STEP_ANCHOR
+    )
+    require(step, "gh pr create", "protected release PR opener")
+    bindings = [
+        match.group("token") for match in STEP_ENV_TOKEN_BINDING.finditer(step)
+    ]
+    if bindings != [RELEASE_APP_TOKEN]:
+        raise AssertionError(
+            "the step that opens the protected release PR must bind GH_TOKEN "
+            f"to the minted App installation token {RELEASE_APP_TOKEN} exactly "
+            f"once, and binds {bindings or '<nothing>'}. GitHub Actions is not "
+            "permitted to create pull requests, so an Actions token here "
+            "leaves every prepared release branch unopened"
+        )
+    if "GH_TOKEN=" in step:
+        raise AssertionError(
+            "the step that opens the protected release PR must not override "
+            "GH_TOKEN inline, because a per-command token re-authors the pull "
+            "request as an identity the step's environment no longer describes"
+        )
+
+
 def release_branch_allowlist(release_train: str) -> str:
     """Return the regex the train uses to admit its own generated branch."""
 
@@ -2130,18 +2186,18 @@ def abandonment_manifest(*records: dict[str, str]) -> str:
 
 
 def workflow_step_source(workflow: str, content: str, step_anchor: str) -> str:
-    """Extract one named workflow step so its internal order can be judged."""
+    """Extract one named workflow step so its internals can be judged."""
 
     if step_anchor not in content:
         raise AssertionError(
-            f"{workflow} no longer carries the step that owns release-lane "
-            f"admission: {step_anchor.strip()}"
+            f"{workflow} no longer carries the step this gate is anchored to: "
+            f"{step_anchor.strip()}"
         )
     start = content.index(step_anchor)
     if "\n      - name:" not in content[start + 1 :]:
         raise AssertionError(
-            f"{workflow} admission step is no longer followed by another step, "
-            "so its boundary cannot be resolved"
+            f"{workflow} step {step_anchor.strip()} is no longer followed by "
+            "another step, so its boundary cannot be resolved"
         )
     return content[start : content.index("\n      - name:", start + 1)]
 
@@ -3043,6 +3099,36 @@ def main() -> None:
     ):
         require(release_train, policy, "coalescing protected release train")
     assert_merge_policy_gate(release_train)
+    assert_release_pr_author_identity(release_train)
+    # The reverts this pin has to survive, in the order they are reachable: the
+    # binding falling back to the default token, a per-command token quietly
+    # restoring it while the environment still reads as the App, and creation
+    # moving out from under the step the pin is anchored to.
+    expect_assertion(
+        "the release PR opener falls back to the Actions token",
+        f"must bind GH_TOKEN to the minted App installation token {RELEASE_APP_TOKEN}",
+        lambda: assert_release_pr_author_identity(
+            rebind_release_pr_token(release_train, DEFAULT_WORKFLOW_TOKEN)
+        ),
+    )
+    expect_assertion(
+        "the release PR opener overrides its token for the create call",
+        "must not override GH_TOKEN inline",
+        lambda: assert_release_pr_author_identity(
+            release_train.replace(
+                "            gh pr create \\",
+                '            GH_TOKEN="$FALLBACK" gh pr create \\',
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "pull-request creation leaves the step whose token the pin binds",
+        "protected release PR opener is missing required policy: gh pr create",
+        lambda: assert_release_pr_author_identity(
+            release_train.replace("gh pr create \\", "gh pr view \\", 1)
+        ),
+    )
     assert_release_branch_allowlist_covers_generator(release_train)
     assert_abandoned_tag_admission(release_tag, release_train)
     # The release bump must never be resolvable from anything a merged pull

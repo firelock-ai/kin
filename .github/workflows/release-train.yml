@@ -368,7 +368,16 @@ jobs:
         id: pr
         if: steps.plan.outputs.needed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Open the PR as the release App rather than GITHUB_TOKEN. GitHub
+          # refuses `createPullRequest` from an Actions token wherever the
+          # organization withholds pull-request creation from workflows, and
+          # granting it back would let every workflow in the repository open
+          # pull requests. The App identity is also what makes the new pull
+          # request emit the events that start its own protected checks. The
+          # installation is scoped to this repository and carries contents,
+          # issues, and pull-requests write, which covers creating, editing,
+          # and labelling the release PR.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BRANCH: ${{ steps.branch.outputs.branch }}
           TAG: ${{ steps.branch.outputs.tag }}
           BUMP: ${{ steps.plan.outputs.bump }}
@@ -476,8 +485,11 @@ jobs:
           BRANCH: ${{ steps.branch.outputs.branch }}
         run: |
           set -euo pipefail
-          # A GITHUB_TOKEN-created PR starts in GitHub's approval-required
-          # recursion state. This App-authored synchronize event is the narrow,
+          # An App-opened pull request starts its own checks, so this step is
+          # the fallback for a head that has none: a run GitHub had not yet
+          # registered when the poll above gave up, or a head carrying only the
+          # approval-required run a GITHUB_TOKEN-created pull request leaves
+          # behind. This App-authored synchronize event is the narrow,
           # unattended handoff into the ordinary protected PR checks.
           git commit --allow-empty --signoff \
             -m "Activate protected checks for the automated release PR"
