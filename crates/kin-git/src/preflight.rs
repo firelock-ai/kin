@@ -2279,10 +2279,23 @@ mod platform_materialization_tests {
         if filesystem_records_executable_bit() {
             assert_eq!(executable, ExecutableModeAuthority::WorktreeMode);
             assert_eq!(symlinks, SymlinkMaterialization::Link);
-        } else {
-            assert_eq!(executable, ExecutableModeAuthority::IndexMode);
-            assert_eq!(symlinks, SymlinkMaterialization::TargetTextFile);
+            return;
         }
+
+        assert_eq!(executable, ExecutableModeAuthority::IndexMode);
+        // Whether Git recorded core.symlinks at creation depends on the
+        // privilege this host granted it, so pin the resolution against what
+        // the repository actually says rather than against one host's default.
+        let recorded = repository.config_snapshot().boolean("core.symlinks");
+        let expected = if recorded == Some(true) {
+            SymlinkMaterialization::Link
+        } else {
+            SymlinkMaterialization::TargetTextFile
+        };
+        assert_eq!(
+            symlinks, expected,
+            "core.symlinks resolved to {recorded:?}, which must decide the materialization"
+        );
     }
 
     #[test]
