@@ -1112,19 +1112,25 @@ jobs:
           # is no prior value for a newly created ref to be stale from, so a
           # different sha means something else created it, which is terminal.
           got=""
+          why=""
           for attempt in 1 2 3 4 5; do
-            if got="$(gh api "repos/$REPO/git/ref/tags/$TAG" -q '.object.sha' 2>/dev/null)" \
+            if got="$(gh api "repos/$REPO/git/ref/tags/$TAG" -q '.object.sha' 2>"$RUNNER_TEMP/readback.err")" \
               && [ -n "$got" ]; then
               break
             fi
             got=""
+            why="$(tr -d '\r' < "$RUNNER_TEMP/readback.err" | tail -n 1)"
             if [ "$attempt" -lt 5 ]; then
-              echo "tag ref not readable yet (attempt ${attempt}/5); retrying"
+              echo "tag ref not readable yet (attempt ${attempt}/5): ${why:-empty response}; retrying"
               sleep "$(( attempt * 3 ))"
             fi
           done
           if [ -z "$got" ]; then
-            echo "::error::post-verify failed: tag $TAG did not become readable across 5 reads over ~30s"
+            # Say what the API said rather than asserting the tag is gone. A
+            # persistent auth or rate-limit failure reads the same as a missing
+            # ref from here, and sending an operator after a deleted tag that
+            # exists is its own outage.
+            echo "::error::post-verify failed: tag $TAG never read back across 5 reads over ~30s; last reason: ${why:-empty response}"
             exit 1
           fi
           echo "created ref points at: $got (expected $SHA)"

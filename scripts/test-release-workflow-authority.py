@@ -2234,6 +2234,7 @@ def execute_tag_readback(
                 "TAG": "v9.9.9",
                 "SHA": RELEASE_GATE_FIXTURE_SHA,
                 "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
+                "RUNNER_TEMP": str(root),
             }
         )
         return subprocess.run(
@@ -2277,10 +2278,18 @@ def assert_tag_readback_retries(release_tag: str) -> None:
     absent = execute_tag_readback(source, [missing])
     if absent.returncode == 0:
         raise AssertionError("post-mint readback accepted a ref that never appeared")
-    if "did not become readable" not in absent.stdout:
+    if "never read back" not in absent.stdout:
         raise AssertionError(
             "post-mint readback must distinguish exhausted reads from a "
             f"mismatch: {absent.stdout}{absent.stderr}"
+        )
+    # The reason the API gave has to survive into the refusal. A persistent
+    # auth or rate-limit failure reads identically to a missing ref from here,
+    # and reporting it as absence sends an operator after a tag that exists.
+    if "last reason:" not in absent.stdout or "Not Found" not in absent.stdout:
+        raise AssertionError(
+            "post-mint readback must report why the read failed rather than "
+            f"asserting the tag is gone: {absent.stdout}"
         )
 
     # A ref that reads back pointing elsewhere is terminal on the first read.
@@ -2311,23 +2320,37 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
         content = workflows.get(ROOT / path)
         if content is None:
             raise AssertionError(f"required-context producer is missing: {path}")
-        actual: dict[str, str] = {}
+        # Every reference is collected, not the last one seen per action. Each
+        # `uses:` executes, so a single unpinned reference is an unpinned
+        # execution however many pinned ones sit beside it, and whichever order
+        # they appear in. Keying on one reference per action hid exactly that:
+        # a floating duplicate placed above the pinned line was overwritten by
+        # it and the guard stayed green while the floating ref still ran.
+        observed: dict[str, set[str]] = {}
         for reference in re.findall(r"uses:\s*(\S+)", content):
             if reference.startswith("actions/"):
                 continue
             action, _, version = reference.partition("@")
-            actual[action] = version
-        if actual != expected:
+            observed.setdefault(action, set()).add(version)
+        if set(observed) != set(expected):
             raise AssertionError(
-                f"{path} produces a presence-required release context, so every "
-                "third-party action in it must stay pinned to its exact reviewed "
-                f"commit: expected={expected} actual={actual}"
+                f"{path} produces a presence-required release context, so its "
+                "third-party action set must stay exactly as reviewed: "
+                f"expected={sorted(expected)} actual={sorted(observed)}"
             )
-        for action, sha in actual.items():
-            if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        for action, references in sorted(observed.items()):
+            pin = expected[action]
+            if not re.fullmatch(r"[0-9a-f]{40}", pin):
                 raise AssertionError(
-                    f"{path} uses {action} at '{sha}', which is a movable ref "
+                    f"{path} pins {action} to '{pin}', which is a movable ref "
                     "rather than an immutable commit"
+                )
+            drifted = sorted(reference for reference in references if reference != pin)
+            if drifted:
+                raise AssertionError(
+                    f"{path} runs {action} at {drifted} alongside its reviewed "
+                    f"pin {pin}; every reference to it must be that pin, "
+                    "because each one executes"
                 )
 
 
