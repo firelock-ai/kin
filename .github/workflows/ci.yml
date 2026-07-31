@@ -249,6 +249,14 @@ jobs:
             "config::capability_owned_config_replacement_tests" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-core --lib
+          # What the retained directory handle excludes is a property of
+          # Windows' sharing rules, not of Kin's code, so it can only be
+          # settled here. The module doc states the exclusion; these cases are
+          # what entitle it to.
+          run_required_filter "retained config capability exclusion" \
+            "config::windows::capability_exclusion_tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
           run_nonempty_target "kin-git library" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-git --lib

@@ -899,7 +899,18 @@ struct ConfigFileIdentity {
     inode: u64,
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+/// Where a contract case may inject a failure into either arm's transaction.
+///
+/// Both arms carry the same four points so one case can drive both. That
+/// matters most for rollback, which is the reason the Windows arm publishes
+/// with `ReplaceFileW` rather than the atomic replacing move, and which no
+/// ordinary save can reach.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigSaveHookPoint {
     AfterPartialTempWrite,
@@ -1302,6 +1313,20 @@ fn save_config_atomically_with_hook(
     hook: impl FnMut(ConfigSaveHookPoint) -> Result<()>,
 ) -> Result<()> {
     save_config_atomically_scoped_with_hook(
+        path,
+        contents,
+        ConfigAuthorityKind::PublishedRepository,
+        hook,
+    )
+}
+
+#[cfg(all(test, windows))]
+fn save_config_atomically_with_hook(
+    path: &Path,
+    contents: &[u8],
+    hook: impl FnMut(ConfigSaveHookPoint) -> Result<()>,
+) -> Result<()> {
+    windows::save_config_atomically_scoped_with_hook(
         path,
         contents,
         ConfigAuthorityKind::PublishedRepository,
@@ -2139,10 +2164,11 @@ args = ["--verbose"]
 ///
 /// The arms share no code below the namespace validation: Unix publishes with
 /// directory-descriptor-relative renames and Windows with `ReplaceFileW` and
-/// `MoveFileExW`. Gating this module on `test` alone rather than on `unix` is
-/// what makes the Windows CI leg execute these cases instead of only compiling
-/// them, which is the difference between a Windows arm that builds and a
-/// Windows arm that is known to behave.
+/// `MoveFileExW`. Gating this module on the whole supported-platform set
+/// rather than on the Unix arm it grew from is what makes the Windows CI leg
+/// execute these cases instead of only compiling them, which is the difference
+/// between a Windows arm that builds and a Windows arm that is known to
+/// behave.
 #[cfg(all(
     test,
     any(
@@ -2378,5 +2404,72 @@ mod capability_owned_config_replacement_tests {
             b"auto_index = true\n"
         );
         assert!(residual_writer_entries(&config).is_empty());
+    }
+
+    /// Rollback is why the Windows arm publishes with `ReplaceFileW` instead
+    /// of the atomic replacing move, and why the Unix arm exchanges rather
+    /// than renames over. No ordinary save reaches it, so without an injected
+    /// failure the justification would ship and the behaviour would not.
+    #[test]
+    fn a_failure_after_publication_puts_the_predecessor_back() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+        save_config_atomically(&config, b"auto_index = true\n").expect("publish predecessor");
+
+        let error = save_config_atomically_with_hook(&config, b"auto_index = false\n", |point| {
+            if point == ConfigSaveHookPoint::AfterPublication {
+                return Err(KinError::Other(
+                    "injected failure after publication".to_string(),
+                ));
+            }
+            Ok(())
+        })
+        .expect_err("a post-publication failure must not leave the replacement as authority");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure after publication"),
+            "the original failure must survive the rollback, not be replaced by it: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&config).expect("read the rolled-back config"),
+            b"auto_index = true\n",
+            "the predecessor's bytes must be authority again"
+        );
+        assert!(
+            residual_writer_entries(&config).is_empty(),
+            "a rolled-back replacement left writer-owned entries behind: {:?}",
+            residual_writer_entries(&config)
+        );
+    }
+
+    #[test]
+    fn a_failure_after_a_first_publication_leaves_the_name_as_it_found_it() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+
+        let error = save_config_atomically_with_hook(&config, b"auto_index = true\n", |point| {
+            if point == ConfigSaveHookPoint::AfterPublication {
+                return Err(KinError::Other(
+                    "injected failure after first publication".to_string(),
+                ));
+            }
+            Ok(())
+        })
+        .expect_err("a post-publication failure must not leave a config nobody agreed to");
+
+        assert!(error
+            .to_string()
+            .contains("injected failure after first publication"));
+        assert!(
+            !config.exists(),
+            "a rolled-back first publication must leave the name absent, not half-published"
+        );
+        assert!(
+            residual_writer_entries(&config).is_empty(),
+            "a rolled-back first publication left writer-owned entries behind: {:?}",
+            residual_writer_entries(&config)
+        );
     }
 }

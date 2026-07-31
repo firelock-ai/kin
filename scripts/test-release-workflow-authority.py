@@ -2686,6 +2686,14 @@ def main() -> None:
         "config::capability_owned_config_replacement_tests",
         "native Windows config replacement proof",
     )
+    # The retained directory handle's exclusion is a Windows sharing-rule
+    # property. The module doc claims it, so the leg has to keep proving it, or
+    # the claim reverts to an assertion nobody checks.
+    require(
+        ci_jobs["windows-authority-tests"],
+        "config::windows::capability_exclusion_tests",
+        "native retained-capability exclusion proof",
+    )
     require(
         ci_jobs["windows-authority-tests"],
         "target/x86_64-pc-windows-msvc/debug/kin.exe",

@@ -9,27 +9,41 @@
 //! Windows has neither call. What it does have is enough to satisfy the same
 //! contract, by different means:
 //!
-//! * **The retained capability is a directory handle opened without
-//!   `FILE_SHARE_DELETE`.** Renaming or deleting a directory requires opening
-//!   it with `DELETE` access, and that open fails while this handle is held.
-//!   The directory therefore cannot be swapped for another one mid-write. The
-//!   handle is opened for `FILE_READ_ATTRIBUTES` only, which Windows exempts
-//!   from sharing checks, so holding it never blocks ordinary work inside the
-//!   directory and never conflicts with Kin's own second open.
+//! * **The retained capability is a directory handle whose share mode
+//!   withholds `FILE_SHARE_DELETE`.** A share mode binds only the opens that
+//!   take part in Windows' sharing checks, and what decides participation is
+//!   the desired access: an open asking for none of read, write, or delete
+//!   access is exempt from the check and, symmetrically, contributes no share
+//!   mode of its own. So the retained handle asks for `FILE_LIST_DIRECTORY`,
+//!   which makes it a participant and gives the withheld `FILE_SHARE_DELETE`
+//!   teeth. A later open asking for `DELETE` is then refused, and renaming or
+//!   removing a directory needs exactly that access, so `.kin` itself cannot
+//!   be renamed or removed while this transaction runs. Every other open this
+//!   module makes asks for `FILE_READ_ATTRIBUTES` only and stays exempt, so
+//!   the retained handle never blocks Kin's own revalidation and never blocks
+//!   ordinary work inside the directory. `capability_exclusion_tests` proves
+//!   both halves on the target, including that the refused operation succeeds
+//!   once the handle is dropped.
 //! * **Names are still resolved through the visible path**, because Windows
 //!   has no handle-relative open in `std`. That is why every step revalidates
 //!   the directory: the visible path is reopened and its
 //!   `BY_HANDLE_FILE_INFORMATION` identity compared to the retained handle's.
-//!   An ancestor rename that leaves a different directory at the same path is
-//!   caught there, which is the same hole `revalidate_visible_directory`
-//!   closes on Unix.
+//!   The share mode above excludes a swap of `.kin` itself. A rename of an
+//!   ancestor, which leaves a different directory at the same visible path
+//!   without ever opening `.kin`, is not excluded, and revalidation is what
+//!   catches it. That is the same hole `revalidate_visible_directory` closes
+//!   on Unix.
 //! * **Publication over an existing config is `ReplaceFileW`**, which renames
-//!   the current config to a backup name and the new file into its place. That
-//!   is the pairing `RENAME_EXCHANGE` provides on Unix: the predecessor
-//!   survives under a name this writer owns, so a failed post-publication
-//!   check can put it back. `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
-//!   would publish atomically too, but it destroys the predecessor and with it
-//!   any possibility of rollback.
+//!   the current config to a backup name and the new file into its place.
+//!   `RENAME_EXCHANGE` gives Unix two properties at once, atomicity of the
+//!   published name and survival of the predecessor. `ReplaceFileW` is chosen
+//!   for the second: the predecessor survives under a name this writer owns,
+//!   so a failed post-publication check can put it back. The first is
+//!   deliberately not claimed here, because Microsoft documents no atomicity
+//!   for `ReplaceFile` with respect to the replaced name, and nothing in this
+//!   module rests on one. `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
+//!   would publish in a single namespace operation, but it destroys the
+//!   predecessor and with it any possibility of rollback.
 //! * **Publication with no existing config is `MoveFileExW` without
 //!   `MOVEFILE_REPLACE_EXISTING`**, which fails when the destination exists.
 //!   That is `RENAME_NOREPLACE`, so a config raced in during the write is
@@ -56,7 +70,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -64,11 +78,11 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, ReplaceFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
 };
 
-use super::{validated_config_authority_path, ConfigAuthorityKind};
+use super::{validated_config_authority_path, ConfigAuthorityKind, ConfigSaveHookPoint};
 use crate::error::{KinError, Result};
 
 /// Identity of one file or directory, read from an open handle.
@@ -82,7 +96,14 @@ struct ConfigFileIdentity {
 }
 
 struct ConfigAuthority {
-    directory: File,
+    /// The capability itself, whose whole value is that it stays open.
+    ///
+    /// Nothing reads this handle. It is held so the share mode it was opened
+    /// with keeps refusing `DELETE` opens of the directory for as long as the
+    /// transaction runs, in the same way the crate's `_process_guard` locals
+    /// are held rather than read. The identity it was opened with is captured
+    /// once below, because a handle's identity cannot change while it is open.
+    _retained_directory: File,
     directory_identity: ConfigFileIdentity,
     display_directory: PathBuf,
     display_config: PathBuf,
@@ -101,15 +122,37 @@ pub(super) fn save_config_atomically_scoped(
     contents: &[u8],
     kind: ConfigAuthorityKind,
 ) -> Result<()> {
+    save_config_atomically_scoped_with_hook(path, contents, kind, |_| Ok(()))
+}
+
+/// The transaction, with a failure-injection point at each step boundary.
+///
+/// Rollback is the reason `ReplaceFileW` was chosen over the atomic replacing
+/// move, so leaving it unexecuted would mean shipping the justification and
+/// not the behaviour. The hook is how the shared contract module reaches it:
+/// in production the only caller passes a hook that does nothing, and the
+/// points match the Unix arm's so one contract case can drive both.
+pub(super) fn save_config_atomically_scoped_with_hook(
+    path: &Path,
+    contents: &[u8],
+    kind: ConfigAuthorityKind,
+    mut hook: impl FnMut(ConfigSaveHookPoint) -> Result<()>,
+) -> Result<()> {
     let authority = ConfigAuthority::open(path, kind)?;
     let (handle, temp) = authority.create_temp()?;
     let mut handle = Some(handle);
+    let hook: &mut dyn FnMut(ConfigSaveHookPoint) -> Result<()> = &mut hook;
     let result = (|| {
         let mut file = handle.take().expect("temp handle is taken exactly once");
-        file.write_all(contents)
+        let split = contents.len() / 2;
+        file.write_all(&contents[..split])
+            .map_err(|error| KinError::io(&temp.display_path, error))?;
+        hook(ConfigSaveHookPoint::AfterPartialTempWrite)?;
+        file.write_all(&contents[split..])
             .map_err(|error| KinError::io(&temp.display_path, error))?;
         file.sync_all()
             .map_err(|error| KinError::io(&temp.display_path, error))?;
+        hook(ConfigSaveHookPoint::AfterTempSync)?;
         // The Unix arm re-reads the temp by name here, to catch a name swapped
         // out from under the handle it wrote through. That cannot happen while
         // this handle is open: renaming or deleting a file requires opening it
@@ -131,10 +174,13 @@ pub(super) fn save_config_atomically_scoped(
             &temp.display_path,
             "config temp file",
         )?;
+        hook(ConfigSaveHookPoint::BeforePublication)?;
 
         match authority.expected_config {
-            Some(expected) => authority.replace_published_config(&temp, expected, contents),
-            None => authority.publish_first_config(&temp, contents),
+            Some(expected) => {
+                authority.replace_published_config(&temp, expected, contents, &mut *hook)
+            }
+            None => authority.publish_first_config(&temp, contents, &mut *hook),
         }
     })();
 
@@ -154,12 +200,12 @@ impl ConfigAuthority {
     fn open(path: &Path, kind: ConfigAuthorityKind) -> Result<Self> {
         let (config_name, directory_path) = validated_config_authority_path(path, kind)?;
 
-        let directory = open_config_directory_nofollow(directory_path)?;
+        let directory = open_retained_config_directory(directory_path)?;
         let directory_identity = handle_identity(&directory, directory_path)?;
         let expected_config =
             inspect_config_file(directory_path, config_name, path, "repository config")?;
         let authority = Self {
-            directory,
+            _retained_directory: directory,
             directory_identity,
             display_directory: directory_path.to_path_buf(),
             display_config: path.to_path_buf(),
@@ -201,13 +247,18 @@ impl ConfigAuthority {
         }
     }
 
+    /// Prove the visible path still names the directory this transaction owns.
+    ///
+    /// Only the visible path is reread. The retained handle's own identity is
+    /// deliberately not compared against itself: the volume-serial and
+    /// file-index pair Windows binds to an open handle is fixed for the life
+    /// of that handle, through rename and through delete alike, so the
+    /// comparison could never fail. It would cost a syscall to read as
+    /// evidence while proving nothing.
     fn revalidate_visible_directory(&self) -> Result<()> {
         let visible = open_config_directory_nofollow(&self.display_directory)?;
         let visible_identity = handle_identity(&visible, &self.display_directory)?;
-        let retained_identity = handle_identity(&self.directory, &self.display_directory)?;
-        if visible_identity != self.directory_identity
-            || retained_identity != self.directory_identity
-        {
+        if visible_identity != self.directory_identity {
             return Err(KinError::Config(format!(
                 "retained .kin authority changed or was replaced while saving {}",
                 self.display_config.display()
@@ -265,8 +316,30 @@ impl ConfigAuthority {
     /// Reading the name back is a stronger statement than any metadata
     /// comparison, and it is the one that matters: repository authority is the
     /// bytes, not the file record they happen to live in.
+    ///
+    /// The read is no-follow, and the bytes come from the same handle that
+    /// proved what the name holds. A plain path read would follow a reparse
+    /// point raced into the config name and report its target's bytes as
+    /// authority; opening once and reading through that handle leaves no
+    /// window between the proof and the read for such a name to appear.
     fn require_published_bytes(&self, contents: &[u8]) -> Result<()> {
-        let published = std::fs::read(&self.display_config)
+        let mut file = OpenOptions::new()
+            .access_mode(FILE_READ_DATA | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&self.display_config)
+            .map_err(|error| KinError::io(&self.display_config, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| KinError::io(&self.display_config, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(KinError::Config(format!(
+                "published repository config at {} is not a regular no-follow file",
+                self.display_config.display()
+            )));
+        }
+        let mut published = Vec::new();
+        file.read_to_end(&mut published)
             .map_err(|error| KinError::io(&self.display_config, error))?;
         if published != contents {
             return Err(KinError::Config(format!(
@@ -282,7 +355,12 @@ impl ConfigAuthority {
     /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` fails when the
     /// destination exists, so a config created by anyone else between opening
     /// this authority and publishing is refused rather than overwritten.
-    fn publish_first_config(&self, temp: &ConfigTemp, contents: &[u8]) -> Result<()> {
+    fn publish_first_config(
+        &self,
+        temp: &ConfigTemp,
+        contents: &[u8],
+        hook: &mut dyn FnMut(ConfigSaveHookPoint) -> Result<()>,
+    ) -> Result<()> {
         move_file_no_replace(&temp.display_path, &self.display_config).map_err(|error| {
             if is_destination_exists(&error) {
                 KinError::Config(format!(
@@ -294,13 +372,15 @@ impl ConfigAuthority {
             }
         })?;
 
-        let post_publication = self
-            .require_named_identity(
-                &self.config_name,
-                temp.identity,
-                &self.display_config,
-                "published repository config",
-            )
+        let post_publication = hook(ConfigSaveHookPoint::AfterPublication)
+            .and_then(|()| {
+                self.require_named_identity(
+                    &self.config_name,
+                    temp.identity,
+                    &self.display_config,
+                    "published repository config",
+                )
+            })
             .and_then(|()| self.require_published_bytes(contents))
             .and_then(|()| {
                 self.require_named_absent(&temp.name, &temp.display_path, "config temp file")
@@ -316,14 +396,18 @@ impl ConfigAuthority {
     /// Publish over an existing config, keeping the predecessor recoverable.
     ///
     /// `ReplaceFileW` moves the current config to `backup` and the temp file
-    /// into the config name in one call, so no reader ever observes the config
-    /// name as absent, and the bytes that were authority a moment ago are
-    /// still on disk under a name this writer owns.
+    /// into the config name in one call, so the bytes that were authority a
+    /// moment ago are still on disk under a name this writer owns and a failed
+    /// post-publication check can put them back. What is not claimed is that
+    /// the call is atomic with respect to the config name: it is documented as
+    /// a sequence of renames, Microsoft states no atomicity for it, and no
+    /// check in this module depends on one.
     fn replace_published_config(
         &self,
         temp: &ConfigTemp,
         expected: ConfigFileIdentity,
         contents: &[u8],
+        hook: &mut dyn FnMut(ConfigSaveHookPoint) -> Result<()>,
     ) -> Result<()> {
         let backup_name = OsString::from(format!(
             ".config.toml.kin-replaced-{}",
@@ -335,8 +419,8 @@ impl ConfigAuthority {
         replace_file_with_backup(&self.display_config, &temp.display_path, &backup_display)
             .map_err(|error| KinError::io(&self.display_config, error))?;
 
-        let post_publication = self
-            .require_published_bytes(contents)
+        let post_publication = hook(ConfigSaveHookPoint::AfterPublication)
+            .and_then(|()| self.require_published_bytes(contents))
             .and_then(|()| {
                 self.require_named_identity(
                     &backup_name,
@@ -452,15 +536,46 @@ impl ConfigAuthority {
 
 /// Open the `.kin` directory as the transaction's retained capability.
 ///
-/// The share mode grants read and write and withholds delete, which is what
-/// prevents the directory from being renamed or removed while Kin publishes
-/// into it. `FILE_FLAG_BACKUP_SEMANTICS` is what allows a directory to be
-/// opened at all, and `FILE_FLAG_OPEN_REPARSE_POINT` refuses to follow a
-/// reparse point standing where `.kin` should be.
+/// The access mask is what makes the share mode binding, so it is chosen for
+/// that and not for what this handle reads. `FILE_LIST_DIRECTORY` is a read
+/// access right, which makes the open take part in Windows' sharing checks and
+/// records its share mode against the directory object. Withholding
+/// `FILE_SHARE_DELETE` then refuses any later open asking for `DELETE`, which
+/// is the access renaming or removing a directory requires. Asking for
+/// `FILE_READ_ATTRIBUTES` instead would be exempt from the check, and an
+/// exempt handle imposes no share mode at all: that is the whole difference
+/// between excluding a swap of this directory and merely noticing one after
+/// the fact.
+fn open_retained_config_directory(path: &Path) -> Result<File> {
+    open_config_directory(
+        path,
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+}
+
+/// Reopen a directory only to read which one it is.
+///
+/// `FILE_READ_ATTRIBUTES` is none of read, write, or delete access, so this
+/// open is exempt from sharing checks in both directions: the retained
+/// capability above cannot refuse it, and it imposes nothing that could refuse
+/// anyone else. That is exactly what a revalidation wants, because proving
+/// which directory stands at a path must never itself become contention.
 fn open_config_directory_nofollow(path: &Path) -> Result<File> {
+    open_config_directory(
+        path,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+}
+
+/// `FILE_FLAG_BACKUP_SEMANTICS` is what allows a directory to be opened at
+/// all, and `FILE_FLAG_OPEN_REPARSE_POINT` refuses to follow a reparse point
+/// standing where the directory should be.
+fn open_config_directory(path: &Path, access: u32, share: u32) -> Result<File> {
     let directory = OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .access_mode(access)
+        .share_mode(share)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| KinError::io(path, error))?;
@@ -606,5 +721,138 @@ fn rollback_error(error: KinError, rollback: Result<()>) -> KinError {
         Err(rollback) => KinError::Other(format!(
             "{error}; capability-owned config rollback also failed: {rollback}"
         )),
+    }
+}
+
+/// What the retained capability excludes, and what it deliberately does not.
+///
+/// The module doc above asserts two properties of one handle: that withholding
+/// `FILE_SHARE_DELETE` refuses a later `DELETE` open, and that Kin's own
+/// attributes-only opens stay exempt from the same check. Both are properties
+/// of Windows' sharing rules rather than of Kin's code, so neither can be
+/// settled by reading this file, and an arm that merely compiles establishes
+/// nothing about either. These cases run on the Windows CI runner. Each pairs
+/// its assertion with the falsification that the refused operation succeeds
+/// once the handle is dropped, so a refusal arriving for some other reason
+/// fails the case rather than passing it.
+#[cfg(test)]
+mod capability_exclusion_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+    fn kin_directory(root: &tempfile::TempDir) -> PathBuf {
+        let kin = root.path().join(".kin");
+        std::fs::create_dir(&kin).expect("create .kin");
+        kin
+    }
+
+    /// Ask for delete access while granting every share right in return, so
+    /// the only thing that can refuse this open is another handle's share
+    /// mode.
+    fn open_with_delete_intent(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    #[test]
+    fn a_delete_intent_open_is_refused_while_the_retained_handle_is_held() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let kin = kin_directory(&root);
+
+        let retained = open_retained_config_directory(&kin).expect("retain the config authority");
+        let refused = open_with_delete_intent(&kin)
+            .expect_err("a DELETE open must not be granted while the capability is retained");
+        let sharing_violation =
+            i32::try_from(ERROR_SHARING_VIOLATION).expect("a documented WIN32_ERROR fits an i32");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(sharing_violation),
+            "the refusal must come from the retained share mode, not from anything else: {refused}"
+        );
+
+        drop(retained);
+        open_with_delete_intent(&kin)
+            .expect("the same open must be granted once the capability is released");
+    }
+
+    #[test]
+    fn renaming_the_retained_directory_is_refused_while_the_handle_is_held() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let kin = kin_directory(&root);
+        let displaced = root.path().join(".kin.displaced");
+
+        let retained = open_retained_config_directory(&kin).expect("retain the config authority");
+        move_file_no_replace(&kin, &displaced)
+            .expect_err("renaming the retained authority must be excluded, not merely detected");
+        assert!(
+            !displaced.exists(),
+            "a refused rename must leave the namespace untouched"
+        );
+
+        drop(retained);
+        move_file_no_replace(&kin, &displaced)
+            .expect("the same rename must succeed once the capability is released");
+    }
+
+    #[test]
+    fn the_retained_handle_does_not_refuse_kins_own_work() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let kin = kin_directory(&root);
+        let config = kin.join("config.toml");
+        std::fs::write(&config, b"x = 1\n").expect("seed a published config");
+
+        let retained = open_retained_config_directory(&kin).expect("retain the config authority");
+
+        // Every second open this module makes is attributes-only, and the
+        // transaction would refuse its own first revalidation if that were not
+        // exempt from the share mode the retained handle now imposes.
+        open_config_directory_nofollow(&kin)
+            .expect("revalidating the directory must not be refused by Kin's own capability");
+        inspect_config_file(
+            &kin,
+            OsStr::new("config.toml"),
+            &config,
+            "repository config",
+        )
+        .expect("inspecting a file inside the directory must not be refused")
+        .expect("the seeded config is present");
+        std::fs::write(kin.join("other.toml"), b"y = 2\n")
+            .expect("ordinary work inside the directory must not be refused");
+
+        drop(retained);
+    }
+
+    #[test]
+    fn a_stage_directory_can_still_be_promoted_after_publishing_its_config() {
+        // `kin init` publishes into `.kin.init-<uuid>` and then renames that
+        // directory to `.kin`, which is exactly the operation the retained
+        // capability refuses while it is held. A handle outliving its
+        // transaction would therefore turn a working init into a refusal, and
+        // nothing else in the suite would notice. This is the case that fails
+        // if one ever does.
+        let root = tempfile::tempdir().expect("tempdir");
+        let stage = root
+            .path()
+            .join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&stage).expect("create stage");
+
+        save_config_atomically_scoped(
+            &stage.join("config.toml"),
+            b"mode = \"native\"\n",
+            ConfigAuthorityKind::InitializationStage,
+        )
+        .expect("publish the staged repository config");
+
+        let published = root.path().join(".kin");
+        move_file_no_replace(&stage, &published)
+            .expect("the transaction must not outlive itself and block stage promotion");
+        assert_eq!(
+            std::fs::read(published.join("config.toml")).expect("read the promoted config"),
+            b"mode = \"native\"\n"
+        );
     }
 }
