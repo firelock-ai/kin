@@ -91,6 +91,9 @@ pub struct SemanticEnrichmentStatus {
     pub entity_count: usize,
     pub relation_count: usize,
     pub semantic_change_count: usize,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
     /// There is no repository-v6 completion attestation yet. Counts are exact;
     /// completeness is deliberately not inferred from them.
     pub completion_attested: bool,
@@ -106,6 +109,9 @@ struct SemanticEnrichmentStatusWire {
     entity_count: usize,
     relation_count: usize,
     semantic_change_count: usize,
+    embeddings_indexed: usize,
+    embeddings_pending: usize,
+    embeddings_total: usize,
     #[serde(deserialize_with = "deserialize_status_unattested")]
     completion_attested: bool,
 }
@@ -124,6 +130,9 @@ impl<'de> Deserialize<'de> for SemanticEnrichmentStatus {
             entity_count: wire.entity_count,
             relation_count: wire.relation_count,
             semantic_change_count: wire.semantic_change_count,
+            embeddings_indexed: wire.embeddings_indexed,
+            embeddings_pending: wire.embeddings_pending,
+            embeddings_total: wire.embeddings_total,
             completion_attested: wire.completion_attested,
         };
         enrichment.validate().map_err(serde::de::Error::custom)?;
@@ -147,6 +156,9 @@ impl SemanticEnrichmentStatus {
             entity_count: summary.entity_count,
             relation_count: summary.relation_count,
             semantic_change_count: summary.semantic_change_count,
+            embeddings_indexed: summary.embeddings_indexed,
+            embeddings_pending: summary.embeddings_pending,
+            embeddings_total: summary.embeddings_total,
             completion_attested: false,
         }
     }
@@ -162,7 +174,15 @@ impl SemanticEnrichmentStatus {
                 "semantic_enrichment.presence is present despite zero entity/relation counts"
                     .to_string(),
             ),
-            _ => Ok(()),
+            _ => {
+                if self.embeddings_indexed > self.embeddings_total {
+                    return Err(format!(
+                        "embeddings_indexed ({}) exceeds embeddings_total ({})",
+                        self.embeddings_indexed, self.embeddings_total
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -751,6 +771,9 @@ mod tests {
             entity_count: 7,
             relation_count: 4,
             semantic_change_count: 2,
+            embeddings_indexed: 5,
+            embeddings_pending: 2,
+            embeddings_total: 7,
             completion_attested: false,
         };
 
@@ -758,6 +781,9 @@ mod tests {
         assert_eq!(encoded["view"], "durable_repository_authority");
         assert_eq!(encoded["authority_generation"], 9);
         assert_eq!(encoded["workspace_generation"], 3);
+        assert_eq!(encoded["embeddings_indexed"], 5);
+        assert_eq!(encoded["embeddings_pending"], 2);
+        assert_eq!(encoded["embeddings_total"], 7);
         assert_eq!(
             serde_json::from_value::<SemanticEnrichmentStatus>(encoded).unwrap(),
             enrichment

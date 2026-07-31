@@ -37,6 +37,9 @@ pub struct DurableSemanticEnrichmentSummary {
     /// Repository-wide immutable semantic changes sealed by this authority
     /// generation. Entity and relation counts remain workspace-scoped.
     pub semantic_change_count: usize,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
 }
 
 /// Summarize one durable workspace without materializing its complete query graph.
@@ -83,12 +86,28 @@ pub fn durable_semantic_enrichment_summary(
         "workspace semantic overlay",
     )?;
 
+    let (embeddings_indexed, embeddings_pending, embeddings_total) =
+        if let Some(snapshot) = authority
+            .workspace_graph_snapshot(workspace_id)
+            .map_err(|error| KinError::Graph(error.to_string()))?
+        {
+            let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+                .map_err(|error| KinError::Graph(error.to_string()))?;
+            let status = graph.embedding_status();
+            (status.indexed, status.pending, status.total)
+        } else {
+            (0, 0, 0)
+        };
+
     Ok(DurableSemanticEnrichmentSummary {
         authority_generation: authority.roots().generation,
         workspace_generation: workspace.generation,
         entity_count: entity_ids.len(),
         relation_count: relation_ids.len(),
         semantic_change_count: authority.snapshot().changes.len(),
+        embeddings_indexed,
+        embeddings_pending,
+        embeddings_total,
     })
 }
 
