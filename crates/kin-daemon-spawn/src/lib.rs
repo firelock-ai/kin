@@ -3396,8 +3396,15 @@ mod tests {
     /// fire-and-forget `SIGCONT` cannot clear, so this pins the property the
     /// fork-boundary handshake depends on: a release is complete only once the
     /// target's own progress proves it is running, not once a signal has been
-    /// sent. Replace [`resume_test_pid_until`] with a bare `kill(SIGCONT)` and
-    /// the child never reaches its marker, so this goes red.
+    /// sent.
+    ///
+    /// Falsify it by replacing the repeat loop INSIDE [`resume_test_pid_until`]
+    /// with a single `kill(SIGCONT)`: the child stays parked at its second stop,
+    /// never publishes its marker, and the assertion below fails. That
+    /// assertion is deliberately outside the helper, because the closure the
+    /// helper takes is its own success condition, and a test whose only
+    /// observation lives inside the thing under test cannot fail when that
+    /// thing stops working.
     #[cfg(unix)]
     #[test]
     fn resuming_a_stopped_target_clears_every_stop_it_enters() {
@@ -3439,18 +3446,42 @@ mod tests {
             }
         }
 
-        wait_for_test_pid_stopped(child, Duration::from_secs(5));
-        // The marker is published only after BOTH stops are cleared, so its
-        // presence is the running-target proof the helper must deliver.
-        resume_test_pid_until(child, Duration::from_secs(5), || marker.is_file());
+        // The child's terminal state is `pause()`, so it never exits on its
+        // own: if the helper below trips its deadline assert, an unguarded
+        // cleanup line would never run and would leave a permanently stopped,
+        // reparented child pinning this lane's target directory. The neighbouring
+        // multi-process tests take an owner for the same reason.
+        let child = StoppedProbeChild(child);
 
-        assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
-        let mut status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(child, &mut status, 0) },
-            child,
-            "reap resume-probe child"
+        wait_for_test_pid_stopped(child.0, Duration::from_secs(5));
+        resume_test_pid_until(child.0, Duration::from_secs(5), || marker.is_file());
+        // Outside the helper on purpose: the closure above is the helper's own
+        // success condition, so observing the marker only there would leave this
+        // test green if the helper stopped proving anything.
+        assert!(
+            marker.is_file(),
+            "the target must have cleared both stops and published its marker"
         );
+    }
+
+    /// Kills and reaps a probe child that cannot terminate on its own, however
+    /// the test leaves its scope.
+    #[cfg(unix)]
+    struct StoppedProbeChild(libc::pid_t);
+
+    #[cfg(unix)]
+    impl Drop for StoppedProbeChild {
+        fn drop(&mut self) {
+            // SIGCONT first: SIGKILL is delivered to a stopped process, but a
+            // stopped process that is never continued is not reaped promptly on
+            // every platform, and the point of this guard is to leave nothing.
+            unsafe {
+                libc::kill(self.0, libc::SIGCONT);
+                libc::kill(self.0, libc::SIGKILL);
+            }
+            let mut status = 0;
+            unsafe { libc::waitpid(self.0, &mut status, 0) };
+        }
     }
 
     #[cfg(unix)]
