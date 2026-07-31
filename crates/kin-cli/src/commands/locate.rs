@@ -643,7 +643,15 @@ struct LocateBudget {
     start: std::time::Instant,
     total_secs: f64,
     phase_budgets: HashMap<&'static str, f64>,
+    /// Advisory notes for the log and the explain surface. Mixed on purpose:
+    /// this holds both work that was skipped and work that merely overran a
+    /// soft per-phase budget and finished anyway. Do NOT infer truncation from
+    /// it; the second kind truncates nothing, so a caller that reads emptiness
+    /// here as "the answer is whole" is reading the wrong field.
     warnings: Vec<String>,
+    /// Retrieval that was actually cut short, recorded at the point it was cut.
+    /// This is the only sound basis for telling a caller the answer is partial.
+    truncations: Vec<String>,
 }
 
 /// The budget-gated phases of the locate pipeline, with the environment knob
@@ -684,6 +692,7 @@ impl LocateBudget {
                 .map(|(phase, knob, default)| (*phase, secs_budget(knob, *default)))
                 .collect(),
             warnings: Vec::new(),
+            truncations: Vec::new(),
         }
     }
 
@@ -712,6 +721,22 @@ impl LocateBudget {
         Self::uniform(-1.0)
     }
 
+    /// A generous total with specific phases overridden.
+    ///
+    /// `uniform` cannot express the one budget cut that reaches the end of the
+    /// pipeline, because that cut depends on a phase remainder being small
+    /// while the total is not exhausted. Setting them independently is what
+    /// lets a test drive a real truncation all the way to the completing path
+    /// instead of bailing at the scoring gate.
+    #[cfg(test)]
+    fn with_phase_overrides(total_secs: f64, overrides: &[(&'static str, f64)]) -> Self {
+        let mut budget = Self::uniform(total_secs);
+        for (phase, secs) in overrides {
+            budget.phase_budgets.insert(phase, *secs);
+        }
+        budget
+    }
+
     /// Every gate in the pipeline, total and per phase, set to `secs`.
     #[cfg(test)]
     fn uniform(secs: f64) -> Self {
@@ -723,6 +748,7 @@ impl LocateBudget {
                 .map(|(phase, _, _)| (*phase, secs))
                 .collect(),
             warnings: Vec::new(),
+            truncations: Vec::new(),
         }
     }
 
@@ -743,6 +769,10 @@ impl LocateBudget {
     /// Check if a phase should be skipped entirely (no budget left).
     fn phase_should_skip(&mut self, phase: &str) -> bool {
         if self.total_exceeded() {
+            self.record_truncation(format!(
+                "skipped {phase}: total budget exhausted ({:.1}s elapsed)",
+                self.start.elapsed().as_secs_f64()
+            ));
             self.warnings.push(format!(
                 "skipped {phase}: total budget exhausted ({:.1}s elapsed)",
                 self.start.elapsed().as_secs_f64()
@@ -757,6 +787,9 @@ impl LocateBudget {
         false
     }
 
+    /// Note a phase that overran its soft budget. Deliberately NOT a truncation:
+    /// every call site fires in the branch where the phase already ran to
+    /// completion, so the result is whole and only the timing was poor.
     fn warn_phase_timeout(&mut self, phase: &str, elapsed: std::time::Duration) {
         self.warnings.push(format!(
             "{phase} exceeded budget ({:.1}s)",
@@ -767,6 +800,17 @@ impl LocateBudget {
             elapsed_ms = elapsed.as_millis(),
             "locate phase exceeded budget, returning partial results"
         );
+    }
+
+    /// Record retrieval that was cut short. Called at the cut, never inferred
+    /// after the fact.
+    fn record_truncation(&mut self, what: String) {
+        self.truncations.push(what);
+    }
+
+    /// Whether any retrieval was cut short for this query.
+    fn truncated(&self) -> bool {
+        !self.truncations.is_empty()
     }
 
     fn elapsed_secs(&self) -> f64 {
@@ -1766,6 +1810,14 @@ fn run_with_graph_capture_budgeted(
         let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
             tracing::info!(
                 "skipping embedding sub-phase: entity_discovery budget nearly exhausted"
+            );
+            // The one budget cut that does NOT imply the total was exceeded: it
+            // fires on the per-phase remainder, so the pipeline runs to
+            // completion with the embedding signal missing. Before this it was
+            // recorded nowhere the caller could see, which is precisely the
+            // silent partial answer the degradation ledger exists to prevent.
+            budget.record_truncation(
+                "embedding sub-phase skipped: entity_discovery budget nearly exhausted".to_string(),
             );
             if explain {
                 prune_ledger.push(PruneEvent {
@@ -3625,22 +3677,31 @@ fn run_with_graph_capture_budgeted(
             warnings = ?budget.warnings,
             "locate pipeline completed with budget warnings"
         );
-        // A budget that truncated discovery returns FEWER results, not an error,
-        // so without this the caller cannot tell "nothing matched" from "the
-        // pipeline stopped looking". The early scoring-skip return already
-        // reports this; a phase skipped mid-pipeline has to report it as well
-        // or the same silence returns through the other door.
+    }
+    // Gated on truncation, NOT on `warnings`. A phase that overran its soft
+    // budget and still produced its full result writes a warning and truncates
+    // nothing, so reporting that as a degradation would tell a caller its whole
+    // answer was partial, on exactly the slow-host path this file otherwise
+    // works to stop conflating with retrieval semantics.
+    //
+    // Reaching here with a truncation means the per-phase embedding cut above:
+    // a skipped PHASE implies the total was exceeded, and `total_exceeded` only
+    // ever goes from false to true, so the scoring gate would have returned
+    // early with its own report before this line.
+    if budget.truncated() {
         record_degradation(
             &mut degradations,
             RetrievalDegradation {
                 component: "pipeline".to_string(),
-                reason: "budget_exhausted".to_string(),
+                reason: "budget_truncated".to_string(),
                 detail: format!(
-                    "locate budget exhausted after {:.1}s; {}",
+                    "retrieval truncated after {:.1}s; {}",
                     budget.elapsed_secs(),
-                    budget.warnings.join("; ")
+                    budget.truncations.join("; ")
                 ),
-                remediation: "raise KIN_LOCATE_TOTAL_TIMEOUT_SECS for this repo size".to_string(),
+                remediation:
+                    "raise KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS, or the total budget, for this repo size"
+                        .to_string(),
             },
         );
     }
@@ -17733,40 +17794,49 @@ mod tests {
         assert!(!vector_degradations[0].remediation.contains("kin embed"));
     }
 
-    /// A budget that truncated retrieval must say so on the result.
+    /// Truncated retrieval must say so on the result, and untruncated retrieval
+    /// must not.
     ///
-    /// Over budget the pipeline skips discovery and returns `Ok` with fewer
-    /// files, so "found nothing" and "stopped looking" are the same value at
-    /// the assertion. That is what made a wall-clock stall read as a retrieval
-    /// regression. The degradation ledger is what tells them apart, and it has
-    /// to be populated on the completing path and not only on the early return.
+    /// Over budget the pipeline returns `Ok` with fewer files, so "found
+    /// nothing" and "stopped looking" are the same value at the assertion. The
+    /// degradation ledger is what separates them.
+    ///
+    /// The positive case drives the ONE budget cut that reaches the end of the
+    /// pipeline: a tiny `entity_discovery` phase budget under a generous total
+    /// skips the embedding sub-phase without ever exhausting the total, so no
+    /// phase gate fires and the run completes normally. Revert the
+    /// `budget.truncated()` block and this goes red, which the previous version
+    /// of this test could not do: it drove an exhausted TOTAL, which bails at
+    /// the scoring gate and is reported by code that predates this branch.
     #[test]
-    fn budget_truncated_locate_reports_the_truncation_rather_than_an_empty_result() {
+    fn truncated_retrieval_is_reported_and_whole_retrieval_is_not() {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
-        let starved = run_with_graph_capture_in_workspace_budgeted(
+        let truncated_marker = |result: &LocateResult| {
+            result.degradations.iter().any(|degradation| {
+                degradation.component == "pipeline" && degradation.reason == "budget_truncated"
+            })
+        };
+
+        let truncated = run_with_graph_capture_in_workspace_budgeted(
             &graph,
             None,
             "handler failure",
             false,
             10,
             true,
-            LocateBudget::already_exhausted(),
+            LocateBudget::with_phase_overrides(f64::INFINITY, &[("entity_discovery", 0.0)]),
         )
-        .expect("an exhausted budget truncates retrieval, it does not error");
+        .expect("a truncating budget cuts retrieval, it does not error");
         assert!(
-            starved.degradations.iter().any(|degradation| {
-                degradation.component == "pipeline" && degradation.reason == "budget_exhausted"
-            }),
-            "a truncated locate must carry its budget_exhausted degradation, got {:?}",
-            starved.degradations
+            truncated_marker(&truncated),
+            "retrieval cut short must carry its truncation, got {:?}",
+            truncated.degradations
         );
 
-        // The control: the same query under a budget that cannot truncate must
-        // NOT claim truncation, or the marker means nothing.
         let whole = run_with_graph_capture_in_workspace_budgeted(
             &graph,
             None,
@@ -17778,11 +17848,40 @@ mod tests {
         )
         .expect("an unbounded budget runs the whole pipeline");
         assert!(
-            !whole.degradations.iter().any(|degradation| {
-                degradation.component == "pipeline" && degradation.reason == "budget_exhausted"
-            }),
-            "an untruncated locate must not claim a budget was exhausted, got {:?}",
+            !truncated_marker(&whole),
+            "whole retrieval must not claim truncation, got {:?}",
             whole.degradations
+        );
+    }
+
+    /// The distinction the truncation marker rests on, asserted directly.
+    ///
+    /// `warnings` mixes two events that mean opposite things to a caller: work
+    /// that was skipped, and work that overran a soft budget and finished
+    /// anyway. Gating a "your answer is partial" signal on that vector reports
+    /// a whole answer as truncated every time a slow host trips the second
+    /// kind, which is the inversion this pins against returning.
+    #[test]
+    fn a_phase_that_overran_its_budget_but_completed_is_not_a_truncation() {
+        let mut overran = LocateBudget::unbounded();
+        overran.warn_phase_timeout("entity_discovery", std::time::Duration::from_secs(30));
+        assert!(
+            !overran.warnings.is_empty(),
+            "the advisory warning is still recorded for the log and explain surface"
+        );
+        assert!(
+            !overran.truncated(),
+            "a phase that produced its full result truncated nothing"
+        );
+
+        let mut exhausted = LocateBudget::already_exhausted();
+        assert!(
+            exhausted.phase_should_skip("entity_discovery"),
+            "an exhausted total must skip the phase"
+        );
+        assert!(
+            exhausted.truncated(),
+            "a skipped phase IS a truncation and must be recorded as one"
         );
     }
 
