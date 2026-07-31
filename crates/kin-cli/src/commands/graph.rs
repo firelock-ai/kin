@@ -81,15 +81,13 @@ pub enum EntitySourceOutcome {
 
 /// `kin graph status` — quick health check of the semantic graph.
 pub async fn status() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Status).await?)
 }
 
 /// `kin graph validate` — structural integrity checks.
 pub async fn validate() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Validate).await?)
 }
 
@@ -101,8 +99,7 @@ pub async fn validate() -> Result<()> {
 /// This lets an LLM agent recover from a hallucinated UUID instead of treating
 /// the tool call as a hard CLI failure.
 pub async fn inspect(name: String, json: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_graph(&layout, &GraphCommandRequest::Inspect { name }).await?;
     if json {
         // SP-23 graceful-error: emit the full response (lines + error) as JSON
@@ -128,8 +125,7 @@ pub async fn inspect(name: String, json: bool) -> Result<()> {
 /// response rather than a hard CLI failure. Non-JSON mode keeps the existing
 /// exit-1-on-error behavior for shell-script compatibility.
 pub async fn source(entity: String, json: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_graph(&layout, &GraphCommandRequest::Source { entity }).await?;
     if json {
         if let Some(error) = response.error {

@@ -34,8 +34,7 @@ const EJECT_GIT_CAPTURE_LIMIT: u64 = 8 * 1024 * 1024;
 pub async fn run(yes: bool) -> Result<()> {
     ensure_eject_platform()?;
     let cwd = std::env::current_dir()?;
-    let layout = kin_core::KinLayout::discover(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository"))?;
+    let layout = crate::commands::require_repository_layout_at(&cwd)?;
     ensure_real_directory(layout.root(), "Kin metadata")?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     refuse_live_vfs(&layout)?;

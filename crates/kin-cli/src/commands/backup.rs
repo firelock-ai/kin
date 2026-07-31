@@ -210,8 +210,7 @@ pub async fn delete(name: String) -> Result<()> {
 // -- Helpers --
 
 fn discover_layout() -> Result<kin_core::KinLayout> {
-    kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))
+    crate::commands::require_repository_layout()
 }
 
 fn require_explicit_offline_restore(layout: &kin_core::KinLayout) -> Result<()> {

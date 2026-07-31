@@ -89,8 +89,7 @@ pub struct BulkRefsResponse {
 }
 
 pub async fn run(entity: String, kind: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "refs").await?;
     let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
     for line in response.lines {
@@ -100,8 +99,7 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
 }
 
 pub async fn run_bulk(entities: String, kind: String, compact: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "refs:bulk").await?;
     let entity_ids: Vec<String> = entities
         .split(',')

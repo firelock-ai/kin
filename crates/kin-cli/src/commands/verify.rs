@@ -52,8 +52,7 @@ pub struct VerifyCommandResponse {
 ///
 /// Shows per-entity test linkage and overall coverage summary.
 pub async fn run(entity: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_verify_response(
         run_daemon_verify_command(&layout, &VerifyCommandRequest::Entity { entity }).await?,
     )
@@ -61,23 +60,20 @@ pub async fn run(entity: String) -> Result<()> {
 
 /// `kin verify --summary` — Show repository-wide coverage summary only.
 pub async fn summary() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_verify_response(run_daemon_verify_command(&layout, &VerifyCommandRequest::Summary).await?)
 }
 
 /// `kin verify --missing` — Show only entities without any linked test.
 pub async fn missing() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_verify_response(run_daemon_verify_command(&layout, &VerifyCommandRequest::Missing).await?)
 }
 
 /// `kin verify plan <entity> --depth 2` — Show the targeted proof set Kin would
 /// use for verification, widened by downstream semantic impact.
 pub async fn plan(entity: String, depth: u32) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_verify_response(
         run_daemon_verify_command(&layout, &VerifyCommandRequest::Plan { entity, depth }).await?,
     )
@@ -86,8 +82,7 @@ pub async fn plan(entity: String, depth: u32) -> Result<()> {
 /// `kin verify change [<change-id>] --depth 2` — Show the targeted proof set
 /// Kin would use for a semantic change, defaulting to the current HEAD.
 pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_verify_response(
         run_daemon_verify_command(
             &layout,
@@ -104,8 +99,7 @@ pub async fn plan_change(change_id: Option<String>, depth: u32) -> Result<()> {
 /// set. Otherwise it falls back to an entity-name filter and still records a
 /// proof run for the entity.
 pub async fn run_verification(entity: String, runner: String, depth: u32) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_verify_run(
         &layout,
         &VerifyRunRequest {

@@ -68,7 +68,9 @@ pub async fn publish(target: PathBuf, json: bool) -> Result<()> {
     let repo_path = std::env::current_dir()?;
     let kin_dir = repo_path.join(".kin");
     if !kin_dir.exists() {
-        bail!("not a Kin repository (no .kin/ found)");
+        bail!(
+            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
+        );
     }
 
     let mut manifest = expected_manifest(&repo_path)?;

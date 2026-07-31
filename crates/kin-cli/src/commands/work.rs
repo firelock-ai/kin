@@ -69,8 +69,7 @@ pub struct WorkExecution {
 }
 
 async fn run_daemon_work(request: &WorkRequest) -> Result<WorkResponse> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())

@@ -21,8 +21,7 @@ pub struct ApprovalsResponse {
 
 /// `kin approvals <change-id>` — Show approvals for a specific change.
 pub async fn show(change_id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_approvals_response(
         run_daemon_approvals(&layout, &ApprovalsRequest::Show { change_id }).await?,
     )
@@ -30,8 +29,7 @@ pub async fn show(change_id: String) -> Result<()> {
 
 /// `kin approvals list` — Show all actors and their delegation counts.
 pub async fn list() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     print_approvals_response(run_daemon_approvals(&layout, &ApprovalsRequest::List).await?)
 }
 

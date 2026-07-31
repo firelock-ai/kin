@@ -263,8 +263,7 @@ pub async fn run(
     show_body: bool,
     body_limit: Option<usize>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let _scope = announce_active_scope(&layout, "search").await?;
 
@@ -299,8 +298,7 @@ pub async fn run_json(
     _show_body: bool,
     _body_limit: Option<usize>,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let _scope = announce_active_scope(&layout, "search").await?;
 
@@ -372,8 +370,7 @@ async fn run_semantic_daemon(
     language: Option<String>,
     limit: usize,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "search --semantic").await?;
     let response = run_daemon_search(
         &layout,
@@ -397,8 +394,7 @@ async fn run_semantic_daemon_json(
     language: Option<String>,
     limit: usize,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "search --semantic --json").await?;
     let response = run_daemon_search(
         &layout,

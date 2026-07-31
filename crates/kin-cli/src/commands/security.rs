@@ -29,8 +29,7 @@ pub struct SecurityResponse {
 /// When `--propagate` is set, additionally traces transitive dependency
 /// chains for each finding to surface downstream vulnerability propagation.
 pub async fn run_with_options(propagate: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_security(&layout, &SecurityRequest { propagate }).await?;
     for line in response.lines {
         println!("{line}");

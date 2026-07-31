@@ -87,8 +87,7 @@ pub fn inspect_support_graph(
 }
 
 pub async fn run(json: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let report = run_daemon_support(&layout).await?;
 

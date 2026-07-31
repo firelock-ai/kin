@@ -369,8 +369,7 @@ pub(crate) fn ensure_git_remote(working_dir: &Path, name: &str, url: Option<&str
 }
 
 pub async fn list() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
     if config.remote.refs.is_empty() {
@@ -420,8 +419,7 @@ pub async fn add(
     publish_proofs: bool,
     default: bool,
 ) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let host = RemoteHostKind::from_str(&host).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown remote host '{}'; expected github, gitlab, bitbucket, or kinlab",
@@ -526,8 +524,7 @@ pub async fn lease(
 }
 
 pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<PushPlanContext> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
 

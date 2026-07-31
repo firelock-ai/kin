@@ -168,8 +168,7 @@ pub fn inspect(
 }
 
 pub fn run(count: usize, json: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let report = inspect(&binding, count)?;
     if json {

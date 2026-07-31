@@ -6,8 +6,7 @@ use std::fs;
 use anyhow::Result;
 
 pub async fn create(intent: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let spec = kin_model::Spec {
         id: kin_model::SpecId::new(),
@@ -35,8 +34,7 @@ pub async fn create(intent: String) -> Result<()> {
 }
 
 pub async fn list() -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let specs_dir = layout.root().join("specs");
     if !specs_dir.exists() {
@@ -66,8 +64,7 @@ pub async fn list() -> Result<()> {
 }
 
 pub async fn show(id: String) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let specs_dir = layout.root().join("specs");
     let spec_file = specs_dir.join(format!("{}.json", id));

@@ -615,8 +615,7 @@ fn summarize(
 }
 
 pub fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let report = inspect(&binding, base.as_deref(), head.as_deref())?;
     if json {

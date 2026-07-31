@@ -68,8 +68,7 @@ fn truncate(value: &str, width: usize) -> String {
 }
 
 pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_history(&layout, &HistoryRequest { entity, reference }).await?;
     for line in response.lines {
         println!("{}", crate::output_style::paint_history_line(&line));

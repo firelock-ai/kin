@@ -213,8 +213,7 @@ pub async fn run(
         rebuild = rebuild
     )
     .entered();
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
 
     if let Some(seconds) = max_seconds {
         let response = run_daemon_embed(

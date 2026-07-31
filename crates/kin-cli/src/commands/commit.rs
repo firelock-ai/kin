@@ -4,11 +4,7 @@
 use anyhow::{Context, Result};
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?).ok_or_else(|| {
-        anyhow::anyhow!(
-            "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
-        )
-    })?;
+    let layout = crate::commands::require_repository_layout()?;
 
     let result = run_daemon_commit(&layout, &message).await?;
     if !quiet {

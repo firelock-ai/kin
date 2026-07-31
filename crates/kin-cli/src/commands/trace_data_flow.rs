@@ -155,8 +155,7 @@ pub async fn run_seeded(
         direction,
         limit_per_step,
     };
-    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())

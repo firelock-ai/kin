@@ -42,8 +42,7 @@ pub fn persist_locate_cursor(next_cursor: Option<&str>) {
 /// absent: a `--next` with no prior page is a user error, not a silent empty.
 pub fn read_persisted_locate_cursor() -> Result<String> {
     let cwd = std::env::current_dir()?;
-    let layout = kin_core::KinLayout::discover(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let layout = crate::commands::require_repository_layout_at(&cwd)?;
     let path = locate_cursor_path(&layout);
     let cursor = std::fs::read_to_string(&path).map_err(|_| {
         anyhow::anyhow!(
