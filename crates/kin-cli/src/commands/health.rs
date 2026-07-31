@@ -16,6 +16,7 @@ use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
     check_binary_in_path, detect_shell, hook_filename, kin_dir, shell_rc, shim_filename,
 };
+use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
 /// Outcome of a single probed health check.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -143,6 +144,7 @@ pub async fn run_health_checks() -> HealthReport {
     let mut checks = vec![
         check_kin_binary(),
         check_kin_daemon_binary(),
+        check_supervisor_startup_protocol(),
         check_daemon_running().await,
         check_vfs_projection(),
         check_repo_init(),
@@ -348,6 +350,144 @@ fn check_kin_daemon_binary() -> HealthCheck {
         )
         .with_manual_fix("reinstall Kin so kin-daemon is installed alongside kin"),
     }
+}
+
+/// One installed kin other than the running binary, with its probed verdict on
+/// the supervisor startup protocol.
+#[derive(Debug, Clone)]
+struct InstalledKin {
+    path: PathBuf,
+    protocol: InstalledStartupProtocol,
+}
+
+/// Report an installed kin that cannot start a supervisor against the on-disk
+/// startup sentinel because it predates the current startup protocol.
+///
+/// This is the diagnosis a stuck operator never gets from the stuck binary
+/// itself: a pre-v2 kin meeting the v2 sentinel sleeps to its startup deadline
+/// and then blames lock contention. The running binary can see both halves, the
+/// sentinel on disk and the other install's own protocol answer, so it is the
+/// surface that can name binary age as the cause.
+///
+/// Severity follows one rule: a state blocks readiness exactly when it stops
+/// the binary running this check from starting a supervisor. A pre-v2 *other*
+/// install is `Stale`, because another install's age does not stop this one. The
+/// two sentinel shapes `ensure_supervisor_startup_namespace` refuses on are
+/// `Misconfigured`: a legacy marker file, and a symlink or reparse point the
+/// protocol will not follow. Metadata that simply cannot be read proves nothing
+/// either way and stays advisory.
+fn supervisor_startup_protocol_check(
+    sentinel: SupervisorStartupSentinel,
+    sentinel_path: &Path,
+    installed: &[InstalledKin],
+) -> HealthCheck {
+    let protocol = crate::daemon_client::supervisor_startup_protocol();
+    let update = format!("update kin: {}", crate::daemon_client::KIN_INSTALL_COMMAND);
+    let sentinel_path = sentinel_path.display();
+
+    match sentinel {
+        SupervisorStartupSentinel::LegacyMarker => HealthCheck::new(
+            "supervisor_startup_protocol",
+            "Supervisor protocol",
+            HealthStatus::Misconfigured,
+            format!(
+                "{sentinel_path} is a protocol-v1 marker file, which only a kin older than \
+                 startup protocol v{protocol} creates; this binary refuses to start a supervisor \
+                 against it"
+            ),
+        )
+        .with_manual_fix(update),
+        SupervisorStartupSentinel::RefusedLink => HealthCheck::new(
+            "supervisor_startup_protocol",
+            "Supervisor protocol",
+            HealthStatus::Misconfigured,
+            format!(
+                "{sentinel_path} is a symlink rather than a directory; startup protocol \
+                 v{protocol} refuses to follow one, so this binary cannot start a supervisor at \
+                 all while it is there"
+            ),
+        )
+        .with_manual_fix(
+            "remove the link at the supervisor startup sentinel path; kin recreates it as an \
+             ordinary directory",
+        ),
+        SupervisorStartupSentinel::Unreadable => HealthCheck::new(
+            "supervisor_startup_protocol",
+            "Supervisor protocol",
+            HealthStatus::Stale,
+            format!("{sentinel_path} exists but its metadata could not be read"),
+        )
+        .with_manual_fix(
+            "inspect the supervisor startup sentinel; it must be an ordinary directory",
+        ),
+        SupervisorStartupSentinel::Absent => HealthCheck::new(
+            "supervisor_startup_protocol",
+            "Supervisor protocol",
+            HealthStatus::Healthy,
+            format!("startup protocol v{protocol}; no sentinel written yet"),
+        ),
+        SupervisorStartupSentinel::ProtocolDirectory => {
+            let outdated: Vec<String> = installed
+                .iter()
+                .filter_map(|kin| match &kin.protocol {
+                    InstalledStartupProtocol::Predates(reason) => {
+                        Some(format!("{} ({reason})", kin.path.display()))
+                    }
+                    InstalledStartupProtocol::Current
+                    | InstalledStartupProtocol::Undetermined(_) => None,
+                })
+                .collect();
+            if outdated.is_empty() {
+                return HealthCheck::new(
+                    "supervisor_startup_protocol",
+                    "Supervisor protocol",
+                    HealthStatus::Healthy,
+                    format!("startup protocol v{protocol}; {sentinel_path} matches it"),
+                );
+            }
+            let detail = outdated.join(", ");
+            HealthCheck::new(
+                "supervisor_startup_protocol",
+                "Supervisor protocol",
+                HealthStatus::Stale,
+                format!(
+                    "your installed kin predates the current supervisor protocol: {detail}. \
+                     While {sentinel_path} exists, that binary cannot start a supervisor and \
+                     waits out its full startup deadline in silence before reporting a lock \
+                     timeout that names contention it is not hitting"
+                ),
+            )
+            .with_manual_fix(update)
+        }
+    }
+}
+
+fn check_supervisor_startup_protocol() -> HealthCheck {
+    let sentinel = crate::daemon_client::supervisor_startup_sentinel();
+    let sentinel_path = crate::daemon_client::supervisor_startup_sentinel_path();
+    // Enumerating and probing installs is boundary IO and belongs to
+    // daemon_client. The probe is requested only in the state whose answer can
+    // change the verdict, but that state is the steady one for every current
+    // user, so this runs on essentially every invocation rather than rarely.
+    // What keeps it acceptable is its bound, not its frequency: at most two
+    // deduped candidates, each capped by the daemon probe timeout.
+    //
+    // Never under test. This runs inside the unit suite through
+    // `run_health_checks`, where spawning the host's installed kin-daemon would
+    // make a unit test depend on whatever is installed on the machine and add
+    // subprocesses to a thousand-test parallel run. The verdict logic is
+    // exercised directly against constructed inputs instead.
+    let probe_installs =
+        matches!(sentinel, SupervisorStartupSentinel::ProtocolDirectory) && !cfg!(test);
+    let installed: Vec<InstalledKin> = if probe_installs {
+        crate::daemon_client::installed_kin_startup_protocols()
+            .into_iter()
+            .map(|(path, protocol)| InstalledKin { path, protocol })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    supervisor_startup_protocol_check(sentinel, &sentinel_path, &installed)
 }
 
 /// Probe whether the daemon is actually *running* (reachable) for the current
@@ -1850,6 +1990,178 @@ mod tests {
         )
         .unwrap();
         assert!(evaluate_codex_binding_for(&path, &expected).is_some());
+    }
+
+    fn installed_kin(path: &str, protocol: InstalledStartupProtocol) -> InstalledKin {
+        InstalledKin {
+            path: PathBuf::from(path),
+            protocol,
+        }
+    }
+
+    /// The doctor is the surface that can name binary age, because the stuck
+    /// binary blames lock contention instead. It must say so only when an
+    /// install actually answers that it predates the protocol.
+    #[test]
+    fn doctor_names_binary_age_when_an_install_predates_the_startup_protocol() {
+        let sentinel = PathBuf::from("/home/dev/.kin/supervisor.start.lock");
+        let outdated = installed_kin(
+            "/usr/local/bin/kin",
+            InstalledStartupProtocol::Predates(
+                "it reports compat schema kin.daemon.compat.v1 and no supervisor startup protocol \
+                 at all"
+                    .to_string(),
+            ),
+        );
+
+        let check = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::ProtocolDirectory,
+            &sentinel,
+            std::slice::from_ref(&outdated),
+        );
+        assert_eq!(check.id, "supervisor_startup_protocol");
+        assert!(matches!(check.status, HealthStatus::Stale), "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("your installed kin predates the current supervisor protocol")
+                && check.detail.contains("/usr/local/bin/kin")
+                && check.detail.contains("kin.daemon.compat.v1"),
+            "the diagnosis must name the binary and the evidence: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains(crate::daemon_client::KIN_INSTALL_COMMAND)),
+            "the remedy must be the exact install command: {:?}",
+            check.manual_fix
+        );
+        assert!(
+            !blocks_readiness(&check),
+            "another install's age does not stop this binary from working, so it must not flip \
+             the report's readiness"
+        );
+    }
+
+    #[test]
+    fn doctor_stays_quiet_when_no_install_answers_that_it_predates_the_protocol() {
+        let sentinel = PathBuf::from("/home/dev/.kin/supervisor.start.lock");
+        for installed in [
+            vec![],
+            vec![installed_kin(
+                "/usr/local/bin/kin",
+                InstalledStartupProtocol::Current,
+            )],
+            vec![installed_kin(
+                "/usr/local/bin/kin",
+                InstalledStartupProtocol::Undetermined("no kin-daemon beside it".to_string()),
+            )],
+        ] {
+            let check = supervisor_startup_protocol_check(
+                SupervisorStartupSentinel::ProtocolDirectory,
+                &sentinel,
+                &installed,
+            );
+            assert!(
+                matches!(check.status, HealthStatus::Healthy),
+                "an unanswered probe is not evidence of age: {check:?}"
+            );
+        }
+
+        let absent = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::Absent,
+            &sentinel,
+            &[installed_kin(
+                "/usr/local/bin/kin",
+                InstalledStartupProtocol::Predates("older".to_string()),
+            )],
+        );
+        assert!(
+            matches!(absent.status, HealthStatus::Healthy),
+            "with no sentinel written there is nothing for an older binary to stall on: {absent:?}"
+        );
+    }
+
+    /// A legacy marker file is different in kind: the running binary refuses to
+    /// start a supervisor at all against one, so it blocks readiness.
+    #[test]
+    fn doctor_treats_a_legacy_marker_as_blocking_and_names_the_update() {
+        let sentinel = PathBuf::from("/home/dev/.kin/supervisor.start.lock");
+        let check = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::LegacyMarker,
+            &sentinel,
+            &[],
+        );
+        assert!(
+            matches!(check.status, HealthStatus::Misconfigured),
+            "{check:?}"
+        );
+        assert!(blocks_readiness(&check));
+        assert!(check.detail.contains("protocol-v1 marker file"));
+        assert!(check
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains(crate::daemon_client::KIN_INSTALL_COMMAND)));
+    }
+
+    /// A link at the sentinel path is a hard block in fact: startup refuses to
+    /// follow one, so a report that stayed healthy would print "first-run
+    /// ready" on a host where no supervisor can start. The two contrasts are
+    /// the point of the severity rule, so they are asserted beside it:
+    /// unreadable metadata proves nothing, and a pre-v2 sibling install does
+    /// not stop the binary running the check.
+    #[test]
+    fn doctor_blocks_on_a_refused_link_but_not_on_states_that_do_not_stop_this_binary() {
+        let sentinel = PathBuf::from("/home/dev/.kin/supervisor.start.lock");
+
+        let linked = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::RefusedLink,
+            &sentinel,
+            &[],
+        );
+        assert!(
+            matches!(linked.status, HealthStatus::Misconfigured),
+            "a sentinel startup refuses to follow blocks readiness in fact: {linked:?}"
+        );
+        assert!(
+            blocks_readiness(&linked),
+            "doctor must not report readiness on a host where no supervisor can start"
+        );
+        assert!(
+            linked.detail.contains("symlink")
+                && linked.detail.contains("cannot start a supervisor"),
+            "the detail must name the actual refusal, not just an odd file type: {}",
+            linked.detail
+        );
+        assert!(linked.manual_fix.is_some(), "{linked:?}");
+
+        let unreadable = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::Unreadable,
+            &sentinel,
+            &[],
+        );
+        assert!(
+            !blocks_readiness(&unreadable),
+            "metadata that cannot be read proves nothing either way: {unreadable:?}"
+        );
+
+        let sibling = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::ProtocolDirectory,
+            &sentinel,
+            &[installed_kin(
+                "/usr/local/bin/kin",
+                InstalledStartupProtocol::Predates(
+                    "no supervisor startup protocol at all".to_string(),
+                ),
+            )],
+        );
+        assert!(
+            !blocks_readiness(&sibling),
+            "another install's age does not stop this binary, so it must not share the blocking \
+             severity: {sibling:?}"
+        );
     }
 
     #[test]
