@@ -2326,6 +2326,159 @@ mod platform_materialization_tests {
         }
     }
 
+    /// Drive `prove_tracked_entry` directly with a chosen materialization.
+    ///
+    /// `worktree_materialization` never returns the Windows shapes on Unix, so
+    /// the cases below would otherwise only be compiled here and never run. The
+    /// walk state is small enough to build outright, which lets both platforms
+    /// execute the same comparison logic against a real store and real files.
+    fn prove_one_entry(
+        absolute: &std::path::Path,
+        entry: TreeEntry,
+        blob_store: &BlobStore,
+        executable_authority: ExecutableModeAuthority,
+        symlink_materialization: SymlinkMaterialization,
+    ) -> Result<()> {
+        let path = RepoPath::from_bytes(b"tracked".to_vec()).expect("repo path");
+        let expected = ExpectedIndexEntry {
+            mode: match entry {
+                TreeEntry::Blob {
+                    executable: true, ..
+                } => gix::index::entry::Mode::FILE_EXECUTABLE,
+                TreeEntry::Blob { .. } => gix::index::entry::Mode::FILE,
+                TreeEntry::Symlink { .. } => gix::index::entry::Mode::SYMLINK,
+                TreeEntry::Gitlink { .. } => gix::index::entry::Mode::COMMIT,
+            },
+            oid: GitObjectId::sha1([0; 20]),
+            tree_entry: entry,
+        };
+        let mut expected_entries = BTreeMap::new();
+        expected_entries.insert(path.clone(), expected);
+        let mut state = WorktreeWalk {
+            expected: &expected_entries,
+            blob_store,
+            seen: BTreeSet::new(),
+            tracked_hash: FramedHash::new(b"kin.git.preflight.worktree.test"),
+            gitlink_count: 0,
+            host_unrepresentable_count: 0,
+            ignored: Vec::new(),
+            executable_authority,
+            symlink_materialization,
+        };
+        let metadata = fs::symlink_metadata(absolute).expect("entry metadata");
+        prove_tracked_entry(absolute, &path, &metadata, expected, &mut state)
+    }
+
+    #[test]
+    fn a_link_target_written_as_a_regular_file_proves_against_the_committed_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let blob_store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let target_blob = blob_store.write(b"src/main.rs").expect("target blob");
+
+        let tracked = temp.path().join("tracked");
+        fs::write(&tracked, b"src/main.rs").expect("target text file");
+        prove_one_entry(
+            &tracked,
+            TreeEntry::Symlink { target_blob },
+            &blob_store,
+            ExecutableModeAuthority::IndexMode,
+            SymlinkMaterialization::TargetTextFile,
+        )
+        .expect("the target text file matches the committed target");
+
+        fs::write(&tracked, b"src/other.rs").expect("rewrite target text file");
+        let error = prove_one_entry(
+            &tracked,
+            TreeEntry::Symlink { target_blob },
+            &blob_store,
+            ExecutableModeAuthority::IndexMode,
+            SymlinkMaterialization::TargetTextFile,
+        )
+        .expect_err("a different target is not the committed one");
+        assert!(
+            error
+                .to_string()
+                .contains("target differs from the committed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_real_link_where_links_are_off_is_refused_rather_than_read_through() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let blob_store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let target_blob = blob_store.write(b"src/main.rs").expect("target blob");
+
+        let tracked = temp.path().join("tracked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("src/main.rs", &tracked).expect("symlink");
+        #[cfg(windows)]
+        {
+            // Requires the symlink privilege; without it there is nothing to
+            // build the case out of, and the refusal cannot arise either.
+            if std::os::windows::fs::symlink_file("src/main.rs", &tracked).is_err() {
+                return;
+            }
+        }
+
+        let error = prove_one_entry(
+            &tracked,
+            TreeEntry::Symlink { target_blob },
+            &blob_store,
+            ExecutableModeAuthority::IndexMode,
+            SymlinkMaterialization::TargetTextFile,
+        )
+        .expect_err("a real link contradicts core.symlinks=off");
+        assert!(
+            error.to_string().contains("core.symlinks is off"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_index_mode_authority_does_not_reread_the_worktree_for_the_executable_bit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let blob_store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let hash = blob_store.write(b"#!/bin/sh\nexit 0\n").expect("blob");
+
+        let tracked = temp.path().join("tracked");
+        fs::write(&tracked, b"#!/bin/sh\nexit 0\n").expect("tracked file");
+
+        // The file carries no executable bit anywhere, yet the committed tree
+        // says it is executable. Under index authority the index proof already
+        // settled that, so admission proceeds; under worktree authority the
+        // same file must be refused.
+        prove_one_entry(
+            &tracked,
+            TreeEntry::Blob {
+                hash,
+                executable: true,
+            },
+            &blob_store,
+            ExecutableModeAuthority::IndexMode,
+            SymlinkMaterialization::TargetTextFile,
+        )
+        .expect("the index carries the exact mode");
+
+        let error = prove_one_entry(
+            &tracked,
+            TreeEntry::Blob {
+                hash,
+                executable: true,
+            },
+            &blob_store,
+            ExecutableModeAuthority::WorktreeMode,
+            SymlinkMaterialization::Link,
+        )
+        .expect_err("a worktree authority must still compare the filesystem");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("different executable mode")
+                || rendered.contains("records no executable bit"),
+            "unexpected error: {rendered}"
+        );
+    }
+
     #[test]
     fn hook_executability_reports_what_the_filesystem_records() {
         let temp = tempfile::tempdir().expect("tempdir");
