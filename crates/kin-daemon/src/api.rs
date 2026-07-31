@@ -12038,6 +12038,10 @@ mod tests {
     /// makes the failure recoverable: the replica exists, holds the adopted
     /// identity, and is what a later `kin pull` resumes into once the transfer
     /// seam can bootstrap a Git baseline.
+    ///
+    /// Unix-only because `run_test_git` is: the Git fixture helper this needs
+    /// is itself gated, and the Windows job runs no kin-daemon library test, so
+    /// un-gating would add no Windows coverage.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_git_admitted_remote_refuses_the_history_half_of_a_clone() {
@@ -12100,6 +12104,124 @@ mod tests {
         assert_eq!(manifest.repo_id, peer_repository_id.to_string());
 
         std::fs::remove_dir_all(&peer_working).ok();
+    }
+
+    /// Serve one hand-written ref advertisement on a real socket.
+    ///
+    /// A hostile peer is not a daemon that malfunctions; it is a host that
+    /// answers correctly-shaped envelopes with contents of its choosing. The
+    /// only way to put one on the other end of the real transport is to serve
+    /// the answer directly, so this serves exactly the advertisement route and
+    /// nothing else: a negotiation that gets past it would be the defect.
+    async fn serve_advertisement(
+        advertisement: kin_remote::repository_transfer::RepositoryRefAdvertisement,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/repos/{repo_id}/transfer/advertise",
+            get(move || {
+                let advertisement = advertisement.clone();
+                async move { Json(advertisement) }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The identity refusal has to hold over the real transport, not only at
+    /// the unit seam where a fake peer lies in-process.
+    ///
+    /// A peer that answers for a repository it does not serve is the case the
+    /// whole adoption path exists to survive: adopting on the peer's word would
+    /// point a clone at a repository nobody asked for, and every later transfer
+    /// would then be identity-exact against the wrong identity. The
+    /// advertisement served here is the honest peer's own, altered in the one
+    /// field, so nothing but the identity can be what refuses it.
+    #[tokio::test]
+    async fn a_peer_advertising_a_repository_it_does_not_serve_is_refused_over_http() {
+        let peer = native_clone_peer().await;
+        let requested = peer.repository_id.clone();
+        let foreign = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+
+        let honest_endpoint = clone_endpoint(&peer.url);
+        let honest_requested = requested.clone();
+        let mut advertisement = tokio::task::spawn_blocking(move || {
+            use kin_remote::repository_transfer_negotiation::RepositoryTransferTransport as _;
+            kin_remote::repository_transfer_http::HttpRepositoryTransferTransport::new(
+                honest_endpoint,
+            )
+            .advertise_refs(&honest_requested)
+        })
+        .await
+        .unwrap()
+        .expect("the honest peer advertises its own repository");
+        advertisement.repository_id = foreign.clone();
+
+        let hostile_url = serve_advertisement(advertisement).await;
+        let destination = tempfile::tempdir().unwrap();
+
+        let error = crate::replica_adoption::clone_native_replica(
+            destination.path(),
+            clone_endpoint(&hostile_url),
+            &requested,
+        )
+        .await
+        .expect_err("a peer answering for another repository is never adopted");
+
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                crate::replica_adoption::NativeCloneError::Identity(_)
+            ),
+            "{message}"
+        );
+        assert!(message.contains(foreign.as_str()), "{message}");
+        assert!(message.contains(requested.as_str()), "{message}");
+        assert!(
+            !destination.path().join(".kin").exists(),
+            "negotiation runs before anything is created, so a refused clone leaves no replica"
+        );
+    }
+
+    /// The other half of a refused negotiation, and the likelier one in
+    /// practice: a peer that simply does not serve the repository asked for.
+    /// Nothing is created either way, which is what makes a mistyped clone safe
+    /// to retry against a corrected address.
+    ///
+    /// The refusal reports the peer's own 404 rather than naming the repository
+    /// that was asked for, because the transport maps a status code without
+    /// carrying the request's identity into the message.
+    #[tokio::test]
+    async fn a_clone_of_a_repository_the_peer_does_not_serve_creates_nothing() {
+        let peer = native_clone_peer().await;
+        let absent = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let error = crate::replica_adoption::clone_native_replica(
+            destination.path(),
+            clone_endpoint(&peer.url),
+            &absent,
+        )
+        .await
+        .expect_err("a peer that does not serve the repository cannot be cloned from");
+
+        let message = error.to_string();
+        assert!(
+            matches!(
+                error,
+                crate::replica_adoption::NativeCloneError::Identity(_)
+            ),
+            "{message}"
+        );
+        assert!(message.contains("HTTP 404"), "{message}");
+        assert!(
+            !destination.path().join(".kin").exists(),
+            "a negotiation the peer refused creates no replica"
+        );
     }
 
     fn pull_request(
