@@ -24,15 +24,17 @@
 use std::collections::{HashMap, HashSet};
 
 use kin_db::{RepositoryAuthorityManager, StorageBackend};
-use kin_model::{AuthorId, RefName, RepositoryId, SemanticChange, SemanticChangeId};
+use kin_model::{AuthorId, RefName, RepositoryId, RootBundle, SemanticChange, SemanticChangeId};
 use serde::{Deserialize, Serialize};
 
 use crate::repository_transfer::{
     apply_repository_transfer_pack, build_repository_transfer_segment,
-    count_repository_transfer_packs, repository_transfer_status, verify_transfer_source_readiness,
-    RepositoryRefAdvertisement, RepositoryTransferError, RepositoryTransferExpectation,
-    RepositoryTransferPack, RepositoryTransferReceipt, RepositoryTransferStatus, Result,
-    REPOSITORY_TRANSFER_PROTOCOL, REPOSITORY_TRANSFER_SCHEMA_VERSION,
+    count_repository_transfer_packs, model, repository_transfer_status,
+    require_negotiated_features, validate_limits, verify_transfer_source_readiness,
+    RepositoryAuthorityMetadata, RepositoryRefAdvertisement, RepositoryTransferError,
+    RepositoryTransferExpectation, RepositoryTransferPack, RepositoryTransferReceipt,
+    RepositoryTransferStatus, Result, REPOSITORY_TRANSFER_PROTOCOL,
+    REPOSITORY_TRANSFER_SCHEMA_VERSION,
 };
 
 fn invalid(message: impl Into<String>) -> RepositoryTransferError {
@@ -293,6 +295,30 @@ pub fn remote_default_ref<T>(transport: &T, repository_id: &RepositoryId) -> Res
 where
     T: RepositoryTransferTransport + ?Sized,
 {
+    read_ref_advertisement(transport, repository_id)?
+        .default_ref
+        .ok_or_else(|| {
+            invalid(format!(
+                "remote publishes no default ref for {repository_id}; name one explicitly"
+            ))
+        })
+}
+
+/// Read one ref advertisement and refuse a peer that is not speaking this
+/// protocol, or is answering for another repository.
+///
+/// These two checks are the floor every advertisement reader shares. Anything
+/// stricter belongs to the caller: [`remote_default_ref`] runs on a replica
+/// that already holds this repository's authority, while
+/// [`negotiate_replica_identity`] runs before any local authority exists and so
+/// has to validate what a fresh replica is about to be built from.
+fn read_ref_advertisement<T>(
+    transport: &T,
+    repository_id: &RepositoryId,
+) -> Result<RepositoryRefAdvertisement>
+where
+    T: RepositoryTransferTransport + ?Sized,
+{
     let advertisement = transport.advertise_refs(repository_id)?;
     require_protocol(
         advertisement.schema_version,
@@ -304,11 +330,170 @@ where
         &advertisement.repository_id,
         "ref advertisement",
     )?;
-    advertisement.default_ref.ok_or_else(|| {
+    Ok(advertisement)
+}
+
+/// The identity and starting layout a fresh replica adopts from a peer.
+///
+/// A replica that mints its own repository identity can never exchange history
+/// with the repository it was cloned from: the ref advertisement, the transfer
+/// expectation, and pack admission each refuse an identity other than the one
+/// the receiving authority records. So a clone has to learn identity before it
+/// has any authority of its own, and the advertisement is the only surface that
+/// answers before history moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteReplicaIdentity {
+    /// The identity the new replica adopts verbatim.
+    pub repository_id: RepositoryId,
+    /// The ref the replica is created against, so it reproduces the remote's
+    /// layout instead of synthesizing a ref the remote does not publish.
+    pub default_ref: RefName,
+    /// The exact change the default ref resolved to when the advertisement was
+    /// read, or `None` for a remote whose default ref is unborn.
+    ///
+    /// This is a statement about the advertisement, not a reservation: the
+    /// remote may move before any history is admitted. Adoption is verified
+    /// against local history reaching this head, never against it still being
+    /// the remote head.
+    pub default_ref_head: Option<SemanticChangeId>,
+    /// The remote's authority roots as advertised, carried so a caller can
+    /// record what identity was adopted against.
+    pub roots: RootBundle,
+}
+
+/// Learn, over the native transport, the identity a fresh replica should adopt.
+///
+/// The peer is asked about one repository and must answer for that repository:
+/// an advertisement naming a different identity is refused rather than adopted,
+/// because adopting it would silently point a clone at a repository nobody
+/// asked for. The envelope is validated as strictly as a transfer's is, since a
+/// replica created from an advertisement this build cannot transfer against
+/// would be born unable to pull.
+///
+/// This proves nothing about history on its own. It reads one envelope the peer
+/// wrote, which is why [`verify_adopted_replica_identity`] exists and why an
+/// adoption is not complete until history has been admitted under the adopted
+/// identity.
+pub fn negotiate_replica_identity<T>(
+    transport: &T,
+    repository_id: &RepositoryId,
+) -> Result<RemoteReplicaIdentity>
+where
+    T: RepositoryTransferTransport + ?Sized,
+{
+    let advertisement = read_ref_advertisement(transport, repository_id)?;
+    advertisement.roots.validate().map_err(model)?;
+    validate_limits(&advertisement.limits)?;
+    require_negotiated_features(&advertisement.supported_features)?;
+
+    let default_ref = advertisement.default_ref.clone().ok_or_else(|| {
         invalid(format!(
-            "remote publishes no default ref for {repository_id}; name one explicitly"
+            "remote publishes no default ref for {repository_id}, so a replica has no ref to \
+             adopt; a repository that has admitted nothing still publishes the ref its history \
+             will land on"
         ))
+    })?;
+    let default_ref_head = advertisement
+        .refs
+        .iter()
+        .find(|entry| entry.name == default_ref)
+        .map(|entry| entry.head);
+
+    Ok(RemoteReplicaIdentity {
+        repository_id: advertisement.repository_id,
+        default_ref,
+        default_ref_head,
+        roots: advertisement.roots,
     })
+}
+
+/// Prove an adopted identity against the authority a replica actually
+/// committed, after the remote's history has been admitted into it.
+///
+/// Writing an identity into a manifest establishes nothing: it is one local
+/// file naming what a peer claimed. What makes the adoption real is that the
+/// remote's history admitted cleanly under it, and every step of that admission
+/// is identity-exact. The pack declares a repository and [`validate_pack`]
+/// refuses one whose replicated alias records name a different repository than
+/// the pack header, so a peer serving repository A cannot export Git-origin
+/// history as repository B. `apply_repository_transfer_pack` then refuses a
+/// pack whose repository is not the one the receiving authority records.
+///
+/// What is left, and what this checks, is that the replica ended where it
+/// claims: the committed authority records the adopted identity, the receipts
+/// bind it, and this replica's own history reaches the head the identity
+/// advertisement published. That last check is the one that separates a replica
+/// that adopted an identity from one that merely wrote it down.
+///
+/// The advertised head is required to be reachable, not to be the current head.
+/// A remote that moved between the advertisement and the transfer is ordinary,
+/// and the replica has still admitted the history it was told about.
+///
+/// This does not claim the identity is cryptographically bound to the changes.
+/// A semantic change id is a hash of the change alone and carries no repository
+/// identity, so natively authored history with no external alias records is
+/// bound to a repository only by the authority records that carry it.
+pub fn verify_adopted_replica_identity<B>(
+    local: &RepositoryAuthorityManager<B>,
+    adopted: &RepositoryId,
+    identity: &RemoteReplicaIdentity,
+    outcome: &RepositoryTransferOutcome,
+) -> Result<()>
+where
+    B: StorageBackend + ?Sized + 'static,
+{
+    if &identity.repository_id != adopted {
+        return Err(invalid(format!(
+            "replica adopted repository {adopted} but the remote identity names {}",
+            identity.repository_id
+        )));
+    }
+    if &outcome.repository_id != adopted {
+        return Err(invalid(format!(
+            "transfer ran against repository {} on a replica that adopted {adopted}",
+            outcome.repository_id
+        )));
+    }
+    for receipt in &outcome.receipts {
+        if &receipt.repository_id != adopted {
+            return Err(conflict(format!(
+                "a transfer receipt binds repository {} on a replica that adopted {adopted}",
+                receipt.repository_id
+            )));
+        }
+    }
+
+    let lease = local.read_authority();
+    let committed = lease.committed_authority_metadata().ok_or_else(|| {
+        conflict(format!(
+            "this replica's authority carries no repository envelope, so nothing records it \
+             adopting {adopted}"
+        ))
+    })?;
+    if &committed.repository_id != adopted {
+        return Err(conflict(format!(
+            "this replica committed its authority under repository {}, not the adopted {adopted}",
+            committed.repository_id
+        )));
+    }
+
+    let Some(advertised_head) = identity.default_ref_head else {
+        return Ok(());
+    };
+    let local_head = lease
+        .resolve_ref_target(&identity.default_ref)
+        .map_err(storage)?
+        .map(|target| lease.resolve_target_change_id(&target).map_err(storage))
+        .transpose()?;
+    match classify_local_ancestry(&lease.snapshot().changes, local_head, advertised_head)? {
+        LocalAncestry::Same | LocalAncestry::Ancestor { .. } => Ok(()),
+        LocalAncestry::Unreachable => Err(conflict(format!(
+            "this replica adopted repository {adopted} but has not admitted {advertised_head}, \
+             the head that identity advertised on {}. Adopting an identity does not import \
+             history; the transfer that would have is what did not complete",
+            identity.default_ref
+        ))),
+    }
 }
 
 /// Read the remote's exact lease for one destination ref, refusing a peer that
@@ -943,6 +1128,9 @@ mod tests {
         /// a step that is unsplittable on a non-change bound is exercised on a
         /// history a test can build.
         advertised_max_trees: Option<u32>,
+        /// Publish no default ref, to prove a clone refuses rather than
+        /// synthesizing a ref the remote does not publish.
+        strip_default_ref: bool,
         exported: RefCell<usize>,
         received: RefCell<usize>,
     }
@@ -957,6 +1145,7 @@ mod tests {
                 claimed_destination_ref: None,
                 advertised_max_changes: None,
                 advertised_max_trees: None,
+                strip_default_ref: false,
                 exported: RefCell::new(0),
                 received: RefCell::new(0),
             }
@@ -996,6 +1185,13 @@ mod tests {
                 ..Self::new(authority)
             }
         }
+
+        fn without_default_ref(authority: &'a TestManager) -> Self {
+            Self {
+                strip_default_ref: true,
+                ..Self::new(authority)
+            }
+        }
     }
 
     impl RepositoryTransferTransport for LocalPeer<'_> {
@@ -1006,6 +1202,9 @@ mod tests {
             let mut advertisement = repository_ref_advertisement(self.authority, repository_id)?;
             if let Some(claimed) = &self.claimed_repository {
                 advertisement.repository_id = claimed.clone();
+            }
+            if self.strip_default_ref {
+                advertisement.default_ref = None;
             }
             Ok(advertisement)
         }
@@ -2271,5 +2470,333 @@ mod tests {
             classify_local_ancestry(&changes, Some(sibling_id), fixture.source_head).unwrap(),
             LocalAncestry::Unreachable
         );
+    }
+
+    /// What a fresh replica has to learn before it has any authority of its
+    /// own: whose repository this is, and which ref to be created against.
+    #[test]
+    fn replica_identity_is_read_from_the_remote_advertisement() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+
+        assert_eq!(identity.repository_id, fixture.repository_id);
+        assert_eq!(identity.default_ref, fixture.main);
+        assert_eq!(identity.default_ref_head, Some(fixture.source_head));
+        assert_eq!(&identity.roots, fixture.source.read_authority().roots());
+    }
+
+    /// A peer answering for another repository must be refused rather than
+    /// adopted: adopting it would silently point a clone at a repository
+    /// nobody asked for.
+    #[test]
+    fn a_peer_answering_for_another_repository_is_never_adopted() {
+        let fixture = fixture();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+        let peer = LocalPeer::claiming_repository(&fixture.source, other.clone());
+
+        let error = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Invalid(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// An unborn repository still publishes the ref its history will land on.
+    /// One that publishes none leaves a clone nothing to adopt, and inventing
+    /// `main` would leave a ghost ref no transfer can reconcile.
+    #[test]
+    fn a_peer_publishing_no_default_ref_leaves_a_replica_nothing_to_adopt() {
+        let fixture = fixture();
+        let peer = LocalPeer::without_default_ref(&fixture.source);
+
+        let error = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Invalid(_)),
+            "{message}"
+        );
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// A repository that has admitted nothing is a legal clone source: the
+    /// replica adopts its identity and its declared default ref, and there is
+    /// no head to reach.
+    #[test]
+    fn an_unborn_remote_advertises_an_identity_with_no_head() {
+        let fixture = fixture();
+        let unborn_dir = TempDir::new().unwrap();
+        let unborn_id = RepositoryId::new(format!("unborn-{}", Uuid::new_v4())).unwrap();
+        let unborn = manager(&unborn_dir, &unborn_id);
+        adopt_default_ref(&unborn, &unborn_id, &fixture.main);
+        let peer = LocalPeer::new(&unborn);
+
+        let identity = negotiate_replica_identity(&peer, &unborn_id).unwrap();
+
+        assert_eq!(identity.repository_id, unborn_id);
+        assert_eq!(identity.default_ref, fixture.main);
+        assert_eq!(identity.default_ref_head, None);
+
+        // Nothing to reach, so the adoption verifies on identity alone.
+        verify_adopted_replica_identity(
+            &unborn,
+            &unborn_id,
+            &identity,
+            &up_to_date_outcome(&unborn_id, &fixture.main, None),
+        )
+        .unwrap();
+    }
+
+    /// The adoption is proven by history arriving under the adopted identity,
+    /// not by the identity having been written down.
+    #[test]
+    fn an_adoption_verifies_once_the_advertised_head_is_admitted() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+
+        let outcome = pull_from_remote(
+            &fixture.destination,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            AuthorId::new("clone-identity-test"),
+        )
+        .unwrap();
+
+        verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &outcome,
+        )
+        .unwrap();
+        assert_eq!(
+            head_of(&fixture.destination, &fixture.main),
+            Some(fixture.source_head)
+        );
+    }
+
+    /// A replica that adopted an identity and admitted nothing is exactly the
+    /// state a half-finished clone leaves behind. Reporting it as an adopted
+    /// replica would claim history it does not hold.
+    #[test]
+    fn an_adoption_that_admitted_no_history_is_refused_by_name() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &up_to_date_outcome(&fixture.repository_id, &fixture.main, None),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Conflict(_)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&fixture.source_head.to_string()),
+            "{message}"
+        );
+    }
+
+    /// The committed authority is what decides, not the identity a caller
+    /// passes in. A replica whose authority records another repository has not
+    /// adopted this one, however the call was spelled.
+    #[test]
+    fn a_replica_whose_authority_records_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let other_dir = TempDir::new().unwrap();
+        let other_id = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+        let other = manager(&other_dir, &other_id);
+        adopt_default_ref(&other, &other_id, &fixture.main);
+
+        let error = verify_adopted_replica_identity(
+            &other,
+            &fixture.repository_id,
+            &identity,
+            &up_to_date_outcome(&fixture.repository_id, &fixture.main, None),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Conflict(_)),
+            "{message}"
+        );
+        assert!(message.contains(other_id.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// The identity a replica adopted and the identity a caller passes in have
+    /// to be the same repository. They disagree exactly when a caller verified
+    /// one adoption against another's advertisement, and reporting that as
+    /// verified would claim a peer said something it never said.
+    #[test]
+    fn an_identity_naming_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let mut identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+        identity.repository_id = other.clone();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &up_to_date_outcome(&fixture.repository_id, &fixture.main, None),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Invalid(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// A transfer that ran against another repository proves nothing about this
+    /// adoption, however it was reached. Accepting it would let a replica
+    /// report itself cloned on the strength of a transfer that never touched
+    /// the repository it adopted.
+    #[test]
+    fn a_transfer_that_ran_against_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &up_to_date_outcome(&other, &fixture.main, None),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Invalid(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// The receipts are what bind admitted history to the adopted identity, so
+    /// a receipt naming another repository is the one arm where the transfer
+    /// really did move history and it landed bound to something else. The
+    /// outcome here is a real pull's, mutated in one field, so nothing but the
+    /// binding can be what refuses it.
+    #[test]
+    fn a_receipt_binding_another_repository_is_refused() {
+        let fixture = fixture();
+        let peer = LocalPeer::new(&fixture.source);
+        let identity = negotiate_replica_identity(&peer, &fixture.repository_id).unwrap();
+        let mut outcome = pull_from_remote(
+            &fixture.destination,
+            &peer,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+            AuthorId::new("clone-identity-test"),
+        )
+        .unwrap();
+        let other = RepositoryId::new(format!("other-{}", Uuid::new_v4())).unwrap();
+        outcome
+            .receipts
+            .first_mut()
+            .expect("a pull that moved history returns a receipt")
+            .repository_id = other.clone();
+
+        let error = verify_adopted_replica_identity(
+            &fixture.destination,
+            &fixture.repository_id,
+            &identity,
+            &outcome,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, RepositoryTransferError::Conflict(_)),
+            "{message}"
+        );
+        assert!(message.contains(other.as_str()), "{message}");
+        assert!(
+            message.contains(fixture.repository_id.as_str()),
+            "{message}"
+        );
+    }
+
+    /// Declare a repository's default ref without publishing any history, which
+    /// is the state an unborn remote and a freshly adopted replica share.
+    fn adopt_default_ref(manager: &TestManager, repository_id: &RepositoryId, ref_name: &RefName) {
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::new_v4()),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("negotiation-fixture"),
+            reason: "adopt the default ref".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(ref_name.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
+    /// An outcome for a negotiation that moved nothing, which is what a caller
+    /// holds when the transfer half of a clone did not run.
+    fn up_to_date_outcome(
+        repository_id: &RepositoryId,
+        ref_name: &RefName,
+        head: Option<SemanticChangeId>,
+    ) -> RepositoryTransferOutcome {
+        RepositoryTransferOutcome {
+            direction: RepositoryTransferDirection::Pull,
+            repository_id: repository_id.clone(),
+            source_ref: ref_name.clone(),
+            destination_ref: ref_name.clone(),
+            plan: RepositoryTransferPlan::UpToDate { head },
+            receipts: Vec::new(),
+        }
     }
 }

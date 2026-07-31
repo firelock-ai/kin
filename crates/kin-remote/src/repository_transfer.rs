@@ -40,14 +40,30 @@ use thiserror::Error;
 /// guard an exception that a real filesystem probe could later hide behind.
 pub(crate) trait RepositoryAuthorityMetadata {
     fn authority_metadata(&self) -> &PersistedRepositoryAuthority;
+
+    /// The same state, read where the caller can refuse instead of abort.
+    ///
+    /// The envelope is a kin-db invariant rather than a local one: opening
+    /// authority refuses a persisted snapshot that carries none, constructs one
+    /// for a store that has never been written, and every commit re-sets it. So
+    /// this returns `None` only if that invariant is broken, and no test here
+    /// can produce that state.
+    ///
+    /// Adoption verification reads this anyway. It runs against a replica this
+    /// process just created, it is the one caller whose whole job is deciding
+    /// whether an adoption is recorded, and a refusal naming the replica is
+    /// strictly more useful there than a panic in the middle of a clone.
+    fn committed_authority_metadata(&self) -> Option<&PersistedRepositoryAuthority>;
 }
 
 impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
     fn authority_metadata(&self) -> &PersistedRepositoryAuthority {
-        self.snapshot()
-            .repository_authority
-            .as_ref()
+        self.committed_authority_metadata()
             .expect("repository authority lease always carries authority metadata")
+    }
+
+    fn committed_authority_metadata(&self) -> Option<&PersistedRepositoryAuthority> {
+        self.snapshot().repository_authority.as_ref()
     }
 }
 
@@ -1300,7 +1316,7 @@ fn validate_status(status: &RepositoryTransferStatus) -> Result<()> {
 /// arrive in a request body rather than from a status this process built, so
 /// an exporter checks them too rather than trusting the sender to have asked
 /// for something it can answer.
-fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
+pub(crate) fn validate_limits(limits: &RepositoryTransferLimits) -> Result<()> {
     for (label, value) in [
         ("max_changes", u64::from(limits.max_changes)),
         ("max_trees", u64::from(limits.max_trees)),
@@ -1344,7 +1360,7 @@ fn required_features() -> Vec<String> {
         .collect()
 }
 
-fn require_negotiated_features(supported: &[String]) -> Result<()> {
+pub(crate) fn require_negotiated_features(supported: &[String]) -> Result<()> {
     let supported = supported
         .iter()
         .map(String::as_str)
@@ -1674,7 +1690,7 @@ fn storage(error: impl std::fmt::Display) -> RepositoryTransferError {
     RepositoryTransferError::Storage(error.to_string())
 }
 
-fn model(error: impl std::fmt::Display) -> RepositoryTransferError {
+pub(crate) fn model(error: impl std::fmt::Display) -> RepositoryTransferError {
     invalid(error.to_string())
 }
 

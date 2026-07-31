@@ -359,7 +359,7 @@ impl Drop for PreparedRepositoryInit {
 ///
 /// Returns `KinError::AlreadyInitialized` if `.kin/` already exists.
 pub fn init(working_dir: &Path) -> Result<InitResult> {
-    init_with_config(working_dir, KinConfig::default())
+    init_with_config(working_dir, KinConfig::default(), KinManifest::new())
 }
 
 /// Initialize a repository that will adopt a remote's history over a native
@@ -379,14 +379,104 @@ pub fn init(working_dir: &Path) -> Result<InitResult> {
 /// Returns `KinError::AlreadyInitialized` if `.kin/` already exists, and fails
 /// loud if `default_branch` is not a valid ref name.
 pub fn init_replica(working_dir: &Path, default_branch: &str) -> Result<InitResult> {
-    let config = KinConfig {
-        default_branch: default_branch.to_string(),
-        ..KinConfig::default()
-    };
-    init_with_config(working_dir, config)
+    init_with_config(
+        working_dir,
+        replica_config(default_branch),
+        KinManifest::new(),
+    )
 }
 
-fn init_with_config(working_dir: &Path, config: KinConfig) -> Result<InitResult> {
+/// Initialize a replica that adopts an existing repository identity instead of
+/// minting one.
+///
+/// Two replicas can only exchange history when they are replicas of the same
+/// repository: the ref advertisement, the transfer expectation, and pack
+/// admission all refuse an identity other than the one the receiving authority
+/// records. A replica that minted its own identity is therefore unreachable
+/// from the repository it was cloned from, which is why this exists.
+///
+/// `repository_id` must be the identity the remote published over the native
+/// transport, and it is written into the manifest verbatim. The workspace
+/// identity is still minted here, because repository truth is shared between
+/// replicas and local workspace/session authority never is.
+///
+/// This admits no history. Adoption is not proven by writing the manifest; it
+/// is proven when the remote's history is admitted into this replica under the
+/// adopted identity and the committed authority is read back and agrees. See
+/// `kin_remote::repository_transfer_negotiation::verify_adopted_replica_identity`.
+///
+/// # Errors
+///
+/// Refuses a directory that already holds a Kin repository, naming the identity
+/// already there alongside the one being adopted, so an adoption never
+/// re-identifies an existing replica. Refuses an identity that is not a UUID
+/// v4, which is the shape every locally published repository identity has.
+pub fn init_replica_adopting(
+    working_dir: &Path,
+    default_branch: &str,
+    repository_id: &RepositoryId,
+) -> Result<InitResult> {
+    let adopted = repository_id.as_str();
+    match uuid::Uuid::parse_str(adopted) {
+        Ok(parsed) if parsed.get_version_num() == 4 => {}
+        _ => {
+            return Err(KinError::Config(format!(
+                "remote repository identity {adopted} is not a UUID v4, so no local replica can \
+                 adopt it. A local repository identity is minted as a UUID v4 and every authority \
+                 that opens one requires that shape"
+            )));
+        }
+    }
+    refuse_adoption_over_existing_replica(working_dir, adopted)?;
+    init_with_config(
+        working_dir,
+        replica_config(default_branch),
+        KinManifest::adopting(adopted),
+    )
+}
+
+fn replica_config(default_branch: &str) -> KinConfig {
+    KinConfig {
+        default_branch: default_branch.to_string(),
+        ..KinConfig::default()
+    }
+}
+
+/// Report what is already at `working_dir` before an adoption reaches init.
+///
+/// [`init_with_config`] refuses an existing `.kin/` on its own and remains the
+/// check that decides. This runs first only so the refusal names both
+/// identities: a caller who ran a clone into an existing replica needs to know
+/// which repository is already there, and `AlreadyInitialized` carries a path
+/// alone. A manifest that cannot be read falls through to that generic refusal
+/// rather than inventing a reason.
+fn refuse_adoption_over_existing_replica(working_dir: &Path, adopted: &str) -> Result<()> {
+    let Ok(canonical_working_dir) = working_dir.canonicalize() else {
+        return Ok(());
+    };
+    let layout = KinLayout::new(canonical_working_dir.join(".kin"));
+    let Ok(existing) = KinManifest::load(&layout.manifest_path()) else {
+        return Ok(());
+    };
+    if existing.repo_id == adopted {
+        return Err(KinError::AlreadyInitialized(format!(
+            "{} already holds repository {adopted}",
+            canonical_working_dir.display()
+        )));
+    }
+    Err(KinError::AlreadyInitialized(format!(
+        "{} already holds repository {}, and adopting {adopted} would re-identify it. Clone into \
+         an empty directory instead",
+        canonical_working_dir.display(),
+        existing.repo_id
+    )))
+}
+
+fn init_with_config(
+    working_dir: &Path,
+    config: KinConfig,
+    manifest: KinManifest,
+) -> Result<InitResult> {
     let canonical_working_dir = working_dir
         .canonicalize()
         .map_err(|error| KinError::io(working_dir, error))?;
@@ -401,7 +491,6 @@ fn init_with_config(working_dir: &Path, config: KinConfig) -> Result<InitResult>
         Err(error) => return Err(KinError::io(&kin_dir, error)),
     }
 
-    let manifest = KinManifest::new();
     let staging_parent = canonical_working_dir.parent().ok_or_else(|| {
         KinError::Other(format!(
             "repository root has no parent for atomic staging: {}",
@@ -2355,6 +2444,115 @@ mod tests {
             .filter(|name| name.to_string_lossy().starts_with(".kin.init-"))
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+    }
+
+    /// The whole point of adoption: the replica is a replica of the remote's
+    /// repository, not of a repository that happens to hold the same files.
+    #[test]
+    fn an_adopting_replica_takes_the_remote_identity_and_mints_only_its_workspace() {
+        let remote_directory = tempfile::tempdir().unwrap();
+        let replica_directory = tempfile::tempdir().unwrap();
+        let remote = init(remote_directory.path()).unwrap();
+        let replica =
+            init_replica_adopting(replica_directory.path(), "main", &remote.repository_id).unwrap();
+
+        assert_eq!(replica.repository_id, remote.repository_id);
+        assert_ne!(replica.workspace_id, remote.workspace_id);
+
+        // The adopted identity is what the replica's own authority records,
+        // not only what its manifest says.
+        let manifest = KinManifest::load(&replica.layout.manifest_path()).unwrap();
+        assert_eq!(manifest.repo_id, remote.repository_id.to_string());
+        assert_ne!(manifest.workspace_id, remote.manifest.workspace_id);
+        let authority = RepositoryAuthorityManager::open(
+            replica.repository_id.clone(),
+            Arc::new(LocalFileBackend::new(replica.layout.kindb_dir())),
+        )
+        .unwrap();
+        assert_eq!(
+            authority
+                .read_authority()
+                .snapshot()
+                .repository_authority
+                .as_ref()
+                .unwrap()
+                .repository_id,
+            remote.repository_id
+        );
+
+        // Adoption imports no history. The transfer that follows is what does.
+        assert_eq!(replica.authority.initial_change_id, None);
+        assert!(held_change_ids(&replica).is_empty());
+    }
+
+    #[test]
+    fn a_plain_replica_still_mints_its_own_identity() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first = init_replica(first_directory.path(), "main").unwrap();
+        let second = init_replica(second_directory.path(), "main").unwrap();
+
+        assert_ne!(first.repository_id, second.repository_id);
+        assert_ne!(first.workspace_id, second.workspace_id);
+    }
+
+    /// A directory that already holds a replica must never be re-identified,
+    /// and the refusal has to name the identity that is already there: a caller
+    /// who cloned into the wrong directory cannot act on a bare path.
+    #[test]
+    fn adopting_over_an_existing_replica_names_both_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = init(directory.path()).unwrap();
+        let adopted = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+
+        let error = init_replica_adopting(directory.path(), "main", &adopted).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, KinError::AlreadyInitialized(_)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&existing.repository_id.to_string()),
+            "{message}"
+        );
+        assert!(message.contains(&adopted.to_string()), "{message}");
+
+        // Nothing was re-identified.
+        let manifest = KinManifest::load(&existing.layout.manifest_path()).unwrap();
+        assert_eq!(manifest.repo_id, existing.repository_id.to_string());
+    }
+
+    #[test]
+    fn adopting_the_identity_already_present_is_still_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = init(directory.path()).unwrap();
+
+        let error =
+            init_replica_adopting(directory.path(), "main", &existing.repository_id).unwrap_err();
+        assert!(matches!(error, KinError::AlreadyInitialized(_)));
+        assert!(error
+            .to_string()
+            .contains(&existing.repository_id.to_string()));
+    }
+
+    /// A repository identity is minted as a UUID v4 and every local authority
+    /// requires that shape, so an identity that is not one has to be refused
+    /// before a layout is staged rather than after.
+    #[test]
+    fn a_remote_identity_that_is_not_a_uuid_v4_is_refused_before_anything_is_created() {
+        let parent = tempfile::tempdir().unwrap();
+        for adopted in [
+            RepositoryId::new("hosted-repo-42").unwrap(),
+            RepositoryId::new(uuid::Uuid::nil().to_string()).unwrap(),
+        ] {
+            let replica = parent.path().join(adopted.as_str());
+            std::fs::create_dir(&replica).unwrap();
+            let error = init_replica_adopting(&replica, "main", &adopted).unwrap_err();
+            let message = error.to_string();
+            assert!(matches!(error, KinError::Config(_)), "{message}");
+            assert!(message.contains(adopted.as_str()), "{message}");
+            assert!(!replica.join(".kin").exists(), "{message}");
+        }
     }
 
     fn held_change_ids(result: &InitResult) -> std::collections::BTreeSet<SemanticChangeId> {

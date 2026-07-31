@@ -122,6 +122,7 @@ pub mod lifecycle;
 mod local_repository_authority;
 pub mod loop_runner;
 mod mcp_commit;
+pub mod replica_adoption;
 mod repository_branch;
 mod repository_checkout;
 pub mod repository_commit;

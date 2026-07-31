@@ -60,9 +60,10 @@ pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
 pub use init::{
-    init, init_replica, initialize_repository_authority, prepare_repository_layout_at,
-    publish_repository_layout, publish_repository_layout_linearized, InitResult,
-    PreparedRepositoryInit, PublishedRepository, RepositoryBootstrap, RepositoryPublication,
+    init, init_replica, init_replica_adopting, initialize_repository_authority,
+    prepare_repository_layout_at, publish_repository_layout, publish_repository_layout_linearized,
+    InitResult, PreparedRepositoryInit, PublishedRepository, RepositoryBootstrap,
+    RepositoryPublication,
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
