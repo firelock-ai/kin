@@ -954,6 +954,9 @@ jobs:
       - name: Test gcs feature
         run: cargo nextest run -p kin-daemon --features gcs --locked
 
+      - name: Test featureless kin-cli
+        run: cargo test -p kin-cli --no-default-features --locked
+
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:
