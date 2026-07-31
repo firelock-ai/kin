@@ -2632,8 +2632,8 @@ def main() -> None:
     ):
         require(release, policy, "Kin and pinned kin-vfs release compatibility gate")
 
-    # Windows admission refusals are stated once and asserted from one script.
-    # The installer leg proves them on the landing push, which is the commit
+    # What Windows admission does is stated once and asserted from one script.
+    # The installer leg proves it on the landing push, which is the commit
     # release proof reads. The authority job proves the same assertions against
     # the same command on every pull request and merge group, which is the only
     # place an admission change is still reviewable. Pin both invocations and
@@ -2641,29 +2641,51 @@ def main() -> None:
     # behavior change no one can see until it fails a required check on a
     # release commit, and letting the two legs carry their own copies restores
     # the drift that made the copies disagree.
-    windows_admission = (ROOT / "scripts" / "assert-windows-init-refusals.sh").read_text(
+    #
+    # Both boundaries now reach the graph authority store, one transaction past
+    # the config writer, so the config-writer refusal is pinned as a REFUTATION
+    # and the store's missing durable-flush capability is pinned by name.
+    # Requiring the absence of the one and the presence of the other is what
+    # keeps a regression to the old fail-closed arm from reading as a pass, and
+    # what forces the change that finally moves this boundary to say so here.
+    windows_admission = (ROOT / "scripts" / "assert-windows-init-contract.sh").read_text(
         encoding="utf-8"
     )
     for policy in (
         '"$kin_bin" init',
         'CONFIG_REFUSAL="cannot publish repository config"',
-        'CONFIG_CAUSE="an atomic exchanging or no-replace directory rename"',
         'SOURCE_PROOF_STAGE="prove mutable Git workspace"',
+        'DURABLE_FLUSH_GAP="for durable metadata flush"',
+        'NON_EMPTY_REFUSAL="requires an empty directory"',
         'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
-        'require_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
-        'require_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
+        'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
+        'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
+        'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
+        'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
+        'require_refused "Windows exact-Git admission"',
+        'require_refused "Windows native-unborn bootstrap"',
+        'require_refused "Windows non-empty native boundary"',
         'fail "$label unexpectedly succeeded" "$log"',
         'if [ -e "$dir/.kin" ]; then',
+        "'.kin.init-*'",
     ):
-        require(windows_admission, policy, "Windows admission refusal assertions")
+        require(windows_admission, policy, "Windows admission contract assertions")
 
     ci_jobs = workflow_job_blocks(ci_workflow)
     for job_id in ("windows-authority-tests", "windows-installer"):
         for policy in (
-            "- name: Assert Windows admission refusals",
-            "bash ./scripts/assert-windows-init-refusals.sh",
+            "- name: Assert the Windows admission contract",
+            "bash ./scripts/assert-windows-init-contract.sh",
         ):
             require(ci_jobs[job_id], policy, f"shared Windows admission proof in {job_id}")
+    # The Windows arm of the config writer shares no code with the Unix one, so
+    # a leg that never runs its cases proves nothing about the transaction
+    # `kin init` depends on.
+    require(
+        ci_jobs["windows-authority-tests"],
+        "config::capability_owned_config_replacement_tests",
+        "native Windows config replacement proof",
+    )
     require(
         ci_jobs["windows-authority-tests"],
         "target/x86_64-pc-windows-msvc/debug/kin.exe",

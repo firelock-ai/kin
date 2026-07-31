@@ -5,12 +5,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
+// Carried only by the Unix `ConfigAuthority` and `ConfigTemp` fields below.
+// The Windows arm owns its own, in its own module, so this gate must stay
+// narrower than the one on the writer it serves.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 use std::path::PathBuf;
 
 use gix::bstr::ByteSlice;
 
 use crate::error::{KinError, Result};
+
+/// Capability-owned atomic config replacement on Windows.
+///
+/// The Unix writer is built on directory-descriptor-relative renames, which
+/// Windows does not have. The arm behind this module publishes through the
+/// primitives Windows does provide and satisfies the same contract; both are
+/// held to it by the `capability_owned_config_replacement_tests` module below.
+#[cfg(windows)]
+mod windows;
 
 /// High-level worldview preset for how Kin should treat non-code artifacts
 /// and external tool execution.
@@ -801,7 +813,12 @@ impl Default for KinConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigAuthorityKind {
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    ))]
     PublishedRepository,
     InitializationStage,
 }
@@ -909,53 +926,75 @@ struct ConfigTemp {
     display_path: PathBuf,
 }
 
+/// Resolve which directory and name a config write is allowed to own.
+///
+/// Every platform arm answers this the same way, because it is a statement
+/// about the repository namespace rather than about any host primitive: the
+/// writer owns `.kin/config.toml` under a published repository and
+/// `config.toml` under one canonical `.kin.init-<uuid-v4>` stage, and nothing
+/// else. Sharing one body keeps the two arms from drifting into different
+/// answers about what a caller may replace.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
+fn validated_config_authority_path(
+    path: &Path,
+    kind: ConfigAuthorityKind,
+) -> Result<(&std::ffi::OsStr, &Path)> {
+    if !path.is_absolute() {
+        return Err(KinError::Config(format!(
+            "repository config path must be absolute: {}",
+            path.display()
+        )));
+    }
+    let config_name = path.file_name().ok_or_else(|| {
+        KinError::Config(format!(
+            "repository config path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    if config_name != std::ffi::OsStr::new("config.toml") {
+        return Err(KinError::Config(format!(
+            "KinConfig::save only owns .kin/config.toml, not {}",
+            path.display()
+        )));
+    }
+    let directory_path = path.parent().ok_or_else(|| {
+        KinError::Config(format!(
+            "repository config path has no .kin parent: {}",
+            path.display()
+        ))
+    })?;
+    match kind {
+        ConfigAuthorityKind::PublishedRepository
+            if directory_path.file_name() != Some(std::ffi::OsStr::new(".kin")) =>
+        {
+            return Err(KinError::Config(format!(
+                "repository config must be a direct child of .kin: {}",
+                path.display()
+            )));
+        }
+        ConfigAuthorityKind::InitializationStage
+            if !is_initialization_stage_directory(directory_path) =>
+        {
+            return Err(KinError::Config(format!(
+                "staged repository config must be a direct child of a canonical \
+                 .kin.init-<uuid-v4> authority: {}",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
+    Ok((config_name, directory_path))
+}
+
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 impl ConfigAuthority {
     fn open(path: &Path, kind: ConfigAuthorityKind) -> Result<Self> {
-        if !path.is_absolute() {
-            return Err(KinError::Config(format!(
-                "repository config path must be absolute: {}",
-                path.display()
-            )));
-        }
-        let config_name = path.file_name().ok_or_else(|| {
-            KinError::Config(format!(
-                "repository config path has no file name: {}",
-                path.display()
-            ))
-        })?;
-        if config_name != std::ffi::OsStr::new("config.toml") {
-            return Err(KinError::Config(format!(
-                "KinConfig::save only owns .kin/config.toml, not {}",
-                path.display()
-            )));
-        }
-        let directory_path = path.parent().ok_or_else(|| {
-            KinError::Config(format!(
-                "repository config path has no .kin parent: {}",
-                path.display()
-            ))
-        })?;
-        match kind {
-            ConfigAuthorityKind::PublishedRepository
-                if directory_path.file_name() != Some(std::ffi::OsStr::new(".kin")) =>
-            {
-                return Err(KinError::Config(format!(
-                    "repository config must be a direct child of .kin: {}",
-                    path.display()
-                )));
-            }
-            ConfigAuthorityKind::InitializationStage
-                if !is_initialization_stage_directory(directory_path) =>
-            {
-                return Err(KinError::Config(format!(
-                    "staged repository config must be a direct child of a canonical \
-                     .kin.init-<uuid-v4> authority: {}",
-                    path.display()
-                )));
-            }
-            _ => {}
-        }
+        let (config_name, directory_path) = validated_config_authority_path(path, kind)?;
 
         let directory = open_config_directory_nofollow(directory_path)?;
         let directory_identity = config_directory_identity(&directory)
@@ -1162,7 +1201,17 @@ fn save_config_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     save_config_atomically_scoped(path, contents, ConfigAuthorityKind::PublishedRepository)
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[cfg(windows)]
+fn save_config_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    windows::save_config_atomically_scoped(path, contents, ConfigAuthorityKind::PublishedRepository)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
 fn save_config_atomically(path: &Path, _contents: &[u8]) -> Result<()> {
     Err(unsupported_config_replacement(path))
 }
@@ -1175,7 +1224,12 @@ fn save_config_atomically(path: &Path, _contents: &[u8]) -> Result<()> {
 /// exchanging or no-replace directory rename plus a durable directory flush.
 /// A host without them gets no truncating path-based fallback: a partially
 /// written config would become repository authority with no way back.
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
 fn unsupported_config_replacement(path: &Path) -> KinError {
     KinError::Config(format!(
         "cannot publish repository config {} on this platform: capability-owned replacement needs \
@@ -1186,7 +1240,12 @@ fn unsupported_config_replacement(path: &Path) -> KinError {
     ))
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
 fn is_initialization_stage_directory(path: &Path) -> bool {
     let Some(raw) = path
         .file_name()
@@ -1210,7 +1269,21 @@ fn save_config_atomically_scoped(
     save_config_atomically_scoped_with_hook(path, contents, kind, |_| Ok(()))
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[cfg(windows)]
+fn save_config_atomically_scoped(
+    path: &Path,
+    contents: &[u8],
+    kind: ConfigAuthorityKind,
+) -> Result<()> {
+    windows::save_config_atomically_scoped(path, contents, kind)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
 fn save_config_atomically_scoped(
     path: &Path,
     _contents: &[u8],
@@ -2059,5 +2132,251 @@ args = ["--verbose"]
         assert_eq!(loaded.lsp.required, vec!["rust"]);
         assert_eq!(loaded.lsp.providers.len(), 1);
         assert_eq!(loaded.lsp.providers[0].provider, "rust-analyzer");
+    }
+}
+
+/// One contract, held by every platform arm that publishes repository config.
+///
+/// The arms share no code below the namespace validation: Unix publishes with
+/// directory-descriptor-relative renames and Windows with `ReplaceFileW` and
+/// `MoveFileExW`. Gating this module on `test` alone rather than on `unix` is
+/// what makes the Windows CI leg execute these cases instead of only compiling
+/// them, which is the difference between a Windows arm that builds and a
+/// Windows arm that is known to behave.
+#[cfg(all(
+    test,
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )
+))]
+mod capability_owned_config_replacement_tests {
+    use super::*;
+
+    const TEMP_PREFIXES: [&str; 2] = [".config.toml.kin-tmp-", ".config.toml.kin-replaced-"];
+
+    fn published_config_path(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        let kin = directory.path().join(".kin");
+        std::fs::create_dir(&kin).expect("create .kin");
+        kin.join("config.toml")
+    }
+
+    fn staged_config_path(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        let stage = directory
+            .path()
+            .join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&stage).expect("create stage");
+        stage.join("config.toml")
+    }
+
+    /// Every intermediate name this writer owns, still present after a save.
+    ///
+    /// A publication that leaves one behind has either not finished its
+    /// cleanup or has published something other than what it staged, and both
+    /// are failures of the same contract.
+    fn residual_writer_entries(config: &Path) -> Vec<std::ffi::OsString> {
+        let parent = config.parent().expect("config has a parent");
+        std::fs::read_dir(parent)
+            .expect("read config directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy().into_owned();
+                TEMP_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_first_publication_holds_exactly_the_bytes_it_was_given() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+
+        save_config_atomically(&config, b"mode = \"native\"\n").expect("publish repository config");
+
+        assert_eq!(
+            std::fs::read(&config).expect("read published config"),
+            b"mode = \"native\"\n",
+            "publication must not alter, truncate, or re-encode the bytes it was given"
+        );
+        assert!(
+            residual_writer_entries(&config).is_empty(),
+            "publication left writer-owned intermediates behind: {:?}",
+            residual_writer_entries(&config)
+        );
+    }
+
+    #[test]
+    fn replacing_a_published_config_leaves_only_the_new_bytes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+
+        save_config_atomically(&config, b"auto_index = true\n").expect("publish first");
+        save_config_atomically(&config, b"auto_index = false\n").expect("replace published");
+
+        assert_eq!(
+            std::fs::read(&config).expect("read replaced config"),
+            b"auto_index = false\n",
+            "the replacement must win outright, with no merged or appended remnant"
+        );
+        assert!(
+            residual_writer_entries(&config).is_empty(),
+            "replacement left the predecessor or a temp behind: {:?}",
+            residual_writer_entries(&config)
+        );
+    }
+
+    #[test]
+    fn a_shorter_replacement_does_not_leave_a_longer_predecessor_tail() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+
+        save_config_atomically(&config, b"auto_index = true\n# a long trailing comment\n")
+            .expect("publish long");
+        save_config_atomically(&config, b"x = 1\n").expect("publish short");
+
+        // An in-place truncating writer is the failure mode this whole design
+        // exists to exclude, and a surviving tail is how it shows up.
+        assert_eq!(
+            std::fs::read(&config).expect("read replaced config"),
+            b"x = 1\n"
+        );
+    }
+
+    #[test]
+    fn an_initialization_stage_publishes_under_its_own_canonical_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = staged_config_path(&directory);
+
+        save_config_atomically_scoped(
+            &config,
+            b"mode = \"native\"\n",
+            ConfigAuthorityKind::InitializationStage,
+        )
+        .expect("publish staged repository config");
+
+        assert_eq!(
+            std::fs::read(&config).expect("read staged config"),
+            b"mode = \"native\"\n"
+        );
+        assert!(residual_writer_entries(&config).is_empty());
+    }
+
+    #[test]
+    fn a_stage_directory_that_is_not_a_canonical_uuid_v4_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let stage = directory.path().join(".kin.init-not-a-uuid");
+        std::fs::create_dir(&stage).expect("create stage");
+        let config = stage.join("config.toml");
+
+        let error = save_config_atomically_scoped(
+            &config,
+            b"mode = \"native\"\n",
+            ConfigAuthorityKind::InitializationStage,
+        )
+        .expect_err("a non-canonical stage name is not an authority");
+        assert!(
+            error.to_string().contains(".kin.init-<uuid-v4>"),
+            "the refusal must name the shape it required: {error}"
+        );
+        assert!(
+            !config.exists(),
+            "a refused save must not create the file it refused to publish"
+        );
+    }
+
+    #[test]
+    fn a_config_outside_the_owned_namespace_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let elsewhere = directory.path().join("notes.toml");
+
+        let error = save_config_atomically(&elsewhere, b"x = 1\n")
+            .expect_err("the writer owns one name and no other");
+        assert!(
+            error.to_string().contains("only owns .kin/config.toml"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!elsewhere.exists());
+    }
+
+    #[test]
+    fn a_config_whose_parent_is_not_dot_kin_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let parent = directory.path().join("config");
+        std::fs::create_dir(&parent).expect("create parent");
+        let config = parent.join("config.toml");
+
+        let error = save_config_atomically(&config, b"x = 1\n")
+            .expect_err("only .kin carries repository config authority");
+        assert!(
+            error.to_string().contains("direct child of .kin"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn a_relative_config_path_is_refused_before_any_file_is_created() {
+        let error = save_config_atomically(Path::new(".kin/config.toml"), b"x = 1\n")
+            .expect_err("a relative path names no directory this writer can retain");
+        assert!(
+            error.to_string().contains("must be absolute"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn a_directory_standing_where_the_config_belongs_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+        std::fs::create_dir(&config).expect("directory at the config name");
+
+        let error = save_config_atomically(&config, b"x = 1\n")
+            .expect_err("a directory is not a config this writer may replace");
+        // The arms word this differently because they discover it at different
+        // calls, so what is pinned here is the cause each one must name, not
+        // one arm's sentence.
+        assert!(
+            error.to_string().contains("not a regular"),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            config.is_dir(),
+            "a refused save must leave what it found untouched"
+        );
+    }
+
+    #[test]
+    fn an_absent_authority_directory_is_refused_rather_than_created() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = directory.path().join(".kin").join("config.toml");
+
+        save_config_atomically(&config, b"x = 1\n")
+            .expect_err("the writer publishes into an authority, it does not invent one");
+        assert!(
+            !directory.path().join(".kin").exists(),
+            "a refused save must not create the authority directory"
+        );
+    }
+
+    #[test]
+    fn a_refused_save_leaves_the_previously_published_bytes_in_place() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = published_config_path(&directory);
+        save_config_atomically(&config, b"auto_index = true\n").expect("publish first");
+
+        let wrong_name = config
+            .parent()
+            .expect("config parent")
+            .join("config.toml.bak");
+        save_config_atomically(&wrong_name, b"auto_index = false\n")
+            .expect_err("the writer owns one name and no other");
+
+        assert_eq!(
+            std::fs::read(&config).expect("read published config"),
+            b"auto_index = true\n"
+        );
+        assert!(residual_writer_entries(&config).is_empty());
     }
 }
