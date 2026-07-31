@@ -141,7 +141,10 @@ The single job refuses — before any tag is created — unless **all** hold:
    active, and the prior stable must have either a successful exact tag/SHA
    Release run or its attested terminal completion marker. This prevents GitHub
    concurrency from replacing a pending version without making Actions log
-   retention part of durable release authority.
+   retention part of durable release authority. The highest tag this compares
+   against skips any tag carried by `scripts/abandoned-release-tags.json`; see
+   [Abandoning a release tag](#abandoning-a-release-tag). A tag that is merely
+   failing so far carries no record and still blocks its successor.
 7. **Tag does not already exist.** Refuses if `refs/tags/<tag>` is present.
 
 Only then does it mint the App token, create `refs/tags/<tag>` at the SHA, and
@@ -159,6 +162,44 @@ active release before requesting `rerun-failed-jobs`. The initial attempt plus
 two retries is the hard cap. Cancellation is treated as an operator stop and is
 never retried. If all three attempts fail, the controller opens one
 `Release blocked after automatic retries` issue and stops.
+
+## Abandoning a release tag
+
+Recovery stopping is not the end of the story. The rail serializes on the
+highest `vX.Y.Z` tag being the finalized GitHub Latest release, which holds that
+tag responsible for finishing. A tag whose artifacts can never be built cannot
+finish, and on its own it holds the gate closed against every successor,
+including the one that repairs whatever made it unbuildable.
+
+`scripts/abandoned-release-tags.json` is the reviewed way out. It is the only
+thing that waives the predicate for a tag, so a tag that is merely failing so far
+keeps blocking, which is what the predicate is for. Each entry records the `tag`,
+the exact `sha` it pointed at, a `reason`, the `superseded_by` tag, and the
+`failed_release_run_id` that evidences it. Both the record and the selector that
+reads it are loaded from protected `main`, never from the checked-out release
+commit, which predates any abandonment it has to honour.
+
+**Operating rule: record the abandonment and leave the tag in place.**
+
+Deleting an abandoned tag while the workspace version still equals it wedges both
+rails, and nothing automatic recovers:
+
+- the mint refuses, because the abandonment refusal reads the record and not the
+  tag listing, so the version stays burned after its tag is gone (this is
+  deliberate: a burned version must never be re-minted onto a different commit)
+- drift resolution defers rather than proposing a bump, because it finds no base
+  tag to measure from and hands the transition to the mint that is refusing
+
+The only exit from that state is a hand-landed version bump. Delete an abandoned
+tag only when a version bump is landing with it.
+
+Two further properties worth knowing before editing the record:
+
+- an entry applies only while it still describes the repository. It names the
+  exact commit its tag pointed at, so a tag that has since moved refuses loudly
+  rather than quietly waiving a different object than the one reviewed
+- a malformed, unparsable, or under-evidenced entry fails the rail closed rather
+  than degrading to an empty waiver set
 
 ## Captain break-glass usage
 

@@ -51,6 +51,17 @@ TAG_LISTING_FORMAT = (
 # tag until the train opens the bump the record exists to unblock. The empty
 # argument is spelled as a literal rather than an expanded variable so that
 # refilling it is a visible diff here and not a silent assignment upstream.
+# Third-party actions inside the workflows that produce presence-required release
+# contexts. A required context is release evidence, so whatever can write into it
+# is release supply chain and has to be pinned to an immutable object rather than
+# a tag anyone upstream can move. `actions/*` are first-party and governed
+# separately; these are the ones outside that trust boundary.
+EXPECTED_REQUIRED_CONTEXT_ACTION_PINS = {
+    ".github/workflows/sast.yml": {
+        "dtolnay/rust-toolchain": "191af2e1955bbe165f9bbacff2d2438002dff4d4",
+        "taiki-e/install-action": "6a1bd70eaac3c8bdf093356838d7ee09fda951cf",
+    },
+}
 EXPECTED_SELECTOR_INVOCATIONS = {
     "release-tag": ('"$abandoned"', '"$candidate_tags"', '"$TAG"', '"$admissible"'),
     "release-train": ('"$abandoned"', '"$candidate_tags"', '""', '"$admissible"'),
@@ -2193,23 +2204,222 @@ def assert_admission_step_order(
 
 
 def selector_invocation(workflow: str, content: str) -> tuple[str, ...]:
-    """Return the exact argument list a workflow hands the admission selector."""
+    """Return the exact argument list a workflow hands the admission selector.
 
-    anchor = 'python3 "$selector" \\\n'
-    if anchor not in content:
+    Every invocation is read, not the first. A second one is what would defeat
+    this pin: it can re-run the selector with any argument at all and overwrite
+    the file the workflow then adopts as the highest admissible tag, so pinning
+    only the first would leave the guard describing bytes that no longer decide
+    the outcome.
+    """
+
+    anchor = 'python3 "$selector"'
+    invocations: list[tuple[str, ...]] = []
+    for match in re.finditer(re.escape(anchor), content):
+        tail = content[match.end() :]
+        if not tail.startswith(" \\\n"):
+            raise AssertionError(
+                f"{workflow} invokes the admission selector without a "
+                "reviewable multi-line argument list"
+            )
+        arguments: list[str] = []
+        for line in tail[len(" \\\n") :].splitlines():
+            argument = line.strip()
+            if argument.endswith("\\"):
+                arguments.append(argument[:-1].strip())
+                continue
+            arguments.append(argument)
+            break
+        invocations.append(tuple(arguments))
+    if len(invocations) != 1:
         raise AssertionError(
-            f"{workflow} no longer invokes the admission selector as a "
-            "reviewable multi-line argument list"
+            f"{workflow} must invoke the admission selector exactly once, so "
+            "one reviewed argument list decides the highest admissible tag: "
+            f"found {len(invocations)}"
         )
-    arguments: list[str] = []
-    for line in content[content.index(anchor) + len(anchor) :].splitlines():
-        argument = line.strip()
-        if argument.endswith("\\"):
-            arguments.append(argument[:-1].strip())
-            continue
-        arguments.append(argument)
-        break
-    return tuple(arguments)
+    return invocations[0]
+
+
+def tag_readback_source(release_tag: str) -> str:
+    """Extract the post-mint ref readback exactly as the workflow runs it."""
+
+    anchor = "      - name: Verify tag ref and summarize\n"
+    if anchor not in release_tag:
+        raise AssertionError(
+            "release-tag no longer carries the post-mint ref readback step"
+        )
+    start = release_tag.index(anchor)
+    end = release_tag.index("\n      - name:", start + 1) if (
+        "\n      - name:" in release_tag[start + 1 :]
+    ) else len(release_tag)
+    step = release_tag[start:end]
+    marker = "        run: |\n"
+    return textwrap.dedent(step[step.index(marker) + len(marker) :])
+
+
+def execute_tag_readback(
+    source: str,
+    responses: list[tuple[int, str]],
+) -> subprocess.CompletedProcess[str]:
+    """Run the readback against a scripted sequence of API answers."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "readback.sh"
+        script.write_text(source, encoding="utf-8")
+        (root / "responses").write_text(
+            "".join(f"{code} {body}\n" for code, body in responses),
+            encoding="utf-8",
+        )
+        (root / "attempts").write_text("0", encoding="utf-8")
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "gh").write_text(
+            "#!/usr/bin/env bash\n"
+            'attempt="$(cat "$FIXTURE/attempts")"\n'
+            'attempt=$((attempt + 1))\n'
+            'printf %s "$attempt" > "$FIXTURE/attempts"\n'
+            'line="$(sed -n "${attempt}p" "$FIXTURE/responses")"\n'
+            '[ -n "$line" ] || line="$(tail -n 1 "$FIXTURE/responses")"\n'
+            'code="${line%% *}"; body="${line#* }"\n'
+            '[ "$code" = 0 ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }\n'
+            'printf "%s\\n" "$body"\n',
+            encoding="utf-8",
+        )
+        (binaries / "gh").chmod(0o755)
+        # The exhaustion path sleeps ~30s in production; the fixture proves the
+        # control flow, not the wall clock.
+        (binaries / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (binaries / "sleep").chmod(0o755)
+        environment = dict(os.environ)
+        environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
+        environment.update(
+            {
+                "FIXTURE": str(root),
+                "GH_TOKEN": "fixture",
+                "REPO": "firelock-ai/kin",
+                "ACTOR": "kin-release-bot[bot]",
+                "TAG": "v9.9.9",
+                "SHA": RELEASE_GATE_FIXTURE_SHA,
+                "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
+                "RUNNER_TEMP": str(root),
+            }
+        )
+        return subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=30,
+            check=False,
+        )
+
+
+def assert_tag_readback_retries(release_tag: str) -> None:
+    """A minted tag must never be reported failed because a read was early."""
+
+    source = tag_readback_source(release_tag)
+    good = (0, RELEASE_GATE_FIXTURE_SHA)
+    missing = (404, "")
+
+    immediate = execute_tag_readback(source, [good])
+    if immediate.returncode != 0:
+        raise AssertionError(
+            f"post-mint readback failed on a readable ref: "
+            f"{immediate.stdout}{immediate.stderr}"
+        )
+
+    # The observed defect: the ref exists, the first reads 404, and the mint
+    # concluded failure on a release it had already created.
+    delayed = execute_tag_readback(source, [missing, missing, good])
+    if delayed.returncode != 0:
+        raise AssertionError(
+            "post-mint readback reported a successful mint as failed because "
+            f"the ref was not visible yet: {delayed.stdout}{delayed.stderr}"
+        )
+    if "retrying" not in delayed.stdout:
+        raise AssertionError(
+            "post-mint readback must say it is retrying, so a slow read is "
+            f"legible in the log: {delayed.stdout}"
+        )
+
+    absent = execute_tag_readback(source, [missing])
+    if absent.returncode == 0:
+        raise AssertionError("post-mint readback accepted a ref that never appeared")
+    if "never read back" not in absent.stdout:
+        raise AssertionError(
+            "post-mint readback must distinguish exhausted reads from a "
+            f"mismatch: {absent.stdout}{absent.stderr}"
+        )
+    # The reason the API gave has to survive into the refusal. A persistent
+    # auth or rate-limit failure reads identically to a missing ref from here,
+    # and reporting it as absence sends an operator after a tag that exists.
+    if "last reason:" not in absent.stdout or "Not Found" not in absent.stdout:
+        raise AssertionError(
+            "post-mint readback must report why the read failed rather than "
+            f"asserting the tag is gone: {absent.stdout}"
+        )
+
+    # A ref that reads back pointing elsewhere is terminal on the first read.
+    # Retrying it would be waiting for someone else's tag to change.
+    mismatch = execute_tag_readback(source, [(0, "0" * 40)])
+    if mismatch.returncode == 0:
+        raise AssertionError("post-mint readback accepted a ref at the wrong commit")
+    if "points at" not in mismatch.stdout:
+        raise AssertionError(
+            f"post-mint readback must name the wrong commit: {mismatch.stdout}"
+        )
+    if "retrying" in mismatch.stdout:
+        raise AssertionError(
+            "post-mint readback retried a ref that resolved to another commit, "
+            "which cannot become correct by waiting"
+        )
+
+
+def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
+    """Pin the supply chain of anything that can write a required release context.
+
+    A required context is the evidence a release is minted from, so an action
+    running inside its producer can decide what that evidence says. A floating
+    tag leaves that decision with whoever can move the tag upstream.
+    """
+
+    for path, expected in EXPECTED_REQUIRED_CONTEXT_ACTION_PINS.items():
+        content = workflows.get(ROOT / path)
+        if content is None:
+            raise AssertionError(f"required-context producer is missing: {path}")
+        # Every reference is collected, not the last one seen per action. Each
+        # `uses:` executes, so a single unpinned reference is an unpinned
+        # execution however many pinned ones sit beside it, and whichever order
+        # they appear in. Keying on one reference per action hid exactly that:
+        # a floating duplicate placed above the pinned line was overwritten by
+        # it and the guard stayed green while the floating ref still ran.
+        observed: dict[str, set[str]] = {}
+        for reference in re.findall(r"uses:\s*(\S+)", content):
+            if reference.startswith("actions/"):
+                continue
+            action, _, version = reference.partition("@")
+            observed.setdefault(action, set()).add(version)
+        if set(observed) != set(expected):
+            raise AssertionError(
+                f"{path} produces a presence-required release context, so its "
+                "third-party action set must stay exactly as reviewed: "
+                f"expected={sorted(expected)} actual={sorted(observed)}"
+            )
+        for action, references in sorted(observed.items()):
+            pin = expected[action]
+            if not re.fullmatch(r"[0-9a-f]{40}", pin):
+                raise AssertionError(
+                    f"{path} pins {action} to '{pin}', which is a movable ref "
+                    "rather than an immutable commit"
+                )
+            drifted = sorted(reference for reference in references if reference != pin)
+            if drifted:
+                raise AssertionError(
+                    f"{path} runs {action} at {drifted} alongside its reviewed "
+                    f"pin {pin}; every reference to it must be that pin, "
+                    "because each one executes"
+                )
 
 
 def assert_selector_arguments(release_tag: str, release_train: str) -> None:
@@ -3080,6 +3290,15 @@ def main() -> None:
         "organization-level copy visible",
         "gh api --method POST repos/firelock-ai/kin/dispatches --input -",
         '{event_type:"release_tag",client_payload:{tag:$tag,sha:$sha}}',
+        # The abandonment operating rule has to live where an operator editing
+        # the record will read it. JSON carries no comments, so the record file
+        # itself cannot hold it, and a Python module docstring is not where the
+        # person writing an entry is looking.
+        "## Abandoning a release tag",
+        "record the abandonment and leave the tag in place",
+        "The only exit from that state is a hand-landed version bump",
+        "a tag that has since moved refuses loudly",
+        "fails the rail closed rather",
     ):
         require(
             release_bot_doc,
@@ -5055,6 +5274,8 @@ def main() -> None:
     # qualifying pull request. This is not a repository-wide no-PR-writes
     # invariant.
     assert_rust_cache_steps(workflow_sources)
+    assert_required_context_action_pins(workflow_sources)
+    assert_tag_readback_retries(release_tag)
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)
