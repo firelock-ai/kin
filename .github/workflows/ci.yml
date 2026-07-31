@@ -373,7 +373,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Install sccache
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: sccache
 
@@ -931,7 +931,7 @@ jobs:
               -p kin-cli -p kin-daemon
 
       - name: Install nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: nextest
 
@@ -1001,7 +1001,7 @@ jobs:
             ${{ runner.os }}-cargo-tarpaulin-
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-tarpaulin
 
