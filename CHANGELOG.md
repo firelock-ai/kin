@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Give the release container two registries and compile both musl release targets before landing (#545)
 - Admit every path the release generator writes (#552)
 - Report retrieval truncation from where it was cut, not from an advisory log (#553)
+- Pin what the release guards actually read and stop failing a mint on an early read (#549)
 
 
 ## [0.4.4] - 2026-07-31
