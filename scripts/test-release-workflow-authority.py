@@ -22,7 +22,10 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
+RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
+RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
+RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
@@ -420,8 +423,14 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
     },
+    ".github/workflows/release-recovery.yml": {
+        "reconcile": "Reconcile failed release",
+    },
     ".github/workflows/release-tag.yml": {
         "mint-release-tag": "Mint release tag",
+    },
+    ".github/workflows/release-train.yml": {
+        "reconcile": "Reconcile release PR",
     },
     ".github/workflows/release.yml": {
         "config": "Resolve release config",
@@ -446,6 +455,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "promote_ghcr_latest": "Promote stable ghcr latest",
         "publish_boundary_contracts": "Post-release boundary contracts publish",
         "version_tag_image": "Version-tag ghcr image",
+        "seal_release_completion": "Seal completed stable release",
     },
     ".github/workflows/sast.yml": {
         "changes": "Classify diff scope",
@@ -522,6 +532,7 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
         "push",
     ),
 }
+GITHUB_ACTIONS_APP_ID = 15_368
 RELEASE_TAG_WORKFLOW_ID = 318_521_292
 RELEASE_GATE_FIXTURE_SHA = "1" * 40
 RELEASE_GATE_CURRENT_RUN_ID = 9000
@@ -1579,6 +1590,7 @@ def execute_release_check_gate(
             "workflow_id": 245_803_170,
             "path": ".github/workflows/ci.yml",
             "event": "push",
+            "head_branch": "main",
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
             "status": "completed",
             "conclusion": "success",
@@ -1589,6 +1601,7 @@ def execute_release_check_gate(
             "workflow_id": 251_549_972,
             "path": ".github/workflows/sast.yml",
             "event": "push",
+            "head_branch": "main",
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
             "status": "completed",
             "conclusion": "success",
@@ -1599,6 +1612,7 @@ def execute_release_check_gate(
             "workflow_id": 293_452_372,
             "path": ".github/workflows/secret-scan.yml",
             "event": "push",
+            "head_branch": "main",
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
             "status": "completed",
             "conclusion": "success",
@@ -1610,7 +1624,8 @@ def execute_release_check_gate(
         "id": RELEASE_GATE_CURRENT_RUN_ID,
         "workflow_id": RELEASE_TAG_WORKFLOW_ID,
         "path": ".github/workflows/release-tag.yml",
-        "event": "workflow_dispatch",
+        "event": "workflow_run",
+        "head_branch": "main",
         "head_sha": RELEASE_GATE_FIXTURE_SHA,
         "status": "in_progress",
         "conclusion": None,
@@ -1626,6 +1641,7 @@ def execute_release_check_gate(
                 "status": "completed",
                 "conclusion": conclusions.get(name, "success"),
                 "id": index,
+                "app_id": GITHUB_ACTIONS_APP_ID,
                 "app_slug": "github-actions",
                 "check_suite_id": workflow_specs[workflow_path]["check_suite_id"],
                 "head_sha": RELEASE_GATE_FIXTURE_SHA,
@@ -1637,6 +1653,7 @@ def execute_release_check_gate(
             "status": "in_progress",
             "conclusion": None,
             "id": len(check_runs) + 1,
+            "app_id": GITHUB_ACTIONS_APP_ID,
             "app_slug": "github-actions",
             "check_suite_id": current_run["check_suite_id"],
             "head_sha": RELEASE_GATE_FIXTURE_SHA,
@@ -1663,8 +1680,12 @@ def execute_release_check_gate(
         environment.update(
             {
                 "CURRENT_RUN_ID": str(RELEASE_GATE_CURRENT_RUN_ID),
+                "CURRENT_RUN_EVENT": str(current_run["event"]),
                 "REQUIRED_CHECKS": "\n".join(REQUIRED_RELEASE_CHECKS),
                 "SHA": RELEASE_GATE_FIXTURE_SHA,
+                "TRIGGER_SHA": RELEASE_GATE_FIXTURE_SHA,
+                "GITHUB_ACTIONS_APP_ID": str(GITHUB_ACTIONS_APP_ID),
+                "GITHUB_ACTIONS_APP_SLUG": "github-actions",
             }
         )
         return subprocess.run(
@@ -1753,6 +1774,10 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
+    release_tag = RELEASE_TAG.read_text(encoding="utf-8")
+    release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
+    release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
@@ -1947,6 +1972,295 @@ def main() -> None:
     require(release, 'tags:\n      - "v*.*.*"', "release trigger")
     require(release, "  build_daemon_image:", "release daemon image job")
     require(release, "  attest_daemon_image:", "release daemon attestation job")
+    for policy in (
+        "  seal_release_completion:",
+        "name: Seal completed stable release",
+        "needs.promote_ghcr_latest.result == 'success'",
+        "needs.publish_boundary_contracts.result == 'success'",
+        "release-promotion.json.sha256",
+        "release_workflow_run_id",
+        "completed_capstones",
+        "Attest terminal completion marker",
+        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+        "Refuse mismatched existing completion assets",
+        "Verify public terminal completion proof",
+    ):
+        require(release, policy, "terminal stable-release completion seal")
+
+    for policy in (
+        'workflows: ["CI"]',
+        "types: [completed]",
+        'cron: "11,26,41,56 * * * *"',
+        "actions: read",
+        "attestations: read",
+        "contents: read",
+        "checks: read",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+        "github.event.workflow_run.conclusion == 'success'",
+        "repository_dispatch:",
+        "types: [release_tag]",
+        "github.event.action",
+        "github.event.repository.default_branch",
+        "github.event.client_payload.tag",
+        "github.event.client_payload.sha",
+        "EVENT_SHA: ${{ github.sha }}",
+        'EVENT_NAME" != repository_dispatch',
+        'EVENT_ACTION" != release_tag',
+        'DEFAULT_BRANCH" != main',
+        'REF" != "refs/heads/$DEFAULT_BRANCH"',
+        "environment: release-tag",
+        'git show "${authority_main}:scripts/release-intent.mjs" > "$policy"',
+        '"$node_bin" "$policy"',
+        "git merge-base --is-ancestor",
+        "break-glass release sha",
+        "actions/workflows/release.yml/runs?per_page=100",
+        '.status == "requested"',
+        ".status == \"queued\"",
+        ".conclusion == \"success\"",
+        "release-provenance.json.sha256",
+        "release-promotion.json.sha256",
+        "gh attestation verify release-provenance.json",
+        "gh attestation verify release-promotion.json",
+        "release_workflow_run_id",
+        "runInvocationURI",
+        "runDetails.metadata.invocationId",
+        "ltrimstr($run_uri)",
+        "verifiedTimestamps",
+        "registry.npmjs.org/@kinlab%2F",
+        "ghcr.io/v2/firelock-ai/kin/manifests",
+        "oci://ghcr.io/firelock-ai/kin@${ghcr_latest}",
+        "--bundle-from-oci",
+        'latest_tag" != v0.3.6',
+        "markerless logless fallback is retired",
+        "matching_count",
+        "highest_tag",
+        "REQUIRED_CHECKS:",
+        'GITHUB_ACTIONS_APP_ID: "15368"',
+        "GITHUB_ACTIONS_APP_SLUG: github-actions",
+        "app_id: (.app.id // 0)",
+        'actual_app = (run.get("app_id"), run.get("app_slug"))',
+        "if actual_app != expected_app:",
+        "check-runs?per_page=100&filter=all",
+        "head_branch: .head_branch",
+        'release_branch = "main"',
+        "expected_provenance = {",
+        "if identity == expected_identity:",
+        "ambiguous required check",
+        'allowed_conclusions = (\n                  {"success", "skipped"}',
+        "release_tag_suite_ids",
+        "did not settle within 30 minutes",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        "repositories: kin",
+        "break-glass release sha $SHA is no longer current origin/main HEAD",
+        'ref="refs/tags/$TAG"',
+    ):
+        require(release_tag, policy, "automatic App-mediated release tag admission")
+    for forbidden in (
+        "workflow_dispatch:",
+        "${{ inputs.",
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "KIN_CI_BOT_TOKEN",
+    ):
+        if forbidden in release_tag:
+            raise AssertionError(
+                f"release-tag workflow contains forbidden standing authority: {forbidden}"
+            )
+
+    resolve_start = release_tag.index(
+        "      - name: Resolve exact coherent release commit\n"
+    )
+    resolve_end = release_tag.index(
+        "      - name: Re-verify checked-out SHA is on reviewed origin/main history\n"
+    )
+    resolve_step = release_tag[resolve_start:resolve_end]
+    authority_main = resolve_step.index(
+        'authority_main="$(git rev-parse refs/remotes/origin/main)"'
+    )
+    automatic_authority = resolve_step.index(
+        'git merge-base --is-ancestor "$sha" "$authority_main"'
+    )
+    break_glass_authority = resolve_step.index(
+        'elif [ "$sha" != "$authority_main" ]; then'
+    )
+    trusted_node = resolve_step.index('node_bin="$(command -v node)"')
+    trusted_policy = resolve_step.index(
+        'git show "${authority_main}:scripts/release-intent.mjs" > "$policy"'
+    )
+    target_checkout = resolve_step.index('git checkout --detach "$sha"')
+    intent_execution = resolve_step.index('"$node_bin" "$policy"')
+    runner_state_isolation = tuple(
+        resolve_step.index(marker)
+        for marker in (
+            'GITHUB_ENV="$intent_env"',
+            'GITHUB_PATH="$intent_path"',
+            'GITHUB_STATE="$intent_state"',
+        )
+    )
+    if not (
+        authority_main
+        < automatic_authority
+        < break_glass_authority
+        < trusted_node
+        < trusted_policy
+        < target_checkout
+        < min(runner_state_isolation)
+        <= max(runner_state_isolation)
+        < intent_execution
+    ):
+        raise AssertionError(
+            "release-tag must validate the selected SHA against freshly fetched "
+            "main, copy trusted current-main policy, and isolate runner state "
+            "before checkout or policy execution"
+        )
+    if "node scripts/release-intent.mjs" in resolve_step:
+        raise AssertionError(
+            "release-tag must not execute release policy from the "
+            "payload-selected checkout"
+        )
+
+    for policy in (
+        'name: Release Train',
+        'workflows: ["CI"]',
+        'cron: "7,22,37,52 * * * *"',
+        "types: [release-reconcile]",
+        "contents: read",
+        "issues: write",
+        "pull-requests: write",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+        "github.event.workflow_run.conclusion == 'success'",
+        "environment: release-tag",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        "repositories: kin",
+        "BRANCH: automation/release-next",
+        'git show "refs/remotes/origin/main:${policy}"',
+        'node "$policy_dir/prepare-release.mjs"',
+        'node "$policy_dir/check-release-version.mjs"',
+        'node "$policy_dir/release-intent.mjs"',
+        "release branch contains non-generated paths",
+        "git restore --source refs/remotes/origin/main",
+        '.headRepositoryOwner.login == "firelock-ai"',
+        '.headRepository.nameWithOwner == "firelock-ai/kin"',
+        "highest_tag",
+        "git merge --signoff --no-edit -X ours refs/remotes/origin/main",
+        'gh pr merge "$PR"',
+        "GH_TOKEN: ${{ steps.app-token.outputs.token }}",
+        "--match-head-commit",
+        "--auto",
+        "--squash",
+        "git commit --allow-empty --signoff",
+        "Activate protected checks for the automated release PR",
+        'node "$intent_policy"',
+        'git show "refs/remotes/origin/main:scripts/resolve-release-intent.mjs"',
+        '--base-ref "$tag"',
+        "--head-ref refs/remotes/origin/main",
+        "unsupported immutable release intent",
+        '.squash_merge_commit_title == "PR_TITLE"',
+        '.squash_merge_commit_message == "PR_BODY"',
+        "immutable PR-body release intent requires enforced PR_TITLE + PR_BODY "
+        "squash-only merging",
+    ):
+        require(release_train, policy, "coalescing protected release train")
+    # The release bump must never be resolvable from anything a merged pull
+    # request can still change.
+    for forbidden in (
+        "workflow_dispatch:",
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "git push --force",
+        "git push -f",
+        "client_payload.bump",
+        "OVERRIDE_BUMP",
+        "/pulls\" \\",
+        "raise_bump",
+        "train_labels",
+    ):
+        if forbidden in release_train:
+            raise AssertionError(
+                f"release train contains forbidden authority or history rewrite: {forbidden}"
+            )
+
+    for policy in (
+        "Create the protected `release-tag` Environment",
+        "allows **only `main`**",
+        "forbids",
+        "branch-selectable",
+        "`workflow_dispatch`",
+        "last commit on the default branch",
+        "exists there",
+        "only as `release-tag` Environment secrets",
+        "any other eligible workflow",
+        "repository could explicitly request a broadly scoped secret",
+        "Remove or rotate away every",
+        "organization-level copy visible",
+        "gh api --method POST repos/firelock-ai/kin/dispatches --input -",
+        '{event_type:"release_tag",client_payload:{tag:$tag,sha:$sha}}',
+    ):
+        require(
+            release_bot_doc,
+            policy,
+            "default-branch-pinned release dispatch runbook",
+        )
+    if "Recommended hardening (optional)" in release_bot_doc:
+        raise AssertionError(
+            "release App Environment isolation must be mandatory, not optional"
+        )
+    if "gh workflow run release-tag.yml" in release_bot_doc:
+        raise AssertionError(
+            "release break glass must use typed repository_dispatch, not "
+            "branch-selectable workflow_dispatch"
+        )
+    for policy in (
+        "last commit on the default branch",
+        "exists there",
+        "forbids",
+        "branch-selectable `workflow_dispatch`",
+        "exact current-main payload",
+        "must",
+        "exist only as Environment secrets",
+        "every broader copy must be removed or",
+        "production-ready",
+    ):
+        require(
+            update_trust,
+            policy,
+            "default-branch-pinned release App trust boundary",
+        )
+
+    for policy in (
+        "name: Release Recovery",
+        'workflows: ["Release"]',
+        'cron: "3,18,33,48 * * * *"',
+        "actions: write",
+        "contents: read",
+        "issues: write",
+        "github.event.workflow_run.conclusion == 'failure'",
+        "github.event.workflow_run.conclusion == 'timed_out'",
+        "github.event.workflow_run.conclusion == 'startup_failure'",
+        "actions/workflows/release.yml/runs?per_page=100",
+        '.status == "requested"',
+        '.path == ".github/workflows/release.yml"',
+        '.head_repository.full_name == $repo',
+        "rerun-failed-jobs",
+        '[ "$attempt" -ge 3 ]',
+        "Release blocked after automatic retries",
+    ):
+        require(release_recovery, policy, "bounded automatic release recovery")
+    for forbidden in (
+        "workflow_dispatch:",
+        "contents: write",
+        "packages: write",
+        "id-token: write",
+        "conclusion == 'cancelled'",
+    ):
+        if forbidden in release_recovery:
+            raise AssertionError(
+                f"release recovery contains forbidden authority or retry state: {forbidden}"
+            )
 
     pinned_readme_version = re.search(r"\bv?\d+\.\d+\.\d+\b", readme)
     if pinned_readme_version:
@@ -3189,7 +3503,8 @@ def main() -> None:
         "required check workflow provenance mismatch: {name}",
         "actions: read",
         "filter=all",
-        "app_slug: .app.slug",
+        'app_slug: (.app.slug // "")',
+        "head_branch: .head_branch",
         "check_suite_id: .check_suite.id",
         "workflow_id: .workflow_id",
         "head_sha: .head_sha",
@@ -3267,7 +3582,8 @@ def main() -> None:
                 "id": 8_000,
                 "workflow_id": RELEASE_TAG_WORKFLOW_ID,
                 "path": ".github/workflows/release-tag.yml",
-                "event": "workflow_dispatch",
+                "event": "repository_dispatch",
+                "head_branch": "main",
                 "head_sha": RELEASE_GATE_FIXTURE_SHA,
                 "status": "completed",
                 "conclusion": "failure",
@@ -3280,6 +3596,7 @@ def main() -> None:
                 "status": "completed",
                 "conclusion": "failure",
                 "id": 8_001,
+                "app_id": GITHUB_ACTIONS_APP_ID,
                 "app_slug": "github-actions",
                 "check_suite_id": 105,
                 "head_sha": RELEASE_GATE_FIXTURE_SHA,
@@ -3308,6 +3625,7 @@ def main() -> None:
                 "workflow_id": 999,
                 "path": ".github/workflows/mint-name-spoof.yml",
                 "event": "push",
+                "head_branch": "main",
                 "head_sha": RELEASE_GATE_FIXTURE_SHA,
                 "status": "completed",
                 "conclusion": "failure",
@@ -3320,6 +3638,7 @@ def main() -> None:
                 "status": "completed",
                 "conclusion": "failure",
                 "id": 8_101,
+                "app_id": GITHUB_ACTIONS_APP_ID,
                 "app_slug": "github-actions",
                 "check_suite_id": 106,
                 "head_sha": RELEASE_GATE_FIXTURE_SHA,
@@ -3358,6 +3677,7 @@ def main() -> None:
                 "workflow_id": 999,
                 "path": ".github/workflows/required-context-spoof.yaml",
                 "event": "push",
+                "head_branch": "main",
                 "head_sha": RELEASE_GATE_FIXTURE_SHA,
                 "status": "completed",
                 "conclusion": "success",
@@ -3368,7 +3688,10 @@ def main() -> None:
     assert_release_gate_fixture_rejected(
         release_gate,
         "higher-ID same-name success masks a failed required producer",
-        "ambiguous required check: Check & Test (ubuntu-latest) (2 check-runs)",
+        (
+            "required check workflow provenance mismatch: "
+            "Check & Test (ubuntu-latest)"
+        ),
         add_higher_id_success_collision,
     )
 
@@ -3384,9 +3707,116 @@ def main() -> None:
     assert_release_gate_fixture_rejected(
         release_gate,
         "two successful check-runs claim one required context",
-        "ambiguous required check: cargo-deny (2 check-runs)",
+        "ambiguous required check: cargo-deny (2 check-runs under one provenance)",
         add_duplicate_success,
     )
+
+    def add_merge_queue_producer(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A landing through the merge queue publishes the same contexts twice."""
+
+        queue_branch = "gh-readonly-queue/main/pr-1-" + "0" * 40
+        for path, suite in (
+            (".github/workflows/ci.yml", 201),
+            (".github/workflows/sast.yml", 202),
+            (".github/workflows/secret-scan.yml", 203),
+        ):
+            source = workflow_fixture(
+                workflow_runs,
+                next(
+                    run["check_suite_id"]
+                    for run in workflow_runs
+                    if run.get("path") == path
+                ),
+            ).copy()
+            source.update(
+                {
+                    "id": suite * 10,
+                    "event": (
+                        "push" if path.endswith("secret-scan.yml") else "merge_group"
+                    ),
+                    "head_branch": queue_branch,
+                    "check_suite_id": suite,
+                }
+            )
+            workflow_runs.append(source)
+        for name in REQUIRED_RELEASE_CHECKS:
+            _, workflow_path, _ = REQUIRED_RELEASE_CHECK_PROVENANCE[name]
+            queue_copy = required_check_fixture(check_runs, name).copy()
+            queue_copy.update(
+                {
+                    "id": 20_000 + len(check_runs),
+                    "check_suite_id": {
+                        ".github/workflows/ci.yml": 201,
+                        ".github/workflows/sast.yml": 202,
+                        ".github/workflows/secret-scan.yml": 203,
+                    }[workflow_path],
+                    # The queue build deliberately skips the legs that only the
+                    # landing push runs for real.
+                    "conclusion": "skipped",
+                }
+            )
+            check_runs.append(queue_copy)
+
+    merge_queue_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=add_merge_queue_producer,
+    )
+    if merge_queue_fixture.returncode != 0:
+        raise AssertionError(
+            "a merge-queue landing's duplicate contexts blocked the release: "
+            f"{merge_queue_fixture.stdout}{merge_queue_fixture.stderr}"
+        )
+
+    def only_merge_queue_producer(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """Before the landing push runs, only queue evidence exists."""
+
+        add_merge_queue_producer(check_runs, workflow_runs, current_run)
+        release_suites = {
+            run["check_suite_id"]
+            for run in workflow_runs
+            if run.get("head_branch") == "main"
+            and run.get("path")
+            in (
+                ".github/workflows/ci.yml",
+                ".github/workflows/sast.yml",
+                ".github/workflows/secret-scan.yml",
+            )
+        }
+        check_runs[:] = [
+            run for run in check_runs if run["check_suite_id"] not in release_suites
+        ]
+        workflow_runs[:] = [
+            run
+            for run in workflow_runs
+            if run.get("check_suite_id") not in release_suites
+        ]
+
+    queue_only_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=only_merge_queue_producer,
+    )
+    if queue_only_fixture.returncode == 0:
+        raise AssertionError(
+            "the merge queue's skipped build was admitted as release evidence"
+        )
+    for name in REQUIRED_RELEASE_CHECKS:
+        expected = f"missing required check: {name}"
+        if expected not in queue_only_fixture.stdout + queue_only_fixture.stderr:
+            raise AssertionError(
+                "queue-only evidence was refused without naming the missing "
+                f"producer: {name}: {queue_only_fixture.stdout}"
+                f"{queue_only_fixture.stderr}"
+            )
 
     def change_required_workflow_path(
         check_runs: list[dict[str, object]],
@@ -3490,7 +3920,7 @@ def main() -> None:
     assert_release_gate_fixture_rejected(
         release_gate,
         "required check comes from a different checks app",
-        "required check has wrong app authority: DCO Sign-off",
+        "required check name claimed by another app: DCO Sign-off",
         change_required_check_app,
     )
 
@@ -3933,7 +4363,7 @@ jobs:
                 )
 
         if "workflow_dispatch:" in content and re.search(
-            r"secrets\.(?:KIN_[A-Z0-9_]*TOKEN|NPM_TOKEN|WIF_PROVIDER|WIF_SERVICE_ACCOUNT)",
+            r"secrets\.(?:KIN_[A-Z0-9_]*(?:TOKEN|KEY|APP_ID)|NPM_TOKEN|WIF_PROVIDER|WIF_SERVICE_ACCOUNT)",
             content,
         ):
             raise AssertionError(
@@ -3941,9 +4371,9 @@ jobs:
             )
 
     print(
-        "release workflow authority is tag-only, protected, pinned, GCP-free, "
-        "cross-platform byte-canonical, and npm automatic through short-lived "
-        "OIDC with post-public proof"
+        "release workflow authority is reviewed-PR to App-tag automatic, "
+        "protected, pinned, GCP-free, cross-platform byte-canonical, and npm "
+        "automatic through short-lived OIDC with post-public proof"
     )
 
 

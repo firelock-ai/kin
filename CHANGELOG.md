@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-30
+
+### Breaking
+
+- Repository-v6 authority replaces the legacy Git-compatibility command path.
+  Session execution is now graph-backed; the former `kin run` alias and remote
+  daemon exec endpoint are removed.
+- Graph storage moves to on-disk snapshot format 13. A Kin binary accepts
+  exactly one on-disk format, so no repository initialized by v0.3.6, which
+  wrote format 12, opens under v0.4.0. Re-initialize the repository against its
+  source of truth. This is the standing pre-release storage posture rather than
+  something this release introduces: v0.3.6 accepted only the one format it
+  wrote, and so does this one. The accepted range widens when the format is
+  declared stable, not before.
+
+### Changed
+
+- Reviewed `main` drift now coalesces into one protected release PR, then a
+  scoped GitHub App automatically admits and tags the exact green release
+  commit. The existing signed release, installer, and hosted promotion chain
+  remains fail closed.
+- Give Kin its own macOS notification identity (#443)
+- docs: clarify Git hook safety (#444)
+- Cut Kin over to exact repository-v6 authority and retire the legacy Git-compatibility surface (#447)
+- Let the archive stager accept the macOS notification bundle (#446)
+- Narrow the whole-graph entity fallback and compact history output (#445)
+- Make every MCP daemon forward survive repo-daemon idle shutdown (#450)
+- Resolve history and blame revisions from committed state (#448)
+- Resolve compatibility remotes from sealed Git config (#451)
+- Prove and enforce sealed all-content observation at exact Git admission (#449)
+- Close replication preconditions on v6: replica init, pack identity, init determinism (#452)
+- Load LSP source from repository authority and normalize admitted event paths (#453)
+- Keep exact Git admission output replayable (#455)
+- Revalidate the pinned repository namespace on every authority bind and expose checkout (#454)
+- Seal exact workspace and session observation through publication (#456)
+- Bump kin-db to 0.6.4 (#457)
+- Negotiate, transport, and wire native repository-v6 push and pull (#458)
+- Publish repository-v6 semantic merges (#461)
+- README: brand lockup hero, live impact example, dynamic release badge (#463)
+- README: absolute srcset URLs for theme-aware lockup (#464)
+- README: keep theme sources inside the picture element (#465)
+- README: restore policy-compliant release badge (#466)
+- README: badges on one row (#467)
+- Seal exact workspace state as a graph-owned repository stash (#462)
+- Implement the release-ops commands on repository-v6 authority (#460)
+- Run exec, open, with, and shell in exact session projections (#459)
+- Name the upstream commits the historical enrichment fixtures encode (#469)
+- Gate daemon startup on the .kin layout version before manifest parsing (#473)
+- Carry repository-v6 transfers past one envelope and name a stale derived view (#470)
+- Plan daemon workspace transitions from the live graph (#472)
+- Adopt the kin-model merge-transaction schema (#475)
+- Consume kin-db 0.6.7 reopen proof (#476)
+- Pin governance workflows to kin-actions v0.1.21 (#478)
+- Move the Windows release leg off the pull-request path and scope CI caches to trusted refs (#480)
+- Keep a busy daemon distinguishable from a dead one (#481)
+- Read entity body indentation absolutely and surface session expiry (#482)
+- Serve repository CAS bodies at the content address the VFS tree advertises (#484)
+- Resolve capability evidence entries against the test inventory (#485)
+- Report MCP graph status from the fields the daemon emits and traverse neighborhoods in both directions (#487)
+- Bound managed-config discovery to a declared scan root (#490)
+- Scan the graph command modules for file-search authority (#492)
+- Integrate the test-harness build-identity gate, locate result ordering, and deterministic context-pack truncation (#494)
+- Give both daemon spawn paths one contract and stop killing daemons for being slow (#493)
+- Read impact hops from one walk and stop calling harness-run code dead (#491)
+- Report graph health and admission enrichment from graph truth (#483)
+- Fix the cargo-fuzz build and scope the per-PR fuzz job to compiling (#496)
+- Wire kin conflicts and kin resolve onto the durable merge-transaction record (#497)
+- Make the daemon's advertised repo identity routable and restore graph validate notes (#498)
+- Report admission progress by default for init and clone (#505)
+- Scan the daemon crate for file-search authority and pin the fuzz lock (#500)
+- Make the MCP write path tell the truth about what it committed and who committed it (#499)
+- Bind daemon endpoint files to their publisher and commit the ingest CAS barrier (#501)
+- Bind external targets for cross-repo references at admission (#503)
+- Make test subprocesses hermetic, bounded, and tree-owned (#502)
+- Preserve merge bases and fail closed on ambiguous acknowledgements (#506)
+- Run required CI contexts on merge queue groups (#508)
+- Keep Kin MCP auto-init off protocol stdout (#510)
+- Read entity bodies from workspace head truth, one snippet field, 1-based lines (#504)
+- Judge daemon endpoint liveness by incarnation and leave one start contract (#511)
+- Probe what the default log filter admits, not the shape of its directive (#507)
+- Decide test exclusion from cfg predicates and narrow the spawn crate to pins (#509)
+- Execute the gcs feature test suite in the CI check job (#514)
+- Separate an absent repository from a storage fault, and refuse a self-contradicting daemon identity at startup (#513)
+- Bound integration daemon lifetime by the runtime teardown proof (#512)
+- Hold one repository authority for the daemon projection routes (#495)
+- Answer a mis-addressed spine ingest as an unserved repository rather than a daemon fault (#517)
+- Prove process-group containment against exit state, not group membership (#515)
+- Wait out a contended lifecycle lock instead of trusting one syscall (#516)
+- Bind the release tag mint job to the release-tag environment (#520)
+
 ### Fixed
 
 - A daemon that refuses to start can no longer take the running daemon's
@@ -34,6 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local cache before fetching, and an instance whose cache already covers the
   tree does no remote work at all, where every open previously re-fetched every
   body before checking.
+
 
 ## [0.3.6] - 2026-07-26
 
@@ -78,18 +169,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget and, for adaptively sized declarations, within the confident prefix
   (`KIN_LOCATE_FUSED_DECLARATION_CAP`, default 8). Explicit `--max-files`
   widths are honored as-is.
-### Changed
-
-- `kin exec` executes exact argv locally in the materialized session workspace;
-  shell parsing requires one explicitly quoted `--shell` script, the `kin run`
-  compatibility alias is removed, and the redundant daemon remote-exec endpoint
-  no longer exists.
-- Session launchers now require graph-backed materialization from a
-  repository-verified daemon, register one heartbeating session identity for
-  the child lifetime, scrub inherited Git/Compose/Kin path authority, and
-  preserve failed workspaces. `kin open` now supports only the proven blocking
-  lifecycles of VS Code and Cursor.
-
 ## [0.3.4] - 2026-07-24
 
 ### Fixed

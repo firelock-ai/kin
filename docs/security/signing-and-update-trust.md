@@ -56,10 +56,32 @@ after publication. GitHub Latest is promoted only after both packages pass
 every gate.
 
 The protected `release` environment intentionally has no required reviewer.
-After the release captain creates an authorized version tag on reviewed `main`,
-the tag policy, main-ancestor check, exact Trusted Publishing identity, and
-post-publication proofs admit and verify every public release surface without a
-second manual approval.
+After the coalescing release PR passes protected-main checks, the repository-
+scoped release App automatically creates the authorized version tag at that
+exact reviewed commit. The tag policy, main-ancestor check, exact Trusted
+Publishing identity, and post-publication proofs then admit and verify every
+public release surface without a second manual approval. A typed
+`repository_dispatch` is break glass, not the normal release path. GitHub runs
+that event from the last commit on the default branch and only when the workflow
+exists there; the caller cannot select a branch copy of the release controller.
+
+Both workflows that mint an App token declare the separate `release-tag`
+Environment, whose custom deployment policy admits `main` and no other branch.
+That boundary is defense in depth: the tag controller forbids
+branch-selectable `workflow_dispatch`, accepts only the typed `release_tag`
+repository event, validates its authorized actor and exact current-main payload,
+and rechecks main immediately before writing the ref. The App credentials must
+exist only as Environment secrets; repository and organization secrets are
+available to other workflows in scope, so every broader copy must be removed or
+rotated away before the release controller is production-ready.
+
+After GitHub stable/latest, public install proof, both npm packages, and GHCR
+version/latest all succeed, the release publishes deterministic
+`release-promotion.json` plus its checksum and a source-bound GitHub
+attestation. This terminal marker is durable release-completion authority when
+an Actions run record later expires. Its attested stable run ID preserves
+downstream audit linkage without making the mutable Actions API authoritative;
+aggregate archive provenance alone is not.
 
 The daemon container is a separate attested subject. The protected tag workflow
 builds one exact commit-tagged image in GHCR, verifies its embedded source and
