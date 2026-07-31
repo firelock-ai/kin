@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+name: CoE Probe
+on:
+  push:
+    branches: [chore/lane-coe-probe-kin]
+permissions:
+  contents: read
+jobs:
+  a-coe-failing-step:
+    name: probe A job-coe failing step
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - run: exit 1
+  b-plain-failing-step:
+    name: probe B no-coe failing step
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  c-coe-timeout:
+    name: probe C job-coe timeout
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 1
+    steps:
+      - run: sleep 150
+  d-fixed-body:
+    name: probe D fixed step body
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify
+        id: verify
+        shell: bash --noprofile --norc {0}
+        run: |
+          set -uo pipefail
+          set +e
+          bash -c 'echo "::error::stub prover failed"; exit 1' 2>&1 | tee /tmp/probe.log
+          status="${PIPESTATUS[0]}"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "REACHED-CAPTURE status=${status}"
+          exit 0
+      - name: alarm
+        if: always() && steps.verify.outputs.status == '1'
+        run: echo "ALARM FIRED with status=${{ steps.verify.outputs.status }}"
