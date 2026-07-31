@@ -2929,7 +2929,7 @@ mod tests {
         // This worker is deliberately killed as a process-group member. Moving
         // the handle out of Drop makes that intentional non-wait explicit.
         std::mem::forget(child);
-        std::fs::write(&report, format!("{child_id}\n")).expect("publish late inherited member");
+        publish_test_report(&report, format!("{child_id}\n"));
         if std::env::var_os(LATE_RELAY_ESCAPE_CHILD_ENV).is_some() {
             return;
         }
@@ -2983,11 +2983,10 @@ mod tests {
         // The hard `_exit` below intentionally bypasses Rust cleanup so the
         // watcher, rather than this driver, must reap the containment tree.
         std::mem::forget(member);
-        std::fs::write(
-            report_path,
+        publish_test_report(
+            &report_path,
             format!("{watcher_id} {process_group} {member_id}\n"),
-        )
-        .expect("publish owner-death process ids");
+        );
 
         // Do not unwind and do not run `ProcessGroupGuardian::drop`. Exact PPID
         // change (with ownership EOF as a secondary trigger) is under test.
@@ -3024,15 +3023,14 @@ mod tests {
                 |_| {},
             )
             .expect("spawn pre-exec stall guardian");
-        std::fs::write(
+        publish_test_report(
             &report_path,
             format!(
                 "{} {}\n",
                 guardian.watcher_id().expect("owned watcher"),
                 guardian.process_group()
             ),
-        )
-        .expect("publish pre-exec stall guardian ids");
+        );
 
         let stalled_path =
             CString::new(stalled_path.as_os_str().as_bytes()).expect("NUL-free stall marker");
@@ -3902,6 +3900,20 @@ mod tests {
         wait_for_test_pid_gone(pids[0], Duration::from_secs(5));
         wait_for_test_pid_gone(pids[1], Duration::from_secs(5));
         wait_for_test_pid_gone(pids[2], Duration::from_secs(5));
+    }
+
+    // A report file is a rendezvous: a worker publishes process ids and the
+    // test polls for the path and parses what it finds. `fs::write` creates the
+    // file before it writes any bytes, so a poller can observe the path and
+    // read an empty file, which surfaces as a parse error on a value the worker
+    // did produce. Publish through a temporary sibling and one rename, the same
+    // way the guardian publishes its own readiness, so the path appears only
+    // once its contents are complete.
+    #[cfg(unix)]
+    fn publish_test_report(path: &Path, contents: impl AsRef<[u8]>) {
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&temporary, contents).expect("stage test report");
+        std::fs::rename(&temporary, path).expect("publish test report");
     }
 
     #[cfg(unix)]
