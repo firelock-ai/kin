@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "abandoned": [
+    {
+      "tag": "v0.4.3",
+      "sha": "72149519de5451fcbd441bfb0641a6224a57268d",
+      "reason": "The tagged lockfile immutably pins kin-db 0.7.6, which cannot compile for the musl release targets, so no Linux artifact can ever be produced from this commit. Automatic release recovery exhausted its bounded retries, no GitHub Release object was ever published, and the tag produced zero artifacts.",
+      "superseded_by": "v0.4.4",
+      "failed_release_run_id": "30627672394"
+    }
+  ]
+}

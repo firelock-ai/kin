@@ -155,13 +155,45 @@ jobs:
           print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])
           ')"
           tag="v${version}"
-          highest_tag=""
-          while IFS= read -r candidate_tag; do
-            if [[ "$candidate_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              highest_tag="$candidate_tag"
-              break
-            fi
-          done < <(git tag --list --sort=-v:refname)
+          # The same serialization predicate the tag mint admits against, and
+          # the same waiver. Fixing only the mint would leave this side wedged:
+          # an abandoned tag that stays highest here stops the version bump PR
+          # from ever opening, so the version never moves and the mint has
+          # nothing new to tag. Only a reviewed abandonment record skips a tag,
+          # read from protected main together with the selector that reads it.
+          #
+          # The selector's mint-intent argument is empty here on purpose. This
+          # step resolves drift and opens a version bump PR; it never creates a
+          # tag, and $tag below is the pre-existing base it measures drift from.
+          # Handing that base over as mint intent would refuse precisely when a
+          # record covers it, and a record always covers it: the mint only
+          # creates v$(workspace version), so main's version equals the stuck
+          # tag and cannot move until this step opens the bump that a record is
+          # written to unblock.
+          train_policy="$RUNNER_TEMP/release-train-policy"
+          mkdir -p "$train_policy"
+          abandoned="$train_policy/abandoned-release-tags.json"
+          selector="$train_policy/select-admissible-release-tag.py"
+          git show \
+            "refs/remotes/origin/main:scripts/abandoned-release-tags.json" \
+            > "$abandoned"
+          git show \
+            "refs/remotes/origin/main:scripts/select-admissible-release-tag.py" \
+            > "$selector"
+          test -s "$abandoned"
+          test -s "$selector"
+          candidate_tags="$train_policy/release-tags"
+          git for-each-ref \
+            --sort=-v:refname \
+            --format='%(refname:strip=2) %(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)' \
+            refs/tags > "$candidate_tags"
+          admissible="$train_policy/highest-admissible-tag"
+          python3 "$selector" \
+            "$abandoned" \
+            "$candidate_tags" \
+            "" \
+            "$admissible"
+          highest_tag="$(cat "$admissible")"
           latest_tag="$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)"
           if [ -z "$highest_tag" ] || [ "$highest_tag" != "$latest_tag" ]; then
             echo "::notice::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery owns this state."

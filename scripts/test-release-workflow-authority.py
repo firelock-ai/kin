@@ -31,6 +31,27 @@ INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
+ABANDONED_TAGS = ROOT / "scripts" / "abandoned-release-tags.json"
+TAG_SELECTOR = ROOT / "scripts" / "select-admissible-release-tag.py"
+ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
+TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
+TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
+TAG_LISTING_FORMAT = (
+    "--format='%(refname:strip=2) "
+    "%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)'"
+)
+# Which tag each workflow declares it is about to create. Only the mint creates
+# one, so only the mint names it. The train resolves drift from a base tag it
+# never mints, and handing that base over as mint intent refuses exactly when a
+# record covers it, which is always the moment a record is written: the mint
+# only ever creates `v$(workspace version)`, so main's version equals the stuck
+# tag until the train opens the bump the record exists to unblock. The empty
+# argument is spelled as a literal rather than an expanded variable so that
+# refilling it is a visible diff here and not a silent assignment upstream.
+EXPECTED_SELECTOR_INVOCATIONS = {
+    "release-tag": ('"$abandoned"', '"$candidate_tags"', '"$TAG"', '"$admissible"'),
+    "release-train": ('"$abandoned"', '"$candidate_tags"', '""', '"$admissible"'),
+}
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
@@ -1953,6 +1974,441 @@ def assert_release_check_accepted(
         )
 
 
+def run_tag_selector(
+    manifest: str,
+    candidates: str,
+    minting_tag: str = "",
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Execute the shipped admission selector against fixture inputs."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = Path(directory)
+        manifest_path = fixture / "abandoned-release-tags.json"
+        manifest_path.write_text(manifest, encoding="utf-8")
+        candidates_path = fixture / "release-tags"
+        candidates_path.write_text(candidates, encoding="utf-8")
+        selected_path = fixture / "highest-admissible-tag"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(TAG_SELECTOR),
+                str(manifest_path),
+                str(candidates_path),
+                minting_tag,
+                str(selected_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        selected = ""
+        if selected_path.exists():
+            selected = selected_path.read_text(encoding="utf-8")
+    return completed, selected
+
+
+def assert_admissible_tag(
+    label: str,
+    manifest: str,
+    candidates: str,
+    expected: str,
+    *,
+    minting_tag: str = "",
+) -> None:
+    """Require the selector to name exactly the tag the rail must wait on."""
+
+    completed, selected = run_tag_selector(manifest, candidates, minting_tag)
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"release-lane admission refused {label}: "
+            f"{completed.stdout}{completed.stderr}"
+        )
+    if selected != expected:
+        raise AssertionError(
+            f"release-lane admission selected {selected or '<none>'} for "
+            f"{label}, expected {expected or '<none>'}"
+        )
+
+
+def assert_tag_selection_refused(
+    label: str,
+    manifest: str,
+    candidates: str,
+    expected_error: str,
+    *,
+    minting_tag: str = "",
+) -> None:
+    """Require a loud, named refusal rather than a silently degraded skip."""
+
+    completed, selected = run_tag_selector(manifest, candidates, minting_tag)
+    output = completed.stdout + completed.stderr
+    if completed.returncode == 0:
+        raise AssertionError(f"release-lane admission accepted {label}: {output}")
+    if expected_error not in output:
+        raise AssertionError(
+            f"release-lane admission refused {label} for the wrong reason: {output}"
+        )
+    if selected:
+        raise AssertionError(
+            f"release-lane admission named {selected} while refusing {label}"
+        )
+
+
+def abandonment_manifest(*records: dict[str, str]) -> str:
+    """Serialize an abandonment record the way the tracked file carries it."""
+
+    return json.dumps({"schema_version": 1, "abandoned": list(records)})
+
+
+def workflow_step_source(workflow: str, content: str, step_anchor: str) -> str:
+    """Extract one named workflow step so its internal order can be judged."""
+
+    if step_anchor not in content:
+        raise AssertionError(
+            f"{workflow} no longer carries the step that owns release-lane "
+            f"admission: {step_anchor.strip()}"
+        )
+    start = content.index(step_anchor)
+    if "\n      - name:" not in content[start + 1 :]:
+        raise AssertionError(
+            f"{workflow} admission step is no longer followed by another step, "
+            "so its boundary cannot be resolved"
+        )
+    return content[start : content.index("\n      - name:", start + 1)]
+
+
+def assert_trusted_abandonment_reads(workflow: str, content: str) -> None:
+    """Both admission policies must come from protected main, nowhere else."""
+
+    for policy in (ABANDONED_TAGS_POLICY, TAG_SELECTOR_POLICY):
+        index = content.find(policy)
+        if index < 0:
+            raise AssertionError(f"{workflow} never reads {policy}")
+        while index >= 0:
+            prefix = content[max(0, index - len(TRUSTED_POLICY_PREFIX)) : index]
+            if prefix != TRUSTED_POLICY_PREFIX:
+                raise AssertionError(
+                    f"{workflow} reads {policy} from something other than "
+                    "protected main. The release commit under admission can "
+                    "predate the abandonment it must honour, so reading either "
+                    "policy from the checkout re-deadlocks the lane it unblocks"
+                )
+            index = content.find(policy, index + 1)
+
+
+def assert_admission_step_order(
+    workflow: str,
+    content: str,
+    step_anchor: str,
+    comparison: str,
+) -> None:
+    """The waiver must be read, then applied, before the lane predicate runs."""
+
+    step = workflow_step_source(workflow, content, step_anchor)
+    manifest_read = step.index(f"{TRUSTED_POLICY_PREFIX}{ABANDONED_TAGS_POLICY}")
+    selector_read = step.index(f"{TRUSTED_POLICY_PREFIX}{TAG_SELECTOR_POLICY}")
+    selection = step.index('python3 "$selector"')
+    adoption = step.index('highest_tag="$(cat "$admissible")"')
+    predicate = step.index(comparison)
+    if not manifest_read < selector_read < selection < adoption < predicate:
+        raise AssertionError(
+            f"{workflow} must read the reviewed abandonment record and its "
+            "selector from protected main, resolve the highest admissible tag, "
+            "and only then admit against finalized GitHub Latest"
+        )
+    if "git tag --list" in step:
+        raise AssertionError(
+            f"{workflow} still ranks release tags without consulting the "
+            "reviewed abandonment record"
+        )
+
+
+def selector_invocation(workflow: str, content: str) -> tuple[str, ...]:
+    """Return the exact argument list a workflow hands the admission selector."""
+
+    anchor = 'python3 "$selector" \\\n'
+    if anchor not in content:
+        raise AssertionError(
+            f"{workflow} no longer invokes the admission selector as a "
+            "reviewable multi-line argument list"
+        )
+    arguments: list[str] = []
+    for line in content[content.index(anchor) + len(anchor) :].splitlines():
+        argument = line.strip()
+        if argument.endswith("\\"):
+            arguments.append(argument[:-1].strip())
+            continue
+        arguments.append(argument)
+        break
+    return tuple(arguments)
+
+
+def assert_selector_arguments(release_tag: str, release_train: str) -> None:
+    """Pin which tag each workflow declares it is about to mint."""
+
+    actual = {
+        "release-tag": selector_invocation("release-tag", release_tag),
+        "release-train": selector_invocation("release-train", release_train),
+    }
+    if actual != EXPECTED_SELECTOR_INVOCATIONS:
+        raise AssertionError(
+            "each release workflow must hand the admission selector its own "
+            "reviewed arguments. The mint-intent argument names the tag that "
+            "workflow is about to create, and only the mint creates one. The "
+            "train resolves drift from a base tag it never mints, so naming "
+            "that base as mint intent refuses exactly when a record covers it, "
+            f"which is every abandonment: expected={EXPECTED_SELECTOR_INVOCATIONS} "
+            f"actual={actual}"
+        )
+
+
+def assert_abandoned_tag_admission(release_tag: str, release_train: str) -> None:
+    """Only a reviewed record may waive release-lane serialization."""
+
+    assert_selector_arguments(release_tag, release_train)
+
+    for workflow, content, step_anchor, comparison in (
+        (
+            "release-tag",
+            release_tag,
+            "      - name: Admit the serialized release lane\n",
+            '[ "$highest_tag" != "$latest_tag" ]',
+        ),
+        (
+            "release-train",
+            release_train,
+            "      - name: Resolve releasable drift and SemVer intent\n",
+            '[ "$highest_tag" != "$latest_tag" ]',
+        ),
+    ):
+        assert_trusted_abandonment_reads(workflow, content)
+        assert_admission_step_order(workflow, content, step_anchor, comparison)
+
+    unbuildable = "1" * 40
+    superseding = "2" * 40
+    stable = "3" * 40
+    older = "4" * 40
+    unversioned = "5" * 40
+    # A non-release tag ahead of every version tag, because the version filter
+    # has to survive whatever else the repository has tagged.
+    candidates = (
+        f"nightly {unversioned}\n"
+        f"v0.4.3 {unbuildable}\n"
+        f"v0.3.6 {stable}\n"
+        f"v0.3.5 {older}\n"
+    )
+    record = {
+        "tag": "v0.4.3",
+        "sha": unbuildable,
+        "reason": "the tagged lockfile pins a dependency that cannot build",
+        "superseded_by": "v0.4.4",
+        "failed_release_run_id": "30627672394",
+    }
+
+    # The invariant this whole gate exists for: a tag that is only failing so
+    # far is not skippable, so it still holds its successor. Nothing but a
+    # reviewed record changes that, and a record that does not describe the tag
+    # in the repository is not one.
+    assert_admissible_tag(
+        "an unlisted tag whose release keeps failing",
+        abandonment_manifest(),
+        candidates,
+        "v0.4.3",
+    )
+    assert_admissible_tag(
+        "an abandonment naming a different tag",
+        abandonment_manifest({**record, "tag": "v0.3.5", "sha": older}),
+        candidates,
+        "v0.4.3",
+    )
+    assert_admissible_tag(
+        "an abandonment of a tag that no longer exists",
+        abandonment_manifest({**record, "tag": "v0.9.9"}),
+        candidates,
+        "v0.4.3",
+    )
+    assert_tag_selection_refused(
+        "an abandonment whose tag has since moved",
+        abandonment_manifest({**record, "sha": superseding}),
+        candidates,
+        f"abandonment of v0.4.3 waives {superseding} but the tag now names",
+    )
+
+    # With the record present the unbuildable tag stops holding the lane, and
+    # ranking otherwise stays exactly what git already decided.
+    assert_admissible_tag(
+        "a reviewed abandonment",
+        abandonment_manifest(record),
+        candidates,
+        "v0.3.6",
+    )
+    assert_admissible_tag(
+        "consecutive reviewed abandonments",
+        abandonment_manifest(
+            record,
+            {**record, "tag": "v0.3.6", "sha": stable, "superseded_by": "v0.4.4"},
+        ),
+        candidates,
+        "v0.3.5",
+    )
+    assert_admissible_tag(
+        "an abandonment of every version tag",
+        abandonment_manifest(
+            record,
+            {**record, "tag": "v0.3.6", "sha": stable, "superseded_by": "v0.4.4"},
+            {**record, "tag": "v0.3.5", "sha": older, "superseded_by": "v0.4.4"},
+        ),
+        candidates,
+        "",
+    )
+    # The mint-intent contract, in the state that actually occurs. A record is
+    # written the moment a release is stuck, and main's version still equals the
+    # stuck tag then, because the mint only ever creates `v$(workspace version)`
+    # and the bump that moves main past it is the thing being unblocked. So the
+    # tag under a fresh record IS the tag both workflows are holding. Naming it
+    # as mint intent must refuse, and resolving drift without naming it must
+    # walk past it. Getting this backwards turns the record's own scenario into
+    # a permanently failing scheduled workflow.
+    assert_tag_selection_refused(
+        "minting a tag that is itself recorded as abandoned",
+        abandonment_manifest(record),
+        candidates,
+        "v0.4.3 is recorded as an abandoned release tag and must not be released",
+        minting_tag="v0.4.3",
+    )
+    assert_admissible_tag(
+        "resolving drift in the same state, declaring no mint intent",
+        abandonment_manifest(record),
+        candidates,
+        "v0.3.6",
+        minting_tag="",
+    )
+
+    for label, manifest, expected_error in (
+        ("a manifest that is not JSON", "{not json", "is not valid JSON"),
+        ("a manifest that is a JSON array", "[]", "must be a JSON object"),
+        (
+            "a manifest declaring another schema",
+            json.dumps({"schema_version": 2, "abandoned": []}),
+            "must declare schema_version 1",
+        ),
+        (
+            "a manifest carrying an unreviewed key",
+            json.dumps({"schema_version": 1, "abandoned": [], "waive_all": True}),
+            "unreviewed keys: waive_all",
+        ),
+        (
+            "a manifest with no abandonment array",
+            json.dumps({"schema_version": 1}),
+            "must carry an 'abandoned' array",
+        ),
+        (
+            "a manifest whose abandonments are an object",
+            json.dumps({"schema_version": 1, "abandoned": {}}),
+            "must carry an 'abandoned' array",
+        ),
+        (
+            "an abandonment that is a bare tag string",
+            json.dumps({"schema_version": 1, "abandoned": ["v0.4.3"]}),
+            "every abandonment entry must be a JSON object",
+        ),
+        (
+            "an abandonment carrying an unreviewed field",
+            abandonment_manifest({**record, "force": "yes"}),
+            "unreviewed fields: force",
+        ),
+        (
+            "an abandonment with no reason",
+            abandonment_manifest(
+                {key: value for key, value in record.items() if key != "reason"}
+            ),
+            "missing required evidence: reason",
+        ),
+        (
+            "an abandonment whose reason is blank",
+            abandonment_manifest({**record, "reason": "   "}),
+            "missing required evidence: reason",
+        ),
+        (
+            "an abandonment with no superseding tag",
+            abandonment_manifest(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key != "superseded_by"
+                }
+            ),
+            "missing required evidence: superseded_by",
+        ),
+        (
+            "an abandonment that is not a release tag",
+            abandonment_manifest({**record, "tag": "0.4.3"}),
+            "abandoned tag '0.4.3' is not a vX.Y.Z release tag",
+        ),
+        (
+            "an abandonment with an abbreviated commit",
+            abandonment_manifest({**record, "sha": unbuildable[:12]}),
+            "must record the exact 40-hex commit it waives",
+        ),
+        (
+            "an abandonment superseded by a non-release tag",
+            abandonment_manifest({**record, "superseded_by": "main"}),
+            "must name a vX.Y.Z superseding tag",
+        ),
+        (
+            "an abandonment superseded by itself",
+            abandonment_manifest({**record, "superseded_by": record["tag"]}),
+            "cannot name itself as its successor",
+        ),
+        (
+            "an abandonment citing no failed run",
+            abandonment_manifest({**record, "failed_release_run_id": "0"}),
+            "must cite the Release run id that failed",
+        ),
+        (
+            "an abandonment recorded twice",
+            abandonment_manifest(record, record),
+            "v0.4.3 is recorded as abandoned more than once",
+        ),
+    ):
+        assert_tag_selection_refused(label, manifest, candidates, expected_error)
+
+    assert_tag_selection_refused(
+        "a tag listing with no commit",
+        abandonment_manifest(record),
+        "v0.4.3\n",
+        "release tag listing carries an unreadable record",
+    )
+    assert_tag_selection_refused(
+        "a tag listed against two commits",
+        abandonment_manifest(record),
+        f"v0.3.6 {stable}\nv0.3.6 {older}\n",
+        "release tag v0.3.6 was listed against two different commits",
+    )
+
+    # The tracked record itself is release authority, so it is exercised rather
+    # than trusted: every entry it carries must survive the same validation and
+    # actually stop holding the lane.
+    shipped = ABANDONED_TAGS.read_text(encoding="utf-8")
+    entries = json.loads(shipped)["abandoned"]
+    if not entries:
+        raise AssertionError(
+            "the tracked abandonment record must stay a reviewed ledger of "
+            "every tag the release rail has given up on"
+        )
+    floor = "v0.0.1"
+    shipped_candidates = "".join(
+        f"{entry['tag']} {entry['sha']}\n" for entry in entries
+    )
+    assert_admissible_tag(
+        "the tracked abandonment record",
+        shipped,
+        f"{shipped_candidates}{floor} {'9' * 40}\n",
+        floor,
+    )
+
+
 def main() -> None:
     retired = (
         "auto-tag-release.yml",
@@ -2228,6 +2684,12 @@ def main() -> None:
         "markerless logless fallback is retired",
         "matching_count",
         "highest_tag",
+        "refs/remotes/origin/main:scripts/abandoned-release-tags.json",
+        "refs/remotes/origin/main:scripts/select-admissible-release-tag.py",
+        "git for-each-ref",
+        TAG_LISTING_FORMAT,
+        'python3 "$selector"',
+        'highest_tag="$(cat "$admissible")"',
         "REQUIRED_CHECKS:",
         'GITHUB_ACTIONS_APP_ID: "15368"',
         "GITHUB_ACTIONS_APP_SLUG: github-actions",
@@ -2338,6 +2800,12 @@ def main() -> None:
         '.headRepositoryOwner.login == "firelock-ai"',
         '.headRepository.nameWithOwner == "firelock-ai/kin"',
         "highest_tag",
+        "refs/remotes/origin/main:scripts/abandoned-release-tags.json",
+        "refs/remotes/origin/main:scripts/select-admissible-release-tag.py",
+        "git for-each-ref",
+        TAG_LISTING_FORMAT,
+        'python3 "$selector"',
+        'highest_tag="$(cat "$admissible")"',
         "git merge --signoff --no-edit -X ours refs/remotes/origin/main",
         'gh pr merge "$PR"',
         "GH_TOKEN: ${{ steps.app-token.outputs.token }}",
@@ -2366,6 +2834,7 @@ def main() -> None:
     ):
         require(release_train, policy, "coalescing protected release train")
     assert_merge_policy_gate(release_train)
+    assert_abandoned_tag_admission(release_tag, release_train)
     # The release bump must never be resolvable from anything a merged pull
     # request can still change.
     for forbidden in (
