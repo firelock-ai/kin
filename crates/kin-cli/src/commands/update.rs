@@ -14993,36 +14993,65 @@ cwd = {:?}
         assert!(format!("{error:#}").contains("inspection bound"));
     }
 
+    /// A permissive umask must not widen the private updater root.
+    ///
+    /// The observation runs in a worker process because the file-creation mask
+    /// is process-global, exactly like the environment table: every directory
+    /// any concurrently running test creates while this one holds `umask(0)`
+    /// comes out world-writable, and Kin's own namespace-safety checks then
+    /// refuse those directories. The failures land on whatever test happened to
+    /// be creating a temporary directory in that window, which is why the set
+    /// moved run to run. `#[serial]` cannot prevent it: it orders a test only
+    /// against other serial tests, not against the thousand running beside it.
+    /// The restrictive-umask tests in `setup.rs` already take this shape.
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn private_root_is_atomically_0700_even_with_umask_zero() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                // SAFETY: umask accepts every mode value and has no pointer arguments.
-                unsafe { libc::umask(self.0) };
-            }
+        const WORKER_ROOT: &str = "KIN_UPDATE_TEST_PRIVATE_ROOT_UMASK_ROOT";
+
+        if let Some(root) = std::env::var_os(WORKER_ROOT) {
+            let root = PathBuf::from(root);
+            // SAFETY: umask accepts every mode value and has no pointer
+            // arguments. This process exists only to hold the permissive mask.
+            unsafe { libc::umask(0) };
+            let private =
+                PrivateUpdaterTempDir::create(&root, PREFLIGHT_TEMP_PREFIX, "atomic-mode-test")
+                    .unwrap();
+            assert_eq!(
+                fs::symlink_metadata(private.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            return;
         }
 
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("observed-mode");
-        let _observe = EnvVarGuard::set("KIN_UPDATE_TEST_PRIVATE_CREATE_OBSERVE", &marker);
-        // SAFETY: umask accepts every mode value and has no pointer arguments.
-        let _umask = UmaskGuard(unsafe { libc::umask(0) });
-        let root =
-            PrivateUpdaterTempDir::create(temp.path(), PREFLIGHT_TEMP_PREFIX, "atomic-mode-test")
-                .unwrap();
-        assert_eq!(fs::read_to_string(&marker).unwrap(), "700");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::update::tests::private_root_is_atomically_0700_even_with_umask_zero",
+                "--nocapture",
+            ])
+            .env(WORKER_ROOT, temp.path())
+            .env("KIN_UPDATE_TEST_PRIVATE_CREATE_OBSERVE", &marker);
+        let output = test_subprocess_output(command, "private updater root under umask 0").unwrap();
+        assert!(
+            output.status.success(),
+            "worker output: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
-            fs::symlink_metadata(root.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
+            fs::read_to_string(&marker).unwrap(),
+            "700",
+            "creation must request 0700 atomically rather than widen and repair"
         );
     }
 
