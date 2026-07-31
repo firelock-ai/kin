@@ -203,7 +203,7 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
             "kin {args:?} must no longer answer from the capability gate: {stderr}"
         );
         assert!(
-            stderr.contains("not inside a Kin repository"),
+            stderr.contains("not a Kin repository"),
             "kin {args:?} must reach the session surface and fail on discovery: {stderr}"
         );
     }
