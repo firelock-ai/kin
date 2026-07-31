@@ -3392,6 +3392,67 @@ mod tests {
         assert_test_child_reaped(sentinel_pid);
     }
 
+    /// A target that enters a second stop is exactly the shape a single
+    /// fire-and-forget `SIGCONT` cannot clear, so this pins the property the
+    /// fork-boundary handshake depends on: a release is complete only once the
+    /// target's own progress proves it is running, not once a signal has been
+    /// sent. Replace [`resume_test_pid_until`] with a bare `kill(SIGCONT)` and
+    /// the child never reaches its marker, so this goes red.
+    #[cfg(unix)]
+    #[test]
+    fn resuming_a_stopped_target_clears_every_stop_it_enters() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("resumed");
+        // Built before the fork: the child runs between a fork and an `_exit`
+        // in a multi-threaded process, where allocating can deadlock against a
+        // lock another thread held at fork time.
+        let marker_path = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+
+        let child = unsafe { libc::fork() };
+        assert_ne!(child, -1, "fork resume-probe child");
+        if child == 0 {
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+                libc::raise(libc::SIGSTOP);
+                let fd = libc::open(
+                    marker_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    0o600 as libc::c_int,
+                );
+                if fd < 0 {
+                    libc::_exit(1);
+                }
+                let body = b"resumed\n";
+                let written = libc::write(fd, body.as_ptr().cast(), body.len());
+                libc::close(fd);
+                if written != body.len() as isize {
+                    libc::_exit(1);
+                }
+                // Park rather than exit, matching the worker this helper serves.
+                // A target that exits inside the helper's window would have its
+                // status collected there instead of by the caller.
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+
+        wait_for_test_pid_stopped(child, Duration::from_secs(5));
+        // The marker is published only after BOTH stops are cleared, so its
+        // presence is the running-target proof the helper must deliver.
+        resume_test_pid_until(child, Duration::from_secs(5), || marker.is_file());
+
+        assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut status, 0) },
+            child,
+            "reap resume-probe child"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn stop_barrier_catches_repeated_forks_at_the_cleanup_boundary() {
@@ -3451,13 +3512,12 @@ mod tests {
             // publication, so completed-fork coverage is deterministic.
             std::fs::write(&race_path, b"fork-at-cleanup\n").unwrap();
             wait_for_test_pid_stopped(worker_pid, Duration::from_secs(5));
-            assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGCONT) }, 0);
-            receive_fork_boundary_signal(
-                &fork_boundary_signal,
-                &mut round_owner.worker,
-                1,
-                Duration::from_secs(15),
-            );
+            // The signal the worker publishes on the far side of its stop IS the
+            // proof it resumed, so release it until that byte arrives rather
+            // than releasing once and then blaming the socket for 15s.
+            resume_test_pid_until(worker_pid, Duration::from_secs(15), || {
+                poll_fork_boundary_signal(&fork_boundary_signal, &mut round_owner.worker, 1)
+            });
             if round % 2 == 1 {
                 receive_fork_boundary_signal(
                     &fork_boundary_signal,
@@ -3986,6 +4046,55 @@ mod tests {
         }
     }
 
+    /// Release a process parked at a job-control stop, and keep releasing it
+    /// until it proves it is running.
+    ///
+    /// Every cheap observation available here is a proxy. `waitpid(WUNTRACED)`
+    /// reporting a stop says the parent was told a stop happened, not that the
+    /// target is parked where exactly one process-directed `SIGCONT` will move
+    /// it: `raise(SIGSTOP)` inside a test binary is thread-directed, and on a
+    /// contended host the stop can still be settling when that `SIGCONT`
+    /// arrives, so it is spent against a stop the target then completes.
+    /// `waitpid(WCONTINUED)` is no better, because it reports the continue that
+    /// was granted and says nothing about the pending stop that parks the
+    /// target again immediately afterwards. Measured on a loaded host, a single
+    /// release left the target parked in roughly 3% of rounds, and confirming
+    /// that release through `WIFCONTINUED` did not move the rate at all.
+    ///
+    /// The only trustworthy evidence is the target's own progress, so repeat
+    /// the release until `proved_running` observes it. That is the same shape
+    /// as the production cleanup barrier in this file, which repeats its signal
+    /// rather than trusting one delivery. `SIGCONT` to a process that is
+    /// already running carries no handler and is discarded, so repeating costs
+    /// nothing and cannot disturb a target that already resumed.
+    #[cfg(unix)]
+    fn resume_test_pid_until(
+        pid: libc::pid_t,
+        timeout: Duration,
+        mut proved_running: impl FnMut() -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if proved_running() {
+                return;
+            }
+            assert_eq!(
+                unsafe { libc::kill(pid, libc::SIGCONT) },
+                0,
+                "could not continue process {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+            if proved_running() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} did not resume from its stop"
+            );
+            std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+        }
+    }
+
     #[cfg(unix)]
     struct ForkBoundaryRoundOwner {
         guardian: ProcessGroupGuardian,
@@ -4019,6 +4128,50 @@ mod tests {
         }
     }
 
+    /// One non-blocking attempt at the fork-boundary signal.
+    ///
+    /// `true` means the expected byte arrived. `false` means nothing was queued
+    /// yet and the worker is still alive to publish it. Everything else is a
+    /// protocol violation and panics here rather than being retried.
+    #[cfg(unix)]
+    fn poll_fork_boundary_signal(
+        signal_socket: &std::os::unix::net::UnixDatagram,
+        worker: &mut std::process::Child,
+        expected: u8,
+    ) -> bool {
+        let mut signal = [0_u8; 1];
+        match signal_socket.recv(&mut signal) {
+            Ok(1) => {
+                assert_eq!(
+                    signal,
+                    [expected],
+                    "fork-boundary worker published an out-of-order signal"
+                );
+                true
+            }
+            Ok(received) => {
+                panic!("fork-boundary worker published a {received}-byte signal")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                match worker.try_wait() {
+                    Ok(Some(status)) => {
+                        panic!("fork-boundary worker exited before signal {expected}: {status}")
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        panic!(
+                            "failed to poll fork-boundary worker before signal {expected}: {error}"
+                        )
+                    }
+                }
+            }
+            Err(error) => {
+                panic!("failed to receive fork-boundary signal {expected}: {error}")
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn receive_fork_boundary_signal(
         signal_socket: &std::os::unix::net::UnixDatagram,
@@ -4027,36 +4180,7 @@ mod tests {
         timeout: Duration,
     ) {
         let deadline = std::time::Instant::now() + timeout;
-        let mut signal = [0_u8; 1];
-        loop {
-            match signal_socket.recv(&mut signal) {
-                Ok(1) => {
-                    assert_eq!(
-                        signal,
-                        [expected],
-                        "fork-boundary worker published an out-of-order signal"
-                    );
-                    return;
-                }
-                Ok(received) => {
-                    panic!("fork-boundary worker published a {received}-byte signal")
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    match worker.try_wait() {
-                        Ok(Some(status)) => {
-                            panic!("fork-boundary worker exited before signal {expected}: {status}")
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            panic!("failed to poll fork-boundary worker before signal {expected}: {error}")
-                        }
-                    }
-                }
-                Err(error) => {
-                    panic!("failed to receive fork-boundary signal {expected}: {error}")
-                }
-            }
+        while !poll_fork_boundary_signal(signal_socket, worker, expected) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for fork-boundary signal {expected}"

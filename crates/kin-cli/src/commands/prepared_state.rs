@@ -627,6 +627,12 @@ mod tests {
         );
     }
 
+    /// Vector-gated: the message asserted here comes from opening the sidecar
+    /// and finding it invalid, which is work only a build with a vector index
+    /// can do. A vector-free build refuses the same prepared state earlier and
+    /// for a different reason, asserted separately below, so both builds are
+    /// held to a refusal rather than one of them being left unchecked.
+    #[cfg(feature = "vector")]
     #[test]
     fn validation_rejects_invalid_vector_sidecar_when_embeddings_expected() {
         let dir = tempfile::tempdir().unwrap();
@@ -638,6 +644,25 @@ mod tests {
         assert!(
             msg.contains("validate prepared vector index") && msg.contains("graph.kvec"),
             "error should explain coverage validation failed, got: {msg}"
+        );
+    }
+
+    /// A build with vector support compiled out cannot restore an embeddings
+    /// prepared state at all, so reuse must refuse it and say why. Silently
+    /// accepting it would reopen with an empty index, which is the dormant-index
+    /// trap the vector-gated case above guards from the other side.
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    fn vector_free_validation_refuses_prepared_state_that_expects_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = make_prepared_dir(dir.path(), true, true, /* with_vectors */ true);
+
+        let err = validate_prepared_state(dir.path(), &manifest)
+            .expect_err("a vector-free build must refuse an embeddings prepared state");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vector support disabled"),
+            "error should explain the build cannot serve embeddings, got: {msg}"
         );
     }
 
