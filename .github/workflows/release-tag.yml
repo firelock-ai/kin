@@ -349,13 +349,44 @@ jobs:
 
           latest="$(gh api "repos/${REPO}/releases/latest")"
           latest_tag="$(jq -er .tag_name <<< "$latest")"
-          highest_tag=""
-          while IFS= read -r candidate_tag; do
-            if [[ "$candidate_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              highest_tag="$candidate_tag"
-              break
-            fi
-          done < <(git tag --list --sort=-v:refname)
+          # Serialization is owed to a release that can still finish. A tag
+          # whose artifacts can never be built cannot, and on its own it holds
+          # this lane closed against every successor, including the one that
+          # repairs the defect. A reviewed abandonment record is the only
+          # waiver, so a tag that is merely failing so far still blocks. Both
+          # the record and the selector come from protected main rather than the
+          # checked-out release commit, which predates the abandonment it has to
+          # honour and would otherwise re-deadlock the lane it unblocks.
+          lane_policy="$RUNNER_TEMP/release-lane-policy"
+          mkdir -p "$lane_policy"
+          abandoned="$lane_policy/abandoned-release-tags.json"
+          selector="$lane_policy/select-admissible-release-tag.py"
+          if ! git show \
+            "refs/remotes/origin/main:scripts/abandoned-release-tags.json" \
+            > "$abandoned"; then
+            echo "::error::protected main carries no abandoned release-tag record"
+            exit 1
+          fi
+          if ! git show \
+            "refs/remotes/origin/main:scripts/select-admissible-release-tag.py" \
+            > "$selector"; then
+            echo "::error::protected main carries no release-lane tag selector"
+            exit 1
+          fi
+          test -s "$abandoned"
+          test -s "$selector"
+          candidate_tags="$lane_policy/release-tags"
+          git for-each-ref \
+            --sort=-v:refname \
+            --format='%(refname:strip=2) %(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)' \
+            refs/tags > "$candidate_tags"
+          admissible="$lane_policy/highest-admissible-tag"
+          python3 "$selector" \
+            "$abandoned" \
+            "$candidate_tags" \
+            "$TAG" \
+            "$admissible"
+          highest_tag="$(cat "$admissible")"
           if [ -z "$highest_tag" ] || [ "$highest_tag" != "$latest_tag" ]; then
             if [ "$AUTOMATIC" = true ]; then
               echo "::notice::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery will reconcile it."
