@@ -28,13 +28,6 @@ const DELETE_REASON: &str = "delete exact repository branch";
 const SWITCH_REASON: &str = "switch exact repository workspace branch";
 const FOLLOW_REASON: &str = "follow exact repository ref admitted by transfer";
 
-/// Internal discriminator for "this workspace stands on another ref".
-///
-/// It never reaches a client. `follow_moved_ref` is the only caller that can
-/// raise the condition and the only one that reads this back, so the status is
-/// a typed channel between them rather than a wire contract.
-const WORKSPACE_TRACKS_ANOTHER_REF: StatusCode = StatusCode::NO_CONTENT;
-
 /// Why a workspace is being transitioned onto a ref's current target.
 ///
 /// Both transitions publish the same workspace mutation against the same
@@ -98,6 +91,43 @@ impl std::fmt::Display for WorkspaceTracksAnotherRef {
 
 impl std::error::Error for WorkspaceTracksAnotherRef {}
 
+/// How a planned workspace mutation refused.
+///
+/// The tracks-another-ref case is deliberately not carried as an HTTP status.
+/// It is not an answer any client can be given: it means a transfer moved a ref
+/// this workspace does not stand on, which only `follow_moved_ref` asks about
+/// and only it reads back. Giving it a status would let a branch route answer
+/// with it and still compile, and the status it needed to be distinguishable by
+/// was one that may not carry a body. Keeping it a variant instead of a code is
+/// what makes the illegal response unrepresentable rather than merely
+/// documented.
+enum WorkspaceMutationRefusal {
+    /// A refusal a client is told, as the status and message it is told with.
+    Client(StatusCode, String),
+    /// This workspace stands on a different ref than the one a transfer moved.
+    TracksAnotherRef(String),
+}
+
+impl From<(StatusCode, String)> for WorkspaceMutationRefusal {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self::Client(status, message)
+    }
+}
+
+impl WorkspaceMutationRefusal {
+    /// Answer a client. A branch command always transitions under
+    /// `TransitionPolicy::Switch`, which never raises the tracks-another-ref
+    /// case, so this arm is unreachable from a branch route; it maps to a
+    /// conflict rather than panicking, because an answer that is merely wrong
+    /// beats one that takes the daemon down.
+    fn into_client_response(self) -> (StatusCode, String) {
+        match self {
+            Self::Client(status, message) => (status, message),
+            Self::TracksAnotherRef(detail) => (StatusCode::CONFLICT, detail),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BranchBadRequest(String);
 
@@ -121,10 +151,22 @@ fn branch_bad_request(message: impl Into<String>) -> anyhow::Error {
 /// owns. Only admitted state reaches this: unadmitted working-copy bytes are
 /// reported as projection drift instead, so the wording never describes host
 /// content that has not crossed the repository-v6 compare-and-swap.
-fn graph_owned_changes(workspace: &kin_model::WorkspaceState) -> anyhow::Error {
+///
+/// The remedy names what the caller actually asked for. A caller who ran a pull
+/// is not switching branches, and telling them to finish doing so describes an
+/// operation they never started.
+fn graph_owned_changes(
+    workspace: &kin_model::WorkspaceState,
+    policy: TransitionPolicy,
+) -> anyhow::Error {
+    let remedy = match policy {
+        TransitionPolicy::Switch => "before switching branches",
+        TransitionPolicy::FollowMovedRef => {
+            "before this workspace can follow the ref the transfer moved"
+        }
+    };
     branch_conflict(format!(
-        "workspace {} has graph-owned changes; commit or explicitly preserve them before \
-         switching branches",
+        "workspace {} has graph-owned changes; commit or explicitly preserve them {remedy}",
         workspace.workspace_id
     ))
 }
@@ -164,6 +206,7 @@ pub(crate) fn execute(
             TransitionPolicy::Switch,
         ),
     })
+    .map_err(WorkspaceMutationRefusal::into_client_response)
 }
 
 /// Move the graph-owned workspace onto the current target of the ref it already
@@ -201,8 +244,10 @@ pub(crate) fn follow_moved_ref(
         Ok(response) => WorkspaceFollow::AlreadyCurrent {
             authority_generation: response.authority_generation.unwrap_or_default(),
         },
-        Err((WORKSPACE_TRACKS_ANOTHER_REF, detail)) => WorkspaceFollow::NotApplicable { detail },
-        Err((_, detail)) => WorkspaceFollow::Behind { detail },
+        Err(WorkspaceMutationRefusal::TracksAnotherRef(detail)) => {
+            WorkspaceFollow::NotApplicable { detail }
+        }
+        Err(WorkspaceMutationRefusal::Client(_, detail)) => WorkspaceFollow::Behind { detail },
     }
 }
 
@@ -211,13 +256,13 @@ pub(crate) fn follow_moved_ref(
 fn run_workspace_mutation<Plan>(
     state: &DaemonState,
     plan: Plan,
-) -> std::result::Result<BranchResponse, (StatusCode, String)>
+) -> std::result::Result<BranchResponse, WorkspaceMutationRefusal>
 where
     Plan: FnOnce(&DaemonState, &ActiveLocalRepositoryAuthority) -> Result<BranchCommandOutcome>,
 {
     let graph_mutation = state.begin_graph_authority_mutation();
     let persistence = state.persist_lock.lock().map_err(|_| {
-        (
+        WorkspaceMutationRefusal::Client(
             StatusCode::INTERNAL_SERVER_ERROR,
             "daemon persistence lock poisoned".to_string(),
         )
@@ -240,7 +285,7 @@ where
         .repository_command_fail_after_authority_once
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
-        return Err((
+        return Err(WorkspaceMutationRefusal::Client(
             StatusCode::INTERNAL_SERVER_ERROR,
             "injected failure after branch authority commit".to_string(),
         ));
@@ -654,7 +699,7 @@ fn switch(
     // the history it would refuse over is already durable and a workspace that
     // is already at the moved ref has nothing to refuse about.
     if policy == TransitionPolicy::Switch && workspace.is_dirty() {
-        return Err(graph_owned_changes(&workspace));
+        return Err(graph_owned_changes(&workspace, policy));
     }
     if policy == TransitionPolicy::FollowMovedRef
         && !matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name)
@@ -777,7 +822,7 @@ fn switch(
     // tree out from under it would discard work the compare-and-swap already
     // owns, so the transition stops here and the transfer reports it.
     if policy == TransitionPolicy::FollowMovedRef && workspace.is_dirty() {
-        return Err(graph_owned_changes(&workspace));
+        return Err(graph_owned_changes(&workspace, policy));
     }
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -1199,14 +1244,18 @@ fn render_target(target: &RefTarget) -> String {
     }
 }
 
-fn classify_branch_error(error: anyhow::Error) -> (StatusCode, String) {
-    // Nothing to do is not a failure, and a follow tells the two apart by this
-    // status rather than by reading the message it would otherwise have to
-    // pattern-match. No branch command can produce it: the marker type is
-    // raised only under `TransitionPolicy::FollowMovedRef`.
+fn classify_branch_error(error: anyhow::Error) -> WorkspaceMutationRefusal {
+    // Nothing to do is not a failure, and a follow tells it apart from one by
+    // the variant rather than by reading a message it would have to
+    // pattern-match. It is raised only under `TransitionPolicy::FollowMovedRef`,
+    // and it carries no status because no client is ever answered with it.
     if error.downcast_ref::<WorkspaceTracksAnotherRef>().is_some() {
-        return (WORKSPACE_TRACKS_ANOTHER_REF, format!("{error:#}"));
+        return WorkspaceMutationRefusal::TracksAnotherRef(format!("{error:#}"));
     }
+    client_branch_refusal(error).into()
+}
+
+fn client_branch_refusal(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<BranchBadRequest>().is_some() {
         return (StatusCode::BAD_REQUEST, format!("{error:#}"));
     }

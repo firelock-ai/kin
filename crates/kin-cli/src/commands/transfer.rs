@@ -79,9 +79,9 @@ pub enum WorkspaceFollow {
     /// The responding daemon predates this report, so whether the working tree
     /// followed is unknown. Never produced by this build.
     Unreported,
-    /// No local workspace was in a position to follow: hosted snapshot
-    /// authority owns no working tree, or this replica's workspace does not
-    /// track the ref the pull moved.
+    /// No local workspace was in a position to follow: the pull admitted no
+    /// history so no ref moved, hosted snapshot authority owns no working tree,
+    /// or this replica's workspace does not track the ref the pull moved.
     NotApplicable { detail: String },
     /// The workspace already stood at the admitted head, so nothing moved.
     AlreadyCurrent { authority_generation: u64 },
@@ -340,7 +340,11 @@ fn render_plan(plan: &RepositoryTransferPlan) -> String {
 fn render_outcome(response: &CommandTransferResponse, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(response)?);
-        return Ok(());
+        // The exit contract is not a property of the human rendering. `--json`
+        // is the mode a caller chains work from, so it is the mode where an
+        // exit status that ignored a working tree left behind would do the most
+        // damage. The body still carries the state; this decides the status.
+        return workspace_follow_outcome(&response.workspace);
     }
     let outcome = &response.outcome;
     let verb = match outcome.direction {
@@ -382,11 +386,6 @@ fn render_outcome(response: &CommandTransferResponse, json: bool) -> Result<()> 
 
 /// Report what the working tree did, and fail the command when it did not
 /// follow a head that is now durable.
-///
-/// A caller that chains work onto a pull reads the exit status, not the prose.
-/// Succeeding after the workspace stayed behind would let that work run against
-/// the tree the pull was supposed to replace, which is the one outcome nobody
-/// can see from the files alone.
 fn render_workspace_follow(workspace: &WorkspaceFollow) -> Result<()> {
     match workspace {
         WorkspaceFollow::Unreported => {}
@@ -400,14 +399,27 @@ fn render_workspace_follow(workspace: &WorkspaceFollow) -> Result<()> {
             detail,
             authority_generation,
         } => println!("Workspace: {detail} (authority generation {authority_generation})"),
-        WorkspaceFollow::Behind { detail } => {
-            println!(
-                "Repository authority moved and is durable, but this workspace did not follow it: {detail}"
-            );
-            bail!(
-                "the admitted history is durable; the working tree still shows the head it had before. Resolve the reason above, then run `kin branch switch` onto the pulled ref to move it."
-            );
-        }
+        WorkspaceFollow::Behind { detail } => println!(
+            "Repository authority moved and is durable, but this workspace did not follow it: {detail}"
+        ),
+    }
+    workspace_follow_outcome(workspace)
+}
+
+/// Decide the command's exit status from what the working tree did, separately
+/// from how it was rendered.
+///
+/// A caller that chains work onto a pull reads the exit status, not the prose.
+/// Succeeding after the workspace stayed behind would let that work run against
+/// the tree the pull was supposed to replace, which is the one outcome nobody
+/// can see from the files alone. Keeping the decision out of the renderer is
+/// what makes it hold in every output mode rather than only the one a person
+/// reads.
+fn workspace_follow_outcome(workspace: &WorkspaceFollow) -> Result<()> {
+    if workspace.is_behind() {
+        bail!(
+            "the admitted history is durable; the working tree still shows the head it had before. Resolve the reason above, then run `kin branch switch` onto the pulled ref to move it."
+        );
     }
     Ok(())
 }
@@ -449,57 +461,12 @@ mod tests {
         assert_eq!(request.source_ref, Some(RefName::branch(b"main").unwrap()));
     }
 
-    /// A working tree that stayed behind must not exit clean. Anything chained
-    /// onto the pull would otherwise run against the head the pull replaced,
-    /// which is invisible from the files alone.
-    #[test]
-    fn a_workspace_that_stayed_behind_fails_the_command() {
-        let error = render_workspace_follow(&WorkspaceFollow::Behind {
-            detail: "workspace has graph-owned changes".to_string(),
-        })
-        .expect_err("a working tree that did not follow cannot report success");
-        assert!(
-            error.to_string().contains("still shows the head it had"),
-            "refusal must say what the working tree is showing: {error}"
-        );
-    }
-
-    /// Every other state is a success. A transfer that landed is not turned into
-    /// a failure by a workspace that had nothing to do.
-    #[test]
-    fn every_state_other_than_behind_succeeds() {
-        for follow in [
-            WorkspaceFollow::Unreported,
-            WorkspaceFollow::NotApplicable {
-                detail: "hosted snapshot authority serves no local working tree".to_string(),
-            },
-            WorkspaceFollow::AlreadyCurrent {
-                authority_generation: 7,
-            },
-            WorkspaceFollow::Advanced {
-                detail: "Followed refs/heads/main".to_string(),
-                authority_generation: 8,
-            },
-        ] {
-            assert!(
-                render_workspace_follow(&follow).is_ok(),
-                "{follow:?} is not a failed pull"
-            );
-            assert!(!follow.is_behind());
-        }
-        assert!(WorkspaceFollow::Behind {
-            detail: String::new()
-        }
-        .is_behind());
-    }
-
-    /// A daemon that predates this report says nothing about the working tree,
-    /// and the default must say exactly that rather than claim a transition
-    /// nobody observed.
-    #[test]
-    fn a_response_without_the_field_reads_as_unreported() {
+    /// One pull response carrying the workspace report under test. The transfer
+    /// itself is deliberately the boring one: what these tests decide is what a
+    /// caller reads back, not what the negotiation did.
+    fn pull_response(workspace: WorkspaceFollow) -> CommandTransferResponse {
         let main = RefName::branch(b"main").unwrap();
-        let current = CommandTransferResponse {
+        CommandTransferResponse {
             outcome: RepositoryTransferOutcome {
                 direction: RepositoryTransferDirection::Pull,
                 repository_id: kin_model::RepositoryId::new(
@@ -512,11 +479,71 @@ mod tests {
                 receipts: Vec::new(),
             },
             derived_views: DerivedViewRefresh::Current,
-            workspace: WorkspaceFollow::Advanced {
-                detail: "Followed refs/heads/main".to_string(),
-                authority_generation: 3,
+            workspace,
+        }
+    }
+
+    /// The non-zero exit is a contract of the command, not of the prose. A
+    /// caller that chains work onto a pull almost always asks for `--json`, so
+    /// an exit status that only held in the human path would fail exactly the
+    /// caller it exists for.
+    #[test]
+    fn a_workspace_that_stayed_behind_fails_the_command_in_every_output_mode() {
+        for json in [false, true] {
+            let error = render_outcome(
+                &pull_response(WorkspaceFollow::Behind {
+                    detail: "a tracked path was edited outside Kin".to_string(),
+                }),
+                json,
+            )
+            .expect_err("a working tree that did not follow cannot report success");
+            assert!(
+                error.to_string().contains("still shows the head it had"),
+                "refusal must say what the working tree is showing (json={json}): {error}"
+            );
+        }
+    }
+
+    /// The same contract read from the other side: no other state turns a
+    /// transfer that landed into a failed command, in either mode.
+    #[test]
+    fn every_other_state_exits_clean_in_every_output_mode() {
+        for workspace in [
+            WorkspaceFollow::Unreported,
+            WorkspaceFollow::NotApplicable {
+                detail: "this pull admitted no history".to_string(),
             },
-        };
+            WorkspaceFollow::AlreadyCurrent {
+                authority_generation: 7,
+            },
+            WorkspaceFollow::Advanced {
+                detail: "Followed refs/heads/main".to_string(),
+                authority_generation: 8,
+            },
+        ] {
+            assert!(!workspace.is_behind());
+            for json in [false, true] {
+                assert!(
+                    render_outcome(&pull_response(workspace.clone()), json).is_ok(),
+                    "{workspace:?} is not a failed pull (json={json})"
+                );
+            }
+        }
+        assert!(WorkspaceFollow::Behind {
+            detail: String::new()
+        }
+        .is_behind());
+    }
+
+    /// A daemon that predates this report says nothing about the working tree,
+    /// and the default must say exactly that rather than claim a transition
+    /// nobody observed.
+    #[test]
+    fn a_response_without_the_field_reads_as_unreported() {
+        let current = pull_response(WorkspaceFollow::Advanced {
+            detail: "Followed refs/heads/main".to_string(),
+            authority_generation: 3,
+        });
         let mut wire = serde_json::to_value(&current).unwrap();
         // Exactly what an older daemon's body looks like: the outcome, and
         // neither optional report.

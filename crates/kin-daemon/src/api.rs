@@ -7629,7 +7629,8 @@ async fn command_pull(
                 None => kin_remote::repository_transfer_negotiation::remote_default_ref(
                     &transport,
                     &repository_id,
-                )?,
+                )
+                .map_err(|error| (error, 0usize))?,
             };
             let destination_ref = requested_destination_ref.unwrap_or_else(|| source_ref.clone());
             // Admission runs here rather than inside the negotiation helper so
@@ -7638,7 +7639,8 @@ async fn command_pull(
             // past one envelope arrives as several packs, and each takes that
             // path in turn.
             let mut refresh = DerivedViewRefresh::Current;
-            let outcome = kin_remote::repository_transfer_negotiation::pull_from_remote_with(
+            let mut admitted_packs = 0usize;
+            let admitted = kin_remote::repository_transfer_negotiation::pull_from_remote_with(
                 &authority,
                 &transport,
                 &repository_id,
@@ -7652,6 +7654,7 @@ async fn command_pull(
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
                     )?;
+                    admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {
                         if let Err(detail) = refresh_local_derived_views(
                             &blocking_state,
@@ -7664,13 +7667,28 @@ async fn command_pull(
                     }
                     Ok(receipt)
                 },
-            )?;
-            Ok::<_, kin_remote::repository_transfer::RepositoryTransferError>((outcome, refresh))
+            );
+            // Bound as its own statement so the admit closure, and the borrows
+            // it holds, are gone before the count it kept is read back.
+            let outcome = admitted.map_err(|error| (error, admitted_packs))?;
+            Ok::<
+                _,
+                (
+                    kin_remote::repository_transfer::RepositoryTransferError,
+                    usize,
+                ),
+            >((outcome, refresh))
         })
         .await
         .map_err(internal_error)?
     };
-    let (outcome, mut derived_views) = outcome.map_err(repository_transfer_error)?;
+    let (outcome, mut derived_views) = outcome.map_err(|(error, admitted_packs)| {
+        let (status, message) = repository_transfer_error(error);
+        match interrupted_pull_report(admitted_packs) {
+            Some(report) => (status, format!("{message} {report}")),
+            None => (status, message),
+        }
+    })?;
 
     if !local_derived_views && outcome.moved_history() {
         state.repo_graphs.write().await.remove(&repo_id);
@@ -7680,13 +7698,29 @@ async fn command_pull(
     }
     record_derived_view_staleness(&state, &derived_views).await;
 
-    let workspace = pull_workspace_follow(
-        &state,
-        local_derived_views,
-        &derived_views,
-        &outcome.destination_ref,
-    )
-    .await;
+    // A pull that admitted nothing moved no ref, so no working tree can be
+    // behind a head that did not move. Planning the transition anyway answers an
+    // ordinary no-op pull with whatever the planner finds in the working copy,
+    // which is how a plain local edit came to be reported as authority having
+    // moved. It also pays the whole branch-switch planner on every `kin pull`.
+    //
+    // The cost of the guard is that a workspace an earlier pull left behind no
+    // longer completes on the next pull. That is the remedy the report already
+    // names: `kin branch switch` onto the pulled ref.
+    let workspace = if outcome.moved_history() {
+        pull_workspace_follow(
+            &state,
+            local_derived_views,
+            &derived_views,
+            &outcome.destination_ref,
+        )
+        .await
+    } else {
+        WorkspaceFollow::NotApplicable {
+            detail: "this pull admitted no history, so no ref moved for a working tree to follow"
+                .to_string(),
+        }
+    };
 
     Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
         outcome,
@@ -7695,12 +7729,34 @@ async fn command_pull(
     }))
 }
 
+/// Name what a pull left durable when it failed partway through a multi-pack
+/// gap, so the caller is not told a transfer that partly landed did nothing.
+///
+/// The protocol supports this interruption on purpose: each pack is its own
+/// repository transaction, so the ones that landed are durable and the
+/// destination ref has already moved with them. The workspace transition never
+/// ran, which means the working tree is now behind that ref and no
+/// `WorkspaceFollow` report reached the caller to say so.
+fn interrupted_pull_report(admitted_packs: usize) -> Option<String> {
+    if admitted_packs == 0 {
+        return None;
+    }
+    Some(format!(
+        "{admitted_packs} pack(s) were admitted before this failed and are durable, so this \
+         replica's destination ref has already moved while its working tree still shows the head \
+         it had before. Re-run the pull to resume from the last admitted pack; that run reports \
+         and completes the workspace transition."
+    ))
+}
+
 /// Move the graph-owned workspace onto the head this pull admitted.
 ///
 /// Runs after admission rather than inside it, because admission is atomic per
 /// pack while a workspace transition is one mutation onto the ref's final
 /// target. A gap carried by several packs therefore moves the working tree once,
-/// at the end, instead of walking it through every intermediate head.
+/// at the end, instead of walking it through every intermediate head. Its caller
+/// runs it only for a pull that admitted history, so every state it reports is a
+/// statement about a ref that did move.
 ///
 /// Every outcome here is reported, never raised. The admitted history is already
 /// durable and receipted; answering a caller with a failure would describe a
@@ -11829,19 +11885,21 @@ mod tests {
         drop(lease);
         drop(authority);
 
-        // Re-running finds both halves already where they belong: no history to
-        // admit, and no tree to move.
+        // Re-running finds both halves already where they belong. Nothing is
+        // admitted, so no ref moves, and the report says exactly that instead of
+        // describing a working tree measured against a head that did not move.
         let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let repeated: kin_cli::commands::transfer::CommandTransferResponse =
             serde_json::from_slice(&body).unwrap();
         assert!(repeated.outcome.receipts.is_empty());
-        assert_eq!(
-            repeated.workspace,
-            WorkspaceFollow::AlreadyCurrent {
-                authority_generation: advanced_generation
-            }
-        );
+        match &repeated.workspace {
+            WorkspaceFollow::NotApplicable { detail } => assert!(
+                detail.contains("admitted no history"),
+                "the report must name why no transition was planned: {detail}"
+            ),
+            other => panic!("a pull that admitted nothing plans no transition, got {other:?}"),
+        }
         assert_eq!(
             std::fs::read(&fixture.projected).unwrap(),
             b"services:\n  api: { image: peer }\n"
@@ -11927,6 +11985,165 @@ mod tests {
             std::fs::read(&fixture.projected).unwrap(),
             b"services:\n  api: { image: local }\n",
             "the caller's edit must survive a transfer that could not move the tree"
+        );
+    }
+
+    /// The everyday invocation: up to date with the peer, one tracked file
+    /// edited in an editor, `kin pull` run out of habit.
+    ///
+    /// Nothing is admitted, so no ref moves and no working tree can be behind
+    /// one. Planning the transition anyway would find the edit and report a
+    /// workspace that failed to follow a head that never moved, which fails the
+    /// command and asserts two things that are both false.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_that_admits_nothing_reports_no_transition_over_an_edited_tree() {
+        let fixture = workspace_follow_fixture(
+            "pull-noop-edited",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        let request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+
+        // Reach "up to date with the peer" the way a caller does.
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            matches!(pulled.workspace, WorkspaceFollow::Advanced { .. }),
+            "the first pull moves the tree, got {:?}",
+            pulled.workspace
+        );
+
+        std::fs::write(&fixture.projected, b"services:\n  api: { image: local }\n").unwrap();
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let repeated: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            !repeated.outcome.moved_history(),
+            "the second pull has nothing left to admit"
+        );
+        assert!(
+            !repeated.workspace.is_behind(),
+            "nothing moved for this working tree to be behind of: {:?}",
+            repeated.workspace
+        );
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: local }\n",
+            "a pull that admitted nothing may not touch the caller's edit"
+        );
+    }
+
+    /// The refusal a follow owes a workspace that holds uncommitted state graph
+    /// authority already owns: the history still lands, the tree does not move,
+    /// and the refusal names the operation the caller actually ran.
+    ///
+    /// Reaching that state means going through the daemon. Bytes edited on disk
+    /// are projection drift, which is a different branch with a different
+    /// refusal; a stash seal followed by a restore is how a real workspace comes
+    /// to hold changes the compare-and-swap owns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_over_graph_owned_changes_reports_the_workspace_behind_without_naming_a_switch()
+    {
+        let fixture = workspace_follow_fixture(
+            "pull-graph-owned-changes",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        std::fs::write(&fixture.projected, b"services:\n  api: { image: staged }\n").unwrap();
+        let (status, body) = post_stash_request(Arc::clone(&fixture.state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = post_stash_request(Arc::clone(&fixture.state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let layout = kin_core::KinLayout::discover(&fixture.working).unwrap();
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let dirty = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .is_dirty();
+        drop(lease);
+        drop(authority);
+        assert!(
+            dirty,
+            "the fixture must reach uncommitted state graph authority owns, not host drift"
+        );
+
+        let request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            pulled
+                .outcome
+                .final_receipt()
+                .expect("history is admitted regardless of the working tree")
+                .destination_head,
+            fixture.peer_head,
+            "a workspace that cannot follow must not cost the caller the transfer"
+        );
+        match &pulled.workspace {
+            WorkspaceFollow::Behind { detail } => {
+                assert!(
+                    detail.contains("has graph-owned changes"),
+                    "the report must name what blocked the transition: {detail}"
+                );
+                assert!(
+                    detail.contains("follow the ref the transfer moved"),
+                    "a caller who ran a pull is not part-way through a branch switch: {detail}"
+                );
+            }
+            other => panic!("uncommitted graph-owned state cannot be discarded, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: staged }\n",
+            "the caller's uncommitted state must survive a transfer that could not move the tree"
+        );
+
+        // The gap is closed now, so the next pull admits nothing. It must not
+        // repeat a refusal about a head that no longer moves.
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let repeated: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!repeated.outcome.moved_history());
+        assert!(
+            !repeated.workspace.is_behind(),
+            "a pull that admitted nothing reports no workspace behind it: {:?}",
+            repeated.workspace
+        );
+    }
+
+    /// An interrupted multi-pack pull left every pack it admitted durable, and
+    /// the destination ref moved with them. The workspace report never runs on
+    /// that path, so the error is the only place that state can be named.
+    #[test]
+    fn an_interrupted_multi_pack_pull_names_what_it_left_durable() {
+        assert!(
+            interrupted_pull_report(0).is_none(),
+            "a pull that admitted nothing has nothing durable to report"
+        );
+        let report = interrupted_pull_report(2).expect("admitted packs are reported");
+        assert!(report.contains("2 pack(s)"), "{report}");
+        assert!(
+            report.contains("working tree still shows the head it had before"),
+            "the caller has to be told the tree is now behind the moved ref: {report}"
+        );
+        assert!(
+            report.contains("Re-run the pull"),
+            "the remedy is resumption, not repair: {report}"
         );
     }
 
