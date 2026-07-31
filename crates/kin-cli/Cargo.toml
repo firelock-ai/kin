@@ -90,7 +90,7 @@ toml = { workspace = true }
 toml_edit = "0.25"
 tempfile = { workspace = true }
 unicode-normalization = "0.1"
-kin-spine = { version = "0.4.3", path = "../kin-spine" }
+kin-spine = { version = "0.4.4", path = "../kin-spine" }
 
 [dev-dependencies]
 kin-git = { workspace = true, features = ["test-support"] }

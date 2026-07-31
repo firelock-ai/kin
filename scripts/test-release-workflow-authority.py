@@ -2680,6 +2680,48 @@ def main() -> None:
             "refusals are asserted before a release commit can carry them"
         )
 
+    # The Linux release artifacts are the only musl compilation Kin performs,
+    # and until this guard existed no required context compiled for that target.
+    # A target_env cfg is invisible to a glibc build, so a dependency resolving
+    # a glibc-only libc entry point passed every check, reached a tag, and then
+    # failed the release run, where the only remedy is another version cut. Pin
+    # the guard to the release matrix so it cannot drift off the target whose
+    # artifacts it protects, and pin its package set so it cannot shrink below
+    # what the release builds. It lives in the required Check & Test job on
+    # purpose: a guard in a context no ruleset requires cannot refuse a merge.
+    release_musl_targets = {
+        match.group("target")
+        for match in re.finditer(
+            r"(?m)^\s+target: (?P<target>\S+-linux-musl)$",
+            workflow_job_blocks(release)["build"],
+        )
+    }
+    if not release_musl_targets:
+        raise AssertionError(
+            "the release build matrix must name at least one musl target for "
+            "the pull-request release-target compile guard to protect"
+        )
+    for policy in (
+        "- name: Check the Linux release target (musl)",
+        "rustup target add x86_64-unknown-linux-musl",
+        "musl-tools",
+        "cargo check --locked --target x86_64-unknown-linux-musl",
+        "-p kin-cli -p kin-daemon",
+    ):
+        require(ci_jobs["check"], policy, "pull-request Linux release-target compile guard")
+    if "x86_64-unknown-linux-musl" not in release_musl_targets:
+        raise AssertionError(
+            "the pull-request compile guard must build a target the release "
+            "workflow actually ships; release musl targets="
+            f"{sorted(release_musl_targets)}"
+        )
+    for package in ("-p kin-cli", "-p kin-daemon"):
+        require(
+            workflow_job_blocks(release)["build"],
+            package,
+            "release core binary package set the compile guard mirrors",
+        )
+
     for policy in (
         'workflows: ["Release"]',
         "types: [completed]",

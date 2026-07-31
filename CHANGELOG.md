@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.3] - 2026-07-31
+## [0.4.4] - 2026-07-31
 
 v0.4.0 was never published. Its release commit was refused by the mint gate
 because the release rail read the repository merge policy through a token that
@@ -25,6 +25,17 @@ slice had already replaced, and that check runs only on the landing push, so no
 pull request could have caught it. This release aligns the assertion with the
 behavior that shipped and mirrors it into a job that runs before a change can
 land.
+
+v0.4.3 was never published either, and it is the first of these that reached its
+tag. What refused it was the Linux artifact build. Kin's Linux binaries link
+against musl so that one archive runs on every distribution, and the pinned
+graph engine published local directory namespaces through a rename entry point
+that the libc bindings declare only for glibc, so both Linux legs stopped at a
+compile error and the release published nothing. This release moves to a graph
+engine that performs the same no-replace publication through the raw kernel
+syscall on musl, and it compiles the release targets on every pull request so
+that a target the artifacts need can no longer break where only a tag can see
+it.
 
 ### Breaking
 
@@ -147,6 +158,25 @@ land.
   local cache before fetching, and an instance whose cache already covers the
   tree does no remote work at all, where every open previously re-fetched every
   body before checking.
+- The release rail installs its dependency scanner from a pinned release
+  artifact instead of building a container image on every run, so a public
+  container-registry outage no longer refuses a release commit on a required
+  check that has nothing to say about the dependency graph (#529).
+- Embedding checkpoints reuse an authority match they have already proved
+  instead of reopening repository authority after every batch. Reopening
+  recovers the snapshot, revalidates every semantic change id, re-verifies every
+  stored body against its content address, and builds a second in-memory graph,
+  and that cost scales with the store rather than with the batch. A generation
+  bump or any live-tree mutation still misses the retained pair and reopens in
+  full, so the refusal it guards is unchanged (#530).
+- The Windows admission refusals Kin ships are now asserted by a job that runs
+  before a change can land, rather than only on the landing push where no pull
+  request could review them. The same slice reserves a Windows main-thread stack
+  large enough to parse the command tree, so a Windows build of the CLI starts
+  instead of aborting before it reaches any command (#534).
+- kin-model moves from 0.7.1 to 0.7.2. This is a version-only move forced by the
+  graph engine's own requirement; the two published crates carry identical
+  source.
 
 
 ## [0.3.6] - 2026-07-26
