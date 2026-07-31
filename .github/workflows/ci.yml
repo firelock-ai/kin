@@ -919,6 +919,11 @@ jobs:
         run: |
           set -euo pipefail
           rustup target add aarch64-unknown-linux-musl
+          # Self-contained rather than relying on the step above having
+          # refreshed the index. This is a required context, so an implicit
+          # ordering dependency between two steps is a way for a reorder to
+          # turn a stale index into a red Check & Test.
+          sudo apt-get update
           sudo apt-get install --yes gcc-aarch64-linux-gnu
           CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
           AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar \

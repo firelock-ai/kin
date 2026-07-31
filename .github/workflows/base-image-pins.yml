@@ -3,16 +3,31 @@
 
 name: Base Image Pins
 
-# Scheduled and manual only, deliberately. A pull_request or push trigger would
-# publish a check-run against the commits that reach main, and release-tag.yml's
-# second sweep refuses a release commit carrying any non-green check-run whether
-# or not a ruleset requires it. A registry-reachability probe is exactly the
-# kind of job whose transient failure must never be able to refuse a release:
-# adding one to the release sha would recreate the failure class this workflow
-# exists to watch. Pre-landing coverage is already there without a new context.
-# `Docker Image Build (no push)` pulls both pinned digests on every pull request
-# and every push to main, and the release-authority suite refuses an unpinned
-# FROM inside the required Check & Test job.
+# A scheduled run's check-runs DO land on a commit. GitHub binds a check suite
+# to every workflow run, and for a `schedule` event `github.sha` is the default
+# branch HEAD at fire time, so a red scheduled run publishes a failure check-run
+# on a main commit. release-tag.yml's second sweep refuses a release commit
+# carrying any non-green check-run whether or not a ruleset requires it, and a
+# quiesced main during a release train holds HEAD still across exactly the
+# window that matters. This repo already carries a live instance of that shape:
+# fuzz.yml's scheduled run left two `failure` check-runs on a main sha.
+#
+# Dropping the push and pull_request triggers therefore does NOT make this job
+# safe on its own. What makes it safe is that the scheduled path is
+# structurally incapable of concluding failure: the prover's exit status is
+# captured rather than propagated, and the step exits 0 whatever it found. A
+# registry-reachability probe must never be able to refuse a release, because
+# that is the failure class this workflow exists to watch.
+#
+# Loudness comes from a surface that cannot poison a mint. When a pin is
+# definitively unreachable the run opens or updates a tracking issue, which
+# persists until someone acts on it, unlike a red check nobody is paged for.
+#
+# A `workflow_dispatch` run may fail hard, because an operator asked a direct
+# question and deserves a direct answer. The residual is real and is theirs to
+# own: dispatching against main during a release train can publish a failure
+# check-run on the candidate sha. Prefer the schedule unless you need the
+# answer now.
 on:
   schedule:
     - cron: "23 5 * * 1"
@@ -30,16 +45,103 @@ jobs:
     name: Verify base image pins
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      # The tracking issue is the alarm. It is the only write this job performs.
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      # Fails when a pinned digest has stopped resolving from either registry,
-      # which is the state that turns the fallback into a single point of
-      # failure again while every build still looks healthy. Upstream tag drift
-      # is reported rather than failed: a base image moving is normal, and a
-      # scheduled job that is red every week is a job nobody reads.
+      # Exit status is captured, never propagated. `set -e` is deliberately
+      # absent so a non-zero prover status reaches the capture instead of
+      # killing the step, and the explicit `exit 0` makes the green conclusion
+      # a property of the step rather than of what the prover happened to find.
+      #
+      # 1 means a pin is definitively gone or wrong, which is the alarm. 2 means
+      # the probe could not reach a verdict, which is reported and nothing more:
+      # a throttled lookup is not evidence about a digest, and `Docker Image
+      # Build (no push)` already proves buildability on every pull request and
+      # every push to main.
       - name: Verify base image pins resolve from both registries
-        run: bash scripts/verify-base-image-pins.sh Dockerfile
+        id: verify
+        run: |
+          set -uo pipefail
+          bash scripts/verify-base-image-pins.sh Dockerfile 2>&1 | tee /tmp/base-image-pins.log
+          status="${PIPESTATUS[0]}"
+          # A status outside the documented set means the prover itself broke,
+          # which would otherwise route to neither the alarm nor the all-clear
+          # and leave this job quietly doing nothing for weeks.
+          case "$status" in
+            0 | 1 | 2) ;;
+            *)
+              echo "::warning::the pin prover exited ${status}, which is not one of its documented statuses; no conclusion drawn"
+              ;;
+          esac
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # The alarm must not become the thing that reds a main sha. An API hiccup
+      # while filing it is the same hazard as a registry hiccup while probing,
+      # so it is reported and tolerated rather than propagated.
+      - name: Open or update the tracking issue
+        if: steps.verify.outputs.status == '1'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALARM_TITLE: "Base image pin unreachable: the release build has lost a registry"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "A base image pinned by \`Dockerfile\` is no longer served at that digest by"
+            echo "one of the two registries the release build resolves through, so the build"
+            echo "has lost its second door and a registry blip can refuse a release again."
+            echo ""
+            echo "Detected by [this run](${RUN_URL})."
+            echo ""
+            echo '```'
+            cat /tmp/base-image-pins.log
+            echo '```'
+            echo ""
+            echo "Remedy: repin the affected \`FROM\` in \`Dockerfile\` to a digest both"
+            echo "registries serve, then rerun this workflow to confirm and close."
+          } > /tmp/alarm-body.md
+
+          # Match on the exact title rather than a search expression so the
+          # lookup cannot widen into an unrelated issue.
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.ALARM_TITLE)] | .[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/alarm-body.md
+            echo "updated tracking issue #${existing}"
+          else
+            gh issue create --title "$ALARM_TITLE" --body-file /tmp/alarm-body.md
+          fi
+
+      - name: Close the tracking issue once the pins are healthy
+        if: steps.verify.outputs.status == '0'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALARM_TITLE: "Base image pin unreachable: the release build has lost a registry"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == env.ALARM_TITLE)] | .[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" \
+              --comment "Every pin resolves from both registries again, verified by [this run](${RUN_URL})."
+            echo "closed tracking issue #${existing}"
+          fi
+
+      # Only a dispatched run may go red, and only after the alarm above has
+      # already been raised, so the operator's answer never costs the alarm.
+      - name: Report the failure to the operator who asked
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.verify.outputs.status != '0' }}
+        run: |
+          echo "::error::base image pin verification exited ${{ steps.verify.outputs.status }}; see the log above"
+          exit 1

@@ -56,7 +56,9 @@ HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 DOCKERFILE = ROOT / "Dockerfile"
 BASE_IMAGE_REGISTRY = "docker.io"
 BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
+BASE_IMAGE_MIRROR_INPUT = "buildkitd-config-inline:"
 BASE_IMAGE_PIN = re.compile(r"(?m)^FROM\s+(?P<reference>\S+)")
+SETUP_BUILDX_ACTION = "docker/setup-buildx-action@"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
 MAIN_ONLY_CACHE_SAVE_VALUE = "${{ github.ref == 'refs/heads/main' }}"
@@ -2463,8 +2465,99 @@ def assert_container_base_image_authority(
             raise AssertionError(
                 f"{label} no longer declares the {job} job that builds the Dockerfile"
             )
+        mirror_input = setup_buildx_mirror_input(block, f"{label}:{job}")
         for needle in (f'[registry."{BASE_IMAGE_REGISTRY}"]', BASE_IMAGE_MIRROR):
-            require(block, needle, f"{label}:{job} base image mirror")
+            require(mirror_input, needle, f"{label}:{job} base image mirror")
+
+
+def comment_out_mirror_input(workflow: str) -> str:
+    """Comment out the buildx mirror input while leaving its text in the file."""
+
+    lines = workflow.splitlines(keepends=True)
+    mutated: list[str] = []
+    commenting = False
+    input_indent = 0
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if stripped.startswith(BASE_IMAGE_MIRROR_INPUT):
+            commenting = True
+            input_indent = indent
+            mutated.append(f"{' ' * indent}# {line.lstrip()}")
+            continue
+        if commenting:
+            if not stripped or indent > input_indent:
+                mutated.append(f"{' ' * indent}# {line.lstrip()}" if stripped else line)
+                continue
+            commenting = False
+        mutated.append(line)
+    return "".join(mutated)
+
+
+def setup_buildx_mirror_input(job_block: str, label: str) -> str:
+    """Return the active `buildkitd-config-inline` the buildx action receives.
+
+    Asserting the mirror against the job body as raw text accepts a config that
+    was commented out and left behind, which is the shape a debugging session
+    produces and the one shape a delete-the-string falsification cannot catch.
+    Binding the assertion to the input of the step whose `uses:` is the buildx
+    action, with comment lines dropped, means only a configuration the action
+    is actually handed can satisfy it.
+    """
+
+    lines = job_block.splitlines()
+    uses = [
+        index
+        for index, line in enumerate(lines)
+        if SETUP_BUILDX_ACTION in line and not line.lstrip().startswith("#")
+    ]
+    if len(uses) != 1:
+        raise AssertionError(
+            f"{label} base image mirror expects exactly one buildx setup step, "
+            f"found {len(uses)}"
+        )
+
+    start = uses[0]
+    while start >= 0 and re.match(r"^\s*-\s", lines[start]) is None:
+        start -= 1
+    if start < 0:
+        raise AssertionError(
+            f"{label} base image mirror could not find the buildx step's start"
+        )
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+
+    active: list[str] = []
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= step_indent:
+            break
+        if line.lstrip().startswith("#"):
+            continue
+        active.append(line)
+
+    input_index = next(
+        (
+            index
+            for index, line in enumerate(active)
+            if line.strip().startswith(BASE_IMAGE_MIRROR_INPUT)
+        ),
+        None,
+    )
+    if input_index is None:
+        raise AssertionError(
+            f"{label} base image mirror is missing required policy: "
+            f"{BASE_IMAGE_MIRROR_INPUT}"
+        )
+
+    input_indent = len(active[input_index]) - len(active[input_index].lstrip())
+    body: list[str] = []
+    for line in active[input_index + 1 :]:
+        if len(line) - len(line.lstrip()) <= input_indent:
+            break
+        body.append(line)
+    return "\n".join(body)
 
 
 def main() -> None:
@@ -3334,6 +3427,29 @@ def main() -> None:
             release.replace(BASE_IMAGE_MIRROR, ""),
         ),
     )
+    # Deleting the string is the one mutation shape a raw-text assertion always
+    # catches, so it proves the least. These comment the config out instead and
+    # leave the strings in the file, which is what a debugging session actually
+    # leaves behind, and which a raw-text assertion passes.
+    for label, mutated_docker, mutated_release in (
+        (
+            "the pull-request image build's mirror is commented out",
+            comment_out_mirror_input(docker_workflow),
+            release,
+        ),
+        (
+            "the released image build's mirror is commented out",
+            docker_workflow,
+            comment_out_mirror_input(release),
+        ),
+    ):
+        expect_assertion(
+            label,
+            f"base image mirror is missing required policy: {BASE_IMAGE_MIRROR_INPUT}",
+            lambda docker=mutated_docker, source=mutated_release: (
+                assert_container_base_image_authority(dockerfile, docker, source)
+            ),
+        )
 
     for policy in (
         'workflows: ["Release"]',

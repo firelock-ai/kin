@@ -13,9 +13,21 @@
 # build right up to the outage it was supposed to survive. This asserts each
 # door independently.
 #
-# Drift is reported, not failed. The pinned digest going stale relative to the
-# upstream tag is a maintenance signal a human acts on; the pinned digest
-# becoming unreachable is the failure.
+# Three outcomes, deliberately distinct, because the caller acts differently on
+# each and because reporting one as another is how a prover lies:
+#
+#   0  every pin verified from both registries
+#   1  a pin is DEFINITIVELY gone or wrong at a registry
+#   2  verification could not be completed (throttled or otherwise transient)
+#
+# A registry throttle is not a missing digest. Docker Hub's anonymous manifest
+# limit is per IP and hosted runners share heavily used egress, so treating an
+# exhausted retry as "no longer serves" would raise a false alarm far more often
+# than a true one. release.yml's own inspect_digest retries against the same
+# reality; this mirrors that rather than inventing a second policy.
+#
+# Upstream tag drift is reported, never failed, and a drift lookup that does not
+# answer must not stop the remaining pins from being checked.
 
 set -euo pipefail
 
@@ -24,13 +36,46 @@ canonical_registry="docker.io"
 mirror_registry="mirror.gcr.io"
 
 if [ ! -f "$dockerfile" ]; then
-  echo "::error::no Dockerfile at $dockerfile" >&2
+  echo "::error::no Dockerfile at $dockerfile"
   exit 1
 fi
 
-# Resolve one reference to the digest its registry reports, or print nothing.
+# resolve_digest runs inside a command substitution, so anything it assigns to a
+# variable dies with that subshell. The diagnostic has to survive in a file for
+# the caller to be able to say WHY a lookup did not answer.
+resolve_error_file="$(mktemp)"
+trap 'rm -f "$resolve_error_file"' EXIT
+
+# Resolve one reference to the digest its registry reports.
+#
+#   0   digest printed on stdout
+#   44  the registry answered definitively that it does not have it
+#   2   no usable answer within the retry budget
+#
+# Distinguishing 44 from 2 is the point: only 44 justifies claiming a registry
+# no longer serves a pin.
 resolve_digest() {
-  docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2>/dev/null
+  local reference="$1"
+  local output=""
+  local attempt
+  : > "$resolve_error_file"
+  for attempt in 1 2 3 4 5; do
+    if output="$(docker buildx imagetools inspect "$reference" \
+      --format '{{.Manifest.Digest}}' 2>&1)"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    printf '%s' "$output" > "$resolve_error_file"
+    case "$output" in
+      *"not found"* | *404* | *MANIFEST_UNKNOWN* | *"manifest unknown"*)
+        return 44
+        ;;
+    esac
+    if [ "$attempt" -lt 5 ]; then
+      sleep $(( attempt * 3 ))
+    fi
+  done
+  return 2
 }
 
 summary() {
@@ -39,8 +84,40 @@ summary() {
   fi
 }
 
+# Probe one door. Reports through a global rather than stdout so its own log
+# lines cannot be captured into the state it is reporting, and always returns 0
+# so a probe result can never terminate the caller under errexit.
+probe_state=""
+probe_registry() {
+  local registry="$1"
+  local path="$2"
+  local pinned_digest="$3"
+  local resolved=""
+  local status=0
+
+  resolved="$(resolve_digest "${registry}/${path}@${pinned_digest}")" || status=$?
+  if [ "$status" -eq 0 ]; then
+    if [ "$resolved" = "$pinned_digest" ]; then
+      probe_state=ok
+    else
+      echo "::error::${registry} served ${path} as ${resolved}, not the pinned ${pinned_digest}"
+      probe_state=mismatch
+    fi
+    return 0
+  fi
+  if [ "$status" -eq 44 ]; then
+    echo "::error::${registry} no longer serves ${path} at ${pinned_digest}: $(cat "$resolve_error_file")"
+    probe_state=gone
+    return 0
+  fi
+  echo "::warning::${registry} did not answer for ${path} at ${pinned_digest} within the retry budget; this is not a claim that it is gone: $(cat "$resolve_error_file")"
+  probe_state=unverified
+  return 0
+}
+
 pins_found=0
-failures=0
+broken=0
+unverified=0
 drifted=0
 
 summary "## Base image pins"
@@ -51,13 +128,26 @@ summary "| --- | --- | --- | --- | --- |"
 # Read FROM lines from the Dockerfile itself so the pins cannot be checked
 # against a second copy that drifts from the one the build uses.
 while IFS= read -r from_line; do
-  reference="$(printf '%s\n' "$from_line" | awk '{print $2}')"
+  # `FROM` accepts flags before the reference (`--platform=`) and a trailing
+  # `AS <stage>` after it. Take the first token that is neither.
+  reference=""
+  for token in $from_line; do
+    case "$token" in
+      FROM | --*) continue ;;
+      *) reference="$token"; break ;;
+    esac
+  done
+  if [ -z "$reference" ]; then
+    echo "::error::could not read a base image reference from: ${from_line}"
+    broken=$((broken + 1))
+    continue
+  fi
 
   case "$reference" in
     *@sha256:*) ;;
     *)
-      echo "::error::base image is not digest-pinned: ${reference}" >&2
-      failures=$((failures + 1))
+      echo "::error::base image is not digest-pinned: ${reference}"
+      broken=$((broken + 1))
       continue
       ;;
   esac
@@ -65,45 +155,52 @@ while IFS= read -r from_line; do
   pins_found=$((pins_found + 1))
   pinned_digest="${reference##*@}"
   name_with_tag="${reference%@*}"
-  repository="${name_with_tag%%:*}"
-  tag="${name_with_tag##*:}"
+
+  # Split the tag off only when the colon follows the last slash: a registry
+  # host may carry a port, and a reference may be pinned with no tag at all.
+  repository="$name_with_tag"
+  tag=""
+  case "${name_with_tag##*/}" in
+    *:*)
+      tag="${name_with_tag##*:}"
+      repository="${name_with_tag%:*}"
+      ;;
+  esac
 
   case "$repository" in
     "${canonical_registry}/"*)
       path="${repository#"${canonical_registry}/"}"
       ;;
     *)
-      echo "::error::base image must name ${canonical_registry} explicitly so the mirror rewrite is reviewable: ${reference}" >&2
-      failures=$((failures + 1))
+      echo "::error::base image must name ${canonical_registry} explicitly so the mirror rewrite is reviewable: ${reference}"
+      broken=$((broken + 1))
       continue
       ;;
   esac
 
-  canonical_state=fail
-  if [ "$(resolve_digest "${canonical_registry}/${path}@${pinned_digest}")" = "$pinned_digest" ]; then
-    canonical_state=ok
-  else
-    echo "::error::${canonical_registry} no longer serves ${path} at ${pinned_digest}" >&2
-    failures=$((failures + 1))
-  fi
+  probe_registry "$canonical_registry" "$path" "$pinned_digest"
+  canonical_state="$probe_state"
+  probe_registry "$mirror_registry" "$path" "$pinned_digest"
+  mirror_state="$probe_state"
+  for state in "$canonical_state" "$mirror_state"; do
+    case "$state" in
+      gone | mismatch) broken=$((broken + 1)) ;;
+      unverified) unverified=$((unverified + 1)) ;;
+    esac
+  done
 
-  mirror_state=fail
-  if [ "$(resolve_digest "${mirror_registry}/${path}@${pinned_digest}")" = "$pinned_digest" ]; then
-    mirror_state=ok
-  else
-    echo "::error::${mirror_registry} no longer serves ${path} at ${pinned_digest}; the build has lost its second registry" >&2
-    failures=$((failures + 1))
-  fi
-
-  upstream_digest="$(resolve_digest "${canonical_registry}/${path}:${tag}")"
-  tag_state="unresolved"
-  if [ -n "$upstream_digest" ]; then
-    if [ "$upstream_digest" = "$pinned_digest" ]; then
-      tag_state="current"
-    else
-      tag_state="moved to ${upstream_digest}"
-      drifted=$((drifted + 1))
-      echo "::warning::${path}:${tag} has moved past the pin; bump the Dockerfile digest to ${upstream_digest}"
+  tag_state="untagged"
+  if [ -n "$tag" ]; then
+    upstream_digest=""
+    tag_state="unresolved"
+    if upstream_digest="$(resolve_digest "${canonical_registry}/${path}:${tag}")"; then
+      if [ "$upstream_digest" = "$pinned_digest" ]; then
+        tag_state="current"
+      else
+        tag_state="moved to ${upstream_digest}"
+        drifted=$((drifted + 1))
+        echo "::warning::${path}:${tag} has moved past the pin; bump the Dockerfile digest to ${upstream_digest}"
+      fi
     fi
   fi
 
@@ -112,16 +209,20 @@ while IFS= read -r from_line; do
 done < <(grep -E '^FROM[[:space:]]' "$dockerfile")
 
 if [ "$pins_found" -eq 0 ]; then
-  echo "::error::no digest-pinned base image was found in ${dockerfile}; this check would pass an unpinned build" >&2
+  echo "::error::no digest-pinned base image was found in ${dockerfile}; this check would pass an unpinned build"
   exit 1
 fi
 
 summary ""
-summary "${pins_found} pinned base image(s), ${drifted} behind the upstream tag."
+summary "${pins_found} pinned base image(s): ${broken} unreachable or wrong, ${unverified} unverified, ${drifted} behind the upstream tag."
 
-if [ "$failures" -gt 0 ]; then
-  echo "::error::${failures} base image pin check(s) failed" >&2
+if [ "$broken" -gt 0 ]; then
+  echo "::error::${broken} base image pin check(s) failed definitively"
   exit 1
+fi
+if [ "$unverified" -gt 0 ]; then
+  echo "::warning::${unverified} base image pin check(s) could not be completed; no conclusion is being drawn about them"
+  exit 2
 fi
 
 echo "all ${pins_found} base image pin(s) resolve from ${canonical_registry} and ${mirror_registry}"
