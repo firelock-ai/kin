@@ -28,7 +28,7 @@ use kin_model::{
 };
 // One declared bound governs both directions: what these routes accept is what
 // the transfer client reads.
-use kin_cli::commands::transfer::DerivedViewRefresh;
+use kin_cli::commands::transfer::{DerivedViewRefresh, WorkspaceFollow};
 use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -7586,8 +7586,12 @@ async fn command_push(
     Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
         outcome,
         // A push moves the remote's authority, not this replica's, so nothing
-        // derived from local authority is behind after it.
+        // derived from local authority is behind after it, and this replica's
+        // workspace has nothing to follow.
         derived_views: DerivedViewRefresh::Current,
+        workspace: WorkspaceFollow::NotApplicable {
+            detail: "a push moves the remote's authority; this workspace is unchanged".to_string(),
+        },
     }))
 }
 
@@ -7625,7 +7629,8 @@ async fn command_pull(
                 None => kin_remote::repository_transfer_negotiation::remote_default_ref(
                     &transport,
                     &repository_id,
-                )?,
+                )
+                .map_err(|error| (error, 0usize))?,
             };
             let destination_ref = requested_destination_ref.unwrap_or_else(|| source_ref.clone());
             // Admission runs here rather than inside the negotiation helper so
@@ -7634,7 +7639,8 @@ async fn command_pull(
             // past one envelope arrives as several packs, and each takes that
             // path in turn.
             let mut refresh = DerivedViewRefresh::Current;
-            let outcome = kin_remote::repository_transfer_negotiation::pull_from_remote_with(
+            let mut admitted_packs = 0usize;
+            let admitted = kin_remote::repository_transfer_negotiation::pull_from_remote_with(
                 &authority,
                 &transport,
                 &repository_id,
@@ -7648,6 +7654,7 @@ async fn command_pull(
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
                     )?;
+                    admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {
                         if let Err(detail) = refresh_local_derived_views(
                             &blocking_state,
@@ -7660,13 +7667,28 @@ async fn command_pull(
                     }
                     Ok(receipt)
                 },
-            )?;
-            Ok::<_, kin_remote::repository_transfer::RepositoryTransferError>((outcome, refresh))
+            );
+            // Bound as its own statement so the admit closure, and the borrows
+            // it holds, are gone before the count it kept is read back.
+            let outcome = admitted.map_err(|error| (error, admitted_packs))?;
+            Ok::<
+                _,
+                (
+                    kin_remote::repository_transfer::RepositoryTransferError,
+                    usize,
+                ),
+            >((outcome, refresh))
         })
         .await
         .map_err(internal_error)?
     };
-    let (outcome, mut derived_views) = outcome.map_err(repository_transfer_error)?;
+    let (outcome, mut derived_views) = outcome.map_err(|(error, admitted_packs)| {
+        let (status, message) = repository_transfer_error(error);
+        match interrupted_pull_report(admitted_packs) {
+            Some(report) => (status, format!("{message} {report}")),
+            None => (status, message),
+        }
+    })?;
 
     if !local_derived_views && outcome.moved_history() {
         state.repo_graphs.write().await.remove(&repo_id);
@@ -7676,10 +7698,117 @@ async fn command_pull(
     }
     record_derived_view_staleness(&state, &derived_views).await;
 
+    // A pull that admitted nothing moved no ref, so no working tree can be
+    // behind a head that did not move. Planning the transition anyway answers an
+    // ordinary no-op pull with whatever the planner finds in the working copy,
+    // which is how a plain local edit came to be reported as authority having
+    // moved. It also pays the whole branch-switch planner on every `kin pull`.
+    //
+    // The cost of the guard is that a workspace an earlier pull left behind no
+    // longer completes on the next pull. That is the remedy the report already
+    // names: `kin branch switch` onto the pulled ref.
+    let workspace = if outcome.moved_history() {
+        pull_workspace_follow(
+            &state,
+            local_derived_views,
+            &derived_views,
+            &outcome.destination_ref,
+        )
+        .await
+    } else {
+        WorkspaceFollow::NotApplicable {
+            detail: "this pull admitted no history, so no ref moved for a working tree to follow"
+                .to_string(),
+        }
+    };
+
     Ok(Json(kin_cli::commands::transfer::CommandTransferResponse {
         outcome,
         derived_views,
+        workspace,
     }))
+}
+
+/// Name what a pull left durable when it failed partway through a multi-pack
+/// gap, so the caller is not told a transfer that partly landed did nothing.
+///
+/// The protocol supports this interruption on purpose: each pack is its own
+/// repository transaction, so the ones that landed are durable and the
+/// destination ref has already moved with them. The workspace transition never
+/// ran, which means the working tree is now behind that ref and no
+/// `WorkspaceFollow` report reached the caller to say so.
+fn interrupted_pull_report(admitted_packs: usize) -> Option<String> {
+    if admitted_packs == 0 {
+        return None;
+    }
+    Some(format!(
+        "{admitted_packs} pack(s) were admitted before this failed and are durable, so this \
+         replica's destination ref has already moved while its working tree still shows the head \
+         it had before. Re-run the pull to resume from the last admitted pack; that run reports \
+         and completes the workspace transition."
+    ))
+}
+
+/// Move the graph-owned workspace onto the head this pull admitted.
+///
+/// Runs after admission rather than inside it, because admission is atomic per
+/// pack while a workspace transition is one mutation onto the ref's final
+/// target. A gap carried by several packs therefore moves the working tree once,
+/// at the end, instead of walking it through every intermediate head. Its caller
+/// runs it only for a pull that admitted history, so every state it reports is a
+/// statement about a ref that did move.
+///
+/// Every outcome here is reported, never raised. The admitted history is already
+/// durable and receipted; answering a caller with a failure would describe a
+/// transfer that did happen as one that did not.
+async fn pull_workspace_follow(
+    state: &Arc<DaemonState>,
+    local_derived_views: bool,
+    derived_views: &DerivedViewRefresh,
+    destination_ref: &kin_model::RefName,
+) -> WorkspaceFollow {
+    if !local_derived_views {
+        return WorkspaceFollow::NotApplicable {
+            detail: "hosted snapshot authority serves no local working tree".to_string(),
+        };
+    }
+    // The transition plans its target from the daemon's own graph, so a graph
+    // that did not follow authority cannot be the thing a working tree is
+    // materialized from. Refusing here keeps a stale derived view from being
+    // projected onto disk as if it were the admitted head.
+    if let DerivedViewRefresh::Stale { detail } = derived_views {
+        return WorkspaceFollow::Behind {
+            detail: format!(
+                "the views this transition plans from are behind the admitted head: {detail}"
+            ),
+        };
+    }
+    // Take the gate every other command that mutates this workspace takes, in
+    // the same order, so a transition does not merely lose a race against a
+    // concurrent commit or branch switch and report itself behind. Admission
+    // has already happened and does not hold this, so the gate covers the
+    // transition alone; the workspace compare-and-swap is still what makes the
+    // outcome safe rather than this lock.
+    let _coordination = state.coordination_gate.lock().await;
+    let state = Arc::clone(state);
+    let destination_ref = destination_ref.clone();
+    // Authority reads, projection IO, and the workspace commit all block, so
+    // they must not run on the executor that also serves this daemon's own
+    // transfer seam.
+    match tokio::task::spawn_blocking(move || {
+        crate::repository_branch::follow_moved_ref(
+            &state,
+            &destination_ref,
+            &kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
+        )
+    })
+    .await
+    {
+        Ok(follow) => follow,
+        Err(error) => WorkspaceFollow::Behind {
+            detail: format!("workspace transition task did not complete: {error}"),
+        },
+    }
 }
 
 /// POST /commands/transfer-plan — negotiate a publication without moving any
@@ -11231,6 +11360,96 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
+    /// Advance a peer replica by one exact native change that edits an artifact
+    /// the replica already holds, and move `branch` onto it.
+    ///
+    /// Deliberately an edit rather than an addition. Repository-v6 binds a
+    /// native change that INTRODUCES an artifact to the workspace mutation that
+    /// publishes it, and a transfer's receive transaction carries no workspace
+    /// mutation, so native history that introduces artifacts cannot be admitted
+    /// by any pull today. Editing an artifact the destination already holds is
+    /// what a native transfer can actually carry, so it is what this proves.
+    fn advance_peer_artifact(
+        storage: &FsPath,
+        repository_id: &RepositoryId,
+        branch: &[u8],
+        previous_head: kin_model::SemanticChangeId,
+        previous_target: kin_model::RefTarget,
+        artifact_id: kin_model::ArtifactId,
+        old: kin_model::LocatedEntry,
+        body: &[u8],
+    ) -> kin_model::SemanticChangeId {
+        use kin_model::{
+            compute_semantic_change_id, ChangeOrigin, LocatedEntry, RefExpectation, RefMutation,
+            RefTarget, RefUpdatePolicy, RepositoryTransaction, SemanticChange, TreeDelta,
+            TreeEntry, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        };
+
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+        )
+        .unwrap();
+        let digest = Hash256::from_bytes(
+            <[u8; 32]>::try_from(<sha2::Sha256 as sha2::Digest>::digest(body).as_slice()).unwrap(),
+        );
+        manager.save_source_blob(digest, body).unwrap();
+        let branch_ref = kin_model::RefName::branch(branch).unwrap();
+        let mut change = SemanticChange {
+            id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![previous_head],
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("transfer-workspace-e2e"),
+            message: "edit the projected artifact on the peer".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Updated {
+                artifact_id,
+                new: LocatedEntry::new(old.path.clone(), TreeEntry::blob(digest, false)),
+                old,
+            }],
+            admission_policy_delta: None,
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: kin_model::AuthorId::new("transfer-workspace-e2e"),
+            reason: "edit the projected artifact on the peer".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: branch_ref,
+                expected: RefExpectation::MustEqual {
+                    target: previous_target,
+                },
+                new_target: Some(RefTarget::change(change.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+        change.id
+    }
+
     /// A daemon backed by its own empty repository-v6 storage under `repo_id`.
     fn replica_state(repo_id: &str) -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
         install_test_registry_override();
@@ -11469,6 +11688,462 @@ mod tests {
         assert_eq!(
             pulled.derived_views,
             kin_cli::commands::transfer::DerivedViewRefresh::Current
+        );
+    }
+
+    /// Two replicas of ONE repository: a real local one with a graph-owned
+    /// workspace projecting into a working directory, and a peer that forked
+    /// from it and has since moved `refs/heads/main` ahead by one exact edit.
+    ///
+    /// The peer is a copy of this replica's own storage rather than a separate
+    /// repository, because a transfer only exists between replicas of the same
+    /// repository identity: the ref advertisement refuses anything else. This is
+    /// the local half of what a native clone will establish.
+    struct WorkspaceFollowFixture {
+        state: Arc<DaemonState>,
+        working: PathBuf,
+        projected: PathBuf,
+        peer_url: String,
+        peer_head: kin_model::SemanticChangeId,
+        _peer_storage: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    async fn workspace_follow_fixture(
+        label: &str,
+        first_body: &[u8],
+        second_body: &[u8],
+    ) -> WorkspaceFollowFixture {
+        const PATH: &str = "service/compose.yaml";
+
+        install_test_registry_override();
+        let working =
+            std::env::temp_dir().join(format!("kin-daemon-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(working.join("service")).unwrap();
+        run_test_git(&working, ["init", "--initial-branch=main"]);
+        run_test_git(&working, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(&working, ["config", "user.name", "Kin Pull Route Test"]);
+        std::fs::write(working.join(PATH), first_body).unwrap();
+        run_test_git(&working, ["add", "--all"]);
+        run_test_git(&working, ["commit", "-s", "-m", "projected baseline"]);
+
+        let layout = kin_core::init_from_git(&working).unwrap().layout;
+        let repo_id = kin_core::manifest::KinManifest::load(&layout.manifest_path())
+            .unwrap()
+            .repo_id;
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        // Read the exact identity the peer's edit has to update. A native edit
+        // that invented a new artifact id would introduce an artifact, which is
+        // a different admission contract.
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let target = lease.resolve_ref_target(&main).unwrap().unwrap();
+        let baseline = lease.resolve_target_change_id(&target).unwrap();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        let baseline_artifact = workspace
+            .tree
+            .artifacts_by_path()
+            .find(|artifact| artifact.path.as_bytes() == PATH.as_bytes())
+            .expect("the admitted baseline projects the fixture path");
+        let artifact_id = baseline_artifact.artifact_id;
+        let old_entry =
+            kin_model::LocatedEntry::new(baseline_artifact.path.clone(), baseline_artifact.entry);
+        drop(lease);
+        drop(authority);
+
+        // Fork the peer from this replica's storage, then advance only the peer.
+        let peer_storage = tempfile::tempdir().unwrap();
+        let peer_root = peer_storage.path().join("kindb");
+        copy_test_directory(&layout.kindb_dir(), &peer_root);
+        let peer_head = advance_peer_artifact(
+            &peer_root,
+            &repository_id,
+            b"main",
+            baseline,
+            target,
+            artifact_id,
+            old_entry,
+            second_body,
+        );
+
+        let state = Arc::new(DaemonState::open_with_repo_id(layout, None).unwrap());
+        let peer_working = tempfile::tempdir().unwrap();
+        let peer_layout = kin_core::init(peer_working.path()).unwrap().layout;
+        let peer_state = Arc::new(
+            DaemonState::open_with_backend(
+                peer_layout,
+                Box::new(kin_db::LocalFileBackend::new(peer_root)),
+                &repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        let peer_url = serve_replica(peer_state).await;
+        // The peer working directory only exists so the peer daemon has a
+        // layout; nothing projects into it. Leaking it keeps it alive for the
+        // duration of the test.
+        std::mem::forget(peer_working);
+
+        WorkspaceFollowFixture {
+            projected: working.join(PATH),
+            working,
+            state,
+            peer_url,
+            peer_head,
+            _peer_storage: peer_storage,
+        }
+    }
+
+    fn pull_request(
+        url: &str,
+        repo_id: &str,
+    ) -> kin_cli::commands::transfer::CommandTransferRequest {
+        kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: url.to_string(),
+            remote_token: None,
+            repository_id: Some(repo_id.to_string()),
+            source_ref: None,
+            destination_ref: None,
+        }
+    }
+
+    /// The gate this command was held closed on: admitting history has to move
+    /// the working tree, not just the ref.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_moves_the_graph_owned_workspace_onto_the_admitted_head() {
+        let fixture = workspace_follow_fixture(
+            "pull-follows",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: baseline }\n",
+            "the replica starts on the head it admitted from Git"
+        );
+
+        let request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            pulled
+                .outcome
+                .final_receipt()
+                .expect("a moved head returns a receipt")
+                .destination_head,
+            fixture.peer_head
+        );
+        assert_eq!(
+            pulled.derived_views,
+            kin_cli::commands::transfer::DerivedViewRefresh::Current
+        );
+        let advanced_generation = match &pulled.workspace {
+            WorkspaceFollow::Advanced {
+                authority_generation,
+                ..
+            } => *authority_generation,
+            other => panic!("the working tree must follow the admitted head, got {other:?}"),
+        };
+
+        // The claim is bytes on disk, so the assertion is bytes on disk.
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: peer }\n",
+            "the working tree must show the head the pull admitted"
+        );
+
+        // Authority and the workspace agree, and both are what the response
+        // reported. A projection that matched by luck would not survive this.
+        let layout = kin_core::KinLayout::discover(&fixture.working).unwrap();
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .clone();
+        assert_eq!(lease.roots().generation, advanced_generation);
+        assert_eq!(
+            workspace.base_target,
+            Some(kin_model::RefTarget::change(fixture.peer_head))
+        );
+        assert!(!workspace.is_dirty());
+        drop(lease);
+        drop(authority);
+
+        // Re-running finds both halves already where they belong. Nothing is
+        // admitted, so no ref moves, and the report says exactly that instead of
+        // describing a working tree measured against a head that did not move.
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let repeated: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(repeated.outcome.receipts.is_empty());
+        match &repeated.workspace {
+            WorkspaceFollow::NotApplicable { detail } => assert!(
+                detail.contains("admitted no history"),
+                "the report must name why no transition was planned: {detail}"
+            ),
+            other => panic!("a pull that admitted nothing plans no transition, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: peer }\n"
+        );
+    }
+
+    /// A pull onto a ref nobody is standing on is not a working tree that fell
+    /// behind. Reporting it as one would train a caller to ignore the report
+    /// that matters.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_an_untracked_ref_reports_no_workspace_to_move() {
+        let fixture = workspace_follow_fixture(
+            "pull-untracked-ref",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        let mut request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+        request.source_ref = Some(kin_model::RefName::branch(b"main").unwrap());
+        request.destination_ref = Some(kin_model::RefName::branch(b"imported").unwrap());
+
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            pulled.outcome.moved_history(),
+            "history still lands on the ref that was named"
+        );
+        match &pulled.workspace {
+            WorkspaceFollow::NotApplicable { detail } => assert!(
+                detail.contains("does not track"),
+                "the report must name why nothing moved: {detail}"
+            ),
+            other => panic!("an untracked ref moves no working tree, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: baseline }\n",
+            "a ref this workspace does not follow may not touch the working tree"
+        );
+    }
+
+    /// History still lands, the caller's edited file survives untouched, and the
+    /// response says both instead of picking one of those truths to report.
+    ///
+    /// This is the case a transfer must never resolve by overwriting: the pull
+    /// carries bytes for a path the caller has since edited outside Kin's seams.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_over_an_edited_projection_admits_history_and_reports_the_workspace_behind() {
+        let fixture = workspace_follow_fixture(
+            "pull-edited-projection",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        std::fs::write(&fixture.projected, b"services:\n  api: { image: local }\n").unwrap();
+
+        let request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            pulled
+                .outcome
+                .final_receipt()
+                .expect("history is admitted regardless of the working tree")
+                .destination_head,
+            fixture.peer_head,
+            "a workspace that cannot follow must not cost the caller the transfer"
+        );
+        match &pulled.workspace {
+            WorkspaceFollow::Behind { detail } => assert!(
+                detail.contains("diverge from the graph-owned workspace projection"),
+                "the report must name what blocked the transition: {detail}"
+            ),
+            other => panic!("an edited projection cannot be silently replaced, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: local }\n",
+            "the caller's edit must survive a transfer that could not move the tree"
+        );
+    }
+
+    /// The everyday invocation: up to date with the peer, one tracked file
+    /// edited in an editor, `kin pull` run out of habit.
+    ///
+    /// Nothing is admitted, so no ref moves and no working tree can be behind
+    /// one. Planning the transition anyway would find the edit and report a
+    /// workspace that failed to follow a head that never moved, which fails the
+    /// command and asserts two things that are both false.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_that_admits_nothing_reports_no_transition_over_an_edited_tree() {
+        let fixture = workspace_follow_fixture(
+            "pull-noop-edited",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        let request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+
+        // Reach "up to date with the peer" the way a caller does.
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            matches!(pulled.workspace, WorkspaceFollow::Advanced { .. }),
+            "the first pull moves the tree, got {:?}",
+            pulled.workspace
+        );
+
+        std::fs::write(&fixture.projected, b"services:\n  api: { image: local }\n").unwrap();
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let repeated: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            !repeated.outcome.moved_history(),
+            "the second pull has nothing left to admit"
+        );
+        assert!(
+            !repeated.workspace.is_behind(),
+            "nothing moved for this working tree to be behind of: {:?}",
+            repeated.workspace
+        );
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: local }\n",
+            "a pull that admitted nothing may not touch the caller's edit"
+        );
+    }
+
+    /// The refusal a follow owes a workspace that holds uncommitted state graph
+    /// authority already owns: the history still lands, the tree does not move,
+    /// and the refusal names the operation the caller actually ran.
+    ///
+    /// Reaching that state means going through the daemon. Bytes edited on disk
+    /// are projection drift, which is a different branch with a different
+    /// refusal; a stash seal followed by a restore is how a real workspace comes
+    /// to hold changes the compare-and-swap owns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_over_graph_owned_changes_reports_the_workspace_behind_without_naming_a_switch()
+    {
+        let fixture = workspace_follow_fixture(
+            "pull-graph-owned-changes",
+            b"services:\n  api: { image: baseline }\n",
+            b"services:\n  api: { image: peer }\n",
+        )
+        .await;
+        std::fs::write(&fixture.projected, b"services:\n  api: { image: staged }\n").unwrap();
+        let (status, body) = post_stash_request(Arc::clone(&fixture.state), &stash_push()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (status, body) = post_stash_request(Arc::clone(&fixture.state), &stash_pop()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let layout = kin_core::KinLayout::discover(&fixture.working).unwrap();
+        let authority = ActiveApiRepositoryAuthority::open_layout_for_test(&layout).unwrap();
+        let lease = authority.manager.read_authority();
+        let dirty = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .unwrap()
+            .is_dirty();
+        drop(lease);
+        drop(authority);
+        assert!(
+            dirty,
+            "the fixture must reach uncommitted state graph authority owns, not host drift"
+        );
+
+        let request = pull_request(&fixture.peer_url, &fixture.state.cached_repo_id);
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            pulled
+                .outcome
+                .final_receipt()
+                .expect("history is admitted regardless of the working tree")
+                .destination_head,
+            fixture.peer_head,
+            "a workspace that cannot follow must not cost the caller the transfer"
+        );
+        match &pulled.workspace {
+            WorkspaceFollow::Behind { detail } => {
+                assert!(
+                    detail.contains("has graph-owned changes"),
+                    "the report must name what blocked the transition: {detail}"
+                );
+                assert!(
+                    detail.contains("follow the ref the transfer moved"),
+                    "a caller who ran a pull is not part-way through a branch switch: {detail}"
+                );
+            }
+            other => panic!("uncommitted graph-owned state cannot be discarded, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&fixture.projected).unwrap(),
+            b"services:\n  api: { image: staged }\n",
+            "the caller's uncommitted state must survive a transfer that could not move the tree"
+        );
+
+        // The gap is closed now, so the next pull admits nothing. It must not
+        // repeat a refusal about a head that no longer moves.
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let repeated: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(!repeated.outcome.moved_history());
+        assert!(
+            !repeated.workspace.is_behind(),
+            "a pull that admitted nothing reports no workspace behind it: {:?}",
+            repeated.workspace
+        );
+    }
+
+    /// An interrupted multi-pack pull left every pack it admitted durable, and
+    /// the destination ref moved with them. The workspace report never runs on
+    /// that path, so the error is the only place that state can be named.
+    #[test]
+    fn an_interrupted_multi_pack_pull_names_what_it_left_durable() {
+        assert!(
+            interrupted_pull_report(0).is_none(),
+            "a pull that admitted nothing has nothing durable to report"
+        );
+        let report = interrupted_pull_report(2).expect("admitted packs are reported");
+        assert!(report.contains("2 pack(s)"), "{report}");
+        assert!(
+            report.contains("working tree still shows the head it had before"),
+            "the caller has to be told the tree is now behind the moved ref: {report}"
+        );
+        assert!(
+            report.contains("Re-run the pull"),
+            "the remedy is resumption, not repair: {report}"
         );
     }
 

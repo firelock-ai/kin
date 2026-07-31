@@ -584,7 +584,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// [OPEN GATE] Admit exact repository-v6 history from a native Kin remote
+    /// Admit exact repository-v6 history from a native Kin remote and move the
+    /// workspace onto it
     #[command(visible_alias = "fetch")]
     Pull {
         /// Remote name (defaults to the configured default native-kin remote)

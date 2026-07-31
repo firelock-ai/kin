@@ -199,7 +199,7 @@
       "evidence_tests": [
         "crates/kin-cli/tests/init_json.rs"
       ],
-      "note": "Git clone uses Git only as transport; Kin authority is admitted atomically from the completed clone."
+      "note": "Git clone uses Git only as transport; Kin authority is admitted atomically from the completed clone. Native Kin transport is an explicit open gate, so a clone cannot yet adopt a remote replica's repository identity. Adopting it is what both sides of a native transfer require, which is why `push` and `pull` are reachable today only between replicas that already share a repository id."
     },
     {
       "command": "migrate",
@@ -266,32 +266,43 @@
         "kin_daemon::api::tests::a_divergent_remote_refuses_the_push_over_http_and_moves_nothing",
         "kin_remote::repository_transfer_negotiation::tests::a_step_that_cannot_be_split_is_refused_by_name_rather_than_replanned",
         "kin_remote::repository_transfer_negotiation::tests::a_peer_whose_envelope_cannot_carry_the_smallest_step_is_refused_rather_than_looped_on",
-        "crates/kin-cli/tests/command_capabilities.rs::push_reaches_the_transfer_surface_instead_of_the_capability_gate"
+        "crates/kin-cli/tests/command_capabilities.rs::push_and_pull_reach_the_transfer_surface_instead_of_the_capability_gate"
       ],
-      "note": "Runs end to end between two Kin daemons over HTTP, including a gap larger than one negotiated envelope, which is published as an ordered sequence of packs rather than refused. Nothing spans those packs and this protocol does not claim it does: each is atomic on its own, and an interruption leaves the remote on the last receipted head. The remaining bound is a step that cannot be split, either one change whose new bodies exceed the negotiated byte limit or the smallest step a merge leaves reachable when that step exceeds a negotiated bound, which is refused by name rather than replanned. The peer is a Kin daemon transfer seam; the KinLab control-plane wrapper and its protection rules are not driven by this command."
+      "note": "Runs end to end between two Kin daemons over HTTP, including a gap larger than one negotiated envelope, which is published as an ordered sequence of packs rather than refused. Nothing spans those packs and this protocol does not claim it does: each is atomic on its own, and an interruption leaves the remote on the last receipted head. The remaining bound is a step that cannot be split, either one change whose new bodies exceed the negotiated byte limit or the smallest step a merge leaves reachable when that step exceeds a negotiated bound, which is refused by name rather than replanned. One bound is inherited from repository-v6 admission and is shared with `pull` and the inbound receive route: a Native change that INTRODUCES an artifact must be published with the workspace mutation that admits it, and a transfer's receive transaction carries no workspace mutation, so natively authored history that adds a path is refused by name on the receiving replica. The peer is a Kin daemon transfer seam; the KinLab control-plane wrapper and its protection rules are not driven by this command."
     },
     {
       "command": "pull",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "repository-v6 remote capability and exact transport",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "DONE: read the remote ref advertisement, adopt its default ref when this replica has none, and fetch the exact exported closure",
-        "DONE: admit each pack in one local authority transaction and refuse a receipt that does not bind it",
-        "DONE: refuse a remote this replica already contains, naming the remote head",
-        "DONE: carry a closure larger than one negotiated envelope as an ordered sequence of packs, resuming from the last one admitted",
-        "DONE: report a derived-view refresh that fails after authority is durable as a typed partial success rather than a server error",
-        "OPEN: graph-derived workspace transition after admission, so a working tree follows the new head"
+        "read the remote ref advertisement, adopt its default ref when this replica has none, and fetch the exact exported closure",
+        "admit each pack in one local authority transaction and refuse a receipt that does not bind it",
+        "refuse a remote this replica already contains, naming the remote head",
+        "carry a closure larger than one negotiated envelope as an ordered sequence of packs, resuming from the last one admitted",
+        "report a derived-view refresh that fails after authority is durable as a typed partial success rather than a server error",
+        "transition the graph-derived workspace onto the admitted head through the same projection transaction a branch switch commits, so the working tree shows what was pulled",
+        "report a working tree that could not follow, naming what blocked it, without revoking the history that is already durable",
+        "plan no workspace transition for a pull that admitted no history, so an ordinary no-op pull reports no working tree behind a head that never moved and exits clean"
       ],
       "evidence_tests": [
         "kin_remote::repository_transfer_negotiation::tests::a_pull_past_the_negotiated_envelope_admits_the_whole_gap_across_continuation_packs",
         "kin_remote::repository_transfer_negotiation::tests::pull_admits_the_same_gap_from_the_other_side",
         "kin_remote::repository_transfer_negotiation::tests::pull_refuses_a_remote_this_replica_already_contains",
         "kin_daemon::api::tests::a_pull_whose_derived_refresh_fails_reports_partial_success_not_a_server_error",
-        "kin_daemon::api::tests::native_push_and_pull_move_exact_history_between_two_daemons_over_http"
+        "kin_daemon::api::tests::native_push_and_pull_move_exact_history_between_two_daemons_over_http",
+        "kin_daemon::api::tests::a_pull_moves_the_graph_owned_workspace_onto_the_admitted_head",
+        "kin_daemon::api::tests::a_pull_onto_an_untracked_ref_reports_no_workspace_to_move",
+        "kin_daemon::api::tests::a_pull_over_an_edited_projection_admits_history_and_reports_the_workspace_behind",
+        "kin_daemon::api::tests::a_pull_over_graph_owned_changes_reports_the_workspace_behind_without_naming_a_switch",
+        "kin_daemon::api::tests::a_pull_that_admits_nothing_reports_no_transition_over_an_edited_tree",
+        "kin_cli::commands::transfer::tests::a_workspace_that_stayed_behind_fails_the_command_in_every_output_mode",
+        "kin_cli::commands::transfer::tests::every_other_state_exits_clean_in_every_output_mode",
+        "kin_cli::commands::transfer::tests::a_response_without_the_field_reads_as_unreported",
+        "crates/kin-cli/tests/command_capabilities.rs::push_and_pull_reach_the_transfer_surface_instead_of_the_capability_gate"
       ],
-      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified, including a gap past one envelope. It stays closed for one reason only: admitting history does not move the workspace to the admitted head, so a working tree after `kin pull` still shows the old one. That is what a caller expects this command to do, and until it does, exposing it would promise a transition that does not happen."
+      "note": "Negotiation, export, and admission run end to end between two Kin daemons over HTTP with receipts verified, including a gap past one envelope, and the graph-owned workspace now follows the admitted head. Admission and the workspace transition are two repository transactions, not one: publication is atomic per pack and durable first, then the workspace moves onto the ref's final target through the same projection transaction `kin branch switch` commits, so a gap carried by several packs moves the working tree once rather than walking it through every intermediate head. Every workspace outcome is reported and none of them revokes the transfer. A workspace standing on another ref is reported as inapplicable; one that cannot move, because graph authority owns uncommitted state or a tracked path was edited outside Kin's seams, is reported as behind and the CLI exits non-zero in every output mode, including `--json`, so work chained onto the pull does not run against the head the pull replaced. Nothing is ever materialized over a tree that did not follow. A pull that admits no history plans no transition at all: no ref moved, so no working tree can be behind one, and the command reports that and exits clean. The cost is that a workspace an earlier pull left behind is not moved by the next pull; the remedy is the one the report already names, `kin branch switch` onto the pulled ref. A native pull is reachable today only between replicas that already share a repository id: `kin init` mints a fresh one, the daemon refuses an id that differs from its manifest, and the ref advertisement refuses a transfer between different identities, so the only thing that establishes a shared identity right now is a raw storage copy, which is what this command's own fixture does. Establishing it from a remote is native clone, which `clone` records as an open gate. One bound is inherited from repository-v6 admission rather than introduced here, and it is shared with `push` and the inbound receive route: a Native change that INTRODUCES an artifact must be published with the workspace mutation that admits it, and a transfer's receive transaction carries no workspace mutation, so natively authored history that adds a path is refused by name on the receiving replica. Native edits and removals, and all Git-origin history, transfer normally. The peer is a Kin daemon transfer seam; the KinLab control-plane wrapper and its protection rules are not driven by this command."
     },
     {
       "command": "merge",
