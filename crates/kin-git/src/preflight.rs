@@ -1027,11 +1027,17 @@ fn prove_tracked_entry(
                 // those bytes is the same observation Git makes, not a
                 // filesystem fallback for a missing link.
                 SymlinkMaterialization::TargetTextFile => {
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    if metadata.file_type().is_symlink() {
                         return Err(preflight_error(format!(
-                            "tracked symlink {path} is materialized as neither a symbolic link \
-                             nor the regular file holding its target, which is what Git writes \
-                             under core.symlinks=false"
+                            "tracked symlink {path} is a real symbolic link, but core.symlinks is \
+                             off, so Git writes and compares the target as a regular file here; \
+                             the worktree disagrees with the repository's own configuration"
+                        )));
+                    }
+                    if !metadata.is_file() {
+                        return Err(preflight_error(format!(
+                            "tracked symlink {path} is not the regular file holding its target, \
+                             which is what Git materializes under core.symlinks=off"
                         )));
                     }
                     fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?

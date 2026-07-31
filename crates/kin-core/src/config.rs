@@ -1164,10 +1164,26 @@ fn save_config_atomically(path: &Path, contents: &[u8]) -> Result<()> {
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 fn save_config_atomically(path: &Path, _contents: &[u8]) -> Result<()> {
-    Err(KinError::Config(format!(
-        "capability-owned atomic repository config replacement is unsupported on this platform: {}",
+    Err(unsupported_config_replacement(path))
+}
+
+/// Say what the host is missing, not merely that it is missing something.
+///
+/// Publishing a config means exchanging a fully written owner-private sibling
+/// for the current one under a retained directory capability, so a name raced
+/// in between is detected and the exchange rolled back. That needs an atomic
+/// exchanging or no-replace directory rename plus a durable directory flush.
+/// A host without them gets no truncating path-based fallback: a partially
+/// written config would become repository authority with no way back.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn unsupported_config_replacement(path: &Path) -> KinError {
+    KinError::Config(format!(
+        "cannot publish repository config {} on this platform: capability-owned replacement needs \
+         an atomic exchanging or no-replace directory rename and a durable directory flush, which \
+         this host does not provide. Kin does not fall back to overwriting the file in place, \
+         because a partially written config would become repository authority with no rollback",
         path.display()
-    )))
+    ))
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
@@ -1200,10 +1216,7 @@ fn save_config_atomically_scoped(
     _contents: &[u8],
     _kind: ConfigAuthorityKind,
 ) -> Result<()> {
-    Err(KinError::Config(format!(
-        "capability-owned atomic repository config replacement is unsupported on this platform: {}",
-        path.display()
-    )))
+    Err(unsupported_config_replacement(path))
 }
 
 #[cfg(all(
