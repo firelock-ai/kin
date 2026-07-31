@@ -52,13 +52,19 @@ CONFIG_CAUSE="an atomic exchanging or no-replace directory rename"
 # materialization replaced.
 SOURCE_PROOF_STAGE="prove mutable Git workspace"
 
+# Every assertion reports and the script exits once at the end. One CI round on
+# a Windows runner is expensive, so a run that stops at the first failure buys a
+# second round to learn what the second boundary did.
+failures=0
+
 fail() {
   local message="$1"
   local log="$2"
+  failures=$((failures + 1))
   echo "::error::$message"
   echo "--- captured kin init output: $log ---"
   cat "$log" || true
-  exit 1
+  echo "--- end $log ---"
 }
 
 # `grep -c` exits 1 on zero matches, which `set -e` would otherwise treat as a
@@ -100,6 +106,16 @@ require_refused() {
   fi
 }
 
+# What a command refuses means nothing until it can start. Windows gives the
+# main thread a 1 MiB stack where Unix gives 8 MiB, and this repository already
+# records that the CLI's own command tree needs more room than a 2 MiB thread
+# gives it, so "the binary died before it reached admission" is a real and
+# distinct outcome that must not be read as a missing refusal.
+startup_log="$scratch/kin-version.txt"
+if ! "$kin_bin" --version > "$startup_log" 2>&1; then
+  fail "kin --version did not run, so nothing below reports on admission" "$startup_log"
+fi
+
 git_boundary="$scratch/exact-git"
 git_log="$scratch/kin-init-exact-git.txt"
 mkdir -p "$git_boundary"
@@ -129,4 +145,8 @@ require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_lo
 require_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL" "$native_log"
 require_text "Windows native-unborn bootstrap" "$CONFIG_CAUSE" "$native_log"
 
+if [ "$failures" -ne 0 ]; then
+  echo "::error::Windows admission did not behave as asserted ($failures check(s) failed)"
+  exit 1
+fi
 echo "Windows admission refused on both boundaries and published no repository."
