@@ -13,8 +13,15 @@ on:
 permissions:
   contents: read
 
+# Sha-scoped on main for the same reason as ci.yml: `cancel-in-progress: false`
+# keeps at most one PENDING run per group and cancels the older one, so two
+# quick pushes to main can delete the earlier commit's run outright. This
+# workflow publishes `cargo-deny`, a required context that release-tag.yml
+# demands with push-event provenance, so a dropped run here makes the commit
+# unmintable. The suffix is empty off main, leaving pull-request and
+# merge-queue supersession exactly as it was.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
