@@ -3605,6 +3605,49 @@ def main() -> None:
         "./scripts/read-update-build-identity.test.cjs",
         "static release build identity parser regression",
     )
+
+    # The archive that carries the release and the manifest that describes it are
+    # produced by one job and judged by another. Both must decide what a release
+    # archive is allowed to contain from the same rules, or a shape one side
+    # emits is a shape the other refuses at publish time.
+    for policy in (
+        'require("./scripts/release-archive-shape.cjs")',
+        "classifyReleaseArchiveRoot(artifact, { target })",
+    ):
+        require(build_job, policy, "sanctioned release archive shape at packaging")
+    for policy in (
+        'require("./scripts/release-archive-shape.cjs")',
+        "assertReleaseArchiveMemberPaths(",
+        "classifyReleaseArchiveRoot(contentRoot, {",
+    ):
+        require(publish_job, policy, "sanctioned release archive shape at publish")
+    for forbidden in (
+        "entries.every((entry) => entry.isFile())",
+        ".filter((entry) => entry.isFile())",
+    ):
+        if forbidden in publish_job or forbidden in build_job:
+            raise AssertionError(
+                "release archive shape must be judged by the shared classifier, not by "
+                f"an inline entry-type filter: {forbidden}"
+            )
+    member_path_check = publish_job.index("assertReleaseArchiveMemberPaths(")
+    archive_extraction = publish_job.index("fs.mkdtempSync(path.join(os.tmpdir()")
+    if member_path_check >= archive_extraction:
+        raise AssertionError(
+            "release archive member paths must be judged before extraction, because a "
+            "member that escapes the extraction root has already been written by then"
+        )
+    if 'tar tzf "${ARTIFACT}.tar.gz" | grep' in build_job:
+        raise AssertionError(
+            "release packaging must read the archive listing from a file: piping it into "
+            "grep lets an early grep exit fail the pipeline under pipefail, which is "
+            "indistinguishable from the member being absent"
+        )
+    require(
+        ci_workflow,
+        "./scripts/release-archive-shape.test.cjs",
+        "release archive shape regression",
+    )
     archive_attestation_start = publish_job.index(
         "      - name: Attest final release archives and provenance"
     )
