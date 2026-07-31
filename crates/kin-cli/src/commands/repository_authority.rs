@@ -8,7 +8,9 @@
 //! or the working directory.
 
 use anyhow::{anyhow, Context, Result};
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState};
+use kin_db::{
+    AuthorityPayloadStats, LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState,
+};
 use kin_model::{
     GitObjectId, RefName, RefTarget, RepositoryId, RootBundle, SemanticChangeId, WorkspaceId,
     WorkspaceState,
@@ -16,6 +18,7 @@ use kin_model::{
 
 pub(crate) struct ActiveRepositoryAuthority {
     manager: RepositoryAuthorityManager<LocalFileBackend>,
+    payload_stats: Option<AuthorityPayloadStats>,
     pub(crate) repository_id: RepositoryId,
     pub(crate) workspace_id: WorkspaceId,
 }
@@ -24,12 +27,13 @@ impl ActiveRepositoryAuthority {
     pub(crate) fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
         let repository_id = binding.repository_id().clone();
         let workspace_id = binding.workspace_id();
-        let manager = binding
-            .open_manager()
+        let (manager, payload_stats) = binding
+            .open_manager_with_payload_stats()
             .context("open repository-v6 authority through retained local binding")?;
 
         Ok(Self {
             manager,
+            payload_stats,
             repository_id,
             workspace_id,
         })
@@ -37,6 +41,15 @@ impl ActiveRepositoryAuthority {
 
     pub(crate) fn manager(&self) -> &RepositoryAuthorityManager<LocalFileBackend> {
         &self.manager
+    }
+
+    /// Payload receipt produced by the same recovery that built this manager.
+    ///
+    /// `None` only where no persisted authority existed and generation zero was
+    /// built in memory. It never becomes stale, because it describes the bytes
+    /// this open read rather than the repository's current size.
+    pub(crate) fn payload_stats(&self) -> Option<AuthorityPayloadStats> {
+        self.payload_stats
     }
 
     pub(crate) fn workspace(&self) -> Result<WorkspaceState> {

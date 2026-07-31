@@ -192,6 +192,102 @@ pub fn semantic_enrichment_from_authority(
     Ok(SemanticEnrichmentStatus::from_durable_summary(&summary))
 }
 
+/// Exact serialized payload one authority open recovered.
+///
+/// KinDB mints this receipt inside the same coherent recovery that produced the
+/// manager, so the counts name the bytes status actually read. They are not a
+/// measurement of the storage directory, which also holds retired journal
+/// entries, source bodies, indexes, and allocation overhead that no authority
+/// open admitted. The receipt is fixed at open and does not follow later
+/// commits.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct AuthorityPayloadReceipt {
+    pub snapshot_generation: u64,
+    pub head_generation: u64,
+    pub snapshot_bytes: u64,
+    pub acknowledged_delta_count: u64,
+    pub acknowledged_delta_bytes: u64,
+    pub total_payload_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityPayloadReceiptWire {
+    snapshot_generation: u64,
+    head_generation: u64,
+    snapshot_bytes: u64,
+    acknowledged_delta_count: u64,
+    acknowledged_delta_bytes: u64,
+    total_payload_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for AuthorityPayloadReceipt {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AuthorityPayloadReceiptWire::deserialize(deserializer)?;
+        let receipt = Self {
+            snapshot_generation: wire.snapshot_generation,
+            head_generation: wire.head_generation,
+            snapshot_bytes: wire.snapshot_bytes,
+            acknowledged_delta_count: wire.acknowledged_delta_count,
+            acknowledged_delta_bytes: wire.acknowledged_delta_bytes,
+            total_payload_bytes: wire.total_payload_bytes,
+        };
+        receipt.validate().map_err(serde::de::Error::custom)?;
+        Ok(receipt)
+    }
+}
+
+impl AuthorityPayloadReceipt {
+    /// Carry KinDB's receipt across the wire without restating it.
+    ///
+    /// Every field is the accessor's own value. Recomputing a total here would
+    /// report this process's arithmetic as the payload KinDB admitted.
+    fn from_payload_stats(stats: &kin_db::AuthorityPayloadStats) -> Self {
+        Self {
+            snapshot_generation: stats.snapshot_generation(),
+            head_generation: stats.head_generation(),
+            snapshot_bytes: stats.snapshot_bytes(),
+            acknowledged_delta_count: stats.acknowledged_delta_count(),
+            acknowledged_delta_bytes: stats.acknowledged_delta_bytes(),
+            total_payload_bytes: stats.total_payload_bytes(),
+        }
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        let span = self
+            .head_generation
+            .checked_sub(self.snapshot_generation)
+            .ok_or_else(|| {
+                format!(
+                    "authority_payload.snapshot_generation ({}) exceeds head_generation ({})",
+                    self.snapshot_generation, self.head_generation
+                )
+            })?;
+        if self.acknowledged_delta_count != span {
+            return Err(format!(
+                "authority_payload.acknowledged_delta_count ({}) does not account for the \
+                 generations between snapshot ({}) and head ({})",
+                self.acknowledged_delta_count, self.snapshot_generation, self.head_generation
+            ));
+        }
+        let total = self
+            .snapshot_bytes
+            .checked_add(self.acknowledged_delta_bytes)
+            .ok_or_else(|| "authority_payload byte counts overflow u64".to_string())?;
+        if self.total_payload_bytes != total {
+            return Err(format!(
+                "authority_payload.total_payload_bytes ({}) is not the snapshot ({}) plus \
+                 acknowledged delta ({}) bytes it names",
+                self.total_payload_bytes, self.snapshot_bytes, self.acknowledged_delta_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepositoryStatus {
     pub repository_id: RepositoryId,
@@ -227,6 +323,11 @@ pub struct StatusReport {
     pub repository: RepositoryStatus,
     pub workspace: WorkspaceStatus,
     pub semantic_enrichment: SemanticEnrichmentStatus,
+    /// Absent only where authority was never persisted and generation zero was
+    /// built in memory. A persisted repository always reports the payload its
+    /// open recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_payload: Option<AuthorityPayloadReceipt>,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +341,8 @@ struct StatusReportWire {
     repository: RepositoryStatus,
     workspace: WorkspaceStatus,
     semantic_enrichment: SemanticEnrichmentStatus,
+    #[serde(default)]
+    authority_payload: Option<AuthorityPayloadReceipt>,
 }
 
 impl<'de> Deserialize<'de> for StatusReport {
@@ -255,6 +358,7 @@ impl<'de> Deserialize<'de> for StatusReport {
             repository: wire.repository,
             workspace: wire.workspace,
             semantic_enrichment: wire.semantic_enrichment,
+            authority_payload: wire.authority_payload,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)
@@ -370,6 +474,10 @@ pub fn inspect(
 
     let artifact_count = workspace.tree.artifacts().len();
     let semantic_enrichment = semantic_enrichment_from_authority(&lease, &authority.workspace_id)?;
+    let authority_payload = authority
+        .payload_stats()
+        .as_ref()
+        .map(AuthorityPayloadReceipt::from_payload_stats);
 
     Ok(StatusReport {
         schema: STATUS_SCHEMA.to_string(),
@@ -394,6 +502,7 @@ pub fn inspect(
             artifact_count,
         },
         semantic_enrichment,
+        authority_payload,
     })
 }
 
@@ -475,6 +584,18 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
         ),
         "Live graph enrichment: see `kin graph status`".to_string(),
         "Source CAS: verified".to_string(),
+        match report.authority_payload.as_ref() {
+            Some(payload) => format!(
+                "Authority payload read: {} bytes ({} snapshot bytes at generation {}, {} acknowledged deltas totalling {} bytes to generation {})",
+                payload.total_payload_bytes,
+                payload.snapshot_bytes,
+                payload.snapshot_generation,
+                payload.acknowledged_delta_count,
+                payload.acknowledged_delta_bytes,
+                payload.head_generation
+            ),
+            None => "Authority payload read: none (generation zero built in memory)".to_string(),
+        },
     ];
     if let Some(build) = build {
         lines.push(format!(
@@ -533,6 +654,94 @@ mod tests {
                 .to_string()
                 .contains("unsupported status schema 'kin.status.v1'"),
             "v1 must fail explicitly even when every v2 payload field is present: {error}"
+        );
+    }
+
+    #[test]
+    fn status_receipts_the_authority_payload_a_persisted_reopen_read() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        // A binding rebuilt from the layout reopens the persisted bytes rather
+        // than reusing the in-memory authority that init constructed.
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+
+        let report = inspect(&init.layout, &binding).unwrap();
+
+        // `None` is legal only where authority was never persisted. Accepting it
+        // here would let status report a read whose payload was never measured.
+        let payload = report.authority_payload.expect(
+            "status on a persisted repository must receipt the payload its authority open read",
+        );
+        assert!(
+            payload.snapshot_bytes > 0,
+            "a recovered snapshot cannot occupy zero serialized bytes"
+        );
+        assert_eq!(
+            payload.total_payload_bytes,
+            payload.snapshot_bytes + payload.acknowledged_delta_bytes
+        );
+        assert!(
+            render_text(&report, None).contains("Authority payload read: "),
+            "text status must state the payload the open read"
+        );
+
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            encoded["authority_payload"]["total_payload_bytes"],
+            serde_json::json!(payload.total_payload_bytes)
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusReport>(encoded)
+                .unwrap()
+                .authority_payload,
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn v2_accepts_a_report_without_a_payload_receipt_but_rejects_an_incoherent_one() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let valid = serde_json::to_value(inspect(&init.layout, &binding).unwrap()).unwrap();
+
+        let mut without_receipt = valid.clone();
+        without_receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("authority_payload");
+        assert_eq!(
+            serde_json::from_value::<StatusReport>(without_receipt)
+                .expect("the receipt is additive over the released v2 shape")
+                .authority_payload,
+            None
+        );
+
+        let mut inflated_total = valid.clone();
+        let claimed = inflated_total["authority_payload"]["total_payload_bytes"]
+            .as_u64()
+            .unwrap()
+            + 1;
+        inflated_total["authority_payload"]["total_payload_bytes"] = serde_json::json!(claimed);
+        let error = serde_json::from_value::<StatusReport>(inflated_total)
+            .expect_err("a total that exceeds the bytes it names must be refused");
+        assert!(
+            error.to_string().contains("total_payload_bytes"),
+            "unexpected payload-receipt error: {error}"
+        );
+
+        let mut unaccounted_deltas = valid;
+        unaccounted_deltas["authority_payload"]["head_generation"] = serde_json::json!(
+            unaccounted_deltas["authority_payload"]["head_generation"]
+                .as_u64()
+                .unwrap()
+                + 1
+        );
+        let error = serde_json::from_value::<StatusReport>(unaccounted_deltas)
+            .expect_err("a generation span with no acknowledged deltas must be refused");
+        assert!(
+            error.to_string().contains("acknowledged_delta_count"),
+            "unexpected payload-receipt error: {error}"
         );
     }
 
