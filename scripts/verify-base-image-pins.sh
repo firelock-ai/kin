@@ -59,20 +59,34 @@ resolve_digest() {
   local output=""
   local attempt
   : > "$resolve_error_file"
-  for attempt in 1 2 3 4 5; do
-    if output="$(docker buildx imagetools inspect "$reference" \
+  for attempt in 1 2 3; do
+    # Each call is wall-clock bounded. A registry outage is exactly when a
+    # connect hangs rather than refusing, and this job's whole reason to exist
+    # is registry outages, so an unbounded call would let the job run past its
+    # timeout during the one event it is watching for. A job that exceeds
+    # timeout-minutes concludes `cancelled`, which the release sweep treats as
+    # non-green just like `failure`.
+    if output="$(timeout 20 docker buildx imagetools inspect "$reference" \
       --format '{{.Manifest.Digest}}' 2>&1)"; then
       printf '%s\n' "$output"
       return 0
     fi
     printf '%s' "$output" > "$resolve_error_file"
+    # Match an HTTP status token or a whole phrase, never a bare "404". The
+    # error text embeds the reference, so the pinned digest is part of what is
+    # searched, and roughly one digest in seventy contains "404" somewhere in
+    # its hex. A bare substring match would turn any error, a throttle
+    # included, into "the registry answered definitively that it does not have
+    # it" for those digests, which is the exact false alarm the three-state
+    # design exists to prevent.
     case "$output" in
-      *"not found"* | *404* | *MANIFEST_UNKNOWN* | *"manifest unknown"*)
+      *": not found"* | *"404 Not Found"* | *"status 404"* \
+        | *MANIFEST_UNKNOWN* | *"manifest unknown"*)
         return 44
         ;;
     esac
-    if [ "$attempt" -lt 5 ]; then
-      sleep $(( attempt * 3 ))
+    if [ "$attempt" -lt 3 ]; then
+      sleep $(( attempt * 5 ))
     fi
   done
   return 2

@@ -6,28 +6,58 @@ name: Base Image Pins
 # A scheduled run's check-runs DO land on a commit. GitHub binds a check suite
 # to every workflow run, and for a `schedule` event `github.sha` is the default
 # branch HEAD at fire time, so a red scheduled run publishes a failure check-run
-# on a main commit. release-tag.yml's second sweep refuses a release commit
-# carrying any non-green check-run whether or not a ruleset requires it, and a
-# quiesced main during a release train holds HEAD still across exactly the
-# window that matters. This repo already carries a live instance of that shape:
-# fuzz.yml's scheduled run left two `failure` check-runs on a main sha.
+# on a main commit. release-tag.yml's second sweep treats only `success`,
+# `skipped` and `neutral` as non-failing, so anything else on a release
+# candidate refuses that release terminally. A quiesced main during a release
+# train holds HEAD still across exactly that window. fuzz.yml is the standing
+# example: its scheduled run left two `failure` check-runs on a main sha.
 #
-# Dropping the push and pull_request triggers therefore does NOT make this job
-# safe on its own. What makes it safe is that the scheduled path is
-# structurally incapable of concluding failure: the prover's exit status is
-# captured rather than propagated, and the step exits 0 whatever it found. A
-# registry-reachability probe must never be able to refuse a release, because
-# that is the failure class this workflow exists to watch.
+# So this job must not conclude non-green on what it FINDS. What follows is the
+# measured posture, not the intended one. An earlier version of this file
+# claimed the same protection and did not have it, because a `run:` step's
+# script is executed by `bash -e {0}`: `set -e` was never absent, and adding
+# `set -o pipefail` is what armed it. Every claim below was checked by running
+# the shapes on a scratch branch and reading the check-run conclusions off the
+# commit.
 #
-# Loudness comes from a surface that cannot poison a mint. When a pin is
-# definitively unreachable the run opens or updates a tracking issue, which
-# persists until someone acts on it, unlike a red check nobody is paged for.
+# What IS guaranteed:
 #
-# A `workflow_dispatch` run may fail hard, because an operator asked a direct
-# question and deserves a direct answer. The residual is real and is theirs to
-# own: dispatching against main during a release train can publish a failure
-# check-run on the candidate sha. Prefer the schedule unless you need the
-# answer now.
+#   - No result the prover can report concludes non-green. The step runs under
+#     a shell carrying no `-e`, disarms errexit again in its own body, captures
+#     the prover's status instead of propagating it, and ends in `exit 0`.
+#     Measured: that shape publishes `success` with a prover exit of 1, and the
+#     alarm step still runs.
+#   - A failed checkout does not fail the job: step-level `continue-on-error`.
+#
+# What is NOT guaranteed, stated rather than claimed away:
+#
+#   - Runner or infrastructure failure still concludes non-green. Nothing in a
+#     workflow can prevent that.
+#   - Exceeding `timeout-minutes` concludes `cancelled`, which the sweep also
+#     treats as non-green. That is made unreachable by bounding the work rather
+#     than by tolerating it: every registry call is wall-clock capped, the
+#     retry budget is fixed, and the worst case is roughly a third of the limit.
+#
+# Job-level `continue-on-error: true` is deliberately NOT used. It is the
+# obvious remedy and it does not work: measured, a job carrying it that fails
+# still publishes a `failure` check-run on the sha, and one that times out
+# publishes `cancelled`. It only stops the workflow RUN being marked failed,
+# which is not what the sweep reads. Adding it would look like protection while
+# changing nothing.
+#
+# The complete fix for the residual is the sweep learning to ignore
+# non-required producers, which is release-authority work tracked separately
+# and deliberately out of scope here.
+#
+# Loudness lives on a surface that cannot poison a mint: a definitively
+# unreachable pin opens or updates a tracking issue, which persists until
+# someone acts on it.
+#
+# A `workflow_dispatch` run still fails hard, because an operator asked a direct
+# question and deserves a direct answer. The residual is theirs to own:
+# dispatching against main during a release train can publish a failure
+# check-run on the candidate sha. Prefer the schedule unless you need the answer
+# now.
 on:
   schedule:
     - cron: "23 5 * * 1"
@@ -44,50 +74,75 @@ jobs:
   verify-pins:
     name: Verify base image pins
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Headroom, not a deadline. Worst case is 6 registry references at 3
+    # attempts, each call capped at 20s, with 15s of backoff per reference:
+    # about 7.5 minutes. Exceeding this concludes `cancelled`, so the budget is
+    # sized so that finishing is never in question.
+    timeout-minutes: 20
     permissions:
       contents: read
       # The tracking issue is the alarm. It is the only write this job performs.
       issues: write
     steps:
+      # A checkout that fails is a step failure, and a failed step fails the job
+      # whatever the later steps do. The prover cannot run without a checkout,
+      # but a green run reporting nothing beats a red one refusing a release.
       - name: Checkout
+        continue-on-error: true
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      # Exit status is captured, never propagated. `set -e` is deliberately
-      # absent so a non-zero prover status reaches the capture instead of
-      # killing the step, and the explicit `exit 0` makes the green conclusion
-      # a property of the step rather than of what the prover happened to find.
-      #
-      # 1 means a pin is definitively gone or wrong, which is the alarm. 2 means
-      # the probe could not reach a verdict, which is reported and nothing more:
-      # a throttled lookup is not evidence about a digest, and `Docker Image
-      # Build (no push)` already proves buildability on every pull request and
-      # every push to main.
+      # The shell is declared explicitly and carries no `-e`, because the
+      # default (`bash -e {0}`) does, and the `set -o pipefail` below is exactly
+      # what turns a non-zero prover status into a killed step under it.
+      # `set +e` then disarms errexit a second time in the body, so removing the
+      # `shell:` line later cannot silently re-arm the trap. Either layer alone
+      # is sufficient; both are here because this file already shipped once with
+      # a remedy that read correctly and did nothing.
       - name: Verify base image pins resolve from both registries
         id: verify
+        shell: bash --noprofile --norc {0}
         run: |
           set -uo pipefail
+          set +e
           bash scripts/verify-base-image-pins.sh Dockerfile 2>&1 | tee /tmp/base-image-pins.log
           status="${PIPESTATUS[0]}"
-          # A status outside the documented set means the prover itself broke,
-          # which would otherwise route to neither the alarm nor the all-clear
-          # and leave this job quietly doing nothing for weeks.
           case "$status" in
-            0 | 1 | 2) ;;
+            0)
+              echo "Every pinned base image resolves from both registries." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            1)
+              echo "::error::a pinned base image is unreachable; the release build has lost a registry"
+              echo "A pinned base image is unreachable. Tracking issue opened." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2)
+              # Reported rather than silent. A permanently throttled probe is
+              # the most likely steady state for anonymous registry lookups from
+              # shared runner egress, and without an annotation a run that
+              # verified nothing is indistinguishable from a healthy one.
+              echo "::warning::base image pins could not be verified this run; no conclusion is being drawn"
+              echo "Pins could not be verified this run (throttled or unreachable registry)." >> "$GITHUB_STEP_SUMMARY"
+              ;;
             *)
+              # Includes the prover being missing entirely, which is what a
+              # failed checkout looks like from here.
               echo "::warning::the pin prover exited ${status}, which is not one of its documented statuses; no conclusion drawn"
+              echo "Pin prover exited ${status}; no conclusion drawn." >> "$GITHUB_STEP_SUMMARY"
               ;;
           esac
           echo "status=${status}" >> "$GITHUB_OUTPUT"
           exit 0
 
-      # The alarm must not become the thing that reds a main sha. An API hiccup
-      # while filing it is the same hazard as a registry hiccup while probing,
-      # so it is reported and tolerated rather than propagated.
+      # `always()` so the alarm does not depend on every earlier step having
+      # succeeded. A bare `if:` implies `success()`, which would tie the alarm
+      # to exactly the conditions under which it is most needed.
+      #
+      # The alarm must also not become the thing that reds a main sha, so filing
+      # it is tolerated rather than propagated: an API hiccup while raising an
+      # alarm is the same hazard as a registry hiccup while probing.
       - name: Open or update the tracking issue
-        if: steps.verify.outputs.status == '1'
+        if: ${{ always() && steps.verify.outputs.status == '1' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,7 +177,7 @@ jobs:
           fi
 
       - name: Close the tracking issue once the pins are healthy
-        if: steps.verify.outputs.status == '0'
+        if: ${{ always() && steps.verify.outputs.status == '0' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -141,7 +196,7 @@ jobs:
       # Only a dispatched run may go red, and only after the alarm above has
       # already been raised, so the operator's answer never costs the alarm.
       - name: Report the failure to the operator who asked
-        if: ${{ github.event_name == 'workflow_dispatch' && steps.verify.outputs.status != '0' }}
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && steps.verify.outputs.status != '0' }}
         run: |
           echo "::error::base image pin verification exited ${{ steps.verify.outputs.status }}; see the log above"
           exit 1
