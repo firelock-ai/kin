@@ -73,7 +73,14 @@ resolution is stable and monotone.
 
 The release App has repository Contents permission but no `main` bypass. It can
 only update `automation/release-next`; the repository `GITHUB_TOKEN` opens the
-PR, while the App activates ordinary checks and registers protected auto-merge.
+PR, while the App reads the repository merge policy, activates ordinary checks,
+and registers protected auto-merge. GitHub returns the merge-policy settings
+only to a token holding push-level repository access, so the deliberately
+read-scoped `GITHUB_TOKEN` receives a response with those fields absent rather
+than wrong. The train therefore reads that policy through the App token and
+reports an unreadable policy separately from a violated one, because blaming
+the repository settings for a policy no token ever read sends recovery after a
+correctly configured repository.
 That App identity is important: GitHub suppresses most workflow events caused
 by `GITHUB_TOKEN`, whereas the App-owned merge emits the `main` push that starts
 CI and automatic tag admission. Main must require up-to-date checks so new
