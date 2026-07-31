@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.1] - 2026-07-31
+## [0.4.2] - 2026-07-31
 
 v0.4.0 was never published. Its release commit was refused by the mint gate
 because the release rail read the repository merge policy through a token that
 could not see those settings, and that defect is fixed in this release.
+
+v0.4.1 was never published either. Its release commit was refused by the same
+gate after the required `cargo-deny` check failed on registry-infrastructure
+timeouts rather than on anything in the dependency graph, and this release
+removes that dependency by installing the scanner from its own pinned release
+artifact instead of building a container image on every run.
 
 ### Breaking
 
