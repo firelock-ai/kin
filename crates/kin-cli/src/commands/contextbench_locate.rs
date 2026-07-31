@@ -155,6 +155,10 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
         max_files_explicit,
         None,
         false,
+        // ContextBench scores `files[]` and `symbols[].name`, not `entities[]`.
+        // Held at the pre-existing projection so this change cannot move a
+        // benchmark number.
+        false,
         crate::commands::locate::LocatePaging::default(),
     )
     .await?;

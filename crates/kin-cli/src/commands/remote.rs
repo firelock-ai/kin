@@ -3,8 +3,6 @@
 
 #[cfg(test)]
 use std::path::Path;
-#[cfg(test)]
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use kin_core::{
@@ -336,18 +334,16 @@ pub(crate) fn ensure_git_remote(working_dir: &Path, name: &str, url: Option<&str
         return Ok(());
     };
 
-    let get = Command::new("git")
+    let get = kin_git::test_support::fixture_git_in(working_dir)
         .args(["remote", "get-url", name])
-        .current_dir(working_dir)
         .output()?;
     if get.status.success() {
         let current = String::from_utf8_lossy(&get.stdout).trim().to_string();
         if current == url {
             return Ok(());
         }
-        let set = Command::new("git")
+        let set = kin_git::test_support::fixture_git_in(working_dir)
             .args(["remote", "set-url", name, url])
-            .current_dir(working_dir)
             .output()?;
         if !set.status.success() {
             anyhow::bail!(
@@ -359,9 +355,8 @@ pub(crate) fn ensure_git_remote(working_dir: &Path, name: &str, url: Option<&str
         return Ok(());
     }
 
-    let add = Command::new("git")
+    let add = kin_git::test_support::fixture_git_in(working_dir)
         .args(["remote", "add", name, url])
-        .current_dir(working_dir)
         .output()?;
     if !add.status.success() {
         anyhow::bail!(
@@ -919,7 +914,6 @@ mod tests {
         GitBranchTrackingConfig, GitRemoteTransportConfig, KinConfig, RemoteHostKind,
         RemoteRefConfig, RemoteTransportKind,
     };
-    use std::process::Command;
 
     fn test_remote(name: &str) -> RemoteRefConfig {
         RemoteRefConfig {
@@ -1391,17 +1385,15 @@ mod tests {
     #[test]
     fn ensure_git_remote_adds_origin_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        Command::new("git")
+        kin_git::test_support::fixture_git_in(dir.path())
             .args(["init"])
-            .current_dir(dir.path())
             .output()
             .unwrap();
 
         ensure_git_remote(dir.path(), "origin", Some("https://example.com/repo.git")).unwrap();
 
-        let output = Command::new("git")
+        let output = kin_git::test_support::fixture_git_in(dir.path())
             .args(["remote", "get-url", "origin"])
-            .current_dir(dir.path())
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -1414,22 +1406,19 @@ mod tests {
     #[test]
     fn ensure_git_remote_updates_existing_url() {
         let dir = tempfile::tempdir().unwrap();
-        Command::new("git")
+        kin_git::test_support::fixture_git_in(dir.path())
             .args(["init"])
-            .current_dir(dir.path())
             .output()
             .unwrap();
-        Command::new("git")
+        kin_git::test_support::fixture_git_in(dir.path())
             .args(["remote", "add", "origin", "https://example.com/old.git"])
-            .current_dir(dir.path())
             .output()
             .unwrap();
 
         ensure_git_remote(dir.path(), "origin", Some("https://example.com/new.git")).unwrap();
 
-        let output = Command::new("git")
+        let output = kin_git::test_support::fixture_git_in(dir.path())
             .args(["remote", "get-url", "origin"])
-            .current_dir(dir.path())
             .output()
             .unwrap();
         assert!(output.status.success());

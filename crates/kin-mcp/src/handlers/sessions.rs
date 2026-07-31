@@ -61,7 +61,14 @@ other agents, and gate collaboration features. It returns a session ID that the 
 the session lifecycle uses — keep it alive with kin_session_heartbeat, declare what \
 you'll touch via kin_register_intent (enabling collision detection against other \
 agents), and close out with kin_session_end. Prefer this over the legacy \
-register_session, which captures none of this context.";
+register_session, which captures none of this context. When the session is daemon-backed \
+the response also carries idle_timeout_secs and idle_reap_eligible_at: the latter is the \
+next boundary at which an idle PID-less session may be reaped, not an unconditional \
+expiry (a live registered PID is stronger liveness evidence). If your next step is a read \
+phase that could outlast that boundary, send kin_session_heartbeat; any session-bound call \
+also refreshes the window. A call on an already-reaped session fails saying so and names \
+kin_session_start as the recovery. An in-process session returns neither field; heartbeat \
+it on the same cadence rather than reading a boundary off the response.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -130,7 +137,30 @@ Send a heartbeat to keep an agent session marked alive. Reach for it periodicall
 during a long-running session so Kin doesn't treat it as stale and so the agent's \
 presence (and any held intents) stays visible to other agents. Pair it with \
 kin_session_start (which issues the session ID) and kin_session_end (which closes the \
-session and releases its intents).";
+session and releases its intents). A daemon-backed response carries the refreshed \
+idle_timeout_secs and idle_reap_eligible_at, the next boundary at which an idle PID-less \
+session may be reaped; a live registered PID can keep it active beyond that boundary. \
+Heartbeating an already-reaped session fails saying so and names kin_session_start as the \
+recovery. An in-process response carries neither field and reports only that the session \
+is alive.";
+
+pub(crate) fn delegated_session_heartbeat_result(
+    daemon_result: std::result::Result<Option<serde_json::Value>, String>,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<Option<ToolCallResult>> {
+    match daemon_result {
+        Ok(Some(value)) => {
+            let json =
+                serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
+            Ok(Some(ToolCallResult::text(json)))
+        }
+        Ok(None) if session_authority_mode.requires_daemon() => {
+            Ok(Some(daemon_required_unavailable("session heartbeat")))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Ok(Some(ToolCallResult::error(error))),
+    }
+}
 
 pub async fn handle_session_heartbeat(
     args: &HashMap<String, serde_json::Value>,
@@ -141,19 +171,11 @@ pub async fn handle_session_heartbeat(
     let session_id = parse_session_id(&id_str)?;
 
     if session_authority_mode.uses_daemon() {
-        match crate::daemon_delegate::forward_session_heartbeat(&id_str).await {
-            Ok(Some(value)) => {
-                let json =
-                    serde_json::to_string_pretty(&value).map_err(crate::error::McpError::Json)?;
-                return Ok(ToolCallResult::text(json));
-            }
-            Ok(None) if session_authority_mode.requires_daemon() => {
-                return Ok(daemon_required_unavailable("session heartbeat"));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Ok(ToolCallResult::error(err));
-            }
+        if let Some(result) = delegated_session_heartbeat_result(
+            crate::daemon_delegate::forward_session_heartbeat(&id_str).await,
+            session_authority_mode,
+        )? {
+            return Ok(result);
         }
     }
 
@@ -523,10 +545,11 @@ pub fn resolve_target_entity<G: GraphStore>(
                 .iter()
                 .map(|entity| {
                     format!(
-                        "{} ({:?} at {})",
+                        "{} ({:?} at {}): {}",
                         entity.id,
                         entity.kind,
-                        candidate_location(entity)
+                        candidate_location(entity),
+                        candidate_declaration(entity)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -543,10 +566,43 @@ pub fn resolve_target_entity<G: GraphStore>(
 /// entity carries no source origin.
 fn candidate_location(entity: &kin_model::Entity) -> String {
     match (entity.file_origin.as_ref(), entity.span.as_ref()) {
-        (Some(file), Some(span)) => format!("{}:{}", file.0, span.start_line),
+        // `file:line` is read straight into an editor, so it carries the 1-based
+        // line rather than the graph's 0-based row.
+        (Some(file), Some(span)) => format!(
+            "{}:{}",
+            file.0,
+            crate::handlers::common::presentation_line(span.start_line)
+        ),
         (Some(file), None) => file.0.clone(),
         (None, _) => "<no source origin>".to_string(),
     }
+}
+
+/// The one-line declaration that tells two same-named candidates apart.
+///
+/// A location says where a candidate lives; the declaration says what it is,
+/// which is what the caller is actually choosing between when the same name
+/// appears as several overloads or trait implementations. Bounded so one
+/// ambiguity refusal cannot carry an unbounded signature dump.
+fn candidate_declaration(entity: &kin_model::Entity) -> String {
+    /// Long enough for a real signature, short enough that a dozen candidates
+    /// stay readable.
+    const MAX_DECLARATION: usize = 160;
+
+    let declaration = entity
+        .signature
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(entity.name.as_str());
+    if declaration.chars().count() <= MAX_DECLARATION {
+        return declaration.to_string();
+    }
+    let truncated = declaration
+        .chars()
+        .take(MAX_DECLARATION)
+        .collect::<String>();
+    format!("{truncated}...")
 }
 
 pub const TRANSACTION_BEGIN_DESC: &str = "\
@@ -593,13 +649,25 @@ pub async fn handle_transaction_begin(
 pub const TRANSACTION_STAGE_DESC: &str = "\
 Stage one or more mutation operations onto an active transaction. The simplest write is \
 a payload-less entity source edit: {verb: \"update\", target: \"<entity name or id>\", \
-body: \"<the entity's full new source text>\", description: \"...\"}. The entity is \
-resolved fail-closed server-side (exact name or id; ambiguity is an error) and on \
+body: \"<the entity's full new source text>\", description: \"...\"}. Prefer the entity \
+id that semantic_locate, find_references, or get_context_pack already handed you: a bare \
+name resolves only when it is unique, and an ambiguous one is refused (with the candidate \
+ids, so the retry is mechanical). The body is the entity exactly as its file renders it; \
+its first line's indentation is read as the entity's own line indentation, not as extra \
+indentation on top of it, so a nested method or function goes back unchanged. That read \
+is a byte-exact prefix match against the file's own indentation run, so copy the file's \
+whitespace rather than re-indenting; a body opening with spaces where the file uses tabs \
+(or with a different width) is spliced verbatim and lands on top of the file's \
+indentation. Note also that source rendered by get_entity_source and \
+get_context_pack.focal_entity.body is capped at 40 lines or 2400 characters and marks \
+the cut with \"... [truncated]\": a body that came back truncated is not the entity's \
+full source and must not be staged as-is. The entity is \
+resolved fail-closed server-side and on \
 commit the graph-to-file projection writes the body into the entity's working-directory \
 file. Structured payloads (full entity, relation add/remove) are also accepted. Each \
 operation is validated at stage time: anything the commit path would silently drop (a \
-missing or unknown verb, a missing payload, a nameless entity, a relation \
-update/modify, or a blob payload) is rejected immediately with an actionable error \
+missing or unknown verb, a missing payload outside the target/body source-edit form, a \
+nameless entity, a relation update/modify, or a blob payload) is rejected immediately with an actionable error \
 instead of vanishing at commit. This rejection is identical in daemon and in-process \
 modes. Accepted operations are queued and can be validated or committed together.";
 
@@ -690,15 +758,29 @@ pub async fn handle_transaction_validate(
 }
 
 pub const TRANSACTION_COMMIT_DESC: &str = "\
-Commit all staged mutations in the transaction atomically to the graph. On success \
-returns status, ops_applied (entity+relation deltas applied), empty (true for a \
-no-op commit), new_root_hash (graph Merkle root after the commit), modified_files \
-(working-directory files the projection wrote — entity-body edits reach disk here), \
-collision_warnings, and conflicts (entities skipped due to a concurrent file edit; a \
-non-empty set is surfaced as an error instead). Before graph application, exact entity/artifact \
-intent conflicts and session write/commit capabilities are attested; enforce mode rejects \
-before graph truth changes. Contract-scope coverage remains explicitly false until touched \
-contracts can be derived from the semantic delta.";
+Publish all staged mutations atomically through exact repository authority. The daemon \
+requires a clean exact workspace, loads source from repository CAS, splices existing entity \
+body edits in memory, reparses the final bytes, and journals semantic change, exact workspace \
+tree, and ref publication together. Relation-only transactions are supported. New or deleted \
+source entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, \
+gitlinks, and dirty or mismatched authority fail before mutation. On success the result names \
+status, ops_applied, empty, change_id, repository_generation, new_root_hash, and modified_files. \
+Before graph application, exact entity/artifact intent conflicts and session write/commit \
+capabilities are attested; enforce mode rejects before graph truth changes. Contract-scope \
+coverage remains explicitly false until touched contracts can be derived from the semantic \
+delta. A commit refused before anything is published leaves the transaction usable: its staged \
+operations are cleared and named in the refusal, so re-stage corrected ones on the SAME \
+transaction and commit again; kin_transaction_abort is the clean exit if you would rather \
+abandon it. An optional operations array may stage and commit in one call and uses the same \
+payload-less source-edit or structured payload operation shapes as kin_transaction_stage; it \
+commits with identical durability, so a success naming modified_files means the body reached the \
+file, and re-sending the same array after an interrupted commit resumes it rather than staging it \
+twice. New source text is carried ONLY by `body`: an operation naming it anything else is refused \
+with the unknown field named, never accepted with the source dropped. A refusal ends with a \
+one-line JSON object carrying schema, code, and the operations it names, so you can branch on the \
+code instead of reading the sentence. On success the change is attributed to the calling session: \
+its vendor and client name become the change author and a queryable audit record, so \
+kin_provenance_query, kin history, and kin blame all name the agent that wrote it.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {
@@ -765,13 +847,18 @@ fn transaction_touched_scopes<G: GraphStore>(
 /// Indexed reasons for every staged operation the in-process commit path must
 /// refuse even though staging and the daemon planner accept it.
 ///
-/// Today that is exactly the payload-less source update (verb update/modify
-/// with a `target` and a `body`). Turning that shape into a real change means
-/// planning the exact span edit and projecting the new source into the working
-/// file, and both live in the daemon (`kin-daemon`'s `plan_exact_transaction`).
-/// The in-process path has no projection, so committing it here can only
-/// produce a same-entity no-op delta while reporting success, discarding the
-/// agent's body. Refuse instead.
+/// That is every operation carrying new source text, whether or not it also
+/// carries an entity payload. Turning a body into a real change means planning
+/// the exact span edit and projecting the new source into the working file, and
+/// both live in the daemon (`kin-daemon`'s `plan_exact_transaction`). The
+/// in-process path has no projection, so it can only apply whatever else the
+/// operation carries and drop the body.
+///
+/// The payload-ful case is the one that bit hardest, because it does not look
+/// like a no-op from the outside: the entity payload commits, the response says
+/// `ops_applied: 1` and `empty: false`, and the source the agent actually sent
+/// is gone. A partial success reported as a success is worse than a refusal,
+/// because the caller has no way to detect it and no reason to retry.
 ///
 /// Deliberately private and applied only after the daemon-delegate early
 /// return in [`handle_transaction_commit`]: the daemon commits through
@@ -782,15 +869,25 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
     operations
         .iter()
         .enumerate()
-        .filter(|(_, op)| crate::session::is_target_body_update(op))
+        .filter(|(_, op)| crate::session::carries_source_body(op))
         .map(|(idx, op)| {
+            let shape = if op.payload.is_some() {
+                "an entity payload plus a source body"
+            } else {
+                "a payload-less source update (target plus body)"
+            };
+            let target = op.target.trim();
+            let target = if target.is_empty() {
+                "(unnamed)"
+            } else {
+                target
+            };
             format!(
-                "operation #{idx} ('{}'): a payload-less source update (target '{}' plus body) \
-                 requires the daemon commit path, which plans the exact span edit and projects \
-                 the new source into the working file; the in-process commit path has no \
-                 projection and would report success while discarding the body",
+                "operation #{idx} ('{}'): {shape} for target '{target}' requires the daemon \
+                 commit path, which plans the exact span edit and projects the new source into \
+                 the working file; the in-process commit path has no projection and would report \
+                 success while discarding the body",
                 op.verb,
-                op.target.trim()
             )
         })
         .collect()
@@ -805,13 +902,14 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     let transaction_id = get_string_param(args, "transaction_id")?;
 
     // If operations are provided, validate and stage them in one shot
-    // to bypass state-loss across HTTP calls.
+    // to bypass state-loss across HTTP calls. Decoded through the same parser
+    // the stage tool uses, so an inline caller gets the identical contract: a
+    // field Kin does not model is named rather than dropped, and a shape the
+    // commit path cannot honor is refused here instead of at commit.
     let mut inline_ops = None;
     if let Some(ops_val) = args.get("operations") {
-        let parsed: Vec<crate::session::McpMutationOperation> =
-            serde_json::from_value(ops_val.clone()).map_err(|e| {
-                crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
-            })?;
+        let parsed = crate::session::parse_staged_operations(ops_val)
+            .map_err(crate::error::McpError::InvalidParams)?;
         crate::session::validate_staged_operations(&parsed)
             .map_err(crate::error::McpError::InvalidParams)?;
         inline_ops = Some(parsed);
@@ -863,30 +961,31 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     // is applied and the transaction stays active so the agent can fix it.
     let uncommittable = crate::session::uncommittable_operations(&tx.staged_operations);
     if !uncommittable.is_empty() {
-        return Ok(ToolCallResult::error(format!(
-            "Cannot commit transaction {}: {} staged operation(s) are not committable and would \
-             be silently dropped:\n  - {}\nFix or remove them and retry; the transaction is left \
-             active.",
-            transaction_id,
-            uncommittable.len(),
-            uncommittable.join("\n  - ")
-        )));
+        return Ok(ToolCallResult::error(
+            crate::session::CommitRefusal::new(
+                crate::session::CommitRefusalCode::NotCommittable,
+                &transaction_id,
+                uncommittable,
+            )
+            .render(),
+        ));
     }
 
     // Everything from here down is the in-process path: the daemon returned
     // above. Refuse the operation shapes only the daemon can honor rather than
-    // applying a delta that reports success and changes nothing. Rejected
-    // atomically and before any graph apply, so the transaction stays active.
+    // applying a delta that reports success while dropping the source the
+    // caller sent. Rejected atomically and before any graph apply, so the
+    // transaction stays active.
     let daemon_only = offline_only_uncommittable_operations(&tx.staged_operations);
     if !daemon_only.is_empty() {
-        return Ok(ToolCallResult::error(format!(
-            "Cannot commit transaction {}: {} staged operation(s) require the daemon commit \
-             path:\n  - {}\nCommit through a running Kin daemon, or restage the change as an \
-             entity payload. The transaction is left active.",
-            transaction_id,
-            daemon_only.len(),
-            daemon_only.join("\n  - ")
-        )));
+        return Ok(ToolCallResult::error(
+            crate::session::CommitRefusal::new(
+                crate::session::CommitRefusalCode::SourceBodyRequiresDaemonCommit,
+                &transaction_id,
+                daemon_only,
+            )
+            .render(),
+        ));
     }
 
     // Load-bearing ordering: run coordination enforcement against the fully
@@ -1058,7 +1157,14 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 }
 
 pub const TRANSACTION_ABORT_DESC: &str = "\
-Abort the transaction and discard all staged mutations.";
+Abort an active or validated transaction and discard all staged mutations. Reach for it \
+when you decide against work you already staged, so the transaction ends instead of \
+sitting open holding operations you no longer intend. Once kin_transaction_commit has \
+fenced the transaction for publication this is refused, because repository authority may \
+already have moved; re-send the commit instead, which resumes the fenced payload \
+idempotently and reports whether it landed. You do not need abort to recover from a \
+refused commit either: a commit refused before publication already clears its staged \
+operations and names them, so you can re-stage corrected ones on the same transaction.";
 
 pub async fn handle_transaction_abort(
     args: &HashMap<String, serde_json::Value>,

@@ -14,6 +14,7 @@ kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-core = { workspace = true }
+kin-daemon-spawn = { workspace = true }
 kin-git = { workspace = true }
 kin-parser = { workspace = true }
 kin-index = { workspace = true }
@@ -27,6 +28,23 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+which = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+# The descendant-reap acceptance test is cross-platform even though production
+# process-group enumeration uses sysinfo only on Unix.
+sysinfo = "0.39"

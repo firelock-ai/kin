@@ -25,7 +25,7 @@ fn unsafe_authority() -> (tempfile::TempDir, std::path::PathBuf, std::path::Path
     (root, registry, lock)
 }
 
-fn kin(root: &Path, registry: &Path) -> Command {
+fn kin(root: &Path, registry: &Path) -> Command<'static> {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));

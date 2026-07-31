@@ -3,6 +3,78 @@
 
 use crate::types::{ToolDefinition, ToolsListResult};
 
+/// Honest JSON Schema for one transaction operation.
+///
+/// The product daemon accepts two materially different shapes. A source-body
+/// edit is intentionally payload-less; structured entity/relation mutations
+/// require `payload`. Keeping these as disjoint `oneOf` branches prevents MCP
+/// clients from being told that the preferred source-edit form is invalid.
+fn transaction_operation_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "title": "Entity source body edit",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": ["update", "modify"],
+                        "description": "Update an existing source entity."
+                    },
+                    "target": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Exact repository entity UUID or unambiguous exact entity name."
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The entity's complete new UTF-8 source text, including its own leading indentation. Do not submit a truncated retrieval body."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "body", "description"],
+                "additionalProperties": false
+            },
+            {
+                "title": "Structured entity or relation mutation",
+                "type": "object",
+                "properties": {
+                    "verb": {
+                        "type": "string",
+                        "enum": [
+                            "create", "add", "upsert", "insert",
+                            "update", "modify", "delete", "remove"
+                        ],
+                        "description": "Entity or relation mutation verb."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload."
+                    },
+                    "payload": {
+                        "type": "object",
+                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Full new UTF-8 source text for a source-bound Entity update. Omit for Relation operations."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable explanation of this change."
+                    }
+                },
+                "required": ["verb", "target", "payload", "description"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
 /// Build the list of all MCP tools that Kin exposes.
 pub fn tool_definitions() -> ToolsListResult {
     ToolsListResult {
@@ -93,7 +165,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Attach a bounded inline source snippet to each entity hit",
+                            "description": "Attach a bounded inline source snippet to each entity hit, projected from graph-owned content. Read it from the hit's `snippet` field (the fused pipeline also carries the same text as `body` for locate-schema parity). Entity granularity only: a file hit has no single entity body. A hit with no graph-owned body carries no snippet rather than a placeholder.",
                             "default": true
                         },
                         "pipeline": {
@@ -385,7 +457,8 @@ pub fn tool_definitions() -> ToolsListResult {
                     "properties": {
                         "entity_id": { "type": "string", "description": "Entity UUID" },
                         "depth": { "type": "integer", "description": "Traversal depth", "default": 2 },
-                        "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 }
+                        "limit": { "type": "integer", "description": "Max entities to return (default 30)", "default": 30 },
+                        "direction": { "type": "string", "description": "Direction of traversal: 'out' walks what the focal depends on, 'in' walks what depends on the focal (dependents / blast radius), 'both' merges. Default 'both'.", "default": "both" }
                     },
                     "required": ["entity_id"]
                 }),
@@ -522,7 +595,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_stage".into(),
-                description: "Stage one or more exact repository mutation operations onto an active transaction. Existing source entity edits require the exact entity ID as target plus a full UTF-8 replacement body. Relation operations use an empty target and omit body.".into(),
+                description: crate::handlers::sessions::TRANSACTION_STAGE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -531,23 +604,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "operations": {
                             "type": "array",
                             "description": "Array of mutation operations to stage",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "verb": { "type": "string", "description": "Entity: update or modify. Relation: create/add/upsert/insert or delete/remove." },
-                                    "target": { "type": "string", "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload." },
-                                    "payload": {
-                                        "type": "object",
-                                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}"
-                                    },
-                                    "body": {
-                                        "type": "string",
-                                        "description": "Required full UTF-8 replacement source text for an existing Entity body. Omit only for Relation operations; metadata-only source edits are rejected."
-                                    },
-                                    "description": { "type": "string", "description": "Human-readable explanation of this change" }
-                                },
-                                "required": ["verb", "target", "payload", "description"]
-                            }
+                            "items": transaction_operation_schema()
                         }
                     },
                     "required": ["transaction_id", "operations"]
@@ -567,7 +624,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_commit".into(),
-                description: "Publish staged mutations through exact repository authority. The daemon requires a clean exact workspace, loads source from repository CAS, splices existing entity body edits in memory, reparses final bytes, and journals exact working-tree projection with semantic change + workspace + ref publication. Relation-only transactions are supported. New/source-deleted entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, gitlinks, and dirty/mismatched authority fail before mutation. On success returns `status`, `ops_applied`, `change_id`, `repository_generation`, `new_root_hash`, and `modified_files`. An optional `operations` array may be staged and committed in one call.".into(),
+                description: crate::handlers::sessions::TRANSACTION_COMMIT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -576,23 +633,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "operations": {
                             "type": "array",
                             "description": "Optional exact mutation operations to stage atomically in this commit request",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "verb": { "type": "string", "description": "Entity: update or modify. Relation: create/add/upsert/insert or delete/remove." },
-                                    "target": { "type": "string", "description": "Exact repository entity UUID for an Entity payload; empty string for a Relation payload." },
-                                    "payload": {
-                                        "type": "object",
-                                        "description": "Exact mutation payload: {\"Entity\": { ...existing entity identity... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}}"
-                                    },
-                                    "body": {
-                                        "type": "string",
-                                        "description": "Required full UTF-8 replacement source text for an existing Entity body; omit for Relation operations."
-                                    },
-                                    "description": { "type": "string", "description": "Human-readable explanation of this change" }
-                                },
-                                "required": ["verb", "target", "payload", "description"]
-                            }
+                            "items": transaction_operation_schema()
                         }
                     },
                     "required": ["transaction_id"]
@@ -600,7 +641,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_abort".into(),
-                description: "Abort the transaction and discard all staged mutations.".into(),
+                description: "Abort an active or validated transaction and discard all staged mutations. Once kin_transaction_commit has fenced the transaction for publication this is refused, because repository authority may already have moved; re-send the commit instead, which resumes the fenced payload idempotently and reports whether it landed. You do not need abort to recover from a refused commit: a commit refused before publication already clears its staged operations and names them, so corrected ones go on the same transaction.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1034,6 +1075,13 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "semantic_locate",
         "semantic_search",
         "get_context_pack",
+        // A profile carrying the transaction write surface must carry a direct
+        // entity-body read. Staging a body update means restating the entity's
+        // current source, so an agent without a body read can only guess it --
+        // and a guessed body silently overwrites the real one on commit. The
+        // discovery tools hand back ids and bounded snippets; this is the tool
+        // that turns an id into the exact graph-owned body.
+        "get_entity_source",
         "trace_data_flow",
         "find_references",
         "graph_neighborhood",
@@ -1043,6 +1091,11 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "kin_transaction_begin",
         "kin_transaction_stage",
         "kin_transaction_commit",
+        // Without abort, an agent that decides against a transaction, or that
+        // wants to start clean after a refusal, has no way out of the one it
+        // holds: begin/stage/commit can only push work forward. A write profile
+        // that cannot abandon a transaction cannot honor "nothing half-applies".
+        "kin_transaction_abort",
         "kin_provenance_query",
     ]
 }
@@ -1116,6 +1169,99 @@ mod tests {
     }
 
     #[test]
+    fn serialized_tools_list_exposes_the_real_transaction_operation_contract() {
+        fn required_set(schema: &serde_json::Value) -> std::collections::BTreeSet<String> {
+            schema["required"]
+                .as_array()
+                .expect("schema branch must declare required fields")
+                .iter()
+                .map(|field| {
+                    field
+                        .as_str()
+                        .expect("required field must be a string")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let serialized =
+            serde_json::to_value(tool_definitions()).expect("tools/list must serialize");
+        let tools = serialized["tools"]
+            .as_array()
+            .expect("serialized tools/list must contain a tools array");
+
+        for (tool_name, expected_description, expected_top_required) in [
+            (
+                "kin_transaction_stage",
+                crate::handlers::sessions::TRANSACTION_STAGE_DESC,
+                ["operations", "transaction_id"].as_slice(),
+            ),
+            (
+                "kin_transaction_commit",
+                crate::handlers::sessions::TRANSACTION_COMMIT_DESC,
+                ["transaction_id"].as_slice(),
+            ),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} must be exposed by tools/list"));
+            assert_eq!(tool["description"], expected_description);
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("payload-less")),
+                "{tool_name} must advertise the preferred payload-less source-edit form"
+            );
+            if tool_name == "kin_transaction_stage" {
+                let description = tool["description"].as_str().unwrap();
+                assert!(description.contains("indentation"), "{description}");
+                assert!(description.contains("[truncated]"), "{description}");
+            }
+
+            let top_required = required_set(&tool["inputSchema"]);
+            let expected_top_required: std::collections::BTreeSet<String> = expected_top_required
+                .iter()
+                .map(|field| (*field).into())
+                .collect();
+            assert_eq!(top_required, expected_top_required, "{tool_name}");
+
+            let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
+                .as_array()
+                .expect("transaction operations must be disjoint oneOf variants");
+            assert_eq!(variants.len(), 2, "{tool_name}");
+
+            let body_edit = variants
+                .iter()
+                .find(|variant| variant["title"] == "Entity source body edit")
+                .expect("payload-less body-edit branch");
+            assert_eq!(
+                required_set(body_edit),
+                ["body", "description", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+            assert!(
+                body_edit["properties"].get("payload").is_none(),
+                "payload-less body-edit branch must reject payload"
+            );
+
+            let structured = variants
+                .iter()
+                .find(|variant| variant["title"] == "Structured entity or relation mutation")
+                .expect("structured payload branch");
+            assert_eq!(
+                required_set(structured),
+                ["description", "payload", "target", "verb"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            );
+        }
+    }
+
+    #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
@@ -1131,7 +1277,7 @@ mod tests {
         let profile = agent_default_tool_names();
 
         assert!(
-            profile.len() >= 10 && profile.len() <= 17,
+            profile.len() >= 10 && profile.len() <= 18,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -1150,12 +1296,16 @@ mod tests {
         for required in [
             "semantic_locate",
             "get_context_pack",
+            // The write surface is only safe with a body read beside it.
+            "get_entity_source",
             "kin_transaction_commit",
             "kin_provenance_query",
             // kin_session_start tells the agent to keep the session alive with
             // this tool. A profile that carries the advice without the tool
             // strands any agent whose read phase outlasts the idle TTL.
             "kin_session_heartbeat",
+            // The only clean exit from a transaction the agent decided against.
+            "kin_transaction_abort",
         ] {
             assert!(
                 profile.contains(&required),
@@ -1163,9 +1313,8 @@ mod tests {
             );
         }
 
-        // An agent restricted to this profile cannot call get_entity_source, so
-        // the read tool it does have must say where the source text arrives.
-        // Without that it hunts for a tool it cannot see.
+        // The body-shaped read tool must say where the source text arrives, so an
+        // agent reaching for source knows which field carries it.
         let context_pack = list
             .tools
             .iter()
@@ -1175,6 +1324,23 @@ mod tests {
             context_pack.description.contains("focal_entity.body"),
             "get_context_pack must name the field carrying the source text"
         );
+
+        // Structural guard on the write half of this profile: any profile that can
+        // stage and commit graph writes must also be able to read an entity's
+        // exact body. Staging a body update without one means guessing the
+        // current source, and a guessed body overwrites the real one on commit.
+        let can_write = profile
+            .iter()
+            .any(|name| name.starts_with("kin_transaction_"));
+        if can_write {
+            assert!(
+                profile
+                    .iter()
+                    .any(|name| matches!(*name, "get_entity_source" | "get_entity_body")),
+                "a profile with the transaction write surface must carry a direct \
+                 entity-body read; got {profile:?}"
+            );
+        }
 
         let allowed: std::collections::HashSet<&str> = profile.iter().copied().collect();
         let visible = list

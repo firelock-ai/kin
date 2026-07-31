@@ -31,12 +31,13 @@ on:
 
 # The App installation token carries the only write capability (creating the
 # tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
-# checkout and ref reads, checks:read to inspect the commit's check-runs.
+# checkout and ref reads, checks:read for check-runs, and actions:read to bind
+# each required check suite to its exact workflow path, event, and head SHA.
 permissions:
-  actions: read
-  attestations: read
   contents: read
   checks: read
+  actions: read
+  attestations: read
 
 # Never run two tag mints at once, and never cancel one mid-flight.
 concurrency:
@@ -54,10 +55,18 @@ jobs:
         github.event.workflow_run.conclusion == 'success'
       )
     runs-on: ubuntu-latest
+    # The automatic path waits for release-critical checks to settle, so the
+    # mint needs more headroom than a break-glass dispatch against an already
+    # green commit.
     timeout-minutes: 45
-    # Keep App-token minting behind the main-only Environment as an additional
-    # credential boundary even though repository_dispatch already pins the
-    # executed workflow and ref to protected default-branch history.
+    # The kin-release-bot App credentials are scoped to this environment, which
+    # a job only resolves when it declares the environment. Without the binding
+    # the job silently falls back to repository-scoped copies of the same secret
+    # names, so a key rotation applied to the environment never reaches the mint.
+    # The environment's deployment branch policy admits main only, which matches
+    # the ref guard below, and keeps App-token minting behind a credential
+    # boundary even though every trigger already pins the executed workflow and
+    # ref to protected default-branch history.
     environment: release-tag
     steps:
       - name: Guard trigger authority
@@ -591,16 +600,34 @@ jobs:
           steps.prior.outputs.ready == 'true'
         # Fail closed on the commit's check-runs. REQUIRED_CHECKS is the
         # presence-required release-critical set — a sha missing any of these is
-        # refused even if nothing failed. Each non-DCO required context must
-        # complete with success. DCO alone may be skipped because its push job is
-        # intentionally absent on a merged HEAD. Separately, no check anywhere
-        # may be failing or still in progress; the second loop owns that
-        # present-check strictness, so this list need not mirror every CI
-        # context. It is the main branch-protection required contexts plus the
+        # refused even if nothing failed. Every required check must conclude
+        # success except DCO, which is allowed to report skipped because that
+        # pull-request-only job is inapplicable on a merged main HEAD. Separately,
+        # no check anywhere may be failing or still in progress; the second loop
+        # owns that present-check strictness, so this list need not mirror every
+        # CI context. It is the main branch-protection required contexts plus the
         # Windows installer leg, which is release-critical and never optional.
+        #
+        # Evidence is resolved through workflow provenance, not through the
+        # context name. A merge-queue landing publishes the same context names
+        # twice on one sha, once from the queue's merge_group build and again
+        # from the push build of the commit that landed, and only the push build
+        # runs the legs the queue deliberately skips. Selecting by name alone
+        # would read those two as ambiguous authority, or would accept the
+        # queue's skipped Windows leg as the release proof. Each required context
+        # is therefore matched against its exact workflow id, path, push event,
+        # and head sha, and must be unique within that provenance, so a rerun of
+        # the push build remains ambiguous authority.
+        #
+        # The automatic triggers can reach a commit whose release-critical checks
+        # are still running, so absent and unfinished evidence is retried. Every
+        # other verdict is terminal on the first pass.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_RUN_EVENT: ${{ github.event_name }}
+          TRIGGER_SHA: ${{ github.sha }}
           GITHUB_ACTIONS_APP_ID: "15368"
           GITHUB_ACTIONS_APP_SLUG: github-actions
           REQUIRED_CHECKS: |
@@ -612,89 +639,334 @@ jobs:
             Windows installer + vector-free release build
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 40); do
-            gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+          gh api "repos/$REPO/actions/runs/$CURRENT_RUN_ID" \
+            -q '{
+              id: .id,
+              workflow_id: .workflow_id,
+              path: .path,
+              event: .event,
+              head_branch: .head_branch,
+              head_sha: .head_sha,
+              status: .status,
+              conclusion: .conclusion,
+              check_suite_id: .check_suite_id
+            }' \
+            > current_run.json || { echo "::error::failed to fetch current release-tag run"; exit 1; }
+          for attempt in $(seq 1 60); do
+            # `filter=all` is deliberate: a rerun that claims one required name
+            # is ambiguous authority, not evidence to collapse by recency.
+            gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100&filter=all" --paginate \
               -q '.check_runs[] | {
                 name: .name,
                 status: .status,
                 conclusion: .conclusion,
                 id: .id,
                 app_id: (.app.id // 0),
-                app_slug: (.app.slug // "")
+                app_slug: (.app.slug // ""),
+                check_suite_id: .check_suite.id,
+                head_sha: .head_sha
               }' \
-              > check_runs.ndjson || {
-                echo "::error::failed to fetch check-runs for $SHA"
-                exit 1
-              }
+              > check_runs.ndjson || { echo "::error::failed to fetch check-runs for $SHA"; exit 1; }
+            gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+              -q '.workflow_runs[] | {
+                id: .id,
+                workflow_id: .workflow_id,
+                path: .path,
+                event: .event,
+                head_branch: .head_branch,
+                head_sha: .head_sha,
+                status: .status,
+                conclusion: .conclusion,
+                check_suite_id: .check_suite_id
+              }' \
+              > workflow_runs.ndjson || { echo "::error::failed to fetch workflow runs for $SHA"; exit 1; }
             set +e
             python3 - <<'PY'
           import json, os, sys
 
-          runs = {}
-          with open("check_runs.ndjson") as handle:
-              for line in handle:
-                  line = line.strip()
-                  if not line:
-                      continue
-                  run = json.loads(line)
-                  identity = (run["app_id"], run["app_slug"], run["name"])
-                  # Keep only the latest attempt for one exact App + check
-                  # identity. A different check-writing App must never
-                  # supersede GitHub Actions release evidence by reusing a
-                  # required context name.
-                  if identity not in runs or run["id"] > runs[identity]["id"]:
-                      runs[identity] = run
+          def read_ndjson(path):
+              records = []
+              with open(path) as handle:
+                  for line in handle:
+                      line = line.strip()
+                      if line:
+                          records.append(json.loads(line))
+              return records
 
-          required = [c.strip() for c in os.environ["REQUIRED_CHECKS"].splitlines() if c.strip()]
-          expected_app_id = int(os.environ["GITHUB_ACTIONS_APP_ID"])
-          expected_app_slug = os.environ["GITHUB_ACTIONS_APP_SLUG"]
-          acceptable = {"success", "skipped", "neutral"}
-          failures = []
+          check_runs = read_ndjson("check_runs.ndjson")
+          workflow_runs = read_ndjson("workflow_runs.ndjson")
+          with open("current_run.json") as handle:
+              current_run = json.load(handle)
+
+          runs_by_name = {}
+          for run in check_runs:
+              runs_by_name.setdefault(run["name"], []).append(run)
+
+          workflows_by_suite = {}
+          for run in workflow_runs:
+              workflows_by_suite.setdefault(run["check_suite_id"], []).append(run)
+
+          required = [
+              check.strip()
+              for check in os.environ["REQUIRED_CHECKS"].splitlines()
+              if check.strip()
+          ]
+          # Workflow id, path, event, and branch. The branch is load-bearing: a
+          # merge-queue landing produces a push run of the same workflow at the
+          # same sha from the queue's own ref as well as from main, and only the
+          # run on main is release evidence.
+          release_branch = "main"
+          expected_provenance = {
+              "Check & Test (ubuntu-latest)": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+              "Check & Test (macos-latest)": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+              # Uppercase `Sign-off` is the skipped-on-push CI job. The
+              # pull_request_target DCO workflow emits lowercase `sign-off`
+              # and is deliberately not release evidence.
+              "DCO Sign-off": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+              "cargo-deny": (
+                  251549972,
+                  ".github/workflows/sast.yml",
+                  "push",
+                  release_branch,
+              ),
+              "gitleaks (full history)": (
+                  293452372,
+                  ".github/workflows/secret-scan.yml",
+                  "push",
+                  release_branch,
+              ),
+              "Windows installer + vector-free release build": (
+                  245803170,
+                  ".github/workflows/ci.yml",
+                  "push",
+                  release_branch,
+              ),
+          }
+          expected_sha = os.environ["SHA"]
+          trigger_sha = os.environ["TRIGGER_SHA"]
+          # A required context name is not authority on its own. Only the
+          # GitHub Actions App may write one, pinned by numeric id as well as
+          # slug so a renamed or impersonating App cannot inherit the name.
+          expected_app = (
+              int(os.environ["GITHUB_ACTIONS_APP_ID"]),
+              os.environ["GITHUB_ACTIONS_APP_SLUG"],
+          )
+          current_run_id = int(os.environ["CURRENT_RUN_ID"])
+          current_run_event = os.environ["CURRENT_RUN_EVENT"]
+          # Every trigger this workflow declares. The mint has no
+          # workflow_dispatch path: a human release goes through the
+          # release_tag repository_dispatch, which the trigger guard pins to
+          # the release captain or the App.
+          release_tag_events = {"schedule", "workflow_run", "repository_dispatch"}
+          release_tag_workflow = (318521292, ".github/workflows/release-tag.yml")
+          skippable_required = {"DCO Sign-off"}
+          non_failing_optional = {"success", "skipped", "neutral"}
+          errors = []
           pending = []
 
-          if not runs:
+          if required != list(expected_provenance):
+              errors.append("required check order does not match its provenance contract")
+          if not check_runs:
               pending.append("no check-runs found on sha")
 
-          for name in required:
-              run = runs.get((expected_app_id, expected_app_slug, name))
-              if run is None:
-                  pending.append(
-                      f"missing required GitHub Actions check: {name} "
-                      f"(app={expected_app_slug}/{expected_app_id})"
-                  )
-              elif run["status"] != "completed":
-                  pending.append(f"required check not completed: {name} (status={run['status']})")
-              elif name == "DCO Sign-off" and run["conclusion"] not in {"success", "skipped"}:
-                  failures.append(
-                      f"required DCO check not green/skipped-on-push: "
-                      f"{name} (conclusion={run['conclusion']})"
-                  )
-              elif name != "DCO Sign-off" and run["conclusion"] != "success":
-                  failures.append(f"required check not green: {name} (conclusion={run['conclusion']})")
-
-          for (app_id, app_slug, name), run in runs.items():
-              # Self-exclude this workflow's own job ("Mint release tag") — a gate must not read its own refusals as evidence.
+          current_suite_id = current_run.get("check_suite_id")
+          current_identity = (
+              current_run.get("id"),
+              current_run.get("workflow_id"),
+              current_run.get("path"),
+              current_run.get("head_branch"),
+              current_run.get("head_sha"),
+          )
+          expected_current_identity = (
+              current_run_id,
+              release_tag_workflow[0],
+              release_tag_workflow[1],
+              release_branch,
+              trigger_sha,
+          )
+          if current_identity != expected_current_identity:
+              errors.append(
+                  "current release-tag workflow provenance mismatch: "
+                  f"expected={expected_current_identity} actual={current_identity}"
+              )
+          if current_run.get("event") not in release_tag_events:
+              errors.append(
+                  "current release-tag workflow was not started by a declared "
+                  f"trigger: event={current_run.get('event')}"
+              )
+          release_tag_suite_ids = set()
+          if not isinstance(current_suite_id, int):
+              errors.append("current release-tag workflow has no check suite id")
+          else:
+              release_tag_suite_ids.add(current_suite_id)
+          for workflow in workflow_runs:
+              # A prior mint attempt against this exact release sha. The head
+              # sha is already pinned by the query, and the release sha need not
+              # equal the sha any single attempt was triggered from, so identity
+              # here is the workflow itself under a declared trigger.
               if (
-                  app_id == expected_app_id and
-                  app_slug == expected_app_slug and
+                  workflow.get("workflow_id"),
+                  workflow.get("path"),
+              ) != release_tag_workflow:
+                  continue
+              if workflow.get("event") not in release_tag_events:
+                  errors.append(
+                      "release-tag workflow run has an undeclared trigger: "
+                      f"{workflow.get('id')} event={workflow.get('event')}"
+                  )
+                  continue
+              suite_id = workflow.get("check_suite_id")
+              if isinstance(suite_id, int):
+                  release_tag_suite_ids.add(suite_id)
+              else:
+                  errors.append(
+                      "release-tag workflow run has no check suite id: "
+                      f"{workflow.get('id')}"
+                  )
+
+          for name in required:
+              expected_workflow_id, expected_path, expected_event, expected_branch = (
+                  expected_provenance[name]
+              )
+              expected_identity = (
+                  expected_workflow_id,
+                  expected_path,
+                  expected_event,
+                  expected_branch,
+                  expected_sha,
+              )
+              named_runs = runs_by_name.get(name, [])
+              for run in named_runs:
+                  actual_app = (run.get("app_id"), run.get("app_slug"))
+                  if actual_app != expected_app:
+                      errors.append(
+                          f"required check name claimed by another app: {name} "
+                          f"(app={actual_app})"
+                      )
+
+              matching_runs = []
+              off_release_branch = 0
+              for run in named_runs:
+                  matching_workflows = workflows_by_suite.get(
+                      run.get("check_suite_id"), []
+                  )
+                  if len(matching_workflows) != 1:
+                      errors.append(
+                          f"required check has ambiguous workflow provenance: {name} "
+                          f"(suite={run.get('check_suite_id')}, "
+                          f"workflow-runs={len(matching_workflows)})"
+                      )
+                      continue
+                  workflow = matching_workflows[0]
+                  identity = (
+                      workflow.get("workflow_id"),
+                      workflow.get("path"),
+                      workflow.get("event"),
+                      workflow.get("head_branch"),
+                      workflow.get("head_sha"),
+                  )
+                  if identity == expected_identity:
+                      matching_runs.append((run, workflow))
+                  elif workflow.get("head_branch") == expected_branch:
+                      # Produced on the release branch itself, but not by the
+                      # reviewed producer. A second writer of a required context
+                      # name is an authority conflict, never a fallback.
+                      errors.append(
+                          f"required check workflow provenance mismatch: {name} "
+                          f"expected={expected_identity} actual={identity}"
+                      )
+                  else:
+                      # Produced on another branch, which is what a merge-queue
+                      # build does at this sha before the landing push. Not this
+                      # release's evidence, and not an anomaly either.
+                      off_release_branch += 1
+
+              if not matching_runs:
+                  pending.append(
+                      f"missing required check: {name} "
+                      f"(expected provenance {expected_identity}, "
+                      f"{len(named_runs)} same-named check-runs, "
+                      f"{off_release_branch} produced off the release branch)"
+                  )
+                  continue
+              if len(matching_runs) != 1:
+                  errors.append(
+                      f"ambiguous required check: {name} "
+                      f"({len(matching_runs)} check-runs under one provenance)"
+                  )
+                  continue
+
+              run, workflow = matching_runs[0]
+              allowed_conclusions = (
+                  {"success", "skipped"}
+                  if name in skippable_required
+                  else {"success"}
+              )
+              if run.get("head_sha") != expected_sha:
+                  errors.append(
+                      f"required check has wrong head sha: {name} "
+                      f"(head={run.get('head_sha')})"
+                  )
+              if run["status"] != "completed":
+                  pending.append(
+                      f"required check not completed: {name} "
+                      f"(status={run['status']})"
+                  )
+              elif run["conclusion"] not in allowed_conclusions:
+                  errors.append(
+                      f"required check not green: {name} "
+                      f"(conclusion={run['conclusion']})"
+                  )
+              if workflow.get("status") != "completed":
+                  pending.append(
+                      f"required check workflow not completed: {name} "
+                      f"(status={workflow.get('status')})"
+                  )
+              elif workflow.get("conclusion") != "success":
+                  errors.append(
+                      f"required check workflow not green: {name} "
+                      f"(conclusion={workflow.get('conclusion')})"
+                  )
+
+          for run in check_runs:
+              name = run["name"]
+              # Exclude only this exact workflow identity's tag-mint attempts,
+              # including a prior refusal on the same SHA. A same-name check
+              # from another workflow remains visible and must be green.
+              if (
                   name == "Mint release tag"
+                  and run.get("check_suite_id") in release_tag_suite_ids
               ):
                   continue
               if run["status"] != "completed":
                   pending.append(
-                      f"check still in progress: {name} "
-                      f"(app={app_slug}/{app_id}, status={run['status']})"
+                      f"check still in progress: {name} (status={run['status']})"
                   )
-              elif run["conclusion"] not in acceptable:
-                  failures.append(
+              elif run["conclusion"] not in non_failing_optional:
+                  errors.append(
                       f"check not green: {name} "
-                      f"(app={app_slug}/{app_id}, conclusion={run['conclusion']})"
+                      f"(conclusion={run['conclusion']})"
                   )
 
-          if failures:
+          if errors:
               print("::error::refusing — check verification failed:")
-              for err in failures:
-                  print(f"  - {err}")
+              for error in errors:
+                  print(f"  - {error}")
               sys.exit(1)
           if pending:
               print("release-critical checks are not complete yet:")
@@ -702,8 +974,11 @@ jobs:
                   print(f"  - {item}")
               sys.exit(2)
 
-          print(f"verified {len(required)} required checks green; "
-                f"{len(runs)} total checks, none failing or in progress")
+          print(
+              f"verified {len(required)} required checks against their workflow "
+              f"provenance; {len(check_runs)} total checks, none failing or in "
+              "progress"
+          )
           PY
             status=$?
             set -e
@@ -713,8 +988,8 @@ jobs:
             if [ "$status" -ne 2 ]; then
               exit "$status"
             fi
-            if [ "$attempt" -eq 40 ]; then
-              echo "::error::release-critical checks did not settle within 20 minutes"
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::release-critical checks did not settle within 30 minutes"
               exit 1
             fi
             sleep 30

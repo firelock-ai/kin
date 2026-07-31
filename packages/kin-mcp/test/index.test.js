@@ -6,6 +6,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   childEnv,
@@ -16,6 +17,13 @@ import {
   resolveReleaseTag,
   runKinMcp
 } from '../src/index.js';
+import {
+  absoluteHostPath,
+  createSmokeFixtureContext,
+  hermeticSmokeEnv,
+  initializeGitFixture,
+  runGit
+} from './smoke-first-run.mjs';
 
 async function exists(filePath) {
   try {
@@ -25,6 +33,176 @@ async function exists(filePath) {
     return false;
   }
 }
+
+test('first-run smoke scrubs ambient Git, VFS, loader, and binary authority', () => {
+  const env = hermeticSmokeEnv({
+    sourceEnv: {
+      PATH: '/shadow/bin',
+      KIN_ORIGINAL_PATH: '/host/bin:/usr/bin',
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '/hostile/hooks',
+      GIT_TEMPLATE_DIR: '/hostile/template',
+      GIT_EXEC_PATH: '/hostile/git-core',
+      KIN_VFS_ROOT: '/hostile/vfs',
+      KIN_DAEMON_BIN: '/hostile/daemon',
+      KIN_MCP_KIN_BINARY: '/hostile/kin',
+      KIN_BINARY_PATH: '/hostile/kin',
+      LD_PRELOAD: '/hostile/preload.so',
+      DYLD_INSERT_LIBRARIES: '/hostile/preload.dylib',
+      SSH_ASKPASS: '/hostile/askpass',
+      SAFE_SENTINEL: 'preserved'
+    },
+    hostPath: '/host/bin:/usr/bin',
+    homeDir: '/fixture/home',
+    xdgDir: '/fixture/xdg',
+    platform: 'linux'
+  });
+
+  assert.equal(env.SAFE_SENTINEL, 'preserved');
+  assert.equal(env.PATH, '/host/bin:/usr/bin');
+  assert.equal(env.HOME, '/fixture/home');
+  assert.equal(env.XDG_CONFIG_HOME, '/fixture/xdg');
+  assert.equal(env.GIT_CONFIG_GLOBAL, os.devNull);
+  assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
+  assert.equal(env.GIT_ATTR_NOSYSTEM, '1');
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  assert.equal(env.KIN_VFS_DISABLE, '1');
+  for (const name of [
+    'GIT_CONFIG_COUNT',
+    'GIT_CONFIG_KEY_0',
+    'GIT_CONFIG_VALUE_0',
+    'GIT_TEMPLATE_DIR',
+    'GIT_EXEC_PATH',
+    'KIN_ORIGINAL_PATH',
+    'KIN_VFS_ROOT',
+    'KIN_DAEMON_BIN',
+    'KIN_MCP_KIN_BINARY',
+    'KIN_BINARY_PATH',
+    'LD_PRELOAD',
+    'DYLD_INSERT_LIBRARIES',
+    'SSH_ASKPASS'
+  ]) {
+    assert.equal(Object.hasOwn(env, name), false, `${name} should be scrubbed`);
+  }
+});
+
+test('first-run smoke scrubs mixed-case Windows authority names', () => {
+  const env = hermeticSmokeEnv({
+    sourceEnv: {
+      Path: 'C:\\shadow',
+      git_config_count: '1',
+      Git_Template_Dir: 'C:\\hostile\\template',
+      Kin_Daemon_Bin: 'C:\\hostile\\daemon.exe',
+      kin_mcp_kin_binary: 'C:\\hostile\\kin.exe',
+      kIn_VfS_rOoT: 'C:\\hostile\\vfs',
+      DyLd_Insert_Libraries: 'C:\\hostile\\loader.dll',
+      ld_preload: 'C:\\hostile\\loader.dll',
+      Safe_Sentinel: 'preserved'
+    },
+    hostPath: 'C:\\Git\\cmd;C:\\Windows\\System32',
+    homeDir: 'C:\\fixture\\home',
+    xdgDir: 'C:\\fixture\\xdg',
+    platform: 'win32'
+  });
+
+  assert.equal(env.Safe_Sentinel, 'preserved');
+  assert.equal(env.PATH, 'C:\\Git\\cmd;C:\\Windows\\System32');
+  assert.equal(env.GIT_CONFIG_GLOBAL, 'NUL');
+  assert.equal(env.KIN_VFS_DISABLE, '1');
+  const inheritedNames = Object.keys(env).map(name => name.toLowerCase());
+  for (const name of [
+    'path',
+    'git_config_count',
+    'git_template_dir',
+    'kin_daemon_bin',
+    'kin_mcp_kin_binary',
+    'kin_vfs_root',
+    'dyld_insert_libraries',
+    'ld_preload'
+  ]) {
+    const matches = inheritedNames.filter(candidate => candidate === name);
+    assert.equal(matches.length, name === 'path' ? 1 : 0, `${name} should be controlled`);
+  }
+});
+
+test(
+  'first-run Git fixture ignores hostile command-scope config and hooks',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-hostile-git-'));
+    const repoDir = path.join(tmpDir, 'repo');
+    const hostileHooks = path.join(tmpDir, 'hostile-hooks');
+    const hostileTemplate = path.join(tmpDir, 'hostile-template');
+    const marker = path.join(tmpDir, 'hostile-hook-ran');
+    await Promise.all([
+      fs.mkdir(repoDir),
+      fs.mkdir(hostileHooks),
+      fs.mkdir(hostileTemplate)
+    ]);
+    await fs.writeFile(path.join(repoDir, 'main.rs'), 'fn main() {}\n');
+    await fs.writeFile(
+      path.join(hostileHooks, 'pre-commit'),
+      `#!/bin/sh\nprintf ran > '${marker.replaceAll("'", "'\\''")}'\nexit 1\n`,
+      { mode: 0o755 }
+    );
+    await fs.writeFile(
+      path.join(hostileTemplate, 'config'),
+      `[core]\n\thooksPath = ${hostileHooks}\n`
+    );
+
+    try {
+      const sourceEnv = {
+        ...process.env,
+        KIN_ORIGINAL_PATH: process.env.KIN_ORIGINAL_PATH || process.env.PATH,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: hostileHooks,
+        GIT_TEMPLATE_DIR: hostileTemplate
+      };
+      const context = await createSmokeFixtureContext({
+        workRoot: path.join(tmpDir, 'fixture'),
+        sourceEnv
+      });
+      initializeGitFixture(context, repoDir);
+
+      assert.equal(await exists(marker), false);
+      const head = runGit(context, repoDir, ['rev-parse', '--verify', 'HEAD'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+        .toString('utf8')
+        .trim();
+      assert.match(head, /^[0-9a-f]{40,64}$/);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+);
+
+test('absoluteHostPath prefers the captured host path and normalizes entries', () => {
+  assert.equal(
+    absoluteHostPath({
+      env: {
+        PATH: '/shadow',
+        KIN_ORIGINAL_PATH: 'bin:/usr/bin'
+      },
+      cwd: '/fixture',
+      platform: 'linux'
+    }),
+    '/fixture/bin:/usr/bin'
+  );
+  assert.equal(
+    absoluteHostPath({
+      env: {
+        Path: 'C:\\shadow',
+        kin_original_path: 'Git\\cmd;C:\\Windows\\System32'
+      },
+      cwd: 'C:\\fixture',
+      platform: 'win32'
+    }),
+    'C:\\fixture\\Git\\cmd;C:\\Windows\\System32'
+  );
+});
 
 test('resolveReleaseAsset maps supported targets', () => {
   assert.deepEqual(resolveReleaseAsset('darwin', 'arm64'), {
@@ -337,6 +515,59 @@ test('runKinMcp auto-inits when explicitly allowed', async () => {
     assert.ok(initPos >= 0, 'expected kin init . call');
     assert.ok(mcpPos >= 0, 'expected kin mcp start call');
     assert.ok(initPos < mcpPos, 'init should run before mcp start');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('auto-init keeps MCP stdout protocol-only from process start', async () => {
+  const tmpDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), 'kin-mcp-autoinit-protocol-')
+  );
+  const binaryPath = path.join(tmpDir, 'kin');
+  const protocolPayload = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    result: { protocolVersion: '2024-11-05' }
+  });
+  const protocolFrame =
+    `Content-Length: ${Buffer.byteLength(protocolPayload)}\r\n\r\n${protocolPayload}`;
+  await fs.writeFile(
+    binaryPath,
+    [
+      '#!/bin/sh',
+      'if [ "$1" = "init" ]; then',
+      "  printf '%s\\n' 'init stdout must leave the protocol channel'",
+      "  printf '%s\\n' 'init stderr remains diagnostic' >&2",
+      `  mkdir -p "${tmpDir}/.kin"`,
+      '  exit 0',
+      'fi',
+      `printf '%s' '${protocolFrame}'`,
+      ''
+    ].join('\n'),
+    { mode: 0o755 }
+  );
+
+  try {
+    const result = cp.spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL('../bin/kin-mcp.js', import.meta.url))],
+      {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          KIN_MCP_KIN_BINARY: binaryPath,
+          KIN_MCP_AUTO_INIT: '1'
+        }
+      }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, protocolFrame);
+    assert.doesNotMatch(result.stdout, /init stdout/);
+    assert.match(result.stderr, /init stdout must leave the protocol channel/);
+    assert.match(result.stderr, /init stderr remains diagnostic/);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }

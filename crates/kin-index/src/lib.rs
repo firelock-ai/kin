@@ -10,6 +10,15 @@
 //! `WorkspaceState`. It does not create `SemanticChange` history on its own;
 //! repository authority commits workspace and history transitions atomically.
 
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run Kin index fixture process-group guardian");
+    assert_eq!(dispatched, requested);
+}
+
 pub mod admission;
 pub mod artifacts;
 pub mod classifier;
@@ -35,7 +44,9 @@ pub use error::{IndexError, Result};
 pub use fingerprint::{
     behavior_equivalence_hash, compute_entity_fingerprint, language_supports_equivalence,
 };
-pub use history::{derive_historical_semantic_deltas, HistoricalSemanticDelta};
+pub use history::{
+    derive_historical_semantic_deltas, is_external_reference_target, HistoricalSemanticDelta,
+};
 pub use linker::{
     build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
     extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,

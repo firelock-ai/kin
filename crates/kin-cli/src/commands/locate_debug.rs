@@ -510,6 +510,9 @@ pub async fn run(
         true,
         None,
         false,
+        // This report scores files and gold-set overlap, not the entity ranking,
+        // so it stays on the coordinates-only projection.
+        false,
         crate::commands::locate::LocatePaging::default(),
     )
     .await?;

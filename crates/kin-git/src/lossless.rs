@@ -1640,14 +1640,13 @@ fn display_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    #[cfg(unix)]
-    use std::io::Write as _;
-    use std::process::{Command, Output};
+    use std::process::Output;
 
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
 
     use super::*;
+    use crate::test_support::fixture_git;
 
     /// Gitlink target recorded by the polyglot fixture, which is never a
     /// capturable object in the source repository.
@@ -2318,13 +2317,7 @@ mod tests {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", repo)
-            .output()
-            .unwrap()
+        fixture_git().args(args).current_dir(repo).output().unwrap()
     }
 
     #[cfg(unix)]
@@ -2365,18 +2358,11 @@ mod tests {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut child = Command::new("git")
+        fixture_git()
             .args(args)
             .current_dir(repo)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", repo)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
-        child.wait_with_output().unwrap()
+            .output_with_input(stdin)
+            .unwrap()
     }
 
     #[cfg(unix)]

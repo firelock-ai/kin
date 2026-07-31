@@ -48,11 +48,16 @@ fn exact_source_archive_exports() -> Arc<tokio::sync::Semaphore> {
 
 /// Coherent repository-v6 authority for the daemon's primary workspace.
 ///
-/// Every request opens the durable publication and then holds one immutable
-/// lease while resolving refs, workspace tree state, and source identities.
-/// The raw checkout and Git object database are never consulted.
+/// Opening one reads the durable publication in full and then holds one
+/// immutable lease while resolving refs, workspace tree state, and source
+/// identities. The raw checkout and Git object database are never consulted.
+///
+/// The manager is shared rather than owned so a caller that has already paid
+/// for one open can hand the same coherent authority to another reader; see
+/// [`ProjectionAuthorityCache`].
+#[derive(Clone)]
 struct ActiveApiRepositoryAuthority {
-    manager: RepositoryAuthorityManager<LocalFileBackend>,
+    manager: Arc<RepositoryAuthorityManager<LocalFileBackend>>,
     repository_id: RepositoryId,
     workspace_id: WorkspaceId,
 }
@@ -63,8 +68,12 @@ impl ActiveApiRepositoryAuthority {
             .local_repository_authority_binding()
             .map_err(repository_authority_error)?;
         let manager = binding.open_manager().map_err(repository_authority_error)?;
+        state
+            .projection_authority
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
-            manager,
+            manager: Arc::new(manager),
             repository_id: binding.repository_id().clone(),
             workspace_id: binding.workspace_id(),
         })
@@ -76,7 +85,7 @@ impl ActiveApiRepositoryAuthority {
             .map_err(repository_authority_error)?;
         let manager = binding.open_manager().map_err(repository_authority_error)?;
         Ok(Self {
-            manager,
+            manager: Arc::new(manager),
             repository_id: binding.repository_id().clone(),
             workspace_id: binding.workspace_id(),
         })
@@ -103,6 +112,217 @@ fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, Str
         StatusCode::FAILED_DEPENDENCY,
         format!("repository-v6 authority unavailable: {error}"),
     )
+}
+
+/// KinDB's commit record for one local repository's durable publication.
+///
+/// KinDB stages snapshot and delta bodies, fsyncs them, and then atomically
+/// replaces this one record; that rename is the commit point. The record
+/// content-binds the snapshot digest and every acknowledged delta digest under
+/// deterministic serialization, so identical record bytes mean identical
+/// durable state by construction, and a record that reads identically twice
+/// cannot have moved and returned in between. The converse does not hold: a
+/// rewrite is not always a new publication, because opening a legacy store can
+/// re-mint this record once while binding validation state. With the label read
+/// before the load it describes, that costs one spurious reload and never a
+/// stale serve.
+const AUTHORITY_PUBLICATION_RECORD: &str = "authority.json";
+
+/// KinDB reads its own record under a 1 MiB bound. A larger file at that path
+/// is not a record it wrote, and is reported rather than loaded.
+const MAX_AUTHORITY_PUBLICATION_RECORD_BYTES: u64 = 1024 * 1024;
+
+/// Which durable publication a repository's local storage currently holds.
+///
+/// This is storage-commit metadata, never a semantic answer: it decides only
+/// whether an already-loaded authority may be reused, and every answer served
+/// still comes from repository-v6 graph truth.
+#[derive(Clone, PartialEq, Eq)]
+enum LocalPublicationIdentity {
+    /// The repository has persisted no authority yet, so its authority is the
+    /// unpublished generation-zero state.
+    Unpublished,
+    Published([u8; 32]),
+}
+
+/// Read which publication local storage holds, without loading it.
+///
+/// The full load this labels reads, hashes, and deserializes the entire graph
+/// snapshot. This reads one small record, so a reader can revalidate on every
+/// request and pay the full load only when the publication has actually moved
+/// — including when it moved under a separate process such as a CLI ingest or
+/// commit running beside the daemon.
+fn read_local_publication_identity(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> Result<LocalPublicationIdentity, (StatusCode, String)> {
+    use std::io::Read as _;
+
+    let record = backend
+        .base_path()
+        .join(repository_id.as_str())
+        .join(AUTHORITY_PUBLICATION_RECORD);
+    let record_error = |error: std::io::Error| {
+        repository_authority_error(format!(
+            "cannot read local publication record {}: {error}",
+            record.display()
+        ))
+    };
+    // One handle answers both the bound and the contents, so a commit landing
+    // mid-check cannot bound one record and return the bytes of another. The
+    // bound is enforced by reading a single byte past it rather than by a
+    // separate size probe, so nothing measures a record it did not then read,
+    // and rejecting an oversized file costs one byte beyond the limit.
+    let file = match std::fs::File::open(&record) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LocalPublicationIdentity::Unpublished);
+        }
+        Err(error) => return Err(record_error(error)),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTHORITY_PUBLICATION_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(record_error)?;
+    if bytes.len() as u64 > MAX_AUTHORITY_PUBLICATION_RECORD_BYTES {
+        return Err(repository_authority_error(format!(
+            "local publication record {} is past the {MAX_AUTHORITY_PUBLICATION_RECORD_BYTES}-byte bound",
+            record.display()
+        )));
+    }
+    Ok(LocalPublicationIdentity::Published(
+        Sha256::digest(&bytes).into(),
+    ))
+}
+
+/// One repository-v6 authority shared across the daemon's projection routes.
+///
+/// Opening authority is a full snapshot read, SHA-256, and deserialize under an
+/// exclusive repository lock. Paying that per projected read makes every VFS
+/// request proportional to whole-repository size. Holding one open authority
+/// and revalidating it against the durable publication record keeps the answer
+/// exactly as fresh while making the common request a small metadata read.
+#[derive(Default)]
+pub(crate) struct ProjectionAuthorityCache {
+    held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
+    /// Serializes misses so a burst of concurrent cold requests pays for one
+    /// full load rather than one per request.
+    load_gate: std::sync::Mutex<()>,
+    loads: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct HeldProjectionAuthority {
+    /// The publication this authority is known to be at least as new as.
+    ///
+    /// Read strictly before the authority it labels was loaded, never after.
+    /// A label taken afterwards could name a publication that landed during
+    /// the load, which would mark older bytes as current and serve them past
+    /// the commit that replaced them.
+    published: LocalPublicationIdentity,
+    authority: ActiveApiRepositoryAuthority,
+}
+
+impl ProjectionAuthorityCache {
+    /// Complete durable-authority loads this daemon state has paid for.
+    ///
+    /// Every [`ActiveApiRepositoryAuthority::open`] counts, whichever route
+    /// asked for it. One load per publication rather than one per request is
+    /// the property this cache exists to make true.
+    pub(crate) fn loads(&self) -> u64 {
+        self.loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reuse(&self, published: &LocalPublicationIdentity) -> Option<ActiveApiRepositoryAuthority> {
+        lock_recover(&self.held)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| held.authority.clone())
+    }
+
+    fn install(
+        &self,
+        published: LocalPublicationIdentity,
+        authority: ActiveApiRepositoryAuthority,
+    ) {
+        *lock_recover(&self.held) = Some(HeldProjectionAuthority {
+            published,
+            authority,
+        });
+    }
+
+    fn invalidate(&self) {
+        *lock_recover(&self.held) = None;
+    }
+}
+
+/// Refuse a storage namespace that is no longer the one this daemon pinned.
+///
+/// Opening authority performs this check itself, so reusing a held authority
+/// has to perform it too; otherwise a `.kin/kindb` namespace replaced under the
+/// daemon would keep being answered from the authority of the store it
+/// replaced. The probe decodes no snapshot and takes no repository lock.
+fn confirm_pinned_projection_namespace(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> Result<(), (StatusCode, String)> {
+    match backend.probe_pinned_repository_namespace(repository_id.as_str()) {
+        kin_db::LocalNamespaceProbe::Retained => Ok(()),
+        kin_db::LocalNamespaceProbe::Absent => Err(repository_authority_error(format!(
+            "local storage authority does not hold repository namespace {repository_id}"
+        ))),
+        kin_db::LocalNamespaceProbe::IdentityLost(fault) => Err(repository_authority_error(fault)),
+        kin_db::LocalNamespaceProbe::Unavailable(error) => Err(repository_authority_error(error)),
+    }
+}
+
+/// Resolve the repository-v6 authority the projection routes answer from.
+///
+/// Blocking: reads storage metadata and, on a publication change, loads the
+/// complete durable authority. Callers run it on a blocking thread.
+fn projection_repository_authority(
+    state: &DaemonState,
+) -> Result<ActiveApiRepositoryAuthority, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let repository_id = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?
+        .repository_id()
+        .clone();
+
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse(&published) {
+        return Ok(authority);
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    // Re-read under the gate: the publication may have moved while this
+    // request waited, and the label installed below must be the one taken
+    // before the load it describes.
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse(&published) {
+        return Ok(authority);
+    }
+    let authority = ActiveApiRepositoryAuthority::open(state)?;
+    state
+        .projection_authority
+        .install(published, authority.clone());
+    // Whether reuse is actually holding is not visible from request latency
+    // alone, and a count that climbs with request volume rather than with
+    // publications is the signal that it is not.
+    tracing::debug!(
+        repository = %authority.repository_id,
+        loads = state.projection_authority.loads(),
+        "projection repository authority loaded"
+    );
+    Ok(authority)
 }
 
 /// Fail closed when an explicit filesystem-admission command is unavailable.
@@ -190,6 +410,10 @@ pub struct HealthResponse {
     pub graph_loaded: bool,
     pub reconciliation_status: String,
     pub repo_id: String,
+    /// Exact local workspace authority. Hosted snapshot daemons do not carry a
+    /// local workspace and report `null`.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub repo_root: String,
     pub pid: u32,
     #[serde(default)]
@@ -249,6 +473,11 @@ pub struct HealthResponse {
     /// complete citable measurement source during this daemon lifetime.
     #[serde(default)]
     pub coordination_event_persist_failures: Option<u64>,
+    /// A cross-repo spine warm-up is loading sibling repository graphs right
+    /// now. The daemon is alive and serving its own repo throughout; this is
+    /// the signal that distinguishes "busy" from "dead".
+    #[serde(default)]
+    pub spine_warming: bool,
     pub build: BuildResponse,
 }
 
@@ -264,9 +493,14 @@ pub struct BuildResponse {
 }
 
 /// Readiness response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct ReadinessResponse {
     pub ready: bool,
+    /// The daemon is alive and its own repo is served, but a cross-repo spine
+    /// warm-up is still materializing sibling graphs. Clients must read this as
+    /// alive-and-waiting; it is never evidence that the daemon is dead.
+    #[serde(default)]
+    pub warming: bool,
 }
 
 /// JSON-friendly intent payload for CLI and adapter consumers.
@@ -326,6 +560,13 @@ struct SessionStartResponse {
     started_at: kin_model::timestamp::Timestamp,
     capabilities: SessionCapabilities,
     status: String,
+    /// How long the session may go idle before the sweeper may reap it.
+    idle_timeout_secs: u64,
+    /// When the current idle window becomes eligible for reaping if no call
+    /// refreshes it. A live registered PID is stronger liveness evidence and
+    /// can keep the session past this boundary, so this is deliberately not
+    /// named `expires_at`.
+    idle_reap_eligible_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -333,6 +574,10 @@ struct SessionHeartbeatResponse {
     session_id: String,
     status: String,
     heartbeat_at: kin_model::timestamp::Timestamp,
+    /// Same contract as on [`SessionStartResponse`]: the refreshed idle window
+    /// and its next reaping-eligibility boundary.
+    idle_timeout_secs: u64,
+    idle_reap_eligible_at: kin_model::timestamp::Timestamp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -872,6 +1117,8 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/security", post(command_security))
         .route("/commands/branch", post(command_branch))
         .route("/commands/merge", post(command_merge))
+        .route("/commands/conflicts", post(command_conflicts))
+        .route("/commands/resolve", post(command_resolve))
         .route("/commands/drift", post(command_drift))
         .route("/commands/tag", post(command_tag))
         .route("/commands/rollback", post(command_rollback))
@@ -931,6 +1178,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/tree", get(vfs_tree))
         .route("/vfs/stat/{*path}", get(vfs_stat))
         .route("/vfs/read/{*path}", get(vfs_read))
+        .route("/vfs/blob/{hash}", get(vfs_blob))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/subscribe", get(vfs_subscribe))
         // Spine endpoints — cross-repo federation queries
@@ -1384,6 +1632,78 @@ async fn resolve_session_source_scope(
 }
 
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
+const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
+
+/// Capture one point-in-time status observation of the graph selected for this
+/// request.
+///
+/// Entity/relation mutations participate in the daemon's graph-authority
+/// seqlock. Normal foreground/background embedding passes use
+/// `embedding_work`; kin-db's own queue/vector locks keep reset and startup
+/// requeue transitions structurally valid. Holding the outer lock while reading
+/// all counters, then revalidating the graph epoch and selected HEAD/session
+/// graph, prevents a normal embedding pass or graph mutation from spanning the
+/// published observation without asking kin-mcp to reread a mutable graph.
+async fn mcp_graph_status_with_stable_authority(
+    state: &DaemonState,
+    session_id: Option<&SessionId>,
+    selected_graph: &Arc<kin_db::InMemoryGraph>,
+    authority: RequestGraphAuthority,
+    scope: kin_mcp::handlers::entities::GraphStatusScope,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+
+        let observation = match state.embedding_work.try_lock() {
+            Ok(_embedding_guard) => {
+                let embeddings = selected_graph.embedding_status();
+                kin_mcp::handlers::entities::GraphStatusObservation {
+                    authority_epoch,
+                    entity_count: selected_graph.entity_count(),
+                    relation_count: selected_graph.relation_count(),
+                    embeddings_indexed: embeddings.indexed,
+                    embeddings_pending: embeddings.pending,
+                    embeddings_total: embeddings.total,
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(kin_mcp::ToolCallResult::error(
+                    "selected-graph embedding coverage is changing; retry kin_graph_status",
+                ));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(kin_mcp::McpError::Other(
+                    "embedding work lock poisoned while sampling kin_graph_status".to_string(),
+                ));
+            }
+        };
+
+        if !state.graph_authority_epoch_is_current(authority_epoch) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if !state
+            .graph_authority_is_current(session_id, selected_graph, authority)
+            .await
+            || !state.graph_authority_epoch_is_current(authority_epoch)
+        {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        return kin_mcp::handlers::entities::handle_daemon_graph_status_observation(
+            scope,
+            observation,
+        );
+    }
+
+    Ok(kin_mcp::ToolCallResult::error(
+        "selected graph changed during status sampling; retry kin_graph_status",
+    ))
+}
 
 /// One optimistic, point-in-time graph authority used by xref-style reads.
 ///
@@ -1721,6 +2041,9 @@ async fn health(
         graph_loaded,
         reconciliation_status: state.reconciliation_status_str().to_string(),
         repo_id: primary_repo_id(&state),
+        workspace_id: state
+            .local_repository_workspace_id()
+            .map(|workspace_id| workspace_id.to_string()),
         repo_root: state
             .layout
             .working_dir()
@@ -1746,6 +2069,7 @@ async fn health(
             ),
         ),
         coordination_event_persist_failures: Some(coordination_event_persist_failures),
+        spine_warming: state.spine_warming(),
         build: current_build_response(),
     }))
 }
@@ -1753,17 +2077,32 @@ async fn health(
 /// GET /readiness — returns 200 when initialized, 503 otherwise.
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
+///
+/// Readiness is deliberately independent of cross-repo spine warm-up: this
+/// daemon's own repo is what a client connecting to it needs served, and a
+/// sibling warm-up that gated readiness would report a busy daemon as a dead
+/// one. A warm-up in progress is reported through `warming` instead.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
+    let warming = state.spine_warming();
 
     if initialized {
-        (StatusCode::OK, Json(ReadinessResponse { ready: true }))
+        (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                ready: true,
+                warming,
+            }),
+        )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessResponse { ready: false }),
+            Json(ReadinessResponse {
+                ready: false,
+                warming,
+            }),
         )
     }
 }
@@ -1823,6 +2162,8 @@ async fn start_session(
             )
         })?;
 
+    let idle_ttl = state.coordinator.session_idle_ttl();
+    let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
     Ok(Json(SessionStartResponse {
         session_id: session.session_id.to_string(),
         vendor: session.vendor,
@@ -1831,7 +2172,49 @@ async fn start_session(
         started_at: session.started_at,
         capabilities: session.capabilities,
         status: "active".to_string(),
+        idle_timeout_secs: idle_ttl.as_secs(),
+        idle_reap_eligible_at,
     }))
+}
+
+/// What to tell a caller whose session id no longer names a live session.
+///
+/// The id is well-formed, so this is an ended or idle-reaped session rather
+/// than a typo, and the only move is a fresh `kin_session_start`. Saying so is
+/// the difference between an agent restarting in one call and an agent
+/// retrying the same dead id until it times out.
+fn expired_session_message(session_id: &SessionId) -> String {
+    format!(
+        "session not found: {session_id}. It was ended or expired after its idle timeout \
+         (KIN_SESSION_IDLE_TTL_SECS). Call kin_session_start for a new session id, then \
+         re-open any transaction on it; every session-bound call refreshes the idle window, \
+         and kin_session_heartbeat refreshes it during a long read phase."
+    )
+}
+
+/// The instant the current idle window becomes eligible for reaping, measured
+/// from the last recorded heartbeat.
+///
+/// A registered PID that is still alive is stronger liveness evidence and can
+/// keep the session active beyond this boundary.
+///
+/// Saturates rather than wrapping: a TTL large enough to overflow the calendar
+/// means "not reachable from here", and reporting the heartbeat itself as the
+/// deadline would tell an agent its live session had already expired.
+fn session_idle_reap_eligibility(
+    last_heartbeat: &kin_model::timestamp::Timestamp,
+    idle_ttl: Duration,
+) -> kin_model::timestamp::Timestamp {
+    let window = i64::try_from(idle_ttl.as_secs())
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .unwrap_or(chrono::TimeDelta::MAX);
+    kin_model::timestamp::Timestamp(
+        last_heartbeat
+            .0
+            .checked_add_signed(window)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+    )
 }
 
 /// GET /session/{session_id} — fetch a single active session.
@@ -1859,21 +2242,25 @@ async fn session_heartbeat(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = parse_session_id(&session_id)?;
-    state
-        .coordinator
-        .heartbeat(&session_id)
-        .map_err(internal_error)?;
-
+    // Existence and refresh are one coordinator operation under the same
+    // arbitration guard as stale-session sweeping. A heartbeat against a
+    // session the sweeper already reaped is the one call guaranteed to be in
+    // flight when a long-lived agent loses its session; it must come back as an
+    // actionable 404, never a precheck/update race reported as HTTP 500.
     let session = state
         .coordinator
-        .get_session(&session_id)
+        .heartbeat_session(&session_id)
         .map_err(internal_error)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, expired_session_message(&session_id)))?;
 
+    let idle_ttl = state.coordinator.session_idle_ttl();
+    let idle_reap_eligible_at = session_idle_reap_eligibility(&session.last_heartbeat, idle_ttl);
     Ok(Json(SessionHeartbeatResponse {
         session_id: session.session_id.to_string(),
         status: "active".to_string(),
         heartbeat_at: session.last_heartbeat,
+        idle_timeout_secs: idle_ttl.as_secs(),
+        idle_reap_eligible_at,
     }))
 }
 
@@ -2640,6 +3027,76 @@ async fn command_merge(
 
     let _coordination = state.coordination_gate.lock().await;
     let response = crate::repository_merge::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/conflicts — read the workspace's durable merge record.
+async fn command_conflicts(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::conflicts::ConflictsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository merge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "conflicts does not accept X-Kin-Session because a merge transaction is bound to the \
+             primary repository workspace"
+                .to_string(),
+        ));
+    }
+    let response = crate::repository_merge_state::execute_conflicts(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/resolve — settle, publish, or abandon a durable merge.
+async fn command_resolve(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::resolve::ResolveRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository merge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "resolve does not accept X-Kin-Session because it mutates the primary repository \
+             workspace and its active branch"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_merge_state::execute_resolve(&state, &request)?;
     Ok(Json(response))
 }
 
@@ -3703,8 +4160,17 @@ async fn locate(
     // Resolve the bounded-snippet projection for this request. Off by default
     // (CLI human path, legacy clients); the agent JSON surface sets it so each
     // located definition symbol carries inline code from graph-owned content.
+    //
+    // The middle case is the one that was missing: a structured caller that
+    // declined bodies still wants the graph-native `entities[]` ranking. Falling
+    // through to the default options switched the whole projection off, so
+    // `kin locate --json --no-snippets` answered a request to spend fewer tokens
+    // by returning no results -- the same defect `include_snippet: false` had on
+    // the `semantic_locate` arm.
     let snippet_opts = if req.snippets {
         kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines)
+    } else if req.entity_surface {
+        kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines).without_bodies()
     } else {
         kin_cli::commands::locate::SnippetOptions::default()
     };
@@ -3718,7 +4184,10 @@ async fn locate(
         .unwrap_or_else(kin_cli::commands::locate::entity_page_size);
 
     // Paging fast path: a valid cursor whose ranking is still cached at the
-    // current graph version is windowed straight from cache — NO retrieval.
+    // current graph version AND in this request's body mode is windowed straight
+    // from cache, with NO retrieval. The mode is checked and not merely keyed:
+    // the cursor token carries the key, so a caller can present the other mode's
+    // key and would otherwise be served that mode's ranking.
     if let Some(cursor_token) = req.cursor.as_deref() {
         if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
             let cached = {
@@ -3726,6 +4195,7 @@ async fn locate(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -3847,9 +4317,10 @@ async fn locate(
 
     // Cache the full entity ranking and window page 0 so a follow-up `--next`
     // pages it from cache without re-running retrieval. Keyed by
-    // (query, ref/scope, graph-version) so any edit invalidates the page. A
-    // multi-query ranking keys off the joined variants so it cannot collide with
-    // any single-variant cursor.
+    // (query, ref/scope, graph-version, body-mode) so any edit invalidates the
+    // page and a caller paging in one body mode never receives a ranking built in
+    // the other. A multi-query ranking keys off the joined variants so it cannot
+    // collide with any single-variant cursor.
     let key_text = if multi_query {
         multiquery_cursor_text(&variants)
     } else {
@@ -3859,8 +4330,21 @@ async fn locate(
         &key_text,
         scope_token.as_deref(),
         graph_version,
+        snippet_opts.projection_mode(),
     );
-    cache_locate_ranking(&state, &key, &result.entities, graph_version);
+    // Only a request that actually projected `entities[]` has a ranking worth
+    // holding. The no-projection path leaves it empty, issues no cursor, and never
+    // reads this cache, so writing to it can only do harm: it would publish an
+    // empty ranking under a key another mode's live cursor might present.
+    if snippet_opts.enabled {
+        cache_locate_ranking(
+            &state,
+            &key,
+            &result.entities,
+            graph_version,
+            snippet_opts.projection_mode(),
+        );
+    }
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
 }
@@ -4145,6 +4629,7 @@ fn cache_locate_ranking(
     key: &str,
     entities: &[kin_cli::commands::locate::LocateEntity],
     graph_version: u64,
+    mode: &'static str,
 ) {
     let mut cache = state.locate_rankings.lock().unwrap();
     if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
@@ -4161,6 +4646,7 @@ fn cache_locate_ranking(
         CachedLocateRanking {
             entities: entities.to_vec(),
             graph_version,
+            mode,
             created: std::time::Instant::now(),
         },
     );
@@ -5333,6 +5819,13 @@ fn build_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    // Cached rows already carry (or omit) `snippet`, and the
+                    // cursor supplies the key, so a mode mismatch has to miss the
+                    // cache and re-search rather than replay the other mode.
+                    .filter(|entry| {
+                        entry.mode
+                            == kin_cli::commands::locate::projection_mode(true, include_snippet)
+                    })
                     .map(|entry| entry.rows.clone())
             };
             if let Some(rows) = cached {
@@ -5510,8 +6003,9 @@ fn build_semantic_locate_result(
             "match_evidence": match_evidence,
         });
         if let Some(span) = span {
-            hit["start_line"] = json!(span.start_line);
-            hit["end_line"] = json!(span.end_line);
+            let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
+            hit["start_line"] = json!(start_line);
+            hit["end_line"] = json!(end_line);
         }
         if let Some(snippet) = snippet {
             hit["snippet"] = json!(snippet);
@@ -5524,6 +6018,7 @@ fn build_semantic_locate_result(
         &query,
         Some(granularity_token.as_str()),
         graph_version,
+        kin_cli::commands::locate::projection_mode(true, include_snippet),
     );
     {
         let mut cache = state.semantic_locate_pages.lock().unwrap();
@@ -5541,6 +6036,7 @@ fn build_semantic_locate_result(
             CachedSemanticPage {
                 rows: rows.clone(),
                 graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, include_snippet),
                 created: std::time::Instant::now(),
             },
         );
@@ -5592,6 +6088,12 @@ fn fused_semantic_locate_payload(
         json!(if file_granularity { "file" } else { "entity" }),
     );
     payload.insert("routing".to_string(), json!("fused-v1"));
+    // State the page explicitly. `LocateResult::page` is skipped when zero, so a
+    // caller that asked for page 3 and got page 0 (a cache miss re-ran the ranking
+    // and restarted) saw the key vanish rather than change, and had to infer the
+    // restart from an absent field. The cosine arm always states its page; now both
+    // arms answer the question the same way.
+    payload.insert("page".to_string(), json!(result.page));
     if let Some(coverage) = coverage_detail {
         payload.insert("semantic_coverage_detail".to_string(), json!(coverage));
     }
@@ -5607,6 +6109,17 @@ fn fused_semantic_locate_payload(
                     "match_evidence".to_string(),
                     fused_match_evidence(query, entity),
                 );
+                // The two `semantic_locate` arms carried the same graph-owned
+                // excerpt under different names: the cosine arm called it
+                // `snippet`, the fused arm `body`. An agent that set
+                // `include_snippet` and looked for `snippet` therefore found no
+                // snippet key at all on whichever arm its profile happened to
+                // serve. Mirror the field so `include_snippet` means one thing on
+                // both arms, and keep `body` for the locate-schema parity that
+                // consumers of `kin locate --json` already parse.
+                if let Some(body) = entity.body.as_ref() {
+                    map.insert("snippet".to_string(), json!(body));
+                }
             }
         }
     }
@@ -5684,6 +6197,21 @@ async fn build_fused_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // `entities[]` is the graph-native surface this tool answers with, so it is
+    // projected either way. Only the body text follows `include_snippet`. The
+    // default options would switch the whole projection off, which turned "omit
+    // snippets" into "omit the results".
+    //
+    // Resolved BEFORE the paging fast path below rather than after it: the fast
+    // path answers straight from a cached ranking, and a body mode decided after
+    // that point leaves the cursor path unable to tell which mode the caller
+    // actually asked for.
+    let snippet_opts = if include_snippet {
+        kin_cli::commands::locate::SnippetOptions::enabled(None)
+    } else {
+        kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
+    };
+
     // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
     // so a stale cursor can never page a ranking built against different truth.
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
@@ -5709,6 +6237,10 @@ async fn build_fused_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
+                    // The cursor carries the cache key, so a caller can present a
+                    // key minted in the other body mode. Keying is not enough;
+                    // the held ranking's mode has to match this request's.
+                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
                     .map(|entry| entry.entities.clone())
             };
             if let Some(entities) = cached {
@@ -5735,12 +6267,6 @@ async fn build_fused_semantic_locate_result(
         // Cache miss / stale / undecodable cursor: fall through to a fresh run
         // (returns page 0) rather than silently failing the page.
     }
-
-    let snippet_opts = if include_snippet {
-        kin_cli::commands::locate::SnippetOptions::enabled(None)
-    } else {
-        kin_cli::commands::locate::SnippetOptions::default()
-    };
 
     // Multi-query fan-out: `query` plus any additional `queries` variants,
     // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
@@ -5802,8 +6328,15 @@ async fn build_fused_semantic_locate_result(
         &key_text,
         scope_token.as_deref(),
         graph_version,
+        snippet_opts.projection_mode(),
     );
-    cache_locate_ranking(state, &key, &locate_result.entities, graph_version);
+    cache_locate_ranking(
+        state,
+        &key,
+        &locate_result.entities,
+        graph_version,
+        snippet_opts.projection_mode(),
+    );
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
     fused_semantic_locate_payload(locate_result, &query, file_granularity)
@@ -5861,6 +6394,14 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
             start_line: record.start_line,
             end_line: record.end_line,
             signature: record.signature,
+            // This arm resolves source through kin-cli's own authority read, so it
+            // has no `ExactEntitySource` to render. It reports the coherence label
+            // that read did establish rather than emitting nothing, so the batch
+            // surface is never silent about an unverified span.
+            provenance: serde_json::Map::from_iter([(
+                "span_coherence".to_string(),
+                json!(record.span_coherence),
+            )]),
             body: record.body,
         }),
         Ok(EntitySourceOutcome::NotFound(message)) => ResolvedEntitySource::NotFound {
@@ -6313,6 +6854,21 @@ async fn mcp_tools_call(
                 |_| {},
             )
             .await
+        } else if request.name == "kin_graph_status" {
+            let scope = match graph_authority {
+                RequestGraphAuthority::Head => kin_mcp::handlers::entities::GraphStatusScope::Head,
+                RequestGraphAuthority::SessionScope => {
+                    kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+                }
+            };
+            mcp_graph_status_with_stable_authority(
+                &state,
+                session_id.as_ref(),
+                &graph,
+                graph_authority,
+                scope,
+            )
+            .await
         } else if request.name == "kin_transaction_commit" {
             Ok(crate::mcp_commit::commit_exact_transaction(
                 &state,
@@ -6446,6 +7002,92 @@ async fn mcp_tools_call(
 // Multi-repo endpoints — list and query lazily-loaded repo graphs
 // ---------------------------------------------------------------------------
 
+/// Resolve one repo-scoped route's `{repo_id}` to its graph.
+///
+/// Every `/repos/{repo_id}/…` route goes through here so the identity a daemon
+/// advertises on `/health` is the identity those routes accept: `/health`
+/// reports [`primary_repo_id`], which is the repository authority id the
+/// daemon opened, and that id is always resident in the repo graph map.
+///
+/// Addressing is decided from the served key space
+/// ([`DaemonState::serves_repo_id`]) *before* any load is attempted, so the two
+/// failure categories stay distinct. An id outside that key space is an
+/// identity mismatch and answers 404 naming the id that is served. Every
+/// failure of a repository this daemon does serve is a fault and keeps its
+/// underlying error, whether or not that repository is the advertised one: a
+/// hosted daemon serves each allowlisted sibling, so an unreachable backend or
+/// a corrupt delta chain must not be relabelled as a repository this daemon
+/// does not have.
+///
+/// Deciding the category from the failure afterwards cannot work, because an
+/// identity compare answers "is this the advertised repository" while the
+/// question is "is this one we serve". Those diverge for every sibling a hosted
+/// daemon carries, and a load error holds no evidence either way.
+///
+/// A served repository splits once more, and this half the load itself decides:
+/// a backend that answers completely and holds nothing under the id is a
+/// missing repository (404), while a backend that fails to answer is a fault
+/// (500). The loader types that difference as
+/// [`DaemonError::RepoAbsentFromStorage`] so it survives the trip here. Reading
+/// it back out of a flattened storage error's wording would be the same
+/// infer-from-the-failure mistake the served key space exists to avoid.
+async fn repo_scoped_graph(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<Arc<kin_db::InMemoryGraph>, (StatusCode, String)> {
+    if !state.serves_repo_id(repo_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "this daemon serves repository {} and does not serve {repo_id}; \
+                 GET /health advertises the repo_id every /repos/{{repo_id}} route accepts",
+                state.cached_repo_id
+            ),
+        ));
+    }
+    state
+        .get_repo_graph(repo_id)
+        .await
+        .map_err(|error| repo_addressed_error(state, error))
+}
+
+/// Classify a repository-addressed [`DaemonError`] into an HTTP answer.
+///
+/// Every route that resolves a repository by id owes the caller the same three
+/// answers, so they are decided once here rather than re-decided per route. An
+/// id outside the served key space and a served id storage holds nothing for
+/// are both "not here" and answer 404 naming the served and the requested
+/// identity; everything else is a daemon that could not answer and keeps its
+/// underlying error behind a 500.
+///
+/// Sharing the classification is what keeps the surfaces consistent with each
+/// other. The spine ingest route used to flatten all three into a single 500,
+/// so a control plane posting to the wrong pod read an addressing refusal as an
+/// outage and retried something no retry could fix, while a `/repos/{repo_id}`
+/// route on that same daemon named the mismatch precisely.
+fn repo_addressed_error(
+    state: &DaemonState,
+    error: crate::error::DaemonError,
+) -> (StatusCode, String) {
+    match error {
+        // The refusal already carries both identities, so it is rendered from
+        // the error rather than rebuilt here: one sentence, one definition.
+        crate::error::DaemonError::RepoNotServed { .. } => {
+            (StatusCode::NOT_FOUND, error.to_string())
+        }
+        crate::error::DaemonError::RepoAbsentFromStorage(ref absent) => (
+            StatusCode::NOT_FOUND,
+            format!(
+                "this daemon serves repository {} and is configured for {absent}, \
+                 but storage holds no graph for {absent}; \
+                 GET /repos lists the repositories storage actually holds",
+                state.cached_repo_id
+            ),
+        ),
+        _ => internal_error(error),
+    }
+}
+
 async fn repository_authority_snapshot(
     state: &DaemonState,
     repo_id: &str,
@@ -6455,10 +7097,7 @@ async fn repository_authority_snapshot(
         return Ok(authority.manager.read_authority().snapshot().clone());
     }
 
-    let graph = state
-        .get_repo_graph(repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(state, repo_id).await?;
     let snapshot = graph.to_snapshot();
     let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
         (
@@ -7088,7 +7727,7 @@ async fn command_transfer_plan(
 async fn list_repos(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let repos = state.list_available_repos().map_err(|e| {
+    let repos = state.list_available_repos().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to list repos: {e}"),
@@ -7102,10 +7741,7 @@ async fn repo_health(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
     let entity_count = graph.entity_count();
     Ok(Json(RepoHealthResponse {
         repo_id,
@@ -7132,10 +7768,7 @@ async fn repo_entities(
     Query(params): Query<RepoEntitiesQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
 
     let filter = kin_model::EntityFilter {
         name_pattern: params.query.clone(),
@@ -7322,10 +7955,7 @@ async fn repo_provenance_entity(
     Path((repo_id, entity_id_str)): Path<(String, String)>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
     let entity_id = parse_entity_id_hex(&entity_id_str)?;
 
     let snapshot = graph.to_snapshot();
@@ -7429,10 +8059,7 @@ async fn repo_provenance_verify(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let graph = state
-        .get_repo_graph(&repo_id)
-        .await
-        .map_err(internal_error)?;
+    let graph = repo_scoped_graph(&state, &repo_id).await?;
     let snapshot = graph.to_snapshot();
 
     // Build a stored hash map from the current snapshot (this represents the
@@ -7484,14 +8111,29 @@ async fn repo_provenance_verify(
 // VFS endpoints — serve the committed file tree and blob content
 // ---------------------------------------------------------------------------
 
+/// Run one projection route's storage work off the async runtime.
+///
+/// Resolving authority reads storage metadata, and a publication change reads,
+/// hashes, and deserializes the whole durable snapshot under an exclusive
+/// repository lock. None of that belongs on a runtime worker.
+async fn projection_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, (StatusCode, String)> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| internal_error(format!("projection authority task failed: {error}")))
+}
+
 /// Load one complete repository-v6 workspace projection.
 ///
 /// The manager constructs the wire snapshot from one authority lease and
 /// verifies every blob/symlink body against repository-owned immutable CAS.
+///
+/// Blocking: callers run this through [`projection_blocking`].
 fn active_workspace_tree(
     state: &DaemonState,
 ) -> Result<(ActiveApiRepositoryAuthority, WorkspaceTreeSnapshot), (StatusCode, String)> {
-    let authority = ActiveApiRepositoryAuthority::open(state)?;
+    let authority = projection_repository_authority(state)?;
     let snapshot = authority.workspace_tree_snapshot()?;
     Ok((authority, snapshot))
 }
@@ -7500,7 +8142,7 @@ fn active_workspace_tree(
 async fn vfs_version(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     Ok(Json(json!({
         "version": snapshot.binding.roots.generation,
         "workspace_generation": snapshot.binding.workspace_generation,
@@ -7521,7 +8163,7 @@ fn validate_vfs_tree_path(path: &str) -> Result<(), String> {
 /// generation, exact tree entries (including executable/symlink/gitlink
 /// identity), sizes, and projection mtimes.
 async fn vfs_tree(State(state): State<Arc<DaemonState>>) -> Result<Response, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     let identity = snapshot.identity().map_err(repository_authority_error)?;
     let mut response = Json(snapshot).into_response();
     response.headers_mut().insert(
@@ -7536,7 +8178,7 @@ async fn vfs_stat(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     if !path.is_empty() && path != "." {
         validate_vfs_tree_path(&path).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
         let repo_path = RepoPath::from_utf8(path.clone())
@@ -7678,56 +8320,63 @@ async fn vfs_read(
 ) -> Result<Response, (StatusCode, HeaderMap, String)> {
     validate_vfs_tree_path(&path)
         .map_err(|message| vfs_read_error(StatusCode::BAD_REQUEST, message))?;
-    let (authority, snapshot) = active_workspace_tree(&state)
-        .map_err(|(status, message)| vfs_read_error(status, message))?;
-    let repo_path = RepoPath::from_utf8(path.clone())
-        .map_err(|error| vfs_read_error(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let artifact = snapshot
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.path == repo_path)
-        .ok_or_else(|| {
-            vfs_read_error(
-                StatusCode::NOT_FOUND,
-                format!("file not found in repository-v6 workspace tree: {path}"),
-            )
-        })?;
-    let digest = artifact.entry.blob_identity().ok_or_else(|| {
-        vfs_read_error(
-            StatusCode::FAILED_DEPENDENCY,
-            format!("gitlink {path} has no local source body"),
-        )
-    })?;
-    let blob_data = authority
-        .manager
-        .load_source_blob(digest)
-        .map_err(|error| {
+    let requested = path.clone();
+    let (digest, blob_data, total_size) = projection_blocking(move || {
+        let (authority, snapshot) = active_workspace_tree(&state)
+            .map_err(|(status, message)| vfs_read_error(status, message))?;
+        let path = requested;
+        let repo_path = RepoPath::from_utf8(path.clone())
+            .map_err(|error| vfs_read_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+        let artifact = snapshot
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == repo_path)
+            .ok_or_else(|| {
+                vfs_read_error(
+                    StatusCode::NOT_FOUND,
+                    format!("file not found in repository-v6 workspace tree: {path}"),
+                )
+            })?;
+        let digest = artifact.entry.blob_identity().ok_or_else(|| {
             vfs_read_error(
                 StatusCode::FAILED_DEPENDENCY,
-                format!("repository CAS read failed for {path} at {digest}: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            vfs_read_error(
-                StatusCode::FAILED_DEPENDENCY,
-                format!("repository CAS body missing for {path} at {digest}"),
+                format!("gitlink {path} has no local source body"),
             )
         })?;
-    let total_size = u64::try_from(blob_data.len()).map_err(|_| {
-        vfs_read_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("repository CAS blob size exceeds u64 for {path}"),
-        )
-    })?;
-    if total_size != artifact.size {
-        return Err(vfs_read_error(
-            StatusCode::FAILED_DEPENDENCY,
-            format!(
-                "repository-v6 workspace metadata says {path} has {} bytes but CAS returned {total_size}",
-                artifact.size
-            ),
-        ));
-    }
+        let blob_data = authority
+            .manager
+            .load_source_blob(digest)
+            .map_err(|error| {
+                vfs_read_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!("repository CAS read failed for {path} at {digest}: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                vfs_read_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    format!("repository CAS body missing for {path} at {digest}"),
+                )
+            })?;
+        let total_size = u64::try_from(blob_data.len()).map_err(|_| {
+            vfs_read_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("repository CAS blob size exceeds u64 for {path}"),
+            )
+        })?;
+        if total_size != artifact.size {
+            return Err(vfs_read_error(
+                StatusCode::FAILED_DEPENDENCY,
+                format!(
+                    "repository-v6 workspace metadata says {path} has {} bytes but CAS returned {total_size}",
+                    artifact.size
+                ),
+            ));
+        }
+        Ok((digest, blob_data, total_size))
+    })
+    .await
+    .map_err(|(status, message)| vfs_read_error(status, message))??;
 
     let byte_range = match parse_vfs_byte_range(&headers, total_size) {
         Ok(range) => range,
@@ -7784,12 +8433,106 @@ async fn vfs_read(
     Ok(response)
 }
 
+fn vfs_blob_error(
+    status: StatusCode,
+    error: &str,
+    hash: &str,
+    detail: Option<String>,
+) -> (StatusCode, String) {
+    let mut body = json!({
+        "error": error,
+        "hash": hash,
+        "authority": "repository_v6",
+    });
+    if let Some(detail) = detail {
+        body["detail"] = json!(detail);
+    }
+    (status, body.to_string())
+}
+
+/// GET /vfs/blob/{hash} — return exact repository-owned CAS bytes for one
+/// content address.
+///
+/// This is the read half of the `/vfs/tree` contract. The tree mints every
+/// advertised hash from repository-v6 immutable source CAS and reads each
+/// artifact size from that same store, so a served tree already proves each
+/// body is present. This route answers from that one authority: the manager
+/// re-verifies the digest of the bytes it returns, so the response is exactly
+/// the content named by the address.
+///
+/// The whole body is always returned. A client verifies it against the hash
+/// the tree advertised, which a partial response could not satisfy, so `Range`
+/// carries no meaning here and is ignored.
+///
+/// An address the repository authority does not own is reported as a named
+/// graph gap. It is never repaired from the working copy or a Git object
+/// database.
+async fn vfs_blob(
+    Path(hash): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<Response, (StatusCode, String)> {
+    let digest = kin_model::Hash256::from_hex(&hash).map_err(|error| {
+        vfs_blob_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_content_address",
+            &hash,
+            Some(error.to_string()),
+        )
+    })?;
+    let requested = hash.clone();
+    let blob_data = projection_blocking(move || {
+        let hash = requested;
+        let authority = projection_repository_authority(&state)?;
+        authority
+            .manager
+            .load_source_blob(digest)
+            .map_err(|error| {
+                vfs_blob_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "repository_cas_read_failed",
+                    &hash,
+                    Some(error.to_string()),
+                )
+            })?
+            .ok_or_else(|| {
+                vfs_blob_error(
+                    StatusCode::NOT_FOUND,
+                    "graph_blob_missing",
+                    &hash,
+                    Some(format!(
+                        "repository {} owns no immutable source body at this content address",
+                        authority.repository_id
+                    )),
+                )
+            })
+    })
+    .await??;
+
+    let mut response = blob_data.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-blob-hash"),
+        HeaderValue::from_str(&digest.to_string()).map_err(|error| {
+            vfs_blob_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_content_address_header",
+                &hash,
+                Some(error.to_string()),
+            )
+        })?,
+    );
+    Ok(response)
+}
+
 /// GET /vfs/readdir/*path — return directory listing derived from the file tree.
 async fn vfs_readdir(
     Path(path): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (_, snapshot) = active_workspace_tree(&state)?;
+    let (_, snapshot) = projection_blocking(move || active_workspace_tree(&state)).await??;
     let prefix = if path.is_empty() || path == "." {
         String::new()
     } else {
@@ -8156,7 +8899,7 @@ async fn spine_ingest_repo(
     let outcome = state
         .ingest_repo_into_spine(&repo_id, body.refresh_cross_repo_edges)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| repo_addressed_error(&state, error))?;
 
     Ok(Json(json!({
         "repoId": outcome.repo_id,
@@ -8367,6 +9110,21 @@ fn persist_coordination_reservation(
     persist_coordination_event(state, draft)
 }
 
+/// The repository identity `/health` advertises.
+///
+/// This is the repository authority id the daemon opened, which is also the
+/// key every `/repos/{repo_id}/…` route resolves through
+/// ([`repo_scoped_graph`], [`repository_authority_snapshot`],
+/// [`repository_transfer_authority`]). One key space *for the daemon API*, so a
+/// client may take `/health.repo_id` and address any repo-scoped route on this
+/// daemon with it. A hosted daemon additionally serves the allowlisted siblings
+/// `GET /repos` lists.
+///
+/// The supervisor is a different service on its own port and its
+/// `/repos/{repo_id}/route` endpoint is a distinct, path-derived key space
+/// (`local-<sha16>` of the working directory, see
+/// `kin_cli::daemon_client::supervisor_repo_id_for_working_dir`). Those ids are
+/// not interchangeable with this one in either direction.
 fn primary_repo_id(state: &DaemonState) -> String {
     state.cached_repo_id.clone()
 }
@@ -9963,6 +10721,7 @@ mod tests {
             end_byte: 14,
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
+            span_coherence: "digest_verified".to_string(),
         };
         let result = entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::Found(record)));
 
@@ -10005,6 +10764,7 @@ mod tests {
             end_byte: 14,
             signature: "fn target()".into(),
             body: "fn target() {}".into(),
+            span_coherence: "digest_verified".to_string(),
         };
         let resolved = vec![
             resolved_entity_source_from_outcome(
@@ -10189,10 +10949,8 @@ mod tests {
 
     #[cfg(unix)]
     fn run_test_git<const N: usize>(repository: &FsPath, args: [&str; N]) {
-        let output = std::process::Command::new("git")
+        let output = kin_git::test_support::fixture_git_in(repository)
             .args(args)
-            .current_dir(repository)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();
         assert!(
@@ -10357,13 +11115,10 @@ mod tests {
     #[cfg(unix)]
     fn test_state_with_verified_gitlink() -> Arc<DaemonState> {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
-        use std::process::Command;
 
         fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
-            let output = Command::new("git")
+            let output = kin_git::test_support::fixture_git_in(repository)
                 .args(args)
-                .current_dir(repository)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
             assert!(
@@ -12134,13 +12889,10 @@ mod tests {
     #[tokio::test]
     async fn command_checkout_projects_universal_selected_tree_and_replays_exactly() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
-        use std::process::Command;
 
         fn git<const N: usize>(repository: &FsPath, args: [&str; N]) {
-            let output = Command::new("git")
+            let output = kin_git::test_support::fixture_git_in(repository)
                 .args(args)
-                .current_dir(repository)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
             assert!(
@@ -13584,6 +14336,735 @@ mod tests {
         let legacy: HealthResponse = serde_json::from_value(legacy).unwrap();
         assert!(legacy.coordination.is_none());
         assert!(legacy.coordination_event_persist_failures.is_none());
+    }
+
+    async fn advertised_repo_id(state: Arc<DaemonState>) -> String {
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice::<HealthResponse>(&body)
+            .unwrap()
+            .repo_id
+    }
+
+    async fn repo_route(state: Arc<DaemonState>, path: &str) -> (StatusCode, Vec<u8>) {
+        let response = router(state)
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// Drive the real spine ingest route, body and all, exactly as the hosted
+    /// import orchestrator does. Going through `router` rather than calling the
+    /// state method keeps the status code under test the one a client actually
+    /// receives.
+    async fn spine_ingest(state: Arc<DaemonState>, repo_id: &str) -> (StatusCode, Vec<u8>) {
+        let response = router(state)
+            .oneshot(
+                Request::post(format!("/spine/repos/{repo_id}/ingest"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "repo": repo_id })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// The identity contract a client depends on: read `repo_id` off `/health`
+    /// and every `/repos/{repo_id}/…` route resolves it. Two key spaces here
+    /// meant a caller that trusted the advertised id got a storage-mode 500 on
+    /// every repo-scoped call against a perfectly healthy daemon.
+    #[tokio::test]
+    async fn health_repo_id_addresses_every_repo_scoped_route() {
+        let state = test_state();
+        let repo_id = advertised_repo_id(Arc::clone(&state)).await;
+        assert!(!repo_id.trim().is_empty(), "/health must advertise an id");
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "advertised repo id must route: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            health.repo_id, repo_id,
+            "the repo route must echo the advertised identity back"
+        );
+
+        for path in [
+            format!("/repos/{repo_id}/entities"),
+            format!("/repos/{repo_id}/refs"),
+            format!("/repos/{repo_id}/files"),
+            format!("/repos/{repo_id}/history"),
+            format!("/repos/{repo_id}/provenance/verify"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path} must accept the advertised repo id: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // /repos lists the same key space the advertised id belongs to.
+        let (status, body) = repo_route(Arc::clone(&state), "/repos").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: ReposResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            listed.repos.contains(&repo_id),
+            "the advertised id must appear in the repo listing: {:?}",
+            listed.repos
+        );
+    }
+
+    /// An id this daemon does not serve is an identity mismatch, not a broken
+    /// daemon: 404 naming the id that is served, rather than the lazy
+    /// multi-repo loader's "no storage backend configured" 500.
+    ///
+    /// The route list covers every surface the identity resolution reaches,
+    /// including the four that resolve through `repository_authority_snapshot`.
+    /// Those short-circuit on the advertised id, so driving them with an id the
+    /// daemon serves exercises none of this: only an unserved id reaches
+    /// `repo_scoped_graph` through them.
+    #[tokio::test]
+    async fn an_unserved_repo_id_is_an_identity_mismatch_rather_than_a_storage_failure() {
+        let state = test_state();
+        let served = advertised_repo_id(Arc::clone(&state)).await;
+        let unserved = format!("not-{served}");
+        // Parses as a canonical semantic change id, so the archive route
+        // reaches identity resolution instead of refusing on the id shape.
+        let well_formed_change = "a".repeat(64);
+
+        for path in [
+            format!("/repos/{unserved}/health"),
+            format!("/repos/{unserved}/entities"),
+            format!("/repos/{unserved}/provenance/verify"),
+            format!("/repos/{unserved}/files"),
+            format!("/repos/{unserved}/refs"),
+            format!("/repos/{unserved}/history"),
+            format!("/repos/{unserved}/archive/tar/{well_formed_change}"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            let message = String::from_utf8_lossy(&body);
+            assert!(
+                message.contains(&served) && message.contains(&unserved),
+                "the refusal must name both the served and requested ids: {message}"
+            );
+            assert!(
+                !message.contains("no storage backend configured"),
+                "an identity mismatch must not read as a storage-mode failure: {message}"
+            );
+        }
+    }
+
+    /// A `StorageBackend` that faults on demand for named repositories,
+    /// delegating everything else to a real local backend.
+    ///
+    /// The faults it raises are the ones a hosted backend actually raises for a
+    /// repository it is configured to serve: an unreachable object store,
+    /// expired credentials, a snapshot authority that disagrees with the
+    /// acknowledged head, or a corrupt delta chain. All of them arrive as an
+    /// `Err` out of the recovery read, which is the single path
+    /// `load_recovered_snapshot` takes, so fault injection is scoped to exactly
+    /// the three reads that path makes.
+    ///
+    /// Every other trait method forwards to the inner backend, including the
+    /// ones whose trait defaults would answer instead of delegating. That is
+    /// not tidiness: `supports_incremental_deltas` defaults to `false` and the
+    /// whole source-blob family defaults to "not supported by this backend",
+    /// so a partially-forwarding fixture silently downgrades the very
+    /// capabilities a hosted backend has. A test reusing it would then be
+    /// measuring the fixture's degraded shape and reporting it as hosted
+    /// behavior.
+    ///
+    /// The single method deliberately left on its trait default is
+    /// `compact_deltas`, which `LocalFileBackend` also leaves defaulted. That
+    /// default composes through this type's own reads, so compaction stays
+    /// fault-aware instead of routing around the switch.
+    struct RepoFaultBackend {
+        inner: kin_db::LocalFileBackend,
+        faulting: FaultSwitch,
+    }
+
+    /// Handle the test keeps after the backend is moved into the daemon, so a
+    /// fault can be armed once the daemon has already opened healthy.
+    #[derive(Clone)]
+    struct FaultSwitch(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+
+    impl FaultSwitch {
+        fn start_faulting(&self, repo_id: &str) {
+            self.0.lock().unwrap().insert(repo_id.to_string());
+        }
+
+        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.0.lock().unwrap().contains(repo_id).then(|| {
+                kin_db::KinDbError::StorageError(format!(
+                    "{BACKEND_FAULT_TEXT} while reading {repo_id}"
+                ))
+            })
+        }
+    }
+
+    impl RepoFaultBackend {
+        fn new(path: &std::path::Path) -> (Self, FaultSwitch) {
+            let faulting = FaultSwitch(Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )));
+            (
+                Self {
+                    inner: kin_db::LocalFileBackend::new(path),
+                    faulting: faulting.clone(),
+                },
+                faulting,
+            )
+        }
+
+        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.faulting.fault_for(repo_id)
+        }
+    }
+
+    const BACKEND_FAULT_TEXT: &str = "object store unreachable";
+
+    impl kin_db::StorageBackend for RepoFaultBackend {
+        fn supports_incremental_deltas(&self) -> bool {
+            self.inner.supports_incremental_deltas()
+        }
+
+        fn load_recovery_state(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+            match self.fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_recovery_state(repo_id),
+            }
+        }
+
+        fn load_snapshot_authority(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
+            match self.fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_snapshot_authority(repo_id),
+            }
+        }
+
+        fn load_snapshot(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
+        {
+            match self.fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_snapshot(repo_id),
+            }
+        }
+
+        fn save_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.save_source_blob(repo_id, digest, data)
+        }
+
+        fn load_source_blob(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner.load_source_blob(repo_id, digest)
+        }
+
+        fn load_source_blob_bounded(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+            max_bytes: u64,
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner
+                .load_source_blob_bounded(repo_id, digest, max_bytes)
+        }
+
+        fn with_verified_source_blob_batch(
+            &self,
+            repo_id: &str,
+            operation: &mut dyn FnMut(
+                &dyn kin_db::VerifiedSourceBlobBatch,
+            ) -> std::result::Result<(), kin_db::KinDbError>,
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner
+                .with_verified_source_blob_batch(repo_id, operation)
+        }
+
+        fn source_blob_len(
+            &self,
+            repo_id: &str,
+            digest: [u8; 32],
+        ) -> std::result::Result<Option<u64>, kin_db::KinDbError> {
+            self.inner.source_blob_len(repo_id, digest)
+        }
+
+        fn save_snapshot(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_snapshot_classified(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_cursor: kin_db::SnapshotCursor,
+        ) -> kin_db::SnapshotSaveOutcome {
+            self.inner
+                .save_snapshot_classified(repo_id, data, expected_cursor)
+        }
+
+        fn save_snapshot_validated(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected: kin_db::SnapshotCursor,
+            history_validator_version: Option<u32>,
+        ) -> kin_db::SnapshotSaveOutcome {
+            self.inner
+                .save_snapshot_validated(repo_id, data, expected, history_validator_version)
+        }
+
+        fn record_history_validation(
+            &self,
+            repo_id: &str,
+            generation: kin_db::Generation,
+            snapshot_sha256: &str,
+            validator_version: u32,
+        ) -> std::result::Result<bool, kin_db::KinDbError> {
+            self.inner.record_history_validation(
+                repo_id,
+                generation,
+                snapshot_sha256,
+                validator_version,
+            )
+        }
+
+        fn save_delta(
+            &self,
+            repo_id: &str,
+            delta_data: &[u8],
+            base_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_delta(repo_id, delta_data, base_gen)
+        }
+
+        fn load_deltas_since(
+            &self,
+            repo_id: &str,
+            since_gen: kin_db::Generation,
+        ) -> std::result::Result<Vec<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError> {
+            self.inner.load_deltas_since(repo_id, since_gen)
+        }
+
+        fn clear_deltas(&self, repo_id: &str) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.clear_deltas(repo_id)
+        }
+
+        fn save_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.save_overlay(repo_id, session_id, data)
+        }
+
+        fn load_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner.load_overlay(repo_id, session_id)
+        }
+
+        fn delete_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.delete_overlay(repo_id, session_id)
+        }
+
+        fn list_repos(&self) -> std::result::Result<Vec<String>, kin_db::KinDbError> {
+            self.inner.list_repos()
+        }
+    }
+
+    /// The shipped hosted shape: one advertised repo, several allowlisted
+    /// siblings, none of them pre-warmed into the repo graph map, over a
+    /// backend that can be made to fault per repository.
+    fn hosted_state_with_allowlist(
+        label: &str,
+        advertised: &str,
+        siblings: &[&str],
+    ) -> (Arc<DaemonState>, FaultSwitch) {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-{label}-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let allowed: std::collections::HashSet<String> = std::iter::once(advertised)
+            .chain(siblings.iter().copied())
+            .map(ToOwned::to_owned)
+            .collect();
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
+                .unwrap(),
+        );
+        (state, faults)
+    }
+
+    /// The fault fixture must be indistinguishable from the backend it wraps
+    /// except when a fault is armed. A trait default answering in place of a
+    /// forward is not a smaller lie than a wrong value: it reports "this
+    /// backend cannot do that" about a backend that can, so a test reusing the
+    /// fixture measures a degraded shape and reports it as hosted behavior.
+    #[test]
+    fn the_fault_fixture_forwards_the_capabilities_of_the_backend_it_wraps() {
+        use kin_db::StorageBackend;
+
+        let dir =
+            std::env::temp_dir().join(format!("kin-daemon-fault-fidelity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = kin_db::LocalFileBackend::new(&dir);
+        let (fixture, _faults) = RepoFaultBackend::new(&dir);
+
+        assert!(
+            real.supports_incremental_deltas(),
+            "the wrapped backend is expected to have a delta write path"
+        );
+        assert_eq!(
+            fixture.supports_incremental_deltas(),
+            real.supports_incremental_deltas(),
+            "a fixture that under-reports delta support sends writes down the wrong path"
+        );
+
+        let repo_id = "fidelity-repo";
+        let body: &[u8] = b"fn main() {}";
+        let digest: [u8; 32] = Sha256::digest(body).into();
+        fixture
+            .save_source_blob(repo_id, digest, body)
+            .expect("the fixture must forward immutable source-blob writes");
+        assert_eq!(
+            real.load_source_blob(repo_id, digest).unwrap().as_deref(),
+            Some(body),
+            "the forwarded write must land in the wrapped backend"
+        );
+        assert_eq!(
+            fixture
+                .load_source_blob(repo_id, digest)
+                .unwrap()
+                .as_deref(),
+            Some(body)
+        );
+        assert_eq!(
+            fixture
+                .load_source_blob_bounded(repo_id, digest, kin_db::MAX_SOURCE_BLOB_BYTES)
+                .unwrap()
+                .as_deref(),
+            Some(body)
+        );
+        assert_eq!(
+            fixture.source_blob_len(repo_id, digest).unwrap(),
+            Some(body.len() as u64)
+        );
+
+        let mut batched: Option<Vec<u8>> = None;
+        fixture
+            .with_verified_source_blob_batch(repo_id, &mut |batch| {
+                batched = batch
+                    .load_verified(kin_db::SourceBlobValidationRequest {
+                        digest,
+                        max_bytes: kin_db::MAX_SOURCE_BLOB_BYTES,
+                    })?
+                    .map(|verified| verified.into_bytes());
+                Ok(())
+            })
+            .expect("the fixture must forward verified batch reads");
+        assert_eq!(batched.as_deref(), Some(body));
+    }
+
+    /// A hosted daemon serves every allowlisted repository, not only the one it
+    /// advertises. So a backend fault on an allowlisted sibling is a fault, and
+    /// answering 404 there would report a GCS outage or a corrupt delta chain as
+    /// a repository this daemon does not have: false on its face, contradicted
+    /// by `GET /repos` on the same daemon, and invisible to every retry loop and
+    /// 5xx alert that exists to catch exactly that.
+    ///
+    /// This is the case an identity compare cannot decide, and the reason
+    /// addressing is resolved from the served key space before the load rather
+    /// than inferred from the failure afterwards.
+    #[tokio::test]
+    async fn a_backend_fault_on_a_served_sibling_stays_a_fault_rather_than_a_404() {
+        let advertised = "primary-repo";
+        let sibling = "sibling-repo";
+        let (state, faults) = hosted_state_with_allowlist("repo-fault", advertised, &[sibling]);
+        assert_eq!(
+            advertised_repo_id(Arc::clone(&state)).await,
+            advertised,
+            "the fixture must advertise the primary id"
+        );
+        assert!(
+            state.serves_repo_id(sibling),
+            "the allowlist is the served key space, so the sibling is served"
+        );
+
+        faults.start_faulting(sibling);
+
+        for path in [
+            format!("/repos/{sibling}/health"),
+            format!("/repos/{sibling}/entities"),
+            format!("/repos/{sibling}/provenance/verify"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a backend fault on a served repository must stay a fault at {path}: {message}"
+            );
+            assert!(
+                message.contains(BACKEND_FAULT_TEXT),
+                "the fault must carry the backend error rather than discard it: {message}"
+            );
+            assert!(
+                !message.contains("does not serve"),
+                "a served repository must never be reported as unserved: {message}"
+            );
+        }
+
+        // The same daemon still refuses an id outside the served key space, and
+        // still refuses it as an identity mismatch.
+        let unserved = "absent-repo";
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{unserved}/entities")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an id outside the allowlist is an identity mismatch: {message}"
+        );
+        assert!(
+            message.contains(advertised) && message.contains(unserved),
+            "the refusal must name both the served and requested ids: {message}"
+        );
+    }
+
+    /// An allowlisted repository with nothing stored under it is a repository
+    /// that is not there, not a daemon that is broken. The backend read
+    /// succeeded and reported neither snapshot authority nor deltas, which is a
+    /// complete answer. Reporting it as a fault told every client, retry loop,
+    /// and 5xx alert that this daemon had failed, when no amount of retrying
+    /// makes an absent repository appear.
+    ///
+    /// It is equally not an identity mismatch: the id IS in this daemon's
+    /// served key space, so the refusal must not claim otherwise.
+    #[tokio::test]
+    async fn an_allowlisted_repo_absent_from_storage_is_missing_rather_than_a_fault() {
+        let advertised = "primary-repo";
+        let absent = "never-stored-repo";
+        let (state, faults) = hosted_state_with_allowlist("repo-absent", advertised, &[absent]);
+        assert_eq!(
+            advertised_repo_id(Arc::clone(&state)).await,
+            advertised,
+            "the fixture must advertise the primary id"
+        );
+        assert!(
+            state.serves_repo_id(absent),
+            "the allowlist is the served key space, so the absent id is served"
+        );
+
+        for path in [
+            format!("/repos/{absent}/health"),
+            format!("/repos/{absent}/entities"),
+            format!("/repos/{absent}/provenance/verify"),
+        ] {
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            let message = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "a served repository absent from storage must be missing at {path}: {message}"
+            );
+            assert!(
+                message.contains(advertised) && message.contains(absent),
+                "the refusal must name both the served and requested ids: {message}"
+            );
+            assert!(
+                !message.contains("does not serve"),
+                "an allowlisted repository must not be reported as unserved: {message}"
+            );
+        }
+
+        // The advertised repository still answers on the same daemon, so the
+        // 404s above are about that repository rather than a daemon-wide state.
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{advertised}/entities")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the advertised repo must stay routable: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Absence is decided by what the load reported, not by the id: the very
+        // same id over a backend that cannot answer is still a fault.
+        faults.start_faulting(absent);
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{absent}/entities")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a backend that cannot answer is still a fault: {message}"
+        );
+        assert!(
+            message.contains(BACKEND_FAULT_TEXT),
+            "the fault must carry the backend error rather than discard it: {message}"
+        );
+    }
+
+    /// The spine ingest route resolves a repository by id just as the
+    /// `/repos/{repo_id}` routes do, so it owes a caller the same three
+    /// answers. It gave one: every outcome, a mis-addressed request included,
+    /// arrived as a 500.
+    ///
+    /// This is the shape the control plane actually meets. The import
+    /// orchestrator POSTs one ingest per cataloged repo, so a pod whose
+    /// `KIN_REPO_IDS` omits one of them answered "this daemon failed" to a
+    /// question about which pod owns that repository. The orchestrator then
+    /// retried, and no number of retries moves a repository into a key space
+    /// that excludes it, while the 5xx alerting fired on a daemon that was
+    /// working exactly as configured.
+    #[tokio::test]
+    async fn spine_ingest_refuses_an_unserved_repo_id_rather_than_reporting_a_fault() {
+        let advertised = "primary-repo";
+        let sibling = "sibling-repo";
+        let unserved = "unconfigured-repo";
+        let (state, _faults) =
+            hosted_state_with_allowlist("ingest-unserved", advertised, &[sibling]);
+        assert!(
+            !state.serves_repo_id(unserved),
+            "the fixture must exclude the id under test from the served key space"
+        );
+
+        let (status, body) = spine_ingest(Arc::clone(&state), unserved).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an id outside the served key space is a mis-addressed request, \
+             not a daemon that failed: {message}"
+        );
+        assert!(
+            message.contains(advertised) && message.contains(unserved),
+            "the refusal must name the served and the requested id so the caller \
+             can tell a typo from the wrong pod: {message}"
+        );
+
+        // An allowlisted sibling storage has never held is the other 404, and
+        // the two must stay tellable apart in the body. Both are "not here",
+        // but one says this pod does not own the repository and the other says
+        // this pod owns it and has not ingested it, and those route to
+        // different fixes: re-address the request, or run the ingest.
+        assert!(
+            message.contains("does not serve"),
+            "the unserved refusal must say so plainly: {message}"
+        );
+        let (sibling_status, sibling_body) = spine_ingest(Arc::clone(&state), sibling).await;
+        let sibling_message = String::from_utf8_lossy(&sibling_body);
+        assert_eq!(
+            sibling_status,
+            StatusCode::NOT_FOUND,
+            "a served sibling absent from storage is also missing: {sibling_message}"
+        );
+        assert!(
+            !sibling_message.contains("does not serve"),
+            "a served sibling must not inherit the unserved refusal: {sibling_message}"
+        );
+    }
+
+    /// Absence and fault stay distinguishable on the ingest route too. A
+    /// repository the allowlist admits but storage has never held is missing,
+    /// and a backend that cannot answer for that same id is still a fault: the
+    /// answer is decided by what the load reported, never by the id.
+    #[tokio::test]
+    async fn spine_ingest_reports_a_served_repo_absent_from_storage_as_missing() {
+        let advertised = "primary-repo";
+        let absent = "never-stored-repo";
+        let (state, faults) = hosted_state_with_allowlist("ingest-absent", advertised, &[absent]);
+        assert!(
+            state.serves_repo_id(absent),
+            "the allowlist is the served key space, so the absent id is served"
+        );
+
+        let (status, body) = spine_ingest(Arc::clone(&state), absent).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a served repository storage does not hold is missing, not a fault: {message}"
+        );
+        assert!(
+            !message.contains("does not serve"),
+            "an allowlisted repository must not be reported as unserved: {message}"
+        );
+
+        faults.start_faulting(absent);
+        let (status, body) = spine_ingest(Arc::clone(&state), absent).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a backend that cannot answer is still a fault: {message}"
+        );
+        assert!(
+            message.contains(BACKEND_FAULT_TEXT),
+            "the fault must carry the backend error rather than discard it: {message}"
+        );
     }
 
     #[tokio::test]
@@ -15031,17 +16512,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_status_endpoint_uses_repository_authority() {
+    async fn command_status_and_graph_status_pin_distinct_durable_and_live_views() {
         install_test_registry_override();
         let dir = std::env::temp_dir().join(format!("kin-daemon-status-state-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let initialized = kin_core::init(&dir).unwrap();
         let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
         state
+            .graph
+            .upsert_entity(&test_entity("live_derived_only", "src/derived.rs"))
+            .unwrap();
+        state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/commands/status")
                     .header("content-type", "application/json")
@@ -15069,8 +16555,195 @@ mod tests {
         );
         assert_eq!(result.report.repository.generation, 1);
         assert_eq!(result.report.workspace.artifact_count, 0);
+        assert_eq!(
+            result.report.semantic_enrichment.view,
+            kin_cli::commands::status::SemanticEnrichmentView::DurableRepositoryAuthority
+        );
+        assert_eq!(result.report.semantic_enrichment.authority_generation, 1);
+        assert_eq!(
+            result.report.semantic_enrichment.entity_count, 0,
+            "live-only daemon enrichment must not be restated as durable authority"
+        );
         assert!(result.report.repository.source_cas_verified);
         assert!(result.text.contains("Kin repository-v6 status"));
+        assert!(result.text.contains("Live graph enrichment"));
+
+        let graph_response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/graph")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "command": "status" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(graph_response.status(), StatusCode::OK);
+        let graph_body = axum::body::to_bytes(graph_response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let graph_result: kin_cli::commands::graph::GraphCommandResponse =
+            serde_json::from_slice(&graph_body).unwrap();
+        assert!(
+            graph_result
+                .lines
+                .iter()
+                .any(|line| line.contains("Entities: 1")),
+            "graph status must report the daemon's mutable live view: {:?}",
+            graph_result.lines
+        );
+
+        let mcp_result = mcp_call(app, "kin_graph_status", serde_json::json!({})).await;
+        assert_ne!(
+            mcp_result.is_error,
+            Some(true),
+            "live MCP graph status failed: {mcp_result:?}"
+        );
+        let mcp_status: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&mcp_result)).unwrap();
+        assert_eq!(
+            mcp_status.entity_count, 1,
+            "MCP graph status must not reuse the durable zero count"
+        );
+        assert_eq!(
+            mcp_status.view,
+            kin_mcp::handlers::entities::GraphStatusView::DaemonSelectedGraph
+        );
+        assert_eq!(
+            mcp_status.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::Head
+        );
+        assert_eq!(
+            mcp_status.embedding_source,
+            kin_mcp::handlers::entities::GraphStatusEmbeddingSource::SelectedGraph
+        );
+        assert_eq!(
+            mcp_status.authority,
+            kin_mcp::handlers::entities::GraphStatusAuthority::RepoDaemon
+        );
+        assert_eq!(
+            mcp_status.sampling,
+            kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph
+        );
+        assert!(!mcp_status.completion_attested);
+        assert!(mcp_status.response_envelope.is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_labels_the_graph_selected_by_temporal_scope() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("head_only", "src/head.rs"))
+            .unwrap();
+
+        let scoped_graph = Arc::new(kin_db::InMemoryGraph::new());
+        scoped_graph
+            .upsert_entity(&test_entity("historical_one", "src/old_one.rs"))
+            .unwrap();
+        scoped_graph
+            .upsert_entity(&test_entity("historical_two", "src/old_two.rs"))
+            .unwrap();
+        let scoped_entity_count = scoped_graph.entity_count();
+        let scoped_relation_count = scoped_graph.relation_count();
+        let scoped_embeddings = scoped_graph.embedding_status();
+        let session_id = SessionId::new();
+        state
+            .set_session_scope(
+                &session_id,
+                "git:historical".to_string(),
+                SemanticChangeId::from_hash(Hash256::from_bytes([0x7a; 32])),
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = mcp_call_as(
+            router(Arc::clone(&state)),
+            "kin_graph_status",
+            serde_json::json!({}),
+            session_id,
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let report: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(
+            report.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::TemporalSession
+        );
+        assert_eq!(report.entity_count, scoped_entity_count);
+        assert_eq!(report.relation_count, scoped_relation_count);
+        assert_eq!(report.embeddings_indexed, scoped_embeddings.indexed);
+        assert_eq!(report.embeddings_pending, scoped_embeddings.pending);
+        assert_eq!(report.embeddings_total, scoped_embeddings.total);
+
+        // Scope comes from the graph resolver, not merely from the presence of
+        // a header. An unknown session therefore reports the actual HEAD view.
+        let unscoped = mcp_call_as(
+            router(state),
+            "kin_graph_status",
+            serde_json::json!({}),
+            SessionId::new(),
+        )
+        .await;
+        let unscoped_report: kin_mcp::handlers::entities::GraphStatusReport =
+            serde_json::from_str(&mcp_result_text(&unscoped)).unwrap();
+        assert_eq!(
+            unscoped_report.scope,
+            kin_mcp::handlers::entities::GraphStatusScope::Head
+        );
+        assert_eq!(unscoped_report.entity_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_fails_loud_while_embedding_coverage_is_changing() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let _embedding_guard = state.embedding_work.lock().unwrap();
+
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            mcp_result_text(&result).contains("embedding coverage is changing"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_graph_status_fails_loud_during_graph_authority_mutation() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        let _mutation_guard = state.begin_graph_authority_mutation();
+
+        let result = mcp_graph_status_with_stable_authority(
+            &state,
+            None,
+            &graph,
+            RequestGraphAuthority::Head,
+            kin_mcp::handlers::entities::GraphStatusScope::Head,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            mcp_result_text(&result).contains("changed during status sampling"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -17138,6 +18811,9 @@ mod tests {
     #[tokio::test]
     async fn health_includes_version_string() {
         let state = test_state();
+        let expected_workspace_id = state
+            .local_repository_workspace_id()
+            .map(|workspace_id| workspace_id.to_string());
         let app = router(state);
         let response = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
@@ -17154,6 +18830,10 @@ mod tests {
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert!(!json.version.is_empty());
         assert_eq!(json.reconciliation_status, "idle");
+        assert_eq!(
+            json.workspace_id, expected_workspace_id,
+            "health must name the exact local workspace authority"
+        );
     }
 
     #[tokio::test]
@@ -17168,6 +18848,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Readiness must survive a blocking warm-up ─────────────────────────
+    //
+    // Sibling spine warm-up is a synchronous join that can run for minutes, and
+    // it is reached from async request handlers. Run inline it parks a runtime
+    // worker, and a daemon whose workers are all parked answers nothing — which
+    // is how a live, warming daemon came to look dead to a client and had its
+    // endpoint files clobbered.
+    //
+    // The runtime here has exactly one worker, so a warm-up that fails to release
+    // it starves everything. The assertion is made from the test thread (which is
+    // NOT on that runtime) with a hard wall-clock cap, so the old behavior fails
+    // this test in bounded time instead of hanging.
+    #[test]
+    fn readiness_is_answered_while_a_blocking_warm_up_holds_the_runtime() {
+        use std::sync::mpsc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker runtime");
+
+        let state = runtime.block_on(async { test_state() });
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (warm_started_tx, warm_started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let hook_release_rx = Arc::clone(&release_rx);
+        state.set_spine_initialization_test_hook(Some(Arc::new(move || {
+            let _ = warm_started_tx.send(());
+            // Bounded so a failing assertion still lets the runtime shut down.
+            let _ = hook_release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(120));
+        })));
+
+        let (warm_finished_tx, warm_finished_rx) = mpsc::channel::<bool>();
+        let warm_state = Arc::clone(&state);
+        runtime.spawn(async move {
+            let _ = warm_finished_tx.send(warm_state.ensure_spine().is_some());
+        });
+        warm_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the real ensure_spine warm-up must start");
+
+        let (answered_tx, answered_rx) = mpsc::channel::<(StatusCode, bool)>();
+        let probe_state = Arc::clone(&state);
+        runtime.spawn(async move {
+            let response = router(probe_state)
+                .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+                .await
+                .expect("readiness request");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("readiness body");
+            let readiness: ReadinessResponse =
+                serde_json::from_slice(&body).expect("readiness JSON");
+            let _ = answered_tx.send((status, readiness.warming));
+        });
+
+        // Generous enough that whole-workspace CPU contention cannot trip it,
+        // while still bounded: a warm-up that parks the worker never answers at
+        // any cap, so this fails rather than hangs.
+        let answer = answered_rx.recv_timeout(Duration::from_secs(60));
+        let _ = release_tx.send(());
+        let warmed = warm_finished_rx.recv_timeout(Duration::from_secs(60));
+
+        let (status, warming) = answer.expect(
+            "readiness must be answered while a sibling warm-up blocks; a warm-up that \
+             holds the runtime worker makes a live daemon indistinguishable from a dead one",
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            warming,
+            "readiness must identify the actual ensure_spine pass as warming"
+        );
+        assert!(
+            warmed.expect("spine initialization must finish after release"),
+            "spine initialization must publish after release"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_the_warming_state_it_is_in() {
+        // Readiness is about this daemon's own repo, so it stays 200 during a
+        // cross-repo warm-up. `warming` is how a client learns the daemon is
+        // busy rather than idle — the signal that makes waiting the correct
+        // response instead of respawning.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let readiness: ReadinessResponse = serde_json::from_slice(&body).unwrap();
+        assert!(readiness.ready);
+        assert!(
+            !readiness.warming,
+            "an idle daemon must not claim to be warming"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -17337,6 +19131,103 @@ mod tests {
             .unwrap();
         let end_json: SessionEndResponse = serde_json::from_slice(&end_body).unwrap();
         assert_eq!(end_json.status, "ended");
+    }
+
+    /// Session start and heartbeat must both expose the next idle-reaping
+    /// eligibility boundary, and a call on a dead session must say it expired
+    /// and name the restart.
+    ///
+    /// An agent cannot decide to heartbeat before a deadline it cannot see, and
+    /// a bare "not found" reads like a bad argument rather than an expiry, so a
+    /// thinking pause silently stranded the whole session.
+    #[tokio::test]
+    async fn session_responses_carry_their_expiry_and_a_dead_session_says_so() {
+        let state = test_state();
+        let idle_ttl = state.coordinator.session_idle_ttl();
+        let app = router(state);
+
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "vendor": "claude-code",
+                            "client_name": "expiry-test",
+                            "transport": "mcp",
+                            "cwd": "/project"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let start_body = axum::body::to_bytes(start_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let start_json: SessionStartResponse = serde_json::from_slice(&start_body).unwrap();
+        assert_eq!(start_json.idle_timeout_secs, idle_ttl.as_secs());
+        assert!(
+            start_json.idle_reap_eligible_at.0 > start_json.started_at.0,
+            "the idle-reaping boundary must be ahead of the session it belongs to: {:?} vs {:?}",
+            start_json.idle_reap_eligible_at,
+            start_json.started_at
+        );
+
+        let heartbeat_response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/session/{}/heartbeat", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat_response.status(), StatusCode::OK);
+        let heartbeat_body = axum::body::to_bytes(heartbeat_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let heartbeat_json: SessionHeartbeatResponse =
+            serde_json::from_slice(&heartbeat_body).unwrap();
+        assert_eq!(heartbeat_json.idle_timeout_secs, idle_ttl.as_secs());
+        assert!(
+            heartbeat_json.idle_reap_eligible_at.0 >= start_json.idle_reap_eligible_at.0,
+            "a heartbeat must not move the idle-reaping boundary backwards"
+        );
+
+        // End the session, then heartbeat it: the shape an agent hits after the
+        // sweeper reaps an idle session.
+        let end_response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/session/{}", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end_response.status(), StatusCode::OK);
+
+        let dead_response = app
+            .oneshot(
+                Request::post(format!("/session/{}/heartbeat", start_json.session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dead_response.status(), StatusCode::NOT_FOUND);
+        let dead_body = axum::body::to_bytes(dead_response.into_body(), 4096)
+            .await
+            .unwrap();
+        let message = String::from_utf8(dead_body.to_vec()).unwrap();
+        assert!(
+            message.contains("expired") && message.contains("kin_session_start"),
+            "an expired session must be named as expired and name its recovery: {message}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -17687,6 +19578,213 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Every content address `/vfs/tree` advertises must be readable from the
+    /// same daemon. The tree cannot be built at all unless each body is
+    /// present in repository-owned immutable CAS, so an unreadable advertised
+    /// hash is a broken projection contract, not a missing body.
+    #[tokio::test]
+    async fn vfs_blob_serves_every_content_address_the_tree_advertises() {
+        const BODY: &[u8] = b"content addressed projection body\n";
+        let initial = test_state();
+        let layout = initial.layout.clone();
+        install_repository_file(&initial, "src/probe.rs", BODY);
+        drop(initial);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let snapshot: WorkspaceTreeSnapshot = serde_json::from_slice(&body).unwrap();
+        let artifact = snapshot
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.as_utf8() == Some("src/probe.rs"))
+            .expect("the committed artifact must appear in the workspace tree");
+        let advertised = artifact
+            .entry
+            .blob_identity()
+            .expect("a blob entry carries a content address");
+        assert_eq!(artifact.size, BODY.len() as u64);
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/vfs/blob/{advertised}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "/vfs/tree advertised {advertised} so /vfs/blob must serve it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-kin-blob-hash")
+                .and_then(|value| value.to_str().ok()),
+            Some(advertised.to_string().as_str())
+        );
+        let served = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(served.as_ref(), BODY);
+    }
+
+    #[tokio::test]
+    async fn vfs_blob_names_the_graph_gap_for_an_unowned_content_address() {
+        let state = test_state();
+        let app = router(state);
+        let unowned = "5a".repeat(32);
+        let response = app
+            .oneshot(
+                Request::get(format!("/vfs/blob/{unowned}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .expect("an absent content address reports a typed graph gap");
+        assert_eq!(json["error"], "graph_blob_missing");
+        assert_eq!(json["hash"], unowned);
+        assert_eq!(json["authority"], "repository_v6");
+    }
+
+    /// Repository paths the projection currently advertises.
+    async fn advertised_workspace_paths(app: Router) -> Vec<String> {
+        let response = app
+            .oneshot(Request::get("/vfs/tree").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let snapshot: WorkspaceTreeSnapshot = serde_json::from_slice(&body).unwrap();
+        snapshot
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.path.as_utf8().map(str::to_string))
+            .collect()
+    }
+
+    /// Opening repository authority reads, hashes, and deserializes the entire
+    /// durable snapshot under an exclusive repository lock. Paying that per
+    /// projected read makes every read cost whole-repository work, so reads
+    /// arriving at one publication have to share a single load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_projected_reads_share_one_authority_load() {
+        const BODY: &[u8] = b"one authority serves many projected reads\n";
+        let state = test_state();
+        install_repository_file(&state, "src/shared.rs", BODY);
+        let digest = Hash256::from_bytes(state.blobs.write(BODY).unwrap().0);
+        let url = format!("/vfs/blob/{digest}");
+        let loads_before = state.projection_authority.loads();
+
+        let app = router(Arc::clone(&state));
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let app = app.clone();
+                let url = url.clone();
+                tokio::spawn(async move {
+                    app.oneshot(Request::get(url).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .status()
+                })
+            })
+            .collect();
+        for read in reads {
+            assert_eq!(read.await.unwrap(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            state.projection_authority.loads() - loads_before,
+            1,
+            "eight projected reads at one publication must load repository authority once"
+        );
+    }
+
+    /// A held authority may never outlive the publication it was loaded from.
+    ///
+    /// The commit here goes through the ordinary repository write path, which
+    /// opens its own authority exactly as a CLI ingest or commit running beside
+    /// the daemon does. The next projected read has to serve what that commit
+    /// published, not the publication the previous read loaded.
+    #[tokio::test]
+    async fn projected_reads_serve_a_publication_committed_while_serving() {
+        const FIRST: &[u8] = b"first published body\n";
+        const SECOND: &[u8] = b"second published body\n";
+        let state = test_state();
+        install_repository_file(&state, "src/first.rs", FIRST);
+        let app = router(Arc::clone(&state));
+
+        let advertised = advertised_workspace_paths(app.clone()).await;
+        assert!(advertised.contains(&"src/first.rs".to_string()));
+        assert!(!advertised.contains(&"src/second.rs".to_string()));
+        assert!(
+            state.projection_authority.loads() > 0,
+            "the first projected read must have loaded repository authority"
+        );
+
+        install_repository_file(&state, "src/second.rs", SECOND);
+
+        let advertised = advertised_workspace_paths(app.clone()).await;
+        assert!(
+            advertised.contains(&"src/second.rs".to_string()),
+            "a projected read must serve the publication that replaced the one it last loaded, got {advertised:?}"
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/vfs/read/src/second.rs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), SECOND);
+    }
+
+    #[tokio::test]
+    async fn vfs_blob_rejects_a_content_address_that_is_not_a_sha256() {
+        let state = test_state();
+        let app = router(state);
+        for malformed in ["not-a-hash", "5a", &"5a".repeat(33)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/vfs/blob/{malformed}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{malformed:?} is not a content address"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -20439,6 +22537,7 @@ mod tests {
                             reference: None,
                             snippets: false,
                             snippet_lines: None,
+                            entity_surface: false,
                             cursor: None,
                             page_size: None,
                         })
@@ -20538,6 +22637,229 @@ mod tests {
         assert!(hit["kind"].as_str().is_some());
     }
 
+    /// The fused arm must fill `snippet`, the field the schema names, and must
+    /// keep its entity ranking when snippets are declined.
+    ///
+    /// The two arms disagreed on the field: the cosine arm wrote `snippet`, the
+    /// fused arm wrote only `body`. An agent that asked for a snippet and read
+    /// `snippet` therefore found no snippet key at all under the fused profile,
+    /// which closed the one in-profile path to source text it had.
+    ///
+    /// Scope of this test: the FUSED arm. The cosine arm's `snippet` emission is
+    /// unchanged and cannot be exercised here, because the cosine ranking needs a
+    /// populated vector index and this fixture has none (see
+    /// `mcp_semantic_locate_reports_coverage_without_hard_gate`, which asserts the
+    /// no-index behavior). Field-name agreement between the arms therefore rests
+    /// on the cosine arm's existing emission plus this assertion on the fused one.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_serves_snippets_and_keeps_hits_when_declined() {
+        let state = test_state();
+        let source = "def parse_config(path):\n    return {\"path\": path}\n";
+        install_repository_file(&state, "src/config.py", source.as_bytes());
+        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+
+        // An entity whose span actually covers its body, so a snippet is
+        // projectable from graph-owned bytes.
+        let mut entity = test_entity("parse_config", "src/config.py");
+        entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new("src/config.py"),
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 24,
+        });
+        // Parse time sets this preview from the node's source bytes, and the fused
+        // ranker reads it to decide an entity is a definition rather than a bare
+        // reference. Only definitions get bodies, so a fixture without it would be
+        // testing the reference path.
+        entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!(source.lines().next().unwrap()),
+        );
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let fused = call_semantic_locate(
+            app.clone(),
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": true
+            }),
+        )
+        .await;
+        let hits = fused["entities"].as_array().unwrap();
+        assert!(!hits.is_empty(), "expected a fused hit: {fused}");
+        let snippet = hits[0]["snippet"]
+            .as_str()
+            .unwrap_or_else(|| panic!("fused hit must carry a `snippet` key: {}", hits[0]));
+        assert!(
+            snippet.contains("return {\"path\": path}"),
+            "the snippet must be the entity's graph-owned source: {snippet}"
+        );
+        // `body` stays for the locate-schema parity consumers already parse.
+        assert_eq!(hits[0]["body"].as_str(), Some(snippet));
+
+        // Suppression is honored, not ignored: no snippet key when opted out.
+        let suppressed = call_semantic_locate(
+            app,
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": false
+            }),
+        )
+        .await;
+        let suppressed_hits = suppressed["entities"].as_array().unwrap();
+        assert!(!suppressed_hits.is_empty());
+        assert!(
+            suppressed_hits[0].get("snippet").is_none(),
+            "include_snippet:false must suppress the snippet: {}",
+            suppressed_hits[0]
+        );
+    }
+
+    /// A legacy locate must not be able to empty an agent's live cursor.
+    ///
+    /// `POST /locate` maps `{snippets, entity_surface}` onto THREE projections, and
+    /// the first version of the paging fix keyed and filtered the ranking cache on
+    /// `bodies` alone, which separates only two of them. `bodies` is false both for
+    /// the agent surface that wants a full ranking without source and for the
+    /// legacy path that projects no `entities[]` at all, so they collided on one
+    /// cache slot: a plain `kin locate` overwrote the agent's cached ranking with an
+    /// empty one, and the agent's own cursor then passed the filter and was served
+    /// `entities: []` from cache, with no fall-through re-run precisely because the
+    /// filter passed rather than rejected.
+    ///
+    /// Either outcome is acceptable on the last leg; a silent empty page is not.
+    #[tokio::test]
+    async fn locate_paging_survives_a_legacy_request_on_the_same_query() {
+        let state = test_state();
+        // TWO ranked definitions, so `page_size: 1` leaves a live cursor to page.
+        // With one hit the first page is also the last and no cursor is issued,
+        // which would make the test vacuous rather than failing.
+        let first = "def parse_config(path):\n    return {\"path\": path}\n";
+        let second =
+            "\ndef parse_config_list(paths):\n    return [parse_config(p) for p in paths]\n";
+        let source = format!("{first}{second}");
+        install_repository_file(&state, "src/config.py", source.as_bytes());
+        install_working_copy_file(&state, "src/config.py", source.as_bytes(), false);
+
+        for (name, start_byte, end_byte, preview) in [
+            ("parse_config", 0, first.len(), "def parse_config(path):"),
+            (
+                "parse_config_list",
+                first.len(),
+                source.len(),
+                "def parse_config_list(paths):",
+            ),
+        ] {
+            let mut entity = test_entity(name, "src/config.py");
+            entity.span = Some(SourceSpan {
+                file: kin_model::FilePathId::new("src/config.py"),
+                start_byte,
+                end_byte,
+                start_line: 0,
+                start_col: 0,
+                end_line: 1,
+                end_col: 24,
+            });
+            // The fused ranker reads this to call an entity a definition rather
+            // than a bare reference, and only definitions are ranked.
+            entity
+                .metadata
+                .extra
+                .insert("embedding_body_preview".to_string(), json!(preview));
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        // A `LocateRequest` in one of the three projections. `page_size: 1` keeps a
+        // cursor live across the interleaving below.
+        let post_locate = |app: Router, snippets: bool, entity_surface: bool, cursor| async move {
+            let response = app
+                .oneshot(
+                    Request::post("/locate")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                                text: "parse config".to_string(),
+                                queries: Vec::new(),
+                                explain: false,
+                                max_files: 10,
+                                max_files_explicit: true,
+                                reference: None,
+                                snippets,
+                                snippet_lines: None,
+                                entity_surface,
+                                cursor,
+                                page_size: Some(1),
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<kin_cli::commands::locate::LocateResult>(&body).unwrap()
+        };
+
+        // 1. The agent surface, bodies declined: a real ranking plus a cursor.
+        let page0 = post_locate(app.clone(), false, true, None).await;
+        assert!(
+            !page0.entities.is_empty(),
+            "the agent JSON surface must return the ranking even with bodies declined"
+        );
+        let Some(cursor) = page0.next_cursor.clone() else {
+            panic!(
+                "fixture must issue a cursor: {} entities, total_ranked {}",
+                page0.entities.len(),
+                page0.total_ranked
+            );
+        };
+
+        // 2. A legacy/human locate for the SAME query at the SAME graph version.
+        //    It projects no entities, and must not publish that emptiness anywhere
+        //    the agent's cursor can reach.
+        let legacy = post_locate(app.clone(), false, false, None).await;
+        assert!(
+            legacy.entities.is_empty(),
+            "the legacy projection is coordinates-only by design, got {} entities",
+            legacy.entities.len()
+        );
+
+        // 3. Page the ORIGINAL cursor. Either the correct next page from cache, or
+        //    an honest miss that re-ran and restarted at page 0 with a real ranking.
+        //    Never an empty page.
+        let page1 = post_locate(app, false, true, Some(cursor)).await;
+        assert!(
+            !page1.entities.is_empty(),
+            "a legacy request must not empty an agent's cursor: got {} entities, total_ranked {}, page {}",
+            page1.entities.len(),
+            page1.total_ranked,
+            page1.page
+        );
+        assert!(
+            page1.total_ranked > 0,
+            "an emptied cached ranking reports total_ranked 0, got {}",
+            page1.total_ranked
+        );
+    }
+
     // The legacy cosine ranking stays reachable per-call, independent of the
     // daemon's profile — the A/B lever for benchmarks and the compat escape.
     #[tokio::test]
@@ -20629,6 +22951,7 @@ mod tests {
                             reference: None,
                             snippets: true,
                             snippet_lines: None,
+                            entity_surface: true,
                             cursor: None,
                             page_size: None,
                         })

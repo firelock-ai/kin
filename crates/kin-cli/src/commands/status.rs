@@ -7,6 +7,11 @@
 //! contents, legacy branch sidecars, Git, or a separately opened graph
 //! snapshot. Opening the authority also revalidates every referenced source
 //! body in the repository-owned CAS.
+//!
+//! Semantic counts are resolved from the workspace's durable first-parent
+//! history and cumulative semantic overlay inside that lease. They deliberately
+//! do not describe the daemon's mutable live graph: runtime reconcile and LSP
+//! work may advance that derived view without changing repository authority.
 
 use std::path::PathBuf;
 
@@ -14,11 +19,53 @@ use anyhow::{Context, Result};
 use kin_model::{
     Hash256, RefName, RefTarget, RepositoryId, RootBundle, WorkspaceHead, WorkspaceId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::repository_authority::ActiveRepositoryAuthority;
 
-pub const STATUS_SCHEMA: &str = "kin.status.v1";
+/// First status contract whose enrichment counts name their durable view and
+/// exact authority/workspace generations. The earlier, unreleased v1 shape
+/// carried counts with different semantics and cannot be inferred truthfully.
+pub const STATUS_SCHEMA: &str = "kin.status.v2";
+
+fn deserialize_status_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != STATUS_SCHEMA {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported status schema '{schema}', expected '{STATUS_SCHEMA}'"
+        )));
+    }
+    Ok(schema)
+}
+
+fn deserialize_status_authority<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let authority = String::deserialize(deserializer)?;
+    if authority != "repository-v6" {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported status authority '{authority}', expected 'repository-v6'"
+        )));
+    }
+    Ok(authority)
+}
+
+fn deserialize_status_unattested<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let completion_attested = bool::deserialize(deserializer)?;
+    if completion_attested {
+        return Err(serde::de::Error::custom(
+            "kin.status.v2 does not carry a semantic-enrichment completion attestation",
+        ));
+    }
+    Ok(false)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -28,7 +75,18 @@ pub enum SemanticEnrichmentPresence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticEnrichmentView {
+    DurableRepositoryAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SemanticEnrichmentStatus {
+    /// This is durable repository/workspace authority, not the daemon's live
+    /// query graph. `kin graph status` reports the latter.
+    pub view: SemanticEnrichmentView,
+    pub authority_generation: u64,
+    pub workspace_generation: u64,
     pub presence: SemanticEnrichmentPresence,
     pub entity_count: usize,
     pub relation_count: usize,
@@ -36,6 +94,102 @@ pub struct SemanticEnrichmentStatus {
     /// There is no repository-v6 completion attestation yet. Counts are exact;
     /// completeness is deliberately not inferred from them.
     pub completion_attested: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticEnrichmentStatusWire {
+    view: SemanticEnrichmentView,
+    authority_generation: u64,
+    workspace_generation: u64,
+    presence: SemanticEnrichmentPresence,
+    entity_count: usize,
+    relation_count: usize,
+    semantic_change_count: usize,
+    #[serde(deserialize_with = "deserialize_status_unattested")]
+    completion_attested: bool,
+}
+
+impl<'de> Deserialize<'de> for SemanticEnrichmentStatus {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SemanticEnrichmentStatusWire::deserialize(deserializer)?;
+        let enrichment = Self {
+            view: wire.view,
+            authority_generation: wire.authority_generation,
+            workspace_generation: wire.workspace_generation,
+            presence: wire.presence,
+            entity_count: wire.entity_count,
+            relation_count: wire.relation_count,
+            semantic_change_count: wire.semantic_change_count,
+            completion_attested: wire.completion_attested,
+        };
+        enrichment.validate().map_err(serde::de::Error::custom)?;
+        Ok(enrichment)
+    }
+}
+
+impl SemanticEnrichmentStatus {
+    pub(crate) fn from_durable_summary(
+        summary: &kin_core::DurableSemanticEnrichmentSummary,
+    ) -> Self {
+        Self {
+            view: SemanticEnrichmentView::DurableRepositoryAuthority,
+            authority_generation: summary.authority_generation,
+            workspace_generation: summary.workspace_generation,
+            presence: if summary.entity_count == 0 && summary.relation_count == 0 {
+                SemanticEnrichmentPresence::Absent
+            } else {
+                SemanticEnrichmentPresence::Present
+            },
+            entity_count: summary.entity_count,
+            relation_count: summary.relation_count,
+            semantic_change_count: summary.semantic_change_count,
+            completion_attested: false,
+        }
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        let has_graph_semantics = self.entity_count > 0 || self.relation_count > 0;
+        match (&self.presence, has_graph_semantics) {
+            (SemanticEnrichmentPresence::Absent, true) => Err(
+                "semantic_enrichment.presence is absent despite nonzero entity/relation counts"
+                    .to_string(),
+            ),
+            (SemanticEnrichmentPresence::Present, false) => Err(
+                "semantic_enrichment.presence is present despite zero entity/relation counts"
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Read the durable enrichment this exact authority lease carries.
+///
+/// The authority snapshot's own entity and relation tables are not this
+/// answer. Exact admission binds entity and relation deltas onto the changes it
+/// admits, and the entities a workspace resolves to come from replaying those
+/// deltas to its base change and applying its semantic overlay.
+/// A surface that counted the raw tables instead would report zero enrichment
+/// on a fully enriched repository.
+///
+/// This accessor intentionally does not materialize the complete workspace
+/// graph. Kin core replays only semantic identities and never reconstructs the
+/// exact tree, reads source CAS bodies, or builds query indices. The result is
+/// generation-bound durable truth. The daemon's live graph is a distinct view
+/// and may carry additional derived enrichment.
+pub fn semantic_enrichment_from_authority(
+    authority: &kin_db::RepositoryAuthorityState,
+    workspace_id: &WorkspaceId,
+) -> Result<SemanticEnrichmentStatus> {
+    let summary = kin_core::durable_semantic_enrichment_summary(authority, workspace_id)
+        .with_context(|| {
+            format!("summarize durable repository-v6 semantics for workspace {workspace_id}")
+        })?;
+    Ok(SemanticEnrichmentStatus::from_durable_summary(&summary))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,7 +219,7 @@ pub struct WorkspaceStatus {
     pub artifact_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StatusReport {
     pub schema: String,
     pub authority: String,
@@ -73,6 +227,68 @@ pub struct StatusReport {
     pub repository: RepositoryStatus,
     pub workspace: WorkspaceStatus,
     pub semantic_enrichment: SemanticEnrichmentStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusReportWire {
+    #[serde(deserialize_with = "deserialize_status_schema")]
+    schema: String,
+    #[serde(deserialize_with = "deserialize_status_authority")]
+    authority: String,
+    repo_root: PathBuf,
+    repository: RepositoryStatus,
+    workspace: WorkspaceStatus,
+    semantic_enrichment: SemanticEnrichmentStatus,
+}
+
+impl<'de> Deserialize<'de> for StatusReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StatusReportWire::deserialize(deserializer)?;
+        let report = Self {
+            schema: wire.schema,
+            authority: wire.authority,
+            repo_root: wire.repo_root,
+            repository: wire.repository,
+            workspace: wire.workspace,
+            semantic_enrichment: wire.semantic_enrichment,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
+}
+
+impl StatusReport {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.repository.generation != self.repository.roots.generation {
+            return Err(format!(
+                "repository.generation ({}) does not match repository.roots.generation ({})",
+                self.repository.generation, self.repository.roots.generation
+            ));
+        }
+        self.repository
+            .roots
+            .validate()
+            .map_err(|error| format!("repository.roots is invalid: {error}"))?;
+        if self.semantic_enrichment.authority_generation != self.repository.generation {
+            return Err(format!(
+                "semantic_enrichment.authority_generation ({}) does not match \
+                 repository.generation ({})",
+                self.semantic_enrichment.authority_generation, self.repository.generation
+            ));
+        }
+        if self.semantic_enrichment.workspace_generation != self.workspace.generation {
+            return Err(format!(
+                "semantic_enrichment.workspace_generation ({}) does not match \
+                 workspace.generation ({})",
+                self.semantic_enrichment.workspace_generation, self.workspace.generation
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +352,6 @@ pub fn inspect(
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
-    let snapshot = lease.snapshot();
     let workspace = metadata
         .workspaces
         .iter()
@@ -148,28 +363,13 @@ pub fn inspect(
                 authority.workspace_id
             )
         })?;
-    workspace
-        .validate()
-        .context("active repository-v6 workspace is invalid")?;
     let roots = lease.roots().clone();
     if roots.generation != metadata.roots.generation {
         anyhow::bail!("repository-v6 lease exposed inconsistent root generations");
     }
 
-    let entity_count = snapshot.entities.len();
-    let relation_count = snapshot.relations.len();
     let artifact_count = workspace.tree.artifacts().len();
-    let semantic_enrichment = SemanticEnrichmentStatus {
-        presence: if entity_count == 0 && relation_count == 0 {
-            SemanticEnrichmentPresence::Absent
-        } else {
-            SemanticEnrichmentPresence::Present
-        },
-        entity_count,
-        relation_count,
-        semantic_change_count: snapshot.changes.len(),
-        completion_attested: false,
-    };
+    let semantic_enrichment = semantic_enrichment_from_authority(&lease, &authority.workspace_id)?;
 
     Ok(StatusReport {
         schema: STATUS_SCHEMA.to_string(),
@@ -266,11 +466,14 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
                 .unwrap_or_default()
         ),
         format!(
-            "Semantic enrichment: {enrichment} ({} entities, {} relations, {} changes; completion not attested)",
+            "Durable semantic enrichment: {enrichment} ({} entities, {} relations, {} changes at authority generation {}, workspace generation {}; completion not attested)",
             report.semantic_enrichment.entity_count,
             report.semantic_enrichment.relation_count,
-            report.semantic_enrichment.semantic_change_count
+            report.semantic_enrichment.semantic_change_count,
+            report.semantic_enrichment.authority_generation,
+            report.semantic_enrichment.workspace_generation
         ),
+        "Live graph enrichment: see `kin graph status`".to_string(),
         "Source CAS: verified".to_string(),
     ];
     if let Some(build) = build {
@@ -311,6 +514,119 @@ fn build_id(sha: &str, dirty: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreleased_v1_enrichment_is_not_silently_reinterpreted_as_v2() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding).unwrap();
+        let mut legacy = serde_json::to_value(report).unwrap();
+        legacy["schema"] = serde_json::Value::String("kin.status.v1".to_string());
+
+        let error = serde_json::from_value::<StatusReport>(legacy)
+            .expect_err("a complete late-v1 daemon response must be rejected by schema");
+
+        assert_eq!(STATUS_SCHEMA, "kin.status.v2");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported status schema 'kin.status.v1'"),
+            "v1 must fail explicitly even when every v2 payload field is present: {error}"
+        );
+    }
+
+    #[test]
+    fn v2_enrichment_round_trip_preserves_view_and_generations() {
+        let enrichment = SemanticEnrichmentStatus {
+            view: SemanticEnrichmentView::DurableRepositoryAuthority,
+            authority_generation: 9,
+            workspace_generation: 3,
+            presence: SemanticEnrichmentPresence::Present,
+            entity_count: 7,
+            relation_count: 4,
+            semantic_change_count: 2,
+            completion_attested: false,
+        };
+
+        let encoded = serde_json::to_value(&enrichment).unwrap();
+        assert_eq!(encoded["view"], "durable_repository_authority");
+        assert_eq!(encoded["authority_generation"], 9);
+        assert_eq!(encoded["workspace_generation"], 3);
+        assert_eq!(
+            serde_json::from_value::<SemanticEnrichmentStatus>(encoded).unwrap(),
+            enrichment
+        );
+    }
+
+    #[test]
+    fn v2_rejects_false_authority_completion_and_generation_claims() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let valid = serde_json::to_value(inspect(&init.layout, &binding).unwrap()).unwrap();
+
+        let mut wrong_authority = valid.clone();
+        wrong_authority["authority"] = serde_json::json!("live-daemon-graph");
+        let mut false_completion = valid.clone();
+        false_completion["semantic_enrichment"]["completion_attested"] = serde_json::json!(true);
+        let mut wrong_authority_generation = valid.clone();
+        wrong_authority_generation["semantic_enrichment"]["authority_generation"] =
+            serde_json::json!(99);
+        let mut wrong_workspace_generation = valid.clone();
+        wrong_workspace_generation["semantic_enrichment"]["workspace_generation"] =
+            serde_json::json!(99);
+        let mut wrong_root_generation = valid.clone();
+        wrong_root_generation["repository"]["roots"]["generation"] = serde_json::json!(99);
+        let mut wrong_root_version = valid.clone();
+        wrong_root_version["repository"]["roots"]["version"] = serde_json::json!(99);
+        let mut contradictory_presence = valid.clone();
+        contradictory_presence["semantic_enrichment"]["presence"] = serde_json::json!("present");
+        contradictory_presence["semantic_enrichment"]["entity_count"] = serde_json::json!(0);
+        contradictory_presence["semantic_enrichment"]["relation_count"] = serde_json::json!(0);
+        let mut unknown_report_field = valid.clone();
+        unknown_report_field["unversioned_extension"] = serde_json::json!(true);
+        let mut unknown_enrichment_field = valid;
+        unknown_enrichment_field["semantic_enrichment"]["unversioned_extension"] =
+            serde_json::json!(true);
+
+        for (payload, expected) in [
+            (wrong_authority, "unsupported status authority"),
+            (
+                false_completion,
+                "does not carry a semantic-enrichment completion attestation",
+            ),
+            (
+                wrong_authority_generation,
+                "does not match repository.generation",
+            ),
+            (
+                wrong_workspace_generation,
+                "does not match workspace.generation",
+            ),
+            (
+                wrong_root_generation,
+                "does not match repository.roots.generation",
+            ),
+            (wrong_root_version, "repository.roots is invalid"),
+            (
+                contradictory_presence,
+                "presence is present despite zero entity/relation counts",
+            ),
+            (
+                unknown_report_field,
+                "unknown field `unversioned_extension`",
+            ),
+            (
+                unknown_enrichment_field,
+                "unknown field `unversioned_extension`",
+            ),
+        ] {
+            let error = serde_json::from_value::<StatusReport>(payload)
+                .expect_err("a contradictory v2 status claim must fail deserialization");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
 
     #[test]
     fn non_utf8_symbolic_head_is_rendered_without_loss() {

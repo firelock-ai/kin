@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 mod common;
@@ -61,8 +62,11 @@ fn add_feature_branch(repo: &Path) {
     run_git(repo, &["switch", "main"]);
 }
 
-fn initialize_kin_repo(repo: &Path, home: &Path) -> kin_core::KinLayout {
-    let init = run_kin(repo, home, &["init", ".", "--json"]);
+fn initialize_kin_repo(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+) -> kin_core::KinLayout {
+    let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     assert!(
         init.status.success(),
         "stdout={} stderr={}",
@@ -214,13 +218,16 @@ fn add_host_unrepresentable_branch(repo: &Path) -> (Vec<u8>, Vec<u8>) {
     (raw_path, body)
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn run_kin(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()
         .expect("run kin")
@@ -319,14 +326,13 @@ fn exact_ref_create_transaction(
 #[test]
 fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     add_exact_refs(&layout);
 
-    let before = run_kin(&repo, &home, &["branch", "list", "--json"]);
+    let before = run_kin(&runtime, &repo, &["branch", "list", "--json"]);
     assert!(
         before.status.success(),
         "stdout={} stderr={}",
@@ -361,7 +367,7 @@ fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
         "tag refs are not branches"
     );
 
-    let human = run_kin(&repo, &home, &["branch", "list"]);
+    let human = run_kin(&runtime, &repo, &["branch", "list"]);
     assert!(human.status.success());
     assert!(String::from_utf8_lossy(&human.stdout).contains("refs/heads/raw-\\xff"));
 
@@ -370,7 +376,7 @@ fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
     fs::create_dir_all(repo.join(".git/refs/heads")).expect("create misleading Git refs");
     fs::write(repo.join(".git/refs/heads/fake"), b"not an oid\n").expect("write fake Git ref");
 
-    let after = run_kin(&repo, &home, &["branch", "list", "--json"]);
+    let after = run_kin(&runtime, &repo, &["branch", "list", "--json"]);
     assert!(
         after.status.success(),
         "stdout={} stderr={}",
@@ -388,13 +394,12 @@ fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
 #[test]
 fn branch_create_and_delete_commit_exact_ref_cas() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
 
-    let create = run_kin(&repo, &home, &["branch", "create", "feature"]);
+    let create = run_kin(&runtime, &repo, &["branch", "create", "feature"]);
     assert!(
         create.status.success(),
         "stdout={} stderr={}",
@@ -435,7 +440,7 @@ fn branch_create_and_delete_commit_exact_ref_cas() {
     let generation_after_create = lease.roots().generation;
     drop(lease);
 
-    let duplicate = run_kin(&repo, &home, &["branch", "create", "feature"]);
+    let duplicate = run_kin(&runtime, &repo, &["branch", "create", "feature"]);
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
     assert_eq!(
@@ -444,7 +449,7 @@ fn branch_create_and_delete_commit_exact_ref_cas() {
         "failed create advanced authority"
     );
 
-    let delete = run_kin(&repo, &home, &["branch", "delete", "feature"]);
+    let delete = run_kin(&runtime, &repo, &["branch", "delete", "feature"]);
     assert!(
         delete.status.success(),
         "stdout={} stderr={}",
@@ -478,14 +483,76 @@ fn branch_create_and_delete_commit_exact_ref_cas() {
     );
 }
 
+/// How long a served daemon is watched for self-retirement.
+///
+/// Long enough to cover a short idle window plus the daemon's own idle check
+/// interval, so a runtime that reintroduces one is caught rather than merely
+/// made less likely to bite.
+const SERVED_DAEMON_OBSERVATION: Duration = Duration::from_secs(3);
+const SERVED_DAEMON_POLL: Duration = Duration::from_millis(50);
+
+#[test]
+fn a_daemon_that_served_a_branch_command_keeps_answering_its_recorded_endpoint() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    let command = runtime.kin_command();
+    for key in [
+        common::IDLE_SHUTDOWN_DISABLED_ENV,
+        common::SUPERVISOR_IDLE_SHUTDOWN_DISABLED_ENV,
+    ] {
+        let configured = command
+            .configured_env_for_test(std::ffi::OsStr::new(key))
+            .unwrap_or_else(|| panic!("{key} is not configured by the isolated runtime"));
+        assert!(
+            common::disables_idle_shutdown(configured.as_deref()),
+            "{key}={configured:?} leaves an idle clock running. Daemon lifetime in this runtime \
+             is bounded by its teardown proof, and an idle window instead retires daemons that a \
+             command has already proven healthy."
+        );
+    }
+    drop(command);
+
+    let create = run_kin(&runtime, &repo, &["branch", "create", "retained"]);
+    assert!(
+        create.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let started = Instant::now();
+    let mut proofs = 0_u32;
+    while started.elapsed() < SERVED_DAEMON_OBSERVATION {
+        match common::probe_recorded_daemon_endpoint(layout.root()) {
+            common::RecordedDaemonEndpoint::Listening { .. } => proofs += 1,
+            observed => panic!(
+                "the daemon that served this repository stopped answering its recorded \
+                 endpoint {:.2}s after a command used it, leaving {observed:?}. A command \
+                 that reads this record, proves the endpoint healthy, and then dispatches \
+                 against it fails with a refused connection, and the test harness bounds \
+                 daemon lifetime by its teardown proof rather than by an idle clock.",
+                started.elapsed().as_secs_f64()
+            ),
+        }
+        std::thread::sleep(SERVED_DAEMON_POLL);
+    }
+    assert!(
+        proofs > 0,
+        "observation window never probed the recorded daemon endpoint"
+    );
+}
+
 #[test]
 fn stale_branch_transaction_cannot_overwrite_new_repository_roots() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, manager) = open_authority(&layout);
     let lease = manager.read_authority();
     let roots = lease.roots().clone();
@@ -539,15 +606,14 @@ fn stale_branch_transaction_cannot_overwrite_new_repository_roots() {
 #[test]
 fn branch_delete_rejects_default_and_checked_out_ref_without_mutation() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (_, manager) = open_authority(&layout);
     let before = manager.read_authority().roots().clone();
 
-    let delete = run_kin(&repo, &home, &["branch", "delete", "main"]);
+    let delete = run_kin(&runtime, &repo, &["branch", "delete", "main"]);
     assert!(!delete.status.success());
     assert!(String::from_utf8_lossy(&delete.stderr).contains("default branch"));
     assert_eq!(
@@ -560,11 +626,10 @@ fn branch_delete_rejects_default_and_checked_out_ref_without_mutation() {
 #[test]
 fn branch_mutations_accept_canonical_hex_for_non_utf8_refs() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let raw = RefName::from_bytes([
         b'r', b'e', b'f', b's', b'/', b'h', b'e', b'a', b'd', b's', b'/', b'r', b'a', b'w', b'-',
         0xff,
@@ -572,7 +637,11 @@ fn branch_mutations_accept_canonical_hex_for_non_utf8_refs() {
     .unwrap();
     let encoded = hex::encode(raw.as_bytes());
 
-    let create = run_kin(&repo, &home, &["branch", "create", "--ref-hex", &encoded]);
+    let create = run_kin(
+        &runtime,
+        &repo,
+        &["branch", "create", "--ref-hex", &encoded],
+    );
     assert!(
         create.status.success(),
         "stdout={} stderr={}",
@@ -589,27 +658,34 @@ fn branch_mutations_accept_canonical_hex_for_non_utf8_refs() {
         .any(|repository_ref| repository_ref.name == raw));
 
     let uppercase = encoded.to_uppercase();
-    let rejected = run_kin(&repo, &home, &["branch", "delete", "--ref-hex", &uppercase]);
+    let rejected = run_kin(
+        &runtime,
+        &repo,
+        &["branch", "delete", "--ref-hex", &uppercase],
+    );
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("canonical lowercase"));
 
-    let delete = run_kin(&repo, &home, &["branch", "delete", "--ref-hex", &encoded]);
+    let delete = run_kin(
+        &runtime,
+        &repo,
+        &["branch", "delete", "--ref-hex", &encoded],
+    );
     assert!(delete.status.success());
 }
 
 #[test]
 fn branch_create_uses_detached_workspace_target_without_git_fallback() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     run_git(&repo, &["checkout", "--detach"]);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 
-    let create = run_kin(&repo, &home, &["branch", "create", "detached-copy"]);
+    let create = run_kin(&runtime, &repo, &["branch", "create", "detached-copy"]);
     assert!(
         create.status.success(),
         "stdout={} stderr={}",
@@ -637,7 +713,7 @@ fn branch_create_uses_detached_workspace_target_without_git_fallback() {
     assert_eq!(Some(copied.target.clone()), workspace.base_target.clone());
     drop(lease);
 
-    let switched = run_kin(&repo, &home, &["branch", "switch", "main"]);
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "main"]);
     assert!(
         switched.status.success(),
         "stdout={} stderr={}",
@@ -670,12 +746,11 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     add_feature_branch(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, manager) = open_authority(&layout);
     let lease = manager.read_authority();
     let roots = lease.roots().clone();
@@ -707,8 +782,8 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
         .expect("hide admitted Git metadata");
 
     let switched = run_kin(
+        &runtime,
         &repo,
-        &home,
         &[
             "branch",
             "switch",
@@ -788,17 +863,16 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
 #[test]
 fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     add_feature_branch(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (_, manager) = open_authority(&layout);
     let before = manager.read_authority().roots().clone();
     fs::write(repo.join("unchanged.txt"), b"local uncommitted edit\n").expect("write local edit");
 
-    let switched = run_kin(&repo, &home, &["branch", "switch", "feature"]);
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
     assert!(!switched.status.success());
     assert!(
         String::from_utf8_lossy(&switched.stderr).contains("differs from prior workspace source")
@@ -818,17 +892,16 @@ fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
 #[test]
 fn branch_switch_rejects_admitted_graph_owned_workspace_changes() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     add_feature_branch(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, manager) = open_authority(&layout);
     admit_uncommitted_workspace_edit(&repository_id, &manager, b"unchanged.txt", b"admitted\n");
     let before = manager.read_authority().roots().clone();
 
-    let switched = run_kin(&repo, &home, &["branch", "switch", "feature"]);
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
     assert!(!switched.status.success());
     let stderr = String::from_utf8_lossy(&switched.stderr);
     assert!(
@@ -931,18 +1004,17 @@ fn admit_uncommitted_workspace_edit(
 #[test]
 fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkout() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
     let dependency = repo.join("vendor/dependency");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     let (first_target, second_target) = add_gitlink_branch_history(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, _) = open_authority(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 
-    let add_absent = run_kin(&repo, &home, &["branch", "switch", "gitlink-a"]);
+    let add_absent = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-a"]);
     assert!(
         add_absent.status.success(),
         "stdout={} stderr={}",
@@ -959,7 +1031,7 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
     fs::write(dependency.join("nested/owned.txt"), b"independent before\n")
         .expect("write independent checkout content");
 
-    let retarget = run_kin(&repo, &home, &["branch", "switch", "gitlink-b"]);
+    let retarget = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-b"]);
     assert!(
         retarget.status.success(),
         "stdout={} stderr={}",
@@ -976,7 +1048,7 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
         .expect("mutate independently owned descendants");
     fs::write(dependency.join("untracked.bin"), [0_u8, 0xff, 0x44])
         .expect("add independent opaque content");
-    let remove = run_kin(&repo, &home, &["branch", "switch", "gitlink-removed"]);
+    let remove = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-removed"]);
     assert!(
         remove.status.success(),
         "stdout={} stderr={}",
@@ -993,7 +1065,7 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
     );
     assert_workspace_has_no_path(&open_authority(&layout).1, b"vendor/dependency");
 
-    let add_retained = run_kin(&repo, &home, &["branch", "switch", "gitlink-a"]);
+    let add_retained = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-a"]);
     assert!(
         add_retained.status.success(),
         "stdout={} stderr={}",
@@ -1022,17 +1094,16 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
 #[test]
 fn branch_switch_retains_host_unrepresentable_byte_path_in_graph_authority() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     initialize_git_repo(&repo);
     let (raw_path, body) = add_host_unrepresentable_branch(&repo);
-    let layout = initialize_kin_repo(&repo, &home);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, _) = open_authority(&layout);
     fs::rename(repo.join(".git"), repo.join("git-authority-disabled"))
         .expect("hide admitted Git metadata");
 
-    let switched = run_kin(&repo, &home, &["branch", "switch", "raw-path"]);
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "raw-path"]);
     assert!(
         switched.status.success(),
         "stdout={} stderr={}",
@@ -1045,7 +1116,7 @@ fn branch_switch_retains_host_unrepresentable_byte_path_in_graph_authority() {
     );
     assert_workspace_blob(&open_authority(&layout).1, &raw_path, &body);
 
-    let removed = run_kin(&repo, &home, &["branch", "switch", "main"]);
+    let removed = run_kin(&runtime, &repo, &["branch", "switch", "main"]);
     assert!(
         removed.status.success(),
         "stdout={} stderr={}",
@@ -1054,7 +1125,7 @@ fn branch_switch_retains_host_unrepresentable_byte_path_in_graph_authority() {
     );
     assert_workspace_has_no_path(&open_authority(&layout).1, &raw_path);
 
-    let restored = run_kin(&repo, &home, &["branch", "switch", "raw-path"]);
+    let restored = run_kin(&runtime, &repo, &["branch", "switch", "raw-path"]);
     assert!(
         restored.status.success(),
         "stdout={} stderr={}",

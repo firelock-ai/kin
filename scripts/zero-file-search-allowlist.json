@@ -1,54 +1,6 @@
 {
   "allowlist": [
     {
-      "file": "crates/kin-cli/src/commands/checkout.rs",
-      "reason": "IO Boundary: materializes file state during checkout and reads files for status/reconcile bounds",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/commit.rs",
-      "reason": "IO Boundary: reads local workspace files to build gitignore, hashes, and commit metadata",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/init.rs",
-      "reason": "IO Ingestion: imports files from disk to build the initial semantic graph",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/reconcile.rs",
-      "reason": "IO Boundary: writes/projects graph modifications back to filesystem",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/session_workspace.rs",
-      "reason": "IO Boundary: syncs workspace by reading and writing files",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/secret.rs",
-      "reason": "IO Boundary: reads authentication/tokens from stdin or config file",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/commands/locate_debug.rs",
-      "reason": "Debug Command: reads benchmark/test inputs from disk",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
-      "file": "crates/kin-cli/src/backend.rs",
-      "reason": "Direct Snapshot direct-reads (offline bootstrap fallback)",
-      "owner": "kin-cli",
-      "expiration": "2026-12-31"
-    },
-    {
       "file": "crates/kin-cli/src/capability.rs",
       "reason": "Hardware check: reads /proc/meminfo for system stats",
       "owner": "kin-cli",
@@ -67,10 +19,8 @@
         "if sibling.exists()",
         "if target_sibling.exists()",
         "if candidate.exists()",
-        "std::process::Command::new(&daemon_bin)",
         "cmd.stdout(std::process::Stdio::null());",
-        "cmd.stderr(std::process::Stdio::null());",
-        "use std::os::unix::process::CommandExt;"
+        "cmd.stderr(std::process::Stdio::null());"
       ]
     },
     {
@@ -166,6 +116,351 @@
       "expiration": "2026-12-31",
       "allow_match": [
         "use std::process::ExitCode;"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/daemon_client/probe_process.rs",
+      "reason": "Daemon process-boundary module end to end: bounded compatibility probes and their process-tree containment, capture, cancellation, and cleanup. It reaches and validates the daemon that owns graph authority and never derives a semantic query answer from filesystem or subprocess output. The file is dedicated to this boundary, so a whole-file exemption is reviewable; any future answer logic belongs elsewhere and requires removing or narrowing this exemption.",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
+    },
+    {
+      "file": "crates/kin-daemon-spawn/src/lib.rs",
+      "reason": "Daemon process lifecycle boundary (spawn plan, process-group guardian, readiness handshake, port record, disposition, registrar) with zero answer-authority surface. Every primitive here reaches or supervises the daemon that holds graph authority, never answers in its place, and no query result derives from any of them. This was a whole-file exemption, which left 4041 lines unscanned and let any newly added filesystem read ride in unexamined; the crate's single module made that the entire crate. It is now pinned by primitive, so every line is scanned and only these expressions are masked. Five classes. (1) Type paths: the first three pins are the std, tokio, and unix-extension `process::` module paths, which appear in struct fields, parameter and return types, and imports. A type path is not execution, and pinning the path rather than the surrounding bodies is what keeps execution visible: masking `std::process::` leaves `Command::new(` intact, so every construction site still has to be pinned on its own and a new one fails the guard. (2) Process construction: the two `Command::new` pins are the guardian sentinel and watcher spawns and the daemon command builder, which are the whole point of a spawn boundary. (3) The readiness handshake: the guardian publishes its process group through a temp-and-rename file the parent reads once and removes on every exit path, which is why the remove pin carries seven occurrences. (4) The port record: reading the port the daemon reported, recognizing an orphaned record from a port file without its pid file, and clearing that record. (5) The Linux process table: Linux publishes a process's group and run state only through `/proc` and offers no group-scoped query, so deciding whether the guardian's own process group still holds anything that can execute has to read it. This is process-table IO about this program's own descendants, not repository content, and no query result derives from it; the three pins are the one directory enumeration and the two per-process stat reads that classification needs. Counts are exact over scanned code, so an added occurrence of any pin drops the pin and reports every line it claimed",
+      "owner": "kin-daemon-spawn",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": "std::process::",
+          "count": 53
+        },
+        {
+          "expr": "tokio::process::",
+          "count": 2
+        },
+        {
+          "expr": "std::os::unix::process::",
+          "count": 4
+        },
+        {
+          "expr": "Command::new(&self.executable)",
+          "count": 2
+        },
+        "Command::new(&self.daemon_bin)",
+        {
+          "expr": "std::fs::remove_file(readiness_path)",
+          "count": 7
+        },
+        "std::fs::read_to_string(readiness_path)",
+        "std::fs::write(&temporary_path, readiness)",
+        "std::fs::rename(&temporary_path, readiness_path)",
+        "std::fs::remove_file(&temporary_path)",
+        "std::fs::remove_file(kin_root.join(OWNER_FILE_NAME))",
+        "std::fs::remove_file(kin_root.join(PORT_FILE_NAME))",
+        "std::fs::read_to_string(kin_root.join(PORT_FILE_NAME))",
+        "std::fs::read_dir(\"/proc\")",
+        "std::fs::read_to_string(entry.path().join(\"stat\"))",
+        "std::fs::read_to_string(format!(\"/proc/{pid}/stat\"))",
+        {
+          "expr": ".exists()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/api.rs",
+      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches Kin through, so it is scanned in full and only these four function bodies are excused, each an explicit IO boundary that produces no query answer. (1) npm_registry_routes and (2) router_with_auth create the package-registry cache directories (npm, packages, crates, oci, go) the daemon then serves from; directory creation is materialization, not answer-by-search. (3) health canonicalizes the bound repository root and reports the daemon pid for the status payload, a diagnostic whose subject is the local install rather than the repository. (4) ensure_loopback_token reads, creates, and chmods the loopback bearer token so a local client can authenticate before any graph consult. Two expression pins carry the rest. `.metadata()` is the authority lease accessor in attach_search_bodies, reached as `lease` broken across lines by rustfmt so the receiver cannot be written into the pin: the entity bodies that function attaches resolve through the graph-owned workspace tree to a blob digest and load from the blob store, never from the working tree. `std::fs::File::open(&record)` is the durable publication record probe in read_local_publication_identity, which opens authority.json to label which publication local storage already holds so a projected read revalidates instead of reloading the whole repository. That record is the atomic commit point, and the probe hashes its bytes and keeps only the digest, so it cannot carry file content into an answer; every answer still resolves through repository-v6 graph truth. Both are pinned rather than exempted by body deliberately, because a search answer path and a freshness probe are the most sensitive sites in this policy and must not have whole function bodies excused from every primitive to license one call each. Function-scoped rather than whole-file, which is the point of the entry: the locate, search, context, trace, impact, review, verify, and MCP handler bodies, and any handler added later, are scanned by default.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "npm_registry_routes",
+        "router_with_auth",
+        "health",
+        "ensure_loopback_token"
+      ],
+      "allow_match": [
+        ".metadata()",
+        "std::fs::File::open(&record)"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/supervisor.rs",
+      "reason": "Supervisor process lifecycle boundary. The supervisor owns the daemon process, not any query answer, and each excused body is one of four classes. Endpoint records: the pid and port files, written through a temp-and-rename and removed only by the process that owns them, plus the url and canonical-path helpers that read them back. Singleton locks: the lifecycle guard file and its owner stamp, which decide whether another supervisor is already live. Install and process identity: the loopback auth token, same-binary comparison against the running executable, the log length and mtime probes, re-exec of the supervisor binary, and the reaper that kills rogue daemons. Registration payload and health: the repository record sent to the control plane and the local status report. None of these reads repository content, and no query result derives from any of them. Function-scoped rather than whole-file so the rest of the module, and anything added to it, stays scanned; the single expression pin is a struct field holding the lock file handle.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "acquire_supervisor_lifecycle_guard",
+        "stamp_supervisor_lock_owner",
+        "recorded_supervisor_pid",
+        "acquire_supervisor_lock",
+        "write_supervisor_endpoint_files",
+        "remove_supervisor_endpoint_files_if_current_process",
+        "supervisor_url_from_dir",
+        "canonical_path_string",
+        "repo_registration_payload",
+        "ensure_loopback_token",
+        "health",
+        {
+          "fn": "spawn_rogue_daemon_reaper",
+          "count": 2
+        },
+        "file_mtime_secs",
+        "same_binary",
+        "daemon_log_len",
+        "reexec_self"
+      ],
+      "allow_match": [
+        "file: std::fs::File,"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/lifecycle.rs",
+      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Five classes, all excused per function. Singleton coordination: the lock file, its owner stamp, and the guards that decide whether this process may become the daemon. Endpoint publication and ownership: the pid, port, and owner components are written atomically, read back, and removed only after owner-bound proof; the named ownership helpers make that proof independently testable without adding query authority. Binary resolution and liveness: locating and validating the exact kin-daemon executable and probing whether an endpoint is answering before spawning another. Bounded macOS process ownership: the private launchctl capture, stable process-group guardian, deadline, and cleanup helpers. Platform registration and migration: the digest-addressed LaunchAgent plist, exact legacy-authority inspection, staged replacement, rollback, and non-macOS no-op counterparts, which is why two public names carry a count of two. Every path here reaches, supervises, or registers the authority and answers no repository query. The expression pins are process/file handle declarations and the capture file's Drop cleanup; none produces an answer. Function-scoped so the remainder of the module stays scanned.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "stamp_lock_owner",
+        "current_owner_stamp",
+        "read_lock_owner_stamp",
+        "acquire_singleton_lock_inner_until_with_coordination_hook",
+        "acquire_singleton_coordination_guard",
+        "acquire_singleton_coordination_guard_until",
+        "acquire_singleton_coordination_guard_until_with_hook",
+        "recorded_daemon_pid",
+        "write_atomic_endpoint_component",
+        "publish_daemon_endpoint",
+        "write_pid_file",
+        "read_port_file",
+        "remove_pid_file",
+        "remove_daemon_files_if_current_process",
+        "daemon_is_up",
+        "find_daemon_binary",
+        "resolve_launch_agent_daemon_binary",
+        "validate_launch_agent_daemon_binary",
+        "create",
+        "len",
+        "spawn",
+        "cap_command_capture_files",
+        "launchctl_action",
+        "unload_then_remove_launch_agent",
+        "launch_agent_label",
+        "read_plist_program_arguments",
+        "legacy_program_arguments_target_repository",
+        "inspect_legacy_launch_agent",
+        "install_with_actions",
+        "rollback_with_actions",
+        "read_bounded_launch_agent_plist",
+        "write_launch_agent_stage",
+        {
+          "fn": "register_launch_agent",
+          "count": 2
+        },
+        {
+          "fn": "unregister_launch_agent",
+          "count": 2
+        },
+        "endpoint_ownership_with_probe",
+        "proven_live_other_endpoint_owner_with_probe",
+        "remove_endpoint_components",
+        "publish_daemon_endpoint_under_authority_with_probe"
+      ],
+      "allow_match": [
+        "use std::process::{Child, Command, ExitStatus, Output, Stdio};",
+        "let _ = std::fs::remove_file(&self.path);",
+        "file: std::fs::File,"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/state.rs",
+      "reason": "Daemon state persistence boundary. The excused bodies write and read back state the daemon owns about itself, never repository content. Snapshot and marker persistence: the generation marker, the vfs version record, the mcp transaction log, and the coordination event log, each written through a temp-and-rename with an explicit directory fsync so a crash cannot leave a torn record, which is what the two cfg-gated sync_directory_metadata bodies and the two `open` bodies are. Failure accounting: the persisted failure count and its marker file. Graph-to-disk projection: staging and finalizing the canonical read index from graph truth, and invalidating it. Authority pinning: resolving the registered local repository authority roots. The one expression pin is a lease metadata accessor, which returns graph-owned workspace state and only shares a name with the filesystem probe. Function-scoped rather than whole-file: this module is large and holds far more than its persistence paths, and all of that stays scanned.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        {
+          "fn": "sync_directory_metadata",
+          "count": 2
+        },
+        "load_persisted_mcp_transactions",
+        "write_persisted_mcp_transactions_checked",
+        {
+          "fn": "open",
+          "count": 2
+        },
+        "append",
+        "persisted_failure_count",
+        "persist_failure_count",
+        "load_persisted_vfs_version",
+        "advance_vfs_version",
+        "pin_registered_local_repository_authorities",
+        "finalize_generation_from_graph",
+        "invalidate_canonical_read_index",
+        "stage_read_index_from_graph",
+        "write_generation_marker",
+        "read_generation_marker"
+      ],
+      "allow_match": [
+        "lease.metadata()"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/loop_runner.rs",
+      "reason": "Host event ingestion boundary. The excused bodies are the file watcher's admission path: reading a host file or symlink target and its mode so the change can be admitted into the graph as exact tree state, and comparing a host entry against what the graph already holds so an unchanged file is not re-admitted. Reading the working tree is the entire job of an ingestion boundary, and the result is written into graph truth rather than returned as an answer. The remaining three are repository binding, which precedes any graph consult: recognizing a bare git layout, canonicalizing a host parent while preserving the leaf, and resolving a path relative to the bound root. The cfg-gated executable-bit helper is the pair that carries a count of two. Function-scoped so the rest of the runner stays scanned.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "is_bare_repository",
+        "canonicalize_host_parent_preserving_leaf",
+        "repo_path",
+        {
+          "fn": "regular_file_is_executable",
+          "count": 2
+        },
+        "host_entry_matches_graph",
+        "admit_file_event_with_exact_tree"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/daemon.rs",
+      "reason": "Daemon run loop boundary. Two pins are the liveness checks that ask whether this daemon's own repository root and control plane are still present, which is a question about the process rather than about the repository. The rest are the run loop reporting its process id, exiting, and canonicalizing the bound repository root twice while wiring authority into the server. No repository content is read and no query answer derives from any of it. Pinned by expression rather than by function, because the run loop is half this module and exempting its body would leave more unscanned than the primitives justify. The liveness pins first named endpoint_files_missing and control_plane_missing, expressions that stopped existing when a classifier replaced them to verify who owns an endpoint before treating its absence as an eviction notice. Their successors, repository_root_missing and classify_control_plane, were then exempted per function, which excused twenty-four lines to license two expressions. They are pinned again, but on the primitive rather than on a snippet: the two `.exists()` calls are the only filesystem primitive in either body, and a count on the primitive survives the rewording that made the first pins stale while still failing the guard the moment a third appears.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".canonicalize()",
+          "count": 2
+        },
+        {
+          "expr": ".exists()",
+          "count": 2
+        },
+        "std::process::id(),",
+        "std::process::exit(0);"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/bin/kin-daemon.rs",
+      "reason": "Daemon process entry point. Every pin is either a process exit with a status or the directory probe that recognizes a .kin layout when deciding which repository to bind, which precedes any graph consult. Neither class reads repository content nor answers a query. Pinned by expression with exact counts rather than by function, because the four functions involved are most of this binary and exempting their bodies would leave more unscanned than the primitives justify.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": "process::exit(0);",
+          "count": 2
+        },
+        {
+          "expr": "process::exit(1);",
+          "count": 9
+        },
+        "process::exit(exit_code);",
+        "if path.file_name().and_then(|name| name.to_str()) == Some(\".kin\") && path.is_dir() {"
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_branch.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 9
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_checkout.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. Two of the four are reached through a frozen authority handle rather than a lease binding, which is the same graph-owned metadata behind a different accessor.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 4
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_commit.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified. The count is the six occurrences in scanned code. It deliberately does not cover the module's test paths, which the guard never reads: counting those too would have let a routine test refactor release budget for a real filesystem probe in a scanned path without changing the declared number.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 6
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_drift.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_merge.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_merge_state.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_rollback.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_stash.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 6
+        }
+      ]
+    },
+    {
+      "file": "crates/kin-daemon/src/repository_tag.rs",
+      "reason": "Repository authority lease accessor, not a filesystem probe. Every `.metadata()` in this module is called on a repository-v6 authority lease and returns graph-owned authority metadata: the workspace set, ref state, and operation receipts. It shares a method name with the filesystem metadata probe in the shared deny set, which is the only reason it appears here. The module carries no raw filesystem primitive at all: no read, open, traversal, existence probe, or subprocess. Pinned by exact occurrence count instead of exempting the surrounding function bodies, so every planning and replay path in the module stays scanned and any new `.metadata()` call, filesystem or not, fails the guard until it is re-justified.",
+      "owner": "kin-daemon",
+      "expiration": "2026-12-31",
+      "allow_match": [
+        {
+          "expr": ".metadata()",
+          "count": 3
+        }
       ]
     }
   ]

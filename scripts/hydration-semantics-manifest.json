@@ -1,19 +1,47 @@
 {
-  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what Kin reports about the past on already-ingested repositories. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together.",
-  "hydration_semantics_version": 5,
+  "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what a repository's past is said to contain the next time that repository is admitted. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together. Bumping the version records the decision; it does not migrate, invalidate, or re-enrich a repository that was already admitted, because nothing persists the version beside a graph or compares it when one is opened.",
+  "hydration_semantics_version": 7,
   "guarded": [
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "derive_historical_semantic_deltas",
-      "digest": "sha256:defd5579325f7b159b1aff73498622a72156c64579319d31ceec0b35f85fa2cf",
+      "digest": "sha256:8033956783d1bc36651423c022d06db20d6ef61a27ae08b318d79980f32af224",
       "reason": "Drives the whole parent-first replay: it decides the per-change baseline, which trees are enriched, and the exact EntityDelta/RelationDelta payload persisted for every historical change.",
       "owner": "kin-index"
     },
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "semantic_state_for_tree",
-      "digest": "sha256:883a0ba2ac406e67a7efb59d59cae37c0d33aa6829938d20f986d19833d75cab",
+      "digest": "sha256:0340e3ab07f9168d00307ac4514718a00abc2115a22bb58dd805ccbb7f68e794",
       "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "external_reference_targets",
+      "digest": "sha256:9542f2e28f43ed31d8f66c229992457570c3fc18f07fe2ed5f3d729d8ccf574a",
+      "reason": "Decides which cross-repo destinations a tree binds an external target for, and derives every field of that target from the importers it collects. Its output is persisted entity state, so a change here restates what a repository's past says about the symbols it reaches through another repository.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "external_reference_entity",
+      "digest": "sha256:fb16c3897cb4cf6da2cfb69f72da3a7e1345112b4f6a8f6375263b09689b02bf",
+      "reason": "Authors the exact persisted shape of an external target: its kind, name, visibility, role, and the absence of a file origin, span, and signature. Every cross-repo reference in replayed history terminates on one of these.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "external_reference_fingerprint",
+      "digest": "sha256:b30eaffff97ce12767ffce6e1432d820d741a15e4d0d9ec9f93ddbbd6fc39f94",
+      "reason": "Derives the persisted fingerprint of an external target. It is the only field distinguishing two targets that share a symbol name, so consumers read it as their identity and changing it repartitions them.",
+      "owner": "kin-index"
+    },
+    {
+      "file": "crates/kin-index/src/history.rs",
+      "function": "lowest_language",
+      "digest": "sha256:52f2ceb3fb1aa466042d056aaacc0097a76bb227b07b357a53af3d6294a83569",
+      "reason": "Chooses the persisted language of an external target from every importing language. A different choice restates the target, so history would record a modification to a node no commit touched.",
       "owner": "kin-index"
     },
     {

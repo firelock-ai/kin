@@ -6,9 +6,12 @@ use console::style;
 use dialoguer::MultiSelect;
 use fs2::FileExt;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Embedded shell hooks (from kin-vfs/shell/)
@@ -1598,8 +1601,8 @@ fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
     let target = home.join(".codex").join("config.toml");
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    let repo_root = kin_core::KinLayout::discover(&cwd)
-        .and_then(|layout| layout.working_dir().canonicalize().ok())
+    let repo_root = crate::commands::managed_config_scope::discover_repo_root()
+        .and_then(|root| root.canonicalize().ok())
         .with_context(|| {
             format!(
                 "Codex MCP setup requires an initialized Kin repository; run `kin init` in the target repository and re-run `kin setup` from it (current directory: {})",
@@ -1636,8 +1639,8 @@ fn configure_windsurf() -> Result<PathBuf> {
 
 fn current_initialized_setup_repo(client: &str) -> Result<PathBuf> {
     let cwd = env::current_dir().context("could not determine the current directory")?;
-    kin_core::KinLayout::discover(&cwd)
-        .and_then(|layout| layout.working_dir().canonicalize().ok())
+    crate::commands::managed_config_scope::discover_repo_root()
+        .and_then(|root| root.canonicalize().ok())
         .and_then(|root| canonical_initialized_repo(&root))
         .with_context(|| {
             format!(
@@ -2115,22 +2118,183 @@ fn read_single_git_pointer(path: &Path, label: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+const SETUP_GIT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(15);
+const SETUP_GIT_AUTHORITY_CAPTURE_LIMIT: u64 = 4 * 1024 * 1024;
+
+enum SetupGitDeadlineStart {
+    Immediate,
+    #[cfg(all(test, unix))]
+    AfterParseablePid {
+        marker: PathBuf,
+        readiness_timeout: Duration,
+    },
+}
+
 fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
-    let git = which::which("git").context("git is required to validate workspace MCP authority")?;
-    let output = std::process::Command::new(git)
+    let host_path = kin_core::shims::unshimmed_path();
+    git_authority_output_with_policy(
+        repo_root,
+        args,
+        &host_path,
+        SETUP_GIT_AUTHORITY_TIMEOUT,
+        SETUP_GIT_AUTHORITY_CAPTURE_LIMIT,
+    )
+}
+
+fn git_authority_output_with_policy(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for setup")?;
+    git_authority_output_with_resolution_policy(
+        repo_root,
+        args,
+        host_path,
+        &resolution_cwd,
+        timeout,
+        capture_limit,
+    )
+}
+
+fn git_authority_output_with_resolution_policy(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    resolution_cwd: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    git_authority_output_with_resolution_policy_from(
+        repo_root,
+        args,
+        host_path,
+        resolution_cwd,
+        timeout,
+        capture_limit,
+        SetupGitDeadlineStart::Immediate,
+    )
+}
+
+#[cfg(all(test, unix))]
+fn git_authority_output_with_policy_after_parseable_pid_ready(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    readiness_marker: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String> {
+    let resolution_cwd =
+        std::env::current_dir().context("capture host Git resolution directory for setup")?;
+    git_authority_output_with_resolution_policy_from(
+        repo_root,
+        args,
+        host_path,
+        &resolution_cwd,
+        timeout,
+        capture_limit,
+        SetupGitDeadlineStart::AfterParseablePid {
+            marker: readiness_marker.to_path_buf(),
+            readiness_timeout: Duration::from_secs(5),
+        },
+    )
+}
+
+fn git_authority_output_with_resolution_policy_from(
+    repo_root: &Path,
+    args: &[&str],
+    host_path: &str,
+    resolution_cwd: &Path,
+    timeout: Duration,
+    capture_limit: u64,
+    deadline_start: SetupGitDeadlineStart,
+) -> Result<String> {
+    let repo_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repository {}", repo_root.display()))?;
+    let host_path = absolute_setup_host_search_path(host_path, resolution_cwd)?;
+    let git = which::which_in("git", Some(&host_path), resolution_cwd)
+        .context("host Git is required to validate workspace MCP authority")?;
+    let git = if git.is_absolute() {
+        git
+    } else {
+        resolution_cwd.join(git)
+    };
+    let mut command = Command::new(git);
+    command
+        .arg("--no-replace-objects")
         .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
-        .output()
-        .with_context(|| format!("failed to run git {:?}", args))?;
+        .arg(&repo_root)
+        .args(args);
+    run_git_authority_command(
+        command,
+        args,
+        &host_path,
+        timeout,
+        capture_limit,
+        deadline_start,
+    )
+}
+
+fn absolute_setup_host_search_path(
+    host_path: impl AsRef<OsStr>,
+    resolution_cwd: &Path,
+) -> Result<OsString> {
+    let entries = std::env::split_paths(host_path.as_ref())
+        .map(|entry| {
+            if entry.is_absolute() {
+                entry
+            } else {
+                resolution_cwd.join(entry)
+            }
+        })
+        .collect::<Vec<_>>();
+    std::env::join_paths(entries).with_context(|| {
+        format!(
+            "normalize host Git PATH against {} for setup",
+            resolution_cwd.display()
+        )
+    })
+}
+
+fn run_git_authority_command(
+    mut command: Command,
+    args: &[&str],
+    host_path: &OsStr,
+    timeout: Duration,
+    capture_limit: u64,
+    deadline_start: SetupGitDeadlineStart,
+) -> Result<String> {
+    let label = format!("Git workspace authority query {args:?}");
+    finalize_setup_git_authority_process(&mut command, host_path);
+    let output = match deadline_start {
+        SetupGitDeadlineStart::Immediate => {
+            crate::daemon_client::probe_process::output_finalized_with_timeout_and_limit(
+                command,
+                &label,
+                timeout,
+                capture_limit,
+            )
+        }
+        #[cfg(all(test, unix))]
+        SetupGitDeadlineStart::AfterParseablePid {
+            marker,
+            readiness_timeout,
+        } => crate::daemon_client::probe_process::
+            output_finalized_with_timeout_and_limit_after_parseable_pid_ready(
+                command,
+                &label,
+                &marker,
+                readiness_timeout,
+                timeout,
+                capture_limit,
+            ),
+    }
+    .with_context(|| format!("failed to run host Git authority query {args:?}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "git {:?} rejected workspace authority: {}",
@@ -2139,6 +2303,79 @@ fn git_authority_output(repo_root: &Path, args: &[&str]) -> Result<String> {
         );
     }
     String::from_utf8(output.stdout).context("git authority output is not UTF-8")
+}
+
+/// Apply the complete Git/Kin/VFS/loader authority boundary immediately
+/// before bounded spawn. The bounded helper may only attach stdio afterward.
+fn finalize_setup_git_authority_process(command: &mut Command, host_path: &OsStr) {
+    finalize_setup_git_authority_process_with_ambient(
+        command,
+        host_path,
+        std::env::vars_os().map(|(key, _)| key),
+    );
+}
+
+fn finalize_setup_git_authority_process_with_ambient(
+    command: &mut Command,
+    host_path: &OsStr,
+    ambient_keys: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    let explicit_authority = command
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .filter(|key| is_setup_git_authority_env(key))
+        .collect::<Vec<_>>();
+    for key in ambient_keys
+        .into_iter()
+        .filter(|key| is_setup_git_authority_env(key))
+        .chain(explicit_authority)
+    {
+        command.env_remove(key);
+    }
+    command
+        .env("PATH", host_path)
+        .env("KIN_VFS_DISABLE", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(unix)]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    #[cfg(not(any(unix, windows)))]
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        command
+            .get_current_dir()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".kin-empty-global-gitconfig"),
+    );
+}
+
+fn is_setup_git_authority_env(key: &std::ffi::OsStr) -> bool {
+    let label = key.to_string_lossy();
+    setup_git_env_name_starts_with(&label, "GIT_")
+        || setup_git_env_name_starts_with(&label, "KIN_")
+        || setup_git_env_name_starts_with(&label, "_KIN_")
+        || setup_git_env_name_starts_with(&label, "DYLD_")
+        || setup_git_env_name_starts_with(&label, "LD_")
+}
+
+#[cfg(windows)]
+fn setup_git_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual
+        .get(..expected.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(not(windows))]
+fn setup_git_env_name_starts_with(actual: &str, expected: &str) -> bool {
+    actual.starts_with(expected)
 }
 
 fn canonical_git_output_path(repo_root: &Path, output: &str, label: &str) -> Result<PathBuf> {
@@ -3287,14 +3524,27 @@ fn config_transaction_test_kin_home(subject_path: &Path) -> PathBuf {
         .canonicalize()
         .unwrap_or_else(|_| env::temp_dir());
     let normalized = canonicalize_nearest_existing_test_path(subject_path);
-    let fixture_scope = normalized
+    let fixture_root = normalized
         .strip_prefix(&temp)
         .ok()
         .and_then(|relative| relative.components().next())
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .unwrap_or_else(|| normalized.to_string_lossy().into_owned());
+        .map(|component| temp.join(component.as_os_str()))
+        .filter(|candidate| candidate != &normalized && candidate.is_dir());
+    let fixture_scope = fixture_root
+        .as_deref()
+        .unwrap_or(&normalized)
+        .to_string_lossy()
+        .into_owned();
     let digest = crate::commands::setup_ledger::sha256_hex(fixture_scope.as_bytes());
-    temp.join(format!("kin-config-transaction-tests-{}", &digest[..24]))
+    let name = format!(".kin-config-transaction-tests-{}", &digest[..24]);
+    // A tempfile fixture already gives this test exclusive directory
+    // authority. Keep its transaction home beneath that fixture so parallel
+    // setup tests do not all serialize on the process-wide temporary parent.
+    // A subject directly beneath TMPDIR cannot contain its own authority, so
+    // retain the sibling fallback for that shape.
+    fixture_root
+        .map(|root| root.join(&name))
+        .unwrap_or_else(|| temp.join(name.trim_start_matches('.')))
 }
 
 impl ConfigTransactionAuthority {
@@ -8550,6 +8800,7 @@ impl ConfigLock {
     }
 
     fn plan_with_policy(path: &Path, private: bool) -> Result<ConfigLockPlan> {
+        crate::commands::managed_config_scope::guard_managed_path(path);
         #[cfg(unix)]
         let (path, parent) = Self::normalized_path_with_parent_authority(path)?;
         #[cfg(not(unix))]
@@ -11803,8 +12054,9 @@ fn cleanup_stale_daemons() -> Result<usize> {
         let has_port = kin_root.join("daemon.port").exists();
         let has_pid = kin_root.join("daemon.pid").exists();
         if has_port && !has_pid {
-            let _ = std::fs::remove_file(kin_root.join("daemon.port"));
-            cleaned += 1;
+            if crate::daemon_client::remove_orphaned_daemon_port(&kin_root) {
+                cleaned += 1;
+            }
         }
     }
     Ok(cleaned)
@@ -11980,6 +12232,243 @@ mod tests {
             no_interactive: true,
             intent: None,
         }
+    }
+
+    fn configured_command_env(command: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {
+        command
+            .get_envs()
+            .find(|(candidate, _)| *candidate == OsStr::new(key))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    #[test]
+    fn setup_git_authority_finalizer_scrubs_ambient_and_explicit_authority() {
+        let explicit = [
+            "GIT_DIR",
+            "KIN_SESSION",
+            "_KIN_VFS_LAST_DIR",
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+        ];
+        let ambient = [
+            "GIT_WORK_TREE",
+            "KIN_SOURCE_ROOT",
+            "_KIN_TEST_AUTHORITY",
+            "DYLD_LIBRARY_PATH",
+            "LD_LIBRARY_PATH",
+        ];
+        let mut command = Command::new("git");
+        for key in explicit {
+            command.env(key, "poison");
+        }
+
+        finalize_setup_git_authority_process_with_ambient(
+            &mut command,
+            OsStr::new("trusted-host-path"),
+            ambient.into_iter().map(OsString::from),
+        );
+
+        for key in explicit.into_iter().chain(ambient) {
+            assert_eq!(
+                configured_command_env(&command, key),
+                Some(None),
+                "{key} retained authority"
+            );
+        }
+        assert_eq!(
+            configured_command_env(&command, "PATH"),
+            Some(Some(OsString::from("trusted-host-path")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "KIN_VFS_DISABLE"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_CONFIG_NOSYSTEM"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_NO_REPLACE_OBJECTS"),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            configured_command_env(&command, "GIT_OPTIONAL_LOCKS"),
+            Some(Some(OsString::from("0")))
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_setup_fake_git(bin: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::create_dir_all(bin).unwrap();
+        let git = bin.join("git");
+        fs::write(&git, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+        git
+    }
+
+    #[cfg(unix)]
+    fn fixture_process_is_live(pid: u32) -> bool {
+        let system = sysinfo::System::new_all();
+        system
+            .process(sysinfo::Pid::from_u32(pid))
+            .is_some_and(|process| {
+                !matches!(
+                    process.status(),
+                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+                )
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_authority_uses_resolved_host_git_with_closed_stdin() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_setup_fake_git(
+            &bin,
+            r#"
+if IFS= read -r ignored; then
+    echo "stdin remained readable" >&2
+    exit 90
+fi
+printf 'path=%s\n' "$PATH"
+printf 'vfs=%s\n' "$KIN_VFS_DISABLE"
+printf 'nosystem=%s\n' "$GIT_CONFIG_NOSYSTEM"
+printf 'global=%s\n' "$GIT_CONFIG_GLOBAL"
+printf 'args=%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5"
+"#,
+        );
+        let host_path = bin.to_string_lossy();
+
+        let output = git_authority_output_with_policy(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &host_path,
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .unwrap();
+
+        assert!(output.contains(&format!("path={host_path}\n")), "{output}");
+        assert!(output.contains("vfs=1\n"), "{output}");
+        assert!(output.contains("nosystem=1\n"), "{output}");
+        assert!(output.contains("global=/dev/null\n"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "args=--no-replace-objects|-C|{}|rev-parse|HEAD",
+                fixture.path().canonicalize().unwrap().display()
+            )),
+            "{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_relative_host_path_cannot_rebind_under_repository_cwd() {
+        let fixture = tempfile::tempdir().unwrap();
+        let resolution_root = fixture.path().join("resolution");
+        let repo_root = fixture.path().join("repository");
+        write_setup_fake_git(&resolution_root.join("bin"), "printf trusted");
+        write_setup_fake_git(&repo_root.join("bin"), "printf hostile");
+
+        let output = git_authority_output_with_resolution_policy(
+            &repo_root,
+            &["rev-parse", "HEAD"],
+            "bin",
+            &resolution_root,
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .unwrap();
+
+        assert_eq!(output, "trusted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_authority_rejects_runaway_output_and_reaps_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_setup_fake_git(
+            &bin,
+            r#"
+/bin/sleep 30 &
+descendant_pid="$!"
+printf '%s\n' "$descendant_pid" > "${0%/*}/descendant.pid.staged"
+/bin/mv "${0%/*}/descendant.pid.staged" "${0%/*}/descendant.pid"
+chunk='xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+while :; do
+    printf '%s' "$chunk"
+done
+"#,
+        );
+        let marker = bin.join("descendant.pid");
+        let error = git_authority_output_with_policy_after_parseable_pid_ready(
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            &bin.to_string_lossy(),
+            &marker,
+            Duration::from_secs(5),
+            4 * 1024,
+        )
+        .expect_err("runaway Git output must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("exceeded the 4096-byte"), "{message}");
+        assert!(message.contains("cleanup=ok"), "{message}");
+
+        let pid = fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !fixture_process_is_live(pid),
+            "runaway Git descendant {pid} survived bounded return"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_git_authority_times_out_and_reaps_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("host-bin");
+        write_setup_fake_git(
+            &bin,
+            r#"
+/bin/sleep 30 &
+descendant_pid="$!"
+printf '%s\n' "$descendant_pid" > "${0%/*}/descendant.pid.staged"
+/bin/mv "${0%/*}/descendant.pid.staged" "${0%/*}/descendant.pid"
+wait
+"#,
+        );
+        let marker = bin.join("descendant.pid");
+        let error = git_authority_output_with_policy_after_parseable_pid_ready(
+            fixture.path(),
+            &["worktree", "list", "--porcelain"],
+            &bin.to_string_lossy(),
+            &marker,
+            Duration::from_millis(200),
+            16 * 1024,
+        )
+        .expect_err("hung Git authority query must time out");
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out after 200ms"), "{message}");
+        assert!(message.contains("cleanup=ok"), "{message}");
+
+        let pid = fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !fixture_process_is_live(pid),
+            "timed-out Git descendant {pid} survived bounded return"
+        );
     }
 
     #[test]
@@ -12949,7 +13438,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             ])
             .env(WORKER_PATH, dir.path());
         let output = crate::commands::test_subprocess::output_with_timeout(
-            &mut command,
+            command,
             "restrictive private-directory chain worker",
             crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
         )
@@ -13020,7 +13509,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
             .env(WORKER_ROOT, dir.path())
             .env("TMPDIR", dir.path());
         let output = crate::commands::test_subprocess::output_with_timeout(
-            &mut command,
+            command,
             "restrictive transaction-directory worker",
             crate::commands::test_subprocess::DEFAULT_TEST_SUBPROCESS_TIMEOUT,
         )
@@ -13347,6 +13836,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_unavailable_se_security_privilege_fails_before_wal_or_namespace_change() {
         struct ResetPrivilegeInjection;
         impl Drop for ResetPrivilegeInjection {
@@ -13395,6 +13885,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_config_lock_round_trips_public_and_private_files() {
         let dir = tempfile::tempdir().unwrap();
         let public = dir.path().join("config.json");
@@ -13428,6 +13919,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_prepared_handoff_failure_deletes_stage_and_rolls_back_from_wal() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -13462,6 +13954,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_file_id_info_is_stable_across_handles_and_rename() {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("identity-original.tmp");
@@ -13507,6 +14000,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(windows)]
     #[test]
+    #[serial]
     fn windows_created_file_validation_failures_leave_no_named_residue() {
         use super::super::update::windows_update::{
             inject_created_file_validation_failure, CreatedFileValidationFailure,
@@ -13549,6 +14043,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn codex_relative_repo_binding_uses_entry_cwd_not_process_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let repo_a = dir.path().join("repo-a");
@@ -14145,6 +14640,18 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let identity = wal_test_record(ConfigTransactionPhase::Prepared).sidecar;
         let subject_a = fixture_a.path().join("first.lock");
         let subject_b = fixture_b.path().join("first.lock");
+        let fixture_a_root = fixture_a.path().canonicalize().unwrap();
+        let fixture_b_root = fixture_b.path().canonicalize().unwrap();
+        assert_eq!(
+            config_transaction_test_kin_home(&subject_a).parent(),
+            Some(fixture_a_root.as_path()),
+            "parallel transaction fixtures must not share the system temporary parent"
+        );
+        assert_eq!(
+            config_transaction_test_kin_home(&subject_b).parent(),
+            Some(fixture_b_root.as_path()),
+            "each transaction fixture must own its recovery namespace"
+        );
 
         let authority_a = ConfigTransactionAuthority::acquire(&identity, &subject_a).unwrap();
         let authority_a_path = authority_a.path.clone();
@@ -14269,6 +14776,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     // never pruned: an append-only journal grows without bound and keeps a
     // finished transaction replayable forever.
     #[test]
+    #[serial]
     fn a_resolved_config_transaction_retires_its_journal() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path().canonicalize().unwrap();
@@ -14329,6 +14837,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn config_transaction_test_authority_normalizes_relative_nonexistent_paths() {
         let current = env::current_dir().unwrap();
         let fixture = tempfile::Builder::new()
@@ -14355,6 +14864,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn config_transaction_wal_ignores_newline_terminated_torn_envelope() {
         let record = wal_test_record(ConfigTransactionPhase::Prepared);
         let committed = wal_test_pair(&record, 1);
@@ -14511,6 +15021,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_write_restores_raced_replacement_after_final_validation() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -14543,6 +15054,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_removal_restores_raced_replacement_after_final_validation() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -14572,6 +15084,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_write_revalidates_authority_after_transition_hook() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14607,6 +15120,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn write_namespace_phase_refuses_authority_drift_and_restart_rolls_back() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14651,6 +15165,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn write_namespace_phase_reobserves_retained_bytes_before_advancing_wal() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -14692,6 +15207,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn write_rollback_phase_refuses_authority_drift_and_preserves_raced_object() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14744,6 +15260,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn guarded_config_remove_revalidates_authority_after_quarantine_hook() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14767,6 +15284,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn remove_namespace_phase_refuses_authority_drift_and_restart_restores() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14808,6 +15326,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn remove_namespace_phase_reobserves_retained_metadata_before_advancing_wal() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -14855,6 +15374,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn next_guarded_acquire_removes_only_exact_unjournaled_stage_names() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.json");
@@ -15031,17 +15551,15 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     }
 
     #[test]
+    #[serial]
     fn workspace_mcp_excludes_are_idempotent_in_linked_worktrees() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
         let git = |args: &[&str], cwd: &Path| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(cwd)
                 .args(args)
-                .current_dir(cwd)
                 .output()
                 .unwrap();
             assert!(
@@ -15074,9 +15592,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         for pattern in WORKSPACE_MCP_GIT_EXCLUDE_PATTERNS {
             assert_eq!(exclude.lines().filter(|line| *line == pattern).count(), 1);
         }
-        let status = Command::new("git")
+        let status = crate::commands::test_subprocess::fixture_git(&linked)
             .args(["status", "--porcelain", "--untracked-files=all"])
-            .current_dir(&linked)
             .output()
             .unwrap();
         assert!(status.status.success());
@@ -15091,8 +15608,6 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[test]
     #[serial]
     fn antigravity_first_setup_captures_and_repairs_global_and_workspace_bindings() {
-        use std::process::Command;
-
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -15107,14 +15622,14 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         fs::create_dir_all(kin_home.join("bin")).unwrap();
         fs::create_dir_all(repo.join(".kin")).unwrap();
         fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
-        let git = Command::new("git")
+        let git = crate::commands::test_subprocess::fixture_git(&repo)
             .args(["init", "-q"])
-            .current_dir(&repo)
             .output()
             .unwrap();
         assert!(git.status.success());
         let _home = EnvGuard::set("HOME", &home);
         let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _scan_root = EnvGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &repo);
         let previous = env::current_dir().unwrap();
         env::set_current_dir(&repo).unwrap();
         let _cwd = CurrentDirGuard(previous);
@@ -15159,6 +15674,79 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert!(repaired.contains(&ConfigLock::normalized_path(&workspace).unwrap()));
         assert!(mcp_repair_targets_ledger_verified(&targets).unwrap());
         assert!(!kin_home.join("update-restart-ack-required.json").exists());
+    }
+
+    /// A repository enclosing the fixture is not the repository under test.
+    /// Discovery walks upward, so without a ceiling a test running below a real
+    /// checkout binds that checkout and captures its workspace MCP config.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn enclosing_workspace_config_is_never_captured_from_a_scoped_fixture() {
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("enclosing-checkout");
+        let inner = outer.join("fixture");
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(outer.join(".kin")).unwrap();
+        fs::create_dir_all(outer.join(".agents")).unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let decoy = outer.join(".agents").join("mcp_config.json");
+        let decoy_bytes =
+            br#"{"mcpServers":{"kin":{"command":"/enclosing/kin","args":["mcp","start"]}}}"#;
+        fs::write(&decoy, decoy_bytes).unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &inner);
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(&inner).unwrap();
+        let _cwd = CurrentDirGuard(previous);
+
+        let canonical_decoy = decoy.canonicalize().unwrap();
+        let discovered = crate::commands::health::mcp_client_config_paths();
+        assert!(
+            !discovered.iter().any(|(_, _, path)| path
+                .canonicalize()
+                .is_ok_and(|path| path == canonical_decoy)),
+            "discovery reached the enclosing checkout: {discovered:?}"
+        );
+
+        let targets = current_mcp_repair_targets().unwrap();
+        assert!(
+            !targets.iter().any(|target| target.path == canonical_decoy
+                || target.repo_root.as_deref() == Some(outer.canonicalize().unwrap().as_path())),
+            "repair capture reached the enclosing checkout: {targets:?}"
+        );
+        assert_eq!(fs::read(&decoy).unwrap(), decoy_bytes);
+    }
+
+    /// The fixture guard must fail at the moment an escaping path is resolved,
+    /// so a leak is reported against the flow that produced it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    #[should_panic(expected = "managed config path escaped its fixture")]
+    fn managed_config_outside_the_declared_fixture_aborts_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&fixture).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let _fixture_root = EnvGuard::set(
+            crate::commands::managed_config_scope::FIXTURE_ROOT_ENV,
+            &fixture,
+        );
+        let _ = ConfigLock::acquire(&outside.join("mcp.json"));
     }
 
     #[test]
@@ -15210,14 +15798,12 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[test]
     fn workspace_mcp_excludes_reject_symlink_and_external_gitdir_authority() {
         use std::os::unix::fs::symlink;
-        use std::process::Command;
 
         let dir = tempfile::tempdir().unwrap();
         let trusted = dir.path().join("trusted");
         fs::create_dir_all(&trusted).unwrap();
-        let output = Command::new("git")
+        let output = crate::commands::test_subprocess::fixture_git(&trusted)
             .args(["init", "-q"])
-            .current_dir(&trusted)
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -15246,16 +15832,13 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[test]
     fn workspace_mcp_excludes_reject_escaped_commondir_and_wrong_backpointer() {
-        use std::process::Command;
-
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("main");
         let linked = dir.path().join("linked");
         fs::create_dir_all(&main).unwrap();
         let git = |args: &[&str], cwd: &Path| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(cwd)
                 .args(args)
-                .current_dir(cwd)
                 .output()
                 .unwrap();
             assert!(

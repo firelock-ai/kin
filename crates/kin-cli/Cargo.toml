@@ -29,6 +29,7 @@ path = "src/main.rs"
 mimalloc = { version = "0.1", default-features = false }
 kin-model = { workspace = true }
 kin-core = { workspace = true }
+kin-daemon-spawn = { workspace = true }
 kin-blobs = { workspace = true }
 kin-parser = { workspace = true }
 kin-index = { workspace = true }
@@ -57,6 +58,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 age = "0.11"
 base64 = "0.22"
 directories = "5"
@@ -67,6 +69,7 @@ uuid = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
 chrono = { workspace = true }
+filetime = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json"] }
 hex = { workspace = true }
 sha2.workspace = true
@@ -90,6 +93,7 @@ unicode-normalization = "0.1"
 kin-spine = { version = "0.4.0", path = "../kin-spine" }
 
 [dev-dependencies]
+kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
 
@@ -103,6 +107,7 @@ rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",

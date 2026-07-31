@@ -7,6 +7,7 @@ use kin_core::LocalRepositoryAuthorityBinding;
 use kin_model::entity::EntityKind;
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::relation::RelationKind;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{McpError, Result};
 use crate::session::SessionRegistry;
@@ -205,27 +206,23 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 EntitySourceScope::WorkspaceHead,
             )?
             .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
-            let is_stale = LAST_READ_STALE.with(|f| f.get());
             let source = LAST_READ_SOURCE.with(|f| f.get());
-            let span = entity.span.as_ref();
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": entity.id,
                 "name": entity.name,
                 "kind": entity.kind,
                 "language": entity.language,
                 "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
                 "read_path": entity_read_path(&entity),
-                "start_line": span.map(|s| s.start_line),
-                "end_line": span.map(|s| s.end_line),
+                "start_line": entity_presentation_start_line(&entity),
+                "end_line": entity_presentation_end_line(&entity),
                 "signature": entity.signature,
                 "body": exact_source.body,
-                "source_change_id": exact_source.source_change_id,
-                "artifact_id": exact_source.artifact_id,
-                "artifact_path": exact_source.path,
-                "artifact_entry": exact_source.entry,
-                "stale": is_stale,
                 "source": source,
             });
+            if let Some(map) = value.as_object_mut() {
+                map.extend(source_provenance_fields(&exact_source));
+            }
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
@@ -261,6 +258,14 @@ pub const MAX_BULK_SOURCE_ENTITIES: usize = 50;
 /// One resolved entity's source facts, projected into a path-independent shape:
 /// the generic graph store and the daemon graph both build this before the batch
 /// envelope is assembled, so the response row is identical across serving paths.
+///
+/// Each row is individually coherent; the BATCH is not one instant. Authority is
+/// sampled per entity, so a 50-row response can straddle workspace generations and
+/// two rows may describe different ones. No row is wrong, but nothing here
+/// promises they share a moment, which is why each row carries its own provenance
+/// rather than the envelope carrying one stamp for all of them. A caller that
+/// needs a single consistent snapshot across many entities must compare the
+/// per-row `workspace_generation` values rather than assume they agree.
 #[derive(Debug, Clone)]
 pub struct EntitySourceRow {
     pub id: String,
@@ -272,6 +277,16 @@ pub struct EntitySourceRow {
     pub end_line: u32,
     pub signature: String,
     pub body: String,
+    /// This row's source provenance and span coherence, rendered by the shared
+    /// [`source_provenance_fields`] seam, or empty when the serving path had none
+    /// to offer.
+    ///
+    /// A batch row needs this more than a single read does, not less. This tool
+    /// returns up to 50 full bodies and exists so an agent can restate source it
+    /// is about to overwrite, so "these bytes are uncommitted" and "this span was
+    /// never proven to describe them" are exactly the facts it must not have to
+    /// guess.
+    pub provenance: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Per-ID outcome for the batched source tool. Mirrors the single tool's
@@ -365,8 +380,14 @@ fn source_row_json(
         "signature": row.signature,
         "omitted": omitted,
     });
+    // Provenance rides with the body, and only with the body: a signature-only or
+    // budget-omitted row served no bytes, so it has no byte provenance to describe
+    // and stamping one would invite reading it as though it did.
     if let Some(body) = body {
         value["body"] = serde_json::json!(body);
+        if let Some(object) = value.as_object_mut() {
+            object.extend(row.provenance.clone());
+        }
     }
     if let Some(reason) = reason {
         value["reason"] = serde_json::json!(reason);
@@ -498,13 +519,10 @@ fn resolve_entity_source_generic<G: GraphStore>(
                         .as_ref()
                         .map(|path| path.0.clone())
                         .unwrap_or_default(),
-                    start_line: entity
-                        .span
-                        .as_ref()
-                        .map(|span| span.start_line)
-                        .unwrap_or(0),
-                    end_line: entity.span.as_ref().map(|span| span.end_line).unwrap_or(0),
+                    start_line: entity_presentation_start_line(&entity).unwrap_or(0),
+                    end_line: entity_presentation_end_line(&entity).unwrap_or(0),
                     signature: entity.signature.clone(),
+                    provenance: source_provenance_fields(&source),
                     body: source.body,
                 }),
                 Ok(None) => ResolvedEntitySource::NoSource {
@@ -602,12 +620,14 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let pack = build_context_pack_with_traffic(store, &entity_id, &opts, &nearby_intents)
         .map_err(|e| McpError::Context(e.to_string()))?;
 
-    // Build structured response JSON.
+    // Build structured response JSON. The pack still has to have projected a
+    // focal entry for the focal entity to be worth serializing, but the body
+    // comes from graph truth rather than from that entry.
     let focal_entry = pack.focal_entities.first();
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
-    let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entry, entity, compact, repository_authority)?
+    let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
+        focal_context_json(store, entity, compact, repository_authority)?
     } else {
         serde_json::json!(null)
     };
@@ -625,8 +645,8 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 "signature": e.signature,
                 "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
                 "read_path": entity_read_path(&e),
-                "start_line": e.span.as_ref().map(|span| span.start_line),
-                "end_line": e.span.as_ref().map(|span| span.end_line),
+                "start_line": entity_presentation_start_line(&e),
+                "end_line": entity_presentation_end_line(&e),
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
@@ -638,13 +658,24 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     repository_authority,
                     EntitySourceScope::WorkspaceHead,
                 )?;
-                let is_stale = LAST_READ_STALE.with(|f| f.get());
                 let source = LAST_READ_SOURCE.with(|f| f.get());
-                obj["stale"] = serde_json::json!(is_stale);
                 obj["source"] = serde_json::json!(source);
-                obj["body"] = serde_json::json!(body
-                    .map(|source| source.body)
-                    .unwrap_or_else(|| entry.content.clone()));
+                // Same rule as the focal body: a dependency's `body` is the
+                // graph-owned projection or null. The pack's own `entry.content`
+                // is a token-accounting stub, and serving it here would hand an
+                // agent signature text shaped like an implementation.
+                match body {
+                    Some(source) => {
+                        obj["body"] = serde_json::json!(source.body);
+                        if let Some(map) = obj.as_object_mut() {
+                            map.extend(source_provenance_fields(&source));
+                        }
+                    }
+                    None => {
+                        obj["body"] = serde_json::Value::Null;
+                        obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(&e));
+                    }
+                }
             }
             Ok(obj)
         } else {
@@ -855,6 +886,8 @@ fn spine_reference_rows(
             kind: source.map(|entity| format!("{:?}", entity.kind)),
             file_path: Some(file_path),
             start_line: None,
+            // A federated xref carries no site span from the other repo's graph.
+            reference_lines: Vec::new(),
             signature: source.map(|entity| entity.signature.clone()),
             snippet: None,
             // CrossRepoEdge proves a dependency but does not retain whether
@@ -878,7 +911,11 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
         "name": row.name,
         "kind": row.kind,
         "file_path": row.file_path,
+        // `start_line` locates the CALLER's definition; `reference_lines` locates
+        // the usages inside it. Both are graph facts and both are 1-based, so an
+        // agent never has to count forward from a definition to find a call site.
         "start_line": row.start_line,
+        "reference_lines": row.reference_lines,
         "signature": row.signature,
         "snippet": row.snippet,
         "relation_kinds": row
@@ -1635,7 +1672,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                     output.push_str(&format!("  File: {}\n", fp));
                 }
                 if let Some(ref span) = focal.span {
-                    output.push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                    let (start_line, end_line) = presentation_span_lines(span);
+                    output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
                 }
 
                 let chain = collect_primary_trace_chain(store, &focal, 12)?;
@@ -1667,11 +1705,12 @@ pub fn handle_explore_codebase<G: GraphStore>(
                             }
                         }
                         if let Some(span) = step.span.as_ref() {
+                            let (start_line, end_line) = presentation_span_lines(span);
                             if !push_with_budget(
                                 &mut output,
                                 &mut tokens_used,
                                 token_budget,
-                                &format!("   Lines: {}–{}\n", span.start_line, span.end_line),
+                                &format!("   Lines: {start_line}–{end_line}\n"),
                             ) {
                                 output.push_str("  ... (truncated)\n");
                                 break;
@@ -1891,8 +1930,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                         output.push_str(&format!("  File: {}\n", fp));
                     }
                     if let Some(ref span) = entity.span {
-                        output
-                            .push_str(&format!("  Lines: {}–{}\n", span.start_line, span.end_line));
+                        let (start_line, end_line) = presentation_span_lines(span);
+                        output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
                     }
 
                     match build_context_pack(store, &entity.id, &opts) {
@@ -2345,105 +2384,471 @@ Get the dependency neighborhood of an entity — both what it depends on and wha
 on it — as a compact graph. Starting from an entity ID, Kin traverses the semantic \
 relations (calls, imports, implements, …) out to the depth you specify and returns the \
 reachable entities as lightweight summaries (id, name, kind, file, signature) plus the \
-edges connecting them, along with total counts and a truncation flag. Reach for it when \
-you want the structural shape around a symbol — its blast radius and its supports — \
-rather than full source bodies: impact-scoping a change, understanding coupling, or \
-mapping how a module hangs together. It returns summaries rather than code precisely so \
-the neighborhood stays within token budgets even at depth; when you then want to read a \
+edges connecting them, along with total counts and a truncation flag. Traversal follows \
+edges in both directions by default: direction='out' walks only what the focal depends \
+on, 'in' walks only what depends on the focal (its dependents — this is the blast-radius \
+direction), and 'both' merges them. Every returned edge carries the direction it was \
+traversed in, so dependencies and dependents are never conflated. Reach for it when you \
+want the structural shape around a symbol — its blast radius and its supports — rather \
+than full source bodies: impact-scoping a change, understanding coupling, or mapping how \
+a module hangs together. It returns summaries rather than code precisely so the \
+neighborhood stays within token budgets even at depth; when you then want to read a \
 specific neighbor's implementation, follow up with get_entity_source, and when you want \
 a directional ordered chain with bodies inlined, use trace_data_flow. \
 When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"isolated, no dependencies\" is authoritative or merely \"not indexed yet\".";
 
+/// Traverse the neighborhood around a focal entity in the requested direction.
+///
+/// Walks the relation table with [`GraphStore::get_all_relations_for_entity`],
+/// which returns an entity's outgoing *and* incoming edges from two separate
+/// adjacency indexes at the same cost. This deliberately does not use
+/// `get_dependency_neighborhood`: that traversal is fed only the outgoing index,
+/// so it returns what the focal depends on and never what depends on it. This
+/// tool has always described itself as answering both, which meant an agent
+/// asking for blast radius was handed the focal's dependencies and told they
+/// were its dependents — the one error a caller cannot detect from the output.
+/// Direction is now traversed as described and tagged per edge.
 pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    // Bidirectional traversal widens the frontier: a hot callee's incoming edge
+    // set is unbounded in a way its outgoing set is not, so the walk is capped
+    // and reports the cap through `truncated` rather than returning a partial
+    // neighborhood that looks complete.
+    const MAX_VISITED_ENTITIES: usize = 2_000;
+
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let limit = get_optional_u64(args, "limit", 30) as usize;
+    let direction = match get_optional_string_param(args, "direction") {
+        Some(value) => match value.trim().to_lowercase().as_str() {
+            "out" | "outgoing" | "dependencies" | "depends_on" | "calls" => "out",
+            "in" | "incoming" | "dependents" | "callers" | "impact" => "in",
+            "both" | "all" | "" => "both",
+            other => {
+                return Err(McpError::InvalidParams(format!(
+                    "invalid direction '{other}': expected out, in, or both"
+                )));
+            }
+        },
+        None => "both",
+    };
+    let want_outgoing = matches!(direction, "out" | "both");
+    let want_incoming = matches!(direction, "in" | "both");
 
-    let neighborhood = store
-        .get_dependency_neighborhood(&entity_id, depth)
-        .map_err(McpError::graph)?;
+    let mut visited: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
+    let mut entities: Vec<serde_json::Value> = Vec::new();
+    let mut relations: Vec<serde_json::Value> = Vec::new();
+    let mut seen_relations: std::collections::HashSet<kin_model::ids::RelationId> =
+        std::collections::HashSet::new();
+    let mut truncated = false;
 
-    let total_entities = neighborhood.entities.len();
-    let total_relations = neighborhood.relations.len();
+    // The focal itself is part of its own neighborhood, matching what the
+    // previous traversal returned so counts stay comparable across the change.
+    if let Some(focal) = store.get_entity(&entity_id).map_err(McpError::graph)? {
+        visited.insert(entity_id);
+        entities.push(compact_entity_summary(&focal));
+    }
+
+    let mut frontier: Vec<(kin_model::ids::EntityId, u32)> = vec![(entity_id, 0)];
+    while !frontier.is_empty() && !truncated {
+        let mut next_frontier: Vec<(kin_model::ids::EntityId, u32)> = Vec::new();
+        for (current, current_depth) in frontier.drain(..) {
+            if current_depth >= depth {
+                continue;
+            }
+            let edges = store
+                .get_all_relations_for_entity(&current)
+                .map_err(McpError::graph)?;
+            for rel in &edges {
+                let src_entity = rel.src.as_entity();
+                let dst_entity = rel.dst.as_entity();
+                // Classify by which endpoint is the node being expanded, so the
+                // tag names the direction actually traversed rather than a
+                // direction assumed from the focal.
+                let (neighbor, edge_direction) = if want_outgoing
+                    && src_entity == Some(current)
+                    && dst_entity.is_some_and(|id| id != current)
+                {
+                    (dst_entity.unwrap(), "outgoing")
+                } else if want_incoming
+                    && dst_entity == Some(current)
+                    && src_entity.is_some_and(|id| id != current)
+                {
+                    (src_entity.unwrap(), "incoming")
+                } else {
+                    continue;
+                };
+
+                // An edge is reachable from both endpoints; emit it once.
+                if seen_relations.insert(rel.id) {
+                    relations.push(serde_json::json!({
+                        "src": rel.src,
+                        "dst": rel.dst,
+                        "kind": format!("{:?}", rel.kind),
+                        "direction": edge_direction,
+                        "from": current.to_string(),
+                    }));
+                }
+
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                if visited.len() > MAX_VISITED_ENTITIES {
+                    truncated = true;
+                    break;
+                }
+                if let Some(entity) = store.get_entity(&neighbor).map_err(McpError::graph)? {
+                    entities.push(compact_entity_summary(&entity));
+                }
+                next_frontier.push((neighbor, current_depth + 1));
+            }
+            if truncated {
+                break;
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    let total_entities = entities.len();
+    let total_relations = relations.len();
 
     // Return compact entity summaries (name, kind, file, id) instead of full
     // entity objects to keep response sizes bounded.
-    let compact_entities: Vec<_> = neighborhood
-        .entities
-        .values()
-        .take(limit)
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id,
-                "name": e.name,
-                "kind": format!("{:?}", e.kind),
-                "file_path": e.file_origin.as_ref().map(|p| p.to_string()),
-                "signature": e.signature,
-            })
-        })
-        .collect();
-
+    entities.truncate(limit);
     // Cap relations to match the entity limit to avoid unbounded output.
-    let compact_relations: Vec<_> = neighborhood
-        .relations
-        .iter()
-        .take(limit * 3)
-        .map(|r| {
-            serde_json::json!({
-                "src": r.src,
-                "dst": r.dst,
-                "kind": format!("{:?}", r.kind),
-            })
-        })
-        .collect();
+    relations.truncate(limit * 3);
 
     let result = serde_json::json!({
+        "focal_id": entity_id.to_string(),
+        "direction": direction,
+        "depth": depth,
         "entity_count": total_entities,
         "relation_count": total_relations,
-        "truncated": total_entities > limit,
-        "entities": compact_entities,
-        "relations": compact_relations,
+        "truncated": truncated || total_entities > limit,
+        "entities": entities,
+        "relations": relations,
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
-pub const GRAPH_STATUS_DESC: &str = "\
-Report the status of the semantic graph that MCP is serving from — the live entity \
-count, embedding-index coverage (embeddings_indexed / embeddings_total / \
-embeddings_pending), and the authority backing it. In product mode this is answered by \
-the repo daemon, so it reflects the daemon-owned, live graph state rather than a stale \
-MCP-local snapshot. Reach for it as a quick health/readiness check: confirm the graph \
-is populated, check how much of it has embeddings indexed (so you know whether \
-semantic_locate / vector retrieval will be complete or still warming up), and verify \
-you're talking to graph-owned truth before relying on the other tools.";
+/// The lightweight per-entity row the neighborhood returns in place of a full
+/// entity object, so a deep walk stays within an agent's token budget.
+fn compact_entity_summary(entity: &kin_model::Entity) -> serde_json::Value {
+    serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "kind": format!("{:?}", entity.kind),
+        "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+        "signature": entity.signature,
+    })
+}
 
-/// Report the health of the graph visible to this dispatcher.
+pub const GRAPH_STATUS_SCHEMA: &str = "kin.graph-status.v1";
+
+fn deserialize_graph_status_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema = String::deserialize(deserializer)?;
+    if schema != GRAPH_STATUS_SCHEMA {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported graph status schema '{schema}', expected '{GRAPH_STATUS_SCHEMA}'"
+        )));
+    }
+    Ok(schema)
+}
+
+fn deserialize_graph_status_unattested<'de, D>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let completion_attested = bool::deserialize(deserializer)?;
+    if completion_attested {
+        return Err(serde::de::Error::custom(
+            "kin.graph-status.v1 does not carry an enrichment-completion attestation",
+        ));
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusView {
+    DaemonSelectedGraph,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusScope {
+    Head,
+    TemporalSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusEmbeddingSource {
+    SelectedGraph,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphStatusAuthority {
+    RepoDaemon,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStatusSampling {
+    /// The daemon held embedding-work serialization while it sampled every
+    /// counter, then revalidated the selected graph's mutation epoch and scope
+    /// authority before publishing the report.
+    PointInTimeSelectedGraph,
+}
+
+/// Readiness observations for the one daemon query graph selected for an MCP
+/// call.
 ///
-/// In product mode this handler runs inside the repo daemon, so the count
-/// reflects daemon-owned live graph state. Offline tests may still call it
-/// against an explicit in-process graph.
+/// The schema, view, and scope are load-bearing. In particular, HEAD and a
+/// temporal session graph are both daemon-owned but are not interchangeable.
+/// Unknown fields require a new schema version instead of silently changing
+/// what an existing consumer believes it measured.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GraphStatusReport {
+    pub schema: String,
+    pub view: GraphStatusView,
+    pub scope: GraphStatusScope,
+    pub authority: GraphStatusAuthority,
+    pub sampling: GraphStatusSampling,
+    /// Process-local optimistic graph-authority epoch revalidated after every
+    /// counter was captured. This is an observation fence, not a durable
+    /// repository generation and not stable across daemon restarts.
+    pub authority_epoch: u64,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    pub embedding_source: GraphStatusEmbeddingSource,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
+    /// Observed counts do not attest that every eligible source was enriched.
+    pub completion_attested: bool,
+    /// The stdio server's standard response envelope. Direct daemon calls omit
+    /// it; stdio adds a report-derived envelope that is validated against these
+    /// same selected-graph observations. No unscoped `/health` graph metadata
+    /// is allowed into this schema.
+    #[serde(default, rename = "_kin", skip_serializing_if = "Option::is_none")]
+    pub response_envelope: Option<crate::envelope::Envelope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphStatusReportWire {
+    #[serde(deserialize_with = "deserialize_graph_status_schema")]
+    schema: String,
+    view: GraphStatusView,
+    scope: GraphStatusScope,
+    authority: GraphStatusAuthority,
+    sampling: GraphStatusSampling,
+    authority_epoch: u64,
+    entity_count: usize,
+    relation_count: usize,
+    embedding_source: GraphStatusEmbeddingSource,
+    embeddings_indexed: usize,
+    embeddings_pending: usize,
+    embeddings_total: usize,
+    #[serde(deserialize_with = "deserialize_graph_status_unattested")]
+    completion_attested: bool,
+    #[serde(default, rename = "_kin")]
+    response_envelope: Option<crate::envelope::Envelope>,
+}
+
+impl<'de> Deserialize<'de> for GraphStatusReport {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GraphStatusReportWire::deserialize(deserializer)?;
+        let report = Self {
+            schema: wire.schema,
+            view: wire.view,
+            scope: wire.scope,
+            authority: wire.authority,
+            sampling: wire.sampling,
+            authority_epoch: wire.authority_epoch,
+            entity_count: wire.entity_count,
+            relation_count: wire.relation_count,
+            embedding_source: wire.embedding_source,
+            embeddings_indexed: wire.embeddings_indexed,
+            embeddings_pending: wire.embeddings_pending,
+            embeddings_total: wire.embeddings_total,
+            completion_attested: wire.completion_attested,
+            response_envelope: wire.response_envelope,
+        };
+        report.validate().map_err(serde::de::Error::custom)?;
+        Ok(report)
+    }
+}
+
+impl GraphStatusReport {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.embeddings_indexed > self.embeddings_total {
+            return Err(format!(
+                "embeddings_indexed ({}) exceeds embeddings_total ({})",
+                self.embeddings_indexed, self.embeddings_total
+            ));
+        }
+        let uncovered = self
+            .embeddings_total
+            .saturating_sub(self.embeddings_indexed);
+        if self.embeddings_pending < uncovered {
+            return Err(format!(
+                "embeddings_pending ({}) is below the uncovered embedding count ({uncovered})",
+                self.embeddings_pending
+            ));
+        }
+        if let Some(envelope) = &self.response_envelope {
+            self.validate_response_envelope(envelope)?;
+        }
+        Ok(())
+    }
+
+    fn validate_response_envelope(
+        &self,
+        envelope: &crate::envelope::Envelope,
+    ) -> std::result::Result<(), String> {
+        use crate::envelope::{Runtime, ENVELOPE_VERSION};
+
+        if envelope.envelope_version != ENVELOPE_VERSION {
+            return Err(format!(
+                "_kin envelope version {} does not match {ENVELOPE_VERSION}",
+                envelope.envelope_version
+            ));
+        }
+        if envelope.runtime != Runtime::RepoDaemon {
+            return Err("_kin runtime is not repo-daemon".to_string());
+        }
+        if envelope.graph_as_of.is_some() {
+            return Err(
+                "_kin graph_as_of is not selected-graph identity and must be absent".to_string(),
+            );
+        }
+        let entity_count = u64::try_from(self.entity_count)
+            .map_err(|_| "entity_count does not fit the response envelope".to_string())?;
+        if envelope.graph_state.entity_count != Some(entity_count)
+            || envelope.graph_state.reconciliation_status.is_some()
+            || envelope.graph_state.loaded.is_some()
+            || envelope.graph_state.initialized.is_some()
+        {
+            return Err("_kin graph_state is not the exact selected-graph observation".to_string());
+        }
+        if envelope.degraded.daemon_unreachable.is_some()
+            || envelope.degraded.embed_worker_failed.is_some()
+            || envelope.degraded.mass_deletion_blocked.is_some()
+            || envelope.degraded.offline_fallback.is_some()
+        {
+            return Err(
+                "_kin carries unscoped daemon health alongside selected-graph status".to_string(),
+            );
+        }
+        let coverage = envelope.semantic_coverage.as_ref().ok_or_else(|| {
+            "_kin semantic_coverage is missing from selected-graph status".to_string()
+        })?;
+        let indexed = u64::try_from(self.embeddings_indexed)
+            .map_err(|_| "embeddings_indexed does not fit the response envelope".to_string())?;
+        let pending = u64::try_from(self.embeddings_pending)
+            .map_err(|_| "embeddings_pending does not fit the response envelope".to_string())?;
+        let total = u64::try_from(self.embeddings_total)
+            .map_err(|_| "embeddings_total does not fit the response envelope".to_string())?;
+        let complete = pending == 0 && indexed == total;
+        if coverage.indexed != indexed
+            || coverage.pending != pending
+            || coverage.total != total
+            || coverage.complete != complete
+        {
+            return Err("_kin semantic_coverage disagrees with selected-graph status".to_string());
+        }
+        if coverage.note.is_some() == complete {
+            return Err(
+                "_kin semantic_coverage.note must be present exactly when coverage is incomplete"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub const GRAPH_STATUS_DESC: &str = "\
+Report the status of the semantic graph selected for this MCP call — live entity \
+and relation counts, embedding-index coverage (embeddings_indexed / embeddings_total / \
+embeddings_pending), and the schema, view, scope, and authority backing them. In product \
+mode one repo-daemon response owns every field, including for an X-Kin-Session temporal \
+scope, so durable repository counts cannot be mixed with a different live/session graph. \
+Reach for it as a quick health/readiness check: confirm the selected graph is populated, \
+check how much of its own retrieval universe has embeddings indexed, and verify the scope \
+before relying on other tools. embedding_source is selected_graph; any pipeline-specific \
+fallback coverage is reported by semantic_locate itself. sampling=point_in_time_selected_graph \
+means the daemon held its normal embedding-work fence while reading internally synchronized \
+coverage counters, then revalidated authority_epoch after capturing every counter; \
+authority_epoch is process-local, not a durable repository generation. \
+Enrichment completeness is not attested \
+(completion_attested=false), so a populated graph is not by itself a complete one. This \
+tool requires the Kin daemon; it does not invent an offline approximation.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphStatusObservation {
+    pub authority_epoch: u64,
+    pub entity_count: usize,
+    pub relation_count: usize,
+    pub embeddings_indexed: usize,
+    pub embeddings_pending: usize,
+    pub embeddings_total: usize,
+}
+
+pub fn handle_daemon_graph_status_observation(
+    scope: GraphStatusScope,
+    observation: GraphStatusObservation,
+) -> Result<ToolCallResult> {
+    let report = GraphStatusReport {
+        schema: GRAPH_STATUS_SCHEMA.to_string(),
+        view: GraphStatusView::DaemonSelectedGraph,
+        scope,
+        authority: GraphStatusAuthority::RepoDaemon,
+        sampling: GraphStatusSampling::PointInTimeSelectedGraph,
+        authority_epoch: observation.authority_epoch,
+        entity_count: observation.entity_count,
+        relation_count: observation.relation_count,
+        embedding_source: GraphStatusEmbeddingSource::SelectedGraph,
+        embeddings_indexed: observation.embeddings_indexed,
+        embeddings_pending: observation.embeddings_pending,
+        embeddings_total: observation.embeddings_total,
+        completion_attested: false,
+        response_envelope: None,
+    };
+    report.validate().map_err(crate::McpError::Other)?;
+    Ok(ToolCallResult::text(serde_json::to_string_pretty(&report)?))
+}
+
+/// Fail closed on the generic in-process dispatcher.
+///
+/// Product mode is special-cased by the daemon so it can identify the selected
+/// scope and read the concrete embedding status. A bare [`GraphStore`] cannot
+/// satisfy that contract.
 pub fn handle_graph_status<G: GraphStore>(
     _args: &HashMap<String, serde_json::Value>,
-    store: &G,
+    _store: &G,
 ) -> Result<ToolCallResult> {
-    let entities = store.list_all_entities().map_err(McpError::graph)?;
-    let entity_count = entities.len();
-
-    let result = serde_json::json!({
-        "entity_count": entity_count,
-        "authority": "repo-daemon",
-        "note": "Product MCP calls are served by the repo daemon. Offline in-process dispatch is test-only."
-    });
-
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    Ok(ToolCallResult::error(
+        "kin_graph_status requires the Kin daemon: the generic in-process graph surface cannot \
+         measure the exact embedding universe or identify HEAD versus a temporal session scope",
+    ))
 }
 
 #[cfg(test)]
@@ -2547,6 +2952,7 @@ mod tests {
             start_line: 1,
             end_line: 3,
             signature: format!("fn {name}()"),
+            provenance: serde_json::Map::new(),
             body: body.to_string(),
         })
     }
@@ -3348,5 +3754,320 @@ mod tests {
         args.insert("granularity".to_string(), serde_json::json!("module"));
         let err = handle_semantic_locate(&args, &store).unwrap_err();
         assert!(matches!(err, McpError::InvalidParams(_)));
+    }
+
+    /// `caller -> focal -> callee`: the focal has exactly one dependent and one
+    /// dependency, on opposite sides of the relation table.
+    fn neighborhood_fixture() -> (InMemoryGraph, EntityId, EntityId, EntityId) {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/caller.rs");
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        let (caller_id, focal_id, callee_id) = (caller.id, focal.id, callee.id);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&callee).unwrap();
+        store
+            .upsert_relation(&make_relation(caller_id, focal_id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(focal_id, callee_id, RelationKind::Calls))
+            .unwrap();
+        (store, caller_id, focal_id, callee_id)
+    }
+
+    fn neighborhood_names(response: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = response["entities"]
+            .as_array()
+            .expect("entities must be an array")
+            .iter()
+            .map(|e| {
+                e["name"]
+                    .as_str()
+                    .expect("name must be a string")
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn neighborhood_response_in(
+        store: &InMemoryGraph,
+        focal: EntityId,
+        direction: Option<&str>,
+    ) -> serde_json::Value {
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal.to_string()),
+        );
+        if let Some(direction) = direction {
+            args.insert("direction".to_string(), serde_json::json!(direction));
+        }
+        parsed_response(&handle_graph_neighborhood(&args, store).unwrap())
+    }
+
+    /// The FIR-1595 regression. The tool has always described itself as
+    /// returning "both what it depends on and what depends on it", but traversed
+    /// the outgoing index alone, so `caller` — the only entity whose behavior a
+    /// change to `focal` can break — was never in the answer. An agent asking
+    /// this tool for blast radius got the focal's dependencies instead, with
+    /// nothing in the output to reveal the substitution.
+    #[test]
+    fn graph_neighborhood_returns_dependents_not_only_dependencies() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let response = neighborhood_response_in(&store, focal_id, None);
+        assert_eq!(response["direction"], "both");
+        assert_eq!(
+            neighborhood_names(&response),
+            vec!["callee", "caller", "focal"],
+            "the default neighborhood must carry the dependent as well as the dependency"
+        );
+        assert_eq!(response["entity_count"], 3);
+        assert_eq!(response["relation_count"], 2);
+        assert_eq!(response["truncated"], false);
+    }
+
+    /// Direction is not just a filter on a merged walk: asking for dependents
+    /// alone must return the dependent alone.
+    #[test]
+    fn graph_neighborhood_direction_in_returns_only_dependents() {
+        let (store, caller_id, focal_id, _) = neighborhood_fixture();
+        let response = neighborhood_response_in(&store, focal_id, Some("in"));
+        assert_eq!(response["direction"], "in");
+        assert_eq!(neighborhood_names(&response), vec!["caller", "focal"]);
+        let edges = response["relations"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["direction"], "incoming");
+        assert_eq!(edges[0]["src"]["Entity"], serde_json::json!(caller_id));
+        assert_eq!(edges[0]["dst"]["Entity"], serde_json::json!(focal_id));
+    }
+
+    /// The previous behavior stays reachable by name, so a caller that really
+    /// wants dependencies can ask for them and know that is what it got.
+    #[test]
+    fn graph_neighborhood_direction_out_returns_only_dependencies() {
+        let (store, _, focal_id, callee_id) = neighborhood_fixture();
+        let response = neighborhood_response_in(&store, focal_id, Some("out"));
+        assert_eq!(response["direction"], "out");
+        assert_eq!(neighborhood_names(&response), vec!["callee", "focal"]);
+        let edges = response["relations"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["direction"], "outgoing");
+        assert_eq!(edges[0]["dst"]["Entity"], serde_json::json!(callee_id));
+    }
+
+    /// Direction aliases exist because agents phrase this as "callers" or
+    /// "dependents" far more often than as "in".
+    #[test]
+    fn graph_neighborhood_accepts_direction_aliases() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        for alias in ["in", "incoming", "dependents", "callers", "impact"] {
+            let response = neighborhood_response_in(&store, focal_id, Some(alias));
+            assert_eq!(response["direction"], "in", "alias {alias} must map to in");
+        }
+        for alias in ["out", "outgoing", "dependencies", "depends_on", "calls"] {
+            let response = neighborhood_response_in(&store, focal_id, Some(alias));
+            assert_eq!(
+                response["direction"], "out",
+                "alias {alias} must map to out"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_neighborhood_rejects_an_unknown_direction() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("sideways"));
+        let err = handle_graph_neighborhood(&args, &store).unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)), "{err:?}");
+    }
+
+    /// Depth must walk dependents transitively, not just one hop back: the
+    /// grandparent of a focal is inside its blast radius at depth 2.
+    #[test]
+    fn graph_neighborhood_walks_dependents_transitively() {
+        let (store, caller_id, focal_id, _) = neighborhood_fixture();
+        let grandparent = make_entity("grandparent", "src/grandparent.rs");
+        let grandparent_id = grandparent.id;
+        store.upsert_entity(&grandparent).unwrap();
+        store
+            .upsert_relation(&make_relation(
+                grandparent_id,
+                caller_id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("in"));
+        args.insert("depth".to_string(), serde_json::json!(2));
+        let response = parsed_response(&handle_graph_neighborhood(&args, &store).unwrap());
+        assert_eq!(
+            neighborhood_names(&response),
+            vec!["caller", "focal", "grandparent"]
+        );
+    }
+
+    /// An edge reachable from both of its endpoints is still one edge. Walking
+    /// both directions must not double-count the relation table.
+    #[test]
+    fn graph_neighborhood_emits_each_edge_once() {
+        let (store, _, focal_id, callee_id) = neighborhood_fixture();
+        // focal -> callee and callee -> focal: a cycle whose single pair of
+        // edges is reachable from either side in `both` mode.
+        store
+            .upsert_relation(&make_relation(callee_id, focal_id, RelationKind::Calls))
+            .unwrap();
+        let response = neighborhood_response_in(&store, focal_id, Some("both"));
+        let edges = response["relations"].as_array().unwrap();
+        let mut ids: Vec<String> = edges
+            .iter()
+            .map(|e| format!("{}->{}", e["src"], e["dst"]))
+            .collect();
+        ids.sort();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "each relation must appear once: {ids:?}"
+        );
+    }
+
+    /// A focal with no edges at all still reports itself, and reports honestly
+    /// that nothing else is there.
+    #[test]
+    fn graph_neighborhood_on_an_isolated_entity_reports_only_the_focal() {
+        let store = InMemoryGraph::new();
+        let lonely = make_entity("lonely", "src/lonely.rs");
+        let lonely_id = lonely.id;
+        store.upsert_entity(&lonely).unwrap();
+        let response = neighborhood_response_in(&store, lonely_id, None);
+        assert_eq!(neighborhood_names(&response), vec!["lonely"]);
+        assert_eq!(response["relation_count"], 0);
+        assert_eq!(response["truncated"], false);
+    }
+
+    /// The declared tool schema must offer the parameter the handler honors,
+    /// and the description must claim the direction the traversal delivers.
+    #[test]
+    fn graph_neighborhood_schema_and_description_match_the_behavior() {
+        let tools = crate::tools::tool_definitions();
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name == "graph_neighborhood")
+            .expect("graph_neighborhood must be registered");
+        assert!(
+            tool.input_schema["properties"]["direction"].is_object(),
+            "the direction parameter must be declared: {}",
+            tool.input_schema
+        );
+        assert!(
+            tool.description.contains("both directions"),
+            "the description must state that traversal is bidirectional"
+        );
+    }
+
+    /// Nothing in this crate may quietly go back to the outgoing-only
+    /// traversal: `get_dependency_neighborhood` is fed only the outgoing index
+    /// in kin-db, which is what made this tool answer dependencies when it was
+    /// asked for dependents.
+    #[test]
+    fn graph_neighborhood_does_not_use_the_outgoing_only_traversal() {
+        // Split so this guard's own source line is not a match for itself.
+        let needle = concat!(".get_dependency_", "neighborhood(");
+        let source = include_str!("entities.rs");
+        let call_site = source.lines().find(|line| line.contains(needle));
+        assert!(
+            call_site.is_none(),
+            "outgoing-only neighborhood traversal reintroduced: {call_site:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_graph_status_measures_one_selected_graph() {
+        let graph = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/caller.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
+            .unwrap();
+        let embeddings = graph.embedding_status();
+        let observation = GraphStatusObservation {
+            authority_epoch: 42,
+            entity_count: graph.entity_count(),
+            relation_count: graph.relation_count(),
+            embeddings_indexed: embeddings.indexed,
+            embeddings_pending: embeddings.pending,
+            embeddings_total: embeddings.total,
+        };
+        let result =
+            handle_daemon_graph_status_observation(GraphStatusScope::TemporalSession, observation)
+                .unwrap();
+        let report: GraphStatusReport = serde_json::from_value(parsed_response(&result)).unwrap();
+
+        assert_eq!(report.schema, GRAPH_STATUS_SCHEMA);
+        assert_eq!(report.view, GraphStatusView::DaemonSelectedGraph);
+        assert_eq!(report.scope, GraphStatusScope::TemporalSession);
+        assert_eq!(report.authority, GraphStatusAuthority::RepoDaemon);
+        assert_eq!(
+            report.sampling,
+            GraphStatusSampling::PointInTimeSelectedGraph
+        );
+        assert_eq!(report.authority_epoch, 42);
+        assert_eq!(report.entity_count, observation.entity_count);
+        assert_eq!(report.relation_count, observation.relation_count);
+        assert_eq!(
+            report.embedding_source,
+            GraphStatusEmbeddingSource::SelectedGraph
+        );
+        assert_eq!(report.embeddings_indexed, embeddings.indexed);
+        assert_eq!(report.embeddings_pending, embeddings.pending);
+        assert_eq!(report.embeddings_total, embeddings.total);
+        assert!(!report.completion_attested);
+        assert!(report.response_envelope.is_none());
+    }
+
+    #[test]
+    fn daemon_graph_status_rejects_an_impossible_observation_before_serializing() {
+        let error = handle_daemon_graph_status_observation(
+            GraphStatusScope::Head,
+            GraphStatusObservation {
+                authority_epoch: 42,
+                entity_count: 2,
+                relation_count: 1,
+                embeddings_indexed: 3,
+                embeddings_pending: 0,
+                embeddings_total: 2,
+            },
+        )
+        .expect_err("the direct daemon boundary must reject impossible coverage");
+        assert!(
+            error
+                .to_string()
+                .contains("embeddings_indexed (3) exceeds embeddings_total (2)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn generic_graph_status_refuses_an_unmeasured_offline_approximation() {
+        let result = handle_graph_status(&HashMap::new(), &InMemoryGraph::new()).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("requires the Kin daemon"), "{text}");
     }
 }

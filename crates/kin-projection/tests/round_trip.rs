@@ -54,7 +54,7 @@ fn rust_fn_round_trip() {
 
     // Modify the entity
     let new_body = b"fn add(a: i32, b: i32) -> i32 {\n    a.wrapping_add(b)\n}\n";
-    let splice = splice_entity(&layout, &entity_id, new_body).unwrap();
+    let splice = splice_entity(source, &layout, &entity_id, new_body).unwrap();
     let result = apply_splices(source, vec![splice]).unwrap();
 
     // Verify trivia is preserved
@@ -120,7 +120,7 @@ fn python_def_round_trip() {
     );
 
     let new_body = b"def greet(name):\n    return f\"Hi, {name}!\"\n";
-    let splice = splice_entity(&layout, &entity_id, new_body).unwrap();
+    let splice = splice_entity(source, &layout, &entity_id, new_body).unwrap();
     let result = apply_splices(source, vec![splice]).unwrap();
 
     assert!(result.starts_with(b"# utils\n"));
@@ -178,7 +178,7 @@ fn typescript_function_round_trip() {
     );
 
     let new_body = b"export function parse(input: string): number {\n  return Number(input);\n}\n";
-    let splice = splice_entity(&layout, &entity_id, new_body).unwrap();
+    let splice = splice_entity(source, &layout, &entity_id, new_body).unwrap();
     let result = apply_splices(source, vec![splice]).unwrap();
 
     assert!(result.starts_with(b"// module\n"));
@@ -225,7 +225,7 @@ fn go_func_round_trip() {
     );
 
     let new_body = b"func Add(a, b int) int {\n\tresult := a + b\n\treturn result\n}\n";
-    let splice = splice_entity(&layout, &entity_id, new_body).unwrap();
+    let splice = splice_entity(source, &layout, &entity_id, new_body).unwrap();
     let result = apply_splices(source, vec![splice]).unwrap();
 
     assert!(result.starts_with(b"package main\n\n"));
@@ -283,7 +283,7 @@ fn java_method_round_trip() {
     );
 
     let new_body = b"public int add(int a, int b) {\n    return Math.addExact(a, b);\n}\n";
-    let splice = splice_entity(&layout, &entity_id, new_body).unwrap();
+    let splice = splice_entity(source, &layout, &entity_id, new_body).unwrap();
     let result = apply_splices(source, vec![splice]).unwrap();
 
     assert!(result.starts_with(b"// Main.java\n"));

@@ -127,6 +127,7 @@ mod repository_checkout;
 pub mod repository_commit;
 mod repository_drift;
 mod repository_merge;
+mod repository_merge_state;
 mod repository_rollback;
 mod repository_stash;
 mod repository_tag;
@@ -136,18 +137,28 @@ pub mod supervisor;
 pub mod traffic_adapter;
 pub mod write_veto;
 
-pub use daemon::{run, DaemonConfig};
-pub use error::{DaemonError, Result};
-pub use lifecycle::{
-    daemon_is_up, ensure_daemon_running, ensure_daemon_running_with_idle_timeout, AutoStartError,
-    MCP_IDLE_TIMEOUT_SECS,
+pub use daemon::{
+    acquire_daemon_authority, acquire_daemon_authority_within, run, run_with_authority,
+    DaemonConfig,
 };
+pub use error::{DaemonError, Result};
+pub use lifecycle::{daemon_is_up, AutoStartError, MCP_IDLE_TIMEOUT_SECS};
 pub use loop_runner::LoopConfig;
 pub use session_registry::SessionCoordinator;
 pub use state::{ChangeType, DaemonEvent, DaemonState, LspEnrichmentMessage, LspEnrichmentRequest};
 
 /// Re-export kin_spine so consumers (MCP server, API) can use it via kin_daemon.
 pub use kin_spine;
+
+/// Exact test-harness entrypoint for the shared process-group guardian.
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run daemon process-group guardian worker");
+    assert_eq!(dispatched, requested);
+}
 
 /// Process-global serialization for tests that mutate shared `KIN_*` environment
 /// variables.

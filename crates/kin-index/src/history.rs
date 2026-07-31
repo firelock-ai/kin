@@ -13,8 +13,10 @@ use std::path::Path;
 
 use kin_blobs::BlobStore;
 use kin_model::{
-    ArtifactId, ChangeOrigin, Entity, EntityDelta, EntityId, FilePathId, ParseCompleteness,
-    Relation, RelationDelta, RelationId, ResolvedTree, SemanticChange, SemanticChangeId, TreeEntry,
+    ArtifactId, ChangeOrigin, Entity, EntityDelta, EntityId, EntityKind, EntityMetadata,
+    EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId, ParseCompleteness, Relation,
+    RelationDelta, RelationId, ResolvedTree, SemanticChange, SemanticChangeId, SemanticFingerprint,
+    TreeEntry, Visibility,
 };
 use sha2::{Digest, Sha256};
 
@@ -30,13 +32,22 @@ use crate::pipeline::IndexPipeline;
 ///
 /// Kin's deep history is not a stored fact. It is re-authored here from
 /// graph-owned trees and CAS bodies, so editing any of the replay functions
-/// pinned by `scripts/hydration-semantics-manifest.json` changes what Kin
-/// reports about the past on repositories that were already ingested. A digest
-/// mismatch in that guard is a decision to make, not a file to regenerate:
-/// establish whether replay semantics actually changed, and if they did, bump
-/// this constant and the manifest's recorded version together. Never
-/// regenerate a digest silently.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 5;
+/// pinned by `scripts/hydration-semantics-manifest.json` changes what a
+/// repository's past is said to contain the next time that repository is
+/// admitted. A digest mismatch in that guard is a decision to make, not a file
+/// to regenerate: establish whether replay semantics actually changed, and if
+/// they did, bump this constant and the manifest's recorded version together.
+/// Never regenerate a digest silently.
+///
+/// This constant is a declaration, not an enforcement point. Nothing persists
+/// it beside a graph and nothing compares it when one is opened, and no path
+/// re-derives historical deltas for a repository that was already admitted, so
+/// bumping it does not invalidate, migrate, or re-enrich an existing graph. A
+/// repository admitted under an earlier version keeps whatever its past was
+/// authored to contain until it is admitted again, and reports nothing about
+/// which version authored it. Coupling the dial to graph authority so a
+/// version gap can be detected and refused is open follow-up work.
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 7;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -85,6 +96,12 @@ pub fn derive_historical_semantic_deltas(
     blob_store: &BlobStore,
 ) -> Result<Vec<HistoricalSemanticDelta>> {
     let pipeline = IndexPipeline::new();
+    // An external target's fingerprint is a pure function of the import source
+    // and symbol its identity is derived from, so it is the same value in every
+    // tree that observes the import. The fold relinks the whole tree per change,
+    // which would otherwise recompute those digests once per commit for a value
+    // that cannot change.
+    let mut external_fingerprints = BTreeMap::<EntityId, SemanticFingerprint>::new();
     let mut states = BTreeMap::<SemanticChangeId, SemanticTreeState>::new();
     let mut known_changes = HashSet::with_capacity(changes.len());
     let mut remaining_child_uses = BTreeMap::<SemanticChangeId, usize>::new();
@@ -142,7 +159,13 @@ pub fn derive_historical_semantic_deltas(
                 change.id
             ))
         })?;
-        let current = semantic_state_for_tree(tree, &parent_states, blob_store, &pipeline)?;
+        let current = semantic_state_for_tree(
+            tree,
+            &parent_states,
+            blob_store,
+            &pipeline,
+            &mut external_fingerprints,
+        )?;
         let entity_deltas = diff_entities(&first_parent.entities, &current.entities);
         let relation_deltas = diff_relations(&first_parent.relations, &current.relations);
 
@@ -188,6 +211,7 @@ fn semantic_state_for_tree(
     parents: &[&SemanticTreeState],
     blob_store: &BlobStore,
     pipeline: &IndexPipeline,
+    external_fingerprints: &mut BTreeMap<EntityId, SemanticFingerprint>,
 ) -> Result<SemanticTreeState> {
     let mut files = BTreeMap::new();
 
@@ -308,18 +332,18 @@ fn semantic_state_for_tree(
     parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
     let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
+    entities.extend(external_reference_targets(
+        &linked,
+        &entities,
+        external_fingerprints,
+    ));
     let mut relations = BTreeMap::new();
     for relation in linked {
         if let Some(absent) = absent_local_endpoint(&relation, &entities) {
             // A change carries the entity set of its own tree, so replaying it
-            // can only bind an edge whose endpoints that tree defines. The
-            // linker's cross-repo placeholder destination is absent by
-            // contract and stays a view-time inference rather than change-owned
-            // history; every other absent endpoint is inconsistent state and
-            // fails closed here instead of being admitted.
-            if absent.is_destination && is_external_import_placeholder(&relation) {
-                continue;
-            }
+            // can only bind an edge whose endpoints that tree defines. Every
+            // cross-repo destination now has one, so an absent endpoint here is
+            // inconsistent state and fails closed instead of being admitted.
             return Err(invalid(format!(
                 "linked relation {} names {} entity {} that the tree does not define",
                 relation.id,
@@ -349,6 +373,172 @@ fn semantic_state_for_tree(
 struct AbsentEndpoint {
     entity_id: EntityId,
     is_destination: bool,
+}
+
+/// Bind a graph-owned destination for every cross-repo reference the linker
+/// produced against `entities`.
+///
+/// The linker answers an import it cannot resolve locally with a deterministic
+/// placeholder destination naming the symbol another repository owns. That is
+/// the one endpoint this tree cannot supply from its own files, and a change
+/// whose relation names an entity nothing defines does not replay, so the
+/// reference used to be discarded: a freshly imported repository held no
+/// cross-repo references at all and answered every cross-repo query empty.
+///
+/// Binding an external target instead makes the reference complete,
+/// change-owned truth at the admission boundary. The target keeps the linker's
+/// deterministic identity, so every commit that observes the same import binds
+/// the same node. It carries no file origin, because this tree does not contain
+/// the definition, and no signature, because none was observed. Its uniform
+/// [`EntityKind::Module`] says only what this repository can prove, that the
+/// symbol is reached through a module it does not own, and keeps external
+/// targets from ever matching a local definition by kind.
+///
+/// Every field is derived from the target itself rather than from whichever
+/// importer happened to be walked first, so a commit that only reorders or
+/// renames unrelated files cannot restate the target and make history record a
+/// modification to a node it never touched.
+fn external_reference_targets(
+    linked: &[Relation],
+    entities: &BTreeMap<EntityId, Entity>,
+    fingerprints: &mut BTreeMap<EntityId, SemanticFingerprint>,
+) -> BTreeMap<EntityId, Entity> {
+    // One target can be imported by several files, and in a polyglot tree those
+    // importers do not share a language. The importers are collected first so
+    // the language is chosen from all of them by a total order, because the id
+    // the linker derives excludes language: picking the first importer in walk
+    // order would let an unrelated added or renamed file change which language a
+    // target claims.
+    let mut importers: BTreeMap<EntityId, (&str, &str, Vec<LanguageId>)> = BTreeMap::new();
+    for relation in linked {
+        if !is_external_import_placeholder(relation) {
+            continue;
+        }
+        let Some(destination) = relation.dst.as_entity() else {
+            continue;
+        };
+        if entities.contains_key(&destination) {
+            continue;
+        }
+        // The placeholder contract guarantees a local source, a non-empty
+        // import source, and exactly one evidence entry carrying the symbol.
+        let (Some(source), Some(import_source), Some(symbol)) = (
+            relation.src.as_entity().and_then(|id| entities.get(&id)),
+            relation.import_source.as_deref(),
+            relation
+                .evidence
+                .first()
+                .and_then(|evidence| evidence.token.as_deref()),
+        ) else {
+            continue;
+        };
+        importers
+            .entry(destination)
+            .or_insert((import_source, symbol, Vec::new()))
+            .2
+            .push(source.language);
+    }
+
+    let mut targets = BTreeMap::new();
+    for (destination, (import_source, symbol, languages)) in importers {
+        let fingerprint = fingerprints
+            .entry(destination)
+            .or_insert_with(|| external_reference_fingerprint(import_source, symbol))
+            .clone();
+        let Some(language) = lowest_language(&languages) else {
+            continue;
+        };
+        targets.insert(
+            destination,
+            external_reference_entity(destination, symbol, language, fingerprint),
+        );
+    }
+    targets
+}
+
+/// Choose one language from every language that reached an external target.
+///
+/// [`LanguageId`] carries no total order of its own, so the languages are
+/// ordered by their canonical names. Any total order would do; what matters is
+/// that the choice depends on the set of importing languages and on nothing
+/// else, so it holds still while that set does.
+fn lowest_language(languages: &[LanguageId]) -> Option<LanguageId> {
+    languages
+        .iter()
+        .min_by_key(|language| language.to_string())
+        .copied()
+}
+
+/// Report whether `entity` is an external reference target rather than
+/// something this repository defines.
+///
+/// Consumers of graph truth need this because such a target answers a different
+/// question than every other entity: it names a symbol reached through a module
+/// this repository does not own, so it has no file, no span, and no signature to
+/// report, and it is never the definition of anything found here.
+///
+/// The test is deliberately the conjunction of the role and the absent file
+/// origin rather than the role alone. [`EntityRole::External`] is also assigned
+/// by path classification to real, locally defined entities under `third_party/`
+/// and its siblings, and those own their source; only a target with no file
+/// origin at all stands for a definition that lives elsewhere.
+pub fn is_external_reference_target(entity: &Entity) -> bool {
+    entity.role == EntityRole::External && entity.file_origin.is_none()
+}
+
+/// Build the external target a cross-repo reference resolves against.
+fn external_reference_entity(
+    id: EntityId,
+    symbol: &str,
+    language: LanguageId,
+    fingerprint: SemanticFingerprint,
+) -> Entity {
+    Entity {
+        id,
+        kind: EntityKind::Module,
+        name: symbol.to_string(),
+        language,
+        fingerprint,
+        file_origin: None,
+        span: None,
+        signature: String::new(),
+        visibility: Visibility::Public,
+        role: EntityRole::External,
+        doc_summary: None,
+        metadata: EntityMetadata::default(),
+        lineage_parent: None,
+        created_in: None,
+        superseded_by: None,
+    }
+}
+
+/// Derive the fingerprint of an external target from the only two facts this
+/// repository observed about it.
+///
+/// The bodies that would produce a real fingerprint live in another repository,
+/// so every hash is domain-separated over the import source and symbol instead.
+/// That keeps one external target's identity stable across commits while
+/// keeping two different targets distinct, and it never coincides with a
+/// fingerprint computed over actual source. The stability score is zero because
+/// nothing here was measured.
+fn external_reference_fingerprint(import_source: &str, symbol: &str) -> SemanticFingerprint {
+    let digest = |domain: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update((import_source.len() as u64).to_le_bytes());
+        hasher.update(import_source.as_bytes());
+        hasher.update((symbol.len() as u64).to_le_bytes());
+        hasher.update(symbol.as_bytes());
+        Hash256::from_bytes(hasher.finalize().into())
+    };
+    SemanticFingerprint {
+        algorithm: FingerprintAlgorithm::V1TreeSitter,
+        ast_hash: digest("kin.external-reference.ast.v1"),
+        signature_hash: digest("kin.external-reference.signature.v1"),
+        behavior_hash: digest("kin.external-reference.behavior.v1"),
+        equivalence_hash: digest("kin.external-reference.equivalence.v1"),
+        stability_score: 0.0,
+    }
 }
 
 /// Report the first entity endpoint of `relation` that `entities` does not
@@ -532,7 +722,6 @@ fn invalid(message: impl Into<String>) -> IndexError {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
 
     use kin_git::{
         admit_semantic_git_import, capture_lossless_git_repository, plan_semantic_git_import,
@@ -761,10 +950,10 @@ mod tests {
 
     /// The shape that blocked every real repository: a commit that starts
     /// calling a symbol imported from another crate. The linker answers with a
-    /// cross-repo placeholder destination that is absent from this repository's
-    /// entity set by contract, so a change carrying that edge cannot be
-    /// replayed. Admission must still bind the commit and the local call graph
-    /// around it.
+    /// cross-repo placeholder destination no local file defines, so enrichment
+    /// must bind an external target for it before the change can replay. The
+    /// commit, the local call graph around it, and the cross-repo reference
+    /// itself must all survive admission.
     ///
     /// Upstream trigger: fd b4a252a3916ab342b289331fbf49aa2db73df579, its 26th
     /// commit, which adds `extern crate isatty` and calls `stdout_isatty` from
@@ -848,6 +1037,25 @@ mod tests {
                 .iter()
                 .any(|relation| relation.kind == kin_model::RelationKind::Calls),
             "the local call graph must survive"
+        );
+        let external = bound_relations
+            .iter()
+            .find(|relation| is_external_import_placeholder(relation))
+            .expect("the cross-repo reference must survive admission as change-owned truth");
+        let target = external.dst.as_entity().and_then(|id| {
+            admitted
+                .changes
+                .iter()
+                .flat_map(|change| &change.entity_deltas)
+                .filter_map(EntityDelta::new_state)
+                .find(|entity| entity.id == id)
+        });
+        let target = target.expect("the external reference must bind a destination entity");
+        assert_eq!(target.role, EntityRole::External);
+        assert_eq!(target.name, "stdout_isatty");
+        assert!(
+            target.file_origin.is_none(),
+            "an external target has no file in this repository"
         );
         for relation in &bound_relations {
             for node in [relation.src, relation.dst] {
@@ -1054,17 +1262,16 @@ mod tests {
     }
 
     fn git(repository: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(repository)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .unwrap();
+        let output = fixture_git(repository).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {args:?} failed\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn fixture_git(repository: &Path) -> kin_git::test_support::FixtureGitCommand {
+        kin_git::test_support::fixture_git_in(repository)
     }
 }

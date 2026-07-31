@@ -70,6 +70,111 @@ pub fn is_target_body_update(op: &McpMutationOperation) -> bool {
             .is_some_and(|body| !body.trim().is_empty())
 }
 
+/// An operation that carries new source text for a file.
+///
+/// Source text can only become truth by being spliced into exact repository
+/// bytes and projected into the working file, which lives in the daemon commit
+/// path. Any other path must refuse an operation shaped like this rather than
+/// commit whatever else the operation carries, because a commit that keeps the
+/// metadata and drops the source reports an agent's edit as durable while the
+/// file it named is unchanged.
+///
+/// Deliberately wider than [`is_target_body_update`]: that names the one shape
+/// the daemon can honor without a payload, while this names every shape whose
+/// substance is the body, including an entity payload sent alongside one.
+pub fn carries_source_body(op: &McpMutationOperation) -> bool {
+    op.body
+        .as_deref()
+        .is_some_and(|body| !body.trim().is_empty())
+}
+
+/// Why a commit was refused before anything was applied, in a form a caller can
+/// branch on without reading prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitRefusalCode {
+    /// The operations cannot be turned into a committed delta on any path.
+    NotCommittable,
+    /// The operations carry new source text and this path has no projection to
+    /// write it with. The daemon commit path honors the identical operations.
+    SourceBodyRequiresDaemonCommit,
+}
+
+impl CommitRefusalCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotCommittable => "not_committable",
+            Self::SourceBodyRequiresDaemonCommit => "source_body_requires_daemon_commit",
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::NotCommittable => {
+                "Fix or remove the named operations and commit again; the transaction is left \
+                 active and nothing was applied."
+            }
+            Self::SourceBodyRequiresDaemonCommit => {
+                "These operations require the daemon commit path, which splices the body into \
+                 exact repository bytes and projects the result into the working file. Commit \
+                 through a running Kin daemon; the transaction is left active and nothing was \
+                 applied."
+            }
+        }
+    }
+}
+
+/// One refusal, naming its code, the operations that caused it, and the state
+/// the transaction is left in.
+///
+/// Rendered as a sentence followed by the same refusal as JSON: an agent reads
+/// the code and the operation list, a human reads the sentence, and neither has
+/// to reconstruct the other from the other's format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitRefusal {
+    pub schema: String,
+    pub code: CommitRefusalCode,
+    pub transaction_id: String,
+    pub transaction_state: String,
+    pub applied: bool,
+    pub operations: Vec<String>,
+    pub remedy: String,
+}
+
+impl CommitRefusal {
+    pub const SCHEMA: &'static str = "kin.mcp.commit_refusal.v1";
+
+    pub fn new(code: CommitRefusalCode, transaction_id: &str, operations: Vec<String>) -> Self {
+        Self {
+            schema: Self::SCHEMA.to_string(),
+            code,
+            transaction_id: transaction_id.to_string(),
+            transaction_state: "active".to_string(),
+            applied: false,
+            operations,
+            remedy: code.remedy().to_string(),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let listed = self
+            .operations
+            .iter()
+            .map(|reason| format!("  - {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let evidence = serde_json::to_string(self)
+            .unwrap_or_else(|error| format!("{{\"serialize_error\":\"{error}\"}}"));
+        format!(
+            "Cannot commit transaction {}: {} staged operation(s) were refused ({}):\n{listed}\n{}\n{evidence}",
+            self.transaction_id,
+            self.operations.len(),
+            self.code.as_str(),
+            self.remedy,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTransaction {
     pub transaction_id: String,
@@ -327,6 +432,14 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
      \"description\": \"<why>\"}\n\
      Prefer the first shape: it needs only a target and the new source text";
 
+/// Every field an operation is allowed to carry.
+///
+/// Serde drops keys it does not model, so an operation naming its source text
+/// anything other than `body` decodes cleanly with `body: None` and is planned
+/// as if no source had been sent. Checking the key set first is what turns that
+/// into a refusal the caller can act on.
+const OPERATION_FIELDS: [&str; 5] = ["verb", "target", "payload", "body", "description"];
+
 /// Decode an `operations` argument into staged operations.
 ///
 /// A raw serde failure here names an internal field of whichever payload
@@ -334,17 +447,63 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
 /// improvising the shape nothing it can act on. Every decode failure is
 /// rewritten to name the accepted shapes, so a caller that guessed wrong learns
 /// the contract from the refusal instead of looping on retries.
+///
+/// Unknown keys are refused rather than ignored. A caller writing the shape by
+/// hand reaches for `content`, `source`, or `new_body` before it reaches for
+/// `body`, and silently discarding that key is indistinguishable from a commit
+/// that dropped the change: the operation stages, commits, and reports success
+/// having carried no source at all.
 pub fn parse_staged_operations(
     operations: &serde_json::Value,
 ) -> std::result::Result<Vec<McpMutationOperation>, String> {
-    if !operations.is_array() {
+    let serde_json::Value::Array(elements) = operations else {
         return Err(format!(
             "invalid operations: expected a JSON array, got {}; {ACCEPTED_OPERATION_SHAPES}",
             json_type_name(operations)
         ));
+    };
+    for (idx, element) in elements.iter().enumerate() {
+        let Some(fields) = element.as_object() else {
+            return Err(format!(
+                "invalid operations: element #{idx} is {}, expected an object; \
+                 {ACCEPTED_OPERATION_SHAPES}",
+                json_type_name(element)
+            ));
+        };
+        let unknown = fields
+            .keys()
+            .filter(|key| !OPERATION_FIELDS.contains(&key.as_str()))
+            .map(|key| format!("'{key}'"))
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "invalid operations: element #{idx} carries unknown field(s) {}; an operation is \
+                 described only by {}. New source text goes in `body`, and nowhere else, or it is \
+                 not committed; {ACCEPTED_OPERATION_SHAPES}",
+                unknown.join(", "),
+                OPERATION_FIELDS.join(", ")
+            ));
+        }
     }
     serde_json::from_value(operations.clone())
         .map_err(|error| format!("invalid operations array: {error}; {ACCEPTED_OPERATION_SHAPES}"))
+}
+
+/// Whether two staged operation sets describe exactly the same work.
+///
+/// Used to tell a resume of a fenced commit apart from an attempt to change
+/// what that commit publishes. Compared through their serialized form because
+/// an operation carries payload types that model no equality of their own.
+pub fn staged_operations_match(
+    left: &[McpMutationOperation],
+    right: &[McpMutationOperation],
+) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        // A set that cannot be serialized cannot be proven identical, and a
+        // resume that guesses wrong would append to a fenced payload.
+        _ => false,
+    }
 }
 
 fn json_type_name(value: &serde_json::Value) -> &'static str {
@@ -985,8 +1144,15 @@ impl SessionRegistry {
         scope: &str,
     ) -> std::result::Result<McpTransaction, String> {
         if !self.has_session(session_id) {
+            // A well-formed id that names nothing is an ended or idle-reaped
+            // session, not a typo. Saying only "not found" sends an agent
+            // hunting for a bad argument; naming expiry sends it to the one
+            // call that recovers.
             return Err(format!(
-                "Session not found: {session_id}. Start a session with kin_session_start first."
+                "Session not found: {session_id}. It was ended or expired after its idle \
+                 timeout. Call kin_session_start for a new session id and begin the \
+                 transaction on that one; kin_session_heartbeat keeps a session alive \
+                 through a long read phase."
             ));
         }
         let transaction_id = EntityId::new().to_string();
@@ -1112,6 +1278,21 @@ impl SessionRegistry {
         Ok(cleared)
     }
 
+    /// End an editable transaction and discard everything it staged.
+    ///
+    /// Only `active` and `validated` transactions may abort, because those are
+    /// the states in which nothing has been fenced and the staged set is the
+    /// only thing to undo.
+    ///
+    /// A `committing` transaction is owned by the commit path instead:
+    /// `prepare_transaction_commit` has persisted its payload digest and
+    /// repository authority may already have moved, so the way out is to
+    /// re-enter the commit with the same staged operations, which resumes
+    /// idempotently and resolves whether the commit landed. Relabelling that
+    /// state `aborted` would make the resume unreachable and strand the
+    /// transaction in exactly the case the fence exists to survive. A
+    /// `committed` transaction refuses for a different reason: overwriting a
+    /// real receipt with `aborted` records provenance that never happened.
     pub fn abort_transaction(
         &self,
         transaction_id: &str,
@@ -1120,12 +1301,26 @@ impl SessionRegistry {
             .transactions
             .lock()
             .expect("transactions lock poisoned");
-        if let Some(tx) = map.get_mut(transaction_id) {
-            tx.state = "aborted".to_string();
-            Ok(tx.clone())
-        } else {
-            Err(format!("Transaction not found: {}", transaction_id))
+        let tx = map
+            .get_mut(transaction_id)
+            .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+        if !matches!(tx.state.as_str(), "active" | "validated") {
+            let recovery = if tx.state == "committing" {
+                "its commit is already fenced, so repository authority may have moved: \
+                 re-send kin_transaction_commit with the same transaction id, which \
+                 resumes the fenced payload idempotently and reports whether it landed"
+            } else {
+                "the transaction already reached a terminal state and holds nothing to \
+                 discard: begin a new one with kin_transaction_begin"
+            };
+            return Err(format!(
+                "Cannot abort transaction {} in state: {}. {recovery}.",
+                transaction_id, tx.state
+            ));
         }
+        tx.staged_operations.clear();
+        tx.state = "aborted".to_string();
+        Ok(tx.clone())
     }
 
     pub fn get_transaction(&self, transaction_id: &str) -> Option<McpTransaction> {
@@ -1778,6 +1973,139 @@ mod tests {
             .is_err());
     }
 
+    fn staged_edit(registry: &SessionRegistry, session: &str) -> McpTransaction {
+        let tx = registry.begin_transaction(session, "src/lib.rs").unwrap();
+        registry
+            .stage_transaction(
+                &tx.transaction_id,
+                vec![McpMutationOperation {
+                    verb: "update".to_string(),
+                    target: "value".to_string(),
+                    payload: None,
+                    body: Some("pub fn value() -> u8 { 2 }".to_string()),
+                    description: "replace the body".to_string(),
+                }],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn abort_discards_the_staged_mutations_it_says_it_discards() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let staged = staged_edit(&registry, "sess-1");
+        assert_eq!(staged.staged_operations.len(), 1);
+
+        let aborted = registry.abort_transaction(&staged.transaction_id).unwrap();
+        assert_eq!(aborted.state, "aborted");
+        assert!(
+            aborted.staged_operations.is_empty(),
+            "abort promises to discard the staged mutations, so the returned \
+             transaction must not still carry them"
+        );
+        let stored = registry.get_transaction(&staged.transaction_id).unwrap();
+        assert!(
+            stored.staged_operations.is_empty(),
+            "the registry's own copy must be discarded too, not just the clone \
+             handed back to the caller"
+        );
+        assert!(
+            registry
+                .stage_transaction(&staged.transaction_id, vec![])
+                .is_err(),
+            "an aborted transaction must not accept further operations"
+        );
+    }
+
+    #[test]
+    fn abort_is_refused_once_a_commit_is_fenced_and_the_commit_stays_resumable() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+        let staged = staged_edit(&registry, "sess-1");
+
+        let fenced = registry
+            .prepare_transaction_commit(&staged.transaction_id, "payload-digest")
+            .unwrap();
+        assert_eq!(fenced.state, "committing");
+
+        let refused = registry
+            .abort_transaction(&staged.transaction_id)
+            .expect_err("a fenced transaction must not be abortable");
+        assert!(
+            refused.contains("committing"),
+            "the refusal must name the state that blocks it: {refused}"
+        );
+        assert!(
+            refused.contains("kin_transaction_commit"),
+            "the refusal must name the call that owns a fenced transaction: {refused}"
+        );
+
+        // Refusing is only worth anything if it keeps the documented recovery
+        // reachable: re-entering the fence with the same digest still resumes,
+        // and the payload it resumes is the one that was fenced.
+        let resumed = registry
+            .prepare_transaction_commit(&staged.transaction_id, "payload-digest")
+            .expect("the fenced commit must remain resumable after a refused abort");
+        assert_eq!(resumed.state, "committing");
+        assert_eq!(
+            resumed.staged_operations.len(),
+            1,
+            "a refused abort must not touch the fenced payload"
+        );
+        assert_eq!(
+            registry
+                .commit_transaction(&staged.transaction_id)
+                .unwrap()
+                .state,
+            "committed"
+        );
+    }
+
+    #[test]
+    fn abort_is_refused_on_a_terminal_transaction() {
+        let registry = SessionRegistry::new();
+        registry.register("sess-1", "test");
+
+        let committed = staged_edit(&registry, "sess-1");
+        registry
+            .commit_transaction(&committed.transaction_id)
+            .unwrap();
+        let refused = registry
+            .abort_transaction(&committed.transaction_id)
+            .expect_err(
+                "aborting a committed transaction would record a receipt that never happened",
+            );
+        assert!(refused.contains("committed"), "{refused}");
+        assert_eq!(
+            registry
+                .get_transaction(&committed.transaction_id)
+                .unwrap()
+                .state,
+            "committed",
+            "a refused abort must not relabel the transaction"
+        );
+
+        let aborted = staged_edit(&registry, "sess-1");
+        registry.abort_transaction(&aborted.transaction_id).unwrap();
+        assert!(
+            registry.abort_transaction(&aborted.transaction_id).is_err(),
+            "a second abort must be refused rather than silently succeeding"
+        );
+    }
+
+    #[test]
+    fn abort_of_an_unknown_transaction_names_the_id() {
+        let registry = SessionRegistry::new();
+        let err = registry
+            .abort_transaction("no-such-transaction")
+            .expect_err("aborting an id that names nothing must fail");
+        assert!(
+            err.contains("no-such-transaction"),
+            "the failure must name the id the caller passed: {err}"
+        );
+        assert!(err.contains("not found"), "{err}");
+    }
+
     // ── Stage-time validation (D.7 Track A) ──────────────────────────────────
 
     fn entity_named(name: &str) -> kin_model::Entity {
@@ -1820,6 +2148,89 @@ mod tests {
             body: None,
             description: "d".to_string(),
         }
+    }
+
+    #[test]
+    fn parse_staged_operations_names_a_field_it_does_not_model() {
+        // The whole point: a misspelled `body` used to decode to no body at
+        // all, so the operation staged clean and committed nothing.
+        let error = parse_staged_operations(&serde_json::json!([{
+            "verb": "update",
+            "target": "value",
+            "content": "pub fn value() -> u8 { 2 }",
+            "description": "misspelled body key",
+        }]))
+        .expect_err("an unknown field must be refused, not dropped");
+        assert!(error.contains("'content'"), "got: {error}");
+        assert!(error.contains("body"), "the fix must be named: {error}");
+    }
+
+    #[test]
+    fn parse_staged_operations_rejects_a_non_object_element() {
+        let error = parse_staged_operations(&serde_json::json!(["update value"]))
+            .expect_err("a string element is not an operation");
+        assert!(error.contains("element #0"), "got: {error}");
+    }
+
+    #[test]
+    fn staged_operations_match_distinguishes_a_resume_from_an_edit() {
+        let staged = vec![op(
+            "update",
+            Some(McpMutationPayload::Entity(entity_named("foo"))),
+        )];
+        assert!(staged_operations_match(&staged, &staged.clone()));
+
+        let mut edited = staged.clone();
+        edited[0].body = Some("pub fn foo() {}".to_string());
+        assert!(
+            !staged_operations_match(&staged, &edited),
+            "a changed body is a different payload, not a resume"
+        );
+        assert!(!staged_operations_match(&staged, &[]));
+    }
+
+    #[test]
+    fn commit_refusal_renders_prose_and_machine_readable_evidence() {
+        let refusal = CommitRefusal::new(
+            CommitRefusalCode::SourceBodyRequiresDaemonCommit,
+            "tx-1",
+            vec!["operation #0 ('update'): needs projection".to_string()],
+        );
+        let rendered = refusal.render();
+        assert!(rendered.contains("tx-1"));
+        assert!(rendered.contains("needs projection"));
+
+        let evidence: CommitRefusal =
+            serde_json::from_str(rendered.lines().next_back().unwrap()).unwrap();
+        assert_eq!(evidence.schema, CommitRefusal::SCHEMA);
+        assert_eq!(
+            evidence.code,
+            CommitRefusalCode::SourceBodyRequiresDaemonCommit
+        );
+        assert!(!evidence.applied);
+        assert_eq!(evidence.operations.len(), 1);
+    }
+
+    #[test]
+    fn carries_source_body_covers_every_shape_whose_substance_is_the_body() {
+        let mut payload_less = op("update", None);
+        payload_less.body = Some("pub fn value() {}".to_string());
+        assert!(carries_source_body(&payload_less));
+
+        let mut with_payload = op(
+            "update",
+            Some(McpMutationPayload::Entity(entity_named("value"))),
+        );
+        with_payload.body = Some("pub fn value() {}".to_string());
+        assert!(
+            carries_source_body(&with_payload),
+            "an entity payload does not make the body optional"
+        );
+
+        let mut blank = with_payload.clone();
+        blank.body = Some("   \n".to_string());
+        assert!(!carries_source_body(&blank), "whitespace is not source");
+        assert!(!carries_source_body(&op("update", None)));
     }
 
     #[test]

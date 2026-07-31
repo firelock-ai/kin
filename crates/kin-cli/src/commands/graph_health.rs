@@ -26,13 +26,26 @@ pub struct RepositoryArtifactCoverage {
     /// Symlinks, gitlinks, and non-UTF-8 paths that remain exact tree truth but
     /// do not currently have a `FilePathId` enrichment surface.
     pub exact_only_artifact_count: usize,
+    /// Enrichable artifacts still waiting for a facet.
+    ///
+    /// Absence is not a defect under the current substrate. No admission path
+    /// writes the facet layer: exact Git admission binds entity and relation
+    /// deltas derived from supported sources and nothing else. Facets are
+    /// written one file at a time, after admission, by the reconcile loop, the
+    /// commit path, and projection. Every coverage level from none to full is
+    /// therefore a reachable healthy state, so this count describes progress
+    /// rather than divergence.
     pub missing_enrichment_path_count: usize,
     pub conflicting_enrichment_path_count: usize,
     pub stale_enrichment_path_count: usize,
     pub content_mismatch_path_count: usize,
     pub orphan_entity_count: usize,
-    /// Hard repository-coverage gate. Semantic relations are intentionally not
-    /// part of this value: zero evidence-backed relationships is valid.
+    /// Whether every enrichable artifact carries exactly one agreeing facet.
+    ///
+    /// This is a coverage observation, not the health verdict: a repository
+    /// whose enrichment is still pending is incomplete and healthy. The
+    /// verdict lives in `critical_issues`, which keys on facets that exist and
+    /// disagree with exact tree truth.
     pub complete: bool,
     pub issue_paths_sample: Vec<String>,
 }
@@ -42,6 +55,13 @@ pub struct GraphHealthReport {
     pub repository_artifact_coverage: RepositoryArtifactCoverage,
     pub supported_entity_source_file_count: usize,
     pub supported_shallow_source_file_count: usize,
+    /// Whether supported sources were admitted while the graph derived neither
+    /// an entity layer nor a single facet.
+    ///
+    /// Informational and JSON-only by design: it moves no verdict, no note, and
+    /// no exit code. Every coverage level is a reachable healthy state under
+    /// the current substrate, so keying a verdict on this would fail closed on
+    /// repositories that are merely early. Consumers read it from the report.
     pub graph_empty_for_supported_inputs: bool,
     pub contaminated_entity_count: usize,
     pub contaminated_non_entity_count: usize,
@@ -54,6 +74,11 @@ pub struct GraphHealthReport {
     pub semantic_relation_density_excluding_cochanges: f64,
     pub critical_issues: Vec<String>,
     pub warnings: Vec<String>,
+    /// Observations that describe a healthy graph rather than a defect. They
+    /// are reported separately so a first import does not present expected
+    /// absences as problems.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +217,9 @@ fn collect_repository_artifact_coverage_for_tree(
         }
     }
 
-    issue_paths.extend(missing_enrichment_paths.iter().cloned());
+    // Paths still waiting for a facet are deliberately absent from the issue
+    // sample. They are healthy, and naming them beside real divergence is how
+    // an operator learns to skim past the sample.
     issue_paths.extend(conflicting_enrichment_paths.iter().cloned());
     issue_paths.extend(stale_enrichment_paths.iter().cloned());
     issue_paths.extend(content_mismatch_paths.iter().cloned());
@@ -318,6 +345,7 @@ fn build_graph_health_report(
 ) -> GraphHealthReport {
     let test_role_entity_count = stats.role_counts.get("Test").copied().unwrap_or(0);
     let cochange_relation_count = stats.relation_counts.get("CoChanges").copied().unwrap_or(0);
+    let coverage_relation_count = stats.relation_counts.get("Covers").copied().unwrap_or(0);
     let semantic_relation_count = stats
         .total_relations
         .saturating_sub(cochange_relation_count);
@@ -329,14 +357,18 @@ fn build_graph_health_report(
 
     // A supported source file may legitimately contain no entities, and bytes
     // with a parser-looking extension may correctly route to an opaque facet.
-    // Health therefore keys on universal facet coverage, never on entity or
-    // relationship counts.
+    // Health therefore never keys on relationship counts. It does account for
+    // the entity layer, because exact admission builds that layer and no facet
+    // layer at all: a repository with entities derived from its supported
+    // sources is not an empty graph, whatever its facet coverage is.
     let graph_empty_for_supported_inputs = (supported_inputs.entity_source > 0
         || supported_inputs.shallow_source > 0)
-        && artifact_coverage.enriched_artifact_count == 0;
+        && artifact_coverage.enriched_artifact_count == 0
+        && stats.total_entities == 0;
 
     let mut critical_issues = Vec::new();
     let mut warnings = Vec::new();
+    let mut notes = Vec::new();
 
     if !artifact_coverage.repository_tree_in_sync {
         critical_issues.push(format!(
@@ -345,10 +377,20 @@ fn build_graph_health_report(
         ));
     }
 
+    // Pending enrichment is expected, so it is reported and never promoted to
+    // a failure. Nothing in the current substrate produces a facet at
+    // admission, and the paths that do produce them work one file at a time,
+    // so a health surface that failed on absence would fail on every healthy
+    // repository until the last file happened to be touched. What remains
+    // fail-closed is every facet that exists and disagrees with exact tree
+    // truth, below.
     if artifact_coverage.missing_enrichment_path_count > 0 {
-        critical_issues.push(format!(
-            "{} admitted regular files have no query-facing enrichment facet",
-            artifact_coverage.missing_enrichment_path_count
+        notes.push(format!(
+            "{} of {} admitted regular files have no query-facing enrichment facet yet; \
+             authority admission binds the entity layer only and facets are written per file \
+             after it",
+            artifact_coverage.missing_enrichment_path_count,
+            artifact_coverage.enrichable_artifact_count
         ));
     }
 
@@ -387,11 +429,21 @@ fn build_graph_health_report(
         ));
     }
 
+    // Test-role entities without a catalog are the normal shape of a repository
+    // that has never run `kin verify`; only surviving coverage relationships
+    // prove a catalog existed and is now gone.
     if test_role_entity_count > 0 && stats.test_case_count == 0 {
-        warnings.push(format!(
-            "graph contains {} Test-role entities but no verification test-case catalog",
-            test_role_entity_count
-        ));
+        if coverage_relation_count > 0 {
+            warnings.push(format!(
+                "graph contains {} Test-role entities and {} Covers relations, but the verification test-case catalog is empty",
+                test_role_entity_count, coverage_relation_count
+            ));
+        } else {
+            notes.push(format!(
+                "graph contains {} Test-role entities; no verification test-case catalog has been recorded yet",
+                test_role_entity_count
+            ));
+        }
     }
 
     if stats.total_entities > 0 && stats.total_relations == 0 {
@@ -436,6 +488,7 @@ fn build_graph_health_report(
         semantic_relation_density_excluding_cochanges: semantic_density,
         critical_issues,
         warnings,
+        notes,
     }
 }
 
@@ -514,16 +567,18 @@ mod tests {
         assert!(report.critical_issues.is_empty());
     }
 
-    #[test]
-    fn health_report_flags_contamination_and_missing_test_cases() {
+    fn test_role_stats() -> GraphStats {
         let mut stats = stats();
         stats.total_entities = 12;
         stats.total_relations = 9;
         stats.role_counts.insert("Test".to_string(), 4);
         stats.relation_counts.insert("CoChanges".to_string(), 8);
+        stats
+    }
 
-        let report = build_graph_health_report(
-            &stats,
+    fn contamination_report(stats: &GraphStats) -> GraphHealthReport {
+        build_graph_health_report(
+            stats,
             &SupportedInputCounts {
                 entity_source: 2,
                 shallow_source: 0,
@@ -535,7 +590,12 @@ mod tests {
                 path_samples: vec!["out/generated.rs".to_string()],
             },
             complete_coverage(),
-        );
+        )
+    }
+
+    #[test]
+    fn health_report_flags_contamination() {
+        let report = contamination_report(&test_role_stats());
 
         assert_eq!(report.contaminated_path_count, 3);
         assert_eq!(report.semantic_relation_count, 1);
@@ -543,10 +603,55 @@ mod tests {
             .critical_issues
             .iter()
             .any(|issue| issue.contains("skipped/generated/internal paths")));
+    }
+
+    #[test]
+    fn absent_test_case_catalog_without_coverage_edges_is_a_note() {
+        let report = contamination_report(&test_role_stats());
+
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("no verification test-case catalog has been recorded yet")));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|issue| issue.contains("test-case catalog")));
+    }
+
+    #[test]
+    fn absent_test_case_catalog_with_surviving_coverage_edges_is_a_warning() {
+        let mut stats = test_role_stats();
+        stats.relation_counts.insert("Covers".to_string(), 5);
+        let report = contamination_report(&stats);
+
         assert!(report
             .warnings
             .iter()
-            .any(|issue| issue.contains("no verification test-case catalog")));
+            .any(|issue| issue.contains("5 Covers relations")
+                && issue.contains("verification test-case catalog is empty")));
+        assert!(!report
+            .notes
+            .iter()
+            .any(|note| note.contains("test-case catalog")));
+    }
+
+    #[test]
+    fn populated_test_case_catalog_reports_neither_note_nor_warning() {
+        let mut stats = test_role_stats();
+        stats.test_case_count = 7;
+        stats.relation_counts.insert("Covers".to_string(), 5);
+
+        let report = contamination_report(&stats);
+
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|issue| issue.contains("test-case catalog")));
+        assert!(!report
+            .notes
+            .iter()
+            .any(|note| note.contains("test-case catalog")));
     }
 
     #[test]
@@ -583,8 +688,24 @@ mod tests {
         assert_eq!(report.semantic_relation_count, 0);
     }
 
+    fn empty_supported_inputs() -> SupportedInputCounts {
+        SupportedInputCounts {
+            entity_source: 0,
+            shallow_source: 0,
+        }
+    }
+
+    fn no_contamination() -> ContaminationSummary {
+        ContaminationSummary {
+            entity_count: 0,
+            non_entity_count: 0,
+            path_count: 0,
+            path_samples: Vec::new(),
+        }
+    }
+
     #[test]
-    fn artifact_coverage_gaps_are_critical_and_sampled() {
+    fn artifact_coverage_divergence_is_critical_and_sampled() {
         let coverage = RepositoryArtifactCoverage {
             authority_artifact_count: 3,
             graph_tree_artifact_count: 2,
@@ -595,23 +716,15 @@ mod tests {
             missing_enrichment_path_count: 1,
             conflicting_enrichment_path_count: 0,
             stale_enrichment_path_count: 0,
-            content_mismatch_path_count: 0,
+            content_mismatch_path_count: 1,
             orphan_entity_count: 0,
             complete: false,
             issue_paths_sample: vec!["unknown.custom".to_string()],
         };
         let report = build_graph_health_report(
             &stats(),
-            &SupportedInputCounts {
-                entity_source: 0,
-                shallow_source: 0,
-            },
-            &ContaminationSummary {
-                entity_count: 0,
-                non_entity_count: 0,
-                path_count: 0,
-                path_samples: Vec::new(),
-            },
+            &empty_supported_inputs(),
+            &no_contamination(),
             coverage,
         );
 
@@ -623,7 +736,90 @@ mod tests {
         assert!(report
             .critical_issues
             .iter()
-            .any(|issue| issue.contains("no query-facing enrichment facet")));
+            .any(|issue| issue.contains("disagree with exact repository content identity")));
+    }
+
+    #[test]
+    fn pending_enrichment_is_a_note_rather_than_a_failure() {
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 3,
+            graph_tree_artifact_count: 3,
+            enrichable_artifact_count: 3,
+            enriched_artifact_count: 0,
+            missing_enrichment_path_count: 3,
+            complete: false,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &stats(),
+            &SupportedInputCounts {
+                entity_source: 3,
+                shallow_source: 0,
+            },
+            &no_contamination(),
+            coverage,
+        );
+
+        assert!(report.critical_issues.is_empty());
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("3 of 3 admitted regular files have no query-facing")));
+    }
+
+    #[test]
+    fn an_entity_layer_without_facets_is_not_an_empty_graph() {
+        let mut entity_stats = stats();
+        entity_stats.total_entities = 9;
+        entity_stats.total_relations = 7;
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 7,
+            graph_tree_artifact_count: 7,
+            enrichable_artifact_count: 7,
+            enriched_artifact_count: 0,
+            missing_enrichment_path_count: 7,
+            complete: false,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &entity_stats,
+            &SupportedInputCounts {
+                entity_source: 7,
+                shallow_source: 0,
+            },
+            &no_contamination(),
+            coverage,
+        );
+
+        assert!(!report.graph_empty_for_supported_inputs);
+        assert!(report.critical_issues.is_empty());
+    }
+
+    #[test]
+    fn supported_inputs_with_no_entities_and_no_facets_is_an_empty_graph() {
+        let coverage = RepositoryArtifactCoverage {
+            authority_artifact_count: 2,
+            graph_tree_artifact_count: 2,
+            enrichable_artifact_count: 2,
+            enriched_artifact_count: 0,
+            missing_enrichment_path_count: 2,
+            complete: false,
+            ..complete_coverage()
+        };
+
+        let report = build_graph_health_report(
+            &stats(),
+            &SupportedInputCounts {
+                entity_source: 2,
+                shallow_source: 0,
+            },
+            &no_contamination(),
+            coverage,
+        );
+
+        assert!(report.graph_empty_for_supported_inputs);
     }
 
     #[test]
@@ -785,5 +981,77 @@ mod tests {
             coverage.issue_paths_sample,
             vec!["compose.yaml".to_string(), "ghost.bin".to_string()]
         );
+    }
+
+    #[test]
+    fn content_change_atomically_retires_source_and_shallow_facets() {
+        use kin_model::{
+            ArtifactId, FileLayout, FilePathId, ImportSection, LocatedEntry, ParseCompleteness,
+            ResolvedArtifact, ShallowTrackedFile, TransactionDelta, TreeDelta,
+        };
+
+        let old_hash = Hash256::from_bytes([0x51; 32]);
+        let new_hash = Hash256::from_bytes([0x52; 32]);
+        let artifact_id = ArtifactId::new();
+        let path = RepoPath::from_utf8("src/lib.rs").unwrap();
+        let file_id = FilePathId::new("src/lib.rs");
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        graph
+            .upsert_file_layout(&FileLayout {
+                file_id: file_id.clone(),
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .unwrap();
+        graph
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: file_id.clone(),
+                language_hint: "rust".to_string(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: old_hash,
+                signature_hash: Some(old_hash),
+                declaration_names: vec!["old_definition".to_string()],
+                import_paths: Vec::new(),
+            })
+            .unwrap();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Updated {
+                    artifact_id,
+                    old: LocatedEntry::new(path.clone(), TreeEntry::blob(old_hash, false)),
+                    new: LocatedEntry::new(path.clone(), TreeEntry::blob(new_hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        assert!(graph.get_file_layout(&file_id).unwrap().is_none());
+        assert!(graph.get_shallow_file(&file_id).unwrap().is_none());
+        let authority_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            path,
+            TreeEntry::blob(new_hash, false),
+        )])
+        .unwrap();
+        let coverage =
+            collect_repository_artifact_coverage_for_tree(&authority_tree, &graph).unwrap();
+        assert_eq!(coverage.missing_enrichment_path_count, 1);
+        assert_eq!(coverage.content_mismatch_path_count, 0);
+        assert_eq!(coverage.stale_enrichment_path_count, 0);
     }
 }

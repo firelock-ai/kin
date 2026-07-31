@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-#[cfg(feature = "gcs")]
 use std::collections::HashSet;
 
 #[global_allocator]
@@ -12,7 +11,7 @@ use std::process;
 use std::time::Duration;
 
 use kin_core::KinLayout;
-use kin_daemon::{run, DaemonConfig, DaemonState};
+use kin_daemon::{acquire_daemon_authority, run_with_authority, DaemonConfig, DaemonState};
 use tracing_subscriber::EnvFilter;
 
 kin_buildinfo::embed_update_build_identity!(
@@ -151,16 +150,64 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+/// The `allowed_repo_ids` key space a storage mode hands `DaemonState`, refusing
+/// any configuration whose key space excludes the repository being served.
+///
+/// The daemon takes its identity from two independent sources: the served
+/// repo id (`--repo-id`, `KIN_REPO_ID`, or the manifest) and, in GCS mode, the
+/// allowlist (`KIN_REPO_IDS`). Nothing reconciled them, and
+/// `DaemonState::serves_repo_id` answers from the allowlist alone whenever one
+/// is configured. An allowlist that omits the served id therefore produced a
+/// daemon that advertised that id on `GET /health` and refused it on every
+/// `/repos/{repo_id}` route: a live process whose two identity surfaces
+/// contradict each other, with no request able to tell which one is right.
+///
+/// There is no reading of that configuration under which the daemon can serve
+/// correctly, so it refuses to start rather than admitting the served id behind
+/// the operator's back. Silently widening the allowlist would serve a
+/// repository the operator explicitly did not list, which is the opposite
+/// failure and a worse one in a hosted multi-tenant pod.
+fn served_repo_key_space(
+    storage: &StorageMode,
+    repo_id: &str,
+) -> std::result::Result<Option<HashSet<String>>, String> {
+    let configured: Option<HashSet<String>> = match storage {
+        // Local mode has no allowlist source: the served key space is the
+        // repository authority the daemon opened, so the advertised id is
+        // routable by construction.
+        StorageMode::Local => None,
+        #[cfg(feature = "gcs")]
+        StorageMode::Gcs => parse_allowed_repo_ids(),
+    };
+    match configured {
+        Some(allowed) if !allowed.contains(repo_id) => {
+            let mut listed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            listed.sort_unstable();
+            Err(format!(
+                "KIN_REPO_IDS does not list the repository this daemon serves. \
+                 Serving repo_id {repo_id}; KIN_REPO_IDS allows [{}]. \
+                 This daemon would advertise {repo_id} on GET /health and then refuse \
+                 it on every /repos/{repo_id} route. Add {repo_id} to KIN_REPO_IDS, or \
+                 unset KIN_REPO_IDS to serve every repository the backend holds.",
+                listed.join(", ")
+            ))
+        }
+        admitted => Ok(admitted),
+    }
+}
+
 fn create_state(
     layout: KinLayout,
     storage: &StorageMode,
     repo_id: &str,
+    #[cfg_attr(not(feature = "gcs"), allow(unused_variables))] allowed_repo_ids: Option<
+        HashSet<String>,
+    >,
 ) -> std::result::Result<DaemonState, Box<dyn std::error::Error>> {
     match storage {
         StorageMode::Local => Ok(DaemonState::open_with_repo_id(layout, Some(repo_id))?),
         #[cfg(feature = "gcs")]
         StorageMode::Gcs => {
-            let allowed_repo_ids = parse_allowed_repo_ids();
             let bucket = env::var("KIN_GCS_BUCKET")
                 .map_err(|_| "KIN_GCS_BUCKET env var required for --storage gcs")?;
             let prefix = env::var("KIN_GCS_PREFIX").unwrap_or_default();
@@ -173,6 +220,17 @@ fn create_state(
             )?)
         }
     }
+}
+
+fn acquire_before_state<T>(
+    kin_root: &Path,
+    acquire: impl FnOnce(&Path) -> kin_daemon::Result<kin_daemon::lifecycle::DaemonLock>,
+    create: impl FnOnce() -> std::result::Result<T, Box<dyn std::error::Error>>,
+) -> std::result::Result<(T, kin_daemon::lifecycle::DaemonLock), Box<dyn std::error::Error>> {
+    let authority =
+        acquire(kin_root).map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    let state = create()?;
+    Ok((state, authority))
 }
 
 #[cfg(feature = "gcs")]
@@ -259,6 +317,15 @@ fn embed_batch_size_from_env() -> Result<Option<usize>, String> {
 }
 
 fn main() {
+    match kin_daemon_spawn::run_process_group_guardian_if_requested() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("kin-daemon: process-group guardian failed: {error}");
+            process::exit(1);
+        }
+    }
+
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
     // we own its teardown. The embedding worker dispatches batches onto the
@@ -288,6 +355,16 @@ fn main() {
     // blocking thread that was abandoned above. SIGTERM always ends in real
     // termination; no zombie survives.
     process::exit(exit_code);
+}
+
+/// Exact test-harness entrypoint for the shared process-group guardian.
+#[cfg(all(test, unix))]
+#[test]
+fn kin_process_group_guardian_worker() {
+    let requested = std::env::var_os(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_MODE_ENV).is_some();
+    let dispatched = kin_daemon_spawn::run_process_group_guardian_if_requested()
+        .expect("run daemon binary process-group guardian worker");
+    assert_eq!(dispatched, requested);
 }
 
 /// Default tracing directive when `RUST_LOG` is unset.
@@ -343,9 +420,15 @@ async fn async_main() -> i32 {
         println!(
             "{}",
             serde_json::json!({
-                "schema": "kin.daemon.compat.v1",
+                "schema": "kin.daemon.compat.v2",
                 "version": env!("CARGO_PKG_VERSION"),
                 "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "supervisor_startup_protocol": 2,
+                "supervisor_startup_capabilities": [
+                    "generation-adoption-ack-v2",
+                    "legacy-directory-sentinel-v1",
+                    "bounded-legacy-rollback-v1",
+                ],
                 "build": {
                     "sha": build.sha,
                     "dirty": build.dirty,
@@ -408,10 +491,28 @@ async fn async_main() -> i32 {
         }
     };
 
-    let state = match create_state(layout, &args.storage, &repo_id) {
-        Ok(state) => state,
+    // Reconcile the served identity with the configured key space before taking
+    // the repository singleton lock. A daemon that cannot serve the id it will
+    // advertise has nothing to contend for, and refusing here keeps the operator
+    // message about the misconfiguration itself rather than wrapping it in a
+    // failure to open state.
+    // Exit 2, the same code `enforce_startup_env` uses: this is one more
+    // correctness-relevant KIN_* value refusing to boot, not a runtime failure.
+    let allowed_repo_ids = match served_repo_key_space(&args.storage, &repo_id) {
+        Ok(allowed_repo_ids) => allowed_repo_ids,
         Err(error) => {
-            eprintln!("kin-daemon: failed to open daemon state: {error}");
+            eprintln!("kin-daemon: {error}");
+            return 2;
+        }
+    };
+
+    let kin_root = layout.root().to_path_buf();
+    let (state, authority) = match acquire_before_state(&kin_root, acquire_daemon_authority, || {
+        create_state(layout, &args.storage, &repo_id, allowed_repo_ids)
+    }) {
+        Ok(opened) => opened,
+        Err(error) => {
+            eprintln!("kin-daemon: failed to acquire daemon authority or open state: {error}");
             process::exit(1);
         }
     };
@@ -451,7 +552,7 @@ async fn async_main() -> i32 {
         ..DaemonConfig::default()
     };
 
-    if let Err(error) = run(state, config).await {
+    if let Err(error) = run_with_authority(state, config, authority).await {
         eprintln!("kin-daemon: {error}");
         return 1;
     }
@@ -462,6 +563,7 @@ async fn async_main() -> i32 {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::fmt::MakeWriter;
@@ -471,6 +573,147 @@ mod tests {
     /// the process's stdout/stderr to.
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    #[test]
+    fn singleton_authority_is_acquired_before_state_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let first = kin_daemon::lifecycle::acquire_singleton_lock(root)
+            .expect("first lock IO")
+            .expect("first starter must own the repo");
+        let state_constructor_called = AtomicBool::new(false);
+
+        let opened = acquire_before_state(
+            root,
+            |root| kin_daemon::daemon::acquire_daemon_authority_within(root, Duration::ZERO),
+            || {
+                state_constructor_called.store(true, Ordering::SeqCst);
+                Ok::<_, Box<dyn std::error::Error>>(())
+            },
+        );
+
+        assert!(opened.is_err(), "the contending starter must be refused");
+        assert!(
+            !state_constructor_called.load(Ordering::SeqCst),
+            "state construction must not run before singleton authority is acquired"
+        );
+        drop(first);
+    }
+
+    /// Every storage mode the daemon can boot in, so the routability assertion
+    /// below cannot silently stop covering a mode that is added later. The
+    /// `match` in `served_repo_key_space` is what forces a new variant to be
+    /// handled; this list is what forces it to be exercised.
+    fn every_storage_mode() -> Vec<StorageMode> {
+        #[allow(unused_mut)]
+        let mut modes = vec![StorageMode::Local];
+        #[cfg(feature = "gcs")]
+        modes.push(StorageMode::Gcs);
+        modes
+    }
+
+    fn with_repo_ids<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        match value {
+            Some(value) => env::set_var("KIN_REPO_IDS", value),
+            None => env::remove_var("KIN_REPO_IDS"),
+        }
+        let outcome = body();
+        env::remove_var("KIN_REPO_IDS");
+        outcome
+    }
+
+    /// The identity a daemon advertises must be one it will route, in every
+    /// storage mode and under every allowlist that mode can be handed, not only
+    /// the default configuration that has nothing to disagree with.
+    ///
+    /// `DaemonState::serves_repo_id` answers from `allowed_repo_ids` alone
+    /// whenever a key space is configured, so this is the exact predicate every
+    /// `/repos/{repo_id}` route resolves against. Startup therefore has two
+    /// admissible outcomes and no third: it either yields a key space that
+    /// admits the advertised id, or it refuses to boot. A daemon that runs
+    /// while contradicting its own `/health` is the state this forbids.
+    #[test]
+    #[serial_test::serial]
+    fn every_storage_mode_admits_the_repo_id_it_advertises_or_refuses_to_boot() {
+        let repo_id = "advertised-repo";
+        for storage in every_storage_mode() {
+            for allowlist in [
+                None,
+                Some(repo_id),
+                Some("advertised-repo,sibling-repo"),
+                Some("other-repo,third-repo"),
+            ] {
+                let outcome = with_repo_ids(allowlist, || served_repo_key_space(&storage, repo_id));
+                let Ok(key_space) = outcome else {
+                    continue;
+                };
+                assert!(
+                    key_space
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(repo_id)),
+                    "{storage:?} booted with a key space that refuses the id it advertises \
+                     (KIN_REPO_IDS={allowlist:?}): {key_space:?}"
+                );
+            }
+        }
+    }
+
+    /// The misconfiguration itself: an allowlist that omits the served id. It
+    /// must refuse to boot, and the refusal must name both values so the
+    /// operator can see which one to change.
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn a_gcs_allowlist_excluding_the_served_repo_refuses_startup() {
+        let refusal = with_repo_ids(Some("other-repo, third-repo"), || {
+            served_repo_key_space(&StorageMode::Gcs, "advertised-repo")
+                .expect_err("an allowlist without the served id must refuse startup")
+        });
+
+        assert!(
+            refusal.contains("advertised-repo"),
+            "the refusal must name the served repo id: {refusal}"
+        );
+        assert!(
+            refusal.contains("other-repo") && refusal.contains("third-repo"),
+            "the refusal must name the configured allowlist: {refusal}"
+        );
+        assert!(
+            refusal.contains("KIN_REPO_IDS"),
+            "the refusal must name the setting to change: {refusal}"
+        );
+    }
+
+    /// A consistent allowlist is still honored in full: admission reconciles the
+    /// served id with the key space, it does not discard the operator's list or
+    /// widen it to every repository in the bucket.
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn a_gcs_allowlist_containing_the_served_repo_is_admitted_unchanged() {
+        let admitted = with_repo_ids(Some("advertised-repo,sibling-repo"), || {
+            served_repo_key_space(&StorageMode::Gcs, "advertised-repo")
+                .expect("an allowlist naming the served id must be admitted")
+        })
+        .expect("a configured allowlist must survive admission");
+
+        assert!(admitted.contains("advertised-repo"));
+        assert!(admitted.contains("sibling-repo"));
+        assert_eq!(admitted.len(), 2, "admission must not widen the key space");
+    }
+
+    /// No allowlist means no key-space constraint, which is how a single-repo
+    /// hosted pod runs. Admission must not invent one.
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn gcs_without_an_allowlist_keeps_an_unconstrained_key_space() {
+        let admitted = with_repo_ids(None, || {
+            served_repo_key_space(&StorageMode::Gcs, "advertised-repo")
+                .expect("an unset allowlist must be admitted")
+        });
+        assert!(admitted.is_none(), "got {admitted:?}");
+    }
 
     impl Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

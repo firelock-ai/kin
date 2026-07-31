@@ -445,7 +445,11 @@ where
                         )
                 })
                 .collect::<Vec<_>>();
-            entities.sort_by_key(|entity| same_file_neighbor_rank(&focal, entity));
+            // Same total-order requirement as the weight sort below: the rank is
+            // three coarse buckets, so neighbours tie routinely, and only the
+            // first six survive. Ranking on entity id last keeps the survivors
+            // from depending on the order `query_entities` happened to return.
+            entities.sort_by_key(|entity| (same_file_neighbor_rank(&focal, entity), entity.id));
             entities
         } else {
             Vec::new()
@@ -465,6 +469,16 @@ where
     // Sort subgraph entities by descending relation weight so that when the
     // token budget is tight, high-signal entities (Calls, DependsOn) are
     // included before low-signal ones (References, Contains).
+    //
+    // Entity id breaks weight ties into a total order. `subgraph.entities` is a
+    // hash map, so the collected order varies between invocations; relation
+    // weight comes from a small set of per-kind constants, so equal weights are
+    // the common case rather than an edge case. Ordering on weight alone would
+    // leave tied candidates in hash order, and the budget fold below admits
+    // greedily in this order, so the surviving set would differ run to run for
+    // an unchanged graph. `total_cmp` keeps the comparator total even if a
+    // weight is ever NaN, which would otherwise collapse to `Equal` and
+    // reintroduce the same nondeterminism through a broken ordering.
     let mut sorted_entities: Vec<(&EntityId, &Entity)> = subgraph
         .entities
         .iter()
@@ -473,7 +487,7 @@ where
     sorted_entities.sort_by(|(a_id, _), (b_id, _)| {
         let wa = weight_map.get(a_id).copied().unwrap_or(0.0);
         let wb = weight_map.get(b_id).copied().unwrap_or(0.0);
-        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+        wb.total_cmp(&wa).then_with(|| a_id.cmp(b_id))
     });
 
     let mut dep_entries = Vec::new();
@@ -680,12 +694,17 @@ where
     }
 
     append_supporting_artifacts(graph, &mut pack, &supporting_files, budget_max)?;
+    // Dedup in encounter order rather than through a set. `supporting_artifacts`
+    // is already ordered by file path, and `append_artifact_scoped_metadata`
+    // admits the work items and annotations it finds under the same token
+    // budget, so draining a hash set here would let arbitrary iteration order
+    // decide which metadata survives a tight budget.
+    let mut seen_supporting_files = std::collections::HashSet::new();
     let supporting_files: Vec<FilePathId> = pack
         .supporting_artifacts
         .iter()
         .map(|entry| entry.file_path.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
+        .filter(|path| seen_supporting_files.insert(path.clone()))
         .collect();
     if !supporting_files.is_empty() {
         append_artifact_scoped_metadata(graph, &mut pack, &supporting_files, budget_max)?;
@@ -1027,6 +1046,18 @@ fn format_traffic_entry(intent: &IntentSummary, proximity: TrafficProximity) -> 
     )
 }
 
+/// Project the focal entity's HEADER, not its body, despite the name and despite
+/// the `ProjectionLevel::FullBody` the caller records beside it.
+///
+/// This crate has no source-reading capability: bodies live in content-addressed
+/// blobs reached through repository authority, which is a layer above. What this
+/// produces is a header plus signature, used for the pack's token accounting.
+///
+/// Consumers must NOT surface this text as an entity's `body`. It is source-shaped
+/// but is not source, so an agent that restates it as a body update deletes the
+/// implementation. The MCP context-pack handlers therefore read the real body
+/// through the graph-owned projection and report a gap when it is unavailable,
+/// rather than falling back to this string.
 fn project_full_body(entity: &Entity) -> String {
     let mut content = String::new();
     content.push_str(&format!(
@@ -1257,6 +1288,106 @@ mod tests {
             admitted(&b),
             "parallel context-pack assembly must admit a stable set"
         );
+    }
+
+    #[test]
+    fn tight_budget_truncation_is_deterministic_across_invocations() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+
+        // Equal-weight (all `Calls`) candidates with fixed-width names, so every
+        // projection costs the same tokens and relation weight alone cannot order
+        // them. Which candidates survive a tight budget is then decided purely by
+        // the tie-break, which is exactly what must not vary between runs.
+        let n = PARALLEL_ASSEMBLY_MIN_ENTITIES + 24;
+        let focal = make_entity("focal", EntityKind::Function);
+        let deps: Vec<Entity> = (0..n)
+            .map(|i| make_entity(&format!("dep_{i:04}"), EntityKind::Function))
+            .collect();
+
+        // Two stores holding the same entity ids, populated in opposite orders.
+        // A correct builder owes both the same answer; an order-sensitive one
+        // does not. Insertion order also perturbs the graph's own hash layout.
+        let store_of = |reverse: bool| {
+            let store = kin_db::InMemoryGraph::new();
+            store.upsert_entity(&focal).unwrap();
+            let ordered: Vec<&Entity> = if reverse {
+                deps.iter().rev().collect()
+            } else {
+                deps.iter().collect()
+            };
+            for dep in ordered {
+                store.upsert_entity(dep).unwrap();
+                store
+                    .upsert_relation(&Relation {
+                        id: kin_model::ids::RelationId::new(),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(focal.id),
+                        dst: GraphNodeId::Entity(dep.id),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    })
+                    .unwrap();
+            }
+            store
+        };
+
+        let forward = store_of(false);
+        let reverse = store_of(true);
+
+        let admitted = |p: &ContextPack| {
+            let mut ids: Vec<_> = p
+                .dependency_signatures
+                .iter()
+                .map(|e| e.entity_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        // Size the budget off an unconstrained pack so the cut lands mid-list
+        // regardless of how projection costs change later.
+        let full = build_context_pack(
+            &forward,
+            &focal.id,
+            &ContextOptions {
+                budget: TokenBudget::Large32k,
+                ..ContextOptions::default()
+            },
+        )
+        .unwrap();
+        let opts = ContextOptions {
+            budget: TokenBudget::Custom(full.actual_tokens / 2),
+            ..ContextOptions::default()
+        };
+
+        let baseline = build_context_pack(&forward, &focal.id, &opts).unwrap();
+        let kept = baseline.dependency_signatures.len();
+        assert!(
+            kept > 0 && kept < full.dependency_signatures.len(),
+            "budget must actually truncate for this test to mean anything: kept {kept} of {}",
+            full.dependency_signatures.len()
+        );
+
+        // Repeated invocations rebuild the neighborhood subgraph, and each rebuild
+        // gets a freshly seeded hash map, so an order-sensitive selection diverges
+        // here without needing separate processes.
+        for run in 1..16 {
+            let again = build_context_pack(&forward, &focal.id, &opts).unwrap();
+            assert_eq!(
+                admitted(&again),
+                admitted(&baseline),
+                "invocation {run} admitted a different set under the same budget"
+            );
+            let mirrored = build_context_pack(&reverse, &focal.id, &opts).unwrap();
+            assert_eq!(
+                admitted(&mirrored),
+                admitted(&baseline),
+                "invocation {run} admitted a different set when the graph was populated in reverse"
+            );
+        }
     }
 
     fn make_artifact_work_item(title: &str, file_path: &FilePathId) -> WorkItem {

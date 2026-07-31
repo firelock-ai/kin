@@ -122,12 +122,18 @@ kin init .
 In a clean Git repository, `kin init` atomically admits complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
 repository-v6 graph authority. It never substitutes an exact-HEAD snapshot or
-raw-filesystem semantic rebuild. Remote-bearing repositories currently fail
-closed until exact Kin remote mapping is available.
+raw-filesystem semantic rebuild. Supported repository-local remote URLs,
+refspecs, branch tracking, and push defaults are sealed into Kin's Git
+coexistence configuration; unsafe, ambiguous, or unsupported transfer settings
+fail closed before publication.
 
-Repository admission does not run semantic enrichment. Query surfaces consume
-graph-owned enrichment when it exists and report its absence instead of hiding
-the gap behind raw file search.
+Admission also derives the semantic entity and relation layer for every
+supported entity-source file in that history, and `kin init` reports the durable,
+generation-bound counts it committed. `kin status` reports that repository
+authority view; `kin graph status` separately reports the daemon's mutable live
+query graph, which may include later derived enrichment.
+Query surfaces consume graph-owned enrichment when it exists and report its
+absence instead of hiding the gap behind raw file search.
 
 ### 3. Ask the graph a real question
 
@@ -144,8 +150,9 @@ Once embeddings are complete, your configured AI agent can use the vector-backed
 `semantic_locate` tool; `get_context_pack`, `find_references`, and
 `trace_data_flow` expose the graph neighborhood directly.
 
-After graph-native semantic enrichment exists, run `kin embed` to add local
-vector similarity and confirm coverage with `kin status --json`.
+Admission derives the semantic entities, not their vectors. Run `kin embed` to
+add local vector similarity over them, and confirm coverage with
+`kin graph status`.
 
 ## Review an AI-written change
 

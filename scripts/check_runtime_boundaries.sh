@@ -3,6 +3,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "runtime boundary guard requires ripgrep (rg)" >&2
+  exit 1
+fi
+
 allowed_files=(
   "crates/kin-cli/src/backend.rs"
   "crates/kin-cli/src/commands/init.rs"

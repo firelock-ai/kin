@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-07-28
+## [0.4.0] - 2026-07-30
 
 ### Breaking
 
@@ -52,6 +52,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plan daemon workspace transitions from the live graph (#472)
 - Adopt the kin-model merge-transaction schema (#475)
 - Consume kin-db 0.6.7 reopen proof (#476)
+- Pin governance workflows to kin-actions v0.1.21 (#478)
+- Move the Windows release leg off the pull-request path and scope CI caches to trusted refs (#480)
+- Keep a busy daemon distinguishable from a dead one (#481)
+- Read entity body indentation absolutely and surface session expiry (#482)
+- Serve repository CAS bodies at the content address the VFS tree advertises (#484)
+- Resolve capability evidence entries against the test inventory (#485)
+- Report MCP graph status from the fields the daemon emits and traverse neighborhoods in both directions (#487)
+- Bound managed-config discovery to a declared scan root (#490)
+- Scan the graph command modules for file-search authority (#492)
+- Integrate the test-harness build-identity gate, locate result ordering, and deterministic context-pack truncation (#494)
+- Give both daemon spawn paths one contract and stop killing daemons for being slow (#493)
+- Read impact hops from one walk and stop calling harness-run code dead (#491)
+- Report graph health and admission enrichment from graph truth (#483)
+- Fix the cargo-fuzz build and scope the per-PR fuzz job to compiling (#496)
+- Wire kin conflicts and kin resolve onto the durable merge-transaction record (#497)
+- Make the daemon's advertised repo identity routable and restore graph validate notes (#498)
+- Report admission progress by default for init and clone (#505)
+- Scan the daemon crate for file-search authority and pin the fuzz lock (#500)
+- Make the MCP write path tell the truth about what it committed and who committed it (#499)
+- Bind daemon endpoint files to their publisher and commit the ingest CAS barrier (#501)
+- Bind external targets for cross-repo references at admission (#503)
+- Make test subprocesses hermetic, bounded, and tree-owned (#502)
+- Preserve merge bases and fail closed on ambiguous acknowledgements (#506)
+- Run required CI contexts on merge queue groups (#508)
+- Keep Kin MCP auto-init off protocol stdout (#510)
+- Read entity bodies from workspace head truth, one snippet field, 1-based lines (#504)
+- Judge daemon endpoint liveness by incarnation and leave one start contract (#511)
+- Probe what the default log filter admits, not the shape of its directive (#507)
+- Decide test exclusion from cfg predicates and narrow the spawn crate to pins (#509)
+- Execute the gcs feature test suite in the CI check job (#514)
+- Separate an absent repository from a storage fault, and refuse a self-contradicting daemon identity at startup (#513)
+- Bound integration daemon lifetime by the runtime teardown proof (#512)
+- Hold one repository authority for the daemon projection routes (#495)
+- Answer a mis-addressed spine ingest as an unserved repository rather than a daemon fault (#517)
+- Prove process-group containment against exit state, not group membership (#515)
+- Wait out a contended lifecycle lock instead of trusting one syscall (#516)
+- Bind the release tag mint job to the release-tag environment (#520)
+
+### Fixed
+
+- A daemon that refuses to start can no longer take the running daemon's
+  endpoint down with it. `.kin/daemon.pid` and `.kin/daemon.port` are now
+  attributed by a `.kin/daemon.owner` record naming the exact process
+  incarnation that published them, a process may retire only an endpoint it can
+  prove it owns, and a daemon whose endpoint files are removed by something else
+  republishes them and keeps serving rather than shutting down. Retrying a
+  failing MCP call while a daemon was warming used to kill the daemon being
+  waited on.
+- The daemon publishes only a real bound port. Port `0` is refused on
+  publication and read as unpublished, so a daemon started with `--port 0` can
+  no longer leave behind an endpoint record nothing can connect to while it goes
+  on owning the repository.
+- The derived ingestion CAS is committed at the points that need it rather than
+  relying on its self-drain. `kin-blobs` 0.1.3 amortizes the directory barrier
+  that makes a blob's name durable, so a write returning successfully no longer
+  implies the name survives a crash; the barrier is now issued before each graph
+  snapshot records those names, and again on graceful daemon shutdown. A
+  force-escalated shutdown, which exists to end a wedged process, still skips
+  it, and the store re-hydrates on open.
+- The ingestion CAS is hydrated from repository authority on the storage-backend
+  open path as well as the local one, so projection reads on a freshly opened
+  hosted graph find the source bodies they reference. Hydration consults the
+  local cache before fetching, and an instance whose cache already covers the
+  tree does no remote work at all, where every open previously re-fetched every
+  body before checking.
+
 
 ## [0.3.6] - 2026-07-26
 

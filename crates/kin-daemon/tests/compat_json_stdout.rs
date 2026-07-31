@@ -8,19 +8,27 @@
 //! emit startup warnings). A regression here makes the CLI treat a perfectly
 //! good daemon binary as "stale or incompatible".
 
-use std::process::Command;
+use std::time::Duration;
+use tokio::process::Command;
 
-#[test]
-fn compat_json_stdout_is_pure_json_under_env_overrides() {
+mod common;
+
+use common::{daemon_test_output, isolate_daemon_test_command};
+
+#[tokio::test]
+async fn compat_json_stdout_is_pure_json_under_env_overrides() {
     // These correctness-relevant overrides make the env registry emit startup
     // WARNs. Because the tracing subscriber's default writer is stdout, those
     // warnings previously landed on stdout ahead of the JSON and broke the
     // probe. The compat payload must now be emitted before any logging.
-    let output = Command::new(env!("CARGO_BIN_EXE_kin-daemon"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
+    isolate_daemon_test_command(&mut command);
+    command
         .arg("--compat-json")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1")
-        .env("KIN_DAEMON_DISABLE_LSP", "1")
-        .output()
+        .env("KIN_DAEMON_DISABLE_LSP", "1");
+    let output = daemon_test_output(command, "kin-daemon --compat-json", Duration::from_secs(30))
+        .await
         .expect("run kin-daemon --compat-json");
 
     assert!(
@@ -38,11 +46,25 @@ fn compat_json_stdout_is_pure_json_under_env_overrides() {
             )
         });
 
-    assert_eq!(parsed["schema"], "kin.daemon.compat.v1");
+    assert_eq!(parsed["schema"], "kin.daemon.compat.v2");
     assert!(
         parsed["graph_snapshot_version"].is_number(),
         "compat payload must carry a numeric graph_snapshot_version"
     );
+    assert_eq!(parsed["supervisor_startup_protocol"], 2);
+    let capabilities = parsed["supervisor_startup_capabilities"]
+        .as_array()
+        .expect("compat payload must carry startup capabilities");
+    for required in [
+        "generation-adoption-ack-v2",
+        "legacy-directory-sentinel-v1",
+        "bounded-legacy-rollback-v1",
+    ] {
+        assert!(
+            capabilities.iter().any(|capability| capability == required),
+            "compat payload must advertise {required}: {parsed}"
+        );
+    }
     assert!(parsed["build"]["sha"].is_string());
     assert!(parsed["build"]["dirty"].is_boolean());
     assert!(parsed["build"]["source_known"].is_boolean());

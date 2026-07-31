@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub static GRAPH_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    pub static LAST_READ_STALE: std::cell::Cell<bool> = std::cell::Cell::new(false);
     pub static LAST_READ_SOURCE: std::cell::Cell<&'static str> = std::cell::Cell::new("unknown");
 }
 
@@ -917,7 +916,22 @@ pub struct ReferenceRow {
     pub name: String,
     pub kind: Option<String>,
     pub file_path: Option<String>,
+    /// 1-based line where the REFERENCING ENTITY begins -- the caller's
+    /// definition, not the reference itself. Useful for locating the caller;
+    /// useless for locating the usage. See `reference_lines`.
     pub start_line: Option<u32>,
+    /// 1-based lines of the actual reference sites inside this caller, ascending
+    /// and deduplicated, taken from each relation's own
+    /// `RelationEvidence::source_span`.
+    ///
+    /// This exists because `start_line` alone forced agents to DERIVE call-site
+    /// positions by counting forward from a function's start, which is wrong
+    /// twice over: it assumes the agent can see the body it is counting through,
+    /// and it compounds any staleness in the definition's own span. The reference
+    /// site is a graph fact, so it is served as one. Empty when the parser
+    /// recorded no span for any contributing edge, which is honest absence rather
+    /// than a derived guess.
+    pub reference_lines: Vec<u32>,
     pub signature: Option<String>,
     /// Bounded inline body excerpt of the referencing entity, projected from the
     /// same content-addressed, hash-verified graph body that backs
@@ -966,7 +980,8 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             name: entity.name.clone(),
             kind: Some(format!("{:?}", entity.kind)),
             file_path: file_path.clone(),
-            start_line: entity.span.as_ref().map(|span| span.start_line),
+            start_line: entity_presentation_start_line(&entity),
+            reference_lines: Vec::new(),
             signature: Some(entity.signature.clone()),
             // Project the caller's bounded body once, where the entity is in
             // hand, so `find_references` hands back act-on-able code per caller
@@ -978,19 +993,50 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
             entry.file_path = file_path;
         }
         if entry.start_line.is_none() {
-            entry.start_line = entity.span.as_ref().map(|span| span.start_line);
+            entry.start_line = entity_presentation_start_line(&entity);
         }
         if entry.signature.is_none() {
             entry.signature = Some(entity.signature.clone());
         }
+        // Every edge contributing to this row carries its own site span, so a row
+        // that collapses several call sites reports all of them rather than the
+        // first. Only spans inside the referencing entity's own file are taken: a
+        // cross-file evidence span would be a line number the row's `file_path`
+        // does not explain.
+        entry
+            .reference_lines
+            .extend(relation_reference_lines(&rel, entity.file_origin.as_ref()));
         push_reference_kind(&mut entry.relation_kinds, rel.kind);
     }
 
     let mut rows = grouped.into_values().collect::<Vec<_>>();
     for row in &mut rows {
         row.relation_kinds.sort_by_key(relation_kind_rank);
+        row.reference_lines.sort_unstable();
+        row.reference_lines.dedup();
     }
     Ok(rows)
+}
+
+/// 1-based reference-site lines a single relation records, restricted to the
+/// referencing entity's own file.
+///
+/// The parser stores the syntax that produced each edge in
+/// `RelationEvidence::source_span`, which makes the usage's position a graph fact
+/// rather than something a consumer has to reconstruct. Evidence carrying no span
+/// contributes nothing; a span in some other file is dropped because the row
+/// reports one `file_path` and a line from a different file would read as a line
+/// in that one.
+fn relation_reference_lines(
+    rel: &kin_model::relation::Relation,
+    caller_file: Option<&kin_model::ids::FilePathId>,
+) -> Vec<u32> {
+    rel.evidence
+        .iter()
+        .filter_map(|evidence| evidence.source_span.as_ref())
+        .filter(|span| caller_file.is_none_or(|file| &span.file == file))
+        .map(|span| presentation_line(span.start_line))
+        .collect()
 }
 
 pub fn reference_row_key(file_path: Option<&str>, name: &str) -> String {
@@ -1001,6 +1047,57 @@ pub fn reference_row_key(file_path: Option<&str>, name: &str) -> String {
 
 pub const MCP_SOURCE_MAX_LINES: usize = 40;
 pub const MCP_SOURCE_MAX_CHARS: usize = 2400;
+
+// ── Line-number convention ──
+//
+// Graph truth and presentation disagree on purpose, and they meet here.
+//
+// [`SourceSpan::start_line`]/[`SourceSpan::end_line`] carry tree-sitter
+// `Point::row` values, which are 0-based. That stays the graph convention: it is
+// what the parser produces, what spans are compared and stored as, and what
+// every internal offset calculation assumes.
+//
+// Every agent-facing surface is 1-based, because every editor, `file:line`
+// reference, diff hunk, and stack trace an agent has ever seen is 1-based. A
+// surface that emits the raw graph row is off by one against all of them, and an
+// agent acting on it edits the line above the one it meant.
+//
+// So conversion happens at exactly one seam per surface, through these helpers.
+// Emitting `span.start_line` directly into a response is the bug these exist to
+// prevent; reach for [`presentation_line`] or one of the entity accessors below
+// instead.
+
+/// Convert a graph-owned 0-based line index to the 1-based line number every
+/// editor and agent convention uses.
+pub fn presentation_line(graph_line: u32) -> u32 {
+    graph_line.saturating_add(1)
+}
+
+/// 1-based inclusive `(start, end)` presentation lines for a graph span.
+pub fn presentation_span_lines(span: &SourceSpan) -> (u32, u32) {
+    (
+        presentation_line(span.start_line),
+        presentation_line(span.end_line),
+    )
+}
+
+/// 1-based presentation start line for an entity, or `None` when the entity
+/// carries no span. A spanless entity has no line to report, and reporting `0`
+/// or `1` for one would be a fabricated position.
+pub fn entity_presentation_start_line(entity: &Entity) -> Option<u32> {
+    entity
+        .span
+        .as_ref()
+        .map(|span| presentation_line(span.start_line))
+}
+
+/// 1-based presentation end line for an entity, or `None` when it has no span.
+pub fn entity_presentation_end_line(entity: &Entity) -> Option<u32> {
+    entity
+        .span
+        .as_ref()
+        .map(|span| presentation_line(span.end_line))
+}
 
 pub fn push_reference_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
     if !kinds.contains(&kind) {
@@ -1023,13 +1120,144 @@ pub fn entity_read_path(entity: &Entity) -> Option<String> {
         .map(|path| display_read_path(path.0.as_str()))
 }
 
+/// Which repository state the returned bytes actually came from.
+///
+/// A head read serves `WorkspaceState::tree`, which kin-model defines as
+/// including uncommitted state, so it is routinely AHEAD of the workspace's
+/// base: the watcher admission path advances the tree through
+/// `publish_workspace_tree`, which creates no history node and moves no ref, on
+/// every editor save it admits. Reporting the base change as the source of those
+/// bytes attests committed provenance for state that no commit contains, and on a
+/// substrate whose authority claim is graph-owned provenance that is worse than
+/// reporting nothing.
+///
+/// So the two cases are separate variants rather than one change id with a
+/// caveat: a consumer cannot accidentally read the uncommitted case as committed,
+/// because the committed field is not there to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceProvenance {
+    /// The bytes ARE the committed state at `change_id`. Either a history read,
+    /// or a head read of a workspace whose exact tree still hashes to the tree
+    /// at its base.
+    Committed { change_id: SemanticChangeId },
+    /// The bytes came from the workspace's exact graph-owned tree, which does
+    /// not hash to the tree at `base_change_id`. No committed change contains
+    /// them, so `tree_hash` is their only durable identity.
+    Workspace {
+        tree_hash: Hash256,
+        generation: u64,
+        base_change_id: SemanticChangeId,
+    },
+}
+
+impl SourceProvenance {
+    /// `"committed"` or `"workspace"`: the discriminator every response carries
+    /// so a consumer can branch before reading the case-specific fields.
+    pub fn state_label(&self) -> &'static str {
+        match self {
+            Self::Committed { .. } => "committed",
+            Self::Workspace { .. } => "workspace",
+        }
+    }
+
+    /// The change containing these bytes, or `None` when no change does.
+    pub fn committed_change_id(&self) -> Option<SemanticChangeId> {
+        match self {
+            Self::Committed { change_id } => Some(*change_id),
+            Self::Workspace { .. } => None,
+        }
+    }
+}
+
+/// Whether the span used to cut a body was checked against the artifact the
+/// body was cut from.
+///
+/// These are two independently updated stores. The bytes come from repository
+/// authority; the span comes from the live graph, and the admission path updates
+/// them in separate transactions (the exact tree is published first, entity spans
+/// are re-derived by a later `apply_transaction_delta`). Between those two steps
+/// the graph holds the new blob at a path and the old spans into it, so slicing
+/// one with the other yields text that is syntactically plausible and is not the
+/// entity's source. A bounds check does not catch it: stale offsets usually still
+/// land inside the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanCoherence {
+    /// Span and bytes were resolved from ONE committed state, so they describe
+    /// the same instant by construction. This is the history-read case.
+    CoherentByConstruction,
+    /// The entity's recorded source digest equals the digest of the artifact
+    /// these bytes were loaded from, so the span was derived from exactly these
+    /// bytes.
+    DigestVerified,
+    /// The entity records no source digest, so the pair could not be checked.
+    /// Honest absence, not a claim of coherence: entities admitted by paths that
+    /// do not stamp provenance, and entities reconstructed from committed
+    /// history, legitimately arrive without one.
+    Unverified,
+}
+
+impl SpanCoherence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CoherentByConstruction => "coherent_by_construction",
+            Self::DigestVerified => "digest_verified",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ExactEntitySource {
     pub body: String,
-    pub source_change_id: SemanticChangeId,
+    pub provenance: SourceProvenance,
+    pub span_coherence: SpanCoherence,
     pub artifact_id: ArtifactId,
     pub path: RepoPath,
     pub entry: TreeEntry,
+}
+
+/// The single seam that renders a source read's identity and provenance into a
+/// response object.
+///
+/// Every body-serving surface routes through this, so the shape cannot drift
+/// between `get_entity_source`, `get_entity`, and the context pack the way the
+/// snippet field name did between the two `semantic_locate` arms.
+pub fn source_provenance_fields(
+    source: &ExactEntitySource,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "source_state".into(),
+        serde_json::json!(source.provenance.state_label()),
+    );
+    match &source.provenance {
+        SourceProvenance::Committed { change_id } => {
+            fields.insert("source_change_id".into(), serde_json::json!(change_id));
+        }
+        SourceProvenance::Workspace {
+            tree_hash,
+            generation,
+            base_change_id,
+        } => {
+            // Deliberately NOT under `source_change_id`. These bytes are in no
+            // change, and a consumer reading that key must never receive an id
+            // that does not contain what it was handed.
+            fields.insert(
+                "workspace_tree_hash".into(),
+                serde_json::json!(tree_hash.to_string()),
+            );
+            fields.insert("workspace_generation".into(), serde_json::json!(generation));
+            fields.insert("base_change_id".into(), serde_json::json!(base_change_id));
+        }
+    }
+    fields.insert(
+        "span_coherence".into(),
+        serde_json::json!(source.span_coherence.label()),
+    );
+    fields.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
+    fields.insert("artifact_path".into(), serde_json::json!(source.path));
+    fields.insert("artifact_entry".into(), serde_json::json!(source.entry));
+    fields
 }
 
 fn record_graph_source_gap(error: McpError) -> McpError {
@@ -1045,17 +1273,30 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
     )))
 }
 
-/// The committed repository change a source projection resolves against.
+/// Which graph-owned repository state a source projection resolves against.
 ///
-/// `EntitySourceScope::WorkspaceHead` reads the active workspace head and is
-/// what every HEAD-scoped surface wants.
+/// `EntitySourceScope::WorkspaceHead` reads the workspace's exact graph-owned
+/// tree -- `WorkspaceState::tree`, which kin-model defines as including
+/// uncommitted state -- paired with the live entity's own span. This is the same
+/// truth `get_entity_source`, `get_entity_body`, and `kin trace` read, so every
+/// HEAD-scoped agent surface answers from one state by construction.
 ///
-/// `EntitySourceScope::At(change)` reads a specific committed change and is
-/// mandatory whenever `store` is a ref-scoped historical view: such a view holds
-/// only the changes reachable from its ref, so resolving an entity revision or a
-/// tree against the workspace head is both the wrong history and a hard
-/// graph-store miss for any ref that is not the head itself.
-/// Deliberately has no `Default`: a caller that has not decided which change it
+/// `EntitySourceScope::At(change)` reads a specific committed change by replaying
+/// history to it, and is mandatory whenever `store` is a ref-scoped historical
+/// view: such a view holds only the changes reachable from its ref, so resolving
+/// an entity revision or a tree against the workspace head is both the wrong
+/// history and a hard graph-store miss for any ref that is not the head itself.
+///
+/// The distinction is load-bearing, and conflating the two is what previously
+/// made head reads fail on coherent repositories: the workspace's `base_target`
+/// is the change it was CREATED FROM, not its current state. Resolving a head
+/// read against the base and then requiring the live entity to be the active
+/// committed revision there rejects every workspace that has moved past its base
+/// -- a fresh clone whose admission populated the live graph, a workspace holding
+/// a semantic overlay, or any repository with a commit since. Those are normal
+/// states, not authority gaps.
+///
+/// Deliberately has no `Default`: a caller that has not decided which state it
 /// reads at has not decided whether its answer is history or head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntitySourceScope {
@@ -1063,17 +1304,80 @@ pub enum EntitySourceScope {
     At(SemanticChangeId),
 }
 
-impl EntitySourceScope {
-    /// Resolve the change this scope names, consulting repository authority only
-    /// for the workspace-head case.
-    fn resolve(
-        self,
-        authority: &super::repository_authority::ActiveRepositoryAuthority,
-    ) -> Result<SemanticChangeId> {
-        match self {
-            EntitySourceScope::WorkspaceHead => authority.current_source_change_id(),
-            EntitySourceScope::At(change_id) => Ok(change_id),
+/// The change that introduced `entity`'s active committed revision as of
+/// `change_id`, or `None` when committed history records no such revision.
+///
+/// `None` is an ordinary answer, not a failure: the live graph legitimately
+/// carries entities that committed history has not recorded a revision for yet.
+/// Callers use this to enforce artifact-identity binding where history can
+/// support it, so a replay that cannot answer must not turn into a read failure.
+fn committed_introducing_change<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+    change_id: &SemanticChangeId,
+) -> Option<SemanticChangeId> {
+    store
+        .resolve_graph_at(change_id)
+        .ok()?
+        .entity_revisions
+        .get(&entity.id)?
+        .iter()
+        .rev()
+        .find(|revision| revision.ended_by.is_none())
+        .map(|revision| revision.introduced_by)
+}
+
+/// The digest of the source the entity's span was derived from, when the graph
+/// recorded one.
+///
+/// The reconciler stamps this on every entity it admits, and its own comment
+/// says why: "Span and blob provenance must advance even for source edits that
+/// are semantically equivalent." So the graph already treats this digest as the
+/// span's provenance; a read that slices bytes without consulting it is
+/// discarding a coherence proof the writer went to the trouble of recording.
+///
+/// `None` means the entity carries no such stamp, which is an ordinary state and
+/// must never be escalated into a read failure.
+fn recorded_span_source_digest(entity: &Entity) -> Option<kin_blobs::Hash256> {
+    let serde_json::Value::String(hex) = entity.metadata.extra.get("blob_hash")? else {
+        return None;
+    };
+    kin_blobs::Hash256::from_hex(hex).ok()
+}
+
+/// Bind a live entity's span to the artifact bytes about to be sliced with it.
+///
+/// THE one implementation of the coherence rule, public because not every serving
+/// arm resolves its bytes through [`read_entity_source_excerpt_detailed`]. The
+/// daemon's `get_entity_source` and `get_entity_sources` reach source through
+/// `kin_cli`'s own authority read, so a rule that lived only inside this module's
+/// resolver would hold on the offline arm and not on the arm agents actually use
+/// in product mode. One function, called from both, cannot drift that way.
+///
+/// `Err` means provable incoherence: the span was derived from different bytes
+/// than the ones at this path now, so slicing would return text that is not the
+/// entity's source. That is transient and retryable, and it is named as such,
+/// because the reconciler re-derives the span against the admitted tree.
+///
+/// `Ok(Unverified)` means the entity records no digest, which is an ordinary state
+/// and must never become a read failure.
+pub fn span_source_coherence(
+    entity: &Entity,
+    artifact_blob: &Hash256,
+    artifact_path: &str,
+) -> Result<SpanCoherence> {
+    match recorded_span_source_digest(entity) {
+        Some(recorded) if recorded.as_bytes() == artifact_blob.as_bytes() => {
+            Ok(SpanCoherence::DigestVerified)
         }
+        Some(recorded) => Err(graph_source_gap(format!(
+            "entity {} span was derived from source {recorded} but path '{artifact_path}' now \
+             holds {artifact_blob} in the workspace tree, so the recorded span does not describe \
+             these bytes; the graph has admitted the new source and not yet re-derived this \
+             entity's span",
+            entity.id
+        ))),
+        None => Ok(SpanCoherence::Unverified),
     }
 }
 
@@ -1083,7 +1387,6 @@ fn resolve_entity_source_authority<G: GraphStore>(
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
     scope: EntitySourceScope,
 ) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
-    LAST_READ_STALE.with(|f| f.set(false));
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
 
     let Some(recorded_span) = entity.span.as_ref() else {
@@ -1107,43 +1410,6 @@ fn resolve_entity_source_authority<G: GraphStore>(
         })?,
     )
     .map_err(record_graph_source_gap)?;
-    let source_change_id = scope.resolve(&authority)?;
-    // Replay the COMPLETE first-parent history at the source change, then read
-    // this entity's active revision out of that state. `resolve_entity_revision_at`
-    // is not usable here: it replays only the changes that mention this entity,
-    // yet validates every delta those changes carry. A change that introduces
-    // this entity while removing or modifying another one is then checked
-    // against a state the other entity's own history was filtered out of, and a
-    // sound repository reports a false history conflict. Resolving the whole
-    // state also yields the tree at the same change, so this replaces the
-    // separate tree resolution below rather than adding to it.
-    let committed = store.resolve_graph_at(&source_change_id).map_err(|error| {
-        graph_source_gap(format!(
-            "cannot resolve committed repository state at {source_change_id}: {error}"
-        ))
-    })?;
-    let revision = committed
-        .entity_revisions
-        .get(&entity.id)
-        .and_then(|revisions| {
-            revisions
-                .iter()
-                .rev()
-                .find(|revision| revision.ended_by.is_none())
-        })
-        .cloned()
-        .ok_or_else(|| {
-            graph_source_gap(format!(
-                "entity {} has no active committed revision at {}",
-                entity.id, source_change_id
-            ))
-        })?;
-    if revision.entity.file_origin != entity.file_origin || revision.entity.span != entity.span {
-        return Err(graph_source_gap(format!(
-            "retrieval entity {} is not the active committed revision at {}",
-            entity.id, source_change_id
-        )));
-    }
 
     let path = RepoPath::from_utf8(recorded_origin.0.clone()).map_err(|error| {
         graph_source_gap(format!(
@@ -1151,40 +1417,196 @@ fn resolve_entity_source_authority<G: GraphStore>(
             entity.id, recorded_origin.0
         ))
     })?;
-    let current_tree = committed.tree;
-    let current_artifact = current_tree.artifact_at_path(&path).ok_or_else(|| {
-        graph_source_gap(format!(
-            "entity {} points at '{}' but that path is absent at {}",
-            entity.id, recorded_origin.0, source_change_id
-        ))
-    })?;
 
-    // Bind the entity revision to the artifact identity that occupied its path
-    // when that revision was introduced. A later path reuse must not make an
-    // old entity read bytes from a different artifact.
-    let introduced_tree = store
-        .resolve_tree_at(&revision.introduced_by)
-        .map_err(|error| {
-            graph_source_gap(format!(
-                "cannot resolve entity {} introduction tree at {}: {error}",
-                entity.id, revision.introduced_by
-            ))
-        })?;
-    let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
-        graph_source_gap(format!(
-            "entity {} revision {} was introduced without an artifact at '{}'",
-            entity.id, revision.revision_id, recorded_origin.0
-        ))
-    })?;
-    if introduced_artifact.artifact_id != current_artifact.artifact_id {
-        return Err(graph_source_gap(format!(
-            "path '{}' was reused: entity {} is bound to artifact {:?}, current artifact is {:?}",
-            recorded_origin.0,
-            entity.id,
-            introduced_artifact.artifact_id,
-            current_artifact.artifact_id
-        )));
-    }
+    // Resolve the artifact and the span to read from whichever state the scope
+    // names. A head read and a history read are genuinely different questions and
+    // resolve through different authority, so they are kept apart here rather
+    // than approximated by one path.
+    let (provenance, current_artifact, span) = match scope {
+        // HEAD: the workspace's exact graph-owned tree paired with the live
+        // entity's own span -- byte-for-byte the pair `get_entity_source` reads, so
+        // the body-shaped surfaces cannot diverge on the same repository.
+        //
+        // What is NOT required here is that the live entity be byte-identical to
+        // its active revision at `base_target`. The workspace tree already
+        // includes state past base, so demanding that equality rejects ordinary
+        // repositories (a fresh clone, a live overlay, any commit since) as
+        // authority gaps. Span validity against the resolved bytes is still
+        // enforced, and so is the artifact-identity binding below, which is the
+        // check that actually protects a head read.
+        EntitySourceScope::WorkspaceHead => {
+            // ONE authority sample backs the whole head read. The sample is an
+            // `Arc` snapshot of published authority, so the tree the bytes come
+            // from, its identity and generation, and the change its base resolves
+            // to all describe one instant. Reading the tree from one snapshot and
+            // the change id from another let a response pair generation N's bytes
+            // with generation N+1's provenance, with nothing serializing the two.
+            let sample = authority
+                .workspace_sample()
+                .map_err(record_graph_source_gap)?;
+            let workspace = &sample.workspace;
+            let artifact = workspace
+                .tree
+                .artifact_at_path(&path)
+                .cloned()
+                .ok_or_else(|| {
+                    graph_source_gap(format!(
+                        "entity {} points at '{}' but that path is absent from workspace {} at \
+                         generation {}",
+                        entity.id, recorded_origin.0, workspace.workspace_id, workspace.generation
+                    ))
+                })?;
+            let source_change_id = sample.base_change_id;
+
+            // Report what these bytes actually are. The exact tree includes
+            // uncommitted state, so it is only the committed state at base when
+            // it still hashes to the tree at base; otherwise no change contains
+            // it and the answer says so instead of naming one.
+            let provenance = if workspace.base_tree_hash == Some(workspace.tree_hash) {
+                SourceProvenance::Committed {
+                    change_id: source_change_id,
+                }
+            } else {
+                SourceProvenance::Workspace {
+                    tree_hash: workspace.tree_hash,
+                    generation: workspace.generation,
+                    base_change_id: source_change_id,
+                }
+            };
+
+            // Bind the entity to the artifact identity that occupied its path when
+            // its revision was introduced, so a path later reused by a DIFFERENT
+            // artifact cannot feed an old entity's span someone else's bytes. The
+            // hazard is real even when the bytes are identical, because identity --
+            // not content -- is what says these are the same artifact.
+            //
+            // Only committed history knows the introducing artifact, so the check
+            // runs when history records a revision and is skipped when it does not.
+            // An entity the live graph carries without a committed revision has no
+            // prior binding to contradict, and rejecting it was exactly the false
+            // gap that closed body reads on fresh clones.
+            if let Some(introduced_by) =
+                committed_introducing_change(store, entity, &source_change_id)
+            {
+                let introduced_tree = store.resolve_tree_at(&introduced_by).map_err(|error| {
+                    graph_source_gap(format!(
+                        "cannot resolve entity {} introduction tree at {introduced_by}: {error}",
+                        entity.id
+                    ))
+                })?;
+                let introduced_artifact =
+                    introduced_tree.artifact_at_path(&path).ok_or_else(|| {
+                        graph_source_gap(format!(
+                            "entity {} was introduced at {introduced_by} without an artifact at \
+                             '{}'",
+                            entity.id, recorded_origin.0
+                        ))
+                    })?;
+                if introduced_artifact.artifact_id != artifact.artifact_id {
+                    return Err(graph_source_gap(format!(
+                        "path '{}' was reused: entity {} is bound to artifact {:?}, current \
+                         artifact is {:?}",
+                        recorded_origin.0,
+                        entity.id,
+                        introduced_artifact.artifact_id,
+                        artifact.artifact_id
+                    )));
+                }
+            }
+
+            (provenance, artifact, recorded_span.clone())
+        }
+        // HISTORY: replay the COMPLETE first-parent history at the named change,
+        // then read this entity's active revision out of that state.
+        // `resolve_entity_revision_at` is not usable here: it replays only the
+        // changes that mention this entity, yet validates every delta those
+        // changes carry. A change that introduces this entity while removing or
+        // modifying another one is then checked against a state the other
+        // entity's own history was filtered out of, and a sound repository
+        // reports a false history conflict. Resolving the whole state also yields
+        // the tree at the same change, so this replaces a separate tree
+        // resolution rather than adding to it.
+        EntitySourceScope::At(source_change_id) => {
+            let committed = store.resolve_graph_at(&source_change_id).map_err(|error| {
+                graph_source_gap(format!(
+                    "cannot resolve committed repository state at {source_change_id}: {error}"
+                ))
+            })?;
+            let revision = committed
+                .entity_revisions
+                .get(&entity.id)
+                .and_then(|revisions| {
+                    revisions
+                        .iter()
+                        .rev()
+                        .find(|revision| revision.ended_by.is_none())
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    graph_source_gap(format!(
+                        "entity {} has no active committed revision at {}",
+                        entity.id, source_change_id
+                    ))
+                })?;
+            let current_artifact =
+                committed
+                    .tree
+                    .artifact_at_path(&path)
+                    .cloned()
+                    .ok_or_else(|| {
+                        graph_source_gap(format!(
+                            "entity {} points at '{}' but that path is absent at {}",
+                            entity.id, recorded_origin.0, source_change_id
+                        ))
+                    })?;
+
+            // Bind the entity revision to the artifact identity that occupied its
+            // path when that revision was introduced. A later path reuse must not
+            // make an old entity read bytes from a different artifact.
+            let introduced_tree =
+                store
+                    .resolve_tree_at(&revision.introduced_by)
+                    .map_err(|error| {
+                        graph_source_gap(format!(
+                            "cannot resolve entity {} introduction tree at {}: {error}",
+                            entity.id, revision.introduced_by
+                        ))
+                    })?;
+            let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
+                graph_source_gap(format!(
+                    "entity {} revision {} was introduced without an artifact at '{}'",
+                    entity.id, revision.revision_id, recorded_origin.0
+                ))
+            })?;
+            if introduced_artifact.artifact_id != current_artifact.artifact_id {
+                return Err(graph_source_gap(format!(
+                    "path '{}' was reused: entity {} is bound to artifact {:?}, current artifact \
+                     is {:?}",
+                    recorded_origin.0,
+                    entity.id,
+                    introduced_artifact.artifact_id,
+                    current_artifact.artifact_id
+                )));
+            }
+
+            // A history read answers with the revision's OWN span, not the live
+            // entity's: at an older change the entity may have occupied different
+            // bytes, and reading it with today's span would slice the wrong text
+            // out of the right artifact.
+            let span = revision
+                .entity
+                .span
+                .clone()
+                .expect("active source revision was checked for a span");
+            (
+                SourceProvenance::Committed {
+                    change_id: source_change_id,
+                },
+                current_artifact,
+                span,
+            )
+        }
+    };
 
     let TreeEntry::Blob { hash, .. } = current_artifact.entry else {
         return Err(graph_source_gap(format!(
@@ -1192,17 +1614,34 @@ fn resolve_entity_source_authority<G: GraphStore>(
             entity.id, current_artifact.entry, current_artifact.artifact_id
         )));
     };
+
+    // Bind the span to the bytes it is about to cut.
+    //
+    // Blobs are content-addressed and `load_source_blob` re-verifies the digest,
+    // so the bytes below are provably the bytes of the artifact resolved above --
+    // that half needs no further guarding. The gap is the other half: the span
+    // came from the live graph, and the admission path advances the exact tree in
+    // one transaction and re-derives entity spans in a later one. Between them the
+    // graph holds a path's new blob and the old spans into it. Comparing the
+    // digest the span was derived from against the digest actually being sliced is
+    // what closes that window, and it is a real comparison rather than a bounds
+    // check: stale offsets normally still land inside the file, so the mis-slice
+    // returns plausible text and no error.
+    //
+    // A history read needs none of this: its span and its tree came out of one
+    // resolved committed state.
+    let span_coherence = match scope {
+        EntitySourceScope::At(_) => SpanCoherence::CoherentByConstruction,
+        EntitySourceScope::WorkspaceHead => {
+            span_source_coherence(entity, &hash, &recorded_origin.0)?
+        }
+    };
     let bytes = authority.load_source_blob(hash).map_err(|error| {
         graph_source_gap(format!(
             "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
             entity.id, current_artifact.artifact_id
         ))
     })?;
-    let span = revision
-        .entity
-        .span
-        .clone()
-        .expect("active source revision was checked for a span");
     if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
         return Err(graph_source_gap(format!(
             "entity {} span {}..{} is invalid for artifact {:?} ({} bytes)",
@@ -1217,7 +1656,8 @@ fn resolve_entity_source_authority<G: GraphStore>(
     Ok(Some((
         ExactEntitySource {
             body: String::new(),
-            source_change_id,
+            provenance,
+            span_coherence,
             artifact_id: current_artifact.artifact_id,
             path,
             entry: current_artifact.entry,
@@ -1261,6 +1701,29 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     };
     source.body = body;
     Ok(Some(source))
+}
+
+/// Explain, in agent-actionable terms, why an entity has no graph-owned body.
+///
+/// Reached only when the projection returned no body without erroring, which is
+/// always a structural property of the entity rather than a read failure: an
+/// entity with no file origin or no span has no source to project. The message
+/// names the missing coordinate so an agent stops asking for the body instead of
+/// retrying, and never mistakes absence for an empty implementation.
+pub fn entity_body_gap_reason(entity: &Entity) -> String {
+    let missing = match (entity.file_origin.is_some(), entity.span.is_some()) {
+        (false, false) => "no file origin and no source span",
+        (false, true) => "no file origin",
+        (true, false) => "no source span",
+        // Coordinates present but the projection still produced nothing: the
+        // span resolved to empty or whitespace-only text.
+        (true, true) => "a source span that projects to no text",
+    };
+    format!(
+        "entity {} ({}) has {missing} in graph truth, so no body can be served from it; \
+         its signature is authoritative but its implementation is not available",
+        entity.id, entity.name
+    )
 }
 
 /// Caps for the inline snippet surfaced on a retrieval hit (`kin locate --json`
@@ -1315,9 +1778,18 @@ pub fn excerpt_from_span_bytes(
     }
 
     let text = String::from_utf8_lossy(bytes);
-    excerpt_from_line_range(&text, span.start_line, span.end_line, max_lines, max_chars)
+    // `excerpt_from_line_range` counts lines 1-based; the span carries 0-based
+    // graph rows. Converting here is what keeps the fallback from clipping one
+    // line short, and from dropping an entity that starts on the file's first
+    // line (graph row 0) entirely.
+    let (start_line, end_line) = presentation_span_lines(span);
+    excerpt_from_line_range(&text, start_line, end_line, max_lines, max_chars)
 }
 
+/// Slice a 1-based inclusive line range out of `content`.
+///
+/// Takes PRESENTATION lines, not graph rows: callers holding a [`SourceSpan`]
+/// must convert through [`presentation_span_lines`] first.
 pub fn excerpt_from_line_range(
     content: &str,
     start_line: u32,
@@ -1570,8 +2042,9 @@ pub fn entity_response_json<G: GraphStore>(
         obj.insert("read_path".into(), serde_json::json!(read_path));
     }
     if let Some(span) = entity.span.as_ref() {
-        obj.insert("start_line".into(), serde_json::json!(span.start_line));
-        obj.insert("end_line".into(), serde_json::json!(span.end_line));
+        let (start_line, end_line) = presentation_span_lines(span);
+        obj.insert("start_line".into(), serde_json::json!(start_line));
+        obj.insert("end_line".into(), serde_json::json!(end_line));
     }
     if let Some(source) = read_entity_source_excerpt_detailed(
         store,
@@ -1582,32 +2055,39 @@ pub fn entity_response_json<G: GraphStore>(
         EntitySourceScope::WorkspaceHead,
     )? {
         obj.insert("source_excerpt".into(), serde_json::json!(source.body));
-        obj.insert(
-            "source_change_id".into(),
-            serde_json::json!(source.source_change_id),
-        );
-        obj.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
-        obj.insert("artifact_path".into(), serde_json::json!(source.path));
-        obj.insert("artifact_entry".into(), serde_json::json!(source.entry));
+        obj.extend(source_provenance_fields(&source));
     }
 
-    let is_stale = LAST_READ_STALE.with(|f| f.get());
-    obj.insert("stale".into(), serde_json::json!(is_stale));
     let source = LAST_READ_SOURCE.with(|f| f.get());
     obj.insert("source".into(), serde_json::json!(source));
 
     Ok(value)
 }
 
+/// Project the focal entity of a context pack, including its graph-owned body.
+///
+/// `entry.content` is NOT used as the body. The context builder projects a
+/// synthesized `// name (Kind, language)` header plus the signature for its token
+/// accounting, and serving that as `body` produced the worst possible failure for
+/// a writing agent: source-shaped text that is not the entity's source, with no
+/// signal that the real body was never read. An agent restating it as a body
+/// update deletes the implementation.
+///
+/// So the body is the graph-owned projection or nothing. When the graph cannot
+/// serve it, `body` is null and `body_unavailable` says why, which an agent can
+/// act on by stopping rather than by guessing.
+/// Takes no `ContextEntry`: it used to, and then ignored it. The pack's
+/// `entry.content` is a token-accounting stub, and once it stopped being a body
+/// fallback the parameter only obliged callers to build a value this function
+/// discards.
 pub fn focal_context_json<G: GraphStore>(
     store: &G,
-    entry: &kin_model::ContextEntry,
     entity: &Entity,
     compact: bool,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<serde_json::Value> {
-    let start_line = entity.span.as_ref().map(|span| span.start_line);
-    let end_line = entity.span.as_ref().map(|span| span.end_line);
+    let start_line = entity_presentation_start_line(entity);
+    let end_line = entity_presentation_end_line(entity);
     let source_excerpt = read_entity_source_excerpt_detailed(
         store,
         entity,
@@ -1616,7 +2096,6 @@ pub fn focal_context_json<G: GraphStore>(
         repository_authority,
         EntitySourceScope::WorkspaceHead,
     )?;
-    let is_stale = LAST_READ_STALE.with(|f| f.get());
     let source = LAST_READ_SOURCE.with(|f| f.get());
 
     let mut obj = serde_json::json!({
@@ -1628,21 +2107,22 @@ pub fn focal_context_json<G: GraphStore>(
         "read_path": entity_read_path(entity),
         "start_line": start_line,
         "end_line": end_line,
-        "stale": is_stale,
         "source": source,
     });
 
     if !compact {
-        obj["body"] = serde_json::json!(source_excerpt
-            .as_ref()
-            .map(|source| source.body.clone())
-            .unwrap_or_else(|| entry.content.clone()));
+        match source_excerpt.as_ref() {
+            Some(source) => obj["body"] = serde_json::json!(source.body),
+            None => {
+                obj["body"] = serde_json::Value::Null;
+                obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(entity));
+            }
+        }
     }
     if let Some(source) = source_excerpt {
-        obj["source_change_id"] = serde_json::json!(source.source_change_id);
-        obj["artifact_id"] = serde_json::json!(source.artifact_id);
-        obj["artifact_path"] = serde_json::json!(source.path);
-        obj["artifact_entry"] = serde_json::json!(source.entry);
+        if let Some(map) = obj.as_object_mut() {
+            map.extend(source_provenance_fields(&source));
+        }
     }
 
     Ok(obj)
@@ -1808,7 +2288,7 @@ pub struct SemanticSearchResult {
 
 impl From<kin_model::entity::Entity> for SemanticSearchResult {
     fn from(entity: kin_model::entity::Entity) -> Self {
-        let start_line = entity.span.as_ref().map(|span| span.start_line);
+        let start_line = entity_presentation_start_line(&entity);
         Self {
             id: entity.id,
             name: entity.name,
@@ -1845,8 +2325,8 @@ pub struct CompactSearchResult {
 
 impl From<kin_model::entity::Entity> for CompactSearchResult {
     fn from(entity: kin_model::entity::Entity) -> Self {
-        let start_line = entity.span.as_ref().map(|span| span.start_line);
-        let end_line = entity.span.as_ref().map(|span| span.end_line);
+        let start_line = entity_presentation_start_line(&entity);
+        let end_line = entity_presentation_end_line(&entity);
         Self {
             id: entity.id,
             name: entity.name,

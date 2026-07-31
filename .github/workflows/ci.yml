@@ -8,6 +8,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
   repository_dispatch:
     types: [dependency-updated]
 
@@ -111,46 +112,189 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # Restore on every event, save only from main. A cache entry written from
+      # a pull request ref is readable by later runs on that SAME ref and by
+      # nothing else, so the old configuration warmed pushes 2..N of one pull
+      # request while spending the shared repository cache budget and evicting
+      # main's entry, which is why no reusable cargo cache existed on
+      # refs/heads/main at all. Saving only from main trades that intra-branch
+      # warm start for one entry every pull request restores from push 1.
+      # The tradeoff is real and measured: see the trusted-ref note in
+      # scripts/test-release-workflow-authority.py.
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # A key distinct from the installer job: this builds the debug profile,
-          # and one shared key would have the two jobs overwrite each other.
-          key: windows-authority-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            windows-authority-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Compile and run native Windows authority tests
         shell: bash
         run: |
           set -euo pipefail
           export RUST_BACKTRACE=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
+
+          list_tests() {
+            CARGO_TERM_COLOR=never cargo test "$@" -- --list | tr -d '\r'
+          }
+
+          assert_nonempty_listing() {
+            local label="$1"
+            local listing="$2"
+            local count
+            count="$(printf '%s\n' "$listing" \
+              | awk '/: test$/ { count += 1 } END { print count + 0 }')"
+            if [[ "$count" -eq 0 ]]; then
+              echo "::error title=Missing native Windows tests::$label listed zero tests"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            echo "$label: listed $count test(s)"
+          }
+
+          run_nonempty_target() {
+            local label="$1"
+            shift
+            local listing
+            listing="$(list_tests "$@")"
+            assert_nonempty_listing "$label" "$listing"
+            cargo test "$@" -- --test-threads=1
+          }
+
+          run_required_filter() {
+            local label="$1"
+            local filter="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v needle="$filter" \
+                'index($0, needle) > 0 && /: test$/ { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -eq 0 ]]; then
+              echo "::error title=Missing native Windows tests::$label filter '$filter' matched zero listed tests"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            echo "$label: filter '$filter' matched $matches test(s)"
+            cargo test "$@" "$filter" -- --test-threads=1
+          }
+
+          run_required_exact() {
+            local label="$1"
+            local test_name="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v expected="$test_name: test" \
+                '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -ne 1 ]]; then
+              echo "::error title=Missing native Windows test::$label expected exactly one '$test_name', found $matches"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            cargo test "$@" "$test_name" -- --exact --test-threads=1
+          }
+
+          run_required_target() {
+            local label="$1"
+            local required_test="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            assert_nonempty_listing "$label" "$listing"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v expected="$required_test: test" \
+                '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -ne 1 ]]; then
+              echo "::error title=Missing native Windows test::$label expected exactly one '$required_test', found $matches"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            cargo test "$@" -- --test-threads=1
+          }
+
+          compile_required_target() {
+            local label="$1"
+            local required_test="$2"
+            shift 2
+            local listing
+            local matches
+            listing="$(list_tests "$@")"
+            assert_nonempty_listing "$label" "$listing"
+            matches="$(printf '%s\n' "$listing" \
+              | awk -v expected="$required_test: test" \
+                '$0 == expected { count += 1 } END { print count + 0 }')"
+            if [[ "$matches" -ne 1 ]]; then
+              echo "::error title=Missing native Windows compile target::$label expected exactly one '$required_test', found $matches"
+              printf '%s\n' "$listing"
+              exit 1
+            fi
+            echo "$label: compiled and listed required test '$required_test'"
+          }
+
+          run_nonempty_target "kin-registry library" \
+            --locked --target x86_64-pc-windows-msvc \
             -p kin-registry --lib
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib registry::tests
-          cargo test --locked --target x86_64-pc-windows-msvc \
+          run_required_filter "kin-core registry authority" "registry::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
+          run_nonempty_target "kin-git library" \
+            --locked --target x86_64-pc-windows-msvc \
             -p kin-git --lib
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --no-run
-          test_binary=$(find target/x86_64-pc-windows-msvc/debug/deps \
-            -maxdepth 1 -type f -name 'kin_cli-*.exe' -print -quit)
-          test -n "$test_binary"
-          "$test_binary" windows --test-threads=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib current_branch_write_replaces_existing_head -- \
-            --test-threads=1
-          cargo test --locked --target x86_64-pc-windows-msvc \
-            -p kin-core --lib branch_transaction -- --test-threads=1
+          run_required_filter "kin-cli Windows modules" "windows" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "bounded CLI test subprocesses" \
+            "commands::test_subprocess::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "bounded daemon probe subprocesses" \
+            "daemon_client::probe_process::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_target "spawned-child Windows authority ordering" \
+            "spawned_child_observes_case_insensitive_authority_order" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test windows_authority_order
+          run_required_target "isolated runtime process-tree containment" \
+            "dropping_isolated_runtime_terminates_a_late_descendant" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test daemon_runtime_containment
+          run_required_exact "direct daemon-child containment" \
+            "dropping_a_direct_daemon_child_terminates_its_containment" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --test port_handshake
+          run_required_exact "late daemon-descendant containment" \
+            "dropping_containment_terminates_a_late_descendant" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --test port_handshake
+          run_required_filter "daemon isolation support" "common::daemon_isolation" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --test port_handshake
+          compile_required_target "durable merge resolution containment compile" \
+            "concurrent_resolutions_from_one_view_leave_one_winner" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test repository_merge_resolution
 
   windows-installer:
     name: Windows installer + vector-free release build
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    # Deliberately off the pull-request path. This leg cold-builds the whole
+    # dependency graph in the release profile for x86_64-pc-windows-msvc and
+    # measured 20 to 25 minutes per round, longer than any other job, so it set
+    # the floor for every land-and-iterate cycle. It now runs on each push to
+    # main, which is exactly the commit release proof reads: release-tag.yml
+    # names this check in REQUIRED_CHECKS and refuses to mint a tag unless it is
+    # present and green on the release sha. On a pull request the job reports
+    # skipped, which satisfies the required context the same way the
+    # documentation-only path already relies on.
+    if: >-
+      ${{ !cancelled()
+      && github.event_name != 'pull_request'
+      && github.event_name != 'merge_group'
+      && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -316,12 +460,22 @@ jobs:
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Classify changed paths
         id: classify
+        # This step gates release-critical jobs. Pin its process startup and run
+        # Git with an empty environment rather than inheriting mutable authority.
+        shell: /usr/bin/bash --noprofile --norc -p -e -u -o pipefail {0}
         env:
+          PATH: /usr/bin:/bin
+          BASH_ENV: ""
+          ENV: ""
+          LD_AUDIT: ""
+          LD_LIBRARY_PATH: /dev/null
+          LD_PRELOAD: ""
+          WORKSPACE: ${{ github.workspace }}
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -329,7 +483,43 @@ jobs:
           set -euo pipefail
           docs_only=false
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+            # env -i drops inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE,
+            # GIT_CONFIG_*, object/replace, executable, and diff authority.
+            changed="$(
+              /usr/bin/env -i \
+                HOME=/dev/null \
+                PATH=/usr/bin:/bin \
+                LC_ALL=C \
+                GIT_CONFIG_NOSYSTEM=1 \
+                GIT_CONFIG_SYSTEM=/dev/null \
+                GIT_CONFIG_GLOBAL=/dev/null \
+                GIT_CONFIG_COUNT=0 \
+                GIT_ATTR_NOSYSTEM=1 \
+                GIT_PAGER=cat \
+                GIT_TERMINAL_PROMPT=0 \
+                /usr/bin/git \
+                  --no-pager \
+                  --no-replace-objects \
+                  --no-lazy-fetch \
+                  --no-optional-locks \
+                  --literal-pathspecs \
+                  --git-dir="$WORKSPACE/.git" \
+                  --work-tree="$WORKSPACE" \
+                  -c core.attributesFile=/dev/null \
+                  -c core.fsmonitor=false \
+                  -c diff.external= \
+                  -c diff.renames=false \
+                  -c diff.ignoreSubmodules=none \
+                  diff \
+                  --no-ext-diff \
+                  --no-textconv \
+                  --no-renames \
+                  --ignore-submodules=none \
+                  --submodule=short \
+                  --name-only \
+                  "$BASE_SHA...$HEAD_SHA" \
+                  --
+            )"
             if [ -n "$changed" ]; then
               docs_only=true
               while IFS= read -r path; do
@@ -382,6 +572,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install runtime guard tools
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            case "$RUNNER_OS" in
+              Linux)
+                sudo apt-get update
+                sudo apt-get install --yes ripgrep
+                ;;
+              macOS)
+                brew install ripgrep
+                ;;
+              *)
+                echo "::error::unsupported runner OS for ripgrep install: $RUNNER_OS"
+                exit 1
+                ;;
+            esac
+          fi
+          command -v rg
+
       - name: Validate installer checksum fixtures
         run: python3 scripts/test-install-checksum.py
 
@@ -413,16 +623,13 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
 
+      # Same trusted-ref scoping as the Windows authority job: restore always,
+      # save only from main. This is the pull-request critical path, so a warm
+      # dependency graph here is what a round actually costs.
       - name: Cache cargo registry and build
-        uses: actions/cache@v6
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -459,16 +666,64 @@ jobs:
             echo "  ok: $label"
           }
 
-          # [1/2] Every answer module, poisoned at several sites including
+          # [1/3] Every answer module, poisoned at several sites including
           # end-of-file, against both guards. This step used to plant one probe
           # in one module, at the top of a file it had truncated to three lines.
           # That proved the guards worked at that spot and nowhere else, and it
           # passed for as long as a comment-tracking desync left the last third
           # of the largest answer module unscanned.
-          echo "[1/2] every answer module, every probe site, both guards"
+          #
+          # The harness also probes the two ways an EXEMPTION can lose scope
+          # rather than a pattern losing a site: a brace inside a literal or a
+          # comment planted in an allowlisted function body, which a raw brace
+          # counter reads as an unclosed body and silently excuses to end of
+          # file, and a counted pin paid for by a rename in test code the guard
+          # never reads. Both are the same failure as [2/3] reached through the
+          # exemption mechanism instead of a stale pin.
+          echo "[1/3] every answer module, every probe site, both guards"
           python3 scripts/falsify-zero-file-search.py "$poisoned"
 
-          echo "[2/2] allowlist entry naming a path that no longer exists"
+          # [2/3] A broken pin must not hide the scan. Allowlist validation used
+          # to exit before the walk, so a stale pin reported itself and nothing
+          # else; two stale pins once masked ten real violations in a newly
+          # covered crate, which made a red allowlist useless as a measure of
+          # remaining work. Break one pin's count deliberately and require the
+          # run to report the violations that pin was masking AS WELL AS the pin
+          # error. Runs before [3/3], which mutates the allowlist irreversibly.
+          echo "[2/3] a broken pin must not hide the scan"
+          python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
+          import json, sys
+          path = sys.argv[1]
+          data = json.load(open(path))
+          target = "crates/kin-daemon/src/repository_branch.rs"
+          for entry in data["allowlist"]:
+              if entry["file"] == target:
+                  entry["allow_match"] = [{"expr": ".metadata()", "count": 999}]
+                  break
+          else:
+              raise SystemExit(f"::error::falsification setup: no pin on {target}")
+          json.dump(data, open(path, "w"))
+          PY
+          out=""; rc=0
+          out="$(python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned" 2>&1)" || rc=$?
+          for want in \
+            "[VIOLATION] crates/kin-daemon/src/repository_branch.rs" \
+            "want 999" \
+            "Scanned "; do
+            if ! grep -qF "$want" <<<"$out"; then
+              echo "::error::falsification failed: a broken pin hid the scan (missing '$want')"
+              echo "$out"; exit 1
+            fi
+          done
+          if [[ $rc -eq 0 ]]; then
+            echo "::error::falsification failed: a broken pin did not fail the guard"
+            echo "$out"; exit 1
+          fi
+          echo "  ok: broken pin reported its masked violations and still failed"
+          # Restore the real policy; [3/3] starts from an unbroken allowlist.
+          cp scripts/zero-file-search-allowlist.json "$poisoned/scripts/"
+
+          echo "[3/3] allowlist entry naming a path that no longer exists"
           python3 - "$poisoned/scripts/zero-file-search-allowlist.json" <<'PY'
           import json, sys
           path = sys.argv[1]
@@ -586,6 +841,18 @@ jobs:
       - name: Doc tests
         # nextest does not run doctests; keep them covered explicitly.
         run: cargo test --doc --locked
+
+      # `gcs` is a non-default feature, so the passes above never execute the
+      # hosted-storage code it gates, and Clippy's `--all-features` pass only
+      # type-checks it. Without this step a behavioral regression in the
+      # GCS-mode startup admission path compiles clean and reaches main with a
+      # green required context. The whole package runs rather than just the
+      # binary target: the feature gates only `bin/kin-daemon.rs` today, and
+      # scoping to that target would silently stop covering a gate added to the
+      # library later. No companion doctest pass belongs here because
+      # kin-daemon declares `doctest = false`.
+      - name: Test gcs feature
+        run: cargo nextest run -p kin-daemon --features gcs --locked
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 

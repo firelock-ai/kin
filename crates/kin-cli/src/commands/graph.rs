@@ -4,7 +4,10 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use kin_model::{Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, RelationKind};
+use kin_mcp::handlers::common::presentation_span_lines;
+use kin_model::{
+    Entity, EntityId, EntityKind, EntityRole, EntityStore, GraphStore, Hash256, RelationKind,
+};
 use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
@@ -35,12 +38,23 @@ pub struct GraphSourceRecord {
     pub kind: String,
     pub language: String,
     pub file_path: String,
+    /// 1-based inclusive presentation lines, converted from the graph's 0-based
+    /// span rows at construction. This record is only ever printed or serialized
+    /// to an agent, so it carries the editor convention; `start_byte`/`end_byte`
+    /// stay in the graph's own domain because they are offsets, not positions.
     pub start_line: u32,
     pub end_line: u32,
     pub start_byte: usize,
     pub end_byte: usize,
     pub signature: String,
     pub body: String,
+    /// Whether the span that cut `body` was proven to describe these exact bytes
+    /// (`kin_mcp::handlers::common::SpanCoherence::label`).
+    ///
+    /// A provable mismatch never reaches here, because it fails the read. What this
+    /// distinguishes is a verified pair from one the graph recorded no digest for,
+    /// so a caller about to restate this body as an edit can tell which it has.
+    pub span_coherence: String,
 }
 
 /// The three distinguishable results of resolving an entity's source for
@@ -194,21 +208,40 @@ fn build_graph_status_response(
     let health = inspect_graph(binding, graph)?;
 
     let entities = graph.list_all_entities()?;
-    let entity_count = entities.len();
 
-    // Role counts
+    // An external reference target is a node this repository references without
+    // owning: no file, no span, no signature, and a uniform kind. Counting it
+    // among the entities this repository holds would report documentation
+    // coverage falling with no change to documentation, put a fabricated bucket
+    // in the kind histogram, and make the entity and file totals stop
+    // corresponding. It is counted on its own line instead, so it is disclosed
+    // rather than either hidden or folded into a claim about this repository's
+    // own code.
+    let (defined, external_targets): (Vec<&Entity>, Vec<&Entity>) = entities
+        .iter()
+        .partition(|e| !kin_index::is_external_reference_target(e));
+    let entity_count = defined.len();
+
+    // Role counts, over the entities this repository defines. Role
+    // classification is a statement about a repository's own files, and the
+    // warning below reads these counts to decide whether the classifier ran at
+    // all.
     let mut role_counts: HashMap<EntityRole, usize> = HashMap::new();
-    for e in &entities {
+    for e in &defined {
         *role_counts.entry(e.role).or_insert(0) += 1;
     }
 
     // Kind counts
     let mut kind_counts: HashMap<EntityKind, usize> = HashMap::new();
-    for e in &entities {
+    for e in &defined {
         *kind_counts.entry(e.kind).or_insert(0) += 1;
     }
 
-    // Relation counts by kind
+    // Relation counts by kind. Entity-rooted traversal only reaches edges whose
+    // src and dst are both entities, so this total is narrower than the whole
+    // relation table, which also carries artifact-, test-, contract-, work-, and
+    // verification-run-anchored edges. Both totals are reported below, each
+    // labeled with the scope it counts.
     let mut relation_counts: HashMap<RelationKind, usize> = HashMap::new();
     let mut seen_relation_ids = HashSet::new();
     let mut total_relations = 0usize;
@@ -231,24 +264,28 @@ fn build_graph_status_response(
     let embed_status = graph.embedding_status();
 
     // Doc summary coverage
-    let with_docs = entities.iter().filter(|e| e.doc_summary.is_some()).count();
+    let with_docs = defined.iter().filter(|e| e.doc_summary.is_some()).count();
 
     let mut lines = Vec::new();
     lines.push("=== Graph Health ===".to_string());
     lines.push(String::new());
     lines.push(format!(
-        "Entities: {}  |  Relations: {}  |  Files: {}",
+        "Entities: {}  |  Entity-to-entity relations: {}  |  Files: {}",
         entity_count,
         total_relations,
         unique_files.len()
     ));
     lines.push(format!(
-        "Rels/Entity: {:.2}",
+        "Entity-to-entity rels/entity: {:.2}",
         if entity_count == 0 {
             0.0
         } else {
             total_relations as f64 / entity_count as f64
         }
+    ));
+    lines.push(format!(
+        "External reference targets: {}",
+        external_targets.len()
     ));
     lines.push(String::new());
 
@@ -274,7 +311,10 @@ fn build_graph_status_response(
         .iter()
         .map(|(kind, count)| format!("{:?}: {}", kind, count))
         .collect();
-    lines.push(format!("Relations: {}", rel_parts.join(", ")));
+    lines.push(format!(
+        "Entity-to-entity relation kinds: {}",
+        rel_parts.join(", ")
+    ));
 
     // Kind distribution
     let mut kind_pairs: Vec<_> = kind_counts.iter().collect();
@@ -302,7 +342,7 @@ fn build_graph_status_response(
         }
     ));
     lines.push(format!(
-        "Semantic rels (excluding CoChanges): {} ({:.2}/entity)",
+        "All graph relations excluding CoChanges: {} ({:.2}/entity)",
         health.semantic_relation_count, health.semantic_relation_density_excluding_cochanges
     ));
     lines.push(format!(
@@ -323,22 +363,25 @@ fn build_graph_status_response(
     // Warnings
     let mut warnings = health.warnings.clone();
     let criticals = health.critical_issues.clone();
-    if entity_count > 0 && total_relations == 0 {
+    let all_relation_count = health
+        .semantic_relation_count
+        .saturating_add(health.cochange_relation_count);
+    if entity_count > 0 && all_relation_count == 0 {
         warnings.push("no relations in graph — cross-file linking may have failed".to_string());
     }
     if entity_count > 0 && role_counts.len() == 1 && role_counts.contains_key(&EntityRole::Source) {
         warnings
             .push("all entities are Source — role classification may not be working".to_string());
     }
-    let rels_per_ent = if entity_count == 0 {
+    let entity_rels_per_ent = if entity_count == 0 {
         0.0
     } else {
         total_relations as f64 / entity_count as f64
     };
-    if rels_per_ent < 0.1 && entity_count > 100 {
+    if entity_rels_per_ent < 0.1 && entity_count > 100 {
         warnings.push(format!(
-            "very low relation density ({:.2} rels/entity) — linker may be failing",
-            rels_per_ent
+            "very low entity-to-entity relation density ({:.2} rels/entity) — entity linker may be failing",
+            entity_rels_per_ent
         ));
     }
     if warnings.is_empty() && criticals.is_empty() {
@@ -353,6 +396,7 @@ fn build_graph_status_response(
             lines.push(format!("⚠ {}", w));
         }
     }
+    append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
         lines,
@@ -360,6 +404,20 @@ fn build_graph_status_response(
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
         source: None,
     })
+}
+
+/// Render a health report's notes in the single form every graph reporting
+/// surface uses.
+///
+/// Notes describe expected absences rather than defects, so they follow the
+/// verdict instead of suppressing it. `status` and `validate` render them from
+/// here so the two cannot drift: a surface that carries the verdict but drops
+/// the notes reports a repository whose enrichment is still pending as
+/// indistinguishable from a fully enriched one.
+fn append_health_notes(lines: &mut Vec<String>, notes: &[String]) {
+    for note in notes {
+        lines.push(format!("ℹ {}", note));
+    }
 }
 
 fn build_graph_validate_response(
@@ -380,24 +438,42 @@ fn build_graph_validate_response(
 
     // Check for duplicate entities (same name + file + kind + byte position).
     // Using byte position distinguishes legitimate overloads (Python @overload,
-    // Rust impl From<X>, C++ template specializations) from true duplicates.
-    // Two entities at different positions in the same file are never duplicates.
-    let mut seen: HashMap<(String, Option<String>, EntityKind, usize), Vec<kin_model::EntityId>> =
-        HashMap::new();
+    // Rust impl From<X>, C++ template specializations) from true duplicates: two
+    // entities declared at different positions in one file are never duplicates.
+    //
+    // An entity with no span has no position to be distinguished by, and
+    // collapsing that to byte zero makes the position discriminate nothing. An
+    // external reference target is exactly that shape: it stands for a symbol
+    // another repository owns, so it carries no file and no span, and its kind
+    // is uniform. Name alone would then report two legitimately distinct
+    // targets as one duplicated entity, which is what `use log::info` beside
+    // `use tracing::info` produces on an ordinary repository. Its fingerprint
+    // is derived from the facts that do identify it, the import source and the
+    // symbol, so it stands in for the absent position and keeps the check
+    // meaningful: two targets naming different import sources stay distinct,
+    // while two entities claiming the same import source and symbol are still
+    // reported. Entities that do carry a span keep the position key exactly as
+    // before, so nothing this check used to catch stops being caught.
+    let mut seen: HashMap<
+        (String, Option<String>, EntityKind, usize, Option<Hash256>),
+        Vec<kin_model::EntityId>,
+    > = HashMap::new();
     for e in &entities {
         let start_byte = e.span.as_ref().map(|s| s.start_byte).unwrap_or(0);
+        let placeless_identity = e.span.is_none().then_some(e.fingerprint.ast_hash);
         let key = (
             e.name.clone(),
             e.file_origin.as_ref().map(|f| f.0.clone()),
             e.kind,
             start_byte,
+            placeless_identity,
         );
         seen.entry(key).or_default().push(e.id);
     }
     let duplicates: Vec<_> = seen.iter().filter(|(_, ids)| ids.len() > 1).collect();
     if !duplicates.is_empty() {
         issues.push(format!(
-            "{} true duplicate entities (same name+file+kind+position)",
+            "{} true duplicate entities (same name+file+kind, same position or same identity)",
             duplicates.len()
         ));
     }
@@ -487,6 +563,7 @@ fn build_graph_validate_response(
             lines.push(format!("✗ {}", issue));
         }
     }
+    append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
         lines,
@@ -527,10 +604,8 @@ fn build_graph_inspect_response(
             lines.push(format!("  File: {}", fo.0));
         }
         if let Some(ref span) = entity.span {
-            lines.push(format!(
-                "  Span: lines {}-{}",
-                span.start_line, span.end_line
-            ));
+            let (start_line, end_line) = presentation_span_lines(span);
+            lines.push(format!("  Span: lines {start_line}-{end_line}"));
         }
         lines.push(format!("  Signature: {}", entity.signature));
         if let Some(ref doc) = entity.doc_summary {
@@ -539,55 +614,20 @@ fn build_graph_inspect_response(
         lines.push(format!("  Visibility: {:?}", entity.visibility));
 
         // Show relations
-        let relations = graph.get_all_relations_for_entity(&entity.id)?;
-        if !relations.is_empty() {
-            lines.push(format!("  Relations ({}):", relations.len()));
-            for rel in relations.iter().take(20) {
-                let target_name = match rel.dst {
-                    kin_model::GraphNodeId::Entity(id) => {
-                        if id == entity.id {
-                            // Incoming relation — show source
-                            match rel.src {
-                                kin_model::GraphNodeId::Entity(src_id) => graph
-                                    .get_entity(&src_id)?
-                                    .map(|e| {
-                                        format!(
-                                            "{} ({})",
-                                            e.name,
-                                            e.file_origin
-                                                .as_ref()
-                                                .map(|f| f.0.as_str())
-                                                .unwrap_or("?")
-                                        )
-                                    })
-                                    .unwrap_or_else(|| format!("{}", src_id)),
-                                _ => format!("{:?}", rel.src),
-                            }
-                        } else {
-                            graph
-                                .get_entity(&id)?
-                                .map(|e| {
-                                    format!(
-                                        "{} ({})",
-                                        e.name,
-                                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?")
-                                    )
-                                })
-                                .unwrap_or_else(|| format!("{}", id))
-                        }
-                    }
-                    _ => format!("{:?}", rel.dst),
-                };
-                let direction = if matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id)
-                {
-                    "<-"
-                } else {
-                    "->"
-                };
-                lines.push(format!("    {} {:?} {}", direction, rel.kind, target_name));
+        let rows = inspect_relation_rows(graph, &entity)?;
+        if rows.total > 0 {
+            lines.push(format!("  Relations ({}):", rows.total));
+            for row in &rows.displayed {
+                lines.push(format!(
+                    "    {} {:?} {}",
+                    row.direction, row.kind, row.peer_label
+                ));
             }
-            if relations.len() > 20 {
-                lines.push(format!("    ... and {} more", relations.len() - 20));
+            if rows.total > rows.displayed.len() {
+                lines.push(format!(
+                    "    ... and {} more",
+                    rows.total - rows.displayed.len()
+                ));
             }
         }
         lines.push(String::new());
@@ -597,6 +637,86 @@ fn build_graph_inspect_response(
         lines,
         error: None,
         source: None,
+    })
+}
+
+/// Peer rows rendered past this point are summarized as a remainder count.
+const INSPECT_RELATION_LIMIT: usize = 20;
+
+/// One peer row of a `kin graph inspect` relation list.
+#[derive(Debug)]
+struct InspectRelationRow {
+    direction: &'static str,
+    kind: RelationKind,
+    peer_label: String,
+}
+
+/// Bounded rendered rows plus the full number of unique peer observations.
+#[derive(Debug)]
+struct InspectRelationRows {
+    total: usize,
+    displayed: Vec<InspectRelationRow>,
+}
+
+/// Build the deduplicated peer rows for one inspected entity.
+///
+/// Two rows are the same observation when they share direction marker, kind,
+/// and peer node, so only one is rendered. Mixed-domain relations are included,
+/// and entity labels carry their stable identity because overloads can share a
+/// name, kind, and file. Relation identities determine display order, and peer
+/// labels are resolved only for the bounded displayed prefix.
+fn inspect_relation_rows(
+    graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> Result<InspectRelationRows> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    let self_node = kin_model::GraphNodeId::Entity(entity.id);
+    let mut relations = graph.get_all_relations_for_node(&self_node)?;
+    relations.sort_unstable_by_key(|rel| rel.id.0);
+
+    for rel in relations {
+        let src_is_self = matches!(rel.src, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let dst_is_self = matches!(rel.dst, kin_model::GraphNodeId::Entity(id) if id == entity.id);
+        let (direction, peer) = match (src_is_self, dst_is_self) {
+            (true, true) => ("<->", rel.src),
+            (false, true) => ("<-", rel.src),
+            (true, false) => ("->", rel.dst),
+            (false, false) => continue,
+        };
+        if !seen.insert((direction, rel.kind, peer)) {
+            continue;
+        }
+        if rows.len() >= INSPECT_RELATION_LIMIT {
+            continue;
+        }
+
+        let peer_label = match peer {
+            kin_model::GraphNodeId::Entity(peer_id) => graph
+                .get_entity(&peer_id)?
+                .map(|e| {
+                    format!(
+                        "{} [{:?}] ({}; entity:{})",
+                        e.name,
+                        e.kind,
+                        e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?"),
+                        e.id
+                    )
+                })
+                .unwrap_or_else(|| format!("{}", peer_id)),
+            other => other.to_string(),
+        };
+
+        rows.push(InspectRelationRow {
+            direction,
+            kind: rel.kind,
+            peer_label,
+        });
+    }
+
+    Ok(InspectRelationRows {
+        total: seen.len(),
+        displayed: rows,
     })
 }
 
@@ -757,7 +877,18 @@ fn graph_source_record(
         .span
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("entity '{}' has no source span", entity.name))?;
-    let bytes = read_entity_file_bytes_from_graph(binding, graph, entity)?;
+    let (bytes, blob) = read_entity_file_bytes_with_digest(binding, graph, entity)?;
+    // Bind the span to the bytes it is about to cut, through the SAME rule the MCP
+    // resolver uses.
+    //
+    // This arm resolves its own bytes rather than routing through
+    // `read_entity_source_excerpt_detailed`, and it is the arm the daemon serves
+    // `get_entity_source` and `get_entity_sources` from, so in product mode it is
+    // the arm agents actually read through. Leaving the check on the offline
+    // resolver only would have protected the path used least. The bounds checks
+    // below cannot substitute: a stale span normally still lands inside the file.
+    let span_coherence =
+        kin_mcp::handlers::common::span_source_coherence(entity, &blob, &file_origin.0)?;
     if span.start_byte >= span.end_byte {
         anyhow::bail!(
             "entity '{}' has an empty or invalid source span ({}..{})",
@@ -785,26 +916,43 @@ fn graph_source_record(
             )
         })?
         .to_string();
+    let (start_line, end_line) = presentation_span_lines(span);
     Ok(GraphSourceRecord {
         id: entity.id.to_string(),
         name: entity.name.clone(),
         kind: format!("{:?}", entity.kind),
         language: entity.language.to_string(),
         file_path: file_origin.0.clone(),
-        start_line: span.start_line,
-        end_line: span.end_line,
+        start_line,
+        end_line,
         start_byte: span.start_byte,
         end_byte: span.end_byte,
         signature: entity.signature.clone(),
         body,
+        span_coherence: span_coherence.label().to_string(),
     })
 }
 
 pub(crate) fn read_entity_file_bytes_from_graph(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
-    _graph: &impl GraphStore,
+    graph: &impl GraphStore,
     entity: &Entity,
 ) -> Result<Vec<u8>> {
+    read_entity_file_bytes_with_digest(binding, graph, entity).map(|(bytes, _)| bytes)
+}
+
+/// The bytes at an entity's path in the exact workspace tree, plus the digest
+/// they were loaded by.
+///
+/// Callers that go on to SLICE these bytes with the live entity's span need the
+/// digest, because the span and the bytes come from two independently updated
+/// stores and the digest is what binds them. Returning it here rather than
+/// re-resolving the artifact keeps the pair from being sampled twice.
+pub(crate) fn read_entity_file_bytes_with_digest(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    _graph: &impl GraphStore,
+    entity: &Entity,
+) -> Result<(Vec<u8>, kin_model::Hash256)> {
     let file_id = entity
         .file_origin
         .as_ref()
@@ -834,12 +982,13 @@ pub(crate) fn read_entity_file_bytes_from_graph(
             workspace.workspace_id
         );
     };
-    authority.load_source_blob(hash).with_context(|| {
+    let bytes = authority.load_source_blob(hash).with_context(|| {
         format!(
             "repository-v6 source body for artifact {:?} at '{}' is unavailable",
             artifact.artifact_id, file_id.0
         )
-    })
+    })?;
+    Ok((bytes, hash))
 }
 
 #[cfg(test)]
@@ -851,7 +1000,6 @@ mod tests {
         SemanticFingerprint, SourceSpan, TreeEntry, Visibility,
     };
     use std::fs;
-    use std::process::Command;
 
     #[test]
     fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
@@ -899,11 +1047,15 @@ mod tests {
     }
 
     fn test_relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
+        graph_relation(kind, GraphNodeId::Entity(src), GraphNodeId::Entity(dst))
+    }
+
+    fn graph_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> Relation {
         Relation {
             id: RelationId::new(),
             kind,
-            src: GraphNodeId::Entity(src),
-            dst: GraphNodeId::Entity(dst),
+            src,
+            dst,
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,
@@ -962,6 +1114,80 @@ mod tests {
         let binding =
             kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
         (temp, binding, kin_db::InMemoryGraph::new())
+    }
+
+    #[test]
+    fn graph_status_labels_each_relation_total_with_its_scope() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_status_response(&binding, &graph).unwrap();
+
+        // The entity-rooted total and the whole-table total count different
+        // scopes, so neither line may carry a bare "Relations" label.
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("Entity-to-entity relations: 1")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Entity-to-entity rels/entity: ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Entity-to-entity relation kinds: ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("All graph relations excluding CoChanges: ")));
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Relations: ") || line.contains("  |  Relations: ")),
+            "{:?}",
+            response.lines
+        );
+    }
+
+    #[test]
+    fn graph_status_does_not_call_a_mixed_relation_graph_relationless() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::Covers,
+                GraphNodeId::Test(kin_model::TestId::new()),
+                GraphNodeId::Entity(entity.id),
+            ))
+            .unwrap();
+
+        let response = build_graph_status_response(&binding, &graph).unwrap();
+
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.contains("Entity-to-entity relations: 0")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "All graph relations excluding CoChanges: 1 (1.00/entity)"));
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("no relations in graph")),
+            "{:?}",
+            response.lines
+        );
     }
 
     #[test]
@@ -1042,6 +1268,260 @@ mod tests {
     }
 
     #[test]
+    fn graph_inspect_collapses_repeated_peer_edges() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut container = test_entity("Stats");
+        container.kind = EntityKind::Class;
+        container.file_origin = Some(FilePathId::new("crates/printer/src/stats.rs"));
+        let mut member = test_entity("Stats::elapsed");
+        member.kind = EntityKind::Method;
+        member.file_origin = Some(FilePathId::new("crates/printer/src/stats.rs"));
+        graph.upsert_entity(&container).unwrap();
+        graph.upsert_entity(&member).unwrap();
+
+        // Two rows for one logical edge: distinct relation IDs, identical
+        // (direction, kind, peer).
+        for _ in 0..2 {
+            graph
+                .upsert_relation(&test_relation(
+                    RelationKind::Contains,
+                    container.id,
+                    member.id,
+                ))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "Stats::elapsed").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    <- Contains "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 1, "{:?}", response.lines);
+        assert_eq!(
+            peer_rows[0],
+            &format!(
+                "    <- Contains Stats [Class] (crates/printer/src/stats.rs; entity:{})",
+                container.id
+            )
+        );
+        assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
+    }
+
+    #[test]
+    fn graph_inspect_keeps_distinct_peers_that_share_a_name_and_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut member = test_entity("Stats::elapsed");
+        member.kind = EntityKind::Method;
+        graph.upsert_entity(&member).unwrap();
+
+        let file = FilePathId::new("crates/printer/src/stats.rs");
+        let mut declaration = test_entity("Stats");
+        declaration.kind = EntityKind::Class;
+        declaration.file_origin = Some(file.clone());
+        let mut alias = test_entity("Stats");
+        alias.kind = EntityKind::TypeAlias;
+        alias.file_origin = Some(file);
+        graph.upsert_entity(&declaration).unwrap();
+        graph.upsert_entity(&alias).unwrap();
+
+        for peer in [&declaration, &alias] {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Contains, peer.id, member.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "Stats::elapsed").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    <- Contains "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains("Stats [Class] (crates/printer/src/stats.rs; entity:")));
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains("Stats [TypeAlias] (crates/printer/src/stats.rs; entity:")));
+    }
+
+    #[test]
+    fn graph_inspect_disambiguates_overloads_with_the_same_name_kind_and_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut subject = test_entity("dispatch");
+        subject.kind = EntityKind::Method;
+        graph.upsert_entity(&subject).unwrap();
+
+        let file = FilePathId::new("src/handlers.rs");
+        let mut first = test_entity("Handler::run");
+        first.kind = EntityKind::Method;
+        first.file_origin = Some(file.clone());
+        first.span = Some(SourceSpan {
+            file: file.clone(),
+            start_byte: 10,
+            end_byte: 20,
+            start_line: 2,
+            start_col: 0,
+            end_line: 4,
+            end_col: 1,
+        });
+        let mut second = test_entity("Handler::run");
+        second.kind = EntityKind::Method;
+        second.file_origin = Some(file.clone());
+        second.span = Some(SourceSpan {
+            file,
+            start_byte: 30,
+            end_byte: 40,
+            start_line: 6,
+            start_col: 0,
+            end_line: 8,
+            end_col: 1,
+        });
+        graph.upsert_entity(&first).unwrap();
+        graph.upsert_entity(&second).unwrap();
+
+        for peer in [&first, &second] {
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, subject.id, peer.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+        let peer_rows: Vec<_> = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    -> Calls Handler::run "))
+            .collect();
+
+        assert_eq!(peer_rows.len(), 2, "{:?}", response.lines);
+        assert_ne!(peer_rows[0], peer_rows[1], "{:?}", response.lines);
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains(&format!("entity:{}", first.id))));
+        assert!(peer_rows
+            .iter()
+            .any(|line| line.contains(&format!("entity:{}", second.id))));
+    }
+
+    #[test]
+    fn graph_inspect_includes_mixed_domain_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("dispatch");
+        graph.upsert_entity(&subject).unwrap();
+
+        let test_id = kin_model::TestId::new();
+        let artifact_id = ArtifactId::new();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::Covers,
+                GraphNodeId::Test(test_id),
+                GraphNodeId::Entity(subject.id),
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&graph_relation(
+                RelationKind::OwnedByFile,
+                GraphNodeId::Entity(subject.id),
+                GraphNodeId::Artifact(artifact_id),
+            ))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (2):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("    <- Covers test:{test_id}")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("    -> OwnedByFile artifact:{}", artifact_id.0)));
+    }
+
+    #[test]
+    fn graph_inspect_bounds_rendered_rows_but_reports_the_full_unique_count() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("dispatch");
+        graph.upsert_entity(&subject).unwrap();
+
+        for index in 0..=INSPECT_RELATION_LIMIT {
+            let peer = test_entity(&format!("peer_{index}"));
+            graph.upsert_entity(&peer).unwrap();
+            graph
+                .upsert_relation(&test_relation(RelationKind::Calls, subject.id, peer.id))
+                .unwrap();
+        }
+
+        let response = build_graph_inspect_response(&graph, "dispatch").unwrap();
+        let peer_rows = response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("    -> Calls peer_"))
+            .count();
+
+        assert_eq!(peer_rows, INSPECT_RELATION_LIMIT, "{:?}", response.lines);
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == &format!("  Relations ({}):", INSPECT_RELATION_LIMIT + 1)));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line == "    ... and 1 more"));
+    }
+
+    #[test]
+    fn graph_inspect_separates_incoming_and_outgoing_edges_of_one_kind() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("render");
+        let caller = test_entity("main");
+        let callee = test_entity("format_row");
+        for entity in [&subject, &caller, &callee] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, subject.id))
+            .unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, subject.id, callee.id))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "render").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (2):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    <- Calls main ")));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    -> Calls format_row ")));
+    }
+
+    #[test]
+    fn graph_inspect_renders_self_relation_bidirectionally() {
+        let graph = kin_db::InMemoryGraph::new();
+        let subject = test_entity("render");
+        graph.upsert_entity(&subject).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, subject.id, subject.id))
+            .unwrap();
+
+        let response = build_graph_inspect_response(&graph, "render").unwrap();
+
+        assert!(response.lines.iter().any(|line| line == "  Relations (1):"));
+        assert!(response
+            .lines
+            .iter()
+            .any(|line| line.starts_with("    <-> Calls render ")));
+    }
+
+    #[test]
     fn graph_inspect_accepts_entity_uuid() {
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("checkout");
@@ -1073,10 +1553,12 @@ mod tests {
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::commands::test_subprocess::fixture_git(&repo)
+                // This fixture consumes the committed repository immediately.
+                // Prevent maintenance from detaching work that can leave
+                // transient pack locks after `git commit` exits.
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                 .args(args)
-                .current_dir(&repo)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();
             assert!(
@@ -1097,7 +1579,7 @@ mod tests {
             fs::write(repo.join("README.md"), b"authority without source\n").unwrap();
         }
         git(&["add", "--all"]);
-        git(&["commit", "-m", "seed exact source authority"]);
+        git(&["commit", "--signoff", "-m", "seed exact source authority"]);
         let init = kin_core::init_from_git(&repo).unwrap();
         let layout = init.layout;
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
@@ -1167,6 +1649,68 @@ mod tests {
         assert_eq!(source.file_path, "src/lib.rs");
         assert_eq!(source.start_byte, start);
         assert_eq!(source.end_byte, end);
+    }
+
+    /// This arm enforces the span/bytes coherence rule too.
+    ///
+    /// It is not reached through `resolve_entity_source_authority`: it resolves its
+    /// own bytes, and it is what the daemon serves `get_entity_source` and
+    /// `get_entity_sources` from, so in product mode it is the arm agents actually
+    /// read through. A rule enforced only on the offline resolver would have
+    /// protected the least-used path and left the most-used one open.
+    ///
+    /// The two bounds checks below it cannot substitute: this fixture's stale span
+    /// (0..14 of a 14-byte original) is comfortably inside the longer replacement,
+    /// so a length test passes and the read would return a truncated fragment of a
+    /// different function as this entity's body.
+    #[test]
+    fn graph_source_refuses_a_span_derived_from_different_bytes() {
+        let original = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(original));
+        let mut entity = source_entity("target", fixture.file_id.clone(), 0, original.len() - 1);
+        // Stamp the digest of a DIFFERENT source: the reconciler records the digest
+        // each span was derived from, and here it does not describe the tree's bytes.
+        entity.metadata.extra.insert(
+            "blob_hash".to_string(),
+            serde_json::Value::String(Hash256::from_bytes([0x5a; 32]).to_string()),
+        );
+        let id = entity.id;
+        commit_source_entity(&fixture, &entity);
+
+        let error = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
+            .expect_err("a span derived from other bytes must not serve a mis-sliced body");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not describe these bytes"),
+            "the refusal must name the incoherence, got: {message}"
+        );
+    }
+
+    /// An entity whose recorded digest matches the tree is served AND says so, so
+    /// a caller preparing an overwrite can tell a verified body from an unverified
+    /// one on this arm as well.
+    #[test]
+    fn graph_source_reports_span_coherence_for_a_verified_read() {
+        let original = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(original));
+        let mut entity = source_entity("target", fixture.file_id.clone(), 0, original.len() - 1);
+
+        // The digest the tree actually holds for this path.
+        let blob = read_entity_file_bytes_with_digest(&fixture.binding, &fixture.graph, &entity)
+            .unwrap()
+            .1;
+        entity.metadata.extra.insert(
+            "blob_hash".to_string(),
+            serde_json::Value::String(blob.to_string()),
+        );
+        let id = entity.id;
+        commit_source_entity(&fixture, &entity);
+
+        let response =
+            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
+        let record = response.source.unwrap();
+        assert_eq!(record.body, "fn target() {}");
+        assert_eq!(record.span_coherence, "digest_verified");
     }
 
     #[test]
@@ -1322,5 +1866,182 @@ mod tests {
         assert!(response.source.is_none());
         let error = response.error.expect("not-found must populate error");
         assert!(error.contains(&invented.to_string()), "{error}");
+    }
+
+    /// Build a validate fixture whose graph carries exactly `tree_paths` in its
+    /// resolved tree, independent of what the working directory holds.
+    fn orphan_fixture(
+        tree_paths: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        kin_core::KinLayout,
+        kin_core::LocalRepositoryAuthorityBinding,
+        kin_db::InMemoryGraph,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(temp.path()).unwrap().layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let artifacts: Vec<_> = tree_paths
+            .iter()
+            .map(|path| {
+                ResolvedArtifact::new(
+                    ArtifactId::new(),
+                    RepoPath::from_utf8((*path).to_string()).unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([0x99; 32]), false),
+                )
+            })
+            .collect();
+        let mut snapshot = kin_db::GraphSnapshot::empty();
+        snapshot.resolved_tree = ResolvedTree::from_artifacts(artifacts).unwrap();
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        (temp, layout, binding, graph)
+    }
+
+    fn orphan_line(response: &GraphCommandResponse) -> Option<&String> {
+        response.lines.iter().find(|line| line.contains("orphaned"))
+    }
+
+    /// A file present in the working tree but absent from the graph's exact
+    /// tree is still an orphan. Deciding orphan status by probing the working
+    /// directory reports zero here, which is what this asserts against: the
+    /// projection cannot vouch for an entity the graph does not carry.
+    #[test]
+    fn graph_validate_counts_orphans_absent_from_the_graph_tree_despite_the_file_on_disk() {
+        let (_temp, layout, binding, graph) = orphan_fixture(&[]);
+        let on_disk = layout.working_dir().join("src/present.rs");
+        fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        fs::write(&on_disk, b"fn present() {}\n").unwrap();
+        assert!(on_disk.exists(), "fixture must put the file on disk");
+
+        let mut entity = test_entity("present");
+        entity.file_origin = Some(FilePathId::new("src/present.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
+
+        let line = orphan_line(&response).expect("graph tree lacks the file, so it is orphaned");
+        assert!(line.contains('1'), "{line}");
+    }
+
+    fn note_lines(response: &GraphCommandResponse) -> Vec<&String> {
+        response
+            .lines
+            .iter()
+            .filter(|line| line.starts_with('ℹ'))
+            .collect()
+    }
+
+    /// The shape admission binds for a symbol another repository owns. Two of
+    /// them differ only in the fingerprint derived from their import source and
+    /// symbol, which is what makes that fingerprint the identity the duplicate
+    /// check has to read.
+    fn external_target_entity(name: &str, import_identity: u8) -> Entity {
+        let mut entity = test_entity(name);
+        entity.kind = EntityKind::Module;
+        entity.role = EntityRole::External;
+        entity.signature = String::new();
+        entity.fingerprint.ast_hash = Hash256::from_bytes([import_identity; 32]);
+        entity
+    }
+
+    fn duplicate_line(response: &GraphCommandResponse) -> Option<&String> {
+        response
+            .lines
+            .iter()
+            .find(|line| line.contains("duplicate"))
+    }
+
+    /// Two external targets naming one symbol through different import sources
+    /// are two entities, and reporting them as one duplicated entity makes
+    /// validate assert corruption against a graph Kin wrote correctly. The
+    /// converse still has to hold: two entities that make the same claim about
+    /// one external target are a real duplicate, and the check that stops
+    /// false-positiving must not stop detecting.
+    #[test]
+    fn graph_validate_separates_distinct_external_targets_from_duplicated_ones() {
+        let (_temp, _layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        graph
+            .upsert_entity(&external_target_entity("info", 0x11))
+            .unwrap();
+        graph
+            .upsert_entity(&external_target_entity("info", 0x22))
+            .unwrap();
+
+        let distinct = build_graph_validate_response(&binding, &graph).unwrap();
+        assert!(
+            duplicate_line(&distinct).is_none(),
+            "distinct import sources are distinct entities: {}",
+            distinct.lines.join("\n")
+        );
+
+        // A third entity repeating the second one's claim: same name, same
+        // import identity, its own entity id.
+        graph
+            .upsert_entity(&external_target_entity("info", 0x22))
+            .unwrap();
+
+        let duplicated = build_graph_validate_response(&binding, &graph).unwrap();
+        let line = duplicate_line(&duplicated)
+            .expect("two entities claiming one external target is a duplicate");
+        assert!(line.contains('1'), "{line}");
+    }
+
+    /// Notes describe a healthy graph rather than a defect, so a surface that
+    /// keeps the verdict but drops them under-reports the repository's real
+    /// state. Both graph surfaces read one health report, so both must render
+    /// the same notes for the same state, and a reported issue must not
+    /// suppress them.
+    #[test]
+    fn graph_validate_and_status_report_the_same_health_notes() {
+        let (_temp, _layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        let mut entity = test_entity("covered");
+        entity.role = EntityRole::Test;
+        entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let validate = build_graph_validate_response(&binding, &graph).unwrap();
+        let status = build_graph_status_response(&binding, &graph).unwrap();
+
+        let validate_notes = note_lines(&validate);
+        assert!(
+            !validate_notes.is_empty(),
+            "validate must carry the health notes: {:?}",
+            validate.lines
+        );
+        assert_eq!(
+            validate_notes,
+            note_lines(&status),
+            "the two surfaces must not drift on note reporting"
+        );
+        assert!(
+            validate.lines.iter().any(|line| line.starts_with('✗')),
+            "this fixture also diverges, so notes are proven to survive a verdict: {:?}",
+            validate.lines
+        );
+    }
+
+    /// The converse: a file the graph's exact tree carries is not an orphan
+    /// even though nothing was ever written to the working directory. Together
+    /// with the test above this pins the authority — the filesystem is neither
+    /// necessary nor sufficient to decide orphan status.
+    #[test]
+    fn graph_validate_clears_orphans_carried_by_the_graph_tree_with_no_file_on_disk() {
+        let (_temp, layout, binding, graph) = orphan_fixture(&["src/tracked.rs"]);
+        assert!(
+            !layout.working_dir().join("src/tracked.rs").exists(),
+            "fixture must leave the working tree empty"
+        );
+
+        let mut entity = test_entity("tracked");
+        entity.file_origin = Some(FilePathId::new("src/tracked.rs"));
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_validate_response(&binding, &graph).unwrap();
+
+        assert!(
+            orphan_line(&response).is_none(),
+            "graph tree carries the file: {:?}",
+            response.lines
+        );
     }
 }
