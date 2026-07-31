@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository-v6 authority replaces the legacy Git-compatibility command path.
   Session execution is now graph-backed; the former `kin run` alias and remote
   daemon exec endpoint are removed.
+- Graph storage moves to on-disk snapshot format 13. A Kin binary accepts
+  exactly one on-disk format, so no repository initialized by v0.3.6, which
+  wrote format 12, opens under v0.4.0. Re-initialize the repository against its
+  source of truth. This is the standing pre-release storage posture rather than
+  something this release introduces: v0.3.6 accepted only the one format it
+  wrote, and so does this one. The accepted range widens when the format is
+  declared stable, not before.
 
 ### Changed
 
