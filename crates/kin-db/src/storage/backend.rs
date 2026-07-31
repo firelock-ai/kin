@@ -2891,6 +2891,65 @@ impl LocalFileBackend {
         }
     }
 
+    /// Rename one directory entry onto a name the kernel must refuse to
+    /// overwrite, reporting the C convention of `0` for success and `-1` with
+    /// `errno` set for failure.
+    ///
+    /// `libc` declares the `renameat2` wrapper only for the environments whose
+    /// C library exports one, which on Linux is glibc and Bionic. Every other
+    /// Linux environment, musl above all, issues the same kernel call through
+    /// `syscall` instead. Both routes reach one kernel entry point with one
+    /// flag, so `RENAME_NOREPLACE` is enforced by the kernel rather than by the
+    /// C library, and the no-replace publication guarantee does not vary with
+    /// the environment a build targets. A kernel too old to implement
+    /// `renameat2` fails the call loudly on both routes; it never degrades to a
+    /// rename that would replace the winner of a publication race.
+    #[cfg(any(target_os = "android", all(target_os = "linux", target_env = "gnu")))]
+    unsafe fn renameat2_no_replace(
+        source_directory: libc::c_int,
+        source_name: *const libc::c_char,
+        target_directory: libc::c_int,
+        target_name: *const libc::c_char,
+    ) -> libc::c_int {
+        unsafe {
+            libc::renameat2(
+                source_directory,
+                source_name,
+                target_directory,
+                target_name,
+                libc::RENAME_NOREPLACE as libc::c_uint,
+            )
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+    unsafe fn renameat2_no_replace(
+        source_directory: libc::c_int,
+        source_name: *const libc::c_char,
+        target_directory: libc::c_int,
+        target_name: *const libc::c_char,
+    ) -> libc::c_int {
+        // `syscall` is variadic, so it reads every argument at full register
+        // width. Widen each descriptor and the flag word explicitly rather than
+        // letting an `int`-sized argument leave the upper half of its register
+        // undefined.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                source_directory as libc::c_long,
+                source_name,
+                target_directory as libc::c_long,
+                target_name,
+                libc::RENAME_NOREPLACE as libc::c_long,
+            )
+        };
+        if result == 0 {
+            0
+        } else {
+            -1
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn rename_local_directory_no_replace(
         parent: &cap_std::fs::Dir,
@@ -2908,12 +2967,11 @@ impl LocalFileBackend {
         // SAFETY: both names are single NUL-terminated components and both
         // directory descriptors are the same retained parent capability.
         let result = unsafe {
-            libc::renameat2(
+            Self::renameat2_no_replace(
                 parent.as_raw_fd(),
                 source.as_ptr(),
                 parent.as_raw_fd(),
                 target.as_ptr(),
-                libc::RENAME_NOREPLACE as libc::c_uint,
             )
         };
         if result == 0 {
@@ -8594,6 +8652,91 @@ mod tests {
             std::fs::read_dir(&visible).unwrap().count(),
             0,
             "same-backend retry must not write into the replacement surface"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_replace_publication_refuses_an_occupied_directory_name() {
+        let directory = TempDir::new().unwrap();
+        let parent =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .expect("the temporary parent namespace opens");
+        parent.create_dir("stage").unwrap();
+        parent.create_dir("published").unwrap();
+        let occupant = LocalFileBackend::local_directory_entry_identity(
+            &parent,
+            "published".as_ref(),
+            Path::new("published"),
+        )
+        .unwrap()
+        .expect("the occupied target name holds a directory");
+        let staged = LocalFileBackend::local_directory_entry_identity(
+            &parent,
+            "stage".as_ref(),
+            Path::new("stage"),
+        )
+        .unwrap()
+        .expect("the staged name holds a directory");
+
+        assert!(
+            !LocalFileBackend::rename_local_directory_no_replace(
+                &parent,
+                "stage".as_ref(),
+                "published".as_ref(),
+            )
+            .expect("an occupied target name is a refusal, not a failure"),
+            "publication must refuse a target name another directory already holds"
+        );
+        assert_eq!(
+            LocalFileBackend::local_directory_entry_identity(
+                &parent,
+                "published".as_ref(),
+                Path::new("published"),
+            )
+            .unwrap(),
+            Some(occupant),
+            "the refused publication must leave the occupant's exact epoch in place"
+        );
+        assert_eq!(
+            LocalFileBackend::local_directory_entry_identity(
+                &parent,
+                "stage".as_ref(),
+                Path::new("stage"),
+            )
+            .unwrap(),
+            Some(staged),
+            "the refused stage must survive for its caller to report a competing target"
+        );
+
+        assert!(
+            LocalFileBackend::rename_local_directory_no_replace(
+                &parent,
+                "stage".as_ref(),
+                "unoccupied".as_ref(),
+            )
+            .expect("an unoccupied target name publishes"),
+            "publication must succeed onto a name no directory holds"
+        );
+        assert_eq!(
+            LocalFileBackend::local_directory_entry_identity(
+                &parent,
+                "unoccupied".as_ref(),
+                Path::new("unoccupied"),
+            )
+            .unwrap(),
+            Some(staged),
+            "the published name must carry the exact staged epoch"
+        );
+        assert_eq!(
+            LocalFileBackend::local_directory_entry_identity(
+                &parent,
+                "stage".as_ref(),
+                Path::new("stage"),
+            )
+            .unwrap(),
+            None,
+            "the staged name must be free once its epoch is published"
         );
     }
 
