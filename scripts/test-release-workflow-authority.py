@@ -2172,6 +2172,133 @@ def selector_invocation(workflow: str, content: str) -> tuple[str, ...]:
     return invocations[0]
 
 
+def tag_readback_source(release_tag: str) -> str:
+    """Extract the post-mint ref readback exactly as the workflow runs it."""
+
+    anchor = "      - name: Verify tag ref and summarize\n"
+    if anchor not in release_tag:
+        raise AssertionError(
+            "release-tag no longer carries the post-mint ref readback step"
+        )
+    start = release_tag.index(anchor)
+    end = release_tag.index("\n      - name:", start + 1) if (
+        "\n      - name:" in release_tag[start + 1 :]
+    ) else len(release_tag)
+    step = release_tag[start:end]
+    marker = "        run: |\n"
+    return textwrap.dedent(step[step.index(marker) + len(marker) :])
+
+
+def execute_tag_readback(
+    source: str,
+    responses: list[tuple[int, str]],
+) -> subprocess.CompletedProcess[str]:
+    """Run the readback against a scripted sequence of API answers."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "readback.sh"
+        script.write_text(source, encoding="utf-8")
+        (root / "responses").write_text(
+            "".join(f"{code} {body}\n" for code, body in responses),
+            encoding="utf-8",
+        )
+        (root / "attempts").write_text("0", encoding="utf-8")
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "gh").write_text(
+            "#!/usr/bin/env bash\n"
+            'attempt="$(cat "$FIXTURE/attempts")"\n'
+            'attempt=$((attempt + 1))\n'
+            'printf %s "$attempt" > "$FIXTURE/attempts"\n'
+            'line="$(sed -n "${attempt}p" "$FIXTURE/responses")"\n'
+            '[ -n "$line" ] || line="$(tail -n 1 "$FIXTURE/responses")"\n'
+            'code="${line%% *}"; body="${line#* }"\n'
+            '[ "$code" = 0 ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }\n'
+            'printf "%s\\n" "$body"\n',
+            encoding="utf-8",
+        )
+        (binaries / "gh").chmod(0o755)
+        # The exhaustion path sleeps ~30s in production; the fixture proves the
+        # control flow, not the wall clock.
+        (binaries / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (binaries / "sleep").chmod(0o755)
+        environment = dict(os.environ)
+        environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
+        environment.update(
+            {
+                "FIXTURE": str(root),
+                "GH_TOKEN": "fixture",
+                "REPO": "firelock-ai/kin",
+                "ACTOR": "kin-release-bot[bot]",
+                "TAG": "v9.9.9",
+                "SHA": RELEASE_GATE_FIXTURE_SHA,
+                "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
+            }
+        )
+        return subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=30,
+            check=False,
+        )
+
+
+def assert_tag_readback_retries(release_tag: str) -> None:
+    """A minted tag must never be reported failed because a read was early."""
+
+    source = tag_readback_source(release_tag)
+    good = (0, RELEASE_GATE_FIXTURE_SHA)
+    missing = (404, "")
+
+    immediate = execute_tag_readback(source, [good])
+    if immediate.returncode != 0:
+        raise AssertionError(
+            f"post-mint readback failed on a readable ref: "
+            f"{immediate.stdout}{immediate.stderr}"
+        )
+
+    # The observed defect: the ref exists, the first reads 404, and the mint
+    # concluded failure on a release it had already created.
+    delayed = execute_tag_readback(source, [missing, missing, good])
+    if delayed.returncode != 0:
+        raise AssertionError(
+            "post-mint readback reported a successful mint as failed because "
+            f"the ref was not visible yet: {delayed.stdout}{delayed.stderr}"
+        )
+    if "retrying" not in delayed.stdout:
+        raise AssertionError(
+            "post-mint readback must say it is retrying, so a slow read is "
+            f"legible in the log: {delayed.stdout}"
+        )
+
+    absent = execute_tag_readback(source, [missing])
+    if absent.returncode == 0:
+        raise AssertionError("post-mint readback accepted a ref that never appeared")
+    if "did not become readable" not in absent.stdout:
+        raise AssertionError(
+            "post-mint readback must distinguish exhausted reads from a "
+            f"mismatch: {absent.stdout}{absent.stderr}"
+        )
+
+    # A ref that reads back pointing elsewhere is terminal on the first read.
+    # Retrying it would be waiting for someone else's tag to change.
+    mismatch = execute_tag_readback(source, [(0, "0" * 40)])
+    if mismatch.returncode == 0:
+        raise AssertionError("post-mint readback accepted a ref at the wrong commit")
+    if "points at" not in mismatch.stdout:
+        raise AssertionError(
+            f"post-mint readback must name the wrong commit: {mismatch.stdout}"
+        )
+    if "retrying" in mismatch.stdout:
+        raise AssertionError(
+            "post-mint readback retried a ref that resolved to another commit, "
+            "which cannot become correct by waiting"
+        )
+
+
 def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
     """Pin the supply chain of anything that can write a required release context.
 
@@ -4793,6 +4920,7 @@ def main() -> None:
     # invariant.
     assert_rust_cache_steps(workflow_sources)
     assert_required_context_action_pins(workflow_sources)
+    assert_tag_readback_retries(release_tag)
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)

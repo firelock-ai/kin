@@ -1101,7 +1101,32 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          got="$(gh api "repos/$REPO/git/ref/tags/$TAG" -q '.object.sha')"
+          # The ref was just created, and the API is read-after-write eventually
+          # consistent, so the first read can 404 on a tag that exists. A bare
+          # read here concludes the whole mint FAILURE after it already
+          # succeeded, which is worse than a slow answer: release recovery reads
+          # a failed run as a release needing repair and goes to work on a
+          # healthy one. Absence is only believed after the reads are exhausted.
+          #
+          # A ref that reads back pointing somewhere else is not retried. There
+          # is no prior value for a newly created ref to be stale from, so a
+          # different sha means something else created it, which is terminal.
+          got=""
+          for attempt in 1 2 3 4 5; do
+            if got="$(gh api "repos/$REPO/git/ref/tags/$TAG" -q '.object.sha' 2>/dev/null)" \
+              && [ -n "$got" ]; then
+              break
+            fi
+            got=""
+            if [ "$attempt" -lt 5 ]; then
+              echo "tag ref not readable yet (attempt ${attempt}/5); retrying"
+              sleep "$(( attempt * 3 ))"
+            fi
+          done
+          if [ -z "$got" ]; then
+            echo "::error::post-verify failed: tag $TAG did not become readable across 5 reads over ~30s"
+            exit 1
+          fi
           echo "created ref points at: $got (expected $SHA)"
           if [ "$got" != "$SHA" ]; then
             echo "::error::post-verify failed: tag $TAG points at $got, not $SHA"
