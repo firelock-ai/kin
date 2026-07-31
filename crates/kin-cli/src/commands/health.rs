@@ -369,10 +369,13 @@ struct InstalledKin {
 /// sentinel on disk and the other install's own protocol answer, so it is the
 /// surface that can name binary age as the cause.
 ///
-/// A pre-v2 install is `Stale`, not `Misconfigured`: it does not block the
-/// binary running this check, so it must not flip the report's readiness. A
-/// legacy marker file is `Misconfigured`, because the current binary refuses to
-/// start a supervisor at all while one exists.
+/// Severity follows one rule: a state blocks readiness exactly when it stops
+/// the binary running this check from starting a supervisor. A pre-v2 *other*
+/// install is `Stale`, because another install's age does not stop this one. The
+/// two sentinel shapes `ensure_supervisor_startup_namespace` refuses on are
+/// `Misconfigured`: a legacy marker file, and a symlink or reparse point the
+/// protocol will not follow. Metadata that simply cannot be read proves nothing
+/// either way and stays advisory.
 fn supervisor_startup_protocol_check(
     sentinel: SupervisorStartupSentinel,
     sentinel_path: &Path,
@@ -394,11 +397,25 @@ fn supervisor_startup_protocol_check(
             ),
         )
         .with_manual_fix(update),
+        SupervisorStartupSentinel::RefusedLink => HealthCheck::new(
+            "supervisor_startup_protocol",
+            "Supervisor protocol",
+            HealthStatus::Misconfigured,
+            format!(
+                "{sentinel_path} is a symlink rather than a directory; startup protocol \
+                 v{protocol} refuses to follow one, so this binary cannot start a supervisor at \
+                 all while it is there"
+            ),
+        )
+        .with_manual_fix(
+            "remove the link at the supervisor startup sentinel path; kin recreates it as an \
+             ordinary directory",
+        ),
         SupervisorStartupSentinel::Unreadable => HealthCheck::new(
             "supervisor_startup_protocol",
             "Supervisor protocol",
             HealthStatus::Stale,
-            format!("{sentinel_path} exists but is neither a directory nor a regular file"),
+            format!("{sentinel_path} exists but its metadata could not be read"),
         )
         .with_manual_fix(
             "inspect the supervisor startup sentinel; it must be an ordinary directory",
@@ -449,8 +466,11 @@ fn check_supervisor_startup_protocol() -> HealthCheck {
     let sentinel = crate::daemon_client::supervisor_startup_sentinel();
     let sentinel_path = crate::daemon_client::supervisor_startup_sentinel_path();
     // Enumerating and probing installs is boundary IO and belongs to
-    // daemon_client. Probing costs a subprocess per install, so it is requested
-    // only in the state whose answer can change the verdict.
+    // daemon_client. The probe is requested only in the state whose answer can
+    // change the verdict, but that state is the steady one for every current
+    // user, so this runs on essentially every invocation rather than rarely.
+    // What keeps it acceptable is its bound, not its frequency: at most two
+    // deduped candidates, each capped by the daemon probe timeout.
     //
     // Never under test. This runs inside the unit suite through
     // `run_health_checks`, where spawning the host's installed kin-daemon would
@@ -2084,6 +2104,64 @@ mod tests {
             .manual_fix
             .as_deref()
             .is_some_and(|fix| fix.contains(crate::daemon_client::KIN_INSTALL_COMMAND)));
+    }
+
+    /// A link at the sentinel path is a hard block in fact: startup refuses to
+    /// follow one, so a report that stayed healthy would print "first-run
+    /// ready" on a host where no supervisor can start. The two contrasts are
+    /// the point of the severity rule, so they are asserted beside it:
+    /// unreadable metadata proves nothing, and a pre-v2 sibling install does
+    /// not stop the binary running the check.
+    #[test]
+    fn doctor_blocks_on_a_refused_link_but_not_on_states_that_do_not_stop_this_binary() {
+        let sentinel = PathBuf::from("/home/dev/.kin/supervisor.start.lock");
+
+        let linked = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::RefusedLink,
+            &sentinel,
+            &[],
+        );
+        assert!(
+            matches!(linked.status, HealthStatus::Misconfigured),
+            "a sentinel startup refuses to follow blocks readiness in fact: {linked:?}"
+        );
+        assert!(
+            blocks_readiness(&linked),
+            "doctor must not report readiness on a host where no supervisor can start"
+        );
+        assert!(
+            linked.detail.contains("symlink")
+                && linked.detail.contains("cannot start a supervisor"),
+            "the detail must name the actual refusal, not just an odd file type: {}",
+            linked.detail
+        );
+        assert!(linked.manual_fix.is_some(), "{linked:?}");
+
+        let unreadable = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::Unreadable,
+            &sentinel,
+            &[],
+        );
+        assert!(
+            !blocks_readiness(&unreadable),
+            "metadata that cannot be read proves nothing either way: {unreadable:?}"
+        );
+
+        let sibling = supervisor_startup_protocol_check(
+            SupervisorStartupSentinel::ProtocolDirectory,
+            &sentinel,
+            &[installed_kin(
+                "/usr/local/bin/kin",
+                InstalledStartupProtocol::Predates(
+                    "no supervisor startup protocol at all".to_string(),
+                ),
+            )],
+        );
+        assert!(
+            !blocks_readiness(&sibling),
+            "another install's age does not stop this binary, so it must not share the blocking \
+             severity: {sibling:?}"
+        );
     }
 
     #[test]

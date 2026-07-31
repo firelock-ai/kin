@@ -6,6 +6,12 @@
 //! Used by CLI commands to query the daemon's live graph instead of
 //! opening a snapshot directly. Also owns the repo-scoped daemon
 //! auto-start logic so the CLI does not need to depend on `kin-daemon`.
+//!
+//! This module is the process and install boundary for the CLI, so locating
+//! installed kin binaries and probing them is boundary IO that belongs here:
+//! it resolves what to execute and executes it, and never answers a question
+//! about repository content. Diagnostic surfaces consume the verdict rather
+//! than reaching for the filesystem to compute one.
 
 use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
@@ -3929,8 +3935,13 @@ fn preserve_bounded_legacy_rollback(
 /// Leave the protocol-upgrade notice inside the startup sentinel.
 ///
 /// Written only when the bytes differ, so a refresh is a no-op rather than a
-/// rewrite, and always before the sentinel is stamped, so the first write's
-/// effect on the directory mtime is overwritten by the compatibility stamp.
+/// rewrite, and before the sentinel is stamped, so namespace setup never hands
+/// back an aged compatibility stamp.
+///
+/// That ordering is hygiene, not the mechanism. What actually keeps the stamp
+/// safe is that every acquisition re-stamps the sentinel and fails closed
+/// unless the timestamp reads back in the future, so any dir-mtime bump taken
+/// while the namespace is built is repaired before a caller holds the lock.
 fn refresh_supervisor_startup_notice(sentinel: &Path) -> std::io::Result<()> {
     let path = sentinel.join(SUPERVISOR_STARTUP_NOTICE_FILE);
     let mut file = open_startup_regular_file(&path, true, false, true)?;
@@ -4349,10 +4360,10 @@ enum SupervisorStartupAcquisition {
 
 /// Why a supervisor startup-lock wait reached its deadline.
 ///
-/// The old message named lock contention unconditionally, which is the one
-/// explanation that is false in the case that actually reaches users: an
-/// installed binary predating startup protocol v2 sleeps out this same deadline
-/// against a sentinel nothing is holding.
+/// The old message named lock contention unconditionally. Contention is only one
+/// of the states this deadline is reachable from, and asserting it sends the
+/// caller looking for a competing launcher that may no longer exist, or never
+/// did. Each cause below is named only from evidence that distinguishes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupervisorStartupTimeoutCause {
     /// A live launcher holds the kernel authority lock. The kernel releases an
@@ -4372,7 +4383,11 @@ enum SupervisorStartupTimeoutCause {
 /// live filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SupervisorStartupTimeoutState {
-    authority_held: bool,
+    /// `None` where the probe could not decide. A filesystem whose `flock` is
+    /// unsupported or emulated answers that way on every attempt, and reading
+    /// it as "not held" would convert "contention cannot be observed here" into
+    /// "there is no contention".
+    authority_held: Option<bool>,
     sentinel_is_protocol_directory: bool,
     sentinel_stamp_is_future: bool,
     supervisor_may_be_alive: bool,
@@ -4381,8 +4396,13 @@ struct SupervisorStartupTimeoutState {
 fn classify_supervisor_startup_timeout(
     state: SupervisorStartupTimeoutState,
 ) -> SupervisorStartupTimeoutCause {
-    if state.authority_held {
-        return SupervisorStartupTimeoutCause::Contention;
+    match state.authority_held {
+        Some(true) => return SupervisorStartupTimeoutCause::Contention,
+        // An undecidable probe is not evidence of absence, so it falls through
+        // to the classifier's safe default rather than to a diagnosis that
+        // tells the caller their binary is the problem.
+        None => return SupervisorStartupTimeoutCause::SlowStartup,
+        Some(false) => {}
     }
     // A future stamp exists only where a current launcher set and read one back,
     // so it also stands in for a well-formed v2 namespace: without it this falls
@@ -4407,7 +4427,7 @@ fn probe_supervisor_startup_timeout_state(dir: &Path) -> SupervisorStartupTimeou
         .unwrap_or(false);
     let recorded = supervisor_endpoint_snapshot(dir);
     SupervisorStartupTimeoutState {
-        authority_held: supervisor_startup_authority_is_held(&sentinel).unwrap_or(false),
+        authority_held: supervisor_startup_authority_is_held(&sentinel).ok(),
         sentinel_is_protocol_directory,
         sentinel_stamp_is_future,
         supervisor_may_be_alive: recorded
@@ -4484,7 +4504,12 @@ pub enum SupervisorStartupSentinel {
     /// A protocol-v1 marker file, which only a pre-v2 launcher creates. Its
     /// presence is proof that a binary too old for this protocol ran here.
     LegacyMarker,
-    /// Present but unclassifiable (a symlink, or unreadable metadata).
+    /// A symlink, or on Windows a reparse point, where the sentinel belongs.
+    /// The startup protocol refuses to follow one, so no supervisor can start
+    /// against this Kin home until it is replaced by an ordinary directory.
+    RefusedLink,
+    /// Present, but its metadata could not be read, so nothing is claimed
+    /// either way about whether a supervisor could start here.
     Unreadable,
 }
 
@@ -4506,7 +4531,15 @@ fn supervisor_startup_sentinel_in_dir(dir: &Path) -> SupervisorStartupSentinel {
             SupervisorStartupSentinel::Absent
         }
         Err(_) => SupervisorStartupSentinel::Unreadable,
-        Ok(metadata) if metadata.file_type().is_symlink() => SupervisorStartupSentinel::Unreadable,
+        // Deliberately the same predicate `ensure_supervisor_startup_namespace`
+        // refuses on, so a state that hard-blocks supervisor startup can never
+        // be reported as one startup would accept.
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || startup_metadata_is_reparse_point(&metadata) =>
+        {
+            SupervisorStartupSentinel::RefusedLink
+        }
         Ok(metadata) if metadata.is_dir() => SupervisorStartupSentinel::ProtocolDirectory,
         Ok(_) => SupervisorStartupSentinel::LegacyMarker,
     }
@@ -4527,10 +4560,13 @@ pub enum InstalledStartupProtocol {
 
 /// Installed kin binaries on this host that are not the running one.
 ///
-/// Only install locations are considered, meaning what PATH resolves plus the
-/// Kin home's `bin`, so a build tree is never mistaken for an install. Paths are
-/// canonicalized so one binary reachable by two names is probed once and the
-/// running binary is excluded even when it was invoked through a symlink.
+/// Candidates are whatever `PATH` resolves for `kin`, plus the Kin home's
+/// `bin`. That is deliberately the set an operator actually invokes rather than
+/// a filtered notion of an install: `PATH` is what decides which binary runs, so
+/// a build tree reachable through it is probed like any other install and
+/// diagnosed on the same evidence. Paths are canonicalized so one binary
+/// reachable by two names is probed once, and so the running binary is excluded
+/// even when it was invoked through a symlink.
 fn other_installed_kin_binaries() -> Vec<PathBuf> {
     let running = std::env::current_exe()
         .ok()
@@ -7399,7 +7435,7 @@ mod tests {
     #[test]
     fn startup_timeout_diagnosis_separates_contention_from_legacy_exclusion() {
         let contended = SupervisorStartupTimeoutState {
-            authority_held: true,
+            authority_held: Some(true),
             sentinel_is_protocol_directory: true,
             sentinel_stamp_is_future: true,
             supervisor_may_be_alive: false,
@@ -7412,7 +7448,7 @@ mod tests {
         );
 
         let excluded = SupervisorStartupTimeoutState {
-            authority_held: false,
+            authority_held: Some(false),
             ..contended
         };
         assert_eq!(
@@ -7442,6 +7478,15 @@ mod tests {
                 ..excluded
             }),
             SupervisorStartupTimeoutCause::SlowStartup
+        );
+        assert_eq!(
+            classify_supervisor_startup_timeout(SupervisorStartupTimeoutState {
+                authority_held: None,
+                ..excluded
+            }),
+            SupervisorStartupTimeoutCause::SlowStartup,
+            "a filesystem that cannot report contention must not have its silence read as proof \
+             of absence and turned into a verdict on the caller's binary"
         );
     }
 
@@ -7499,10 +7544,41 @@ mod tests {
     /// The sentinel path is the only channel a current binary has to the
     /// operator of a binary too old to speak this protocol, and the far-future
     /// stamp that keeps such a binary bounded must survive using it.
+    ///
+    /// The guarded property is stamp survival, not write ordering.
+    /// `ensure_supervisor_startup_namespace` does write the notice before it
+    /// stamps, and the first block below pins that directly, but the ordering is
+    /// hygiene rather than the mechanism. Every acquisition stamps the sentinel
+    /// again and fails closed unless the timestamp reads back in the future, so
+    /// a dir-mtime bump taken while the namespace is built is repaired before
+    /// any caller holds the lock. The aged-sentinel block asserts that repair on
+    /// its own, which is the property that holds whatever order the writes
+    /// happen in.
     #[test]
     fn startup_notice_reaches_the_sentinel_without_aging_its_compatibility_stamp() {
+        // Observed at the seam rather than only after a full acquire, because
+        // the outer re-stamp would otherwise mask a notice write moved after
+        // the inner one.
+        let fresh = tempfile::tempdir().unwrap();
+        let namespace = ensure_supervisor_startup_namespace(fresh.path()).unwrap();
+        assert!(
+            namespace
+                .sentinel
+                .join(SUPERVISOR_STARTUP_NOTICE_FILE)
+                .is_file(),
+            "the notice must be written while the namespace is built, not afterwards"
+        );
+        assert!(
+            !startup_lock_is_stale(&namespace.sentinel, Duration::ZERO),
+            "namespace setup must hand back a sentinel already stamped into the future, so no \
+             write it performs can leave the stamp aged even momentarily"
+        );
+        drop(namespace);
+        drop(fresh);
+
         let dir = tempfile::tempdir().unwrap();
         let launcher = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let sentinel = launcher.path().to_path_buf();
         let notice = launcher.path().join(SUPERVISOR_STARTUP_NOTICE_FILE);
 
         assert_eq!(
@@ -7538,6 +7614,27 @@ mod tests {
             "a damaged notice must be restored rather than left wrong"
         );
         assert!(!startup_lock_is_stale(repaired.path(), Duration::ZERO));
+
+        // Aging the sentinel by hand reaches the same end state as any write
+        // ordered after a stamp, without depending on where in setup that write
+        // sits. An acquisition owes the future stamp back either way.
+        drop(repaired);
+        filetime::set_file_mtime(
+            &sentinel,
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            ),
+        )
+        .unwrap();
+        assert!(
+            startup_lock_is_stale(&sentinel, Duration::ZERO),
+            "the aging must be visible here, or the repair assertion below could not fail"
+        );
+        let restamped = take_supervisor_startup_authority_after_release(dir.path());
+        assert!(
+            !startup_lock_is_stale(restamped.path(), Duration::ZERO),
+            "an acquisition must restore a compatibility stamp it finds aged, whatever aged it"
+        );
     }
 
     /// The doctor's sentinel classification decides which diagnosis it prints,
@@ -7582,6 +7679,35 @@ mod tests {
             SupervisorStartupSentinel::ProtocolDirectory
         );
         assert_eq!(supervisor_startup_protocol(), SUPERVISOR_STARTUP_PROTOCOL);
+    }
+
+    /// A link at the sentinel path hard-blocks supervisor startup, so it must
+    /// classify as its own state rather than as the directory it points at or
+    /// as merely unreadable. The refusal is asserted in fact, not assumed: the
+    /// classification is only honest while startup really does refuse.
+    #[cfg(unix)]
+    #[test]
+    fn sentinel_classification_marks_a_link_the_startup_protocol_refuses_to_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("kin-home");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(SUPERVISOR_STARTUP_FILE)).unwrap();
+
+        assert_eq!(
+            supervisor_startup_sentinel_in_dir(&home),
+            SupervisorStartupSentinel::RefusedLink,
+            "a symlink must not be reported as the protocol directory it points at"
+        );
+
+        let refusal = ensure_supervisor_startup_namespace(&home).unwrap_err();
+        assert_eq!(
+            refusal.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "no supervisor can start against this sentinel: {refusal}"
+        );
+        assert!(refusal.to_string().contains("refuses symlink"), "{refusal}");
     }
 
     #[test]
