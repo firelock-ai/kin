@@ -214,6 +214,32 @@ async function main() {
     }
   }
 
+  // 1c. The fuzz workspace resolves kin-parser by path, so its lockfile carries
+  // the workspace version as well. A stale entry only surfaces in the fuzz job's
+  // --locked resolution, which runs after the release commit already exists.
+  const fuzzLockPath = 'fuzz/Cargo.lock';
+  const fuzzLock = await readFileOrNull(fuzzLockPath);
+  if (fuzzLock === null) {
+    failures.push(`${fuzzLockPath} not found`);
+  } else {
+    let fuzzLocal = 0;
+    for (const block of fuzzLock.split('[[package]]').slice(1)) {
+      if (/^source\s*=/m.test(block)) continue;
+      const name = block.match(/^name = "([^"]+)"/m)?.[1] ?? null;
+      const locked = block.match(/^version = "([^"]+)"/m)?.[1] ?? null;
+      if (name !== 'kin-parser') continue;
+      fuzzLocal += 1;
+      if (locked !== version) {
+        failures.push(
+          `${fuzzLockPath} local package ${name} is ${locked ?? '<missing>'}, workspace is ${version}`,
+        );
+      }
+    }
+    if (fuzzLocal === 0) {
+      failures.push(`${fuzzLockPath} has no path-resolved kin-parser entry`);
+    }
+  }
+
   // 2. CHANGELOG section: required for a stable release, advisory for prereleases.
   const changelogText = await readFileOrNull(opts.changelog);
   const hasChangelog = changelogText !== null && changelogHasSection(changelogText, version);

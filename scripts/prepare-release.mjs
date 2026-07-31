@@ -284,6 +284,16 @@ async function main() {
   const lockResult = updateWorkspaceLock(lock, workingVersion, target);
   await fs.writeFile(lockPath, lockResult.lock);
 
+  // The fuzz targets live in their own workspace that resolves kin-parser by
+  // path, so its lockfile names the workspace version too. Leaving it behind
+  // makes the fuzz job's --locked resolution refuse the release commit.
+  const fuzzLockPath = 'fuzz/Cargo.lock';
+  const fuzzLock = await fs.readFile(fuzzLockPath, 'utf8');
+  await fs.writeFile(
+    fuzzLockPath,
+    updateWorkspaceLock(fuzzLock, workingVersion, target).lock,
+  );
+
   const changelogPath = 'CHANGELOG.md';
   let changelog = await fs.readFile(changelogPath, 'utf8');
   if (workingVersion !== from && workingVersion !== target) {

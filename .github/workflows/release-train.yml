@@ -245,6 +245,7 @@ jobs:
           git restore --source refs/remotes/origin/main -- \
             Cargo.toml \
             Cargo.lock \
+            fuzz/Cargo.lock \
             CHANGELOG.md \
             crates/kin-cli/Cargo.toml \
             packages/kin-mcp/package.json \
@@ -268,6 +269,7 @@ jobs:
           git add \
             Cargo.toml \
             Cargo.lock \
+            fuzz/Cargo.lock \
             CHANGELOG.md \
             crates/kin-cli/Cargo.toml \
             packages/kin-mcp/package.json \

@@ -117,3 +117,28 @@ test('removes a superseded generated section when bump intent escalates', () => 
   assert.doesNotMatch(updated, /0\.3\.7|stale patch train/);
   assert.match(updated, /## \[0\.3\.6\] - 2026-07-26/);
 });
+
+test('the fuzz lockfile moves with the workspace version', () => {
+  const source = `version = 4
+
+[[package]]
+name = "kin-parser"
+version = "0.3.6"
+
+[[package]]
+name = "kin-parser-fuzz"
+version = "0.0.0"
+
+[[package]]
+name = "kin-model"
+version = "0.7.1"
+source = "sparse+https://example.invalid/"
+checksum = "keep"
+`;
+  const result = updateWorkspaceLock(source, '0.3.6', '0.4.0');
+  assert.equal(result.replacements, 1);
+  assert.match(result.lock, /name = "kin-parser"\nversion = "0.4.0"/);
+  // A fuzz target pinned at 0.0.0 and a registry dependency are untouched.
+  assert.match(result.lock, /name = "kin-parser-fuzz"\nversion = "0.0.0"/);
+  assert.match(result.lock, /name = "kin-model"\nversion = "0.7.1"/);
+});
