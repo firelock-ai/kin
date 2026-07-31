@@ -53,6 +53,10 @@ EXPECTED_SELECTOR_INVOCATIONS = {
     "release-train": ('"$abandoned"', '"$candidate_tags"', '""', '"$admissible"'),
 }
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
+DOCKERFILE = ROOT / "Dockerfile"
+BASE_IMAGE_REGISTRY = "docker.io"
+BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
+BASE_IMAGE_PIN = re.compile(r"(?m)^FROM\s+(?P<reference>\S+)")
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
 MAIN_ONLY_CACHE_SAVE_VALUE = "${{ github.ref == 'refs/heads/main' }}"
@@ -412,6 +416,9 @@ CI_JOB_DISPLAY_NAMES = {
 EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/approve-to-merge.yml": {
         "gate": None,
+    },
+    ".github/workflows/base-image-pins.yml": {
+        "verify-pins": "Verify base image pins",
     },
     ".github/workflows/ci.yml": CI_JOB_DISPLAY_NAMES,
     ".github/workflows/daemon-smoke.yml": {
@@ -1974,6 +1981,7 @@ def assert_release_check_accepted(
         )
 
 
+<<<<<<< HEAD
 def run_tag_selector(
     manifest: str,
     candidates: str,
@@ -2407,6 +2415,56 @@ def assert_abandoned_tag_admission(release_tag: str, release_train: str) -> None
         f"{shipped_candidates}{floor} {'9' * 40}\n",
         floor,
     )
+
+
+def assert_container_base_image_authority(
+    dockerfile: str,
+    docker_workflow: str,
+    release: str,
+) -> None:
+    """Keep one registry from being able to refuse a release on its own.
+
+    `Docker Image Build (no push)` publishes a check-run against every commit
+    that reaches main, and release-tag.yml's second sweep refuses a release
+    commit carrying any non-green check-run whether or not a ruleset requires
+    it. Minutes of registry unavailability therefore refuse a release
+    permanently, which has already cost a cut. Two properties remove that: the
+    build resolves base images through a mirror before the canonical registry,
+    and every base image is pinned by digest so the two doors cannot serve
+    different bytes.
+    """
+
+    references = [
+        match.group("reference") for match in BASE_IMAGE_PIN.finditer(dockerfile)
+    ]
+    if not references:
+        raise AssertionError(
+            "the release container Dockerfile must declare at least one base image"
+        )
+    for reference in references:
+        if re.search(r"@sha256:[0-9a-f]{64}$", reference) is None:
+            raise AssertionError(
+                "release container base images must be pinned by digest, so a "
+                "mirror cannot serve different bytes than the canonical "
+                f"registry: {reference}"
+            )
+        if not reference.startswith(f"{BASE_IMAGE_REGISTRY}/"):
+            raise AssertionError(
+                "release container base images must name their registry, so the "
+                f"reviewed mirror rewrite applies to them: {reference}"
+            )
+
+    for label, source, job in (
+        ("docker.yml", docker_workflow, "build-image"),
+        ("release.yml", release, "build_daemon_image"),
+    ):
+        block = workflow_job_blocks(source).get(job)
+        if block is None:
+            raise AssertionError(
+                f"{label} no longer declares the {job} job that builds the Dockerfile"
+            )
+        for needle in (f'[registry."{BASE_IMAGE_REGISTRY}"]', BASE_IMAGE_MIRROR):
+            require(block, needle, f"{label}:{job} base image mirror")
 
 
 def main() -> None:
@@ -3202,17 +3260,34 @@ def main() -> None:
         )
     for policy in (
         "- name: Check the Linux release target (musl)",
-        "rustup target add x86_64-unknown-linux-musl",
         "musl-tools",
-        "cargo check --locked --target x86_64-unknown-linux-musl",
         "-p kin-cli -p kin-daemon",
     ):
         require(ci_jobs["check"], policy, "pull-request Linux release-target compile guard")
-    if "x86_64-unknown-linux-musl" not in release_musl_targets:
-        raise AssertionError(
-            "the pull-request compile guard must build a target the release "
-            "workflow actually ships; release musl targets="
-            f"{sorted(release_musl_targets)}"
+    # Every musl target the release workflow ships must compile before a merge,
+    # not first inside the tagged release run. Deriving the requirement from the
+    # release matrix rather than naming one target keeps the two from drifting
+    # apart in the direction that costs a version cut: a release target that no
+    # required context compiles. The aarch64 leg needs a C compiler for the same
+    # dependency build scripts, and Ubuntu carries no aarch64 musl one, so it
+    # compiles those C sources with the aarch64 glibc cross toolchain and proves
+    # the Rust half exactly; the native ubuntu-24.04-arm release leg is what
+    # proves the C half against musl.
+    for target in sorted(release_musl_targets):
+        for policy in (
+            f"rustup target add {target}",
+            f"cargo check --locked --target {target}",
+        ):
+            require(
+                ci_jobs["check"],
+                policy,
+                f"pull-request compile guard coverage of release musl target {target}",
+            )
+    if "aarch64-unknown-linux-musl" in release_musl_targets:
+        require(
+            ci_jobs["check"],
+            "gcc-aarch64-linux-gnu",
+            "aarch64 release-target compile guard C toolchain",
         )
     for package in ("-p kin-cli", "-p kin-daemon"):
         require(
@@ -3220,6 +3295,45 @@ def main() -> None:
             package,
             "release core binary package set the compile guard mirrors",
         )
+
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert_container_base_image_authority(dockerfile, docker_workflow, release)
+    expect_assertion(
+        "a floating base image tag reaches the release container",
+        "must be pinned by digest",
+        lambda: assert_container_base_image_authority(
+            re.sub(r"@sha256:[0-9a-f]{64}", "", dockerfile, count=1),
+            docker_workflow,
+            release,
+        ),
+    )
+    expect_assertion(
+        "a base image with no registry escapes the reviewed mirror rewrite",
+        "must name their registry",
+        lambda: assert_container_base_image_authority(
+            dockerfile.replace(f"FROM {BASE_IMAGE_REGISTRY}/", "FROM ", 1),
+            docker_workflow,
+            release,
+        ),
+    )
+    expect_assertion(
+        "the pull-request image build loses its second registry",
+        "docker.yml:build-image base image mirror",
+        lambda: assert_container_base_image_authority(
+            dockerfile,
+            docker_workflow.replace(BASE_IMAGE_MIRROR, ""),
+            release,
+        ),
+    )
+    expect_assertion(
+        "the released image build loses its second registry",
+        "release.yml:build_daemon_image base image mirror",
+        lambda: assert_container_base_image_authority(
+            dockerfile,
+            docker_workflow,
+            release.replace(BASE_IMAGE_MIRROR, ""),
+        ),
+    )
 
     for policy in (
         'workflows: ["Release"]',

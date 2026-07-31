@@ -103,6 +103,7 @@ jobs:
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
           bash -n ./scripts/assert-windows-init-contract.sh
+          bash -n ./scripts/verify-base-image-pins.sh
 
   windows-authority-tests:
     name: Windows authority tests
@@ -879,12 +880,8 @@ jobs:
       # packages the release builds, for the target it builds them for, so that
       # break is a red pull request instead of a burned tag.
       #
-      # Two deliberate bounds. It checks rather than builds, so it proves
-      # compilation and name resolution and not linking. And it covers
-      # x86_64 only: aarch64-unknown-linux-musl is also a release target, but
-      # its C dependencies need an aarch64 musl cross toolchain that musl-tools
-      # does not carry, and the gate that has broken selects on target_env
-      # rather than architecture, so one musl target exercises it.
+      # One deliberate bound: it checks rather than builds, so it proves
+      # compilation and name resolution and not linking.
       - name: Check the Linux release target (musl)
         if: runner.os == 'Linux'
         run: |
@@ -896,6 +893,37 @@ jobs:
           sudo apt-get install --yes musl-tools
           cargo check --locked --target x86_64-unknown-linux-musl \
             -p kin-cli -p kin-daemon
+
+      # The second Linux release target. The step above proves any break that
+      # selects on the C environment, because that selection is identical on
+      # both architectures. It cannot prove a break that selects on the
+      # architecture, and until this step existed that class first compiled
+      # inside the release run, after the tag exists, which is the shape that
+      # burned a cut.
+      #
+      # The Rust half is exact: rustc type-checks the release package set for
+      # the real target triple, which is where the defect class lives. A
+      # dependency resolving a libc entry point that libc declares for some
+      # architectures and not others fails here rather than after the tag.
+      #
+      # The C half is bounded and stays bounded on purpose. Ubuntu ships no
+      # aarch64 musl C toolchain, so the C sources that dependency build
+      # scripts compile are built by the aarch64 glibc cross compiler: right
+      # architecture, wrong C library headers. That is enough for the build
+      # scripts to produce objects and let the Rust check run, and it is not a
+      # proof that those C sources compile against musl headers. The release
+      # leg proves that natively on ubuntu-24.04-arm, where musl-tools does
+      # supply an aarch64 musl-gcc, which is why nothing here is a cross build.
+      - name: Check the aarch64 Linux release target (musl)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-unknown-linux-musl
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
+          CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
+          AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar \
+            cargo check --locked --target aarch64-unknown-linux-musl \
+              -p kin-cli -p kin-daemon
 
       - name: Install nextest
         uses: taiki-e/install-action@v2

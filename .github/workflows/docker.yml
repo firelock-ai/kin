@@ -33,8 +33,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Resolve the Dockerfile's digest-pinned base images through a mirror
+      # first. This job publishes a check-run against every commit that reaches
+      # main, and release-tag.yml's second sweep refuses a release commit
+      # carrying any non-green check-run, required or not, so minutes of
+      # registry unavailability refuse a release permanently. BuildKit tries
+      # each mirror in order and falls back to the canonical registry, so the
+      # two are independent front doors rather than a redirect: verified
+      # locally by building the pinned bases with a deliberately unreachable
+      # mirror host, which still completed against docker.io.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       # Build-only gate: this job NEVER pushes an image. It proves the
       # multi-stage Dockerfile still builds end to end — kin-* dependencies

@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Base Image Pins
+
+# Scheduled and manual only, deliberately. A pull_request or push trigger would
+# publish a check-run against the commits that reach main, and release-tag.yml's
+# second sweep refuses a release commit carrying any non-green check-run whether
+# or not a ruleset requires it. A registry-reachability probe is exactly the
+# kind of job whose transient failure must never be able to refuse a release:
+# adding one to the release sha would recreate the failure class this workflow
+# exists to watch. Pre-landing coverage is already there without a new context.
+# `Docker Image Build (no push)` pulls both pinned digests on every pull request
+# and every push to main, and the release-authority suite refuses an unpinned
+# FROM inside the required Check & Test job.
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  verify-pins:
+    name: Verify base image pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Fails when a pinned digest has stopped resolving from either registry,
+      # which is the state that turns the fallback into a single point of
+      # failure again while every build still looks healthy. Upstream tag drift
+      # is reported rather than failed: a base image moving is normal, and a
+      # scheduled job that is red every week is a job nobody reads.
+      - name: Verify base image pins resolve from both registries
+        run: bash scripts/verify-base-image-pins.sh Dockerfile

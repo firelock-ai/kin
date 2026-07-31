@@ -1,4 +1,19 @@
-FROM rust:slim AS builder
+# Both base images are pinned by digest and reachable through two independent
+# registries. The tag is kept for review; the digest is what gets pulled, and a
+# digest cannot serve different bytes whichever registry answers. The build
+# configures BuildKit to try mirror.gcr.io before docker.io (see docker.yml and
+# release.yml), and falls back to docker.io when the mirror cannot serve the
+# digest, so neither registry is a single point of failure.
+#
+# This matters beyond reproducibility. `Docker Image Build (no push)` publishes
+# a check-run against every commit that reaches main, and release-tag.yml's
+# second sweep refuses a release commit carrying any non-green check-run,
+# required or not. A registry blip lasting minutes therefore refuses a release
+# permanently, which is how one cut was already lost.
+#
+# scripts/verify-base-image-pins.sh proves both registries still serve both
+# pinned digests, and reports when the upstream tag has moved past the pin.
+FROM docker.io/library/rust:slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
 RUN apt-get update && apt-get install -y git pkg-config libssl-dev g++ && rm -rf /var/lib/apt/lists/*
 ARG KIN_DB_REF=main
 ARG KIN_BUILD_GIT_SHA=""
@@ -35,7 +50,7 @@ RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BU
       cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
     fi
 
-FROM debian:trixie-slim
+FROM docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r kin \
     && useradd -r -g kin -d /home/kin -m kin \
