@@ -360,35 +360,6 @@ struct InstalledKin {
     protocol: InstalledStartupProtocol,
 }
 
-/// Installed kin binaries on this host that are not the running one.
-///
-/// Only install locations are considered, meaning what PATH resolves plus the
-/// Kin home's `bin`, so a build tree is never mistaken for an install.
-fn other_installed_kin_binaries() -> Vec<PathBuf> {
-    let running = env::current_exe()
-        .ok()
-        .and_then(|path| path.canonicalize().ok());
-    let mut candidates = Vec::new();
-    if let Some(path) = check_binary_in_path("kin") {
-        candidates.push(path);
-    }
-    if let Ok(home) = kin_dir() {
-        candidates.push(home.join("bin").join("kin"));
-    }
-
-    let mut found: Vec<PathBuf> = Vec::new();
-    for candidate in candidates {
-        let Ok(resolved) = candidate.canonicalize() else {
-            continue;
-        };
-        if running.as_ref() == Some(&resolved) || found.contains(&resolved) {
-            continue;
-        }
-        found.push(resolved);
-    }
-    found
-}
-
 /// Report an installed kin that cannot start a supervisor against the on-disk
 /// startup sentinel because it predates the current startup protocol.
 ///
@@ -477,19 +448,18 @@ fn supervisor_startup_protocol_check(
 fn check_supervisor_startup_protocol() -> HealthCheck {
     let sentinel = crate::daemon_client::supervisor_startup_sentinel();
     let sentinel_path = crate::daemon_client::supervisor_startup_sentinel_path();
-    // Probing costs a subprocess per install, so it runs only in the state whose
-    // answer can change the verdict.
-    let installed = if matches!(sentinel, SupervisorStartupSentinel::ProtocolDirectory) {
-        other_installed_kin_binaries()
-            .into_iter()
-            .map(|path| InstalledKin {
-                protocol: crate::daemon_client::probe_installed_startup_protocol(&path),
-                path,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Enumerating and probing installs is boundary IO and belongs to
+    // daemon_client. Probing costs a subprocess per install, so it is requested
+    // only in the state whose answer can change the verdict.
+    let installed: Vec<InstalledKin> =
+        if matches!(sentinel, SupervisorStartupSentinel::ProtocolDirectory) {
+            crate::daemon_client::installed_kin_startup_protocols()
+                .into_iter()
+                .map(|(path, protocol)| InstalledKin { path, protocol })
+                .collect()
+        } else {
+            Vec::new()
+        };
     supervisor_startup_protocol_check(sentinel, &sentinel_path, &installed)
 }
 

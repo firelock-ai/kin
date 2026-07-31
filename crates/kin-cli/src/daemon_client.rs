@@ -4514,6 +4514,54 @@ pub enum InstalledStartupProtocol {
     Undetermined(String),
 }
 
+/// Installed kin binaries on this host that are not the running one.
+///
+/// Only install locations are considered, meaning what PATH resolves plus the
+/// Kin home's `bin`, so a build tree is never mistaken for an install. Paths are
+/// canonicalized so one binary reachable by two names is probed once and the
+/// running binary is excluded even when it was invoked through a symlink.
+fn other_installed_kin_binaries() -> Vec<PathBuf> {
+    let running = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    let mut candidates = Vec::new();
+    if let Some(path) = crate::commands::setup::check_binary_in_path("kin") {
+        candidates.push(path);
+    }
+    if let Ok(home) = crate::commands::setup::kin_dir() {
+        candidates.push(home.join("bin").join("kin"));
+    }
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        let Ok(resolved) = candidate.canonicalize() else {
+            continue;
+        };
+        if running.as_ref() == Some(&resolved) || found.contains(&resolved) {
+            continue;
+        }
+        found.push(resolved);
+    }
+    found
+}
+
+/// Every installed kin other than the running one, with its probed verdict on
+/// the supervisor startup protocol.
+///
+/// Enumeration and probing both live here rather than in the health reporter,
+/// because this module is the declared process and install boundary: resolving
+/// installed binaries is boundary IO, and a diagnostic surface should consume
+/// the verdict rather than reach for the filesystem to compute it.
+pub fn installed_kin_startup_protocols() -> Vec<(PathBuf, InstalledStartupProtocol)> {
+    other_installed_kin_binaries()
+        .into_iter()
+        .map(|path| {
+            let protocol = probe_installed_startup_protocol(&path);
+            (path, protocol)
+        })
+        .collect()
+}
+
 /// Ask an installed kin whether it speaks the current supervisor startup
 /// protocol, by probing the `kin-daemon` shipped beside it.
 ///
