@@ -7727,6 +7727,13 @@ async fn pull_workspace_follow(
             ),
         };
     }
+    // Take the gate every other command that mutates this workspace takes, in
+    // the same order, so a transition does not merely lose a race against a
+    // concurrent commit or branch switch and report itself behind. Admission
+    // has already happened and does not hold this, so the gate covers the
+    // transition alone; the workspace compare-and-swap is still what makes the
+    // outcome safe rather than this lock.
+    let _coordination = state.coordination_gate.lock().await;
     let state = Arc::clone(state);
     let destination_ref = destination_ref.clone();
     // Authority reads, projection IO, and the workspace commit all block, so
