@@ -10,8 +10,17 @@ on:
     branches: [main]
   merge_group:
 
+# The sha suffix is empty off main, so every pull request and merge-queue ref
+# keeps one group per ref and `cancel-in-progress` supersedes an older push
+# exactly as it did before. On main each commit gets its own group, because
+# `cancel-in-progress: false` does not mean "never cancel": GitHub keeps at
+# most one PENDING run per group and cancels the older one. Two landings in
+# quick succession therefore delete the earlier commit's run before it starts
+# a job, and a run that started no jobs leaves the commit with its checks
+# absent rather than failed. The hosted merge queue lands PRs back to back, so
+# that window is the ordinary case here, not a rare one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
