@@ -146,8 +146,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Same mirror-first base image resolution the pull-request build uses. The
+      # shipped image is built here, so the registry serving its base layers is
+      # part of the release path: mirror first, canonical registry on failure,
+      # and the Dockerfile pins both bases by digest so neither door can serve
+      # different bytes.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       - name: Publish or verify immutable commit image
         id: publish
