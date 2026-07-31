@@ -7,6 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kin_core::test_env::EnvVarGuard;
 use serial_test::serial;
 use tempfile::tempdir;
 
@@ -67,8 +68,6 @@ const COMMAND_REGISTRY: &str = "KIN_REGISTRY_PATH";
 #[cfg(windows)]
 const COMMAND_OWNER_TOKEN: &str = "kIn_TeSt_RuNtImE_oWnEr_ToKeN";
 #[cfg(not(windows))]
-use kin_core::test_env::EnvVarGuard;
-
 const COMMAND_OWNER_TOKEN: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
 #[cfg(windows)]
 const COMMAND_GIT_CONFIG_NOSYSTEM: &str = "gIt_cOnFiG_nOsYsTeM";
