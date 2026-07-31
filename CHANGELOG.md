@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-07-31
+## [0.4.3] - 2026-07-31
 
 v0.4.0 was never published. Its release commit was refused by the mint gate
 because the release rail read the repository merge policy through a token that
@@ -19,6 +19,13 @@ timeouts rather than on anything in the dependency graph, and this release
 removes that dependency by installing the scanner from its own pinned release
 artifact instead of building a container image on every run.
 
+v0.4.2 was never published either. Its release commit was refused when a
+required Windows check asserted a refusal message that a landed Windows-support
+slice had already replaced, and that check runs only on the landing push, so no
+pull request could have caught it. This release aligns the assertion with the
+behavior that shipped and mirrors it into a job that runs before a change can
+land.
+
 ### Breaking
 
 - Repository-v6 authority replaces the legacy Git-compatibility command path.
@@ -26,11 +33,11 @@ artifact instead of building a container image on every run.
   daemon exec endpoint are removed.
 - Graph storage moves to on-disk snapshot format 13. A Kin binary accepts
   exactly one on-disk format, so no repository initialized by v0.3.6, which
-  wrote format 12, opens under v0.4.0. Re-initialize the repository against its
-  source of truth. This is the standing pre-release storage posture rather than
-  something this release introduces: v0.3.6 accepted only the one format it
-  wrote, and so does this one. The accepted range widens when the format is
-  declared stable, not before.
+  wrote format 12, opens under this release. Re-initialize the repository
+  against its source of truth. This is the standing pre-release storage posture
+  rather than something this release introduces: v0.3.6 accepted only the one
+  format it wrote, and so does this one. The accepted range widens when the
+  format is declared stable, not before.
 
 ### Changed
 
@@ -109,6 +116,12 @@ artifact instead of building a container image on every run.
 
 ### Fixed
 
+- The Windows `kin` binary reserves a main thread large enough to parse its own
+  command tree. Windows reserves 1 MiB where Unix reserves 8, fixed at link
+  time, and building the command tree recurses over every subcommand, so an
+  unoptimized Windows build overflowed its stack before reaching any command at
+  all, `--version` included. Reserved address space is not committed memory, so
+  matching the 16 MiB the CLI's own tests already use costs nothing at runtime.
 - A daemon that refuses to start can no longer take the running daemon's
   endpoint down with it. `.kin/daemon.pid` and `.kin/daemon.port` are now
   attributed by a `.kin/daemon.owner` record naming the exact process
