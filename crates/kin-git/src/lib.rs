@@ -37,8 +37,8 @@ pub mod test_support;
 pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
 pub use authority::build_git_external_authority;
 pub use error::{
-    GitCheckoutFilterFact, GitError, LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact,
-    RegisteredGitWorktreeKind, Result, UnsealedContentGap,
+    GitCheckoutFilterFact, GitError, LocalGitHookExecutability, LocalGitHookFact, LocalGitHookKind,
+    RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result, UnsealedContentGap,
 };
 pub use lossless::{
     capture_lossless_git_repository, rehydrate_lossless_git_repository,
