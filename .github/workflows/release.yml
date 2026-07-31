@@ -862,18 +862,24 @@ jobs:
             cp -R "target/${TARGET}/release/KinNotifier.app" "$ARTIFACT/"
           fi
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
+          # Take the listing once into a file. Piping it into `grep -q` lets grep
+          # exit on its first match, and under `pipefail` the SIGPIPE that raises
+          # on `tar` fails the pipeline, which reads exactly like the member being
+          # absent. Reading a file cannot invert the guard that way.
+          ARCHIVE_LISTING="$RUNNER_TEMP/${ARTIFACT}.listing.txt"
+          tar tzf "${ARTIFACT}.tar.gz" > "$ARCHIVE_LISTING"
           # All supported Unix surfaces are mandatory release contents.
           for required in kin kin-daemon kin-vfs "$SHIM_NAME"; do
-            if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/${required}$"; then
+            if ! grep -q "/${required}$" "$ARCHIVE_LISTING"; then
               echo "::error::$required missing from ${ARTIFACT}.tar.gz"
               exit 1
             fi
           done
-          # The notifier is mandatory on macOS. Without it the CLI still runs
-          # but every notification is credited to Script Editor, which is a
-          # silent downgrade rather than a visible failure — so assert it.
+          # The notifier is mandatory on macOS. Without it the CLI still runs but
+          # every notification is credited to Script Editor, which is a silent
+          # downgrade rather than a visible failure, so assert it here.
           if [ "$RUNNER_OS" = "macOS" ]; then
-            if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "KinNotifier.app/Contents/MacOS/KinNotifier$"; then
+            if ! grep -q "KinNotifier.app/Contents/MacOS/KinNotifier$" "$ARCHIVE_LISTING"; then
               echo "::error::KinNotifier.app missing from ${ARTIFACT}.tar.gz"
               exit 1
             fi
@@ -928,6 +934,7 @@ jobs:
 
           const artifact = process.env.ARTIFACT;
           const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
+          const { classifyReleaseArchiveRoot } = require("./scripts/release-archive-shape.cjs");
           const target = process.env.TARGET;
           const root = process.cwd();
           const authorityNames = new Set(
@@ -964,16 +971,22 @@ jobs:
             throw new Error(`expected exactly one final archive for ${artifact}, found ${archives.join(", ") || "none"}`);
           }
           const archive = archives[0];
-          const contents = fs.readdirSync(artifact, { withFileTypes: true })
-            .filter((entry) => entry.isFile())
-            .map((entry) => {
-              const file = path.join(artifact, entry.name);
+          // The content inventory covers the archive's component files. The macOS
+          // notification bundle is a sealed directory rather than a component, so
+          // it is classified and shape-checked here but stays out of the manifest:
+          // an installed updater refuses any inventory name outside its managed
+          // component list, and the bundle's bytes are already covered by the
+          // archive digest, its code signature, and its stapled notarization.
+          const contents = classifyReleaseArchiveRoot(artifact, { target })
+            .files
+            .map((name) => {
+              const file = path.join(artifact, name);
               const record = {
-                name: entry.name,
+                name,
                 sha256: sha256(file),
                 size_bytes: fs.statSync(file).size,
               };
-              if (authorityNames.has(entry.name)) {
+              if (authorityNames.has(name)) {
                 record.build_identity = readUpdateBuildIdentity(file);
               }
               return record;
@@ -1249,6 +1262,10 @@ jobs:
           const os = require("os");
           const path = require("path");
           const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
+          const {
+            assertReleaseArchiveMemberPaths,
+            classifyReleaseArchiveRoot,
+          } = require("./scripts/release-archive-shape.cjs");
 
           const root = process.cwd();
           const sha256 = (file) =>
@@ -1337,6 +1354,16 @@ jobs:
             fail(manifest.workflow?.run_attempt === process.env.GITHUB_RUN_ATTEMPT,
               `${manifestPath} run attempt does not match this run`);
 
+            // Judge the archive's declared member paths before extracting it. A
+            // member that escapes the extraction root has already been written
+            // somewhere else by the time the extracted tree can be inspected.
+            const listing = spec.archive.endsWith(".zip")
+              ? childProcess.execFileSync("unzip", ["-Z1", spec.archive], { encoding: "utf8" })
+              : childProcess.execFileSync("tar", ["-tzf", spec.archive], { encoding: "utf8" });
+            assertReleaseArchiveMemberPaths(
+              listing.split("\n").filter((member) => member !== ""),
+              { artifact: spec.artifact, target: spec.target }
+            );
             const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${spec.artifact}-`));
             try {
               if (spec.archive.endsWith(".zip")) {
@@ -1346,9 +1373,12 @@ jobs:
               }
               const nested = path.join(extractRoot, spec.artifact);
               const contentRoot = fs.existsSync(nested) ? nested : extractRoot;
-              const entries = fs.readdirSync(contentRoot, { withFileTypes: true });
-              fail(entries.every((entry) => entry.isFile()), `${spec.archive} has unexpected nested content`);
-              const actualNames = entries.map((entry) => entry.name).sort();
+              // Component files carry per-file provenance; the macOS notification
+              // bundle is admitted as a sealed directory and is inventoried by the
+              // archive digest instead. Everything else is refused.
+              const actualNames = classifyReleaseArchiveRoot(contentRoot, {
+                target: spec.target,
+              }).files;
               const manifestNames = manifest.archive_contents.map((entry) => entry.name).sort();
               fail(JSON.stringify(actualNames) === JSON.stringify(manifestNames),
                 `${manifestPath} content inventory does not match ${spec.archive}`);
