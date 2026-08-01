@@ -59,12 +59,39 @@ fn author_name(author: &str) -> String {
         .to_string()
 }
 
-fn truncate(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_string();
-    }
-    let kept: String = value.chars().take(width.saturating_sub(1)).collect();
-    format!("{kept}…")
+/// One rendered revision, before the author column has been sized.
+struct RevisionRow {
+    id: String,
+    when: String,
+    who: String,
+    subject: String,
+}
+
+/// Render the revision rows with an author column sized to the widest author
+/// present.
+///
+/// The column is measured rather than fixed because an author is an identity,
+/// and half an identity answers nobody. An MCP commit is authored by
+/// `{vendor}/{client_name}`, so a fixed column cut exactly the client name, the
+/// half that tells two sessions of one vendor apart, and an unregistered
+/// session left nineteen characters of a UUID. The date column stays fixed
+/// because a calendar date is always ten characters wide, and the subject is
+/// last so nothing after it needs padding: a wide terminal spends its extra
+/// columns on the message rather than on trailing space.
+fn render_revision_rows(rows: &[RevisionRow]) -> Vec<String> {
+    let author_width = rows
+        .iter()
+        .map(|row| row.who.chars().count())
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|row| {
+            format!(
+                "  {}  {:<10}  {:<author_width$}  {}",
+                row.id, row.when, row.who, row.subject
+            )
+        })
+        .collect()
 }
 
 pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
@@ -130,6 +157,7 @@ pub fn execute_history_request(
     if revisions.is_empty() {
         lines.push("  No history recorded".to_string());
     } else {
+        let mut rows = Vec::with_capacity(revisions.len());
         for revision in &revisions {
             let change = graph.get_change(&revision.introduced_by)?;
             let (when, who, subject) = match change.as_ref() {
@@ -140,15 +168,94 @@ pub fn execute_history_request(
                 ),
                 None => ("?".to_string(), "?".to_string(), "unknown".to_string()),
             };
-            lines.push(format!(
-                "  {}  {:<10}  {:<20}  {}",
-                abbreviate_id(&revision.introduced_by.to_string()),
+            rows.push(RevisionRow {
+                id: abbreviate_id(&revision.introduced_by.to_string()),
                 when,
-                truncate(&who, 20),
-                subject
-            ));
+                who,
+                subject,
+            });
         }
+        lines.extend(render_revision_rows(&rows));
     }
 
     Ok(HistoryResponse { lines })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(who: &str, subject: &str) -> RevisionRow {
+        RevisionRow {
+            id: "0123456789ab".to_string(),
+            when: "2026-07-31".to_string(),
+            who: author_name(who),
+            subject: subject.to_string(),
+        }
+    }
+
+    /// Column each row's subject starts at, which is what "aligned" means here.
+    fn subject_column(line: &str, subject: &str) -> usize {
+        line.char_indices()
+            .position(|(offset, _)| line[offset..].starts_with(subject))
+            .expect("every rendered row carries its subject")
+    }
+
+    #[test]
+    fn an_agent_identity_is_never_cut_to_fit_the_author_column() {
+        // Both values are what `kin history` actually shows for an MCP commit:
+        // the registered `{vendor}/{client_name}`, and the session id an
+        // unregistered session falls back to. Neither fits twenty columns, and
+        // the part a fixed column removed was the part that identifies the
+        // session rather than the vendor.
+        let client = "claude-code/one-change-demo";
+        let session = "3f2a9c8e-7b41-4c2d-9e05-1a6b8c3d4e5f";
+        assert!(client.chars().count() > 20 && session.chars().count() > 20);
+
+        let rendered = render_revision_rows(&[
+            row(
+                &format!("{client} <mcp-agent:{session}>"),
+                "Rename the parser entry point",
+            ),
+            row(
+                &format!("{session} <mcp-agent:{session}>"),
+                "Seed the graph",
+            ),
+        ]);
+
+        for (line, who) in rendered.iter().zip([client, session]) {
+            assert!(
+                line.contains(who),
+                "the author column must carry the whole identity: {line}"
+            );
+        }
+        assert!(
+            !rendered.iter().any(|line| line.contains('…')),
+            "no identity may be ellipsized: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_author_column_is_sized_from_the_widest_author_so_subjects_stay_aligned() {
+        // Growing the column is only worth doing if the table still reads as a
+        // table: every subject has to start in the same place regardless of how
+        // long its row's author is.
+        let rendered = render_revision_rows(&[
+            row("kin <kin@firelock.ai>", "short author"),
+            row("claude-code/one-change-demo <mcp-agent:abc>", "long author"),
+        ]);
+
+        assert_eq!(
+            subject_column(&rendered[0], "short author"),
+            subject_column(&rendered[1], "long author"),
+            "subjects must line up: {rendered:?}"
+        );
+        // Nothing is padded past the widest author, so a history of short
+        // authors does not pay for a column no row needs.
+        assert!(
+            rendered[1].contains("claude-code/one-change-demo  long author"),
+            "the widest author must be followed by the column gap alone: {}",
+            rendered[1]
+        );
+    }
 }
