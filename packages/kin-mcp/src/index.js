@@ -56,10 +56,17 @@ export function resolveReleaseAsset(platform = process.platform, arch = process.
       daemonBinaryName: DAEMON_BINARY_NAME
     };
   }
+  if (platform === 'win32' && arch === 'x64') {
+    return {
+      assetName: 'kin-windows-x86_64',
+      archiveName: 'kin-windows-x86_64.zip',
+      binaryName: `${PRIMARY_BINARY_NAME}.exe`,
+      daemonBinaryName: `${DAEMON_BINARY_NAME}.exe`
+    };
+  }
 
   throw new Error(
-    `kin-mcp does not have a published Kin binary for ${platform}/${arch} yet. ` +
-      'On Windows, use WSL2 for this alpha.'
+    `kin-mcp does not have a published Kin binary for ${platform}/${arch} yet.`
   );
 }
 
@@ -122,7 +129,7 @@ export async function ensureKinBinary({
     cacheRoot
   });
 
-  const daemonPath = path.join(path.dirname(binaryPath), DAEMON_BINARY_NAME);
+  const daemonPath = resolveDaemonBinaryPath(binaryPath);
   if (
     (await isRunnable(binaryPath, platform)) &&
     (await isRunnable(daemonPath, platform))
@@ -215,7 +222,8 @@ export async function runKinMcp(argv = [], options = {}) {
 }
 
 export function resolveDaemonBinaryPath(kinBinaryPath) {
-  return path.join(path.dirname(kinBinaryPath), DAEMON_BINARY_NAME);
+  const suffix = path.extname(kinBinaryPath).toLowerCase() === '.exe' ? '.exe' : '';
+  return path.join(path.dirname(kinBinaryPath), `${DAEMON_BINARY_NAME}${suffix}`);
 }
 
 export function childEnv(env, kinBinaryPath, platform = process.platform) {
@@ -240,7 +248,8 @@ function guidedProvisioningFailure(error) {
     'Fixes:',
     '  - Install Kin directly and run `kin setup` to configure your agent, then point',
     '    this wrapper at it with KIN_MCP_KIN_BINARY=/path/to/kin.',
-    '  - Or retry on a supported target (macOS/Linux). On Windows use WSL2 for this alpha.',
+    '  - Or retry on a supported target (macOS, Linux, or Windows x64).',
+    '    Native Windows is vector-free; use WSL2 when you need vectors or projection.',
     '  - Or override the release source with KIN_MCP_RELEASE_BASE_URL if you mirror releases.'
   ].join('\n');
 }
@@ -332,7 +341,9 @@ async function installFromArchive({
 
   try {
     await fsp.writeFile(archivePath, archiveBytes);
-    await execFile('tar', ['-xzf', archivePath, '-C', tmpRoot]);
+    // Modern Windows ships bsdtar as `tar`; `-xf` auto-detects both the flat
+    // Windows zip and the wrapped Unix tar.gz release archives.
+    await execFile('tar', ['-xf', archivePath, '-C', tmpRoot]);
 
     const kinStaged = await stageBinary({
       tmpRoot,
@@ -378,7 +389,9 @@ async function stageBinary({
   required,
   missingHint
 }) {
-  const extracted = path.join(tmpRoot, assetName, sourceName);
+  const extracted = platform === 'win32'
+    ? path.join(tmpRoot, sourceName)
+    : path.join(tmpRoot, assetName, sourceName);
   try {
     await fsp.access(extracted, fs.constants.R_OK);
   } catch {
