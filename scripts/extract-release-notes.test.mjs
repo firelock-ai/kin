@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -90,7 +90,65 @@ test('sections are ordered newest first and separated by a blank line', () => {
     composed.notes.indexOf('## [0.4.5]') < composed.notes.indexOf('## [0.4.4]'),
     'the version being published must lead its superseded sections',
   );
-  assert.match(composed.notes, /- the published one\n\n## \[0\.4\.4\]/);
+  assert.match(composed.notes, /- the published one\n\n## Carried forward/);
+  assert.match(composed.notes, /first time\.\n\n## \[0\.4\.4\]/);
+});
+
+test('carried-forward sections say why a superseded heading is in these notes', () => {
+  const composed = composeNotes(CHANGELOG, '0.4.5', loadAbandonments(CHAIN));
+
+  // A bare `## [0.4.4]` under the 0.4.5 release reads as though 0.4.4 shipped.
+  // The whole reason its content is here is that it did not.
+  assert.match(composed.notes, /## Carried forward from v0\.4\.4/);
+  assert.match(composed.notes, /never published/);
+  assert.deepEqual(composed.carried, ['v0.4.4']);
+});
+
+test('the notice names every tag actually carried, not every tag walked', () => {
+  // v0.4.3 is in the chain but has no section, so it contributes nothing and
+  // must not be announced as carried forward.
+  const composed = composeNotes(CHANGELOG, '0.4.5', loadAbandonments(CHAIN));
+
+  assert.deepEqual(composed.rolledUp, ['v0.4.4', 'v0.4.3']);
+  assert.deepEqual(composed.carried, ['v0.4.4']);
+  assert.doesNotMatch(composed.notes, /Carried forward from v0\.4\.4, v0\.4\.3/);
+});
+
+test('no carried-forward notice appears when nothing was carried', () => {
+  const composed = composeNotes(CHANGELOG, '0.3.6', new Map());
+
+  assert.doesNotMatch(composed.notes, /Carried forward/);
+});
+
+test('the notice reads as plural only when several tags are carried', () => {
+  const changelog = [
+    '# Changelog',
+    '',
+    '## [2.0.2] - 2026-08-01',
+    '',
+    '- the published one',
+    '',
+    '## [2.0.1] - 2026-07-31',
+    '',
+    '- one abandoned',
+    '',
+    '## [2.0.0] - 2026-07-30',
+    '',
+    '- another abandoned',
+    '',
+  ].join('\n');
+  const forked = loadAbandonments(
+    record([
+      { tag: 'v2.0.0', superseded_by: 'v2.0.2' },
+      { tag: 'v2.0.1', superseded_by: 'v2.0.2' },
+    ]),
+  );
+
+  const composed = composeNotes(changelog, '2.0.2', forked);
+
+  assert.deepEqual(composed.carried, ['v2.0.1', 'v2.0.0']);
+  assert.match(composed.notes, /## Carried forward from v2\.0\.1, v2\.0\.0/);
+  assert.match(composed.notes, /releases were tagged but never published/);
 });
 
 test('an abandoned predecessor with no changelog section is reported, not invented', () => {
@@ -250,6 +308,34 @@ test('end to end, a malformed record fails the run instead of publishing thin no
 
     assert.equal(result.status, 1);
     assert.match(result.stderr, /not a vX\.Y\.Z release tag/);
+  });
+});
+
+test('end to end, the script still writes its notes when invoked through a symlink', () => {
+  withTempDir((dir) => {
+    // `import.meta.url` is a realpath. An entry-point guard that does not
+    // resolve the same way compares false through a symlink, main() never
+    // runs, and the process exits 0 having written nothing. The release rail
+    // would publish empty notes and report success.
+    const linked = join(dir, 'extract-release-notes.mjs');
+    symlinkSync(SCRIPT, linked);
+
+    const input = join(dir, 'CHANGELOG.md');
+    const output = join(dir, 'release-notes.md');
+    const abandoned = join(dir, 'abandoned.json');
+    writeFileSync(input, CHANGELOG);
+    writeFileSync(abandoned, CHAIN);
+
+    const result = spawnSync(
+      process.execPath,
+      [linked, '--version', '0.4.5', '--input', input, '--output', output, '--abandoned', abandoned],
+      { encoding: 'utf8' },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const notes = readFileSync(output, 'utf8');
+    assert.match(notes, /## \[0\.4\.5\]/);
+    assert.match(notes, /## \[0\.4\.4\]/);
   });
 });
 

@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -155,24 +156,47 @@ export function abandonedAncestors(abandonments, version) {
 /// not have to line up, and v0.4.3 is a real example of one that does not.
 export function composeNotes(changelog, version, abandonments) {
   const rolledUp = abandonedAncestors(abandonments, version);
-  const wanted = [version, ...rolledUp.map((tag) => tag.replace(/^v/, ''))];
 
-  const sections = [];
-  const missing = [];
-  for (const candidate of wanted) {
+  const own = extractSection(changelog, version);
+  const missing = own === null ? [version] : [];
+
+  const carried = [];
+  for (const tag of rolledUp) {
+    const candidate = tag.replace(/^v/, '');
     const section = extractSection(changelog, candidate);
     if (section === null) {
       missing.push(candidate);
     } else {
-      sections.push(section);
+      carried.push({ tag, section });
     }
   }
 
+  const parts = [];
+  if (own !== null) {
+    parts.push(own);
+  }
+  if (carried.length > 0) {
+    // Say why a superseded version's heading is in these notes. Without this a
+    // reader sees a bare `## [0.4.4]` under the 0.4.5 release and reasonably
+    // concludes 0.4.4 shipped, when the whole reason its content is here is
+    // that it never did. The workflow-log warning is not a substitute: nobody
+    // reading a release ever sees it.
+    parts.push(carriedForwardNotice(carried.map((entry) => entry.tag)));
+    parts.push(...carried.map((entry) => entry.section));
+  }
+
   return {
-    notes: sections.length > 0 ? sections.join('\n') : null,
+    notes: parts.length > 0 ? parts.join('\n') : null,
     rolledUp,
+    carried: carried.map((entry) => entry.tag),
     missing,
   };
+}
+
+function carriedForwardNotice(tags) {
+  const named = tags.join(', ');
+  const plural = tags.length > 1 ? 'releases were tagged but never published' : 'release was tagged but never published';
+  return `## Carried forward from ${named}\n\nThe following ${plural}, so the notes below ship here for the first time.\n`;
 }
 
 async function readChangelog(input) {
@@ -241,7 +265,10 @@ async function main() {
   await fs.writeFile(output, notes);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// `import.meta.url` is already a realpath, so the entry point must be resolved
+// the same way or invocation through a symlink compares false, main() never
+// runs, and the process exits 0 having written no notes at all.
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   main().catch((error) => {
     console.error(error.message);
     process.exitCode = 1;
