@@ -176,9 +176,10 @@ fn format_duration_secs(total: u64) -> String {
 /// The embedding model `kin embed` downloads on first use.
 const EMBED_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
 
-/// What that download costs, which is also roughly what the model costs
-/// resident once the daemon has loaded it.
-const EMBED_MODEL_DOWNLOAD_BYTES: u64 = 522 * 1024 * 1024;
+/// What that download costs, as the model host reports it. Carried as the
+/// published figure rather than as a byte count, so the number a caller sees is
+/// the one they will see again when the download runs.
+const EMBED_MODEL_DOWNLOAD: &str = "522 MB";
 
 /// The smallest memory ceiling a vector embed has been measured to complete a
 /// real repository under. At 1 GiB a tiny repository finishes exactly at the
@@ -258,13 +259,12 @@ fn embed_resource_exhaustion(
     };
     Some(format!(
         "{cause}.\n\
-         `kin embed` loads the {} {EMBED_MODEL_ID} model and a real repository peaks well above \
-         that, so give this machine at least {}.\n\
+         `kin embed` loads the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} model and a real \
+         repository peaks well above that, so give this machine at least {}.\n\
          Coverage already embedded is persisted, so re-running `kin embed` under a higher limit \
          resumes rather than starting over.\n\
          Lexical and graph retrieval need no model: `kin locate` and `kin search` keep answering \
          without vectors.",
-        human_bytes(EMBED_MODEL_DOWNLOAD_BYTES),
         human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
     ))
 }
@@ -279,11 +279,10 @@ fn constrained_memory_notice(evidence: &crate::capability::MemoryEvidence) -> Op
         return None;
     }
     Some(format!(
-        "Note: {} of memory is available here. `kin embed` downloads and loads the {} \
-         {EMBED_MODEL_ID} model, and at least {} is recommended; below that the daemon can be \
-         killed mid-pass. Lexical and graph retrieval need no model.",
+        "Note: {} of memory is available here. `kin embed` downloads and loads the \
+         {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} model, and at least {} is recommended; below \
+         that the daemon can be killed mid-pass. Lexical and graph retrieval need no model.",
         human_bytes(evidence.limit_bytes),
-        human_bytes(EMBED_MODEL_DOWNLOAD_BYTES),
         human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
     ))
 }
@@ -642,7 +641,8 @@ mod tests {
         constrained_memory_notice, effective_batch_size, embed_pass_should_continue,
         embed_resource_exhaustion, eta_suffix, format_duration_secs, resolve_total_budget,
         should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult, DEFAULT_BATCH_SIZE,
-        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_ID, RECOMMENDED_EMBED_MEMORY_BYTES,
+        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD, EMBED_MODEL_ID,
+        RECOMMENDED_EMBED_MEMORY_BYTES,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
@@ -752,7 +752,7 @@ mod tests {
             "the failure must name the limit that would fix it: {guidance}"
         );
         assert!(
-            guidance.contains(EMBED_MODEL_ID) && guidance.contains("522 MiB"),
+            guidance.contains(EMBED_MODEL_ID) && guidance.contains(EMBED_MODEL_DOWNLOAD),
             "the failure must name what is consuming the memory: {guidance}"
         );
         assert!(
@@ -815,7 +815,7 @@ mod tests {
         let notice = constrained_memory_notice(&evidence(1 << 30, None))
             .expect("a machine under the recommendation is warned before the download");
         assert!(
-            notice.contains("522 MiB") && notice.contains("2.0 GiB"),
+            notice.contains(EMBED_MODEL_DOWNLOAD) && notice.contains("2.0 GiB"),
             "{notice}"
         );
         assert!(
