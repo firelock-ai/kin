@@ -7719,9 +7719,9 @@ pub(crate) async fn pull_into_replica(
     // which is how a plain local edit came to be reported as authority having
     // moved. It also pays the whole branch-switch planner on every `kin pull`.
     //
-    // The cost of the guard is that a workspace an earlier pull left behind no
-    // longer completes on the next pull. That is the remedy the report already
-    // names: `kin branch switch` onto the pulled ref.
+    // A pull that admitted nothing can still find a tree behind, which is what
+    // the no-op path reports instead of planning a transition: see
+    // `pull_admitted_nothing`.
     let workspace = if outcome.moved_history() {
         pull_workspace_follow(
             &state,
@@ -7731,10 +7731,7 @@ pub(crate) async fn pull_into_replica(
         )
         .await
     } else {
-        WorkspaceFollow::NotApplicable {
-            detail: "this pull admitted no history, so no ref moved for a working tree to follow"
-                .to_string(),
-        }
+        pull_admitted_nothing(&state, local_derived_views, &outcome.destination_ref).await
     };
 
     Ok(kin_cli::commands::transfer::CommandTransferResponse {
@@ -7762,6 +7759,52 @@ fn interrupted_pull_report(admitted_packs: usize) -> Option<String> {
          it had before. Re-run the pull to resume from the last admitted pack; that run reports \
          and completes the workspace transition."
     ))
+}
+
+/// Report what a pull that admitted nothing found, rather than assuming that a
+/// run which moved nothing found nothing.
+///
+/// No ref moved here, so there is no transition to plan and none is planned:
+/// planning one is what made an ordinary no-op pull answer with whatever the
+/// planner found in the working copy. What a retry of a failed pull needs is
+/// narrower and costs one authority read. The run that admitted the history is
+/// the one whose transition did not complete, so the retry admits nothing and,
+/// before this, exited zero while the working tree was still on the old head.
+/// That is the exact case the exit-status contract exists to prevent.
+async fn pull_admitted_nothing(
+    state: &Arc<DaemonState>,
+    local_derived_views: bool,
+    destination_ref: &kin_model::RefName,
+) -> WorkspaceFollow {
+    if !local_derived_views {
+        return WorkspaceFollow::NotApplicable {
+            detail: "hosted snapshot authority serves no local working tree".to_string(),
+        };
+    }
+    let state = Arc::clone(state);
+    let destination_ref = destination_ref.clone();
+    // The authority read blocks, so it must not run on the executor that also
+    // serves this daemon's own transfer seam.
+    let behind = tokio::task::spawn_blocking(move || {
+        crate::repository_branch::workspace_behind_ref(&state, &destination_ref)
+    })
+    .await;
+    match behind {
+        Ok(Ok(Some(detail))) => WorkspaceFollow::Behind { detail },
+        Ok(Ok(None)) => WorkspaceFollow::NotApplicable {
+            detail: "this pull admitted no history, so no ref moved for a working tree to follow"
+                .to_string(),
+        },
+        // A check that could not run has not proved this tree current, and
+        // reporting NotApplicable would claim it looked. Behind is the honest
+        // fail-safe, and its detail says which of the two it is.
+        Ok(Err(error)) => WorkspaceFollow::Behind {
+            detail: format!("could not read whether this workspace follows the ref: {error:#}"),
+        },
+        Err(error) => WorkspaceFollow::Behind {
+            detail: format!("workspace follow check did not complete: {error}"),
+        },
+    }
 }
 
 /// Move the graph-owned workspace onto the head this pull admitted.
@@ -12397,10 +12440,20 @@ mod tests {
             "a workspace that cannot follow must not cost the caller the transfer"
         );
         match &pulled.workspace {
-            WorkspaceFollow::Behind { detail } => assert!(
-                detail.contains("diverge from the graph-owned workspace projection"),
-                "the report must name what blocked the transition: {detail}"
-            ),
+            WorkspaceFollow::Behind { detail } => {
+                assert!(
+                    detail.contains("diverge from the graph-owned workspace projection"),
+                    "the report must name what blocked the transition: {detail}"
+                );
+                assert!(
+                    !detail.contains("before switching branches"),
+                    "a caller who ran a pull is not part-way through a branch switch: {detail}"
+                );
+                assert!(
+                    detail.contains("follow the ref the transfer moved"),
+                    "the remedy must name the operation the caller actually ran: {detail}"
+                );
+            }
             other => panic!("an edited projection cannot be silently replaced, got {other:?}"),
         }
         assert_eq!(
@@ -12408,6 +12461,32 @@ mod tests {
             b"services:\n  api: { image: local }\n",
             "the caller's edit must survive a transfer that could not move the tree"
         );
+
+        // The retry. Every pack is durable, so this run has nothing left to
+        // admit and no ref moves under it, while the working tree is still on
+        // the head it had before, which is the state the caller is about to
+        // chain work onto. Reporting "no ref moved" here is true about the
+        // retry and silent about the workspace, and it exits zero.
+        let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let retried: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            !retried.outcome.moved_history(),
+            "the first run already admitted everything the peer had"
+        );
+        match &retried.workspace {
+            WorkspaceFollow::Behind { detail } => {
+                assert!(
+                    detail.contains("kin branch switch"),
+                    "a workspace left behind is told how to catch up: {detail}"
+                );
+            }
+            other => panic!(
+                "a retry that admits nothing must still report the tree an earlier run left \
+                 behind, got {other:?}"
+            ),
+        }
     }
 
     /// The everyday invocation: up to date with the peer, one tracked file
@@ -12534,18 +12613,31 @@ mod tests {
             "the caller's uncommitted state must survive a transfer that could not move the tree"
         );
 
-        // The gap is closed now, so the next pull admits nothing. It must not
-        // repeat a refusal about a head that no longer moves.
+        // The history gap is closed, so the next pull admits nothing. The
+        // workspace gap is not: the tree is still on the head it had before the
+        // refusal. The retry stops repeating the transition refusal, which is
+        // about a head that no longer moves, and reports the state the replica
+        // actually holds instead.
         let (status, body) = transfer_command(Arc::clone(&fixture.state), "pull", &request).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let repeated: kin_cli::commands::transfer::CommandTransferResponse =
             serde_json::from_slice(&body).unwrap();
         assert!(!repeated.outcome.moved_history());
-        assert!(
-            !repeated.workspace.is_behind(),
-            "a pull that admitted nothing reports no workspace behind it: {:?}",
-            repeated.workspace
-        );
+        match &repeated.workspace {
+            WorkspaceFollow::Behind { detail } => {
+                assert!(
+                    !detail.contains("has graph-owned changes"),
+                    "the retry planned no transition, so it cannot report one refusing: {detail}"
+                );
+                assert!(
+                    detail.contains("kin branch switch"),
+                    "a workspace left behind is told how to catch up: {detail}"
+                );
+            }
+            other => panic!(
+                "the working tree is still behind the ref an earlier pull moved, got {other:?}"
+            ),
+        }
     }
 
     /// An interrupted multi-pack pull left every pack it admitted durable, and

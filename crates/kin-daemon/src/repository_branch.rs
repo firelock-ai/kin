@@ -147,28 +147,88 @@ fn branch_bad_request(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(BranchBadRequest(message.into()))
 }
 
-/// Refuse a transition over uncommitted state that graph authority already
-/// owns. Only admitted state reaches this: unadmitted working-copy bytes are
-/// reported as projection drift instead, so the wording never describes host
-/// content that has not crossed the repository-v6 compare-and-swap.
+/// The clause a remedy ends with, naming what the caller actually asked for.
 ///
-/// The remedy names what the caller actually asked for. A caller who ran a pull
-/// is not switching branches, and telling them to finish doing so describes an
-/// operation they never started.
-fn graph_owned_changes(
-    workspace: &kin_model::WorkspaceState,
-    policy: TransitionPolicy,
-) -> anyhow::Error {
-    let remedy = match policy {
+/// A caller who ran a pull is not switching branches, and telling them to
+/// finish doing so describes an operation they never started. Every refusal
+/// this transition can raise reads its verb from here, so a new refusal cannot
+/// pick up branch language by copying a neighbour.
+fn transition_remedy(policy: TransitionPolicy) -> &'static str {
+    match policy {
         TransitionPolicy::Switch => "before switching branches",
         TransitionPolicy::FollowMovedRef => {
             "before this workspace can follow the ref the transfer moved"
         }
-    };
+    }
+}
+
+/// The same distinction as a bare operation noun, for refusals phrased as
+/// "reopen before {operation}".
+fn transition_operation(policy: TransitionPolicy) -> &'static str {
+    match policy {
+        TransitionPolicy::Switch => "switching branches",
+        TransitionPolicy::FollowMovedRef => "following the ref this transfer moved",
+    }
+}
+
+/// Refuse a transition over uncommitted state that graph authority already
+/// owns. Only admitted state reaches this: unadmitted working-copy bytes are
+/// reported as projection drift instead, so the wording never describes host
+/// content that has not crossed the repository-v6 compare-and-swap.
+fn graph_owned_changes(
+    workspace: &kin_model::WorkspaceState,
+    policy: TransitionPolicy,
+) -> anyhow::Error {
     branch_conflict(format!(
-        "workspace {} has graph-owned changes; commit or explicitly preserve them {remedy}",
-        workspace.workspace_id
+        "workspace {} has graph-owned changes; commit or explicitly preserve them {}",
+        workspace.workspace_id,
+        transition_remedy(policy)
     ))
+}
+
+/// Whether this replica's working tree stands behind `name`, decided from
+/// persisted authority on both sides and nothing else.
+///
+/// A pull that admitted nothing moved no ref, so nothing that pull did can have
+/// left a tree behind. It can still find one behind: the run that admitted the
+/// history is the one whose workspace transition did not complete, and its
+/// retry admits nothing precisely because the first attempt already admitted
+/// everything. Answering that retry with "no ref moved" is true about the retry
+/// and silent about the workspace, and the exit status a caller chains on then
+/// says the pull is complete while the working tree still shows the old head.
+///
+/// Reads the workspace's base target against the ref's current target. Both are
+/// graph truth, so this states what the replica holds rather than what this
+/// invocation did, and it never consults the working copy.
+pub(crate) fn workspace_behind_ref(state: &DaemonState, name: &RefName) -> Result<Option<String>> {
+    let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+        .map_err(RepositoryAuthorityBindRefusal::into_error)
+        .context("open repository authority to report whether the workspace follows the ref")?;
+    let lease = authority.manager.read_authority();
+    let workspace = local_workspace(&authority, lease.metadata())?;
+    if !matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name) {
+        return Ok(None);
+    }
+    let Some(target) = lease
+        .resolve_ref_target(name)
+        .with_context(|| format!("resolve repository branch {name} from one authority lease"))?
+    else {
+        return Ok(None);
+    };
+    if workspace.base_target.as_ref() == Some(&target) {
+        return Ok(None);
+    }
+    let standing = match &workspace.base_target {
+        Some(base) => render_target(base),
+        None => "no admitted head".to_string(),
+    };
+    Ok(Some(format!(
+        "workspace {} stands at {standing} while {name} is at {}; this pull admitted nothing, so \
+         the gap is one an earlier pull admitted without completing its workspace transition. Run \
+         `kin branch switch {name}` to move this working tree onto it.",
+        workspace.workspace_id,
+        render_target(&target)
+    )))
 }
 
 pub(crate) fn execute(
@@ -748,7 +808,7 @@ fn switch(
         state,
         &roots,
         &current_workspace_graph,
-        "switching branches",
+        transition_operation(policy),
     )
     .map_err(|error| branch_conflict(error.to_string()))?;
     let mut snapshot = lease.snapshot().clone();
@@ -886,12 +946,13 @@ fn switch(
         &workspace.tree,
         &authority.manager,
     )
-    .with_context(|| format!("validate exact workspace projection before switching to {name}"))?;
+    .with_context(|| format!("validate exact workspace projection before moving onto {name}"))?;
     if let Some(first) = drift.first() {
         return Err(kin_core::KinError::ProjectionConflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
-             reconcile them into graph authority or discard them before switching branches",
-            drift.len()
+             reconcile them into graph authority or discard them {}",
+            drift.len(),
+            transition_remedy(policy)
         ))
         .into());
     }
