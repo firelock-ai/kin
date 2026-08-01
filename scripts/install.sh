@@ -120,16 +120,26 @@ info "Downloading $ARCHIVE..."
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Download the archive and its per-artifact checksum. The release workflow
-# publishes "<archive>.sha256" next to every archive (shasum -a 256 format:
-# "<hash>  <filename>"). Both downloads must succeed.
+# Download the archive and its per-artifact checksum. Interactive terminals get
+# the downloader's live byte/percent meter for the large archive; piped and CI
+# installs stay quiet. The checksum fetch remains quiet in both modes. The
+# release workflow publishes "<archive>.sha256" next to every archive (shasum
+# -a 256 format: "<hash>  <filename>"). Both downloads must succeed.
 if has_cmd curl; then
-    curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
+    if [ -t 2 ]; then
+        curl -fL "$URL" -o "$TMPDIR/$ARCHIVE"
+    else
+        curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
+    fi
     # Tolerate a failed checksum fetch here so the explicit, friendly error
     # below fires (instead of a bare curl error under `set -e`).
     curl -fsSL "$CHECKSUM_URL" -o "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
 elif has_cmd wget; then
-    wget -q "$URL" -O "$TMPDIR/$ARCHIVE"
+    if [ -t 2 ]; then
+        wget "$URL" -O "$TMPDIR/$ARCHIVE"
+    else
+        wget -q "$URL" -O "$TMPDIR/$ARCHIVE"
+    fi
     wget -q "$CHECKSUM_URL" -O "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
 fi
 
@@ -276,9 +286,9 @@ fi
 
 # ── PATH setup ──────────────────────────────────────────────────────────
 
-add_to_path() {
-    local rc_file="$1"
-    local line="export PATH=\"$KIN_BIN:\$PATH\""
+add_to_path() (
+    rc_file="$1"
+    line="export PATH=\"$KIN_BIN:\$PATH\""
 
     if [ -f "$rc_file" ] && grep -F -q "$KIN_BIN" "$rc_file" 2>/dev/null; then
         return 0  # Already configured
@@ -286,7 +296,7 @@ add_to_path() {
 
     printf '\n# Kin\n%s\n' "$line" >> "$rc_file"
     ok "Added $KIN_BIN to PATH in $rc_file"
-}
+)
 
 case "$OS" in
     macos)

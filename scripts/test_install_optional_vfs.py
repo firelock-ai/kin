@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import platform
+import pty
 import stat
 import subprocess
 import tarfile
@@ -42,7 +44,7 @@ def executable(path: Path, body: str) -> None:
 
 class OptionalVfsInstallerTests(unittest.TestCase):
     def run_installer(
-        self, *, vfs_exit: int
+        self, *, vfs_exit: int, progress_tty: bool = False
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -91,19 +93,56 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "SHELL": "/bin/sh",
             }
         )
-        result = subprocess.run(
-            ["sh", str(INSTALLER)],
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        args = ["sh", str(INSTALLER)]
+        if progress_tty:
+            master, slave = pty.openpty()
+            try:
+                process = subprocess.Popen(
+                    args,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=slave,
+                    text=True,
+                )
+            finally:
+                os.close(slave)
+
+            stderr_chunks: list[bytes] = []
+            try:
+                while True:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            finally:
+                os.close(master)
+            stdout, _ = process.communicate()
+            result = subprocess.CompletedProcess(
+                args,
+                process.returncode,
+                stdout,
+                b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+            )
+        else:
+            result = subprocess.run(
+                args,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
         return result, kin_home
 
     def test_reports_projection_only_when_vfs_is_executable(self) -> None:
         result, kin_home = self.run_installer(vfs_exit=0)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("% Total", result.stderr)
         self.assertIn("Filesystem projection installed", result.stdout)
         self.assertTrue((kin_home / "bin" / "kin-vfs").exists())
 
@@ -115,6 +154,13 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         self.assertIn("Filesystem projection is unavailable", result.stdout)
         self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
         self.assertFalse(any((kin_home / "lib").glob("libkin_vfs_shim.*")))
+
+    def test_interactive_archive_download_exposes_live_byte_percent_meter(self) -> None:
+        result, _ = self.run_installer(vfs_exit=0, progress_tty=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("% Total", result.stderr)
+        self.assertIn("% Received", result.stderr)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ import {
   releaseDownloadUrl,
   parseSha256File,
   sha256Hex,
+  formatByteCount,
+  formatDownloadProgress,
   provision,
   probeBinaryVersion,
   ensureProvisioned,
@@ -46,13 +48,26 @@ test('parseSha256File accepts shasum output and rejects junk', () => {
   assert.throws(() => parseSha256File(''), /malformed \.sha256/);
 });
 
+test('download progress reports stable bytes and percent', () => {
+  assert.equal(formatByteCount(0), '0 B');
+  assert.equal(formatByteCount(1536), '1.5 KiB');
+  assert.equal(
+    formatDownloadProgress('kin-test.tar.gz', 524288, 1048576),
+    'kin: downloading kin-test.tar.gz: 50% (512.0 KiB / 1.0 MiB)',
+  );
+  assert.equal(
+    formatDownloadProgress('kin-test.tar.gz', 1536),
+    'kin: downloading kin-test.tar.gz: 1.5 KiB received',
+  );
+});
+
 // ── offline provision fixture ──────────────────────────────────────────────
 //
 // Builds a real tar.gz in a tempdir (via the same `tar` the provisioner uses)
 // containing the archive layout install.sh documents: a kin-* subdirectory
 // with kin + kin-daemon. The fake fetch serves those bytes; no network.
 
-function makeFixture({ withDaemon = true } = {}) {
+function makeFixture({ withDaemon = true, streamArchive = false } = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-fixture-'));
   const stage = path.join(work, 'kin-macos-aarch64');
   fs.mkdirSync(stage, { recursive: true });
@@ -69,6 +84,23 @@ function makeFixture({ withDaemon = true } = {}) {
   const sha = `${sha256Hex(bytes)}  kin-macos-aarch64.tar.gz\n`;
   const fetchImpl = async (url) => {
     const body = url.endsWith('.sha256') ? Buffer.from(sha) : bytes;
+    if (streamArchive && !url.endsWith('.sha256')) {
+      const split = Math.floor(body.length / 2);
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) => (name.toLowerCase() === 'content-length' ? String(body.length) : null),
+        },
+        body: (async function* streamFixture() {
+          yield body.subarray(0, split);
+          yield body.subarray(split);
+        })(),
+        arrayBuffer: async () => {
+          throw new Error('streaming archive must not be buffered through arrayBuffer()');
+        },
+      };
+    }
     return {
       ok: true,
       status: 200,
@@ -94,6 +126,30 @@ test('provision verifies, installs kin + kin-daemon, and stamps the version', as
   assert.ok(fs.existsSync(path.join(home, 'bin', 'kin-daemon')));
   assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
   assert.equal(readLauncherStamp(env), '9.9.9');
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision streams live archive byte and percent progress without touching checksum semantics', async () => {
+  const { work, bytes, fetchImpl } = makeFixture({ streamArchive: true });
+  const home = path.join(work, 'kin-home');
+  const progress = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+    onProgress: (event) => progress.push({ ...event }),
+  });
+
+  assert.ok(
+    progress.some((event) => !event.done && event.received > 0 && event.received < bytes.length),
+  );
+  assert.deepEqual(progress.at(-1), {
+    received: bytes.length,
+    total: bytes.length,
+    done: true,
+  });
   fs.rmSync(work, { recursive: true, force: true });
 });
 

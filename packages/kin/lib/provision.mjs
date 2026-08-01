@@ -79,12 +79,75 @@ export function sha256Hex(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
-async function fetchBuffer(url, fetchImpl) {
+/** Compact, stable byte count for first-install progress. */
+export function formatByteCount(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let amount = value;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : 1;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+
+/** Pure rendering helper so progress wording remains testable without a TTY. */
+export function formatDownloadProgress(file, received, total = null) {
+  const transferred = formatByteCount(received);
+  if (Number.isFinite(total) && total > 0) {
+    const percent = Math.min(100, Math.floor((received * 100) / total));
+    return `kin: downloading ${file}: ${percent}% (${transferred} / ${formatByteCount(total)})`;
+  }
+  return `kin: downloading ${file}: ${transferred} received`;
+}
+
+function createDownloadProgress(file, stream = process.stderr) {
+  let lastAt = 0;
+  let lastBytes = 0;
+  let lastPercent = -1;
+  return ({ received, total, done = false }) => {
+    const now = Date.now();
+    const percent = Number.isFinite(total) && total > 0 ? Math.floor((received * 100) / total) : null;
+    if (!done) {
+      if (percent !== null && percent === lastPercent && now - lastAt < 250) return;
+      if (percent === null && received - lastBytes < 1024 * 1024 && now - lastAt < 250) return;
+    }
+    stream.write(`\r\x1b[2K${formatDownloadProgress(file, received, total)}${done ? '\n' : ''}`);
+    lastAt = now;
+    lastBytes = received;
+    lastPercent = percent;
+  };
+}
+
+async function fetchBuffer(url, fetchImpl, onProgress = null) {
   const res = await fetchImpl(url);
   if (!res.ok) {
     throw new Error(`download failed (${res.status}) for ${url}`);
   }
-  return Buffer.from(await res.arrayBuffer());
+
+  const contentLength = Number(res.headers?.get?.('content-length'));
+  const total = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null;
+  if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+    const chunks = [];
+    let received = 0;
+    for await (const chunk of res.body) {
+      const bytes = Buffer.from(chunk);
+      chunks.push(bytes);
+      received += bytes.length;
+      onProgress?.({ received, total, done: false });
+    }
+    onProgress?.({ received, total: total ?? received, done: true });
+    return Buffer.concat(chunks, received);
+  }
+
+  // Injected/offline test fetches and lightweight fetch shims may expose only
+  // arrayBuffer(). Keep that contract intact; they receive one completion event
+  // when a caller explicitly asks for progress.
+  const buffer = Buffer.from(await res.arrayBuffer());
+  onProgress?.({ received: buffer.length, total: total ?? buffer.length, done: true });
+  return buffer;
 }
 
 /**
@@ -118,14 +181,23 @@ export async function provision(version, opts = {}) {
     arch = process.arch,
     fetchImpl = fetch,
     log = (line) => process.stderr.write(`${line}\n`),
+    onProgress,
   } = opts;
 
   const file = artifactName(platform, arch);
   const url = releaseDownloadUrl(version, file);
   log(`kin: provisioning managed kin ${version} (${file})...`);
 
+  // Interactive first runs show live bytes/percent; redirected/non-TTY npm
+  // invocations stay line-oriented. An injected callback keeps streaming fully
+  // testable without coupling fake fetch implementations to terminal behavior.
+  const archiveProgress =
+    onProgress === undefined && fetchImpl === globalThis.fetch && process.stderr.isTTY
+      ? createDownloadProgress(file)
+      : onProgress;
+
   const [archive, shaText] = await Promise.all([
-    fetchBuffer(url, fetchImpl),
+    fetchBuffer(url, fetchImpl, archiveProgress),
     fetchBuffer(`${url}.sha256`, fetchImpl),
   ]);
   const expected = parseSha256File(shaText.toString('utf8'));
