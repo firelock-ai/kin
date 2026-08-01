@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use kin_db::{
     AuthorityPayloadStats, LocalFileBackend, LocalNamespaceProbe, RepositoryAuthorityManager,
-    RepositoryAuthorityState,
+    RepositoryAuthorityState, StorageBackend,
 };
 use kin_model::{
     EntityDelta, EntityId, RelationDelta, RelationId, RepositoryId, SemanticChangeId, WorkspaceId,
@@ -285,9 +285,11 @@ impl LocalRepositoryAuthorityBinding {
     /// disappeared is refused rather than reopened as an unpersisted
     /// generation-zero repository.
     ///
-    /// This is the one authority load and the one exclusive lock a bind pays:
-    /// the revalidation ahead of it reads namespace identity from metadata
-    /// alone, so naming a replaced namespace as such costs no second load.
+    /// This is one authority recovery and its one exclusive recovery lock: the
+    /// revalidation ahead of it reads namespace identity from metadata alone,
+    /// so naming a replaced namespace as such costs no second recovery. KinDB
+    /// may separately persist a reusable history-validation proof after a full
+    /// replay; that does not reload authority or decide whether a record exists.
     pub fn open_manager(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
@@ -336,16 +338,11 @@ impl LocalRepositoryAuthorityBinding {
 /// record when constructing an unpersisted generation-zero repository, so this
 /// boundary uses the payload receipt from the same recovery to retain the
 /// stricter reopen contract without paying for a second load or lock.
-pub fn open_persisted_local_repository_authority(
+pub fn open_persisted_local_repository_authority<B: StorageBackend + ?Sized + 'static>(
     repository_id: RepositoryId,
-    backend: Arc<LocalFileBackend>,
-) -> std::result::Result<
-    (
-        RepositoryAuthorityManager<LocalFileBackend>,
-        AuthorityPayloadStats,
-    ),
-    kin_db::KinDbError,
-> {
+    backend: Arc<B>,
+) -> std::result::Result<(RepositoryAuthorityManager<B>, AuthorityPayloadStats), kin_db::KinDbError>
+{
     let missing_repository_id = repository_id.clone();
     let (manager, payload_stats) =
         RepositoryAuthorityManager::open_with_payload_stats(repository_id, backend)?;
