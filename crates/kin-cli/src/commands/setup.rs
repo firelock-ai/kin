@@ -11152,7 +11152,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     let configured_assistants = apply_plan(&plan, &assistants, shell_name).await?;
 
-    print_intent_followups(&plan);
+    print_intent_followups(&plan, interactive);
 
     request_notification_authorization(interactive);
 
@@ -11707,7 +11707,7 @@ fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
 
 /// Intent-specific guidance shown before the health checklist, driven by the
 /// applied [`SetupPlan`].
-fn print_intent_followups(plan: &SetupPlan) {
+fn print_intent_followups(plan: &SetupPlan, interactive: bool) {
     if plan.show_editor_hint {
         println!();
         println!("Editor extension:");
@@ -11721,7 +11721,7 @@ fn print_intent_followups(plan: &SetupPlan) {
         println!();
         println!("Hosted / KinLab:");
         let base_url = super::auth::hosted_base_url(None);
-        match super::auth::hosted_credential_state(&base_url) {
+        match super::auth::hosted_credential_state(&base_url, interactive) {
             Ok(state) => {
                 for line in hosted_followup_lines(&base_url, &state) {
                     println!("  {} {}", style("→").cyan(), line);
@@ -11763,6 +11763,14 @@ fn hosted_followup_lines(
             "`kin auth login` connects this machine, then `kin remote add <name> <url>`."
                 .to_string(),
             "Another workspace: `kin auth login --base-url <url>`, or set KINLAB_URL.".to_string(),
+        ],
+        super::auth::HostedCredentialState::AbsentKeyringNotRead => vec![
+            format!("No stored credential file for {base_url} on this machine."),
+            "This run cannot answer a keychain prompt, so the platform keyring was not read; \
+             `kin auth status` reports a keyring-stored credential."
+                .to_string(),
+            "`kin auth login` connects this machine, then `kin remote add <name> <url>`."
+                .to_string(),
         ],
     }
 }
@@ -13017,6 +13025,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     fn hosted_followups_never_deny_the_shipped_connect_command() {
         let states = [
             super::super::auth::HostedCredentialState::Absent,
+            super::super::auth::HostedCredentialState::AbsentKeyringNotRead,
             super::super::auth::HostedCredentialState::Locked,
             super::super::auth::HostedCredentialState::Ready {
                 user_email: "dev@example.com".to_string(),
@@ -13079,6 +13088,37 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert!(
             ready.contains("dev@example.com") && ready.contains("2026-12-31T00:00:00Z"),
             "a signed-in machine must be told which identity and until when: {ready}"
+        );
+    }
+
+    /// A run that cannot answer a keychain prompt does not read the keyring, so
+    /// it does not know whether this machine is signed in. Saying it is not
+    /// would be false on the default install, where the keyring is where a
+    /// credential lands.
+    #[test]
+    fn hosted_followups_do_not_claim_signed_out_when_the_keyring_went_unread() {
+        let unread = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::AbsentKeyringNotRead,
+        )
+        .join("\n");
+        assert!(
+            !unread.to_lowercase().contains("not signed in"),
+            "an unread keyring cannot support a signed-out claim: {unread}"
+        );
+        assert!(
+            unread.contains("kin auth status"),
+            "the report must name the command that does read the keyring: {unread}"
+        );
+
+        let read = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::Absent,
+        )
+        .join("\n");
+        assert!(
+            read.to_lowercase().contains("not signed in"),
+            "a probe that did read the keyring states the machine is signed out: {read}"
         );
     }
 

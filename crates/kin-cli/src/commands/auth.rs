@@ -151,8 +151,11 @@ fn load_credential(base_url: &str, allow_keyring: bool) -> Result<Option<StoredC
         }
     }
 
-    // Fall back to plaintext then encrypted file.
-    let encrypted_path = fallback_credential_path(base_url)?;
+    // Fall back to plaintext then encrypted file. Reading resolves the probe
+    // path: `kin auth status`, `whoami`, and every actor-id lookup reach here,
+    // and none of them may create the auth directory on a machine that never
+    // logged in.
+    let encrypted_path = fallback_credential_probe_path(base_url)?;
     let plaintext_path = encrypted_path.with_extension("json");
     if plaintext_path.exists() {
         let bytes = fs::read(&plaintext_path)?;
@@ -175,6 +178,11 @@ fn load_credential(base_url: &str, allow_keyring: bool) -> Result<Option<StoredC
 pub enum HostedCredentialState {
     /// Nothing on this machine claims an identity for the workspace.
     Absent,
+    /// No credential file names an identity, and the platform keyring was not
+    /// read, so a keyring-stored identity would not have been seen. Reporting
+    /// this as [`HostedCredentialState::Absent`] would state something false
+    /// about a machine that is signed in.
+    AbsentKeyringNotRead,
     /// An encrypted credential file exists; reading it needs the passphrase.
     Locked,
     /// A credential is readable without a prompt.
@@ -190,10 +198,34 @@ pub fn hosted_base_url(base_url: Option<String>) -> String {
     normalized_base_url(base_url)
 }
 
+/// What a probe reports when neither source named an identity.
+///
+/// The two cases are not the same statement. A probe that read the keyring and
+/// found nothing knows the machine is signed out; a probe that never read it
+/// knows only that no file names an identity.
+fn absent_state(keyring_read: bool) -> HostedCredentialState {
+    if keyring_read {
+        HostedCredentialState::Absent
+    } else {
+        HostedCredentialState::AbsentKeyringNotRead
+    }
+}
+
 /// Report the stored identity for a workspace without prompting or writing.
-pub fn hosted_credential_state(base_url: &str) -> Result<HostedCredentialState> {
-    let key = account_key(base_url);
-    if keyring_enabled() {
+///
+/// `allow_keyring` must be false whenever nothing can answer a prompt. A
+/// `get_password` call raises an interactive Keychain authorization dialog on
+/// macOS whenever the item's ACL does not already authorize the calling binary,
+/// which is routine for a rebuilt unsigned binary or after a relock, and that
+/// dialog blocks the process for as long as nobody clicks it. Reading the file
+/// probes alone cannot hang.
+pub fn hosted_credential_state(
+    base_url: &str,
+    allow_keyring: bool,
+) -> Result<HostedCredentialState> {
+    let keyring_read = allow_keyring && keyring_enabled();
+    if keyring_read {
+        let key = account_key(base_url);
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
             if let Ok(value) = entry.get_password() {
                 let credential: StoredCredential = serde_json::from_str(&value)?;
@@ -218,7 +250,7 @@ pub fn hosted_credential_state(base_url: &str) -> Result<HostedCredentialState> 
     if encrypted_path.exists() {
         return Ok(HostedCredentialState::Locked);
     }
-    Ok(HostedCredentialState::Absent)
+    Ok(absent_state(keyring_read))
 }
 
 fn delete_credential(base_url: &str) -> Result<()> {
@@ -577,5 +609,18 @@ mod tests {
         assert_eq!(actor_id, "cli:troy@firelock.ai:workstation");
 
         fs::remove_file(path).unwrap();
+    }
+
+    /// A probe that never read the keyring has not learned that the machine is
+    /// signed out, and the two answers must not collapse into one: the default
+    /// install stores the credential in the keyring, so reporting the
+    /// unread case as `Absent` would deny an identity this machine holds.
+    #[test]
+    fn an_unread_keyring_is_not_an_absent_credential() {
+        assert_eq!(absent_state(true), HostedCredentialState::Absent);
+        assert_eq!(
+            absent_state(false),
+            HostedCredentialState::AbsentKeyringNotRead
+        );
     }
 }
