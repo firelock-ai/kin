@@ -229,11 +229,17 @@ test('resolveReleaseAsset maps supported targets', () => {
     binaryName: 'kin',
     daemonBinaryName: 'kin-daemon'
   });
+  assert.deepEqual(resolveReleaseAsset('win32', 'x64'), {
+    assetName: 'kin-windows-x86_64',
+    archiveName: 'kin-windows-x86_64.zip',
+    binaryName: 'kin.exe',
+    daemonBinaryName: 'kin-daemon.exe'
+  });
 });
 
 test('resolveReleaseAsset rejects unsupported targets', () => {
   assert.throws(
-    () => resolveReleaseAsset('win32', 'x64'),
+    () => resolveReleaseAsset('win32', 'arm64'),
     /does not have a published Kin binary/
   );
 });
@@ -243,36 +249,59 @@ test('resolveReleaseTag prefixes versions with v', () => {
   assert.equal(resolveReleaseTag('v0.1.0-alpha.1'), 'v0.1.0-alpha.1');
 });
 
-async function buildReleaseArchive(tmpDir, assetName, { includeDaemon = true } = {}) {
+async function buildReleaseArchive(
+  tmpDir,
+  assetName,
+  { includeDaemon = true, platform = 'linux' } = {}
+) {
   const kinBytes = Buffer.from('#!/bin/sh\necho kin\n', 'utf8');
   const daemonBytes = Buffer.from('#!/bin/sh\necho kin-daemon\n', 'utf8');
   const packageDir = path.join(tmpDir, assetName);
-  const archivePath = path.join(tmpDir, `${assetName}.tar.gz`);
+  const archiveName = platform === 'win32' ? `${assetName}.zip` : `${assetName}.tar.gz`;
+  const archivePath = path.join(tmpDir, archiveName);
+  const binaryName = platform === 'win32' ? 'kin.exe' : 'kin';
+  const daemonBinaryName = platform === 'win32' ? 'kin-daemon.exe' : 'kin-daemon';
 
   await fs.mkdir(packageDir);
-  await fs.writeFile(path.join(packageDir, 'kin'), kinBytes, { mode: 0o755 });
+  await fs.writeFile(path.join(packageDir, binaryName), kinBytes, { mode: 0o755 });
   if (includeDaemon) {
-    await fs.writeFile(path.join(packageDir, 'kin-daemon'), daemonBytes, { mode: 0o755 });
+    await fs.writeFile(path.join(packageDir, daemonBinaryName), daemonBytes, {
+      mode: 0o755
+    });
   }
-  cp.execFileSync('tar', ['-czf', archivePath, '-C', tmpDir, assetName]);
+  if (platform === 'win32') {
+    const members = [binaryName];
+    if (includeDaemon) {
+      members.push(daemonBinaryName);
+    }
+    if (process.platform === 'win32') {
+      cp.execFileSync('tar', ['-a', '-c', '-f', archivePath, ...members], {
+        cwd: packageDir
+      });
+    } else {
+      cp.execFileSync('zip', ['-q', archivePath, ...members], { cwd: packageDir });
+    }
+  } else {
+    cp.execFileSync('tar', ['-czf', archivePath, '-C', tmpDir, assetName]);
+  }
   await fs.rm(packageDir, { recursive: true, force: true });
 
   const archiveBytes = await fs.readFile(archivePath);
   await fs.rm(archivePath, { force: true });
   const checksum = crypto.createHash('sha256').update(archiveBytes).digest('hex');
-  return { archiveBytes, checksum, kinBytes, daemonBytes };
+  return { archiveBytes, archiveName, checksum, kinBytes, daemonBytes };
 }
 
-function startReleaseServer(version, assetName, archiveBytes, checksum) {
+function startReleaseServer(version, archiveName, archiveBytes, checksum) {
   const server = http.createServer((req, res) => {
-    if (req.url === `/v${version}/${assetName}.tar.gz`) {
+    if (req.url === `/v${version}/${archiveName}`) {
       res.writeHead(200, { 'content-type': 'application/octet-stream' });
       res.end(archiveBytes);
       return;
     }
-    if (req.url === `/v${version}/${assetName}.tar.gz.sha256`) {
+    if (req.url === `/v${version}/${archiveName}.sha256`) {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(`${checksum}  ${assetName}.tar.gz\n`);
+      res.end(`${checksum}  ${archiveName}\n`);
       return;
     }
     res.writeHead(404);
@@ -285,11 +314,9 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-download-'));
   const assetName = 'kin-linux-x86_64';
   const version = '9.9.9-test';
-  const { archiveBytes, checksum, kinBytes, daemonBytes } = await buildReleaseArchive(
-    tmpDir,
-    assetName
-  );
-  const server = startReleaseServer(version, assetName, archiveBytes, checksum);
+  const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
+    await buildReleaseArchive(tmpDir, assetName);
+  const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -327,14 +354,52 @@ test('ensureKinBinary downloads kin and its daemon from a release asset', async 
   }
 });
 
+test('ensureKinBinary installs the flat native Windows zip and .exe pair', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-windows-download-'));
+  const assetName = 'kin-windows-x86_64';
+  const version = '9.9.9-test';
+  const { archiveBytes, archiveName, checksum, kinBytes, daemonBytes } =
+    await buildReleaseArchive(tmpDir, assetName, { platform: 'win32' });
+  const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const env = {
+    KIN_MCP_CACHE_DIR: tmpDir,
+    KIN_MCP_RELEASE_BASE_URL: baseUrl
+  };
+
+  try {
+    const binaryPath = await ensureKinBinary({
+      env,
+      platform: 'win32',
+      arch: 'x64',
+      version
+    });
+
+    assert.equal(path.basename(binaryPath), 'kin.exe');
+    assert.equal(await fs.readFile(binaryPath, 'utf8'), kinBytes.toString('utf8'));
+
+    const daemonPath = resolveDaemonBinaryPath(binaryPath);
+    assert.equal(path.basename(daemonPath), 'kin-daemon.exe');
+    assert.equal(await fs.readFile(daemonPath, 'utf8'), daemonBytes.toString('utf8'));
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('ensureKinBinary fails with a precise message when the archive omits kin-daemon', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-nodaemon-'));
   const assetName = 'kin-linux-x86_64';
   const version = '9.9.9-test';
-  const { archiveBytes, checksum } = await buildReleaseArchive(tmpDir, assetName, {
-    includeDaemon: false
-  });
-  const server = startReleaseServer(version, assetName, archiveBytes, checksum);
+  const { archiveBytes, archiveName, checksum } = await buildReleaseArchive(
+    tmpDir,
+    assetName,
+    { includeDaemon: false }
+  );
+  const server = startReleaseServer(version, archiveName, archiveBytes, checksum);
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
