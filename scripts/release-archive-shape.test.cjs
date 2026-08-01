@@ -13,6 +13,7 @@ const {
   NOTIFIER_BUNDLE_DIR,
   assertReleaseArchiveMemberPaths,
   classifyReleaseArchiveRoot,
+  releaseArchiveRootFiles,
   targetCarriesNotifierBundle,
 } = require("./release-archive-shape.cjs");
 
@@ -59,6 +60,10 @@ const LINUX_LISTING = [
 const WINDOWS_LISTING = ["kin.exe", "kin-daemon.exe", "kin-vfs.exe"];
 
 const MACOS_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"];
+const LINUX_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"];
+// Sorted the way the classifier returns names, which puts the bare CLI between
+// the hyphenated binaries and the underscored shim.
+const WINDOWS_FILES = ["kin-daemon.exe", "kin-vfs.exe", "kin.exe", "kin_vfs_shim.dll"];
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "release-archive-shape-"));
@@ -91,7 +96,15 @@ function macosRoot(options = {}) {
 
 function linuxRoot() {
   const root = tempRoot();
-  for (const name of ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"]) {
+  for (const name of LINUX_FILES) {
+    writeFile(root, [name], 0o755);
+  }
+  return root;
+}
+
+function windowsRoot() {
+  const root = tempRoot();
+  for (const name of WINDOWS_FILES) {
     writeFile(root, [name], 0o755);
   }
   return root;
@@ -204,8 +217,86 @@ test("the extracted macOS root yields exactly the four provenance-bearing files"
 
 test("the extracted Linux root yields its files and no bundle", () => {
   const { files, bundles } = classifyReleaseArchiveRoot(linuxRoot(), { target: LINUX_TARGET });
-  assert.deepEqual(files, ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"]);
+  assert.deepEqual(files, LINUX_FILES);
   assert.deepEqual(bundles, []);
+});
+
+test("the extracted Windows root yields its files and no bundle", () => {
+  const { files, bundles } = classifyReleaseArchiveRoot(windowsRoot(), { target: WINDOWS_TARGET });
+  assert.deepEqual(files, WINDOWS_FILES);
+  assert.deepEqual(bundles, []);
+});
+
+test("the sanctioned root files are read per target family", () => {
+  assert.deepEqual(releaseArchiveRootFiles(MACOS_TARGET).slice().sort(), MACOS_FILES);
+  assert.deepEqual(releaseArchiveRootFiles("aarch64-apple-darwin").slice().sort(), MACOS_FILES);
+  assert.deepEqual(releaseArchiveRootFiles(LINUX_TARGET).slice().sort(), LINUX_FILES);
+  assert.deepEqual(
+    releaseArchiveRootFiles("aarch64-unknown-linux-musl").slice().sort(),
+    LINUX_FILES
+  );
+  assert.deepEqual(releaseArchiveRootFiles(WINDOWS_TARGET).slice().sort(), WINDOWS_FILES);
+  assert.throws(() => releaseArchiveRootFiles(""), /requires a target triple/);
+  assert.throws(
+    () => releaseArchiveRootFiles("wasm32-unknown-unknown"),
+    /no component list for target wasm32-unknown-unknown/
+  );
+});
+
+test("an extracted root holding a stray file is rejected and names it", () => {
+  for (const [root, target] of [
+    [macosRoot(), MACOS_TARGET],
+    [linuxRoot(), LINUX_TARGET],
+    [windowsRoot(), WINDOWS_TARGET],
+  ]) {
+    writeFile(root, ["README"]);
+    assert.throws(
+      () => classifyReleaseArchiveRoot(root, { target }),
+      /holds unexpected file 'README'/,
+      `a stray root file survived the ${target} archive shape check`
+    );
+  }
+});
+
+test("a component belonging to another target family is not a sanctioned name", () => {
+  // Copying the Unix CLI into a Windows archive, or a dylib shim into a Linux
+  // one, is a plausible packaging slip and is only caught if the sanctioned set
+  // is read per family rather than pooled across every release leg.
+  const windows = windowsRoot();
+  writeFile(windows, ["kin"], 0o755);
+  assert.throws(
+    () => classifyReleaseArchiveRoot(windows, { target: WINDOWS_TARGET }),
+    /holds unexpected file 'kin'/
+  );
+
+  const linux = linuxRoot();
+  writeFile(linux, ["libkin_vfs_shim.dylib"], 0o755);
+  assert.throws(
+    () => classifyReleaseArchiveRoot(linux, { target: LINUX_TARGET }),
+    /holds unexpected file 'libkin_vfs_shim\.dylib'/
+  );
+});
+
+test("a listing declaring a stray root file is rejected before extraction", () => {
+  const cases = [
+    [LINUX_ARTIFACT, LINUX_TARGET, [...LINUX_LISTING, `${LINUX_ARTIFACT}/README`], /'.*\/README'/],
+    [
+      MACOS_ARTIFACT,
+      MACOS_TARGET,
+      [...MACOS_LISTING, `${MACOS_ARTIFACT}/install.sh`],
+      /'.*\/install\.sh'/,
+    ],
+    // The Windows zip is flat, so a stray member carries no prefix to hide in.
+    [WINDOWS_ARTIFACT, WINDOWS_TARGET, [...WINDOWS_LISTING, "kin.pdb"], /'kin\.pdb'/],
+  ];
+  for (const [artifact, target, listing, named] of cases) {
+    assert.throws(
+      () => assertReleaseArchiveMemberPaths(listing, { artifact, target }),
+      /declares unexpected file/,
+      `a stray ${artifact} listing member survived the pre-extraction check`
+    );
+    assert.throws(() => assertReleaseArchiveMemberPaths(listing, { artifact, target }), named);
+  }
 });
 
 test("an extracted root holding an unsanctioned directory is rejected", () => {

@@ -4446,6 +4446,80 @@ def main() -> None:
         "./scripts/release-archive-shape.test.cjs",
         "release archive shape regression",
     )
+
+    # The release build decides which files may sit at an archive root; the
+    # updater decides which names it is willing to stage. `kin update` aborts a
+    # whole staging on the first name it does not manage, so a name sanctioned
+    # here that the updater has never heard of publishes cleanly and then stops
+    # every update on that platform until a later release replaces the archive.
+    # Pin the two sets against each other instead of trusting them to be edited
+    # together. Only one direction is required: the updater deliberately manages
+    # names the release no longer ships, so that it can delete a stale copy.
+    archive_shape = (ROOT / "scripts" / "release-archive-shape.cjs").read_text(
+        encoding="utf-8"
+    )
+    for policy in (
+        "holds unexpected file",
+        "declares unexpected file",
+        "has no component list for target",
+    ):
+        require(archive_shape, policy, "sanctioned release archive root file names")
+    updater = (ROOT / "crates" / "kin-cli" / "src" / "commands" / "update.rs").read_text(
+        encoding="utf-8"
+    )
+
+    def between(content: str, start: str, end: str, label: str) -> str:
+        try:
+            begin = content.index(start) + len(start)
+            return content[begin : content.index(end, begin)]
+        except ValueError as error:
+            raise AssertionError(
+                f"cannot read {label}: anchor moved, so this check would compare "
+                "two empty sets and pass without judging anything"
+            ) from error
+
+    for family, spec, cli in (
+        ("darwin", "MACOS_COMPONENTS", "kin"),
+        ("linux", "LINUX_COMPONENTS", "kin"),
+        ("windows", "WINDOWS_COMPONENTS", "kin.exe"),
+    ):
+        sanctioned = set(
+            re.findall(
+                r'"([^"]+)"',
+                between(
+                    archive_shape,
+                    f"  {family}: Object.freeze([",
+                    "]),",
+                    f"the {family} release archive root file names",
+                ),
+            )
+        )
+        managed = set(
+            re.findall(
+                r'name: "([^"]+)"',
+                between(
+                    updater,
+                    f"const {spec}: &[ComponentSpec] = &[",
+                    "\n];",
+                    f"the updater's {spec} list",
+                ),
+            )
+        )
+        # Both extractions have to have found the CLI, or an anchor drifted and
+        # the subset below is comparing nothing against nothing.
+        for names, source in ((sanctioned, family), (managed, spec)):
+            if cli not in names:
+                raise AssertionError(
+                    f"{source} component names do not include {cli}, so the release "
+                    "archive and updater component sets were not actually read"
+                )
+        unmanaged = sorted(sanctioned - managed)
+        if unmanaged:
+            raise AssertionError(
+                f"release archive root files {unmanaged} are sanctioned for {family} "
+                f"but are not in the updater's {spec}, so an archive carrying them "
+                "would publish and then abort every update on that platform"
+            )
     archive_attestation_start = publish_job.index(
         "      - name: Attest final release archives and provenance"
     )
