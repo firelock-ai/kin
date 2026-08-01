@@ -87,6 +87,12 @@ def check_product_wiring() -> None:
     )
 
     installer_requirements = (
+        "function Format-ByteCount",
+        "function Invoke-ArchiveDownload",
+        "[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead",
+        'Write-Progress -Activity "Downloading $ArchiveName"',
+        "-ShowProgress:$ShowArchiveProgress",
+        "Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue",
         "function Resolve-ArchiveChecksum",
         "$Filename -cne $ArchiveName",
         "$UniqueHashes.Count -gt 1",
