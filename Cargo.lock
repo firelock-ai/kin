@@ -3130,6 +3130,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "unicode-ident",
  "unicode-normalization",
  "url",
  "uuid",

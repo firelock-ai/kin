@@ -39,6 +39,8 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_ready"], true);
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
+    assert_eq!(report["all_declared_command_surfaces_enabled"], true);
+    assert_eq!(report["enabled_commands"], 33);
     assert_eq!(report["full_git_replacement_ready"], false);
     // Exact counts, so a silent re-seal cannot pass. They are also the reason
     // two lanes must never flip a gate in the same wave: both bumps merge
@@ -85,7 +87,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
             .as_str()
             .expect("exposure should be a string");
         match status {
-            "ready" => assert_eq!(exposure, "enabled"),
+            "ready" | "ready_bounded" => assert_eq!(exposure, "enabled"),
             "open_gate" => {
                 assert_eq!(exposure, "fail_closed");
                 assert!(
@@ -103,7 +105,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
 }
 
 #[test]
-fn remaining_open_gate_commands_fail_before_repository_discovery() {
+fn exposed_mutation_commands_reach_repository_discovery() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
@@ -121,6 +123,19 @@ fn remaining_open_gate_commands_fail_before_repository_discovery() {
     assert!(
         !stderr.contains("is fail-closed on repository-v6"),
         "checkout must no longer answer from the capability gate: {stderr}"
+    );
+    assert!(stderr.contains("not a Kin repository"), "{stderr}");
+
+    let output = kin_command(&home)
+        .args(["rename", "before", "after"])
+        .current_dir(root.path())
+        .output()
+        .expect("run exposed rename outside a repository");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is fail-closed on repository-v6"),
+        "rename must no longer answer from the capability gate: {stderr}"
     );
     assert!(stderr.contains("not a Kin repository"), "{stderr}");
 }
@@ -265,4 +280,5 @@ fn top_level_help_marks_open_git_replacement_surfaces() {
     assert!(stdout.contains("Show coherent repository-v6 workspace status"));
     assert!(stdout.contains("Create an exact semantic and artifact commit"));
     assert!(stdout.contains("Show exact repository-v6 artifact and semantic changes"));
+    assert!(stdout.contains("Bounded graph-native rename; unsupported cases fail closed"));
 }

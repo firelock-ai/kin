@@ -1,0 +1,794 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Adversarial evidence for repository-v6 rename planning.
+//!
+//! Production relation evidence currently carries occurrence counts but no
+//! source spans. These tests prove the bounded replacement contract: Kin uses
+//! the graph-owned source entity span plus the relation occurrence count to
+//! account for exact identifier sites in repository CAS, and refuses any case
+//! where one-to-one accounting cannot be established.
+
+use std::collections::{BTreeSet, HashMap};
+
+use kin_cli::commands::rename::{plan_rename, RenamePlan, RenameRequest};
+use kin_db::InMemoryGraph;
+use kin_index::linker::ArtifactIdentityMap;
+use kin_model::{
+    ArtifactId, AuthorId, Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore,
+    FileLayout, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256, ImportSection, LanguageId,
+    LocatedEntry, OperationId, ParseCompleteness, Relation, RelationEvidence, RelationId,
+    RelationKind, RelationOrigin, RepoPath, SemanticFingerprint, SourceSpan, TransactionDelta,
+    TreeDelta, TreeEntry, Visibility,
+};
+
+struct PlannerHarness {
+    graph: InMemoryGraph,
+    bodies: HashMap<String, Vec<u8>>,
+}
+
+impl PlannerHarness {
+    fn new() -> Self {
+        Self {
+            graph: InMemoryGraph::new(),
+            bodies: HashMap::new(),
+        }
+    }
+
+    fn add_tree_blob(&mut self, path: &str, body: &str) -> ArtifactId {
+        let artifact_id = ArtifactId::new();
+        let digest = kin_blobs::digest(body.as_bytes());
+        self.graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(path).unwrap(),
+                        TreeEntry::blob(Hash256::from_bytes(digest.0), false),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        self.bodies
+            .insert(path.to_string(), body.as_bytes().to_vec());
+        artifact_id
+    }
+
+    fn add_file(&mut self, path: &str, body: &str, completeness: ParseCompleteness) {
+        let artifact_id = self.add_tree_blob(path, body);
+        let parser_rule = if completeness == ParseCompleteness::Full {
+            kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1
+        } else {
+            kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+        };
+        self.graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DependsOn,
+                src: GraphNodeId::Artifact(artifact_id),
+                dst: GraphNodeId::Artifact(artifact_id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: vec![RelationEvidence {
+                    parser_rule: Some(parser_rule.to_string()),
+                    source_path: Some(path.to_string()),
+                    occurrence_count: 1,
+                    ..RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+        self.graph
+            .upsert_file_layout(&FileLayout {
+                file_id: FilePathId::new(path),
+                parse_completeness: completeness,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn add_entity(&self, name: &str, path: &str, start_byte: usize, end_byte: usize) -> Entity {
+        let entity = test_entity(name, path, start_byte, end_byte);
+        self.graph.upsert_entity(&entity).unwrap();
+        entity
+    }
+
+    fn add_entity_at(
+        &self,
+        name: &str,
+        path: &str,
+        start_byte: usize,
+        end_byte: usize,
+        start_line: u32,
+        end_line: u32,
+        language: LanguageId,
+    ) -> Entity {
+        let mut entity = test_entity(name, path, start_byte, end_byte);
+        entity.language = language;
+        entity.span = Some(SourceSpan {
+            file: FilePathId::new(path),
+            start_byte,
+            end_byte,
+            start_line,
+            start_col: 0,
+            end_line,
+            end_col: u32::try_from(end_byte.saturating_sub(start_byte)).unwrap(),
+        });
+        self.graph.upsert_entity(&entity).unwrap();
+        entity
+    }
+
+    fn add_reference(&self, source: &Entity, target: &Entity, occurrence_count: u32) -> RelationId {
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(source.id),
+            dst: GraphNodeId::Entity(target.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                occurrence_count,
+                source_span: None,
+                ..RelationEvidence::default()
+            }],
+        };
+        let id = relation.id;
+        self.graph.upsert_relation(&relation).unwrap();
+        id
+    }
+
+    fn plan(&self, symbol: &str, new_name: &str, file: &str) -> anyhow::Result<RenamePlan> {
+        plan_rename(
+            &self.graph,
+            &request(symbol, new_name, Some(file)),
+            |path, _hash| {
+                let path = path.as_utf8().expect("fixture paths are UTF-8");
+                self.bodies
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing fixture body {path}"))
+            },
+        )
+    }
+}
+
+fn request(symbol: &str, new_name: &str, file: Option<&str>) -> RenameRequest {
+    RenameRequest {
+        symbol: symbol.to_string(),
+        new_name: new_name.to_string(),
+        file: file.map(ToString::to_string),
+        line: None,
+        column: None,
+        json: true,
+        operation_id: OperationId::new(),
+        actor: AuthorId::new("rename-planner-test"),
+    }
+}
+
+fn test_entity(name: &str, path: &str, start_byte: usize, end_byte: usize) -> Entity {
+    Entity {
+        id: EntityId::new(),
+        kind: EntityKind::Function,
+        name: name.to_string(),
+        language: LanguageId::Rust,
+        fingerprint: SemanticFingerprint {
+            algorithm: FingerprintAlgorithm::V1TreeSitter,
+            ast_hash: Hash256::from_bytes([0x11; 32]),
+            signature_hash: Hash256::from_bytes([0x22; 32]),
+            behavior_hash: Hash256::from_bytes([0x33; 32]),
+            equivalence_hash: Hash256::from_bytes([0x44; 32]),
+            stability_score: 1.0,
+        },
+        file_origin: Some(FilePathId::new(path)),
+        span: Some(SourceSpan {
+            file: FilePathId::new(path),
+            start_byte,
+            end_byte,
+            start_line: 0,
+            start_col: u32::try_from(start_byte).unwrap(),
+            end_line: 0,
+            end_col: u32::try_from(end_byte).unwrap(),
+        }),
+        signature: format!("fn {name}()"),
+        visibility: Visibility::Public,
+        role: EntityRole::Source,
+        doc_summary: None,
+        metadata: EntityMetadata::default(),
+        lineage_parent: None,
+        created_in: None,
+        superseded_by: None,
+    }
+}
+
+#[test]
+fn occurrence_count_without_relation_spans_accounts_for_every_site() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "pub fn target() {}\n";
+    let caller_body = "pub fn caller() { target(); target(); }\n";
+    harness.add_file("src/target.rs", target_body, ParseCompleteness::Full);
+    harness.add_file("src/caller.rs", caller_body, ParseCompleteness::Full);
+    let target = harness.add_entity("target", "src/target.rs", 0, target_body.len());
+    let caller = harness.add_entity("caller", "src/caller.rs", 0, caller_body.len());
+    let relation_id = harness.add_reference(&caller, &target, 2);
+
+    let plan = harness.plan("target", "renamed", "src/target.rs").unwrap();
+    assert_eq!(plan.edits.len(), 3);
+    assert_eq!(plan.relation_ids, vec![relation_id]);
+    assert_eq!(
+        plan.edits
+            .iter()
+            .map(|edit| edit.file.0.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["src/caller.rs", "src/target.rs"])
+    );
+}
+
+#[test]
+fn occurrence_count_mismatch_refuses_instead_of_skipping_or_guessing() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "pub fn target() {}\n";
+    let caller_body = "pub fn caller() { target(); target(); }\n";
+    harness.add_file("src/target.rs", target_body, ParseCompleteness::Full);
+    harness.add_file("src/caller.rs", caller_body, ParseCompleteness::Full);
+    let target = harness.add_entity("target", "src/target.rs", 0, target_body.len());
+    let caller = harness.add_entity("caller", "src/caller.rs", 0, caller_body.len());
+    harness.add_reference(&caller, &target, 3);
+
+    let error = harness
+        .plan("target", "renamed", "src/target.rs")
+        .unwrap_err();
+    assert!(error.to_string().contains("require 3 'target' occurrence"));
+}
+
+#[test]
+fn overlapping_entity_spans_cannot_double_claim_one_occurrence() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "pub fn target() {}\n";
+    let caller_body = "pub fn outer() { target(); }\n";
+    harness.add_file("src/target.rs", target_body, ParseCompleteness::Full);
+    harness.add_file("src/caller.rs", caller_body, ParseCompleteness::Full);
+    let target = harness.add_entity("target", "src/target.rs", 0, target_body.len());
+    let outer = harness.add_entity("outer", "src/caller.rs", 0, caller_body.len());
+    let token_start = caller_body.find("target").unwrap();
+    let nested = harness.add_entity(
+        "nested",
+        "src/caller.rs",
+        token_start,
+        token_start + "target".len(),
+    );
+    harness.add_reference(&outer, &target, 1);
+    harness.add_reference(&nested, &target, 1);
+
+    let error = harness
+        .plan("target", "renamed", "src/target.rs")
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("overlapping graph source entities"));
+}
+
+#[test]
+fn same_spelling_different_target_only_follows_the_selected_identity() {
+    let mut harness = PlannerHarness::new();
+    let declaration = "pub fn target() {}\n";
+    let caller_a_body = "pub fn caller_a() { target(); }\n";
+    let caller_b_body = "pub fn caller_b() { target(); }\n";
+    for (path, body) in [
+        ("src/a.rs", declaration),
+        ("src/b.rs", declaration),
+        ("src/caller_a.rs", caller_a_body),
+        ("src/caller_b.rs", caller_b_body),
+    ] {
+        harness.add_file(path, body, ParseCompleteness::Full);
+    }
+    let target_a = harness.add_entity("target", "src/a.rs", 0, declaration.len());
+    let target_b = harness.add_entity("target", "src/b.rs", 0, declaration.len());
+    let caller_a = harness.add_entity("caller_a", "src/caller_a.rs", 0, caller_a_body.len());
+    let caller_b = harness.add_entity("caller_b", "src/caller_b.rs", 0, caller_b_body.len());
+    harness.add_reference(&caller_a, &target_a, 1);
+    harness.add_reference(&caller_b, &target_b, 1);
+
+    let plan = harness.plan("target", "renamed", "src/a.rs").unwrap();
+    let edited = plan
+        .edits
+        .iter()
+        .map(|edit| edit.file.0.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(edited, BTreeSet::from(["src/a.rs", "src/caller_a.rs"]));
+    assert!(!edited.contains("src/b.rs"));
+    assert!(!edited.contains("src/caller_b.rs"));
+}
+
+#[test]
+fn same_spelling_shadowing_inside_one_source_entity_refuses_ambiguous_sites() {
+    let mut harness = PlannerHarness::new();
+    let declaration = "pub fn target() {}\n";
+    let caller_body = "pub fn caller() { target(); target(); }\n";
+    harness.add_file("src/a.rs", declaration, ParseCompleteness::Full);
+    harness.add_file("src/b.rs", declaration, ParseCompleteness::Full);
+    harness.add_file("src/caller.rs", caller_body, ParseCompleteness::Full);
+    let target_a = harness.add_entity("target", "src/a.rs", 0, declaration.len());
+    let target_b = harness.add_entity("target", "src/b.rs", 0, declaration.len());
+    let caller = harness.add_entity("caller", "src/caller.rs", 0, caller_body.len());
+    harness.add_reference(&caller, &target_a, 1);
+    harness.add_reference(&caller, &target_b, 1);
+
+    let error = harness.plan("target", "renamed", "src/a.rs").unwrap_err();
+    assert!(
+        error.to_string().contains("require 1 'target' occurrence"),
+        "same-spelling shadow sites must not be guessed: {error:#}"
+    );
+}
+
+#[test]
+fn cross_file_new_name_collision_refuses_unproven_namespaces() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "pub fn target() {}\n";
+    let collision_body = "pub fn renamed() {}\n";
+    harness.add_file("src/target.rs", target_body, ParseCompleteness::Full);
+    harness.add_file("src/collision.rs", collision_body, ParseCompleteness::Full);
+    harness.add_entity("target", "src/target.rs", 0, target_body.len());
+    harness.add_entity("renamed", "src/collision.rs", 0, collision_body.len());
+
+    let error = harness
+        .plan("target", "renamed", "src/target.rs")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cross-file namespace equivalence is unproven"),
+        "collision must fail closed: {error:#}"
+    );
+}
+
+#[test]
+fn one_unsupported_reference_file_refuses_the_whole_plan() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "pub fn target() {}\n";
+    let supported = "pub fn supported() { target(); }\n";
+    let unsupported = "pub fn unsupported() { target(); }\n";
+    harness.add_file("src/target.rs", target_body, ParseCompleteness::Full);
+    harness.add_file("src/supported.rs", supported, ParseCompleteness::Full);
+    harness.add_file(
+        "src/unsupported.rs",
+        unsupported,
+        ParseCompleteness::Partial("fixture parser gap".to_string()),
+    );
+    let target = harness.add_entity("target", "src/target.rs", 0, target_body.len());
+    let supported_entity = harness.add_entity("supported", "src/supported.rs", 0, supported.len());
+    let unsupported_entity =
+        harness.add_entity("unsupported", "src/unsupported.rs", 0, unsupported.len());
+    harness.add_reference(&supported_entity, &target, 1);
+    harness.add_reference(&unsupported_entity, &target, 1);
+
+    let error = harness
+        .plan("target", "renamed", "src/target.rs")
+        .unwrap_err();
+    assert!(error.to_string().contains("partial parse coverage"));
+}
+
+#[test]
+fn graph_tree_source_without_a_layout_refuses_repository_wide_coverage() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "pub fn target() {}\n";
+    let caller_body = "pub fn caller() { target(); }\n";
+    harness.add_file("src/target.rs", target_body, ParseCompleteness::Full);
+    harness.add_file("src/caller.rs", caller_body, ParseCompleteness::Full);
+    harness.add_tree_blob("src/uncovered.rs", "use crate::target;\n");
+    let target = harness.add_entity("target", "src/target.rs", 0, target_body.len());
+    let caller = harness.add_entity("caller", "src/caller.rs", 0, caller_body.len());
+    harness.add_reference(&caller, &target, 1);
+
+    let error = harness
+        .plan("target", "renamed", "src/target.rs")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("src/uncovered.rs has no graph-owned file layout"),
+        "uncovered source must fail closed: {error:#}"
+    );
+}
+
+#[test]
+fn one_based_line_cursor_selects_graph_row_zero_not_the_adjacent_identity() {
+    let mut harness = PlannerHarness::new();
+    let body = "fn target() {}\nfn target() {}\n";
+    harness.add_file("src/two.rs", body, ParseCompleteness::Full);
+    let split = body.find('\n').unwrap() + 1;
+    let first = harness.add_entity_at("target", "src/two.rs", 0, split - 1, 0, 0, LanguageId::Rust);
+    harness.add_entity_at(
+        "target",
+        "src/two.rs",
+        split,
+        body.len() - 1,
+        1,
+        1,
+        LanguageId::Rust,
+    );
+
+    let mut cursor = request("target", "renamed", Some("src/two.rs"));
+    cursor.line = Some(1);
+    let plan = plan_rename(&harness.graph, &cursor, |path, _| {
+        Ok(harness.bodies[path.as_utf8().unwrap()].clone())
+    })
+    .unwrap();
+    assert_eq!(plan.entity_id, first.id);
+    assert_eq!(plan.edits.len(), 1);
+    assert_eq!(plan.edits[0].start_line, 1);
+}
+
+#[test]
+fn reference_cursor_beats_an_unrelated_same_named_declaration_in_the_file() {
+    let mut harness = PlannerHarness::new();
+    let remote_body = "fn target() {}\n";
+    let caller_body = "fn target() {}\nfn caller() { target(); }\n";
+    harness.add_file("src/remote.rs", remote_body, ParseCompleteness::Full);
+    harness.add_file("src/caller.rs", caller_body, ParseCompleteness::Full);
+    let remote = harness.add_entity_at(
+        "target",
+        "src/remote.rs",
+        0,
+        remote_body.len(),
+        0,
+        0,
+        LanguageId::Rust,
+    );
+    let split = caller_body.find('\n').unwrap() + 1;
+    harness.add_entity_at(
+        "target",
+        "src/caller.rs",
+        0,
+        split - 1,
+        0,
+        0,
+        LanguageId::Rust,
+    );
+    let caller = harness.add_entity_at(
+        "caller",
+        "src/caller.rs",
+        split,
+        caller_body.len(),
+        1,
+        1,
+        LanguageId::Rust,
+    );
+    harness.add_reference(&caller, &remote, 1);
+    let mut cursor = request("target", "renamed", Some("src/caller.rs"));
+    cursor.line = Some(2);
+
+    let plan = plan_rename(&harness.graph, &cursor, |path, _| {
+        Ok(harness.bodies[path.as_utf8().unwrap()].clone())
+    })
+    .unwrap();
+    assert_eq!(plan.entity_id, remote.id);
+    assert_eq!(
+        plan.edits
+            .iter()
+            .map(|edit| edit.file.0.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["src/caller.rs", "src/remote.rs"])
+    );
+}
+
+#[test]
+fn extraction_incomplete_certificate_refuses_a_syntax_full_partial_refactor() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "def target():\n    return 1\n";
+    let caller_body =
+        "def other():\n    return 2\n\ndef caller(flag):\n    return (target if flag else other)()\n";
+    harness.add_file("target.py", target_body, ParseCompleteness::Full);
+    harness.add_file("caller.py", caller_body, ParseCompleteness::Full);
+    harness.add_entity_at(
+        "target",
+        "target.py",
+        0,
+        target_body.len(),
+        0,
+        1,
+        LanguageId::Python,
+    );
+    harness
+        .graph
+        .upsert_relation(&Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: GraphNodeId::Artifact(ArtifactId::new()),
+            dst: GraphNodeId::Artifact(ArtifactId::new()),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                parser_rule: Some(
+                    kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1.to_string(),
+                ),
+                source_path: Some("caller.py".to_string()),
+                occurrence_count: 1,
+                ..RelationEvidence::default()
+            }],
+        })
+        .unwrap();
+
+    let error = harness.plan("target", "renamed", "target.py").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("extraction-incomplete certificate")
+            || error
+                .to_string()
+                .contains("incomplete named-reference extraction"),
+        "syntax-full extraction gaps must fail closed: {error:#}"
+    );
+}
+
+#[test]
+fn unicode_prefix_cannot_turn_a_spanless_edge_into_an_ascii_substring_edit() {
+    let mut harness = PlannerHarness::new();
+    let target_body = "def foo():\n    return 1\n";
+    let caller_body = "def caller():\n    return éfoo()\n";
+    harness.add_file("target.py", target_body, ParseCompleteness::Full);
+    harness.add_file("caller.py", caller_body, ParseCompleteness::Full);
+    let target = harness.add_entity_at(
+        "foo",
+        "target.py",
+        0,
+        target_body.len(),
+        0,
+        1,
+        LanguageId::Python,
+    );
+    let caller = harness.add_entity_at(
+        "caller",
+        "caller.py",
+        0,
+        caller_body.len(),
+        0,
+        1,
+        LanguageId::Python,
+    );
+    harness.add_reference(&caller, &target, 1);
+
+    let error = harness.plan("foo", "renamed", "target.py").unwrap_err();
+    assert!(
+        error.to_string().contains("require 1 'foo' occurrence"),
+        "Unicode identifier neighbors must not be spliced: {error:#}"
+    );
+}
+
+struct LanguageFixture {
+    name: &'static str,
+    target_path: &'static str,
+    target_source: &'static str,
+    caller_path: &'static str,
+    caller_source: &'static str,
+    has_named_import_without_span: bool,
+}
+
+fn entity_leaf(name: &str) -> &str {
+    name.rsplit(|character| character == '.' || character == ':')
+        .find(|part| !part.is_empty())
+        .unwrap_or(name)
+}
+
+const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
+    LanguageFixture {
+        name: "Rust",
+        target_path: "defs.rs",
+        target_source: "pub fn target() -> u32 { 1 }\n",
+        caller_path: "caller.rs",
+        caller_source: "pub fn caller() -> u32 { target() + target() }\n",
+        has_named_import_without_span: false,
+    },
+    LanguageFixture {
+        name: "TypeScript",
+        target_path: "defs.ts",
+        target_source: "export function target(): number { return 1; }\n",
+        caller_path: "caller.ts",
+        caller_source: "import { target } from './defs';\nexport function caller(): number { return target() + target(); }\n",
+        has_named_import_without_span: true,
+    },
+    LanguageFixture {
+        name: "JavaScript",
+        target_path: "defs.js",
+        target_source: "export function target() { return 1; }\n",
+        caller_path: "caller.js",
+        caller_source: "import { target } from './defs';\nexport function caller() { return target() + target(); }\n",
+        has_named_import_without_span: true,
+    },
+    LanguageFixture {
+        name: "Python",
+        target_path: "defs.py",
+        target_source: "def target():\n    return 1\n",
+        caller_path: "caller.py",
+        caller_source: "from defs import target\n\ndef caller():\n    return target() + target()\n",
+        has_named_import_without_span: true,
+    },
+    LanguageFixture {
+        name: "Go",
+        target_path: "defs.go",
+        target_source: "package main\n\nfunc target() int { return 1 }\n",
+        caller_path: "caller.go",
+        caller_source: "package main\n\nfunc caller() int { return target() + target() }\n",
+        has_named_import_without_span: false,
+    },
+    LanguageFixture {
+        name: "Java",
+        target_path: "Defs.java",
+        target_source: "class Defs { static int target() { return 1; } }\n",
+        caller_path: "Caller.java",
+        caller_source: "class Caller { int caller() { return target() + target(); } }\n",
+        has_named_import_without_span: false,
+    },
+    LanguageFixture {
+        name: "C",
+        target_path: "defs.c",
+        target_source: "int target(void) { return 1; }\n",
+        caller_path: "caller.c",
+        caller_source: "int caller(void) { return target() + target(); }\n",
+        has_named_import_without_span: false,
+    },
+    LanguageFixture {
+        name: "Cpp",
+        target_path: "defs.cpp",
+        target_source: "int target() { return 1; }\n",
+        caller_path: "caller.cpp",
+        caller_source: "int caller() { return target() + target(); }\n",
+        has_named_import_without_span: false,
+    },
+];
+
+#[test]
+fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() {
+    for fixture in LANGUAGE_FIXTURES {
+        let pipeline = kin_index::IndexPipeline::new();
+        let graph = InMemoryGraph::new();
+        let mut bodies = HashMap::new();
+        let mut parse_data = Vec::new();
+        let mut artifact_ids = ArtifactIdentityMap::new();
+        let mut indexed_files = Vec::new();
+
+        for (path, source) in [
+            (fixture.target_path, fixture.target_source),
+            (fixture.caller_path, fixture.caller_source),
+        ] {
+            let digest = kin_blobs::digest(source.as_bytes());
+            let indexed = pipeline
+                .index_file_content_with_tests(&FilePathId::new(path), source.as_bytes(), digest)
+                .unwrap_or_else(|error| panic!("{} index {path}: {error}", fixture.name))
+                .indexed_file;
+            let artifact_id = ArtifactId::new();
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas: vec![TreeDelta::Added {
+                        artifact_id,
+                        new: LocatedEntry::new(
+                            RepoPath::from_utf8(path).unwrap(),
+                            TreeEntry::blob(Hash256::from_bytes(digest.0), false),
+                        ),
+                    }],
+                    ..TransactionDelta::default()
+                })
+                .unwrap();
+            graph.upsert_file_layout(&indexed.file_layout).unwrap();
+            for entity in &indexed.entities {
+                graph.upsert_entity(entity).unwrap();
+            }
+            artifact_ids.insert(path.to_string(), artifact_id);
+            bodies.insert(path.to_string(), source.as_bytes().to_vec());
+            parse_data.push(kin_index::FileParseData {
+                file_path: path.to_string(),
+                entities: indexed.entities.clone(),
+                relations: indexed.extracted_relations.clone(),
+                imports: indexed.imports.clone(),
+            });
+            indexed_files.push(indexed);
+        }
+
+        let completeness = indexed_files
+            .iter()
+            .map(|indexed| {
+                (
+                    indexed.file_id.0.clone(),
+                    indexed.file_layout.parse_completeness.clone(),
+                )
+            })
+            .collect::<kin_index::FileParseCompletenessMap>();
+        let linked =
+            kin_index::link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)
+                .unwrap_or_else(|error| panic!("{} link: {error}", fixture.name));
+        for relation in &linked {
+            graph.upsert_relation(relation).unwrap();
+        }
+        let target = indexed_files[0]
+            .entities
+            .iter()
+            .find(|entity| entity_leaf(&entity.name) == "target")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} target entity; found {:?}",
+                    fixture.name,
+                    indexed_files[0]
+                        .entities
+                        .iter()
+                        .map(|entity| (&entity.name, entity.kind))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let caller = indexed_files[1]
+            .entities
+            .iter()
+            .find(|entity| entity_leaf(&entity.name) == "caller")
+            .unwrap_or_else(|| panic!("{} caller entity", fixture.name));
+        let call = linked
+            .iter()
+            .find(|relation| {
+                relation.kind == RelationKind::Calls
+                    && relation.src == GraphNodeId::Entity(caller.id)
+                    && relation.dst == GraphNodeId::Entity(target.id)
+            })
+            .unwrap_or_else(|| panic!("{} repeated call edge", fixture.name));
+        assert!(
+            call.evidence
+                .iter()
+                .all(|evidence| evidence.source_span.is_none()),
+            "{} unexpectedly gained a relation span; update the bounded planner proof",
+            fixture.name
+        );
+        assert_eq!(
+            call.evidence
+                .iter()
+                .map(|evidence| evidence.occurrence_count)
+                .sum::<u32>(),
+            2,
+            "{} must retain both sites through occurrence_count",
+            fixture.name
+        );
+
+        let result = plan_rename(
+            &graph,
+            &request("target", "renamed", Some(fixture.target_path)),
+            |path, _hash| {
+                let path = path.as_utf8().unwrap();
+                Ok(bodies.get(path).unwrap().clone())
+            },
+        );
+        if fixture.has_named_import_without_span {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("graph import evidence has no exact source span"),
+                "{} must refuse its unspanned named import: {error:#}",
+                fixture.name
+            );
+        } else if target.name != "target" {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("cannot be proven")
+                    || error
+                        .to_string()
+                        .contains("not found in repository-v6 graph authority")
+                    || error.to_string().contains("is not declared in graph file"),
+                "{} must fail closed for its qualified declaration name: {error:#}",
+                fixture.name
+            );
+        } else {
+            let plan = result.unwrap_or_else(|error| {
+                panic!(
+                    "{} exact spanless plan should succeed: {error:#}",
+                    fixture.name
+                )
+            });
+            assert_eq!(plan.edits.len(), 3, "{} exact edit count", fixture.name);
+        }
+    }
+}

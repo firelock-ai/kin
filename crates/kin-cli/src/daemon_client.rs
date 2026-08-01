@@ -1553,20 +1553,12 @@ impl DaemonClient {
         &self,
         request: &crate::commands::rename::RenameRequest,
     ) -> Result<crate::commands::rename::RenameResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/rename", self.base_url))
-                    .json(request),
-                "send daemon rename request",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon rename error (HTTP {}): {}", status, body);
-        }
-        resp.json().await.context("parse daemon rename response")
+        self.post_idempotent_json(
+            "/commands/rename",
+            request,
+            "send daemon-owned exact rename request",
+        )
+        .await
     }
 
     pub async fn session_workspace(
