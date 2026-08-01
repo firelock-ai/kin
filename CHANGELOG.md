@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Install and refresh the macOS notification bundle on every channel that delivers Kin (#575)
 - Show bounded first-install download progress (#581)
 - Add bounded graph-native repository rename (#583)
+- Make v0.4.6 install proof behaviorally authoritative (#584)
 
 
 ### Breaking
