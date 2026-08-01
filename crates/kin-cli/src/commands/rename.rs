@@ -47,6 +47,26 @@ pub fn available_today(symbol: &str) -> Vec<String> {
     ]
 }
 
+/// The gate refusal with the reachable surfaces appended.
+///
+/// Both the CLI and the daemon path answer with this, so the agent-facing
+/// refusal carries the same guidance a person gets at the terminal. The `Ok`
+/// arm is the tripwire for a fixture that flips `rename` to ready without an
+/// executor behind it.
+fn refusal_with_guidance(symbol: &str) -> anyhow::Error {
+    let refusal = match super::capabilities::require_ready("rename") {
+        Ok(()) => unreachable!("a ready rename capability must replace the fail-closed executor"),
+        Err(refusal) => refusal,
+    };
+    let mut message = refusal.to_string();
+    message.push_str("\nwhat works today:");
+    for line in available_today(symbol) {
+        message.push_str("\n  - ");
+        message.push_str(&line);
+    }
+    anyhow::anyhow!(message)
+}
+
 pub async fn run(
     symbol: String,
     _new_name: String,
@@ -55,26 +75,15 @@ pub async fn run(
     _column: Option<u32>,
     _json: bool,
 ) -> Result<()> {
-    let refusal = match super::capabilities::require_ready("rename") {
-        Ok(()) => unreachable!("a ready rename capability must replace the fail-closed executor"),
-        Err(refusal) => refusal,
-    };
-    let mut message = refusal.to_string();
-    message.push_str("\nwhat works today:");
-    for line in available_today(&symbol) {
-        message.push_str("\n  - ");
-        message.push_str(&line);
-    }
-    Err(anyhow::anyhow!(message))
+    Err(refusal_with_guidance(&symbol))
 }
 
 pub fn build_rename_response(
     _layout: &kin_core::KinLayout,
     _graph: &kin_db::InMemoryGraph,
-    _request: &RenameRequest,
+    request: &RenameRequest,
 ) -> Result<RenameResponse> {
-    super::capabilities::require_ready("rename")?;
-    unreachable!("ready rename capability must replace the fail-closed executor")
+    Err(refusal_with_guidance(&request.symbol))
 }
 
 #[cfg(test)]
@@ -96,10 +105,66 @@ mod tests {
         );
     }
 
-    /// The executor stays fail-closed; guidance must not read as a partial
-    /// rename having happened.
+    fn rename_request(symbol: &str) -> RenameRequest {
+        RenameRequest {
+            symbol: symbol.to_string(),
+            new_name: "parse_settings".to_string(),
+            file: None,
+            line: None,
+            column: None,
+            json: false,
+        }
+    }
+
+    /// The daemon answers `/rename` through this function, so asserting on the
+    /// capability fixture instead would leave an executor that fabricated a
+    /// response passing a test named for the executor.
     #[test]
     fn build_rename_response_stays_fail_closed() {
-        assert!(super::super::capabilities::require_ready("rename").is_err());
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/nonexistent/.kin"));
+        let graph = kin_db::InMemoryGraph::new();
+        let error = build_rename_response(&layout, &graph, &rename_request("parse_config"))
+            .expect_err("the rename executor must refuse while the gate is closed");
+        let message = error.to_string();
+        for expected in [
+            "`kin rename`",
+            "open acceptance gates:",
+            "kin refs parse_config",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the wire refusal must carry {expected}: {message}"
+            );
+        }
+    }
+
+    /// The composed CLI refusal states the gate and then the reachable
+    /// surfaces. Nothing else asserts on the composition, so a change that
+    /// dropped either half would otherwise only show up in a manual run.
+    #[tokio::test]
+    async fn run_refuses_with_the_gate_and_the_reachable_surfaces() {
+        let error = run(
+            "parse_config".to_string(),
+            "parse_settings".to_string(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("`kin rename` must refuse while the gate is closed");
+        let message = error.to_string();
+        for expected in [
+            "`kin rename`",
+            "open acceptance gates:",
+            "what works today:",
+            "kin refs parse_config",
+            "kin locate parse_config",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must carry {expected}: {message}"
+            );
+        }
     }
 }
