@@ -32,6 +32,7 @@ WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
 WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
 WINDOWS_WSL2_DOC = ROOT / "docs" / "windows-wsl2.md"
 QUICKSTART_DOC = ROOT / "docs" / "quickstart.md"
+MCP_TOOLS_DOC = ROOT / "docs" / "mcp-tools.md"
 LLMS_DOC = ROOT / "llms.txt"
 NPM_CANONICAL_README = ROOT / "packages" / "kin" / "README.md"
 NPM_MCP_README = ROOT / "packages" / "kin-mcp" / "README.md"
@@ -86,6 +87,7 @@ EXPECTED_SELECTOR_INVOCATIONS = {
     "release-recovery": ('"$RECORD"', '"$candidate"', '""', '"$admissible"'),
 }
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
+SETUP = ROOT / "crates" / "kin-cli" / "src" / "commands" / "setup.rs"
 DOCKERFILE = ROOT / "Dockerfile"
 BASE_IMAGE_REGISTRY = "docker.io"
 BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
@@ -5552,6 +5554,10 @@ def main() -> None:
     install_sh = INSTALL_SH.read_text(encoding="utf-8")
     install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
     health = HEALTH.read_text(encoding="utf-8")
+    setup = SETUP.read_text(encoding="utf-8")
+    quickstart = QUICKSTART_DOC.read_text(encoding="utf-8")
+    mcp_tools = MCP_TOOLS_DOC.read_text(encoding="utf-8")
+    npm_canonical_readme = NPM_CANONICAL_README.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
     workflow_sources = {
         workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
@@ -6832,7 +6838,11 @@ def main() -> None:
         require(install_proof, policy, "installed MCP executable and writer proof")
     for policy in (
         "evaluate_mcp_client(&client.path, client.id)",
-        "command != Some(expected_command)",
+        "McpLauncherTopology::Native",
+        "McpLauncherTopology::CanonicalNpm",
+        "CANONICAL_NPM_MCP_COMMAND",
+        "CANONICAL_NPM_MCP_PACKAGE",
+        "mcp_argument_vector_matches(entry, client_id, topology)",
         '"codex" | "antigravity" | "antigravity_workspace"',
         "configured_mcp_launcher()",
     ):
@@ -6847,6 +6857,67 @@ def main() -> None:
         "super::setup::codex_entry_has_exact_repo_binding(&content, expected_repo)",
         "shared TOML parser for Codex MCP binding validation",
     )
+    for policy in (
+        "CANONICAL_NPM_MCP_PACKAGE",
+        'args[0].as_str() == Some("-y")',
+        'args[2].as_str() == Some("mcp")',
+        'args[4].as_str() == Some("--repo")',
+    ):
+        require(setup, policy, "canonical npm Codex repository binding")
+
+    ordinary_repair_start = setup.index(
+        "pub(crate) fn remerge_existing_mcp_configs_detailed()"
+    )
+    ordinary_repair_end = setup.index(
+        "#[cfg(all(test, unix))]", ordinary_repair_start
+    )
+    ordinary_repair = setup[ordinary_repair_start:ordinary_repair_end]
+    require(
+        ordinary_repair,
+        "configured_mcp_launcher",
+        "doctor repair uses the configured installation launcher",
+    )
+    updater_repair_start = setup.index(
+        "pub(crate) fn remerge_mcp_targets_exact_with_topology_and_finalizer"
+    )
+    updater_repair_end = setup.index(
+        "fn validate_mcp_repair_precondition", updater_repair_start
+    )
+    updater_repair = setup[updater_repair_start:updater_repair_end]
+    require(
+        updater_repair,
+        "let command = managed_mcp_launcher()?;",
+        "updater repair stays pinned to the managed launcher",
+    )
+    if "configured_mcp_launcher" in updater_repair:
+        raise AssertionError(
+            "updater MCP repair must not accept the ordinary configured launcher resolver"
+        )
+
+    for path, source in (
+        (QUICKSTART_DOC, quickstart),
+        (MCP_TOOLS_DOC, mcp_tools),
+        (NPM_CANONICAL_README, npm_canonical_readme),
+    ):
+        if '"command": "kin"' in "\n".join(active_lines(source)):
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} must not document a PATH-dependent bare Kin MCP launcher"
+            )
+    for source, label in (
+        (quickstart, "quickstart canonical npm MCP launcher"),
+        (npm_canonical_readme, "canonical npm package MCP launcher"),
+    ):
+        require(source, '"command": "npx"', label)
+        require(
+            source,
+            '"args": ["-y", "@kinlab/kin", "mcp", "start"]',
+            label,
+        )
+    for source, label in (
+        (quickstart, "quickstart native MCP launcher"),
+        (mcp_tools, "MCP tools native launcher"),
+    ):
+        require(source, '"command": "/absolute/path/to/kin"', label)
     if "JSON.parse(codexArgsMatch[1])" in install_proof:
         raise AssertionError(
             "install proof must not parse TOML as JSON; the product health check owns Codex binding validation"

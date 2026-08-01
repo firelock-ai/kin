@@ -1219,6 +1219,13 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 // AI assistant MCP configuration
 // ---------------------------------------------------------------------------
 
+/// Exact public npm wrapper topology accepted by setup health.
+///
+/// Keep these values shared with the health parser rather than accepting an
+/// arbitrary package spec or executable that merely happens to proxy Kin.
+pub(crate) const CANONICAL_NPM_MCP_COMMAND: &str = "npx";
+pub(crate) const CANONICAL_NPM_MCP_PACKAGE: &str = "@kinlab/kin";
+
 /// The MCP server entry we inject for Kin.
 ///
 /// Prefers an absolute path to the `kin` binary (resolved from the current
@@ -2841,12 +2848,19 @@ pub(crate) fn codex_entry_has_exact_repo_binding(
     let Some(args) = entry.get("args").and_then(toml::Value::as_array) else {
         return Ok(false);
     };
-    if args.len() != 4
-        || args[0].as_str() != Some("mcp")
-        || args[1].as_str() != Some("start")
-        || args[2].as_str() != Some("--repo")
-        || args[3].as_str().is_none()
-    {
+    let native_binding = args.len() == 4
+        && args[0].as_str() == Some("mcp")
+        && args[1].as_str() == Some("start")
+        && args[2].as_str() == Some("--repo")
+        && args[3].as_str().is_some();
+    let canonical_npm_binding = args.len() == 6
+        && args[0].as_str() == Some("-y")
+        && args[1].as_str() == Some(CANONICAL_NPM_MCP_PACKAGE)
+        && args[2].as_str() == Some("mcp")
+        && args[3].as_str() == Some("start")
+        && args[4].as_str() == Some("--repo")
+        && args[5].as_str().is_some();
+    if !native_binding && !canonical_npm_binding {
         return Ok(false);
     }
     // `configure_codex` writes the *canonicalized* working directory, and the
@@ -14403,6 +14417,19 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert!(
             !codex_entry_has_exact_repo_binding(content.as_bytes(), &other).unwrap(),
             "a binding for one repository must not satisfy a different repository"
+        );
+
+        let npm_content = format!(
+            "[mcp_servers.kin]\ncommand = \"npx\"\nargs = [\"-y\", \"@kinlab/kin\", \"mcp\", \"start\", \"--repo\", {:?}]\n",
+            canonical.to_string_lossy()
+        );
+        assert!(
+            codex_entry_has_exact_repo_binding(npm_content.as_bytes(), &non_canonical).unwrap(),
+            "the canonical npm wrapper must retain the same exact repository identity"
+        );
+        assert!(
+            !codex_entry_has_exact_repo_binding(npm_content.as_bytes(), &other).unwrap(),
+            "the canonical npm wrapper must not weaken repository binding"
         );
     }
 

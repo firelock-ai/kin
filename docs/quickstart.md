@@ -301,7 +301,7 @@ The wizard writes this entry to each client:
 {
   "mcpServers": {
     "kin": {
-      "command": "kin",
+      "command": "/absolute/path/to/kin",
       "args": ["mcp", "start"],
       "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
@@ -454,6 +454,13 @@ For a manually configured MCP client:
   }
 }
 ```
+
+`kin setup status` and `kin doctor` recognize this exact canonical npm topology and
+`kin doctor --fix` preserves a healthy entry. Nearby wrapper shapes and a bare `kin`
+command are not treated as equivalent: agent clients do not reliably inherit your shell
+`PATH`. Codex and Antigravity entries are repository-bound; when configuring
+either by hand, append `"--repo", "/absolute/path/to/repository"` to the argument vector
+(and set Antigravity's workspace `cwd` to that same absolute repository path).
 
 The older `@kinlab/kin-mcp` package remains published for existing configurations. New
 setups should use `@kinlab/kin`, which includes the same MCP server as `kin mcp start`.

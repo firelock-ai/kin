@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
     check_binary_in_path, configured_mcp_launcher, detect_shell, hook_filename, kin_dir, shell_rc,
-    shim_filename,
+    shim_filename, CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
@@ -936,6 +936,64 @@ fn current_health_repo() -> Option<PathBuf> {
     crate::commands::managed_config_scope::discover_repo_root()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpLauncherTopology {
+    Native,
+    CanonicalNpm,
+}
+
+fn mcp_launcher_topology(
+    entry: &Value,
+    expected_native_command: &str,
+) -> Option<McpLauncherTopology> {
+    match entry.get("command").and_then(Value::as_str) {
+        Some(command) if command == expected_native_command => Some(McpLauncherTopology::Native),
+        Some(CANONICAL_NPM_MCP_COMMAND) => Some(McpLauncherTopology::CanonicalNpm),
+        _ => None,
+    }
+}
+
+fn values_match_strings(values: &[Value], expected: &[&str]) -> bool {
+    values.len() == expected.len()
+        && values
+            .iter()
+            .zip(expected)
+            .all(|(value, expected)| value.as_str() == Some(*expected))
+}
+
+fn mcp_argument_vector_matches(
+    entry: &Value,
+    client_id: &str,
+    topology: McpLauncherTopology,
+) -> bool {
+    let Some(args) = entry.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    let prefix: &[&str] = match topology {
+        McpLauncherTopology::Native => &["mcp", "start"],
+        McpLauncherTopology::CanonicalNpm => &["-y", CANONICAL_NPM_MCP_PACKAGE, "mcp", "start"],
+    };
+    if matches!(client_id, "codex" | "antigravity" | "antigravity_workspace") {
+        args.len() == prefix.len() + 2
+            && values_match_strings(&args[..prefix.len()], prefix)
+            && args[prefix.len()].as_str() == Some("--repo")
+            && args[prefix.len() + 1]
+                .as_str()
+                .is_some_and(|repo| Path::new(repo).is_absolute())
+    } else {
+        values_match_strings(args, prefix)
+    }
+}
+
+fn mcp_repo_argument(entry: &Value, topology: McpLauncherTopology) -> Option<&str> {
+    let args = entry.get("args")?.as_array()?;
+    let repo_index = match topology {
+        McpLauncherTopology::Native => 3,
+        McpLauncherTopology::CanonicalNpm => 5,
+    };
+    args.get(repo_index)?.as_str()
+}
+
 /// Inspect a single MCP config file for a `kin` server entry carrying the
 /// agent-default tool profile.
 ///
@@ -1004,31 +1062,18 @@ fn evaluate_mcp_client_against(
                 );
             }
             let command = entry.get("command").and_then(Value::as_str);
-            if command != Some(expected_command) {
+            let Some(topology) = mcp_launcher_topology(entry, expected_command) else {
                 return (
                     HealthStatus::Misconfigured,
                     format!(
-                        "{servers_key}.kin command is {} (expected the exact Kin launcher for this installation {}) in {}",
+                        "{servers_key}.kin command is {} (expected the exact Kin launcher for this installation {} or the canonical `{CANONICAL_NPM_MCP_COMMAND} -y {CANONICAL_NPM_MCP_PACKAGE} ...` wrapper) in {}",
                         command.unwrap_or("unset"),
                         expected_command,
                         path.display()
                     ),
                 );
-            }
-            let args = entry.get("args").and_then(Value::as_array);
-            let args_match = match client_id {
-                "codex" | "antigravity" | "antigravity_workspace" => args.is_some_and(|args| {
-                    args.len() == 4
-                        && args[0].as_str() == Some("mcp")
-                        && args[1].as_str() == Some("start")
-                        && args[2].as_str() == Some("--repo")
-                        && args[3]
-                            .as_str()
-                            .is_some_and(|repo| Path::new(repo).is_absolute())
-                }),
-                _ => args == serde_json::json!(["mcp", "start"]).as_array(),
             };
-            if !args_match {
+            if !mcp_argument_vector_matches(entry, client_id, topology) {
                 return (
                     HealthStatus::Misconfigured,
                     format!(
@@ -1088,19 +1133,26 @@ fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthS
     let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let entry = root.get("mcpServers")?.get("kin")?;
     let expected_command = configured_mcp_launcher().ok()?;
-    let command_matches =
-        entry.get("command").and_then(Value::as_str) == Some(expected_command.as_str());
-    let expected_args = serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()]);
-    let args_match = entry.get("args") == Some(&expected_args);
-    let cwd_matches = !workspace
-        || entry.get("cwd").and_then(Value::as_str) == Some(repo_root.to_string_lossy().as_ref());
-    if command_matches && args_match && cwd_matches {
+    let client_id = if workspace {
+        "antigravity_workspace"
+    } else {
+        "antigravity"
+    };
+    let expected_repo = repo_root.to_string_lossy();
+    let topology = mcp_launcher_topology(entry, &expected_command);
+    let launcher_and_args_match = topology.is_some_and(|topology| {
+        mcp_argument_vector_matches(entry, client_id, topology)
+            && mcp_repo_argument(entry, topology) == Some(expected_repo.as_ref())
+    });
+    let cwd_matches =
+        !workspace || entry.get("cwd").and_then(Value::as_str) == Some(expected_repo.as_ref());
+    if launcher_and_args_match && cwd_matches {
         None
     } else {
         Some((
             HealthStatus::Misconfigured,
             format!(
-                "Antigravity Kin binding at {} does not use the exact managed binary, repository arguments, or workspace cwd",
+                "Antigravity Kin binding at {} does not use an exact supported launcher, repository arguments, or workspace cwd",
                 path.display()
             ),
         ))
@@ -1933,6 +1985,85 @@ mod tests {
     }
 
     #[test]
+    fn mcp_config_with_canonical_npm_wrapper_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "npx",
+                        "args": ["-y", "@kinlab/kin", "mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+    }
+
+    #[test]
+    fn mcp_config_rejects_nearby_npm_wrapper_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        for args in [
+            serde_json::json!(["@kinlab/kin", "mcp", "start"]),
+            serde_json::json!(["-y", "@kinlab/not-kin", "mcp", "start"]),
+            serde_json::json!(["-y", "@kinlab/kin", "mcp", "start", "extra"]),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "mcpServers": {
+                        "kin": {
+                            "command": "npx",
+                            "args": args,
+                            "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
+            assert!(
+                matches!(status, HealthStatus::Misconfigured),
+                "nearby npm shape was accepted: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_config_rejects_bare_kin_when_the_installation_has_an_exact_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("expected the exact Kin launcher"));
+    }
+
+    #[test]
     fn mcp_config_missing_exact_managed_command_is_misconfigured() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude.json");
@@ -2086,6 +2217,20 @@ mod tests {
     }
 
     #[test]
+    fn repo_bound_mcp_config_with_canonical_npm_wrapper_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.kin]\ncommand = \"npx\"\nargs = [\"-y\", \"@kinlab/kin\", \"mcp\", \"start\", \"--repo\", \"/repo\"]\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-default\" }\n",
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "codex", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+    }
+
+    #[test]
     fn mcp_config_toml_without_kin_entry_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -2129,6 +2274,59 @@ mod tests {
         )
         .unwrap();
         assert!(evaluate_codex_binding_for(&path, &expected).is_some());
+
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.kin]\ncommand = 'npx'\nargs = ['-y', '@kinlab/kin', 'mcp', 'start', '--repo', '{}']\nenv = {{ KIN_MCP_TOOL_PROFILE = 'agent-default' }}\n",
+                expected.display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            evaluate_codex_binding_for(&path, &expected).is_none(),
+            "canonical npm wrapper must preserve Codex's exact repository binding"
+        );
+        assert!(evaluate_codex_binding_for(&path, &other).is_some());
+    }
+
+    #[test]
+    fn antigravity_workspace_accepts_canonical_npm_repo_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let config = repo.join(".agents/mcp_config.json");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let repo_text = repo.to_string_lossy().into_owned();
+        let write_config = |bound_repo: &Path| {
+            std::fs::write(
+                &config,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "mcpServers": {
+                        "kin": {
+                            "command": "npx",
+                            "args": ["-y", "@kinlab/kin", "mcp", "start", "--repo", bound_repo.to_string_lossy()],
+                            "cwd": repo_text,
+                            "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_config(&repo);
+
+        let (status, detail) =
+            evaluate_mcp_client_against(&config, "antigravity_workspace", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+        assert!(evaluate_antigravity_binding(&config, true).is_none());
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write_config(&other);
+        assert!(evaluate_antigravity_binding(&config, true).is_some());
     }
 
     fn installed_kin(path: &str, protocol: InstalledStartupProtocol) -> InstalledKin {
