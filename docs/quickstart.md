@@ -92,7 +92,7 @@ bag of independent toggles:
 | **AI agents** (default) | Kin's MCP server for every detected AI client, plus shell integration and daemon auto-start. The smallest path to value. |
 | **Local-only** | Shell integration + daemon auto-start; no AI client config. |
 | **Editor** | Local-only, plus how to install the `kin-editor` VS Code extension. |
-| **Hosted / KinLab** | Local setup, plus a note that hosted connect is coming soon (see below). |
+| **Hosted / KinLab** | Local setup, plus this machine's KinLab sign-in state and the commands that change it (see below). |
 | **Advanced / manual** | Choose shell, per-client MCP, and daemon options yourself. |
 
 You can pre-select non-interactively (handy in scripts / CI):
@@ -112,9 +112,11 @@ Other flags (`global`, honored across every intent):
 When the wizard finishes, it prints the **health checklist** (the same engine as
 `kin setup status`, see step 8) and your next steps.
 
-> **Hosted / KinLab is not yet a first-run flow.** There is no public `kin login` /
-> connect command shipped today. The wizard is honest about this; your local setup is
-> fully functional in the meantime.
+> **Hosted / KinLab.** The wizard reads the credential this machine already holds and
+> reports it: signed in as an account with its expiry, present but encrypted, or not
+> signed in. Connecting is `kin auth login` (`--base-url <url>`, or `KINLAB_URL`, for a
+> workspace other than the default), and `kin auth whoami` confirms the account the
+> workspace sees. Local setup does not depend on any of it.
 
 ---
 
@@ -347,7 +349,7 @@ The checks (IDs as emitted in `--json`):
 | `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. |
 | `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok ("nothing to configure"). |
 | `editor` | The `kin-editor` VS Code extension is detected in `~/.vscode/extensions`. **n/a** if not found / non-VS Code. |
-| `kinlab_connect` | A stored KinLab credential is present. **n/a** today — hosted connect is not yet a first-run flow. |
+| `kinlab_connect` | A stored KinLab credential is present. **n/a** when nothing is stored; `kin auth login` connects this machine. |
 | `semantic_query_readiness` | The daemon is reachable and the vector index exists. **yellow/STALE** until you run `kin embed`; **MISSING** if the daemon isn't running. |
 
 ### When a check is yellow or red

@@ -1276,8 +1276,9 @@ fn check_kinlab_connect() -> HealthCheck {
             HealthStatus::Unsupported,
             format!("no stored credential for {base_url}"),
         )
-        .with_platform_note("hosted connect is not yet a first-run flow")
-        .with_manual_fix("run `kin auth login` once hosted connect is available")
+        .with_manual_fix(format!(
+            "run `kin auth login` to connect this machine to {base_url}, or `kin auth login --base-url <url>` for another workspace"
+        ))
     }
 }
 

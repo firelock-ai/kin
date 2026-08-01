@@ -933,7 +933,8 @@ pub enum SetupIntent {
     AgentOnly,
     /// Local-only plus a pointer to the kin-editor VS Code extension.
     Editor,
-    /// Hosted / KinLab — not yet a first-run flow (honest gap).
+    /// Local setup plus the real KinLab sign-in state and the commands that
+    /// change it.
     Hosted,
     /// Expose the granular toggles (shell, per-client MCP, daemon).
     Advanced,
@@ -956,7 +957,7 @@ impl SetupIntent {
             Self::LocalOnly => "Local-only (CLI development)",
             Self::AgentOnly => "AI agents (the wedge)",
             Self::Editor => "Editor (VS Code + kin-editor)",
-            Self::Hosted => "Hosted / KinLab (coming soon)",
+            Self::Hosted => "Hosted / KinLab (connect this machine)",
             Self::Advanced => "Advanced / manual (all toggles)",
         }
     }
@@ -966,7 +967,9 @@ impl SetupIntent {
             Self::LocalOnly => "shell integration + auto-daemon; no AI client config",
             Self::AgentOnly => "configure Kin's MCP server for detected AI clients + auto-daemon",
             Self::Editor => "local-only, plus how to install the kin-editor extension",
-            Self::Hosted => "connect to a KinLab workspace (no first-run flow yet)",
+            Self::Hosted => {
+                "local setup, plus the sign-in state and commands for a KinLab workspace"
+            }
             Self::Advanced => "choose shell, per-client MCP, and daemon options yourself",
         }
     }
@@ -11149,7 +11152,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     let configured_assistants = apply_plan(&plan, &assistants, shell_name).await?;
 
-    print_intent_followups(&plan);
+    print_intent_followups(&plan, interactive);
 
     request_notification_authorization(interactive);
 
@@ -11704,7 +11707,7 @@ fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
 
 /// Intent-specific guidance shown before the health checklist, driven by the
 /// applied [`SetupPlan`].
-fn print_intent_followups(plan: &SetupPlan) {
+fn print_intent_followups(plan: &SetupPlan, interactive: bool) {
     if plan.show_editor_hint {
         println!();
         println!("Editor extension:");
@@ -11717,12 +11720,58 @@ fn print_intent_followups(plan: &SetupPlan) {
     if plan.show_hosted_hint {
         println!();
         println!("Hosted / KinLab:");
-        println!(
-            "  {} Hosted connect is not a first-run flow yet. There is no public",
-            style("!").yellow()
-        );
-        println!("    `kin login`/connect command shipped. This is coming soon —");
-        println!("    your local setup above is fully functional in the meantime.");
+        let base_url = super::auth::hosted_base_url(None);
+        match super::auth::hosted_credential_state(&base_url, interactive) {
+            Ok(state) => {
+                for line in hosted_followup_lines(&base_url, &state) {
+                    println!("  {} {}", style("→").cyan(), line);
+                }
+            }
+            Err(error) => {
+                println!(
+                    "  {} could not read the stored KinLab credential for {base_url}: {error}",
+                    style("!").yellow()
+                );
+                println!("    `kin auth status` reports the same state directly.");
+            }
+        }
+    }
+}
+
+/// Hosted follow-ups, rendered from what this machine actually knows about a
+/// KinLab identity. Kept separate from printing so the wording is testable
+/// without touching a credential store.
+fn hosted_followup_lines(
+    base_url: &str,
+    state: &super::auth::HostedCredentialState,
+) -> Vec<String> {
+    match state {
+        super::auth::HostedCredentialState::Ready {
+            user_email,
+            expires_at,
+        } => vec![
+            format!("Signed in to {base_url} as {user_email} (credential expires {expires_at})."),
+            "`kin auth whoami` confirms the account the workspace sees.".to_string(),
+            "Add a native remote with `kin remote add <name> <url>`, then `kin push`.".to_string(),
+        ],
+        super::auth::HostedCredentialState::Locked => vec![
+            format!("A stored credential for {base_url} is encrypted on this machine."),
+            "`kin auth status` unlocks and reports it; `kin auth login` replaces it.".to_string(),
+        ],
+        super::auth::HostedCredentialState::Absent => vec![
+            format!("Not signed in to {base_url}."),
+            "`kin auth login` connects this machine, then `kin remote add <name> <url>`."
+                .to_string(),
+            "Another workspace: `kin auth login --base-url <url>`, or set KINLAB_URL.".to_string(),
+        ],
+        super::auth::HostedCredentialState::AbsentKeyringNotRead => vec![
+            format!("No stored credential file for {base_url} on this machine."),
+            "This run cannot answer a keychain prompt, so the platform keyring was not read; \
+             `kin auth status` reports a keyring-stored credential."
+                .to_string(),
+            "`kin auth login` connects this machine, then `kin remote add <name> <url>`."
+                .to_string(),
+        ],
     }
 }
 
@@ -12967,6 +13016,128 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         assert!(plan.show_editor_hint);
         assert!(!plan.configure_mcp);
         assert!(plan.install_shell_hook);
+    }
+
+    /// The hosted surface is where a first-time caller learns whether they can
+    /// connect at all. `kin auth login` ships, so no hosted wording may say a
+    /// connect command is missing or still on the way.
+    #[test]
+    fn hosted_followups_never_deny_the_shipped_connect_command() {
+        let states = [
+            super::super::auth::HostedCredentialState::Absent,
+            super::super::auth::HostedCredentialState::AbsentKeyringNotRead,
+            super::super::auth::HostedCredentialState::Locked,
+            super::super::auth::HostedCredentialState::Ready {
+                user_email: "dev@example.com".to_string(),
+                expires_at: "2026-12-31T00:00:00Z".to_string(),
+            },
+        ];
+        for state in states {
+            let rendered = hosted_followup_lines("https://kinlab.example", &state).join("\n");
+            let lowered = rendered.to_lowercase();
+            for denial in [
+                "coming soon",
+                "no public",
+                "not a first-run flow",
+                "no first-run flow",
+            ] {
+                assert!(
+                    !lowered.contains(denial),
+                    "hosted wording for {state:?} must not deny a shipped command: {rendered}"
+                );
+            }
+            assert!(
+                rendered.contains("kin auth"),
+                "hosted wording for {state:?} must name a real auth command: {rendered}"
+            );
+        }
+    }
+
+    /// Each state answers the only question the caller has: am I connected, and
+    /// what do I type next.
+    #[test]
+    fn hosted_followups_report_the_state_this_machine_is_in() {
+        let absent = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::Absent,
+        )
+        .join("\n");
+        assert!(
+            absent.contains("https://kinlab.example") && absent.contains("kin auth login"),
+            "a machine with no credential must be told where it is not signed in and how: {absent}"
+        );
+
+        let locked = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::Locked,
+        )
+        .join("\n");
+        assert!(
+            locked.contains("kin auth status"),
+            "a locked credential must name the command that unlocks it: {locked}"
+        );
+
+        let ready = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::Ready {
+                user_email: "dev@example.com".to_string(),
+                expires_at: "2026-12-31T00:00:00Z".to_string(),
+            },
+        )
+        .join("\n");
+        assert!(
+            ready.contains("dev@example.com") && ready.contains("2026-12-31T00:00:00Z"),
+            "a signed-in machine must be told which identity and until when: {ready}"
+        );
+    }
+
+    /// A run that cannot answer a keychain prompt does not read the keyring, so
+    /// it does not know whether this machine is signed in. Saying it is not
+    /// would be false on the default install, where the keyring is where a
+    /// credential lands.
+    #[test]
+    fn hosted_followups_do_not_claim_signed_out_when_the_keyring_went_unread() {
+        let unread = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::AbsentKeyringNotRead,
+        )
+        .join("\n");
+        assert!(
+            !unread.to_lowercase().contains("not signed in"),
+            "an unread keyring cannot support a signed-out claim: {unread}"
+        );
+        assert!(
+            unread.contains("kin auth status"),
+            "the report must name the command that does read the keyring: {unread}"
+        );
+
+        let read = hosted_followup_lines(
+            "https://kinlab.example",
+            &super::super::auth::HostedCredentialState::Absent,
+        )
+        .join("\n");
+        assert!(
+            read.to_lowercase().contains("not signed in"),
+            "a probe that did read the keyring states the machine is signed out: {read}"
+        );
+    }
+
+    /// The intent menu is read before anything runs, so its own line cannot
+    /// promise less than the command surface delivers.
+    #[test]
+    fn hosted_intent_menu_entry_does_not_deny_the_connect_command() {
+        let entry = format!(
+            "{} {}",
+            SetupIntent::Hosted.title(),
+            SetupIntent::Hosted.description()
+        )
+        .to_lowercase();
+        for denial in ["coming soon", "no first-run flow yet", "not yet"] {
+            assert!(
+                !entry.contains(denial),
+                "hosted menu entry must not deny a shipped command: {entry}"
+            );
+        }
     }
 
     #[test]

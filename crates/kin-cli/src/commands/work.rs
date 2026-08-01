@@ -51,15 +51,32 @@ pub enum WorkRequest {
     Verify {
         work_id: String,
     },
+    /// Read a work item's recorded scopes as data rather than rendered text.
+    /// Commands that act on what a work item covers need the scopes typed, and
+    /// parsing the rendered listing back would make the display format load
+    /// bearing.
+    Scopes {
+        work_id: String,
+    },
     TodoImport {
         path: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkScopesReport {
+    pub work_id: WorkId,
+    pub title: String,
+    pub status: WorkStatus,
+    pub scopes: Vec<WorkScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkResponse {
     #[serde(default)]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<WorkScopesReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +99,15 @@ async fn run_daemon_work(request: &WorkRequest) -> Result<WorkResponse> {
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client.work(request).await.context("daemon work failed")
+}
+
+/// Read a work item's scopes as data. Callers that act on what a work item
+/// covers use this rather than the rendered listing.
+pub async fn request_work_scopes(work_id: &str) -> Result<WorkResponse> {
+    run_daemon_work(&WorkRequest::Scopes {
+        work_id: work_id.to_string(),
+    })
+    .await
 }
 
 fn print_work_response(response: WorkResponse) {
@@ -640,6 +666,7 @@ pub fn execute_work_request(
     request: WorkRequest,
 ) -> Result<WorkExecution> {
     let mut mutated = false;
+    let mut scopes = None;
     let text = match request {
         WorkRequest::Create {
             kind,
@@ -837,6 +864,28 @@ pub fn execute_work_request(
             out
         }
         WorkRequest::Verify { work_id } => render_work_verification(graph, work_id)?,
+        WorkRequest::Scopes { work_id } => {
+            let id = parse_work_id(&work_id)?;
+            let item = graph
+                .get_work_item(&id)?
+                .ok_or_else(|| anyhow::anyhow!("work item not found: {}", work_id))?;
+            let report = WorkScopesReport {
+                work_id: item.work_id,
+                title: item.title.clone(),
+                status: item.status,
+                scopes: item.scopes.clone(),
+            };
+            let mut out = format!(
+                "{} scope(s) recorded for {}\n",
+                report.scopes.len(),
+                work_id
+            );
+            for scope in &report.scopes {
+                writeln!(out, "  - {scope}")?;
+            }
+            scopes = Some(report);
+            out
+        }
         WorkRequest::TodoImport { path } => {
             let scan_root = path
                 .map(std::path::PathBuf::from)
@@ -916,7 +965,7 @@ pub fn execute_work_request(
     };
 
     Ok(WorkExecution {
-        response: WorkResponse { text },
+        response: WorkResponse { text, scopes },
         mutated,
     })
 }
