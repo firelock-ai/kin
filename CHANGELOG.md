@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.5] - 2026-07-31
+## [0.4.5] - 2026-08-01
 
 ### Changed
 
@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Admit every path the release generator writes (#552)
 - Report retrieval truncation from where it was cut, not from an advisory log (#553)
 - Pin what the release guards actually read and stop failing a mint on an early read (#549)
+- Open the automated release pull request as the release App (#556)
 
 
 ## [0.4.4] - 2026-07-31
