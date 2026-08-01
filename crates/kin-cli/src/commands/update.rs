@@ -10516,6 +10516,19 @@ mod tests {
         (archive, provenance, identities)
     }
 
+    /// Point ambient home resolution at the fixture for a test's lifetime.
+    ///
+    /// An update records the MCP repair obligation it will owe after the swap,
+    /// and the client configs that obligation covers are addressed from the
+    /// home directory rather than from the install root the test passes in. A
+    /// test that leaves `HOME` alone therefore resolves, and can write, the
+    /// developer's live configuration.
+    fn fixture_home(tmp: &tempfile::TempDir, kin_home: &Path) -> EnvVarGuard {
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        EnvVarGuard::set("HOME", &home).with("KIN_HOME", kin_home)
+    }
+
     fn write_bundle(root: &Path, spec: &[ComponentSpec], prefix: &[u8]) {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("lib")).unwrap();
@@ -11348,6 +11361,7 @@ cwd = {:?}
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let _env = fixture_home(&tmp, &kin_home);
         let expected: Vec<_> = LINUX_COMPONENTS
             .iter()
             .map(|component| {
@@ -12094,6 +12108,7 @@ cwd = {:?}
         let stage = tmp.path().join("stage");
         let outside = tmp.path().join("outside-bin");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let _env = fixture_home(&tmp, &kin_home);
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("kin-daemon"), b"outside-victim").unwrap();
         stage_archive(
@@ -12148,6 +12163,7 @@ cwd = {:?}
         let stage = tmp.path().join("stage");
         let outside = tmp.path().join("outside-lib");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let _env = fixture_home(&tmp, &kin_home);
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("libkin_vfs_shim.so"), b"outside-victim").unwrap();
         stage_archive(
@@ -12690,6 +12706,7 @@ cwd = {:?}
         let detached = tmp.path().join("kin-home-detached");
         let stage = tmp.path().join("stage");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let _env = fixture_home(&tmp, &kin_home);
         let expected = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
         stage_archive(
             &full_linux_archive("kin-linux-x86_64"),
@@ -12745,6 +12762,7 @@ cwd = {:?}
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
+        let _env = fixture_home(&tmp, &kin_home);
         let expected = bundle_snapshot(&kin_home, LINUX_COMPONENTS);
         stage_archive(
             &full_linux_archive("kin-linux-x86_64"),

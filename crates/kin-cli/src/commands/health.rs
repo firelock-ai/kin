@@ -1538,6 +1538,16 @@ mod tests {
 
     #[tokio::test]
     async fn report_is_non_empty_and_serializes_with_ids() {
+        // Health inspects the managed MCP client configs, which are addressed
+        // from the home directory, so an unscoped run reads the developer's
+        // live configuration and reports on whatever it happens to contain.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&kin_home).unwrap();
+        let _env = EnvVarGuard::set("HOME", &home).with("KIN_HOME", &kin_home);
+
         let report = run_health_checks().await;
         assert!(!report.checks.is_empty());
         let json = serde_json::to_string(&report).expect("report serializes");

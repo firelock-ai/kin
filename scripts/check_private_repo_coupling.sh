@@ -8,6 +8,13 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
+# ripgrep anchors a glob containing a slash to the working directory rather than
+# to the path it is told to search, so searching an absolute repo root from any
+# other directory silently stops matching every exclusion below, and the guard
+# then reports its own pattern list as coupling. Searching '.' from the repo
+# root is what makes the exclusions mean what they read as.
+cd "$repo_root"
+
 patterns=(
   '\.\./kinlab'
   'kinlab\.git'
@@ -23,9 +30,9 @@ hits=()
 for pattern in "${patterns[@]}"; do
   while IFS=: read -r file line _; do
     [[ -z "$file" ]] && continue
-    file="${file#"$repo_root/"}"
+    file="${file#./}"
     hits+=("$file:$line:$pattern")
-  done < <(rg -n "$pattern" "$repo_root" \
+  done < <(rg -n "$pattern" . \
     -g '!target/**' \
     -g '!.git/**' \
     -g '!scripts/check_private_repo_coupling.sh' \

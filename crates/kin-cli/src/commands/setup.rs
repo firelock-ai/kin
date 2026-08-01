@@ -15704,9 +15704,11 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     /// The fixture guard must fail at the moment an escaping path is resolved,
     /// so a leak is reported against the flow that produced it.
+    ///
+    /// Not serialized, and it does not need to be: the declaration is
+    /// thread-local, so no other test can observe it however they interleave.
     #[cfg(unix)]
     #[test]
-    #[serial]
     #[should_panic(expected = "managed config path escaped its fixture")]
     fn managed_config_outside_the_declared_fixture_aborts_immediately() {
         let dir = tempfile::tempdir().unwrap();
@@ -15714,10 +15716,8 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         let outside = dir.path().join("outside");
         fs::create_dir_all(&fixture).unwrap();
         fs::create_dir_all(&outside).unwrap();
-        let _fixture_root = EnvVarGuard::set(
-            crate::commands::managed_config_scope::FIXTURE_ROOT_ENV,
-            &fixture,
-        );
+        let _fixture_root =
+            crate::commands::managed_config_scope::test_scope::FixtureScope::declare(&fixture);
         let _ = ConfigLock::acquire(&outside.join("mcp.json"));
     }
 
