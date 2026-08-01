@@ -13,6 +13,7 @@ const INVENTORY_JSON: &str =
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityStatus {
     Ready,
+    ReadyBounded,
     OpenGate,
 }
 
@@ -50,6 +51,8 @@ struct CapabilityReport<'a> {
     bounded_dogfood_ready: bool,
     bounded_dogfood_required_ready: usize,
     bounded_dogfood_required_total: usize,
+    all_declared_command_surfaces_enabled: bool,
+    enabled_commands: usize,
     full_git_replacement_ready: bool,
     ready_commands: usize,
     command_total: usize,
@@ -73,7 +76,7 @@ pub fn require_ready(command: &str) -> Result<()> {
                 command
             )
         })?;
-    if capability.status == CapabilityStatus::Ready
+    if capability.status != CapabilityStatus::OpenGate
         && capability.exposure == CapabilityExposure::Enabled
     {
         return Ok(());
@@ -98,7 +101,7 @@ pub fn run(json: bool) -> Result<()> {
     let bounded_dogfood_required_ready = required
         .iter()
         .filter(|capability| {
-            capability.status == CapabilityStatus::Ready
+            capability.status != CapabilityStatus::OpenGate
                 && capability.exposure == CapabilityExposure::Enabled
         })
         .count();
@@ -110,12 +113,19 @@ pub fn run(json: bool) -> Result<()> {
                 && capability.exposure == CapabilityExposure::Enabled
         })
         .count();
+    let enabled_commands = inventory
+        .commands
+        .iter()
+        .filter(|capability| capability.exposure == CapabilityExposure::Enabled)
+        .count();
     let report = CapabilityReport {
         schema: &inventory.schema,
         substrate: &inventory.substrate,
         bounded_dogfood_ready: bounded_dogfood_required_ready == required.len(),
         bounded_dogfood_required_ready,
         bounded_dogfood_required_total: required.len(),
+        all_declared_command_surfaces_enabled: enabled_commands == inventory.commands.len(),
+        enabled_commands,
         full_git_replacement_ready: ready_commands == inventory.commands.len(),
         ready_commands,
         command_total: inventory.commands.len(),
@@ -139,7 +149,17 @@ pub fn run(json: bool) -> Result<()> {
         report.bounded_dogfood_required_total
     );
     println!(
-        "Full Git replacement ready: {} ({}/{})",
+        "All declared command surfaces enabled: {} ({}/{})",
+        if report.all_declared_command_surfaces_enabled {
+            "yes"
+        } else {
+            "no"
+        },
+        report.enabled_commands,
+        report.command_total
+    );
+    println!(
+        "Fully general Git replacement ready: {} ({}/{} general)",
         if report.full_git_replacement_ready {
             "yes"
         } else {
@@ -152,6 +172,7 @@ pub fn run(json: bool) -> Result<()> {
     for capability in report.commands {
         let status = match capability.status {
             CapabilityStatus::Ready => "READY",
+            CapabilityStatus::ReadyBounded => "BOUND",
             CapabilityStatus::OpenGate => "OPEN ",
         };
         let dogfood = if capability.required_for_bounded_dogfood {
@@ -181,6 +202,11 @@ mod tests {
                 CapabilityStatus::Ready => {
                     assert_eq!(capability.exposure, CapabilityExposure::Enabled)
                 }
+                CapabilityStatus::ReadyBounded => {
+                    assert_eq!(capability.exposure, CapabilityExposure::Enabled);
+                    assert!(!capability.acceptance_spec.is_empty());
+                    assert!(!capability.note.is_empty());
+                }
                 CapabilityStatus::OpenGate => {
                     assert_eq!(capability.exposure, CapabilityExposure::FailClosed);
                     assert!(!capability.acceptance_spec.is_empty());
@@ -194,7 +220,7 @@ mod tests {
     #[test]
     fn every_ready_capability_names_the_evidence_that_proves_it() {
         for capability in inventory().unwrap().commands {
-            if capability.status != CapabilityStatus::Ready {
+            if capability.status == CapabilityStatus::OpenGate {
                 continue;
             }
             assert!(

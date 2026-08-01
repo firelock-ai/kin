@@ -39,12 +39,14 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_ready"], true);
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
-    assert_eq!(report["full_git_replacement_ready"], true);
+    assert_eq!(report["all_declared_command_surfaces_enabled"], true);
+    assert_eq!(report["enabled_commands"], 33);
+    assert_eq!(report["full_git_replacement_ready"], false);
     // Exact counts, so a silent re-seal cannot pass. They are also the reason
     // two lanes must never flip a gate in the same wave: both bumps merge
     // without conflict and main goes red with every pull request green.
     // Recount from the merged fixture rather than from either branch.
-    assert_eq!(report["ready_commands"], 33);
+    assert_eq!(report["ready_commands"], 32);
     assert_eq!(report["command_total"], 33);
 
     let commands = report["commands"]
@@ -85,7 +87,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
             .as_str()
             .expect("exposure should be a string");
         match status {
-            "ready" => assert_eq!(exposure, "enabled"),
+            "ready" | "ready_bounded" => assert_eq!(exposure, "enabled"),
             "open_gate" => {
                 assert_eq!(exposure, "fail_closed");
                 assert!(

@@ -14,10 +14,11 @@ use kin_cli::commands::rename::{
     plan_rename, RenameEdit, RenamePlan, RenameReport, RenameRequest, RenameResponse,
 };
 use kin_model::{
-    ChangeStore, EntityDelta, EntityStore, FileLayout, FilePathId, GraphNodeId, Hash256,
-    LocatedEntry, ParseCompleteness, RepoPath, SourceRegion, TransactionDelta, TreeDelta,
+    ChangeStore, EntityDelta, EntityKind, EntityStore, FileLayout, FilePathId, GraphNodeId,
+    Hash256, LocatedEntry, ParseCompleteness, RepoPath, SourceRegion, TransactionDelta, TreeDelta,
     TreeEntry,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::local_repository_authority::{
@@ -31,12 +32,33 @@ use crate::state::{DaemonEvent, DaemonState};
 
 struct RenameExecution {
     response: RenameResponse,
+    finalization: Option<RenameFinalization>,
+}
+
+struct RenameFinalization {
     committed: NativeCommitResult,
     authority_freeze: kin_db::LocalRepositoryAuthorityFreeze,
     previous_tree: kin_model::ResolvedTree,
     desired_tree: kin_model::ResolvedTree,
     planned_delta: TransactionDelta,
     layouts: Vec<FileLayout>,
+}
+
+const RENAME_METADATA_SCHEMA: &str = "kin.repository-rename-receipt.v1";
+const RENAME_METADATA_PREFIX: &str = "Kin-Rename-Metadata: ";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RenameCommitMetadata {
+    schema: String,
+    request_binding: Hash256,
+    entity_id: kin_model::EntityId,
+    entity_kind: EntityKind,
+    old_name: String,
+    new_name: String,
+    declaration_file: FilePathId,
+    edited_files: Vec<FilePathId>,
+    edit_count: usize,
 }
 
 pub(crate) fn execute(
@@ -51,7 +73,15 @@ pub(crate) fn execute(
         )
     })?;
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
-    let execution = plan_commit_and_retain_authority(state, request).map_err(rename_error)?;
+    let RenameExecution {
+        response,
+        finalization,
+    } = plan_commit_and_retain_authority(state, request).map_err(rename_error)?;
+    let Some(execution) = finalization else {
+        drop(persistence);
+        drop(graph_mutation);
+        return Ok(response);
+    };
 
     if state
         .graph
@@ -99,7 +129,7 @@ pub(crate) fn execute(
     }
     drop(persistence);
     drop(graph_mutation);
-    Ok(execution.response)
+    Ok(response)
 }
 
 fn plan_commit_and_retain_authority(
@@ -139,6 +169,7 @@ fn plan_commit_and_retain_authority(
     let plan = plan_rename(&planning_graph, request, |_path, hash| {
         Ok(load_native_source_blob(&authority_context, hash)?)
     })?;
+    let metadata = RenameCommitMetadata::from_plan(request, &plan)?;
     let (prospective, layouts) = apply_plan_in_memory(state, &authority_context, &base, &plan)?;
     prove_plan_postconditions(&base.graph, &prospective, &plan)?;
 
@@ -151,7 +182,7 @@ fn plan_commit_and_retain_authority(
         request.operation_id,
         kin_model::Timestamp::now(),
         request.actor.clone(),
-        rename_change_message(request)?,
+        rename_change_message(&metadata)?,
         &base,
     )
     .context("plan one exact repository-v6 rename transaction")?;
@@ -171,37 +202,37 @@ fn plan_commit_and_retain_authority(
         native,
     ) {
         Ok(committed) => {
+            if matches!(
+                committed.receipt.outcome,
+                kin_model::RepositoryCommitOutcome::IdempotentReplay
+            ) {
+                return recover_committed_rename(state, request, &authority_context, committed);
+            }
             let authority = authority_context.open()?;
             let freeze = authority
                 .freeze_current_authority(&committed.receipt.roots_after)
                 .context("retain committed rename repository authority")?;
-            let idempotent = matches!(
-                committed.receipt.outcome,
-                kin_model::RepositoryCommitOutcome::IdempotentReplay
-            );
-            (committed, freeze, idempotent)
+            (committed, freeze, false)
         }
         Err(commit_error) => {
             let Some(recovered) = recover_native_commit(&authority_context, request.operation_id)?
             else {
                 bail!("exact rename publication failed before authority moved: {commit_error}");
             };
-            let authority = authority_context.open()?;
-            let freeze = authority
-                .freeze_current_authority(&recovered.receipt.roots_after)
-                .context("retain recovered rename repository authority")?;
-            (recovered, freeze, true)
+            return recover_committed_rename(state, request, &authority_context, recovered);
         }
     };
-    let response = response_for(&plan, &committed, idempotent, request.json)?;
+    let response = response_for(&metadata, &committed, idempotent, request.json)?;
     Ok(RenameExecution {
         response,
-        committed,
-        authority_freeze,
-        previous_tree,
-        desired_tree,
-        planned_delta,
-        layouts,
+        finalization: Some(RenameFinalization {
+            committed,
+            authority_freeze,
+            previous_tree,
+            desired_tree,
+            planned_delta,
+            layouts,
+        }),
     })
 }
 
@@ -211,20 +242,39 @@ fn recover_committed_rename(
     authority_context: &LocalRepositoryAuthorityContext,
     committed: NativeCommitResult,
 ) -> Result<RenameExecution> {
-    let expected_message = rename_change_message(request)?;
-    if committed.change.message != expected_message {
+    let metadata = rename_metadata_from_change(&committed.change.message)?;
+    if metadata.request_binding != rename_request_binding(request)? {
         bail!(
             "rename operation {} was already committed for a different request",
             request.operation_id
         );
     }
+    validate_recovered_metadata(&metadata, &committed)?;
     let receipt = committed.receipt.clone();
     let current = load_native_commit_base(authority_context)?;
-    if current.roots != receipt.roots_after {
+    if current.roots.generation < receipt.generation {
         bail!(
-            "repository authority advanced beyond recovered rename generation {}; reopen before retrying",
+            "repository authority generation {} is behind recovered rename generation {}; refusing inconsistent operation history",
+            current.roots.generation,
+            receipt.generation,
+        );
+    }
+    if current.roots.generation == receipt.generation && current.roots != receipt.roots_after {
+        bail!(
+            "repository authority diverges from recovered rename generation {}; refusing ambiguous operation history",
             receipt.generation
         );
+    }
+    let response = response_for(&metadata, &committed, true, request.json)?;
+    if current.roots != receipt.roots_after {
+        // A later serialized transaction is already authoritative. The
+        // operation receipt and bound change are immutable historical truth;
+        // replay the original outcome without trying to reinstall or finalize
+        // an old generation over the current workspace.
+        return Ok(RenameExecution {
+            response,
+            finalization: None,
+        });
     }
     let desired_tree = current.tree.clone();
     let inverse = committed
@@ -236,64 +286,25 @@ fn recover_committed_rename(
     let previous_tree = desired_tree
         .apply(&inverse)
         .context("reconstruct recovered rename prior tree")?;
-    let entity_id = committed
-        .change
-        .entity_deltas
-        .iter()
-        .find_map(|delta| match delta {
-            EntityDelta::Modified { old, new }
-                if old.name == request.symbol && new.name == request.new_name =>
-            {
-                Some(old.id)
-            }
-            _ => None,
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "recovered rename change does not carry the requested identity-preserving entity delta"
-            )
-        })?;
-    let plan = RenamePlan {
-        entity_id,
-        entity_kind: current
-            .graph
-            .get_entity(&entity_id)?
-            .ok_or_else(|| anyhow::anyhow!("recovered rename entity is absent"))?
-            .kind,
-        old_name: request.symbol.clone(),
-        new_name: request.new_name.clone(),
-        declaration_file: committed
-            .change
-            .tree_deltas
-            .iter()
-            .filter_map(|delta| delta.new_state())
-            .find_map(|located| located.path.as_utf8().map(FilePathId::new))
-            .ok_or_else(|| anyhow::anyhow!("recovered rename has no UTF-8 source path"))?,
-        edits: Vec::new(),
-        relation_ids: Vec::new(),
-    };
     let layouts = rebuild_layouts(state, authority_context, &current, &committed.change)?;
     let authority = authority_context.open()?;
     let authority_freeze = authority
         .freeze_current_authority(&receipt.roots_after)
         .context("retain recovered rename repository authority")?;
-    let response = response_for(&plan, &committed, true, request.json)?;
     Ok(RenameExecution {
         response,
-        committed,
-        authority_freeze,
-        previous_tree,
-        desired_tree,
-        planned_delta: TransactionDelta::default(),
-        layouts,
+        finalization: Some(RenameFinalization {
+            committed,
+            authority_freeze,
+            previous_tree,
+            desired_tree,
+            planned_delta: TransactionDelta::default(),
+            layouts,
+        }),
     })
 }
 
-fn rename_change_message(request: &RenameRequest) -> Result<String> {
-    // Bind idempotent recovery to every semantic selector and the recorded
-    // actor. JSON output preference is intentionally excluded because it does
-    // not change the transaction. A reused operation id with a different file
-    // cursor or actor must never replay a same-spelling rename elsewhere.
+fn rename_request_binding(request: &RenameRequest) -> Result<Hash256> {
     let binding = serde_json::to_vec(&(
         request.symbol.as_str(),
         request.new_name.as_str(),
@@ -303,11 +314,105 @@ fn rename_change_message(request: &RenameRequest) -> Result<String> {
         &request.actor,
     ))
     .context("encode exact rename request binding")?;
-    let digest = kin_blobs::digest(&binding);
+    Ok(Hash256::from_bytes(kin_blobs::digest(&binding).0))
+}
+
+impl RenameCommitMetadata {
+    fn from_plan(request: &RenameRequest, plan: &RenamePlan) -> Result<Self> {
+        let mut edited_files = plan
+            .edits
+            .iter()
+            .map(|edit| edit.file.clone())
+            .collect::<Vec<_>>();
+        edited_files.sort_by(|left, right| left.0.cmp(&right.0));
+        edited_files.dedup();
+        Ok(Self {
+            schema: RENAME_METADATA_SCHEMA.to_string(),
+            request_binding: rename_request_binding(request)?,
+            entity_id: plan.entity_id,
+            entity_kind: plan.entity_kind,
+            old_name: plan.old_name.clone(),
+            new_name: plan.new_name.clone(),
+            declaration_file: plan.declaration_file.clone(),
+            edited_files,
+            edit_count: plan.edits.len(),
+        })
+    }
+}
+
+fn rename_change_message(metadata: &RenameCommitMetadata) -> Result<String> {
+    let encoded =
+        serde_json::to_string(metadata).context("encode durable rename receipt metadata")?;
     Ok(format!(
-        "Rename {} to {}\n\nKin-Rename-Request: {}",
-        request.symbol, request.new_name, digest
+        "Rename {} to {}\n\n{}{}",
+        metadata.old_name, metadata.new_name, RENAME_METADATA_PREFIX, encoded
     ))
+}
+
+fn rename_metadata_from_change(message: &str) -> Result<RenameCommitMetadata> {
+    let encoded = message
+        .lines()
+        .find_map(|line| line.strip_prefix(RENAME_METADATA_PREFIX))
+        .ok_or_else(|| {
+            anyhow::anyhow!("recovered rename change has no durable receipt metadata")
+        })?;
+    let metadata: RenameCommitMetadata =
+        serde_json::from_str(encoded).context("decode durable rename receipt metadata")?;
+    if metadata.schema != RENAME_METADATA_SCHEMA {
+        bail!(
+            "recovered rename metadata schema '{}' is unsupported",
+            metadata.schema
+        );
+    }
+    Ok(metadata)
+}
+
+fn validate_recovered_metadata(
+    metadata: &RenameCommitMetadata,
+    committed: &NativeCommitResult,
+) -> Result<()> {
+    if metadata.edit_count == 0
+        || metadata.edited_files.is_empty()
+        || !metadata.edited_files.contains(&metadata.declaration_file)
+    {
+        bail!("recovered rename metadata does not describe a complete source edit set");
+    }
+    let identity_delta = committed.change.entity_deltas.iter().any(|delta| {
+        matches!(
+            delta,
+            EntityDelta::Modified { old, new }
+                if old.id == metadata.entity_id
+                    && new.id == metadata.entity_id
+                    && old.kind == metadata.entity_kind
+                    && new.kind == metadata.entity_kind
+                    && old.name == metadata.old_name
+                    && new.name == metadata.new_name
+        )
+    });
+    if !identity_delta {
+        bail!(
+            "recovered rename change does not carry its metadata-bound identity-preserving entity delta"
+        );
+    }
+    let mut changed_files = committed
+        .change
+        .tree_deltas
+        .iter()
+        .filter_map(|delta| delta.new_state())
+        .map(|located| {
+            located
+                .path
+                .as_utf8()
+                .map(FilePathId::new)
+                .ok_or_else(|| anyhow::anyhow!("recovered rename source path is not UTF-8"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    changed_files.sort_by(|left, right| left.0.cmp(&right.0));
+    changed_files.dedup();
+    if changed_files != metadata.edited_files {
+        bail!("recovered rename source delta set disagrees with durable receipt metadata");
+    }
+    Ok(())
 }
 
 fn apply_plan_in_memory(
@@ -562,40 +667,32 @@ fn prove_plan_postconditions(
 }
 
 fn response_for(
-    plan: &RenamePlan,
+    metadata: &RenameCommitMetadata,
     committed: &NativeCommitResult,
     idempotent: bool,
     json: bool,
 ) -> Result<RenameResponse> {
-    let mut edited_files = committed
-        .change
-        .tree_deltas
-        .iter()
-        .filter_map(|delta| delta.new_state())
-        .filter_map(|located| located.path.as_utf8().map(FilePathId::new))
-        .collect::<Vec<_>>();
-    edited_files.sort_by(|left, right| left.0.cmp(&right.0));
-    edited_files.dedup();
     let report = RenameReport {
         authority: "repository-v6 graph + source CAS".to_string(),
         operation_id: committed.receipt.operation_id,
         change_id: committed.change.id,
         authority_generation: committed.receipt.generation,
-        entity_id: plan.entity_id,
-        old_name: plan.old_name.clone(),
-        new_name: plan.new_name.clone(),
-        edited_files,
-        edit_count: plan.edits.len(),
+        entity_id: metadata.entity_id,
+        old_name: metadata.old_name.clone(),
+        new_name: metadata.new_name.clone(),
+        edited_files: metadata.edited_files.clone(),
+        edit_count: metadata.edit_count,
         idempotent,
     };
     let lines = if json {
         Vec::new()
-    } else if idempotent && plan.edits.is_empty() {
+    } else if idempotent {
         vec![
             format!(
-                "Recovered committed rename {} -> {} across {} file(s); no new edits applied",
+                "Recovered committed rename {} -> {} ({} original exact edit(s) across {} file(s)); no new edits applied",
                 report.old_name,
                 report.new_name,
+                report.edit_count,
                 report.edited_files.len()
             ),
             format!(
@@ -789,27 +886,35 @@ mod tests {
             (target_file.0.clone(), target_artifact),
             (caller_file.0.clone(), caller_artifact),
         ]);
-        let linked = pipeline
-            .resolve_cross_file(
-                &[
-                    kin_index::FileParseData {
-                        file_path: target_file.0.clone(),
-                        entities: target_indexed.entities.clone(),
-                        relations: target_indexed.extracted_relations.clone(),
-                        imports: target_indexed.imports.clone(),
-                    },
-                    kin_index::FileParseData {
-                        file_path: caller_file.0.clone(),
-                        entities: caller_indexed.entities.clone(),
-                        relations: caller_indexed.extracted_relations.clone(),
-                        imports: caller_indexed.imports.clone(),
-                    },
-                ],
-                &artifact_ids,
-            )
-            .unwrap();
+        let parse_data = [
+            kin_index::FileParseData {
+                file_path: target_file.0.clone(),
+                entities: target_indexed.entities.clone(),
+                relations: target_indexed.extracted_relations.clone(),
+                imports: target_indexed.imports.clone(),
+            },
+            kin_index::FileParseData {
+                file_path: caller_file.0.clone(),
+                entities: caller_indexed.entities.clone(),
+                relations: caller_indexed.extracted_relations.clone(),
+                imports: caller_indexed.imports.clone(),
+            },
+        ];
+        let completeness = kin_index::FileParseCompletenessMap::from([
+            (
+                target_file.0.clone(),
+                target_indexed.file_layout.parse_completeness.clone(),
+            ),
+            (
+                caller_file.0.clone(),
+                caller_indexed.file_layout.parse_completeness.clone(),
+            ),
+        ]);
+        let linked =
+            kin_index::link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)
+                .unwrap();
         let relation = linked
-            .into_iter()
+            .iter()
             .find(|relation| {
                 relation.kind == RelationKind::Calls
                     && relation.src == GraphNodeId::Entity(caller.id)
@@ -838,9 +943,11 @@ mod tests {
                     .cloned()
                     .map(|new| EntityDelta::Added { new })
                     .collect(),
-                relation_deltas: vec![RelationDelta::Added {
-                    new: relation.clone(),
-                }],
+                relation_deltas: linked
+                    .iter()
+                    .cloned()
+                    .map(|new| RelationDelta::Added { new })
+                    .collect(),
                 tree_deltas: vec![
                     TreeDelta::Added {
                         artifact_id: target_artifact,
@@ -1001,21 +1108,40 @@ mod tests {
 
         let mut mismatched = request.clone();
         mismatched.file = Some(fixture.caller_file.0.clone());
-        let (_, mismatch) = execute(&fixture.state, &mismatched).unwrap_err();
-        assert!(mismatch.contains("already committed for a different request"));
+        let mut selector_mismatch = request.clone();
+        selector_mismatch.symbol = "module::target".to_string();
+        let mut name_mismatch = request.clone();
+        name_mismatch.new_name = "other_target".to_string();
+        let mut line_mismatch = request.clone();
+        line_mismatch.line = Some(2);
+        let mut column_mismatch = request.clone();
+        column_mismatch.column = Some(0);
+        let mut actor_mismatch = request.clone();
+        actor_mismatch.actor = AuthorId::new("different-actor");
+        for changed in [
+            mismatched,
+            selector_mismatch,
+            name_mismatch,
+            line_mismatch,
+            column_mismatch,
+            actor_mismatch,
+        ] {
+            let (_, mismatch) = execute(&fixture.state, &changed).unwrap_err();
+            assert!(mismatch.contains("already committed for a different request"));
+        }
 
         let mut text_request = request.clone();
         text_request.json = false;
         let replay = execute(&fixture.state, &text_request).unwrap();
         let replay_report = replay.report.unwrap();
         assert!(replay_report.idempotent);
-        assert_eq!(replay_report.edit_count, 0);
+        assert_eq!(replay_report.edit_count, 3);
 
         let reopened = Arc::new(DaemonState::open(fixture.state.layout.clone()).unwrap());
         let restart_replay = execute(&reopened, &request).unwrap();
         let restart_report = restart_replay.report.unwrap();
         assert!(restart_report.idempotent);
-        assert_eq!(restart_report.edit_count, 0);
+        assert_eq!(restart_report.edit_count, 3);
         assert_eq!(
             reopened
                 .graph
@@ -1024,6 +1150,90 @@ mod tests {
                 .unwrap()
                 .name,
             "renamed_target"
+        );
+    }
+
+    #[test]
+    fn qualified_selector_replays_the_canonical_committed_report() {
+        let fixture = exact_rename_fixture();
+        let request = RenameRequest {
+            symbol: "module::target".to_string(),
+            new_name: "renamed_target".to_string(),
+            file: Some(fixture.target_file.0.clone()),
+            line: Some(1),
+            column: Some(7),
+            json: true,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("qualified-rename-test"),
+        };
+
+        let first = execute(&fixture.state, &request).unwrap().report.unwrap();
+        assert_eq!(first.old_name, "target");
+        assert_eq!(first.new_name, "renamed_target");
+        assert_eq!(first.edit_count, 3);
+        assert!(!first.idempotent);
+
+        let replay = execute(&fixture.state, &request).unwrap().report.unwrap();
+        assert_eq!(replay.old_name, "target");
+        assert_eq!(replay.entity_id, first.entity_id);
+        assert_eq!(replay.edited_files, first.edited_files);
+        assert_eq!(replay.edit_count, first.edit_count);
+        assert!(replay.idempotent);
+    }
+
+    #[test]
+    fn operation_replay_after_a_later_generation_returns_historical_outcome() {
+        let fixture = exact_rename_fixture();
+        let first_request = RenameRequest {
+            symbol: "target".to_string(),
+            new_name: "renamed_target".to_string(),
+            file: Some(fixture.target_file.0.clone()),
+            line: Some(1),
+            column: None,
+            json: true,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("historical-rename-test"),
+        };
+        let first = execute(&fixture.state, &first_request)
+            .unwrap()
+            .report
+            .unwrap();
+        let second_request = RenameRequest {
+            symbol: "renamed_target".to_string(),
+            new_name: "final_target".to_string(),
+            file: Some(fixture.target_file.0.clone()),
+            line: Some(1),
+            column: None,
+            json: true,
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("later-rename-test"),
+        };
+        let second = execute(&fixture.state, &second_request)
+            .unwrap()
+            .report
+            .unwrap();
+        assert!(second.authority_generation > first.authority_generation);
+
+        let replay = execute(&fixture.state, &first_request)
+            .unwrap()
+            .report
+            .unwrap();
+        assert!(replay.idempotent);
+        assert_eq!(replay.change_id, first.change_id);
+        assert_eq!(replay.authority_generation, first.authority_generation);
+        assert_eq!(replay.old_name, first.old_name);
+        assert_eq!(replay.new_name, first.new_name);
+        assert_eq!(replay.edit_count, first.edit_count);
+        assert_eq!(replay.edited_files, first.edited_files);
+        assert_eq!(
+            fixture
+                .state
+                .graph
+                .get_entity(&fixture.target_id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "final_target"
         );
     }
 

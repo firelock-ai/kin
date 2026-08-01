@@ -361,10 +361,10 @@ enum Command {
         /// File hint to disambiguate the target entity
         #[arg(long)]
         file: Option<String>,
-        /// 1-based line hint to disambiguate the target entity
+        /// 1-based line hint in --file; required when --column is provided
         #[arg(long)]
         line: Option<u32>,
-        /// 0-based column hint to disambiguate the target entity
+        /// 0-based UTF-8 byte column (tree-sitter coordinate), requires --line
         #[arg(long)]
         column: Option<u32>,
         /// Output machine-readable JSON for editor integrations

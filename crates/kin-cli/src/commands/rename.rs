@@ -14,8 +14,8 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use kin_model::{
     AuthorId, Entity, EntityFilter, EntityId, EntityKind, EntityStore, FilePathId, GraphNodeId,
-    GraphStore, Hash256, OperationId, ParseCompleteness, Relation, RelationKind, RepoPath,
-    SourceSpan,
+    GraphStore, Hash256, LanguageId, OperationId, ParseCompleteness, Relation, RelationKind,
+    RepoPath, SourceSpan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,7 @@ pub async fn run(
     column: Option<u32>,
     json: bool,
 ) -> Result<()> {
+    validate_cursor(file.as_deref(), line, column)?;
     let layout = crate::commands::require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
@@ -146,13 +147,16 @@ pub fn plan_rename<F>(
 where
     F: FnMut(&RepoPath, Hash256) -> Result<Vec<u8>>,
 {
+    validate_cursor(request.file.as_deref(), request.line, request.column)?;
     if !looks_like_identifier(&request.new_name) {
         bail!(
             "rename target '{}' is not a simple source identifier",
             request.new_name
         );
     }
-    let target = resolve_target(graph, request)?;
+    let tree = graph.resolved_tree();
+    let mut bodies = HashMap::<FilePathId, String>::new();
+    let target = resolve_target(graph, request, &tree, &mut bodies, &mut load_source)?;
     if target.name == request.new_name {
         bail!("rename target already has name '{}'", request.new_name);
     }
@@ -179,9 +183,13 @@ where
         );
     }
 
-    let tree = graph.resolved_tree();
-    let mut bodies = HashMap::<FilePathId, String>::new();
-    reject_unspanned_import_sites(graph, &target, &tree, &mut bodies, &mut load_source)?;
+    let source_languages = require_repository_reference_coverage(
+        graph,
+        &target,
+        &tree,
+        &mut bodies,
+        &mut load_source,
+    )?;
 
     let mut grouped: BTreeMap<EntityId, ReferenceGroup> = BTreeMap::new();
     let mut relation_ids = BTreeSet::new();
@@ -256,7 +264,7 @@ where
         }
         require_complete_layout(graph, file)?;
         let body = load_cached_body(&tree, file, &mut bodies, &mut load_source)?;
-        let occurrences = find_token_occurrences(body, &target.name, span)?;
+        let occurrences = find_token_occurrences(body, &target.name, span, group.entity.language)?;
         if occurrences.len() != group.expected {
             bail!(
                 "rename authority is incomplete for entity {} in {}: graph relations plus declaration require {} '{}' occurrence(s) inside the exact source span, but repository CAS contains {}; refusing a partial or over-broad edit",
@@ -310,6 +318,7 @@ where
     if edits.is_empty() {
         bail!("rename planner produced no exact edits");
     }
+    prove_repository_occurrence_accounting(graph, &target, &source_languages, &bodies, &edits)?;
 
     Ok(RenamePlan {
         entity_id: target.id,
@@ -322,13 +331,13 @@ where
     })
 }
 
-fn reject_unspanned_import_sites<F>(
+fn require_repository_reference_coverage<F>(
     graph: &kin_db::InMemoryGraph,
     target: &Entity,
     tree: &kin_model::ResolvedTree,
     bodies: &mut HashMap<FilePathId, String>,
     load_source: &mut F,
-) -> Result<()>
+) -> Result<HashMap<FilePathId, LanguageId>>
 where
     F: FnMut(&RepoPath, Hash256) -> Result<Vec<u8>>,
 {
@@ -338,6 +347,29 @@ where
         .into_iter()
         .map(|layout| (layout.file_id.clone(), layout))
         .collect::<HashMap<_, _>>();
+    let snapshot = graph.to_snapshot();
+    let mut full_reference_coverage = HashSet::<String>::new();
+    let mut incomplete_reference_coverage = HashSet::<String>::new();
+    for relation in snapshot.relations.values() {
+        for evidence in &relation.evidence {
+            match evidence.parser_rule.as_deref() {
+                Some(kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1) => {
+                    if let Some(path) = evidence.source_path.as_ref() {
+                        full_reference_coverage.insert(path.clone());
+                    }
+                }
+                Some(
+                    kin_index::CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1
+                    | kin_index::CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+                ) => {
+                    if let Some(path) = evidence.source_path.as_ref() {
+                        incomplete_reference_coverage.insert(path.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     // A missing layout is itself a graph-authority gap. Do not limit this
     // check to files that already expose an entity or relation: a source file
     // containing only a named import can still require a rename edit. Path
@@ -377,6 +409,7 @@ where
     // emitting an artifact import edge (for example a Python `from` import).
     // Reparse every graph-owned source body from the exact repository tree so
     // a named import can never be silently omitted from a rename plan.
+    let mut source_languages = HashMap::new();
     for layout in layouts.into_values() {
         let importer_file = layout.file_id;
         if layout.parse_completeness != ParseCompleteness::Full {
@@ -384,6 +417,18 @@ where
                 "graph source {} has {} parse coverage; repository-wide import rename coverage is unproven",
                 importer_file,
                 layout.parse_completeness.bucket()
+            );
+        }
+        if incomplete_reference_coverage.contains(&importer_file.0) {
+            bail!(
+                "graph source {} carries an explicit extraction-incomplete certificate; exhaustive rename-reference coverage is unproven",
+                importer_file
+            );
+        }
+        if !full_reference_coverage.contains(&importer_file.0) {
+            bail!(
+                "graph source {} has no positive versioned full-reference-coverage certificate; exhaustive rename-reference coverage is unproven",
+                importer_file
             );
         }
         let body = load_cached_body(tree, &importer_file, bodies, load_source)?;
@@ -407,6 +452,16 @@ where
                 indexed.file_layout.parse_completeness.bucket()
             );
         }
+        if indexed
+            .extracted_relations
+            .iter()
+            .any(kin_parser::is_call_extraction_incomplete_marker)
+        {
+            bail!(
+                "repository CAS source {} reparses with incomplete named-reference extraction; refusing a partial rename",
+                importer_file
+            );
+        }
         let imported_target = indexed.imports.iter().any(|import| {
             import.specifiers.iter().any(|specifier| {
                 specifier
@@ -423,8 +478,139 @@ where
                 target.name
             );
         }
+        source_languages.insert(importer_file, indexed.language);
+    }
+    Ok(source_languages)
+}
+
+/// Prove that every identifier-shaped occurrence of the selected spelling in
+/// every graph-owned source body is explained by either a declaration identity
+/// or a rename-relevant graph edge. This is deliberately repository-CAS
+/// accounting, never a working-tree search. It complements the graph's
+/// positive extraction certificate and makes comments, strings, hidden dynamic
+/// references, and unmodeled relation classes fail closed instead of being
+/// silently stranded.
+fn prove_repository_occurrence_accounting(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    source_languages: &HashMap<FilePathId, LanguageId>,
+    bodies: &HashMap<FilePathId, String>,
+    edits: &[RenameEdit],
+) -> Result<()> {
+    let snapshot = graph.to_snapshot();
+    let mut expected = HashMap::<EntityId, usize>::new();
+    for entity in snapshot.entities.values() {
+        if entity_leaf(&entity.name) == target.name {
+            expected.insert(entity.id, 1);
+        }
+    }
+    for relation in snapshot.relations.values() {
+        if !rename_reference_kind(relation.kind) {
+            continue;
+        }
+        let (Some(source_id), Some(target_id)) =
+            (relation.src.as_entity(), relation.dst.as_entity())
+        else {
+            continue;
+        };
+        let Some(relation_target) = snapshot.entities.get(&target_id) else {
+            bail!(
+                "rename relation {} points at missing graph entity {}",
+                relation.id,
+                target_id
+            );
+        };
+        if entity_leaf(&relation_target.name) != target.name {
+            continue;
+        }
+        let count = relation_occurrence_count(relation)?;
+        let entry = expected.entry(source_id).or_default();
+        *entry = entry
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("repository rename occurrence count overflow"))?;
+    }
+
+    let planned = edits
+        .iter()
+        .map(|edit| (edit.file.clone(), edit.start_byte, edit.end_byte))
+        .collect::<HashSet<_>>();
+    let mut observed = HashMap::<EntityId, usize>::new();
+    let mut observed_sites = HashSet::new();
+    for (file, language) in source_languages {
+        let body = bodies.get(file).ok_or_else(|| {
+            anyhow::anyhow!("rename coverage body for graph source {file} was not retained")
+        })?;
+        if body.is_empty() {
+            continue;
+        }
+        let whole_file = SourceSpan {
+            file: file.clone(),
+            start_byte: 0,
+            end_byte: body.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+        };
+        let occurrences = find_token_occurrences(body, &target.name, &whole_file, *language)?;
+        let file_entities = snapshot
+            .entities
+            .values()
+            .filter(|entity| entity.file_origin.as_ref() == Some(file))
+            .filter_map(|entity| entity.span.as_ref().map(|span| (entity, span)))
+            .collect::<Vec<_>>();
+        for occurrence in occurrences {
+            let owner = file_entities
+                .iter()
+                .filter(|(_, span)| {
+                    span.start_byte <= occurrence.start_byte
+                        && occurrence.end_byte <= span.end_byte
+                })
+                .min_by_key(|(_, span)| span.end_byte.saturating_sub(span.start_byte))
+                .map(|(entity, _)| *entity)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "repository CAS contains unowned '{}' occurrence at {}:{}..{}; graph reference coverage is incomplete",
+                        target.name,
+                        file,
+                        occurrence.start_byte,
+                        occurrence.end_byte
+                    )
+                })?;
+            *observed.entry(owner.id).or_default() += 1;
+            observed_sites.insert((file.clone(), occurrence.start_byte, occurrence.end_byte));
+        }
+    }
+
+    for entity_id in expected
+        .keys()
+        .chain(observed.keys())
+        .copied()
+        .collect::<BTreeSet<_>>()
+    {
+        let expected_count = expected.get(&entity_id).copied().unwrap_or(0);
+        let observed_count = observed.get(&entity_id).copied().unwrap_or(0);
+        if expected_count != observed_count {
+            bail!(
+                "exhaustive rename-reference coverage disagrees for graph entity {}: graph declarations and edges require {} '{}' occurrence(s), but repository CAS assigns {}; refusing a partial refactor",
+                entity_id,
+                expected_count,
+                target.name,
+                observed_count
+            );
+        }
+    }
+    if !planned.is_subset(&observed_sites) {
+        bail!("rename plan contains an edit outside the exhaustive repository occurrence census");
     }
     Ok(())
+}
+
+fn entity_leaf(name: &str) -> &str {
+    name.rsplit_once("::")
+        .or_else(|| name.rsplit_once('.'))
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(name)
 }
 
 struct ReferenceGroup {
@@ -521,13 +707,17 @@ where
         .expect("rename body was inserted before lookup"))
 }
 
-fn resolve_target(graph: &impl GraphStore, request: &RenameRequest) -> Result<Entity> {
-    let leaf = request
-        .symbol
-        .rsplit_once("::")
-        .or_else(|| request.symbol.rsplit_once('.'))
-        .map(|(_, leaf)| leaf)
-        .unwrap_or(&request.symbol);
+fn resolve_target<F>(
+    graph: &impl GraphStore,
+    request: &RenameRequest,
+    tree: &kin_model::ResolvedTree,
+    bodies: &mut HashMap<FilePathId, String>,
+    load_source: &mut F,
+) -> Result<Entity>
+where
+    F: FnMut(&RepoPath, Hash256) -> Result<Vec<u8>>,
+{
+    let leaf = entity_leaf(&request.symbol);
     let mut matches = graph.query_entities(&EntityFilter {
         name_pattern: Some(leaf.to_string()),
         ..EntityFilter::default()
@@ -535,20 +725,9 @@ fn resolve_target(graph: &impl GraphStore, request: &RenameRequest) -> Result<En
     matches.retain(|entity| entity.name == request.symbol || entity.name == leaf);
     if let Some(file) = request.file.as_deref() {
         let normalized = normalize_repo_hint(file);
-        let at_file = matches
-            .iter()
-            .filter(|entity| {
-                entity
-                    .file_origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.0 == normalized)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !at_file.is_empty() {
-            matches = at_file;
-        } else if let Some(line) = request.line {
-            let containing = graph
+        if let Some(user_line) = request.line {
+            let graph_line = user_line - 1;
+            let mut containing = graph
                 .query_entities(&EntityFilter {
                     file_path: Some(FilePathId::new(normalized.clone())),
                     ..EntityFilter::default()
@@ -558,66 +737,104 @@ fn resolve_target(graph: &impl GraphStore, request: &RenameRequest) -> Result<En
                     entity
                         .span
                         .as_ref()
-                        .is_some_and(|span| span_contains(span, line, request.column))
+                        .is_some_and(|span| span_contains(span, graph_line, request.column))
                 })
-                .min_by_key(|entity| {
+                .collect::<Vec<_>>();
+            containing.sort_by_key(|entity| {
+                (
                     entity
                         .span
                         .as_ref()
                         .map(|span| span.end_byte.saturating_sub(span.start_byte))
-                        .unwrap_or(usize::MAX)
-                });
-            let containing = containing.ok_or_else(|| {
-                anyhow::anyhow!(
+                        .unwrap_or(usize::MAX),
+                    entity.id,
+                )
+            });
+            if containing.is_empty() {
+                bail!(
                     "no graph source entity contains {}:{}; rename file/line hint cannot be proven",
                     normalized,
-                    line
-                )
-            })?;
-            let targets = graph
-                .get_all_relations_for_entity(&containing.id)?
-                .into_iter()
-                .filter(|relation| {
-                    relation.src == GraphNodeId::Entity(containing.id)
-                        && rename_reference_kind(relation.kind)
-                })
-                .filter_map(|relation| relation.dst.as_entity())
-                .collect::<HashSet<_>>();
-            let related = matches
-                .iter()
-                .filter(|entity| targets.contains(&entity.id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if related.is_empty() {
-                bail!(
-                    "entity '{}' is not graph-linked from {}:{}; rename file/line hint cannot be proven",
-                    request.symbol,
-                    normalized,
-                    line
+                    user_line
                 );
             }
-            matches = related;
+
+            // A same-named declaration is eligible only when the cursor is
+            // inside that declaration's own graph span. Never keep another
+            // declaration merely because it shares the file and spelling.
+            let containing_ids = containing
+                .iter()
+                .map(|entity| entity.id)
+                .collect::<HashSet<_>>();
+            let mut declarations = Vec::new();
+            for candidate in &matches {
+                if containing_ids.contains(&candidate.id)
+                    && cursor_hits_declaration(
+                        candidate,
+                        user_line,
+                        request.column,
+                        tree,
+                        bodies,
+                        load_source,
+                    )?
+                {
+                    declarations.push(candidate.clone());
+                }
+            }
+            if !declarations.is_empty() {
+                matches = declarations;
+            } else {
+                // Resolve from the smallest containing source entity first. If
+                // a nested scope has no applicable edge, move outward one
+                // owner at a time; never combine unrelated scope candidates.
+                let mut related = Vec::new();
+                for owner in containing {
+                    let targets = graph
+                        .get_all_relations_for_entity(&owner.id)?
+                        .into_iter()
+                        .filter(|relation| {
+                            relation.src == GraphNodeId::Entity(owner.id)
+                                && rename_reference_kind(relation.kind)
+                        })
+                        .filter_map(|relation| relation.dst.as_entity())
+                        .collect::<HashSet<_>>();
+                    related = matches
+                        .iter()
+                        .filter(|entity| targets.contains(&entity.id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !related.is_empty() {
+                        break;
+                    }
+                }
+                if related.is_empty() {
+                    bail!(
+                        "entity '{}' is not graph-linked from {}:{}; rename file/line hint cannot be proven",
+                        request.symbol,
+                        normalized,
+                        user_line
+                    );
+                }
+                matches = related;
+            }
         } else {
-            bail!(
-                "entity '{}' is not declared in graph file {}; provide a declaration file or a graph-linked --line cursor",
-                request.symbol,
-                normalized
-            );
-        }
-    }
-    if let Some(line) = request.line {
-        let containing = matches
-            .iter()
-            .filter(|entity| {
-                entity
-                    .span
-                    .as_ref()
-                    .is_some_and(|span| span_contains(span, line, request.column))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !containing.is_empty() {
-            matches = containing;
+            let declarations = matches
+                .iter()
+                .filter(|entity| {
+                    entity
+                        .file_origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.0 == normalized)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if declarations.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "entity '{}' is not declared in graph file {}; provide a declaration file or a graph-linked --line cursor",
+                    request.symbol,
+                    normalized
+                ));
+            }
+            matches = declarations;
         }
     }
     matches.sort_by_key(|entity| {
@@ -648,7 +865,7 @@ fn resolve_target(graph: &impl GraphStore, request: &RenameRequest) -> Result<En
                         entity
                             .span
                             .as_ref()
-                            .map(|span| span.start_line)
+                            .map(|span| span.start_line + 1)
                             .unwrap_or(0)
                     )
                 })
@@ -661,6 +878,46 @@ fn resolve_target(graph: &impl GraphStore, request: &RenameRequest) -> Result<En
             )
         }
     }
+}
+
+fn cursor_hits_declaration<F>(
+    candidate: &Entity,
+    user_line: u32,
+    byte_column: Option<u32>,
+    tree: &kin_model::ResolvedTree,
+    bodies: &mut HashMap<FilePathId, String>,
+    load_source: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&RepoPath, Hash256) -> Result<Vec<u8>>,
+{
+    let file = candidate.file_origin.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cursor declaration candidate {} has no graph source file",
+            candidate.id
+        )
+    })?;
+    let span = candidate.span.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cursor declaration candidate {} has no graph source span",
+            candidate.id
+        )
+    })?;
+    let body = load_cached_body(tree, file, bodies, load_source)?;
+    let leaf = entity_leaf(&candidate.name);
+    let occurrences = find_token_occurrences(body, leaf, span, candidate.language)?;
+    let Some(declaration) = occurrences.first() else {
+        bail!(
+            "graph declaration {} named '{}' has no exact identifier token in its repository-CAS span",
+            candidate.id,
+            candidate.name
+        );
+    };
+    if declaration.start_line != user_line {
+        return Ok(false);
+    }
+    Ok(byte_column
+        .is_none_or(|column| declaration.start_col <= column && column < declaration.end_col))
 }
 
 fn reject_local_name_collision(
@@ -731,6 +988,7 @@ fn find_token_occurrences(
     content: &str,
     symbol: &str,
     span: &SourceSpan,
+    language: LanguageId,
 ) -> Result<Vec<TokenOccurrence>> {
     if span.start_byte >= span.end_byte || span.end_byte > content.len() {
         bail!(
@@ -757,7 +1015,7 @@ fn find_token_occurrences(
     for (relative, _) in content[span.start_byte..span.end_byte].match_indices(symbol) {
         let start = span.start_byte + relative;
         let end = start + symbol.len();
-        if !is_symbol_boundary(content, start, symbol.len()) {
+        if !is_symbol_boundary(content, start, symbol.len(), language) {
             continue;
         }
         let line_index = line_starts.partition_point(|line_start| *line_start <= start) - 1;
@@ -776,20 +1034,27 @@ fn find_token_occurrences(
     Ok(occurrences)
 }
 
-fn is_symbol_boundary(content: &str, start: usize, symbol_len: usize) -> bool {
+fn is_symbol_boundary(
+    content: &str,
+    start: usize,
+    symbol_len: usize,
+    language: LanguageId,
+) -> bool {
     let before = content[..start].chars().next_back();
     let after = content[start + symbol_len..].chars().next();
-    before.is_none_or(|character| !is_identifier_char(character))
-        && after.is_none_or(|character| !is_identifier_char(character))
+    before.is_none_or(|character| !is_identifier_continue(language, character))
+        && after.is_none_or(|character| !is_identifier_continue(language, character))
 }
 
-fn span_contains(span: &SourceSpan, line: u32, column: Option<u32>) -> bool {
-    if line < span.start_line || line > span.end_line {
+fn span_contains(span: &SourceSpan, graph_line: u32, byte_column: Option<u32>) -> bool {
+    if graph_line < span.start_line || graph_line > span.end_line {
         return false;
     }
-    let Some(column) = column else { return true };
-    (line != span.start_line || column >= span.start_col)
-        && (line != span.end_line || column <= span.end_col)
+    let Some(byte_column) = byte_column else {
+        return graph_line < span.end_line || span.end_col > 0;
+    };
+    (graph_line > span.start_line || byte_column >= span.start_col)
+        && (graph_line < span.end_line || byte_column < span.end_col)
 }
 
 fn looks_like_identifier(candidate: &str) -> bool {
@@ -798,11 +1063,29 @@ fn looks_like_identifier(candidate: &str) -> bool {
         return false;
     };
     (first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
-        && characters.all(is_identifier_char)
+        && characters.all(|character| is_identifier_continue(LanguageId::TypeScript, character))
 }
 
-fn is_identifier_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+fn is_identifier_continue(_language: LanguageId, character: char) -> bool {
+    // Unicode XID is the common safe core across the supported language
+    // families. The extras are a conservative superset used only as a
+    // boundary refusal: accepting too much here can reject a rename, while
+    // accepting too little can splice an ASCII leaf out of a larger identifier.
+    unicode_ident::is_xid_continue(character)
+        || matches!(character, '_' | '$' | '\u{200c}' | '\u{200d}' | '?' | '!')
+}
+
+fn validate_cursor(file: Option<&str>, line: Option<u32>, column: Option<u32>) -> Result<()> {
+    if line == Some(0) {
+        bail!("--line is 1-based and must be greater than zero");
+    }
+    if column.is_some() && line.is_none() {
+        bail!("--column requires --line and is measured in 0-based UTF-8 bytes");
+    }
+    if line.is_some() && file.is_none() {
+        bail!("--line requires --file so the cursor coordinate has one graph source domain");
+    }
+    Ok(())
 }
 
 fn normalize_file_hint(layout: &kin_core::KinLayout, hint: &str) -> String {
@@ -842,7 +1125,8 @@ mod tests {
             end_line: 1,
             end_col: source.len() as u32,
         };
-        let occurrences = find_token_occurrences(source, "target", &span).unwrap();
+        let occurrences =
+            find_token_occurrences(source, "target", &span, LanguageId::Rust).unwrap();
         assert_eq!(occurrences.len(), 2);
         assert_eq!(
             &source[occurrences[0].start_byte..occurrences[0].end_byte],
@@ -852,6 +1136,47 @@ mod tests {
             &source[occurrences[1].start_byte..occurrences[1].end_byte],
             "target"
         );
+    }
+
+    #[test]
+    fn unicode_identifier_neighbors_are_not_ascii_token_boundaries() {
+        let file = FilePathId::new("caller.py");
+        let source = "def caller():\n    return éfoo() + fooé()\n";
+        let span = SourceSpan {
+            file,
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 31,
+        };
+        assert!(
+            find_token_occurrences(source, "foo", &span, LanguageId::Python)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cursor_coordinates_are_one_based_lines_and_exclusive_byte_columns() {
+        assert!(validate_cursor(Some("src/lib.rs"), Some(1), Some(0)).is_ok());
+        assert!(validate_cursor(Some("src/lib.rs"), Some(0), None).is_err());
+        assert!(validate_cursor(Some("src/lib.rs"), None, Some(0)).is_err());
+        assert!(validate_cursor(None, Some(1), None).is_err());
+
+        let span = SourceSpan {
+            file: FilePathId::new("src/lib.rs"),
+            start_byte: 2,
+            end_byte: 8,
+            start_line: 0,
+            start_col: 2,
+            end_line: 0,
+            end_col: 8,
+        };
+        assert!(span_contains(&span, 0, Some(2)));
+        assert!(span_contains(&span, 0, Some(7)));
+        assert!(!span_contains(&span, 0, Some(8)));
     }
 
     #[test]
