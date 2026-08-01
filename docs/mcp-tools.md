@@ -27,13 +27,18 @@ small curated surface below instead of the full internal one):
 {
   "mcpServers": {
     "kin": {
-      "command": "kin",
+      "command": "/absolute/path/to/kin",
       "args": ["mcp", "start"],
       "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
   }
 }
 ```
+
+The wizard substitutes the installation's exact absolute launcher path. A bare `kin`
+command is not a supported manual shortcut because agent clients do not reliably inherit
+your shell `PATH`. The canonical `npx -y @kinlab/kin mcp start` topology is also accepted;
+see the quickstart's advanced configuration for its exact JSON and repository-bound forms.
 
 To wire a client up by hand, or to use the canonical npm wrapper (`@kinlab/kin`, which
 can run `kin mcp start` with the same `agent-default` profile), see

@@ -16,6 +16,11 @@ npx -y @kinlab/kin --version
 npx -y @kinlab/kin setup --intent agent --no-interactive
 ```
 
+Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+No native Windows ARM64 archive is published. An x64 Node process under Windows
+emulation can provision the x86_64 archive for diagnostics; use WSL2 for the
+repository workflow documented below.
+
 ## What it does
 
 `@kinlab/kin` ships two thin launchers, not a JavaScript reimplementation:
@@ -31,7 +36,7 @@ The launcher and the shell installer (`scripts/install.sh`) share the same insta
 contract (`$KIN_HOME`, default `~/.kin`): either lane satisfies the other, and neither
 silently downgrades an install the other made.
 
-Run `kin setup --intent agent` after provisioning. Setup writes the Kin MCP server into
+On macOS, Linux, or WSL2, run `kin setup --intent agent` after provisioning. Setup writes the Kin MCP server into
 detected AI clients with the `agent-default` tool profile, adds the managed bin directory
 to your shell profile, installs the shell/session hook, and records the install ledger used
 by `kin setup status`, `kin doctor --fix`, and `kin setup uninstall`.
@@ -74,6 +79,12 @@ Any MCP client can also use the included server manually:
   "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
 }
 ```
+
+`kin setup status` and `kin doctor` recognize this exact canonical wrapper topology instead
+of flagging it for repair. Do not shorten `command` to a bare `kin`: agent clients do not
+reliably inherit your shell `PATH`. Codex and Antigravity bindings additionally require
+`"--repo", "/absolute/path/to/repository"` at the end of the argument vector; an Antigravity
+workspace entry also uses that path as `cwd`.
 
 `@kinlab/kin-mcp` remains published for existing configurations; new setups should use
 this package.

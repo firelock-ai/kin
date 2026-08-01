@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Public install proof: verifies the release works end-to-end from a clean
-# environment on every supported OS. Anonymous only — no checkout, no secrets,
-# no registry auth — exactly what a first-time user runs. Exercises the real
-# `get.kinlab.dev` installer, the GitHub-release artifacts + checksum
-# verification, and a post-install daemon/setup health smoke.
+# Public install proof: verifies the complete repository workflow on Unix and
+# the explicit repository-free refusal contract on native Windows. Anonymous
+# only — no checkout, no secrets, no registry auth — exactly what a first-time
+# user downloads. Exercises the real `get.kinlab.dev` installer and public
+# GitHub-release artifacts with checksum and provenance verification.
 name: Install Proof
 
 on:
@@ -98,6 +98,29 @@ jobs:
           daemon_version_line="$(kin-daemon --version)"
           printf '%s\n' "$kin_version_line" | tee kin-version.txt
           printf '%s\n' "$daemon_version_line" | tee kin-daemon-version.txt
+
+          # Capture the one launcher path the public installer owns. Later
+          # setup/health/config checks bind every MCP entry to this exact file,
+          # rather than merely accepting any command that happens to be named
+          # `kin` or trusting the runner's PATH.
+          RUNNER_OS="$RUNNER_OS" node <<'NODE'
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+          const { execFileSync } = require("child_process");
+
+          const executable = process.env.RUNNER_OS === "Windows" ? "kin.exe" : "kin";
+          const installedKin = path.join(os.homedir(), ".kin", "bin", executable);
+          if (!fs.statSync(installedKin).isFile()) {
+            throw new Error(`public installer did not create a regular Kin launcher at ${installedKin}`);
+          }
+          const directVersion = execFileSync(installedKin, ["--version"], { encoding: "utf8" }).trim();
+          const pathVersion = fs.readFileSync("kin-version.txt", "utf8").trim();
+          if (directVersion !== pathVersion) {
+            throw new Error(`PATH selected ${pathVersion}, but the installed launcher reports ${directVersion}`);
+          }
+          fs.writeFileSync("installed-kin-command.txt", `${installedKin}\n`);
+          NODE
 
           expected_tag="$RELEASE_EVENT_TAG"
           if [ -z "$expected_tag" ]; then
@@ -533,10 +556,11 @@ jobs:
       # provenance bound to the release tag's public source, the platform
       # capability posture, and the setup writers for the shell hook, the
       # install ledger, and every agent-client MCP config a repo-free install
-      # can write, which is four of the five. `kin bench-meta` reports the CLI
+      # can write, which is four of the six. `kin bench-meta` reports the CLI
       # build alone, so the daemon's build provenance is not bound here. Codex
-      # is excluded by the product rather than by this proof, because its entry
-      # binds an exact repository, and that exclusion is asserted below.
+      # and Antigravity are excluded by the product rather than by this proof,
+      # because their entries bind an exact repository; both exclusions are
+      # asserted below.
       - name: Windows repo-free provenance and setup proof
         if: runner.os == 'Windows'
         shell: bash
@@ -564,7 +588,7 @@ jobs:
           # .exe copies rather than shell scripts.
           fake_agent_bin="$RUNNER_TEMP/kin-proof-agent-bin"
           mkdir -p "$fake_agent_bin"
-          for agent in claude cursor codex gemini windsurf; do
+          for agent in claude cursor codex gemini windsurf agy; do
             cp "$(command -v kin)" "$fake_agent_bin/$agent.exe"
           done
           export PATH="$fake_agent_bin:$PATH"
@@ -581,6 +605,11 @@ jobs:
 
           const expectedCommit = fs.readFileSync("expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("expected-lock-sha.txt", "utf8").trim();
+          const installedKin = fs.readFileSync("installed-kin-command.txt", "utf8").trim();
+          const expectedInstalledKin = path.join(os.homedir(), ".kin", "bin", "kin.exe");
+          if (installedKin !== expectedInstalledKin) {
+            throw new Error(`installed Kin command proof ${installedKin || "missing"} does not equal ${expectedInstalledKin}`);
+          }
           const meta = JSON.parse(fs.readFileSync("kin-windows-bench-meta.json", "utf8"));
           if (meta.kin_commit !== expectedCommit) {
             throw new Error(`installed Windows build SHA ${meta.kin_commit ?? "missing"} does not match release tag ${expectedCommit}`);
@@ -594,6 +623,13 @@ jobs:
           if (meta.dependency_provenance !== expectedLock) {
             throw new Error(`installed Windows Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} does not match release source ${expectedLock}`);
           }
+          if (
+            meta.embeddings?.vector_enabled !== false ||
+            meta.embeddings?.embeddings_enabled !== false ||
+            meta.embeddings?.metal_enabled !== false
+          ) {
+            throw new Error("installed Windows CLI does not prove the vector-free feature contract");
+          }
 
           const authority = JSON.parse(fs.readFileSync("kin-windows-registry-authority.json", "utf8"));
           if (authority.checks?.length !== 1 || authority.checks[0]?.state !== "unsupported") {
@@ -604,6 +640,27 @@ jobs:
             .filter((check) => check.status !== "healthy")
             .map((check) => `${check.id}=${check.status}`)
             .join(", ") || "none";
+          const validateHealthReport = (report, reportPath) => {
+            if (!Array.isArray(report.checks)) {
+              throw new Error(`${reportPath}: checks is missing or malformed`);
+            }
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            if (checks.size !== report.checks.length) {
+              throw new Error(`${reportPath}: duplicate health-check ids are not authoritative`);
+            }
+            const expectedHealthy = !report.checks.some(
+              (check) =>
+                check.status === "missing" ||
+                check.status === "misconfigured" ||
+                (check.id === "semantic_query_readiness" && check.status === "stale")
+            );
+            if (report.healthy !== expectedHealthy) {
+              throw new Error(
+                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${expectedHealthy}`
+              );
+            }
+            return checks;
+          };
           // The repo-free Windows posture, pinned by name. `repo_init` is
           // missing because there is no repository here, and `daemon_running`
           // is unsupported because the daemon is repo-scoped. Both are the
@@ -628,7 +685,7 @@ jobs:
 
           for (const reportPath of ["kin-windows-health.json", "kin-windows-doctor.json"]) {
             const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            const checks = validateHealthReport(report, reportPath);
             // Missing `repo_init` is the one degradation this repo-free posture
             // expects, and it flips the aggregate report.healthy to false on its
             // own. Accept that single named reason and keep every other
@@ -658,17 +715,13 @@ jobs:
             if (hardFailures.length > 0) {
               throw new Error(`${reportPath}: hard failures: ${hardFailures.map((c) => c.id).join(", ")}`);
             }
-            // Codex is the one agent client Kin cannot configure without a
-            // repository. Its entry binds `mcp start --repo <exact
-            // repository>`, so setup refuses it by design here and never
-            // writes the config, which drops the check from the report
-            // entirely. Asserted as an absence rather than left unmentioned,
-            // so a Codex writer that ever becomes repo-free trips this and
-            // has to come here and say so.
-            if (checks.has("mcp_client_codex")) {
-              throw new Error(
-                `${reportPath}: mcp_client_codex is present without a repository, so the repo-free Codex writer changed`
-              );
+            // Codex and Antigravity cannot be configured without a repository.
+            // Their entries bind `mcp start --repo <exact repository>`, so
+            // setup refuses both by design here and writes neither config.
+            for (const id of ["mcp_client_codex", "mcp_client_antigravity", "mcp_client_antigravity_workspace"]) {
+              if (checks.has(id)) {
+                throw new Error(`${reportPath}: ${id} is present without a repository, so a repo-bound writer changed`);
+              }
             }
           }
 
@@ -681,8 +734,21 @@ jobs:
           ];
           for (const configPath of jsonConfigs) {
             const entry = JSON.parse(fs.readFileSync(configPath, "utf8"))?.mcpServers?.kin;
-            if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {
+            if (
+              !entry ||
+              entry.command !== installedKin ||
+              JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) ||
+              entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default"
+            ) {
               throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
+            }
+          }
+          for (const forbiddenPath of [
+            path.join(home, ".gemini", "config", "mcp_config.json"),
+            path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"),
+          ]) {
+            if (fs.existsSync(forbiddenPath)) {
+              throw new Error(`${forbiddenPath}: repo-free Windows setup wrote a repository-bound Antigravity config`);
             }
           }
           NODE
@@ -736,13 +802,16 @@ jobs:
           cat kin-status.txt
           kin status --json > kin-status.json 2>&1
           cat kin-status.json
+          kin bench-meta --json > kin-build-meta.json
+          cat kin-build-meta.json
           # Prove every supported agent-client config writer without requiring
           # the proprietary clients on a public runner. Detection is PATH-based;
           # these inert shims make setup exercise the real merge paths while the
           # MCP process itself is exercised separately below.
+          proof_base_path="$PATH"
           fake_agent_bin="$RUNNER_TEMP/kin-proof-agent-bin"
           mkdir -p "$fake_agent_bin"
-          for agent in claude cursor codex gemini windsurf; do
+          for agent in claude cursor codex gemini windsurf agy; do
             if [ "$RUNNER_OS" = "Windows" ]; then
               # which-rs follows PATHEXT on Windows, so use a real .exe rather
               # than relying on shell-script executability through MSYS.
@@ -752,12 +821,80 @@ jobs:
               chmod +x "$fake_agent_bin/$agent"
             fi
           done
-          export PATH="$fake_agent_bin:$PATH"
+          export PATH="$fake_agent_bin:$proof_base_path"
+          printf '%s\n' "$fake_agent_bin" >> "$GITHUB_PATH"
+
+          # Antigravity's legacy global path is repaired only when a Kin entry
+          # is already present. Seed an intentionally stale entry so this
+          # conditional writer is part of the release-byte proof, with the
+          # current repository cwd retained as user-owned state.
+          antigravity_legacy="$HOME/.gemini/antigravity-ide/mcp_config.json"
+          mkdir -p "$(dirname "$antigravity_legacy")"
+          ANTIGRAVITY_LEGACY="$antigravity_legacy" REPO_ROOT="$(pwd -P)" node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const config = {
+            userPolicy: "preserve",
+            mcpServers: {
+              kin: {
+                command: "/stale/kin",
+                args: ["mcp", "start"],
+                cwd: process.env.REPO_ROOT,
+                env: { USER_POLICY: "preserve" },
+              },
+            },
+          };
+          fs.writeFileSync(process.env.ANTIGRAVITY_LEGACY, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
 
           kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
             2>&1 | tee kin-setup.txt
-          kin setup status --json | tee kin-health.json
-          kin doctor --json | tee kin-doctor.json
+
+          # Normalize the real TOML Codex entry with Python's standard parser
+          # so the later cross-platform Node validator can apply the same exact
+          # command/args/profile checks it applies to JSON clients.
+          CODEX_CONFIG="$HOME/.codex/config.toml" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tomllib
+
+          config = pathlib.Path(os.environ["CODEX_CONFIG"])
+          with config.open("rb") as handle:
+              entry = tomllib.load(handle)["mcp_servers"]["kin"]
+          pathlib.Path("kin-codex-config.json").write_text(
+              json.dumps({"mcpServers": {"kin": entry}}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          # Exercise Claude's supported fallback writer in an isolated HOME.
+          # Pre-creating only ~/.claude/config.json makes that branch mandatory;
+          # KIN_HOME remains bound to the public installation under test.
+          primary_home="$HOME"
+          claude_fallback_home="$RUNNER_TEMP/kin-proof-claude-fallback-home"
+          claude_fallback_bin="$RUNNER_TEMP/kin-proof-claude-fallback-bin"
+          mkdir -p "$claude_fallback_home/.claude"
+          mkdir -p "$claude_fallback_bin"
+          printf '{}\n' > "$claude_fallback_home/.claude/config.json"
+          printf '#!/bin/sh\nexit 0\n' > "$claude_fallback_bin/claude"
+          chmod +x "$claude_fallback_bin/claude"
+          claude_fallback_path="$claude_fallback_bin:$primary_home/.kin/bin:/usr/bin:/bin"
+          HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
+          KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
+            kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
+            2>&1 | tee kin-claude-fallback-setup.txt
+          if [ -e "$claude_fallback_home/.claude.json" ]; then
+            echo "Claude fallback proof unexpectedly wrote the primary ~/.claude.json path" >&2
+            exit 1
+          fi
+          cp "$claude_fallback_home/.claude/config.json" kin-claude-fallback-config.json
+          HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
+          KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
+            kin setup status --json > kin-claude-fallback-health.json
+          HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
+          KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
+            kin doctor --json > kin-claude-fallback-doctor.json
 
       - name: Graph query and MCP tool-call proof
         if: runner.os != 'Windows'
@@ -768,11 +905,52 @@ jobs:
           kin search hello --json | tee kin-search.json
           kin locate hello --json --explain --max-files 5 | tee kin-locate.json
 
+          # `kin status` deliberately does not auto-start the daemon. The graph
+          # query above does, so capture daemon provenance only after that
+          # startup path has completed and published its endpoint.
+          daemon_port="$(tr -d '[:space:]' < .kin/daemon.port)"
+          case "$daemon_port" in
+            ''|*[!0-9]*)
+              echo "installed daemon published an invalid port: $daemon_port" >&2
+              exit 1
+              ;;
+          esac
+          DAEMON_PORT="$daemon_port" node <<'NODE' > kin-daemon-health.json
+          const http = require("http");
+          const request = http.get(
+            `http://127.0.0.1:${process.env.DAEMON_PORT}/health`,
+            (response) => {
+              const chunks = [];
+              response.on("data", (chunk) => chunks.push(chunk));
+              response.on("end", () => {
+                const body = Buffer.concat(chunks);
+                if (response.statusCode !== 200) {
+                  console.error(`daemon health returned HTTP ${response.statusCode}: ${body}`);
+                  process.exitCode = 1;
+                  return;
+                }
+                process.stdout.write(body);
+              });
+            }
+          );
+          request.setTimeout(30000, () => {
+            request.destroy(new Error("daemon health request exceeded 30 seconds"));
+          });
+          request.on("error", (error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+          cat kin-daemon-health.json
+          kin setup status --json | tee kin-health.json
+          kin doctor --json | tee kin-doctor.json
+
           # Drive the installed MCP stdio server through initialize, tools/list,
           # and a real graph-backed semantic_search call. Node owns the timeout
           # so this behaves the same on Linux, macOS, and Windows.
           node <<'NODE'
           const fs = require("fs");
+          const path = require("path");
           const { spawn } = require("child_process");
 
           const requests = [
@@ -790,9 +968,18 @@ jobs:
             },
           ];
 
-          const child = spawn("kin", ["mcp", "start", "--repo", "."], {
-            cwd: process.cwd(),
-            env: process.env,
+          // Launch through the exact Antigravity workspace entry emitted by
+          // setup. This makes command, arguments, cwd, and profile part of the
+          // working MCP smoke rather than parallel assertions beside a
+          // hard-coded `kin mcp start` process.
+          const configPath = path.join(process.cwd(), ".agents", "mcp_config.json");
+          const entry = JSON.parse(fs.readFileSync(configPath, "utf8"))?.mcpServers?.kin;
+          if (!entry || typeof entry.command !== "string" || !Array.isArray(entry.args) || typeof entry.cwd !== "string") {
+            throw new Error(`${configPath}: captured MCP launch entry is missing`);
+          }
+          const child = spawn(entry.command, entry.args, {
+            cwd: entry.cwd,
+            env: { ...process.env, ...(entry.env ?? {}) },
             stdio: ["pipe", "pipe", "pipe"],
           });
           let stdout = "";
@@ -1069,46 +1256,92 @@ jobs:
           const runnerOs = process.env.RUNNER_OS;
           const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
-          const status = JSON.parse(fs.readFileSync("kin-status.json", "utf8"));
-          const build = status.build;
-          if (!build) {
-            throw new Error("kin-status.json: build provenance is missing");
+          const installedKin = fs.readFileSync("../installed-kin-command.txt", "utf8").trim();
+          const expectedInstalledKin = path.join(os.homedir(), ".kin", "bin", "kin");
+          if (installedKin !== expectedInstalledKin) {
+            throw new Error(`installed Kin command proof ${installedKin || "missing"} does not equal ${expectedInstalledKin}`);
           }
+          const status = JSON.parse(fs.readFileSync("kin-status.json", "utf8"));
+          const cliMeta = JSON.parse(fs.readFileSync("kin-build-meta.json", "utf8"));
+          const daemonHealth = JSON.parse(fs.readFileSync("kin-daemon-health.json", "utf8"));
           const fullSha = /^[0-9a-f]{40}$/;
           const lockSha = /^[0-9a-f]{64}$/;
-          for (const side of ["cli", "daemon"]) {
-            const sha = build[`${side}_sha`];
-            const dirty = build[`${side}_dirty`];
-            const sourceKnown = build[`${side}_source_known`];
-            const provenance = build[`${side}_dependency_provenance`];
-            if (!fullSha.test(sha ?? "")) {
-              throw new Error(`${side} build SHA is not a full 40-hex commit: ${sha ?? "missing"}`);
+          if (cliMeta.schema !== "kin.bench-meta.v2") {
+            throw new Error(`kin-build-meta.json: unsupported schema ${cliMeta.schema ?? "missing"}`);
+          }
+          const builds = new Map([
+            ["cli", {
+              sha: cliMeta.kin_commit,
+              dirty: cliMeta.kin_dirty,
+              sourceKnown: cliMeta.kin_source_known,
+              dependencyProvenance: cliMeta.dependency_provenance,
+            }],
+            ["daemon", {
+              sha: daemonHealth.build?.sha,
+              dirty: daemonHealth.build?.dirty,
+              sourceKnown: daemonHealth.build?.source_known,
+              dependencyProvenance: daemonHealth.build?.dependency_provenance,
+            }],
+          ]);
+          for (const [side, build] of builds) {
+            if (!fullSha.test(build.sha ?? "")) {
+              throw new Error(`${side} build SHA is not a full 40-hex commit: ${build.sha ?? "missing"}`);
             }
-            if (sha !== expectedCommit) {
-              throw new Error(`${side} build SHA ${sha} does not match release tag ${expectedCommit}`);
+            if (build.sha !== expectedCommit) {
+              throw new Error(`${side} build SHA ${build.sha} does not match release tag ${expectedCommit}`);
             }
-            if (dirty !== false) {
+            if (build.dirty !== false) {
               throw new Error(`${side} release binary is dirty or did not report a clean build`);
             }
-            if (sourceKnown !== true) {
+            if (build.sourceKnown !== true) {
               throw new Error(`${side} release binary did not prove source_known=true`);
             }
-            if (!lockSha.test(provenance ?? "")) {
+            if (!lockSha.test(build.dependencyProvenance ?? "")) {
               throw new Error(`${side} Cargo.lock provenance is missing or malformed`);
             }
-            if (provenance !== expectedLock) {
-              throw new Error(`${side} Cargo.lock provenance ${provenance} does not match release source ${expectedLock}`);
+            if (build.dependencyProvenance !== expectedLock) {
+              throw new Error(`${side} Cargo.lock provenance ${build.dependencyProvenance} does not match release source ${expectedLock}`);
             }
           }
-          if (build.cli_dependency_provenance !== build.daemon_dependency_provenance) {
+          if (builds.get("cli").dependencyProvenance !== builds.get("daemon").dependencyProvenance) {
             throw new Error("CLI and daemon were built from different Cargo.lock provenance");
           }
-          const semanticCoverage = status.semantic_coverage;
-          if (!semanticCoverage) {
-            throw new Error("kin-status.json: semantic_coverage is missing");
+
+          if (status.schema !== "kin.status.v3") {
+            throw new Error(`kin-status.json: unsupported schema ${status.schema ?? "missing"}`);
           }
-          if (semanticCoverage.supported !== true) {
-            throw new Error(`${runnerOs} release unexpectedly lacks semantic vector support`);
+          const validateEmbeddingCoverage = (coverage, label) => {
+            if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
+              throw new Error(`${label}: embedding_coverage is missing or malformed`);
+            }
+            if (coverage.state === "observed") {
+              if (coverage.source !== "live_query_graph") {
+                throw new Error(`${label}: observed coverage has source ${coverage.source ?? "missing"}`);
+              }
+              for (const field of ["indexed", "pending", "total"]) {
+                if (!Number.isSafeInteger(coverage[field]) || coverage[field] < 0) {
+                  throw new Error(`${label}: embedding_coverage.${field} is not a non-negative integer`);
+                }
+              }
+              if (coverage.reason !== undefined || coverage.indexed > coverage.total || coverage.pending < coverage.total - coverage.indexed) {
+                throw new Error(`${label}: observed embedding coverage violates kin.status.v3 invariants`);
+              }
+            } else if (coverage.state === "unobserved") {
+              if (typeof coverage.reason !== "string" || coverage.reason.length === 0) {
+                throw new Error(`${label}: unobserved embedding coverage carries no reason`);
+              }
+              for (const field of ["source", "indexed", "pending", "total"]) {
+                if (coverage[field] !== undefined) {
+                  throw new Error(`${label}: unobserved embedding coverage carries ${field}`);
+                }
+              }
+            } else {
+              throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
+            }
+          };
+          validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
+          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
+            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
@@ -1118,6 +1351,48 @@ jobs:
             .filter((check) => check.status !== "healthy")
             .map((check) => `${check.id}=${check.status}`)
             .join(", ") || "none";
+          const validateHealthReport = (report, reportPath) => {
+            if (!Array.isArray(report.checks)) {
+              throw new Error(`${reportPath}: checks is missing or malformed`);
+            }
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            if (checks.size !== report.checks.length) {
+              throw new Error(`${reportPath}: duplicate health-check ids are not authoritative`);
+            }
+            const expectedHealthy = !report.checks.some(
+              (check) =>
+                check.status === "missing" ||
+                check.status === "misconfigured" ||
+                (check.id === "semantic_query_readiness" && check.status === "stale")
+            );
+            if (report.healthy !== expectedHealthy) {
+              throw new Error(
+                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${expectedHealthy}`
+              );
+            }
+            return checks;
+          };
+          for (const fallbackReportPath of [
+            "kin-claude-fallback-health.json",
+            "kin-claude-fallback-doctor.json",
+          ]) {
+            const fallbackReport = JSON.parse(fs.readFileSync(fallbackReportPath, "utf8"));
+            const fallbackChecks = validateHealthReport(fallbackReport, fallbackReportPath);
+            if (fallbackChecks.get("mcp_client_claude")?.status !== "healthy") {
+              throw new Error(`${fallbackReportPath}: forced Claude fallback config is not healthy`);
+            }
+            for (const absentId of [
+              "mcp_client_cursor",
+              "mcp_client_codex",
+              "mcp_client_gemini",
+              "mcp_client_windsurf",
+              "mcp_client_antigravity",
+            ]) {
+              if (fallbackChecks.has(absentId)) {
+                throw new Error(`${fallbackReportPath}: isolated fallback HOME unexpectedly exposed ${absentId}`);
+              }
+            }
+          }
           const required = new Map([
             ["kin_binary", "healthy"],
             ["kin_daemon_binary", "healthy"],
@@ -1132,10 +1407,12 @@ jobs:
             ["mcp_client_codex", "healthy"],
             ["mcp_client_gemini", "healthy"],
             ["mcp_client_windsurf", "healthy"],
+            ["mcp_client_antigravity", "healthy"],
+            ["mcp_client_antigravity_workspace", "healthy"],
           ]);
 
           for (const [path, report] of reports) {
-            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            const checks = validateHealthReport(report, path);
             // This capability capture runs before `kin embed`, so the daemon
             // graph still has embeddings pending. Under graph-authoritative
             // health that is semantic_query_readiness=stale, an intentional
@@ -1186,29 +1463,61 @@ jobs:
           }
 
           const home = os.homedir();
-          const jsonConfigs = [
-            path.join(home, ".claude.json"),
-            path.join(home, ".cursor", "mcp.json"),
-            path.join(home, ".gemini", "settings.json"),
-            path.join(home, ".codeium", "windsurf", "mcp_config.json"),
+          const repoRoot = fs.realpathSync(process.cwd());
+          const ordinaryArgs = ["mcp", "start"];
+          const repositoryArgs = ["mcp", "start", "--repo", repoRoot];
+          const mcpConfigs = [
+            { path: path.join(home, ".claude.json"), args: ordinaryArgs },
+            { path: path.join(home, ".cursor", "mcp.json"), args: ordinaryArgs },
+            { path: path.join(home, ".gemini", "settings.json"), args: ordinaryArgs },
+            { path: path.join(home, ".codeium", "windsurf", "mcp_config.json"), args: ordinaryArgs },
+            { path: "kin-claude-fallback-config.json", args: ordinaryArgs },
+            { path: "kin-codex-config.json", args: repositoryArgs },
+            { path: path.join(home, ".gemini", "config", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
+            { path: path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
+            { path: path.join(repoRoot, ".agents", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
           ];
-          for (const configPath of jsonConfigs) {
-            const entry = JSON.parse(fs.readFileSync(configPath, "utf8"))?.mcpServers?.kin;
-            if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {
-              throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
+          for (const expected of mcpConfigs) {
+            const entry = JSON.parse(fs.readFileSync(expected.path, "utf8"))?.mcpServers?.kin;
+            if (
+              !entry ||
+              entry.command !== installedKin ||
+              JSON.stringify(entry.args) !== JSON.stringify(expected.args) ||
+              entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default" ||
+              (expected.cwd !== undefined && entry.cwd !== expected.cwd)
+            ) {
+              throw new Error(`${expected.path}: Kin MCP entry is missing or malformed`);
             }
+          }
+          const legacy = JSON.parse(
+            fs.readFileSync(path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), "utf8")
+          );
+          if (legacy.userPolicy !== "preserve" || legacy.mcpServers.kin.env.USER_POLICY !== "preserve") {
+            throw new Error("Antigravity legacy repair did not preserve unrelated user policy");
           }
           const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
           if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
             throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
           }
           const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
-          if (embeddedStatus.semantic_coverage?.supported !== true || embeddedStatus.semantic_coverage?.complete !== true) {
-            throw new Error("Unix status did not prove complete semantic coverage after embedding");
+          if (embeddedStatus.schema !== "kin.status.v3") {
+            throw new Error(`kin-embedded-status.json: unsupported schema ${embeddedStatus.schema ?? "missing"}`);
+          }
+          validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
+          const embeddedCoverage = embeddedStatus.embedding_coverage;
+          if (
+            embeddedCoverage.state !== "observed" ||
+            embeddedCoverage.source !== "live_query_graph" ||
+            embeddedCoverage.total === 0 ||
+            embeddedCoverage.indexed !== embeddedCoverage.total ||
+            embeddedCoverage.pending !== 0
+          ) {
+            throw new Error(`Unix status did not prove complete observed embedding coverage: ${JSON.stringify(embeddedCoverage)}`);
           }
           for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
             const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-            const readiness = report.checks?.find((check) => check.id === "semantic_query_readiness")?.status;
+            const checks = validateHealthReport(report, reportPath);
+            const readiness = checks.get("semantic_query_readiness")?.status;
             if (report.healthy !== true || readiness !== "healthy") {
               throw new Error(
                 `${reportPath}: overall healthy=${report.healthy}; ` +
@@ -1240,6 +1549,7 @@ jobs:
             expected-version.txt
             expected-commit.txt
             expected-lock-sha.txt
+            installed-kin-command.txt
             attestation-verification.json
             release-provenance.json
             release-provenance.json.sha256
@@ -1254,5 +1564,7 @@ jobs:
             kin-windows-doctor.json
             kin-windows-admission/*.txt
             kin-install-proof/*.txt
+            kin-install-proof/*-config.json
+            kin-install-proof/.agents/mcp_config.json
             kin-install-proof/*.json
             kin-install-proof/*.log
