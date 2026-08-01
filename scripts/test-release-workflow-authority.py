@@ -983,7 +983,7 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
 
 
 def assert_install_proof_status_contract(
-    first_run: str, embedding: str, validation: str
+    first_run: str, graph_query: str, embedding: str, validation: str
 ) -> None:
     """Pin install proof to fields the released binaries actually emit.
 
@@ -995,13 +995,28 @@ def assert_install_proof_status_contract(
     shipped command produces.
     """
 
-    for policy in (
+    require(
+        first_run,
         "kin bench-meta --json > kin-build-meta.json",
+        "installed CLI provenance capture",
+    )
+
+    for policy in (
+        "kin search hello --json | tee kin-search.json",
+        "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\"",
         'DAEMON_PORT="$daemon_port" node',
         "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
         "kin-daemon-health.json",
     ):
-        require(first_run, policy, "installed CLI and daemon provenance capture")
+        require(graph_query, policy, "installed daemon startup and provenance capture")
+
+    if graph_query.index("kin search hello --json | tee kin-search.json") > graph_query.index(
+        "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
+    ):
+        raise AssertionError(
+            "install proof must start the daemon through a graph query before "
+            "reading its published endpoint"
+        )
 
     for stale in (
         "status.build",
@@ -4679,6 +4694,7 @@ def main() -> None:
         validation_start,
     )
     first_run = install_proof[first_run_start:graph_query_start]
+    graph_query = install_proof[graph_query_start:embedding_start]
     embedding = install_proof[embedding_start:validation_start]
     validation = install_proof[validation_start:preserve_start]
     for policy in (
@@ -4919,14 +4935,33 @@ def main() -> None:
                 original, mutation, 1
             ): assert_install_proof_repo_free_windows_proof(mutated),
         )
-    assert_install_proof_status_contract(first_run, embedding, validation)
+    assert_install_proof_status_contract(first_run, graph_query, embedding, validation)
     expect_assertion(
         "install proof stops capturing CLI build metadata",
-        "installed CLI and daemon provenance capture",
+        "installed CLI provenance capture",
         lambda: assert_install_proof_status_contract(
             first_run.replace(
                 "kin bench-meta --json > kin-build-meta.json",
                 "kin --version > kin-build-meta.json",
+                1,
+            ),
+            graph_query,
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "install proof reads daemon endpoint before a daemon-starting query",
+        "must start the daemon through a graph query",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin search hello --json | tee kin-search.json",
+                "# graph query moved below daemon provenance capture",
+                1,
+            ).replace(
+                "cat kin-daemon-health.json",
+                "cat kin-daemon-health.json\n          kin search hello --json | tee kin-search.json",
                 1,
             ),
             embedding,
@@ -4938,6 +4973,7 @@ def main() -> None:
         "does not emit: status.build",
         lambda: assert_install_proof_status_contract(
             first_run,
+            graph_query,
             embedding,
             validation.replace("const builds = new Map([", "const stale = status.build;\n          const builds = new Map([", 1),
         ),
@@ -4947,6 +4983,7 @@ def main() -> None:
         "released-byte status and build proof contract",
         lambda: assert_install_proof_status_contract(
             first_run,
+            graph_query,
             embedding,
             validation.replace("kin.status.v3", "kin.status.v2"),
         ),
@@ -4956,6 +4993,7 @@ def main() -> None:
         "does not emit: status.semantic_coverage",
         lambda: assert_install_proof_status_contract(
             first_run,
+            graph_query,
             embedding,
             validation.replace(
                 "status.embedding_coverage",
