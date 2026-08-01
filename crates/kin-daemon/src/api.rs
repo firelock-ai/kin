@@ -3400,6 +3400,7 @@ async fn command_checkout(
 
 /// POST /commands/rename — build rename plans from daemon-owned graph state.
 async fn command_rename(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::rename::RenameRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -3413,12 +3414,23 @@ async fn command_rename(
         ));
     }
 
-    let response = kin_cli::commands::rename::build_rename_response(
-        &state.layout,
-        state.graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "exact local rename is unavailable for hosted snapshot authority".to_string(),
+        ));
+    }
+    let session_id = extract_session_id_from_headers(&headers)?;
+    if session_id.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "rename does not accept X-Kin-Session because it mutates the primary repository \
+             workspace; rename inside a session projection and reconcile it instead"
+                .to_string(),
+        ));
+    }
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_rename::execute(&state, &request)?;
     Ok(Json(response))
 }
 
