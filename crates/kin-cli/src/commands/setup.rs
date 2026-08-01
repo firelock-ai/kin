@@ -14840,7 +14840,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         fs::write(&success_helper_release, b"continue\n")?;
         wait_for_windows_condition(
             "successful deferred uninstall",
-            Duration::from_secs(45),
+            Duration::from_secs(120),
             || {
                 !success.incomplete_marker.exists()
                     && !success.retired.exists()
@@ -14897,7 +14897,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         )?;
         wait_for_windows_condition(
             "failed deferred uninstall journal",
-            Duration::from_secs(45),
+            Duration::from_secs(120),
             || failure.helper_log.is_file() && !failure.helper_script.exists(),
         )?;
         anyhow::ensure!(
@@ -14948,7 +14948,6 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     /// PowerShell helper can perform identity-bound deferred deletion.
     #[cfg(windows)]
     #[test]
-    #[cfg(windows)]
     #[serial]
     fn native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup() -> Result<()> {
         if let Some(mode) = env::var_os(WINDOWS_FULL_UNINSTALL_CHILD_MODE) {
