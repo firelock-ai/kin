@@ -44,6 +44,105 @@ function Write-Info  { Write-Host "  -> $args" -ForegroundColor Cyan }
 function Write-Ok    { Write-Host "  [ok] $args" -ForegroundColor Green }
 function Write-Err   { Write-Host "  [error] $args" -ForegroundColor Red }
 
+function Format-ByteCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [long]$Bytes
+    )
+
+    $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Bytes -lt 1KB) { return "$Bytes B" }
+    if ($Bytes -lt 1MB) { return "{0} KiB" -f (($Bytes / 1KB).ToString("0.0", $Invariant)) }
+    if ($Bytes -lt 1GB) { return "{0} MiB" -f (($Bytes / 1MB).ToString("0.0", $Invariant)) }
+    return "{0} GiB" -f (($Bytes / 1GB).ToString("0.0", $Invariant))
+}
+
+function Invoke-ArchiveDownload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutFile,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ArchiveName,
+
+        [switch]$ShowProgress
+    )
+
+    # ResponseHeadersRead lets the installer report the archive as it arrives
+    # instead of buffering the entire release before showing any movement.
+    $Client = $null
+    $Response = $null
+    $InputStream = $null
+    $OutputStream = $null
+    try {
+        $LocalPath = $null
+        if ($Uri -match '^file:') {
+            $LocalPath = ([Uri]$Uri).LocalPath
+        } elseif ($Uri -notmatch '^https?://' -and (Test-Path -LiteralPath $Uri)) {
+            $LocalPath = (Resolve-Path -LiteralPath $Uri).Path
+        }
+
+        if ($null -ne $LocalPath) {
+            $InputStream = [System.IO.File]::OpenRead($LocalPath)
+            $TotalBytes = $InputStream.Length
+        } else {
+            Add-Type -AssemblyName System.Net.Http
+            $Client = [System.Net.Http.HttpClient]::new()
+            $Client.Timeout = [TimeSpan]::FromMinutes(30)
+            $Client.DefaultRequestHeaders.UserAgent.ParseAdd("Kin-Installer")
+            $Response = $Client.GetAsync(
+                $Uri,
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
+            $Response.EnsureSuccessStatusCode() | Out-Null
+            $TotalBytes = $Response.Content.Headers.ContentLength
+            $InputStream = $Response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        }
+
+        $OutputStream = [System.IO.File]::Open(
+            $OutFile,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $Buffer = [byte[]]::new(1024 * 1024)
+        [long]$ReceivedBytes = 0
+
+        while (($Read = $InputStream.ReadAsync($Buffer, 0, $Buffer.Length).GetAwaiter().GetResult()) -gt 0) {
+            $OutputStream.Write($Buffer, 0, $Read)
+            $ReceivedBytes += $Read
+            if ($ShowProgress) {
+                if ($null -ne $TotalBytes -and $TotalBytes -gt 0) {
+                    $Percent = [Math]::Min(100, [Math]::Floor(($ReceivedBytes * 100.0) / $TotalBytes))
+                    $Status = "{0}% ({1} / {2})" -f (
+                        $Percent,
+                        (Format-ByteCount $ReceivedBytes),
+                        (Format-ByteCount $TotalBytes)
+                    )
+                    Write-Progress -Activity "Downloading $ArchiveName" -Status $Status -PercentComplete $Percent
+                } else {
+                    $Status = "{0} received" -f (Format-ByteCount $ReceivedBytes)
+                    Write-Progress -Activity "Downloading $ArchiveName" -Status $Status -PercentComplete -1
+                }
+            }
+        }
+    } finally {
+        if ($ShowProgress) {
+            Write-Progress -Activity "Downloading $ArchiveName" -Completed
+        }
+        if ($null -ne $OutputStream) { $OutputStream.Dispose() }
+        if ($null -ne $InputStream) { $InputStream.Dispose() }
+        if ($null -ne $Response) { $Response.Dispose() }
+        if ($null -ne $Client) { $Client.Dispose() }
+    }
+}
+
 function Resolve-ArchiveChecksum {
     param(
         [Parameter(Mandatory = $true)]
@@ -164,7 +263,22 @@ $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "kin-install-$(Get-Random)
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 
 try {
-    Invoke-WebRequest -Uri $Url -OutFile (Join-Path $TmpDir $Archive) -UseBasicParsing
+# `irm ... | iex` still has a real ConsoleHost, so first installs launched from
+# the documented one-liner get live byte/percent feedback. Redirected and CI
+# hosts skip progress records while preserving the exact same download bytes.
+$ShowArchiveProgress = $Host.Name -eq "ConsoleHost"
+try {
+    $ShowArchiveProgress = $ShowArchiveProgress -and -not [Console]::IsOutputRedirected
+} catch {
+    $ShowArchiveProgress = $false
+}
+
+try {
+    Invoke-ArchiveDownload `
+        -Uri $Url `
+        -OutFile (Join-Path $TmpDir $Archive) `
+        -ArchiveName $Archive `
+        -ShowProgress:$ShowArchiveProgress
 } catch {
     Write-Err "Download failed: $_"
     exit 1
@@ -302,7 +416,12 @@ if ($env:KIN_NO_SETUP -eq "1") {
 
 # ── Cleanup ─────────────────────────────────────────────────────────────
 
-Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+} finally {
+    # `finally` runs for success, terminating errors, and every `exit` above.
+    # Cleanup remains best-effort so a filesystem cleanup error cannot replace
+    # the installer failure that the caller actually needs to diagnose.
+    Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
 Write-Ok "Done! Restart your terminal to get started."
