@@ -369,7 +369,13 @@ QUERY_COMMANDS = {
     # filesystem primitive at all, which is exactly why it belongs here: the
     # agent-facing entry point should never become the one answer surface that
     # nothing was watching.
-    "mcp.rs"
+    "mcp.rs",
+    # `kin spec list`/`show` answer from graph-owned specs. The module was
+    # outside this set for as long as it answered by reading .kin/specs/*.json,
+    # so the guard reported the invariant holding over a surface that was
+    # breaking it. Coverage is half the fix: without the module scanned, a
+    # later reader could reintroduce the sidecar read and CI would stay green.
+    "spec.rs"
 }
 
 # Matches a free or method function declaration, including the visibility,
