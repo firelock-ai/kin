@@ -40,12 +40,29 @@
   const nodeCountEl = document.getElementById("node-count");
   const edgeCountEl = document.getElementById("edge-count");
 
+  // The layout engine is loaded from a CDN, so a machine with no network
+  // reaches this file with `d3` undefined. Say so in the page instead of
+  // throwing on the first `d3.` reference and leaving a blank canvas that looks
+  // like an empty graph.
+  if (typeof d3 === "undefined") {
+    statusEl.textContent =
+      "the layout engine (d3) could not be loaded from the network; " +
+      "kin graph viz needs network access to render";
+    statusEl.classList.add("error");
+    statusEl.classList.remove("hidden");
+    return;
+  }
+
   let width = 0;
   let height = 0;
   let dpr = window.devicePixelRatio || 1;
 
   let nodes = [];
   let links = [];
+  // Relations the graph reported whose other endpoint is no node here. Kept so
+  // the resting page still says the drawing is partial rather than implying
+  // every relation is on screen.
+  let withheldRelations = 0;
   let neighbors = new Map();
   let quadtree = null;
 
@@ -301,6 +318,15 @@
       .addAll(nodes);
   }
 
+  function partialNote() {
+    if (withheldRelations <= 0) return "";
+    return (
+      " (" +
+      withheldRelations.toLocaleString() +
+      " relation(s) point outside this graph and are not drawn)"
+    );
+  }
+
   async function load() {
     setStatus("loading graph...");
     let data;
@@ -314,7 +340,18 @@
     }
 
     nodes = (data.nodes || []).map((n) => Object.assign({}, n));
-    links = (data.links || []).map((l) => Object.assign({}, l));
+
+    // The force layout resolves every link endpoint against the node set and
+    // throws on the first id it cannot find, which aborts the whole render.
+    // The server already withholds those links; drop any that survive anyway
+    // rather than letting one dangling endpoint blank the canvas.
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const raw = data.links || [];
+    links = raw
+      .filter((l) => nodeIds.has(l.source) && nodeIds.has(l.target))
+      .map((l) => Object.assign({}, l));
+    const droppedHere = raw.length - links.length;
+    withheldRelations = (data.unresolved_links || 0) + droppedHere;
 
     nodeCountEl.textContent = nodes.length.toLocaleString();
     edgeCountEl.textContent = links.length.toLocaleString();
@@ -325,7 +362,9 @@
       return;
     }
 
-    setStatus("laying out " + nodes.length.toLocaleString() + " nodes...");
+    setStatus(
+      "laying out " + nodes.length.toLocaleString() + " nodes..." + partialNote()
+    );
 
     const cx = width / 2;
     const cy = height / 2;
@@ -380,7 +419,7 @@
     simulation.on("end", () => {
       rebuildQuadtree();
       draw();
-      setStatus("");
+      setStatus(partialNote().trim());
     });
 
     setTimeout(() => {
@@ -388,7 +427,7 @@
         simulation.alpha(0).stop();
         rebuildQuadtree();
         draw();
-        setStatus("");
+        setStatus(partialNote().trim());
       }
     }, 20000);
   }

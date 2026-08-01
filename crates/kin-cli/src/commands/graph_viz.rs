@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ const INDEX_HTML: &str = include_str!("../../assets/graph_viz/index.html");
 const APP_JS: &str = include_str!("../../assets/graph_viz/app.js");
 const STYLE_CSS: &str = include_str!("../../assets/graph_viz/style.css");
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GraphNode {
     id: String,
     name: String,
@@ -28,28 +28,97 @@ struct GraphNode {
     degree: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GraphLink {
     source: String,
     target: String,
     kind: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct GraphPayload {
     nodes: Vec<GraphNode>,
     links: Vec<GraphLink>,
+    /// Relations whose other endpoint is not itself an entity in this graph,
+    /// counted rather than emitted. A link naming an absent node is not a
+    /// drawable edge, and emitting one made the whole render die.
+    unresolved_links: usize,
+}
+
+/// One node's graph-owned identity, split out from the store so payload
+/// assembly is a pure function over what the graph reported.
+struct NodeMeta {
+    id: String,
+    name: String,
+    kind: String,
+    file: Option<String>,
+}
+
+/// Assemble the render payload, dropping every edge whose endpoints are not
+/// both present in the node set.
+///
+/// Relations legitimately point outside the entity set — an import of an
+/// external crate resolves to a placeholder destination that is no entity in
+/// this graph. The renderer joins edges to nodes by id and throws on the first
+/// unmatched one, so a single such relation used to abort the whole layout and
+/// leave a blank canvas. Withheld edges are counted and reported instead of
+/// dropped silently, so the page can say the graph is partial rather than
+/// implying every relation is drawn.
+fn assemble_payload(
+    node_meta: Vec<NodeMeta>,
+    edges: impl IntoIterator<Item = (String, String, String)>,
+) -> GraphPayload {
+    let node_ids: HashSet<&str> = node_meta.iter().map(|meta| meta.id.as_str()).collect();
+
+    let mut link_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut unresolved_links = 0usize;
+    for (a, b, kind) in edges {
+        if !node_ids.contains(a.as_str()) || !node_ids.contains(b.as_str()) {
+            unresolved_links += 1;
+            continue;
+        }
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        link_keys.insert((a, b, kind));
+    }
+
+    let mut degrees: HashMap<&str, usize> = HashMap::with_capacity(node_meta.len());
+    for (a, b, _kind) in &link_keys {
+        *degrees.entry(a.as_str()).or_insert(0) += 1;
+        *degrees.entry(b.as_str()).or_insert(0) += 1;
+    }
+
+    let nodes: Vec<GraphNode> = node_meta
+        .iter()
+        .map(|meta| GraphNode {
+            id: meta.id.clone(),
+            name: meta.name.clone(),
+            kind: meta.kind.clone(),
+            file: meta.file.clone(),
+            degree: degrees.get(meta.id.as_str()).copied().unwrap_or(0),
+        })
+        .collect();
+
+    let links: Vec<GraphLink> = link_keys
+        .into_iter()
+        .map(|(source, target, kind)| GraphLink {
+            source,
+            target,
+            kind,
+        })
+        .collect();
+
+    GraphPayload {
+        nodes,
+        links,
+        unresolved_links,
+    }
 }
 
 fn build_payload_from_snapshot(snap: &kin_db::SnapshotManager) -> Result<GraphPayload> {
     let graph = snap.graph();
     let entities = graph.list_all_entities()?;
 
-    let mut nodes: Vec<GraphNode> = Vec::with_capacity(entities.len());
-    let mut degrees: HashMap<String, usize> = HashMap::with_capacity(entities.len());
-
-    let mut link_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
-
+    let mut edges: Vec<(String, String, String)> = Vec::new();
     for e in &entities {
         let src_id = e.id.to_string();
         let rels = graph.get_all_relations_for_entity(&e.id)?;
@@ -64,43 +133,21 @@ fn build_payload_from_snapshot(snap: &kin_db::SnapshotManager) -> Result<GraphPa
                 }
                 _ => continue,
             };
-            let kind_str = format!("{:?}", rel.kind);
-            let (a, b) = if src_id <= other_id {
-                (src_id.clone(), other_id)
-            } else {
-                (other_id, src_id.clone())
-            };
-            link_keys.insert((a, b, kind_str));
+            edges.push((src_id.clone(), other_id, format!("{:?}", rel.kind)));
         }
     }
 
-    for (a, b, _kind) in &link_keys {
-        *degrees.entry(a.clone()).or_insert(0) += 1;
-        *degrees.entry(b.clone()).or_insert(0) += 1;
-    }
-
-    for e in &entities {
-        let id_str = e.id.to_string();
-        let degree = degrees.get(&id_str).copied().unwrap_or(0);
-        nodes.push(GraphNode {
-            id: id_str,
+    let node_meta = entities
+        .iter()
+        .map(|e| NodeMeta {
+            id: e.id.to_string(),
             name: e.name.clone(),
             kind: format!("{:?}", e.kind),
             file: e.file_origin.as_ref().map(|f| f.0.clone()),
-            degree,
-        });
-    }
-
-    let links: Vec<GraphLink> = link_keys
-        .into_iter()
-        .map(|(a, b, kind)| GraphLink {
-            source: a,
-            target: b,
-            kind,
         })
         .collect();
 
-    Ok(GraphPayload { nodes, links })
+    Ok(assemble_payload(node_meta, edges))
 }
 
 async fn serve_index() -> Response {
@@ -171,4 +218,120 @@ pub async fn run(port: u16, open_browser: bool) -> Result<()> {
         .await
         .context("kin graph viz server error")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assemble_payload, NodeMeta};
+
+    fn node(id: &str) -> NodeMeta {
+        NodeMeta {
+            id: id.to_string(),
+            name: format!("entity_{id}"),
+            kind: "Function".to_string(),
+            file: Some("src/lib.rs".to_string()),
+        }
+    }
+
+    fn edge(a: &str, b: &str, kind: &str) -> (String, String, String) {
+        (a.to_string(), b.to_string(), kind.to_string())
+    }
+
+    /// The empty-canvas defect in miniature. A relation pointing at an id that
+    /// is no entity in this graph must never reach the payload: the renderer
+    /// joins links to nodes by id and aborts the whole layout on the first
+    /// unmatched one.
+    #[test]
+    fn links_naming_an_absent_node_are_withheld_and_counted() {
+        let payload = assemble_payload(
+            vec![node("a"), node("b")],
+            vec![
+                edge("a", "b", "Calls"),
+                edge("a", "external-placeholder", "Imports"),
+                edge("missing", "b", "Calls"),
+            ],
+        );
+
+        assert_eq!(payload.links.len(), 1);
+        assert_eq!(payload.links[0].source, "a");
+        assert_eq!(payload.links[0].target, "b");
+        assert_eq!(payload.unresolved_links, 2);
+
+        let ids: Vec<&str> = payload.nodes.iter().map(|n| n.id.as_str()).collect();
+        for link in &payload.links {
+            assert!(
+                ids.contains(&link.source.as_str()),
+                "{link:?} source absent"
+            );
+            assert!(
+                ids.contains(&link.target.as_str()),
+                "{link:?} target absent"
+            );
+        }
+    }
+
+    /// Falsification: a graph whose relations all resolve must withhold
+    /// nothing, so a passing test above cannot be explained by the filter
+    /// simply dropping everything.
+    #[test]
+    fn a_fully_resolvable_graph_withholds_no_links() {
+        let payload = assemble_payload(
+            vec![node("a"), node("b"), node("c")],
+            vec![edge("a", "b", "Calls"), edge("b", "c", "Contains")],
+        );
+
+        assert_eq!(payload.unresolved_links, 0);
+        assert_eq!(payload.links.len(), 2);
+    }
+
+    /// Degree drives node radius, so it must count the edges actually drawn.
+    /// Counting withheld relations would inflate a node the layout never
+    /// connects to anything.
+    #[test]
+    fn degree_counts_only_drawn_edges() {
+        let payload = assemble_payload(
+            vec![node("a"), node("b")],
+            vec![
+                edge("a", "b", "Calls"),
+                edge("a", "gone", "Imports"),
+                edge("a", "also-gone", "Imports"),
+            ],
+        );
+
+        let degree_of = |id: &str| {
+            payload
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.degree)
+                .expect("node present")
+        };
+        assert_eq!(degree_of("a"), 1);
+        assert_eq!(degree_of("b"), 1);
+    }
+
+    /// The same relation observed from both endpoints is one edge, and an
+    /// undirected key must not depend on which endpoint reported it.
+    #[test]
+    fn reciprocal_observations_collapse_to_one_link() {
+        let payload = assemble_payload(
+            vec![node("a"), node("b")],
+            vec![edge("a", "b", "Calls"), edge("b", "a", "Calls")],
+        );
+
+        assert_eq!(payload.links.len(), 1);
+        assert_eq!(payload.unresolved_links, 0);
+    }
+
+    /// The page reports the withheld count, so it must survive serialization
+    /// under the name the page reads.
+    #[test]
+    fn payload_serializes_the_withheld_count_for_the_page() {
+        let payload = assemble_payload(vec![node("a")], vec![edge("a", "gone", "Imports")]);
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(json["unresolved_links"], 1);
+        assert_eq!(json["links"].as_array().unwrap().len(), 0);
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 1);
+    }
 }

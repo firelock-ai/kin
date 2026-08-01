@@ -21,15 +21,15 @@ use std::pin::Pin;
 /// actionable error (see `kin_mcp::daemon_delegate::daemon_unavailable_tool_result`)
 /// instead of the process silently never having started at all.
 pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
-    if global {
-        anyhow::bail!(
-            "`kin mcp start --global` (multi-repo registry mode) is not yet implemented.\n\
-             Omit --global to start in single-repo mode, or set KIN_DAEMON_URL to a running daemon."
-        );
-    }
-
     let repo_override = resolve_repo_override(repo);
     if let Some(repo_dir) = &repo_override {
+        if global {
+            eprintln!(
+                "Kin MCP: --repo/KIN_MCP_REPO pins {} for this server; registry mode will not \
+                 repoint it.",
+                repo_dir.display()
+            );
+        }
         if let Err(err) = std::env::set_current_dir(repo_dir) {
             eprintln!(
                 "Kin MCP: --repo/KIN_MCP_REPO path {} could not be used as the working directory \
@@ -40,22 +40,49 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let bound_at_start = match bind_daemon_for_repo_dir(&cwd).await {
+    let mut bound_at_start = match bind_daemon_for_repo_dir(&cwd).await {
         Ok(daemon_url) => {
             eprintln!("{}", session_authority_notice());
             eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
             true
         }
         Err(reason) => {
-            eprintln!(
-                "Kin MCP: no repository bound at startup ({reason}). If the MCP client advertises \
-                 workspace roots, Kin binds to the open repository after initialization; otherwise \
-                 run `kin init .`, relaunch inside a Kin repository, or pass --repo <path> (or set \
-                 KIN_MCP_REPO=<path>)."
-            );
+            if !global {
+                eprintln!(
+                    "Kin MCP: no repository bound at startup ({reason}). If the MCP client \
+                     advertises workspace roots, Kin binds to the open repository after \
+                     initialization; otherwise run `kin init .`, relaunch inside a Kin \
+                     repository, or pass --repo <path> (or set KIN_MCP_REPO=<path>)."
+                );
+            } else {
+                eprintln!("Kin MCP: the launch directory bound no repository ({reason}).");
+            }
             false
         }
     };
+
+    // Registry mode: a launch directory that is no repository is the normal
+    // case, not a failure. Resolve the startup repository from the global
+    // registry instead, but never by guessing between several, which would
+    // answer about a codebase nobody named.
+    //
+    // An operator pin that failed to bind is never rescued this way. Falling
+    // through to the registry there would serve whichever repository the
+    // registry happens to name while the operator asked for a specific one:
+    // the same wrong-repository answer the roots binder refuses, reached
+    // through the registry door instead.
+    if registry_should_resolve(global, bound_at_start, repo_override.is_some()) {
+        bound_at_start = bind_from_registry().await;
+    } else if global && !bound_at_start {
+        if let Some(pinned) = &repo_override {
+            eprintln!(
+                "Kin MCP: --repo/KIN_MCP_REPO pins {}, which did not bind. Registry mode will not \
+                 substitute another repository for a pin; fix the pinned repository or drop the \
+                 pin.",
+                pinned.display()
+            );
+        }
+    }
 
     let mut config = build_mcp_start_config();
     let profile_tools: Option<&'static [&'static str]> =
@@ -107,6 +134,114 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
 
     Ok(())
+}
+
+/// Whether registry mode should resolve a startup repository.
+///
+/// Only in registry mode, only when nothing bound already, and never when an
+/// operator pinned a repository: substituting a registry entry for a pin that
+/// failed to bind is the wrong-repository answer the workspace-roots binder
+/// refuses, reached through the registry door instead.
+pub(crate) fn registry_should_resolve(global: bool, bound: bool, pinned: bool) -> bool {
+    global && !bound && !pinned
+}
+
+/// What the global registry can offer as a startup repository.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RegistryStartupChoice {
+    /// No repository has ever been registered on this host.
+    NoneRegistered,
+    /// Exactly one registered repository, so there is nothing to guess.
+    Single(PathBuf),
+    /// Several registered repositories and no basis for choosing one.
+    Ambiguous(Vec<String>),
+}
+
+/// Choose a startup repository from the registry's recorded entries.
+///
+/// One registered repository is an unambiguous answer. Several is not: picking
+/// the first would make the server answer about whichever repository happened
+/// to sort or register first, which is precisely the wrong-repo failure the
+/// roots binder exists to prevent. Ambiguity is reported so the caller can name
+/// one, never resolved by guessing.
+pub(crate) fn registry_startup_choice(
+    registry: &kin_core::registry::KinRegistry,
+) -> RegistryStartupChoice {
+    match registry.repos.as_slice() {
+        [] => RegistryStartupChoice::NoneRegistered,
+        [only] => RegistryStartupChoice::Single(only.path.clone()),
+        several => {
+            let mut ids: Vec<String> = several.iter().map(|repo| repo.id.clone()).collect();
+            ids.sort();
+            RegistryStartupChoice::Ambiguous(ids)
+        }
+    }
+}
+
+/// Bind the startup repository from the global registry, reporting why when it
+/// cannot. Returns whether a repository is bound.
+async fn bind_from_registry() -> bool {
+    let registry = match kin_core::registry::KinRegistry::load() {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!(
+                "Kin MCP: registry mode could not read the Kin registry ({error}); tool calls \
+                 will fail loud until a repository binds through --repo, KIN_MCP_REPO, or the \
+                 client's workspace roots."
+            );
+            return false;
+        }
+    };
+
+    match registry_startup_choice(&registry) {
+        RegistryStartupChoice::NoneRegistered => {
+            eprintln!(
+                "Kin MCP: registry mode found no registered repositories, and no shipped command \
+                 writes a registry entry. Pass --repo <path> (or set KIN_MCP_REPO=<path>) to \
+                 serve a repository directly."
+            );
+            false
+        }
+        RegistryStartupChoice::Ambiguous(ids) => {
+            eprintln!(
+                "Kin MCP: registry mode found {} registered repositories and will not choose one \
+                 for you ({}). Kin binds whichever the client advertises as a workspace root; to \
+                 pin one now, pass --repo <path> or set KIN_MCP_REPO=<path>.",
+                ids.len(),
+                ids.join(", ")
+            );
+            false
+        }
+        RegistryStartupChoice::Single(path) => match bind_daemon_for_repo_dir(&path).await {
+            Ok(daemon_url) => {
+                // Match the roots path: the daemon delegate reads the
+                // per-install loopback token from <root>/.kin/daemon.token
+                // relative to the process working directory.
+                if let Err(err) = std::env::set_current_dir(&path) {
+                    eprintln!(
+                        "Kin MCP: bound {daemon_url} but could not switch cwd to {} ({err}); \
+                         tool auth will fall back to KIN_DAEMON_AUTH_TOKEN if set.",
+                        path.display()
+                    );
+                }
+                eprintln!("{}", session_authority_notice());
+                eprintln!(
+                    "Kin MCP: registry mode bound the only registered repository at {} (daemon \
+                     {daemon_url})",
+                    path.display()
+                );
+                true
+            }
+            Err(reason) => {
+                eprintln!(
+                    "Kin MCP: registry mode could not bind the only registered repository at {} \
+                     ({reason}); tool calls will fail loud until one binds.",
+                    path.display()
+                );
+                false
+            }
+        },
+    }
 }
 
 /// Bind — or re-bind — the repo daemon for the first workspace root that is a
@@ -301,11 +436,29 @@ async fn bind_daemon_for_repo_dir(dir: &Path) -> std::result::Result<String, Str
 mod tests {
     use super::{
         bind_daemon_for_repo_dir, bind_first_kin_repo_against, build_mcp_start_config,
-        resolve_repo_override, session_authority_notice, start,
+        registry_should_resolve, registry_startup_choice, resolve_repo_override,
+        session_authority_notice, RegistryStartupChoice,
     };
+    use kin_core::registry::{KinRegistry, RegisteredRepo};
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
     use std::path::PathBuf;
+
+    fn registered(id: &str, path: &str) -> RegisteredRepo {
+        RegisteredRepo {
+            id: id.to_string(),
+            path: PathBuf::from(path),
+            entities: 0,
+            last_commit: "2026-01-01T00:00:00Z".to_string(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn registry(repos: Vec<RegisteredRepo>) -> KinRegistry {
+        let mut registry = KinRegistry::default();
+        registry.repos = repos;
+        registry
+    }
 
     #[test]
     fn daemon_available_notice_mentions_daemon_authority() {
@@ -324,15 +477,62 @@ mod tests {
         assert!(config.snapshot_path.is_none());
     }
 
-    #[tokio::test]
-    async fn global_flag_returns_clear_error() {
-        let err = start(true, None).await.unwrap_err();
-        let msg = err.to_string();
+    /// Registry resolution is reached only in registry mode, only when nothing
+    /// bound, and never over an operator pin. The pin row is the one that
+    /// matters: rescuing a failed pin from the registry would serve a
+    /// repository nobody named.
+    #[test]
+    fn registry_resolution_never_substitutes_for_an_operator_pin() {
+        assert!(registry_should_resolve(true, false, false));
         assert!(
-            msg.contains("not yet implemented"),
-            "unexpected message: {msg}"
+            !registry_should_resolve(true, false, true),
+            "a pinned repository that did not bind must not be replaced from the registry"
         );
-        assert!(msg.contains("--global"), "missing flag hint: {msg}");
+        assert!(!registry_should_resolve(true, true, false));
+        assert!(!registry_should_resolve(false, false, false));
+    }
+
+    /// One registered repository is an unambiguous startup answer, which is
+    /// what makes registry mode useful from a non-repository launch directory.
+    #[test]
+    fn registry_mode_binds_the_only_registered_repository() {
+        assert_eq!(
+            registry_startup_choice(&registry(vec![registered("kin", "/registered/kin")])),
+            RegistryStartupChoice::Single(PathBuf::from("/registered/kin"))
+        );
+    }
+
+    /// The wrong-repo failure the roots binder exists to prevent, reached
+    /// through the registry instead. Several registered repositories must not
+    /// collapse into "serve the first one".
+    #[test]
+    fn registry_mode_refuses_to_choose_between_registered_repositories() {
+        let choice = registry_startup_choice(&registry(vec![
+            registered("kin-vfs", "/registered/kin-vfs"),
+            registered("kin", "/registered/kin"),
+            registered("kin-db", "/registered/kin-db"),
+        ]));
+
+        assert_eq!(
+            choice,
+            RegistryStartupChoice::Ambiguous(vec![
+                "kin".to_string(),
+                "kin-db".to_string(),
+                "kin-vfs".to_string(),
+            ]),
+            "ambiguity must be reported with every candidate named, in a stable order"
+        );
+    }
+
+    /// An empty registry is its own case: nothing to bind and nothing to
+    /// disambiguate, so the message must name registration as the remedy
+    /// rather than pinning.
+    #[test]
+    fn registry_mode_reports_an_empty_registry_distinctly() {
+        assert_eq!(
+            registry_startup_choice(&registry(Vec::new())),
+            RegistryStartupChoice::NoneRegistered
+        );
     }
 
     #[test]

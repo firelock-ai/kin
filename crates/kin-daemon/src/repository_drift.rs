@@ -120,6 +120,13 @@ fn report(
         drift_count: observation.drift.len(),
         clean: observation.is_clean(),
         drift: observation.drift,
+        // Byte-exact rather than lossy UTF-8: a repository path is arbitrary
+        // bytes, and `kin doctor --heal` restores exactly the paths named here.
+        drifted_paths_hex: observation
+            .drifted_paths
+            .iter()
+            .map(|path| hex::encode(path.as_bytes()))
+            .collect(),
     };
     Ok(DriftResponse {
         lines: kin_cli::commands::drift::render_lines(&report),

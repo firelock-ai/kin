@@ -464,8 +464,15 @@ enum Command {
         #[arg(long = "limit-per-step", value_name = "M")]
         limit_per_step: Option<usize>,
     },
-    /// Show local cross-repo dependencies
-    Deps,
+    /// Show this repository's recorded cross-repo dependencies
+    Deps {
+        /// Report every registered repository instead of this one
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Show federated cross-repo references (xrefs) for an entity
     Xref {
         /// Entity name or ID
@@ -974,7 +981,8 @@ enum Command {
         /// Compare an explicit projection observation with graph truth
         #[arg(long, default_value_t = false)]
         drift: bool,
-        /// [OPEN GATE] Rematerialize a projection from graph truth
+        /// Rematerialize the derived projection from graph truth, DISCARDING
+        /// uncommitted changes to tracked files that diverge from it
         #[arg(long, default_value_t = false)]
         heal: bool,
     },
@@ -2649,7 +2657,7 @@ fn main() -> Result<()> {
                     commands::trace_data_flow::run_seeded(focal, depth, direction, limit_per_step)
                         .await
                 }
-                Command::Deps => commands::deps::run().await,
+                Command::Deps { all, json } => commands::deps::run(all, json).await,
                 Command::Xref { entity } => commands::xref::run(entity).await,
                 Command::Spec { action } => match action {
                     SpecAction::Create { intent } => commands::spec::create(intent).await,
@@ -3134,10 +3142,11 @@ fn main() -> Result<()> {
                     heal,
                 } => {
                     // `--drift` reports the derived projection against graph
-                    // truth; `--heal` would rematerialize it. Bare `kin doctor`
+                    // truth; `--heal` rematerializes it. Bare `kin doctor`
                     // stays the first-run config health check.
                     if heal {
-                        commands::capabilities::require_ready("doctor --heal")
+                        commands::capabilities::require_ready("doctor --heal")?;
+                        commands::drift::heal(json).await
                     } else if drift {
                         commands::capabilities::require_ready("doctor --drift")?;
                         commands::drift::run(json).await
