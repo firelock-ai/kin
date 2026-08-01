@@ -2160,8 +2160,8 @@ impl AnchoredDir {
                 name
             );
         }
-        // mkdir honors umask, so explicitly restore the required private mode
-        // before opening the directory and verify it again on the descriptor.
+        // mkdir honors umask, so explicitly restore the requested mode before
+        // opening the directory and verify it again on the descriptor.
         match rustix::fs::chmodat(
             &self.file,
             name,
@@ -3151,7 +3151,11 @@ fn open_or_create_bundle_dir(parent: &AnchoredDir, name: &str) -> Result<Anchore
             name
         ),
         None => {
-            let child = parent.create_child(name, 0o700)?;
+            // The install root remains private, while the app tree itself uses
+            // the same conventional directory mode as the script and npm
+            // installers. Keeping all delivery channels byte-and-mode
+            // equivalent avoids an update silently changing bundle shape.
+            let child = parent.create_child(name, 0o755)?;
             parent.ensure_child_binding(name, &child)?;
             Ok(child)
         }
@@ -11052,6 +11056,27 @@ mod tests {
         output_with_timeout(command, label, DEFAULT_TEST_SUBPROCESS_TIMEOUT)
     }
 
+    /// Keep update fixtures from deriving MCP repair authority from the
+    /// developer's real client configuration.
+    ///
+    /// `install_staged_bundle*` captures every configured MCP target before it
+    /// creates the transaction. These tests used to inherit `HOME`, which made
+    /// nextest exercise a developer's live `.claude.json` while `cargo test`
+    /// could see a temporary home installed by another in-process fixture. The two
+    /// runners were therefore testing different transactions. Bind every home
+    /// spelling used by the supported hosts, and clear the legacy Kin aliases,
+    /// so both runners prove only the fixture assembled by the test.
+    fn isolated_update_environment(root: &Path, kin_home: &Path) -> EnvVarGuard {
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        EnvVarGuard::set("HOME", &home)
+            .with("USERPROFILE", &home)
+            .with("XDG_CONFIG_HOME", home.join(".config"))
+            .with("KIN_HOME", kin_home)
+            .without("KIN_DIR")
+            .without("KIN_MCP_REPO")
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_marker_guard_denies_path_replacement_and_disposes_exact_handle() {
@@ -11913,6 +11938,149 @@ mod tests {
         }
     }
 
+    /// A restart during rollback must be idempotent at both bundle mutations:
+    /// after the staged tree is removed and after the original is restored.
+    /// The first-install case has no backup to restore, so its remove point is
+    /// exercised separately from the refresh case.
+    #[cfg(unix)]
+    fn run_bundle_rollback_crash_case(point: &str, had_original: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        if had_original {
+            write_notifier_bundle(&kin_home, b"old-notifier");
+        }
+        let old = bundle_snapshot(&kin_home, MACOS_COMPONENTS);
+        stage_archive(
+            &full_macos_archive("kin-macos-aarch64"),
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+
+        let worker = |crash_point: &str, recover: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "commands::update::tests::crash_recovery_worker",
+                    "--nocapture",
+                ])
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("KIN_HOME", &kin_home)
+                .env_remove("KIN_DIR")
+                .env_remove("KIN_MCP_REPO")
+                .env("KIN_UPDATE_TEST_WORKER_HOME", &kin_home)
+                .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
+                .env("KIN_UPDATE_TEST_WORKER_SPEC", "macos")
+                .env("KIN_UPDATE_TEST_CRASH_POINT", crash_point);
+            if recover {
+                command.env("KIN_UPDATE_TEST_WORKER_RECOVER", "1");
+            }
+            let output = test_subprocess_output(
+                command,
+                &format!("bundle rollback worker at {crash_point}"),
+            )
+            .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "worker output: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Leave a pre-commit transaction with the staged bundle live and the
+        // original, when present, held in the journaled backup.
+        worker("after-install-notifier-bundle", false);
+        worker(point, true);
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        recover_stale_transactions(&lock, MACOS_COMPONENTS).unwrap();
+        assert_bundle_matches(&kin_home, MACOS_COMPONENTS, &old);
+        if had_original {
+            assert_eq!(notifier_executable_bytes(&kin_home), b"old-notifier");
+        } else {
+            assert!(
+                !kin_home.join("lib").join(NOTIFIER_BUNDLE_DIR).exists(),
+                "recovery of a first bundle install must end without a bundle"
+            );
+        }
+        assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn subprocess_crashes_during_bundle_rollback_recover_idempotently() {
+        run_bundle_rollback_crash_case("after-rollback-remove-notifier-bundle", true);
+        run_bundle_rollback_crash_case("after-rollback-restore-notifier-bundle", true);
+        run_bundle_rollback_crash_case("after-rollback-remove-notifier-bundle", false);
+    }
+
+    /// The non-crash failure hooks immediately after each bundle mutation are
+    /// also live, and each one unwinds the whole transaction before returning.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn bundle_post_mutation_failures_restore_the_old_install_immediately() {
+        for failure_point in [
+            "after-backup-mutation-notifier-bundle",
+            "after-install-mutation-notifier-bundle",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let stage = tmp.path().join("stage");
+            let _environment = isolated_update_environment(tmp.path(), &kin_home);
+            write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+            write_notifier_bundle(&kin_home, b"old-notifier");
+            let old = bundle_snapshot(&kin_home, MACOS_COMPONENTS);
+            stage_archive(
+                &full_macos_archive("kin-macos-aarch64"),
+                "kin-macos-aarch64.tar.gz",
+                &stage,
+                MACOS_COMPONENTS,
+            )
+            .unwrap();
+            let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+            let staged_identities = staged_identities_for_test(&stage, MACOS_COMPONENTS).unwrap();
+
+            let error = install_staged_bundle_unix_with_hooks(
+                &lock,
+                &StagingLayout::open(&stage).unwrap(),
+                MACOS_COMPONENTS,
+                &staged_identities,
+                "0.2.22",
+                &test_restart_pending("0.2.22"),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |point| {
+                    if point == failure_point {
+                        anyhow::bail!("injected bundle mutation failure at {point}");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("the bundle mutation failure must abort the transaction");
+            let message = format!("{error:#}");
+            assert!(message.contains(failure_point), "{message}");
+            assert!(
+                message.contains("previous bundle was restored"),
+                "{message}"
+            );
+            assert_bundle_matches(&kin_home, MACOS_COMPONENTS, &old);
+            assert_eq!(notifier_executable_bytes(&kin_home), b"old-notifier");
+            assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+        }
+    }
+
     #[cfg(unix)]
     struct CrashedUpdate {
         _tmp: tempfile::TempDir,
@@ -12074,6 +12242,19 @@ cwd = {:?}
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            for relative in ["", "Contents", "Contents/MacOS", "Contents/Resources"] {
+                let mode = fs::metadata(staged.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode,
+                    0o755,
+                    "bundle directory {} must match every other install channel",
+                    staged.join(relative).display()
+                );
+            }
             let mode = fs::metadata(staged.join("Contents/MacOS/KinNotifier"))
                 .unwrap()
                 .permissions()
@@ -12239,6 +12420,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
         write_notifier_bundle(&kin_home, b"old-notifier");
         assert_eq!(notifier_executable_bytes(&kin_home), b"old-notifier");
@@ -12278,6 +12460,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
         write_notifier_bundle(&kin_home, b"old-notifier");
 
@@ -12337,6 +12520,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
         write_notifier_bundle(&kin_home, b"old-notifier");
 
@@ -12392,6 +12576,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
 
         let archive = full_macos_archive("kin-macos-aarch64");
@@ -12850,10 +13035,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let custom_home = tmp.path().join("custom-kin-home");
         let stage = tmp.path().join("stage");
-        let home = tmp.path().join("home");
-        fs::create_dir(&home).unwrap();
-        let _kin_home = EnvVarGuard::set("KIN_HOME", &custom_home);
-        let _home = EnvVarGuard::set("HOME", &home);
+        let _environment = isolated_update_environment(tmp.path(), &custom_home);
         let _cwd = CwdGuard::set(tmp.path());
         write_bundle(&custom_home, LINUX_COMPONENTS, b"old-");
 
@@ -12900,6 +13082,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
         let _env = fixture_home(&tmp, &kin_home);
         let expected: Vec<_> = LINUX_COMPONENTS
@@ -13651,6 +13834,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         let outside = tmp.path().join("outside-bin");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
         let _env = fixture_home(&tmp, &kin_home);

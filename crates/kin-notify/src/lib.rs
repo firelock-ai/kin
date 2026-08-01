@@ -385,6 +385,10 @@ impl Notifier {
     /// [`Status::degradation`], and a machine with no `lsregister` is not macOS.
     pub fn register_with_launch_services(&self) -> Result<()> {
         const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+        self.register_with_launch_services_at(Path::new(LSREGISTER))
+    }
+
+    fn register_with_launch_services_at(&self, lsregister: &Path) -> Result<()> {
         let Some(executable) = self.resolve_notifier() else {
             return Ok(());
         };
@@ -396,19 +400,20 @@ impl Notifier {
         else {
             return Ok(());
         };
-        if !Path::new(LSREGISTER).is_file() {
+        if !lsregister.is_file() {
             return Ok(());
         }
-        let status = std::process::Command::new(LSREGISTER)
+        let status = std::process::Command::new(lsregister)
             .arg("-f")
             .arg(bundle)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .with_context(|| format!("failed to run {LSREGISTER}"))?;
+            .with_context(|| format!("failed to run {}", lsregister.display()))?;
         if !status.success() {
             anyhow::bail!(
-                "{LSREGISTER} refused to register {} ({status})",
+                "{} refused to register {} ({status})",
+                lsregister.display(),
                 bundle.display()
             );
         }
@@ -874,6 +879,46 @@ mod tests {
         fs::create_dir_all(executable.parent().unwrap()).unwrap();
         fs::write(&executable, b"#!/bin/sh\n").unwrap();
         executable
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_services_registration_forces_the_resolved_bundle_and_reports_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        let bundle = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf();
+        let notifier = Notifier::with_home(kin_home);
+        let registrar = dir.path().join("lsregister");
+        let arguments = PathBuf::from(format!("{}.args", registrar.display()));
+        fs::write(
+            &registrar,
+            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&registrar, fs::Permissions::from_mode(0o755)).unwrap();
+
+        notifier
+            .register_with_launch_services_at(&registrar)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&arguments).unwrap(),
+            format!("-f\n{}\n", bundle.display()),
+            "registration must force-refresh exactly the app that owns the resolved executable"
+        );
+
+        fs::write(&registrar, b"#!/bin/sh\nexit 9\n").unwrap();
+        let error = notifier
+            .register_with_launch_services_at(&registrar)
+            .expect_err("a registrar refusal must be reported to the update/setup caller");
+        assert!(format!("{error:#}").contains("refused to register"));
     }
 
     #[test]
