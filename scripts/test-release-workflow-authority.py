@@ -751,6 +751,26 @@ def windows_init_contract_strings() -> dict[str, str]:
     return strings
 
 
+def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> None:
+    """Keep the shipped contract's published-nothing check able to fail at all.
+
+    Both admission paths stage into the PARENT of the directory they admit:
+    `crates/kin-core/src/git_init.rs` derives the stage from the source's
+    parent and `crates/kin-core/src/init.rs` from the working directory's. A
+    stage count taken inside the admitted directory therefore reports zero for
+    every input and passes whether or not the refusal cleaned up after itself.
+    This script is a required Windows check on every pull request, so a form
+    that cannot fail is worse here than no check at all: it reads as proof.
+    """
+
+    active = "\n".join(active_lines(contract_source))
+    for policy in (
+        'parent="$(dirname "$dir")"',
+        "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
+    ):
+        require(active, policy, "reachable Windows stage-leak check")
+
+
 def assert_install_proof_init_log_authority(first_run: str) -> None:
     """Keep the install proof's own report files out of the worktree kin init admits.
 
@@ -889,7 +909,8 @@ def assert_install_proof_windows_admission_contract(
         'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
         'fail "$1 unexpectedly succeeded" "$3"',
         'if [ -e "$2/.kin" ]; then',
-        "staged=\"$(count_matching \"$2\" '.kin.init-*')\"",
+        'parent="$(dirname "$2")"',
+        "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
     ):
         require(active, policy, "shipped Windows admission contract proof")
 
@@ -3893,6 +3914,34 @@ def main() -> None:
         install_proof, "Windows admission contract proof"
     )
     assert_install_proof_windows_admission_contract(windows_admission, windows_contract)
+    # The published-nothing half of the contract, in both files that state it.
+    # It counted stages inside the directory it admits, which is never where a
+    # stage is created, so it passed on every input in both.
+    windows_contract_source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
+    assert_windows_contract_stage_check_is_reachable(windows_contract_source)
+    expect_assertion(
+        "the contract script counts stages where one can never appear",
+        "reachable Windows stage-leak check",
+        lambda: assert_windows_contract_stage_check_is_reachable(
+            windows_contract_source.replace(
+                'staged="$(count_matching "$parent"',
+                'staged="$(count_matching "$dir"',
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "the install proof counts stages where one can never appear",
+        "shipped Windows admission contract proof",
+        lambda: assert_install_proof_windows_admission_contract(
+            windows_admission.replace(
+                'staged="$(count_matching "$parent"',
+                'staged="$(count_matching "$2"',
+                1,
+            ),
+            windows_contract,
+        ),
+    )
     expect_assertion(
         "the install proof's Windows refusal wording drifts from the contract script",
         "drifted from",
@@ -3920,7 +3969,7 @@ def main() -> None:
         ),
         (
             "a Windows refusal may leave its unpublished stage behind",
-            "staged=\"$(count_matching \"$2\" '.kin.init-*')\"",
+            "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
         ),
         (
             "a successful Windows admission stops failing the leg",
