@@ -762,11 +762,10 @@ jobs:
             fi
           done
           export PATH="$fake_agent_bin:$PATH"
+          printf '%s\n' "$fake_agent_bin" >> "$GITHUB_PATH"
 
           kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
             2>&1 | tee kin-setup.txt
-          kin setup status --json | tee kin-health.json
-          kin doctor --json | tee kin-doctor.json
 
       - name: Graph query and MCP tool-call proof
         if: runner.os != 'Windows'
@@ -814,6 +813,8 @@ jobs:
           });
           NODE
           cat kin-daemon-health.json
+          kin setup status --json | tee kin-health.json
+          kin doctor --json | tee kin-doctor.json
 
           # Drive the installed MCP stdio server through initialize, tools/list,
           # and a real graph-backed semantic_search call. Node owns the timeout
