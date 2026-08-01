@@ -215,9 +215,10 @@ mod repository_refusal_tests {
     /// Keyed on the condition sentence rather than on any call spelling, which
     /// is what makes it blind to how the refusal is raised: `ok_or_else`,
     /// `context`, `bail!`, a `match`, or a `let ... else` all carry the same
-    /// sentence and are all caught. A test that wants to assert on the refusal
-    /// asserts against `NOT_A_KIN_REPOSITORY`, so a literal copy anywhere else
-    /// is a second home for the wording by construction.
+    /// sentence and are all caught. A test that needs the whole sentence reads
+    /// it from `NOT_A_KIN_REPOSITORY` rather than repeating it, so a literal
+    /// copy anywhere else is a second home for the wording rather than an
+    /// assertion about it.
     fn refusal_wording_restated(
         root: &std::path::Path,
         canonical: &std::path::Path,

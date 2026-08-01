@@ -7781,6 +7781,10 @@ async fn pull_admitted_nothing(
             detail: "hosted snapshot authority serves no local working tree".to_string(),
         };
     }
+    // Take the same gate a transition takes, for the same reason: a read that
+    // races a concurrent commit or branch switch would see the workspace before
+    // it moved and report a tree behind that is in the middle of catching up.
+    let _coordination = state.coordination_gate.lock().await;
     let state = Arc::clone(state);
     let destination_ref = destination_ref.clone();
     // The authority read blocks, so it must not run on the executor that also
