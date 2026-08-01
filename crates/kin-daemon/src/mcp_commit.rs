@@ -25,7 +25,9 @@ use kin_model::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::local_repository_authority::LocalRepositoryAuthorityContext;
+use crate::local_repository_authority::{
+    require_fresh_daemon_workspace, LocalRepositoryAuthorityContext,
+};
 use crate::repository_commit::{
     commit_native_plan_with_projection, load_native_commit_base, load_native_source_blob,
     plan_native_commit_from_base, recover_native_commit, NativeCommitBase, NativeCommitResult,
@@ -193,7 +195,7 @@ fn commit_exact_transaction_inner(
 
     let base = load_native_commit_base(&authority_context)
         .map_err(|error| format!("load exact MCP commit base: {error}"))?;
-    require_live_graph_matches_authority(state.graph.as_ref(), &base.graph)?;
+    require_bound_authority_revision(state, &base, &transaction_id)?;
     let plan = match plan_exact_transaction(
         state,
         &authority_context,
@@ -662,17 +664,50 @@ fn persist_registry_checked(
         .map_err(|error| error.to_string())
 }
 
-fn require_live_graph_matches_authority(
-    live: &kin_db::InMemoryGraph,
-    authority: &kin_db::InMemoryGraph,
+/// Refuse an exact MCP commit unless the daemon is still bound to the authority
+/// revision this attempt is being planned against.
+///
+/// This is deliberately not a live-graph-equals-authority check. That invariant
+/// is unachievable by design: the reconcile loop publishes only the tree through
+/// the repository compare-and-swap and leaves parser semantics in the live
+/// graph, and the asynchronous LSP enrichment worker writes relations into the
+/// live graph outside the coordination gate. Both reach authority only when a
+/// change is committed, so equality held for a moment after each commit and then
+/// failed at the next enrichment tick, refusing every legitimate agent commit
+/// that followed one.
+///
+/// Equality was never what kept derived enrichment out of the published change
+/// either. [`plan_exact_transaction`] builds its prospective graph from
+/// `base.graph`, which is repository authority, and applies only the staged
+/// operations, so a derived lead in the live graph cannot reach publication no
+/// matter what this precondition says. The live graph matters after the commit
+/// instead, because [`install_authority_graph`] corrects it onto authority from
+/// the live side.
+///
+/// So what must hold is the binding, not the equality: the daemon is at the same
+/// authority generation this plan is loading, it holds no exact tree state
+/// authority has not admitted, and it has neither dropped nor rewritten anything
+/// that generation owns. That is exactly the boundary every other repository
+/// command is held to, and reusing it keeps one definition of freshness across
+/// them rather than a second, stricter one that only the MCP path can fail.
+fn require_bound_authority_revision(
+    state: &DaemonState,
+    base: &NativeCommitBase,
+    transaction_id: &str,
 ) -> Result<(), String> {
-    if semantic_workspace_matches(live, authority) {
-        return Ok(());
-    }
-    Err(
-        "daemon query graph does not match the clean repository workspace authority; refusing to absorb an unrelated dirty overlay into the MCP commit"
-            .to_string(),
+    require_fresh_daemon_workspace(
+        state,
+        &base.roots,
+        &base.graph.to_snapshot(),
+        "committing an MCP transaction",
     )
+    .map_err(|error| {
+        format!(
+            "Cannot commit transaction {transaction_id}: {error}. No repository authority moved \
+             and the staged operations are untouched, so re-send this commit unchanged once the \
+             daemon is reading current repository authority."
+        )
+    })
 }
 
 fn semantic_workspace_matches(left: &kin_db::InMemoryGraph, right: &kin_db::InMemoryGraph) -> bool {
@@ -4238,5 +4273,296 @@ mod tests {
             &authority.graph
         ));
         drop(dir);
+    }
+
+    /// Find the derived entity an enrichment tick installed into the live graph.
+    fn live_enrichment_entity(state: &Arc<DaemonState>) -> Entity {
+        state
+            .graph
+            .to_snapshot()
+            .entities
+            .values()
+            .find(|entity| entity.name == "enriched_inside_the_command_window")
+            .cloned()
+            .expect("the enrichment tick installs its anchor entity into the live graph")
+    }
+
+    /// The precondition must accept the state an ordinary agent session is
+    /// actually in.
+    ///
+    /// The enrichment worker publishes into the live query graph continuously
+    /// and those facets cross the repository compare-and-swap only when a change
+    /// is committed, so a live graph that leads authority is the normal case
+    /// between commits, not a corrupt one. A precondition demanding equality
+    /// refuses here, which is the wedge: it holds for a moment after each commit
+    /// and then fails at the next tick.
+    ///
+    /// Accepting it costs nothing, because the exact planner reads its
+    /// prospective graph from repository authority and applies only the staged
+    /// operations. This proves both halves: the commit succeeds, and the derived
+    /// lead it committed over is absent from the published authority graph.
+    #[test]
+    fn a_commit_after_an_enrichment_tick_publishes_only_its_staged_operations() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            semantic_workspace_matches(state.graph.as_ref(), &before.graph),
+            "the fixture must start from a daemon that matches authority, or this test cannot \
+             prove the enrichment tick is what the old precondition refused"
+        );
+
+        state.install_derived_enrichment();
+        let derived = live_enrichment_entity(&state);
+        let derived_relations: Vec<_> = state
+            .graph
+            .to_snapshot()
+            .relations
+            .iter()
+            .filter(|(_, relation)| relation.origin == RelationOrigin::Lsp)
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(
+            !derived_relations.is_empty(),
+            "the enrichment tick must install at least one derived relation"
+        );
+        assert!(
+            !semantic_workspace_matches(state.graph.as_ref(), &before.graph),
+            "the enrichment tick must actually put the live graph ahead of authority, or this \
+             test passes without reproducing the refusal it exists to falsify"
+        );
+
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a commit issued after an enrichment tick must not be refused: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "committed"
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation + 1);
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+        let published = after.graph.to_snapshot();
+        assert!(
+            !published.entities.contains_key(&derived.id),
+            "the published change must carry only the staged operations; the derived enrichment \
+             entity reached repository authority"
+        );
+        for relation_id in &derived_relations {
+            assert!(
+                !published.relations.contains_key(relation_id),
+                "derived relation {relation_id} reached repository authority"
+            );
+        }
+        let reparsed = after.graph.get_entity(&entity.id).unwrap().unwrap();
+        assert_ne!(
+            reparsed.fingerprint, entity.fingerprint,
+            "the staged body edit must still be what this commit published"
+        );
+    }
+
+    /// Enrich the live graph the way the LSP worker actually does: one relation
+    /// on an entity repository authority already owns, upserted under nothing
+    /// but the graph-authority epoch.
+    ///
+    /// `DaemonState::install_derived_enrichment` also adds an anchor entity, so
+    /// it diverges both domains at once. The real worker only ever adds
+    /// relations, which is the divergence an ordinary session actually carries
+    /// between commits, and it is the narrower case to prove.
+    fn install_lsp_relation_on(state: &Arc<DaemonState>, entity: &Entity) -> Relation {
+        let relation = Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Entity(entity.id),
+            confidence: 0.95,
+            origin: RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let guard = state.begin_graph_authority_mutation();
+        state.graph.upsert_relation(&relation).unwrap();
+        state.bump_version();
+        drop(guard);
+        relation
+    }
+
+    /// The same acceptance as the enrichment-tick case, in the exact shape the
+    /// LSP worker writes: relations only, on entities authority already owns.
+    #[test]
+    fn a_commit_after_an_lsp_relation_tick_publishes_only_its_staged_operations() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        assert!(semantic_workspace_matches(
+            state.graph.as_ref(),
+            &before.graph
+        ));
+
+        let derived = install_lsp_relation_on(&state, &entity);
+        assert!(
+            !semantic_workspace_matches(state.graph.as_ref(), &before.graph),
+            "an LSP relation tick must put the live graph ahead of authority, or this test \
+             proves nothing about the refusal it exists to falsify"
+        );
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a commit issued after an LSP relation tick must not be refused: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation + 1);
+        assert!(
+            !after
+                .graph
+                .to_snapshot()
+                .relations
+                .contains_key(&derived.id),
+            "the derived LSP relation must not be absorbed into the published change"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    /// The binding this precondition protects is the authority revision, so a
+    /// daemon reading an older revision than the one being planned against must
+    /// still be refused, and the refusal must name that revision gap.
+    #[test]
+    fn a_commit_planned_against_a_trailing_daemon_cursor_is_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let live_before = state.graph.compute_root_hash();
+        assert!(
+            before.roots.generation > 0,
+            "the fixture must have published at least one generation to trail"
+        );
+        let stale_generation = before.roots.generation - 1;
+        state
+            .snapshot_generation
+            .store(stale_generation, Ordering::SeqCst);
+
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+
+        assert_eq!(result.is_error, Some(true));
+        let message = result_text(&result);
+        assert!(
+            message.contains(&format!("cursor is at generation {stale_generation}"))
+                && message.contains(&format!("is at generation {}", before.roots.generation)),
+            "the refusal must name both sides of the stale revision binding: {message}"
+        );
+        assert!(
+            message.contains("reopen from repository authority"),
+            "the refusal must say what to do: {message}"
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active",
+            "a refused precondition must leave the staged operations re-sendable"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "no repository authority may move behind a refused precondition"
+        );
+        assert_eq!(state.graph.compute_root_hash(), live_before);
+    }
+
+    /// A derived lead is permitted, a derived loss is not. A daemon that has
+    /// dropped semantics repository authority owns is answering from something
+    /// other than graph truth, and the post-commit correction would be computed
+    /// from that gap, so the commit must be refused and the refusal must name
+    /// what went missing.
+    #[test]
+    fn a_commit_from_a_daemon_missing_authority_owned_semantics_is_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let authority_owned = before
+            .graph
+            .to_snapshot()
+            .entities
+            .values()
+            .find(|candidate| candidate.id == entity.id)
+            .cloned()
+            .expect("the fixture entity is owned by repository authority");
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed {
+                    old: authority_owned.clone(),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+
+        assert_eq!(result.is_error, Some(true));
+        let message = result_text(&result);
+        assert!(
+            message.contains("no longer holds the repository workspace authority")
+                && message.contains(&format!("entity {} is missing", entity.id)),
+            "the refusal must name the authority-owned semantics that went missing: {message}"
+        );
+        assert!(
+            message.contains("reopen before committing an MCP transaction"),
+            "the refusal must say what to do: {message}"
+        );
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "active"
+        );
+        assert_eq!(
+            load_native_commit_base(&state.layout).unwrap().roots,
+            before.roots,
+            "no repository authority may move behind a refused precondition"
+        );
     }
 }
