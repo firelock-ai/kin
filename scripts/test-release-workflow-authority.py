@@ -864,7 +864,7 @@ def assert_windows_public_support_contract(
         '"ARM64" { throw "No native Windows ARM64 archive is published.',
         "Not running repository setup: native Windows cannot admit a Kin repository.",
     ):
-        require(install_ps1, policy, "truthful native-Windows installer")
+        require(install_active, policy, "truthful native-Windows installer")
     if "windows-aarch64" in install_ps1:
         raise AssertionError(
             "PowerShell installer fabricates the nonexistent windows-aarch64 archive"
@@ -5005,6 +5005,26 @@ def main() -> None:
             compatibility_mcp_readme,
         ),
     )
+    for label, original in (
+        (
+            "the native installer comments out its executable support notice binding",
+            '$NativeWindowsSupportNotice = "',
+        ),
+        (
+            "the native installer comments out its visible support warning",
+            'Write-Host "  ! $NativeWindowsSupportNotice"',
+        ),
+    ):
+        expect_assertion(
+            label,
+            "truthful native-Windows installer",
+            lambda original=original: assert_windows_public_support_contract(
+                windows_contract_source,
+                install_ps1.replace(original, f"# {original}", 1),
+                windows_public_surfaces,
+                compatibility_mcp_readme,
+            ),
+        )
     expect_assertion(
         "the contract script counts stages where one can never appear",
         "reachable Windows stage-leak check",
