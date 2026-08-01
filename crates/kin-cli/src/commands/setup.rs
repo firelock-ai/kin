@@ -12931,6 +12931,8 @@ fn retire_windows_install_root(
 #[cfg(all(test, windows))]
 const WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE: &str =
     "KIN_INTERNAL_TEST_UNINSTALL_PARENT_CREATED_100NS";
+#[cfg(all(test, windows))]
+const WINDOWS_UNINSTALL_HELPER_RELEASE: &str = "KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE";
 
 #[cfg(windows)]
 fn remove_full_install_root(
@@ -13212,6 +13214,21 @@ try {
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }
 "#;
+    #[cfg(test)]
+    let script = script.replace(
+        "    $current = [Environment]::GetEnvironmentVariable('Path', 'User')",
+        r#"    $testRelease = $env:KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE
+    if (-not [string]::IsNullOrEmpty($testRelease)) {
+        $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $testRelease -PathType Leaf)) {
+            if ([DateTime]::UtcNow -ge $testReleaseDeadline) {
+                throw "timed out waiting for the native-test deferred-cleanup release"
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')"#,
+    );
     fs::write(&script_path, script).with_context(|| {
         format!(
             "failed to write deferred Windows uninstall helper {}",
@@ -14614,15 +14631,26 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         mode: &str,
         root: &Path,
         result_path: &Path,
+        helper_release: Option<&Path>,
     ) -> Result<WindowsFullUninstallChildResult> {
         let test_name =
             "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup";
-        let output = Command::new(env::current_exe()?)
+        let mut command = Command::new(env::current_exe()?);
+        command
             .args([test_name, "--exact", "--nocapture"])
             .env(WINDOWS_FULL_UNINSTALL_CHILD_MODE, mode)
             .env(WINDOWS_FULL_UNINSTALL_CHILD_ROOT, root)
             .env(WINDOWS_FULL_UNINSTALL_CHILD_RESULT, result_path)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        match helper_release {
+            Some(path) => {
+                command.env(WINDOWS_UNINSTALL_HELPER_RELEASE, path);
+            }
+            None => {
+                command.env_remove(WINDOWS_UNINSTALL_HELPER_RELEASE);
+            }
+        }
+        let output = command
             .output()
             .context("failed to launch the native Windows uninstall test child")?;
         if !output.status.success() {
@@ -14778,8 +14806,13 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let (success_seed, success_expected_path) = windows_path_fixture(&success_root);
         set_windows_user_path(Some(&success_seed))?;
         let success_result_path = fixture.path().join("success-result.json");
-        let success =
-            run_windows_full_uninstall_child("success", &success_root, &success_result_path)?;
+        let success_helper_release = fixture.path().join("success-helper-release");
+        let success = run_windows_full_uninstall_child(
+            "success",
+            &success_root,
+            &success_result_path,
+            Some(&success_helper_release),
+        )?;
         let reinstall_error = crate::commands::update::InstallRootLock::acquire(&success_root)
             .err()
             .context("a reinstall must not enter while deferred uninstall cleanup is pending")?;
@@ -14789,6 +14822,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                 || reinstall_message.contains("prior Windows Kin uninstall"),
             "pending uninstall rejected reinstall for an unexpected reason: {reinstall_message}"
         );
+        fs::write(&success_helper_release, b"continue\n")?;
         wait_for_windows_condition(
             "successful deferred uninstall",
             Duration::from_secs(45),
@@ -14843,6 +14877,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "identity-mismatch",
             &failure_root,
             &failure_result_path,
+            None,
         )?;
         wait_for_windows_condition(
             "failed deferred uninstall journal",
