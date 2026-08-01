@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Answer deps, projection healing, graph visualization, and global MCP startup from recorded truth (#561)
 - Assert the Windows admission contract the installed release actually ships (#574)
 - Record v0.4.5 as abandoned and reconcile release recovery through the shipped selector (#563)
+- Adopt released KinVFS 0.3.0 in Kin proof and runtime (#579)
+- Classify authority bind refusals on namespace identity alone (#471)
+- Let only reviewed required checks veto a release, and make a blocked one visible (#567)
 
 
 ## [0.4.5] - 2026-08-01
