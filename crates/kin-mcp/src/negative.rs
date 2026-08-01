@@ -460,6 +460,18 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
             trust_reason = "focal_not_in_graph: the focal entity was not found, so an empty \
                  neighborhood is not evidence that it is isolated"
                 .to_string();
+        } else if payload.get("depth").and_then(Value::as_u64) == Some(0) {
+            // A depth of zero expands no edges at all, so the empty result is a
+            // fact about the request and not about the entity. Certifying that
+            // as isolation would answer, from a walk that examined nothing, the
+            // question a caller asks before deleting code.
+            kind = "no_traversal";
+            subject = "no traversal was performed at depth 0, so nothing was examined \
+                 about the entity's neighbors";
+            trustworthy = false;
+            trust_reason = "depth_zero: the walk expanded no edges, so an empty neighborhood \
+                 is not evidence of isolation"
+                .to_string();
         } else if let Some(directional) = neighborhood_absence_subject(payload) {
             subject = directional;
         }
@@ -905,6 +917,7 @@ mod tests {
         json!({
             "focal_id": focal,
             "direction": direction,
+            "depth": 2,
             "entity_count": entities.len(),
             "relation_count": relations.len(),
             "entities": entities,
@@ -980,6 +993,28 @@ mod tests {
                 .contains("either direction"),
             "only a merged walk may claim both sides are empty"
         );
+    }
+
+    /// `depth: 0` expands no edges at all, so the empty result describes the
+    /// request rather than the entity. Reading it as authoritative isolation
+    /// would answer, off a walk that examined nothing, the question a caller
+    /// asks before deleting code.
+    #[test]
+    fn neighborhood_at_depth_zero_never_certifies_absence() {
+        let mut payload = neighborhood_payload("both", 0);
+        payload["depth"] = json!(0);
+        let negative = negative_for("graph_neighborhood", &payload, &structural_ready_envelope())
+            .expect("depth zero must still be qualified rather than left bare");
+        assert_eq!(negative["kind"], json!("no_traversal"));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a walk that expanded no edges cannot certify isolation"
+        );
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("depth_zero"));
     }
 
     /// `limit: 0` empties the edge array of a neighborhood that really has

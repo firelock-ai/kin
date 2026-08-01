@@ -4058,6 +4058,33 @@ mod tests {
         );
     }
 
+    /// At depth 0 the frontier is dropped before a single edge is read, so the
+    /// empty neighborhood describes the request and not the entity. The focal
+    /// here has a dependent and a dependency, and neither is looked at.
+    #[test]
+    fn graph_neighborhood_at_depth_zero_does_not_certify_isolation() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("depth".to_string(), serde_json::json!(0));
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert_eq!(response["relation_count"], 0);
+        assert_eq!(response["negative"]["kind"], "no_traversal");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an entity with both a caller and a callee must never be certified isolated: {}",
+            response["negative"]
+        );
+    }
+
     /// The declared tool schema must offer the parameter the handler honors,
     /// and the description must claim the direction the traversal delivers.
     #[test]
