@@ -77,6 +77,7 @@ BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
 BASE_IMAGE_MIRROR_INPUT = "buildkitd-config-inline:"
 BASE_IMAGE_PIN = re.compile(r"(?m)^FROM\s+(?P<reference>\S+)")
 SETUP_BUILDX_ACTION = "docker/setup-buildx-action@"
+BASE_IMAGE_PINS = WORKFLOWS / "base-image-pins.yml"
 RUST_CACHE_ACTION = "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 MAIN_ONLY_CACHE_SAVE = "save-if: ${{ github.ref == 'refs/heads/main' }}"
 MAIN_ONLY_CACHE_SAVE_VALUE = "${{ github.ref == 'refs/heads/main' }}"
@@ -2794,6 +2795,85 @@ def assert_container_base_image_authority(
             require(mirror_input, needle, f"{label}:{job} base image mirror")
 
 
+def assert_pin_prover_cannot_refuse_a_release(pins_workflow: str) -> None:
+    """Keep the scheduled pin prover unable to red the sha it runs against.
+
+    A `schedule` run's check-runs land on the default branch HEAD, and the
+    release sweep treats anything but success, skipped or neutral as a terminal
+    refusal. This job therefore must not conclude on what it finds. That held by
+    accident once and then stopped holding, because a `run:` step is executed by
+    `bash -e {0}` and the step's own `set -o pipefail` is what armed errexit
+    against the prover's non-zero status. The remedy read correctly and did
+    nothing for a full review round, so the properties it depends on are pinned
+    here rather than left to the next reader to re-derive.
+    """
+
+    verify = job_step_active_lines(pins_workflow, "verify-pins", "id: verify")
+    shell = next(
+        (line for line in verify if line.strip().startswith("shell:")),
+        None,
+    )
+    if shell is None:
+        raise AssertionError(
+            "the pin prover step must declare its shell explicitly; the default "
+            "carries -e, which kills the step on the prover status it exists to "
+            "capture"
+        )
+    if re.search(r"(?<![\w-])-\w*e", shell.split("shell:", 1)[1]) is not None:
+        raise AssertionError(
+            f"the pin prover step's shell must not carry errexit: {shell.strip()}"
+        )
+    for policy in ("set +e", "exit 0"):
+        require(
+            "\n".join(verify),
+            policy,
+            "pin prover step that must not conclude on what it finds",
+        )
+
+    checkout = job_step_active_lines(pins_workflow, "verify-pins", "actions/checkout@")
+    require(
+        "\n".join(checkout),
+        "continue-on-error: true",
+        "pin prover checkout, whose failure would fail the job regardless of "
+        "the guard below it",
+    )
+
+
+def job_step_active_lines(workflow: str, job: str, marker: str) -> list[str]:
+    """Return the active lines of the step in `job` that contains `marker`."""
+
+    block = workflow_job_blocks(workflow).get(job)
+    if block is None:
+        raise AssertionError(f"workflow no longer declares the {job} job")
+    lines = block.splitlines()
+    hits = [
+        index
+        for index, line in enumerate(lines)
+        if marker in line and not line.lstrip().startswith("#")
+    ]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"{job} must contain exactly one step matching {marker!r}, "
+            f"found {len(hits)}"
+        )
+    start = hits[0]
+    while start >= 0 and re.match(r"^\s*-\s", lines[start]) is None:
+        start -= 1
+    if start < 0:
+        raise AssertionError(f"{job} step matching {marker!r} has no step start")
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+    active = [lines[start]]
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= step_indent:
+            break
+        if line.lstrip().startswith("#"):
+            continue
+        active.append(line)
+    return active
+
+
 def comment_out_mirror_input(workflow: str) -> str:
     """Comment out the buildx mirror input while leaving its text in the file."""
 
@@ -3754,6 +3834,58 @@ def main() -> None:
         )
 
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    # P3-4's content landed without a guard, so a deliberate deletion of the
+    # index refresh was invisible to the suite.
+    require(
+        ci_jobs["check"],
+        "sudo apt-get update",
+        "aarch64 release-target compile guard apt index refresh",
+    )
+
+    base_image_pins = BASE_IMAGE_PINS.read_text(encoding="utf-8")
+    assert_pin_prover_cannot_refuse_a_release(base_image_pins)
+    expect_assertion(
+        "the pin prover step loses its explicit errexit-free shell",
+        "must declare its shell explicitly",
+        lambda: assert_pin_prover_cannot_refuse_a_release(
+            re.sub(r"(?m)^\s+shell: bash --noprofile --norc \{0\}\n", "", base_image_pins)
+        ),
+    )
+    expect_assertion(
+        "the pin prover step's shell is given errexit back",
+        "must not carry errexit",
+        lambda: assert_pin_prover_cannot_refuse_a_release(
+            base_image_pins.replace(
+                "shell: bash --noprofile --norc {0}",
+                "shell: bash --noprofile --norc -e {0}",
+            )
+        ),
+    )
+    expect_assertion(
+        "the pin prover step stops disarming errexit in its own body",
+        "missing required policy: set +e",
+        lambda: assert_pin_prover_cannot_refuse_a_release(
+            base_image_pins.replace("          set +e\n", "")
+        ),
+    )
+    expect_assertion(
+        "the pin prover step stops forcing a green conclusion",
+        "missing required policy: exit 0",
+        lambda: assert_pin_prover_cannot_refuse_a_release(
+            base_image_pins.replace("          exit 0\n", "")
+        ),
+    )
+    expect_assertion(
+        "a failed checkout is allowed to fail the pin prover job",
+        "missing required policy: continue-on-error: true",
+        lambda: assert_pin_prover_cannot_refuse_a_release(
+            base_image_pins.replace(
+                "      - name: Checkout\n        continue-on-error: true\n",
+                "      - name: Checkout\n",
+            )
+        ),
+    )
+
     assert_container_base_image_authority(dockerfile, docker_workflow, release)
     expect_assertion(
         "a floating base image tag reaches the release container",
