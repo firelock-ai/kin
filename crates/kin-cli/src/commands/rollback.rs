@@ -115,8 +115,8 @@ impl std::fmt::Display for WorkItemRollbackRefusal {
             ),
             Self::HistoryWindowExhausted => write!(
                 f,
-                "the earliest change this work item records is further back than the {} changes \
-                 read; roll back to an explicit change instead",
+                "not every change this work item records was found within the {} changes read, so \
+                 the branch line cannot be decided; roll back to an explicit change instead",
                 WORK_ITEM_HISTORY_WINDOW
             ),
         }
