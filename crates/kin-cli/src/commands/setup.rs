@@ -12754,8 +12754,8 @@ where
 fn cleanup_windows_user_path(root: &Path, requested_root: &Path) -> Result<()> {
     let script = r#"$ErrorActionPreference = 'Stop'
 $bins = @(
-    [IO.Path]::GetFullPath((Join-Path $env:KIN_UNINSTALL_ROOT 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
-    [IO.Path]::GetFullPath((Join-Path $env:KIN_UNINSTALL_PATH_ROOT 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath([IO.Path]::Combine($env:KIN_UNINSTALL_ROOT, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath([IO.Path]::Combine($env:KIN_UNINSTALL_PATH_ROOT, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
 ) | Select-Object -Unique
 $current = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($null -ne $current) {
@@ -13136,11 +13136,11 @@ public static class KinUninstallIdentity {
     }
 }
 '@
-$root = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_ROOT)
-$pathRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_PATH_ROOT)
+$installRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_ROOT)
+$requestedInstallRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_PATH_ROOT)
 $bins = @(
-    [IO.Path]::GetFullPath((Join-Path $root 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
-    [IO.Path]::GetFullPath((Join-Path $pathRoot 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath([IO.Path]::Combine($installRoot, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath([IO.Path]::Combine($requestedInstallRoot, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
 ) | Select-Object -Unique
 $pidToWait = [int]$env:KIN_UNINSTALL_PID
 $expectedParentCreation = [UInt64]$env:KIN_UNINSTALL_PARENT_CREATED_100NS
@@ -13186,7 +13186,7 @@ try {
     if ([KinUninstallIdentity]::Read($retired) -ne $expectedIdentity) {
         throw "retired Kin root identity changed; preserving $retired"
     }
-    $deleteRoot = Join-Path ([IO.Path]::GetDirectoryName($retired)) ('.kin-uninstall-delete-' + [Guid]::NewGuid().ToString())
+    $deleteRoot = [IO.Path]::Combine([IO.Path]::GetDirectoryName($retired), ('.kin-uninstall-delete-' + [Guid]::NewGuid().ToString()))
     [IO.Directory]::Move($retired, $deleteRoot)
     if ([KinUninstallIdentity]::Read($deleteRoot) -ne $expectedIdentity) {
         throw "retired Kin root changed during private deletion rename; preserving $deleteRoot"
