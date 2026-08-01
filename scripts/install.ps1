@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Kin installer for Windows — one command to install the full semantic development environment.
+# Kin installer for Windows — installs the repository-free native CLI surface.
 #
 # Usage:
 #   irm https://get.kinlab.dev/install.ps1 | iex
@@ -10,12 +10,12 @@
 #   $env:KIN_VERSION = "0.1.0"   Pin a specific version (default: latest)
 #   $env:KIN_HOME = "$HOME\.kin" Install directory (preferred; default: ~/.kin)
 #   $env:KIN_DIR = "$HOME\.kin"  Install directory compatibility alias
-#   $env:KIN_NO_SETUP = "1"     Skip interactive setup after install
+#   $env:KIN_NO_SETUP = "1"     CI compatibility; native repository setup is always skipped
 #   $env:KIN_BASE_URL = "..."   Install from a mirror (CI smoke tests / offline)
 #
-# Note: the native Windows build is a supported vector-free runtime for graph,
-# lexical, daemon, setup, and MCP workflows. Vector similarity and filesystem
-# projection are unsupported; use WSL2 for the complete experience.
+# Native Windows cannot currently admit a repository. The executable refusal
+# contract in scripts/assert-windows-init-contract.sh owns the exact public
+# support notice copied below; release authority fails if the copies drift.
 
 $ErrorActionPreference = "Stop"
 
@@ -43,6 +43,31 @@ $BaseUrl = if ($env:KIN_BASE_URL) { $env:KIN_BASE_URL } else { "https://github.c
 function Write-Info  { Write-Host "  -> $args" -ForegroundColor Cyan }
 function Write-Ok    { Write-Host "  [ok] $args" -ForegroundColor Green }
 function Write-Err   { Write-Host "  [error] $args" -ForegroundColor Red }
+
+$NativeWindowsSupportNotice = "Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories."
+
+function Resolve-KinWindowsArchiveArchitecture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ProcessArchitecture,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$Is64BitProcess
+    )
+
+    if (-not $Is64BitProcess) {
+        throw "32-bit PowerShell is not supported. Re-run from x64 PowerShell or use WSL2."
+    }
+
+    switch ($ProcessArchitecture.ToUpperInvariant()) {
+        # Windows-on-ARM reports AMD64 to an x64 PowerShell process, which is
+        # exactly the emulation lane the published x86_64 archive supports.
+        "AMD64" { return "x86_64" }
+        "ARM64" { throw "No native Windows ARM64 archive is published. Use WSL2, or run x64 PowerShell under Windows x64 emulation to install the x86_64 archive." }
+        default { throw "Unsupported Windows process architecture '$ProcessArchitecture'. Use x64 PowerShell or WSL2." }
+    }
+}
 
 function Resolve-ArchiveChecksum {
     param(
@@ -97,10 +122,13 @@ function Resolve-ArchiveChecksum {
 
 # ── Detect architecture ─────────────────────────────────────────────────
 
-$Arch = if ([Environment]::Is64BitOperatingSystem) {
-    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
-} else {
-    Write-Err "32-bit systems are not supported"
+$Arch = $null
+try {
+    $Arch = Resolve-KinWindowsArchiveArchitecture `
+        -ProcessArchitecture ([string]$env:PROCESSOR_ARCHITECTURE) `
+        -Is64BitProcess ([Environment]::Is64BitProcess)
+} catch {
+    Write-Err $_.Exception.Message
     exit 1
 }
 
@@ -109,19 +137,15 @@ $Target = "windows-$Arch"
 Write-Host ""
 Write-Host "  Kin Installer" -ForegroundColor Cyan -NoNewline
 Write-Host " (Windows)" -ForegroundColor DarkGray
-Write-Host "  Semantic development environment"
+Write-Host "  Repository-free CLI diagnostics"
 Write-Host ""
 
 Write-Info "Platform: windows ($Arch)"
 
-# The native Windows binary is a supported subset: it is vector-free
-# (semantic vector similarity disabled) and does NOT provide the transparent filesystem
-# projection. Projection relies on Unix library-injection (LD_PRELOAD /
-# DYLD_INSERT_LIBRARIES), which native Windows does not offer. For the complete,
-# vector-enabled Kin with working projection, install under WSL2 instead — see
-# docs/windows-wsl2.md.
-Write-Host "  ! Native Windows supports graph + lexical workflows; vector similarity and filesystem projection are unavailable." -ForegroundColor Yellow
-Write-Host "    For the full experience, install under WSL2 (see docs/windows-wsl2.md)." -ForegroundColor DarkGray
+# The notice is intentionally complete rather than a vague "smaller subset":
+# without repository admission there is no supported native graph workflow.
+Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow
+Write-Host "    Details: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor DarkGray
 Write-Host ""
 
 # ── Detect an existing install (reinstall / upgrade) ──────────────────
@@ -216,9 +240,9 @@ New-Item -ItemType Directory -Path $KinLib -Force | Out-Null
 
 Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
 
-# kin-daemon is mandatory — kin status/search and the MCP server all require it.
-# Assert it is present BEFORE moving anything so a daemon-less archive aborts
-# cleanly instead of leaving a half-installed environment.
+# kin-daemon remains a mandatory release component even though repository-backed
+# daemon workflows are unavailable on native Windows today. Assert the archive
+# shape before moving anything so every install stays exact and upgrade-safe.
 if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
     Write-Err "kin-daemon.exe missing from the downloaded archive. Refusing a daemon-less install."
     exit 1
@@ -294,10 +318,11 @@ if (Test-Path $KinExe) {
 
 if ($env:KIN_NO_SETUP -eq "1") {
     Write-Host ""
-    Write-Info "Skipping setup (KIN_NO_SETUP=1). Run 'kin setup' when ready."
+    Write-Info "Skipping repository-free setup diagnostics (KIN_NO_SETUP=1)."
 } else {
     Write-Host ""
-    & $KinExe setup
+    Write-Info "Not running repository setup: native Windows cannot admit a Kin repository."
+    Write-Info "Install inside WSL2 before configuring repository or MCP workflows."
 }
 
 # ── Cleanup ─────────────────────────────────────────────────────────────
@@ -305,5 +330,6 @@ if ($env:KIN_NO_SETUP -eq "1") {
 Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
-Write-Ok "Done! Restart your terminal to get started."
+Write-Ok "Done! Restart your terminal to use repository-free CLI diagnostics."
+Write-Host "  Use WSL2 for Kin repository workflows: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor Yellow
 Write-Host ""

@@ -34,18 +34,19 @@ and the release includes an aggregate manifest binding the Kin and pinned
 binary hash. GitHub signs an artifact attestation over the final archives and
 aggregate manifest before the prerelease is created.
 
-The Windows archive is a release-blocking target. It ships the supported
-vector-free runtime: graph, lexical, daemon, setup, and MCP surfaces are present,
-while vector similarity and local embedding are reported explicitly as
-unsupported. Windows VFS projection is also not shipped. The archive is
-checksum-protected and GitHub-attested, but is not OS-code-signed by this pipeline.
+The Windows archive is a release-blocking target. Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+The archive is vector-free, checksum-protected, and GitHub-attested, but it is
+not OS-code-signed by this pipeline. Windows VFS projection is not shipped.
 
 Every tag is first published as a non-latest prerelease. The anonymous install
 proof installs all five archives (Linux x86_64/aarch64, macOS x86_64/aarch64,
-and Windows x86_64), verifies the GitHub attestation plus exact tag/commit/lock
-provenance, and exercises a fresh repository, graph search/locate, MCP
-initialize/list/call, and all supported agent configuration writers. The four
-Unix legs additionally make the source file unreadable on raw disk, then require
+and Windows x86_64) and verifies the GitHub attestation plus exact
+tag/commit/lock provenance. The four Unix legs exercise a fresh repository,
+graph search/locate, MCP initialize/list/call, and supported agent configuration
+writers. The Windows leg instead requires both `kin init` boundaries to refuse
+without publishing a repository, then proves the remaining repository-free CLI
+diagnostics and setup writers. The four Unix legs additionally make the source
+file unreadable on raw disk, then require
 the installed VFS shim and real Kin daemon to return the exact graph-owned bytes.
 That probe also calls `fstat` on stdout before opening the workspace path, which
 guards the Linux AArch64 passthrough ABI. The same legs build embeddings and

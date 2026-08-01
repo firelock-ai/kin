@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Public install proof: verifies the release works end-to-end from a clean
-# environment on every supported OS. Anonymous only — no checkout, no secrets,
-# no registry auth — exactly what a first-time user runs. Exercises the real
-# `get.kinlab.dev` installer, the GitHub-release artifacts + checksum
-# verification, and a post-install daemon/setup health smoke.
+# Public install proof: verifies the complete repository workflow on Unix and
+# the explicit repository-free refusal contract on native Windows. Anonymous
+# only — no checkout, no secrets, no registry auth — exactly what a first-time
+# user downloads. Exercises the real `get.kinlab.dev` installer and public
+# GitHub-release artifacts with checksum and provenance verification.
 name: Install Proof
 
 on:

@@ -1,9 +1,12 @@
 # Windows: use WSL2
 
-Kin's complete vector-enabled/projection platforms are **Linux and macOS**.
-Native Windows is a supported vector-free subset for graph, lexical, daemon,
-setup, and MCP workflows. For the complete experience, use **WSL2 (Windows
-Subsystem for Linux 2)** running a Linux distribution.
+Kin repository workflows are supported on **Linux and macOS**. Native Windows
+currently has no repository-admission path.
+
+Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+
+Use **WSL2 (Windows Subsystem for Linux 2)** running a Linux distribution for
+the supported Windows-hosted experience.
 
 ## Why WSL2 and not native Windows
 
@@ -13,10 +16,13 @@ Two parts of Kin are built around Unix runtime mechanics:
   calls via `LD_PRELOAD` (Linux) / `DYLD_INSERT_LIBRARIES` (macOS). That
   interception model does not exist on native Windows, so the "any tool sees
   graph-backed files as normal files" experience is Linux/macOS only.
-- **Semantic vector search** ships enabled on Linux/macOS. The native Windows
-  CLI artifact (`kin-windows-x86_64.zip`) is built **vector-free**
-  (`--no-default-features`). It is supported for the non-vector product surface,
-  but it is not the full product surface.
+- **Repository admission** currently fails closed on native Windows before a
+  `.kin` repository is published. Without an admitted repository, graph,
+  lexical, daemon/query, repository setup, MCP, and review flows have no
+  supported native-Windows starting point.
+- **Semantic vector search** ships enabled on Linux/macOS. The repository-free
+  native Windows CLI artifact (`kin-windows-x86_64.zip`) is built vector-free
+  (`--no-default-features`).
 
 Running under WSL2 gives you the complete, vector-enabled Kin with working
 filesystem projection and the same behavior the project tests and benchmarks
@@ -60,7 +66,7 @@ against.
    than under `/mnt/c`; cross-OS filesystem access through `/mnt/*` is
    noticeably slower and does not support the projection layer cleanly.
 
-## Native Windows binary (supported subset)
+## Native Windows binary (repository-free only)
 
 If you only need the core CLI and cannot use WSL2, install with PowerShell:
 
@@ -68,14 +74,13 @@ If you only need the core CLI and cannot use WSL2, install with PowerShell:
 irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
-The installer prints the limitation up front, verifies the download's SHA-256
-checksum, and still requires `kin-daemon` (it aborts on a daemon-less archive).
-The native `kin-windows-x86_64.zip` it installs is **vector-free** (semantic
-vector similarity disabled) and does **not** provide the transparent filesystem projection:
-projection relies on Unix library injection (`LD_PRELOAD` /
-`DYLD_INSERT_LIBRARIES`), which native Windows does not offer. Windows projection
-is planned via ProjFS — an optional feature started by an explicit daemon init,
-not injected by the shell hook — so on native Windows the `vfs_projection` health
-check reports **unsupported** rather than healthy. The graph, lexical, daemon,
-setup, and MCP surfaces are release-tested; WSL2 remains the recommended path
-when vector similarity or transparent projection is required.
+The installer prints the admission limitation before downloading, verifies the
+download's SHA-256 checksum, and installs the x86_64 CLI release shape. It does
+not run repository setup or claim a usable native repository. The archive is
+vector-free and does not provide transparent filesystem projection; native
+Windows health reports repository, daemon, semantic-query, and VFS readiness as
+missing or unsupported.
+
+No native Windows ARM64 archive is published. Use WSL2, or run x64 PowerShell
+under Windows x64 emulation to install the x86_64 archive for repository-free
+diagnostics. WSL2 remains required for usable Kin repository workflows.

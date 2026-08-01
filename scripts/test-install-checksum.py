@@ -91,6 +91,9 @@ def check_product_wiring() -> None:
         "$Filename -cne $ArchiveName",
         "$UniqueHashes.Count -gt 1",
         "Resolve-ArchiveChecksum -ChecksumContent $ChecksumContent -ArchiveName $Archive",
+        "function Resolve-KinWindowsArchiveArchitecture",
+        '"AMD64" { return "x86_64" }',
+        '"ARM64" { throw "No native Windows ARM64 archive is published.',
     )
     for requirement in installer_requirements:
         if requirement not in installer:

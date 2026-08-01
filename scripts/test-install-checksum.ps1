@@ -32,7 +32,20 @@ if ($null -eq $FunctionAst) {
     throw "Resolve-ArchiveChecksum was not found in install.ps1"
 }
 
+$ArchitectureFunctionAst = $InstallerAst.Find(
+    {
+        param($Node)
+        $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $Node.Name -ceq "Resolve-KinWindowsArchiveArchitecture"
+    },
+    $true
+)
+if ($null -eq $ArchitectureFunctionAst) {
+    throw "Resolve-KinWindowsArchiveArchitecture was not found in install.ps1"
+}
+
 . ([ScriptBlock]::Create($FunctionAst.Extent.Text))
+. ([ScriptBlock]::Create($ArchitectureFunctionAst.Extent.Text))
 $Fixtures = Get-Content $FixturesPath -Raw | ConvertFrom-Json
 $Passed = 0
 
@@ -70,4 +83,35 @@ foreach ($Case in $Fixtures.cases) {
     Write-Host "PASS: $($Case.name)"
 }
 
-Write-Host "$Passed checksum fixture cases passed"
+$ResolvedX64 = Resolve-KinWindowsArchiveArchitecture `
+    -ProcessArchitecture "AMD64" `
+    -Is64BitProcess $true
+if ($ResolvedX64 -cne "x86_64") {
+    throw "AMD64 PowerShell resolved '$ResolvedX64', expected the published x86_64 archive"
+}
+
+$Arm64Failure = $null
+try {
+    Resolve-KinWindowsArchiveArchitecture `
+        -ProcessArchitecture "ARM64" `
+        -Is64BitProcess $true | Out-Null
+} catch {
+    $Arm64Failure = $_.Exception.Message
+}
+if ($null -eq $Arm64Failure -or -not $Arm64Failure.Contains("No native Windows ARM64 archive is published")) {
+    throw "native ARM64 PowerShell must fail before fabricating an archive URL; got '$Arm64Failure'"
+}
+
+$X86Failure = $null
+try {
+    Resolve-KinWindowsArchiveArchitecture `
+        -ProcessArchitecture "x86" `
+        -Is64BitProcess $false | Out-Null
+} catch {
+    $X86Failure = $_.Exception.Message
+}
+if ($null -eq $X86Failure -or -not $X86Failure.Contains("32-bit PowerShell is not supported")) {
+    throw "32-bit PowerShell must fail before selecting an archive; got '$X86Failure'"
+}
+
+Write-Host "$Passed checksum fixture cases and the Windows target contract passed"
