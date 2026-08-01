@@ -809,6 +809,13 @@ jobs:
           non_failing_optional = {"success", "skipped", "neutral"}
           errors = []
           pending = []
+          # Everything the gate declines to treat as a veto. Reported once, on
+          # the pass that admits the release, so a mint is never quiet about
+          # what it chose to look past.
+          degraded_producers = []
+          downgraded = []
+          discounted = []
+          unwaited = []
 
           if required != list(expected_provenance):
               errors.append("required check order does not match its provenance contract")
@@ -969,29 +976,107 @@ jobs:
                       f"(status={workflow.get('status')})"
                   )
               elif workflow.get("conclusion") != "success":
-                  errors.append(
-                      f"required check workflow not green: {name} "
-                      f"(conclusion={workflow.get('conclusion')})"
+                  # The producing run carries jobs beyond the release-critical
+                  # ones, so its aggregate conclusion is not a release verdict.
+                  # A red coverage or npm-launcher job turns the whole ci.yml
+                  # run red and would otherwise veto through every required
+                  # context that run produces, which is the same defect the
+                  # sweep below stopped committing per check-run. This
+                  # context's own conclusion is judged directly above; record
+                  # the producer so admitting over it is never silent.
+                  degraded_producers.append(
+                      (
+                          workflow.get("path"),
+                          workflow.get("id"),
+                          workflow.get("conclusion"),
+                      )
                   )
+
+          # A check-run is this release's evidence only when its producing
+          # workflow run is the landing push on the release branch. The merge
+          # queue builds the same workflows at this exact sha on its own ref,
+          # and for a solo queue entry the speculative sha IS the landing sha,
+          # so a queue job the queue never waited for concludes after the merge
+          # on the commit being released, having gated nothing. Gate 1 already
+          # discounts those for required contexts. The sweep discounts them the
+          # same way instead of letting one poison the mint.
+          evidence_workflows = set()
+          for workflow in workflow_runs:
+              if (
+                  workflow.get("event") == "push"
+                  and workflow.get("head_branch") == release_branch
+              ):
+                  evidence_workflows.add(
+                      (workflow.get("workflow_id"), workflow.get("path"))
+                  )
+          required_names = set(required)
 
           for run in check_runs:
               name = run["name"]
               # Exclude only this exact workflow identity's tag-mint attempts,
-              # including a prior refusal on the same SHA. A same-name check
-              # from another workflow remains visible and must be green.
+              # including a prior refusal on the same SHA.
               if (
                   name == "Mint release tag"
                   and run.get("check_suite_id") in release_tag_suite_ids
               ):
                   continue
-              if run["status"] != "completed":
-                  pending.append(
-                      f"check still in progress: {name} (status={run['status']})"
-                  )
-              elif run["conclusion"] not in non_failing_optional:
+              producers = workflows_by_suite.get(run.get("check_suite_id"), [])
+              producer = producers[0] if len(producers) == 1 else None
+              if name == "Mint release tag":
+                  # The mint's own job name from a producer that is not the
+                  # reviewed release-tag workflow. Never release evidence and
+                  # never merely advisory: a second writer of this name is an
+                  # authority conflict whatever it concluded.
                   errors.append(
-                      f"check not green: {name} "
-                      f"(conclusion={run['conclusion']})"
+                      f"release-tag job name claimed by another producer: {name} "
+                      f"(suite={run.get('check_suite_id')}, "
+                      f"conclusion={run.get('conclusion')})"
+                  )
+                  continue
+              if producer is None:
+                  origin = (
+                      "no unique workflow run for suite "
+                      f"{run.get('check_suite_id')}"
+                  )
+              else:
+                  origin = (
+                      f"{producer.get('path')} run {producer.get('id')} "
+                      f"({producer.get('event')} on {producer.get('head_branch')})"
+                  )
+              is_evidence = (
+                  producer is not None
+                  and producer.get("event") == "push"
+                  and producer.get("head_branch") == release_branch
+              )
+              if not is_evidence:
+                  discounted.append(
+                      {
+                          "name": name,
+                          "origin": origin,
+                          "twin": producer is not None
+                          and (
+                              producer.get("workflow_id"),
+                              producer.get("path"),
+                          )
+                          in evidence_workflows,
+                          "status": run.get("status"),
+                          "conclusion": run.get("conclusion"),
+                      }
+                  )
+                  continue
+              if name in required_names:
+                  # Already judged in full above against its exact provenance.
+                  # Judging it again by name here is what let a queue-side
+                  # namesake decide a release.
+                  continue
+              if run["status"] != "completed":
+                  # Its verdict cannot veto this release, so waiting for one
+                  # would only give a hung advisory job a second way to burn
+                  # the mint once the retry budget runs out.
+                  unwaited.append(f"{name} (status={run['status']})")
+              elif run["conclusion"] not in non_failing_optional:
+                  downgraded.append(
+                      f"{name} (conclusion={run['conclusion']}, from {origin})"
                   )
 
           if errors:
@@ -1005,11 +1090,61 @@ jobs:
                   print(f"  - {item}")
               sys.exit(2)
 
-          print(
+          # The release is admissible. Everything the gate declined to treat as
+          # a veto is announced here, on the one pass that admits it, so a
+          # release is never quietly minted from a commit carrying a red that
+          # nobody was told about. Announcing on the retry passes instead would
+          # repeat every line up to sixty times and train the reader to skip it.
+          announcements = []
+          for path, run_id, conclusion in sorted(set(degraded_producers)):
+              announcements.append(
+                  "admitting over a producing run that concluded "
+                  f"{conclusion}: {path} run {run_id}; every required context "
+                  "it produces is green"
+              )
+          for item in downgraded:
+              announcements.append(
+                  f"admitting over a red check no required context covers: {item}"
+              )
+          for entry in discounted:
+              if (
+                  entry["status"] == "completed"
+                  and entry["conclusion"] not in non_failing_optional
+              ):
+                  announcements.append(
+                      "discounting a red check that is not this release's "
+                      f"evidence: {entry['name']} "
+                      f"(conclusion={entry['conclusion']}, from {entry['origin']}); "
+                      + (
+                          "the landing push build on the release branch is the "
+                          "evidence"
+                          if entry["twin"]
+                          else "it has no build on the release branch at this sha"
+                      )
+                  )
+          for line in announcements:
+              print(f"::warning::{line}")
+          for item in unwaited:
+              print(
+                  "::notice::not waiting for a check no required context "
+                  f"covers: {item}"
+              )
+
+          verdict = (
               f"verified {len(required)} required checks against their workflow "
-              f"provenance; {len(check_runs)} total checks, none failing or in "
-              "progress"
+              f"provenance; {len(check_runs)} check-runs on the sha, "
+              f"{len(discounted)} not this release's evidence, "
+              f"{len(downgraded)} red and covered by no required context, "
+              f"{len(unwaited)} unfinished and not waited for"
           )
+          print(verdict)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as handle:
+                  handle.write("### Release check verification\n\n")
+                  handle.write(f"{verdict}\n")
+                  for line in announcements:
+                      handle.write(f"\n- {line}\n")
           PY
             status=$?
             set -e

@@ -2389,6 +2389,39 @@ def assert_release_check_accepted(
             f"{check_name}={conclusion}: {result.stdout}{result.stderr}"
         )
 
+def assert_release_gate_admits(
+    source: str,
+    label: str,
+    expected: tuple[str, ...],
+    mutate_fixture: Callable[
+        [
+            list[dict[str, object]],
+            list[dict[str, object]],
+            dict[str, object],
+        ],
+        None,
+    ],
+) -> None:
+    """Require a fixture to be admitted, and to announce what it admitted over.
+
+    A downgrade that is not announced is worse than the refusal it replaces, so
+    admission and announcement are asserted together and never separately.
+    """
+
+    result = execute_release_check_gate(source, {}, mutate_fixture=mutate_fixture)
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        raise AssertionError(
+            f"release gate refused an admissible fixture: {label}: {output}"
+        )
+    for needle in expected:
+        if needle not in output:
+            raise AssertionError(
+                f"release gate admitted {label} silently, expected {needle!r}: "
+                f"{output}"
+            )
+
+
 def run_tag_selector(
     manifest: str,
     candidates: str,
@@ -5899,8 +5932,27 @@ def main() -> None:
     assert_release_gate_fixture_rejected(
         release_gate,
         "same-name tag check from another workflow is not self-excluded",
-        "check not green: Mint release tag (conclusion=failure)",
+        "release-tag job name claimed by another producer: Mint release tag",
         add_external_mint_failure,
+    )
+
+    def add_external_mint_success(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """A green namesake is the same authority conflict as a red one."""
+
+        add_external_mint_failure(check_runs, workflow_runs, current_run)
+        for run in check_runs:
+            if run["name"] == "Mint release tag" and run["id"] == 8_101:
+                run["conclusion"] = "success"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "green same-name tag check from another workflow is admitted",
+        "release-tag job name claimed by another producer: Mint release tag",
+        add_external_mint_success,
     )
 
     def add_higher_id_success_collision(
@@ -6068,6 +6120,199 @@ def main() -> None:
                 f"producer: {name}: {queue_only_fixture.stdout}"
                 f"{queue_only_fixture.stderr}"
             )
+
+    def non_required_check(
+        name: str,
+        suite_id: int,
+        check_id: int,
+        *,
+        status: str = "completed",
+        conclusion: str | None = "failure",
+    ) -> dict[str, object]:
+        return {
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "id": check_id,
+            "app_id": GITHUB_ACTIONS_APP_ID,
+            "app_slug": "github-actions",
+            "check_suite_id": suite_id,
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+        }
+
+    def add_red_queue_job_after_landing(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """The queue's own build reds on the landing sha, after the merge.
+
+        A solo queue entry's speculative sha IS the landing sha, so a
+        merge_group job no ruleset required keeps running past the merge and
+        concludes on the exact commit being released.
+        """
+
+        add_merge_queue_producer(check_runs, workflow_runs, current_run)
+        check_runs.append(
+            non_required_check("Windows authority tests", 201, 30_001)
+        )
+
+    assert_release_gate_admits(
+        release_gate,
+        "a merge_group job the queue never waited for concluded red",
+        (
+            "discounting a red check that is not this release's evidence: "
+            "Windows authority tests",
+            "the landing push build on the release branch is the evidence",
+        ),
+        add_red_queue_job_after_landing,
+    )
+
+    def add_red_queue_only_job(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A red job from a workflow that never builds the release branch."""
+
+        workflow_runs.append(
+            {
+                "id": 30_100,
+                "workflow_id": 400_200,
+                "path": ".github/workflows/queue-only.yml",
+                "event": "merge_group",
+                "head_branch": "gh-readonly-queue/main/pr-2-" + "0" * 40,
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "failure",
+                "check_suite_id": 302,
+            }
+        )
+        check_runs.append(non_required_check("Queue-only smoke", 302, 30_101))
+
+    assert_release_gate_admits(
+        release_gate,
+        "a red job that only ever runs inside the queue",
+        (
+            "discounting a red check that is not this release's evidence: "
+            "Queue-only smoke",
+            "it has no build on the release branch at this sha",
+        ),
+        add_red_queue_only_job,
+    )
+
+    def add_red_non_required_push_job(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A registry blip reds a landing-push job no ruleset requires."""
+
+        workflow_runs.append(
+            {
+                "id": 31_000,
+                "workflow_id": 400_300,
+                "path": ".github/workflows/docker.yml",
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "failure",
+                "check_suite_id": 303,
+            }
+        )
+        check_runs.append(
+            non_required_check("Docker Image Build (no push)", 303, 31_001)
+        )
+
+    assert_release_gate_admits(
+        release_gate,
+        "a red landing-push check that no required context covers",
+        (
+            "admitting over a red check no required context covers: "
+            "Docker Image Build (no push) (conclusion=failure",
+        ),
+        add_red_non_required_push_job,
+    )
+
+    def red_non_required_job_inside_required_producer(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A red advisory job turns its whole required producer's run red."""
+
+        ci_suite = required_check_fixture(
+            check_runs,
+            "Check & Test (ubuntu-latest)",
+        )["check_suite_id"]
+        workflow_fixture(workflow_runs, ci_suite)["conclusion"] = "failure"
+        check_runs.append(non_required_check("Code Coverage", ci_suite, 32_001))
+
+    assert_release_gate_admits(
+        release_gate,
+        "a red advisory job inside the workflow that produces required contexts",
+        (
+            "admitting over a producing run that concluded failure: "
+            ".github/workflows/ci.yml run 1001",
+            "admitting over a red check no required context covers: "
+            "Code Coverage (conclusion=failure",
+        ),
+        red_non_required_job_inside_required_producer,
+    )
+
+    def unfinished_non_required_check(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """An advisory job still running when every required context is green."""
+
+        ci_suite = required_check_fixture(
+            check_runs,
+            "Check & Test (ubuntu-latest)",
+        )["check_suite_id"]
+        check_runs.append(
+            non_required_check(
+                "npm launcher tests",
+                ci_suite,
+                33_001,
+                status="in_progress",
+                conclusion=None,
+            )
+        )
+
+    assert_release_gate_admits(
+        release_gate,
+        "an unfinished advisory check no required context covers",
+        (
+            "not waiting for a check no required context covers: "
+            "npm launcher tests (status=in_progress)",
+        ),
+        unfinished_non_required_check,
+    )
+
+    def unfinished_required_check(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        required_check_fixture(check_runs, "cargo-deny").update(
+            {"status": "in_progress", "conclusion": None}
+        )
+
+    unfinished_required_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=unfinished_required_check,
+    )
+    if unfinished_required_fixture.returncode != 2:
+        raise AssertionError(
+            "an unfinished required context no longer holds the mint for retry: "
+            f"rc={unfinished_required_fixture.returncode} "
+            f"{unfinished_required_fixture.stdout}"
+            f"{unfinished_required_fixture.stderr}"
+        )
 
     def change_required_workflow_path(
         check_runs: list[dict[str, object]],
