@@ -113,17 +113,25 @@ impl HttpRepositoryTransferTransport {
         )
     }
 
-    fn get_json<R: serde::de::DeserializeOwned>(&self, url: &str, what: &str) -> Result<R> {
+    fn get_json<R: serde::de::DeserializeOwned>(
+        &self,
+        repository_id: &RepositoryId,
+        url: &str,
+        what: &str,
+    ) -> Result<R> {
         let mut request = self.agent.get(url);
         if let Some(token) = &self.endpoint.auth_token {
             request = request.header("Authorization", &format!("Bearer {token}"));
         }
-        let response = request.call().map_err(|error| peer_error(error, what))?;
+        let response = request
+            .call()
+            .map_err(|error| peer_error(error, what, repository_id))?;
         read_json(response, what)
     }
 
     fn post_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
+        repository_id: &RepositoryId,
         url: &str,
         body: &T,
         what: &str,
@@ -134,7 +142,7 @@ impl HttpRepositoryTransferTransport {
         }
         let response = request
             .send_json(body)
-            .map_err(|error| peer_error(error, what))?;
+            .map_err(|error| peer_error(error, what, repository_id))?;
         read_json(response, what)
     }
 }
@@ -182,7 +190,18 @@ fn body_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
 /// 422 for an invalid envelope, 409 for a lease or fast-forward conflict, 424
 /// for storage. Preserving that mapping is what lets a caller distinguish "this
 /// pack is malformed" from "the remote moved under us" without parsing prose.
-fn peer_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
+///
+/// The 404 arm names `repository_id` because 404 is the one class that says the
+/// peer does not know this repository at all, which makes the id itself the
+/// thing that may be wrong. A mistyped id is the most likely first mistake in
+/// team usage, and "this repository" gives the caller nothing to compare their
+/// spelling against. Every other class is the peer refusing on the state of a
+/// repository it does serve, where the id is not what the caller would correct.
+fn peer_error(
+    error: ureq::Error,
+    what: &str,
+    repository_id: &RepositoryId,
+) -> RepositoryTransferError {
     match error {
         ureq::Error::StatusCode(code) => match code {
             409 => RepositoryTransferError::Conflict(format!(
@@ -195,7 +214,9 @@ fn peer_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
                 "remote {what} failed on storage (HTTP 424)"
             )),
             404 => RepositoryTransferError::Invalid(format!(
-                "remote does not serve {what} for this repository (HTTP 404)"
+                "remote does not serve {what} for repository {:?} (HTTP 404); check the \
+                 repository id, or that the peer serves it",
+                repository_id.as_str()
             )),
             // The peer is intact and answered; the envelope is too large for
             // the bound both sides declare. That is the same refusal the
@@ -216,7 +237,11 @@ fn peer_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
 
 impl RepositoryTransferTransport for HttpRepositoryTransferTransport {
     fn advertise_refs(&self, repository_id: &RepositoryId) -> Result<RepositoryRefAdvertisement> {
-        self.get_json(&self.url(repository_id, "advertise"), "ref advertisement")
+        self.get_json(
+            repository_id,
+            &self.url(repository_id, "advertise"),
+            "ref advertisement",
+        )
     }
 
     fn transfer_status(
@@ -225,6 +250,7 @@ impl RepositoryTransferTransport for HttpRepositoryTransferTransport {
         destination_ref: &RefName,
     ) -> Result<RepositoryTransferStatus> {
         self.post_json(
+            repository_id,
             &self.url(repository_id, "status"),
             &serde_json::json!({ "destination_ref": destination_ref }),
             "transfer status",
@@ -238,6 +264,7 @@ impl RepositoryTransferTransport for HttpRepositoryTransferTransport {
         expectation: &RepositoryTransferExpectation,
     ) -> Result<RepositoryTransferPack> {
         self.post_json(
+            repository_id,
             &self.url(repository_id, "export"),
             &serde_json::json!({
                 "source_ref": source_ref,
@@ -254,6 +281,7 @@ impl RepositoryTransferTransport for HttpRepositoryTransferTransport {
         pack: &RepositoryTransferPack,
     ) -> Result<RepositoryTransferReceipt> {
         self.post_json(
+            repository_id,
             &self.url(repository_id, "receive"),
             &serde_json::json!({
                 "destination_ref": destination_ref,
@@ -305,28 +333,61 @@ mod tests {
         );
     }
 
+    fn asked_for() -> RepositoryId {
+        RepositoryId::new("kin").unwrap()
+    }
+
     #[test]
     fn peer_status_codes_keep_their_refusal_class() {
+        let asked_for = asked_for();
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(409), "transfer receive"),
+            peer_error(ureq::Error::StatusCode(409), "transfer receive", &asked_for),
             RepositoryTransferError::Conflict(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(422), "transfer receive"),
+            peer_error(ureq::Error::StatusCode(422), "transfer receive", &asked_for),
             RepositoryTransferError::Invalid(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(424), "transfer receive"),
+            peer_error(ureq::Error::StatusCode(424), "transfer receive", &asked_for),
             RepositoryTransferError::Storage(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(413), "transfer receive"),
+            peer_error(ureq::Error::StatusCode(413), "transfer receive", &asked_for),
             RepositoryTransferError::Invalid(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(500), "transfer receive"),
+            peer_error(ureq::Error::StatusCode(500), "transfer receive", &asked_for),
             RepositoryTransferError::Storage(_)
         ));
+    }
+
+    #[test]
+    fn a_not_found_refusal_names_the_repository_that_was_asked_for() {
+        // A mistyped id is the first-touch mistake this refusal exists to
+        // answer, and it is answerable only if the caller can see what was
+        // sent. Every transfer call can raise it, so each of them carries the
+        // id it asked with rather than the transport naming it once.
+        let asked_for = RepositoryId::new("kin-esosystem").unwrap();
+        for what in [
+            "ref advertisement",
+            "transfer status",
+            "transfer export",
+            "transfer receive",
+        ] {
+            let error = peer_error(ureq::Error::StatusCode(404), what, &asked_for);
+            let RepositoryTransferError::Invalid(message) = error else {
+                panic!("a repository the peer does not serve is not a storage failure");
+            };
+            assert!(
+                message.contains("kin-esosystem"),
+                "a 404 must name the repository it asked for: {message}"
+            );
+            assert!(
+                message.contains(what),
+                "a 404 must still name the call it refused: {message}"
+            );
+        }
     }
 
     #[test]
@@ -408,7 +469,7 @@ mod tests {
         // A peer that cannot be reached has not refused anything. Reporting
         // this as Invalid or Conflict would let a caller conclude the remote
         // evaluated the transfer and said no.
-        let error = peer_error(ureq::Error::HostNotFound, "ref advertisement");
+        let error = peer_error(ureq::Error::HostNotFound, "ref advertisement", &asked_for());
         assert!(matches!(error, RepositoryTransferError::Storage(_)));
     }
 }
