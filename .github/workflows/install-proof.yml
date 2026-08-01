@@ -524,7 +524,10 @@ jobs:
       # remaining first-run surface on the platform: the binaries' own build
       # provenance bound to the release tag's public source, the platform
       # capability posture, and the setup writers for the shell hook, the
-      # install ledger, and all five agent-client MCP configs.
+      # install ledger, and every agent-client MCP config a repo-free install
+      # can write, which is four of the five. Codex is excluded by the product
+      # rather than by this proof, because its entry binds an exact
+      # repository, and that exclusion is asserted below.
       - name: Windows repo-free provenance and setup proof
         if: runner.os == 'Windows'
         shell: bash
@@ -610,7 +613,6 @@ jobs:
             ["repo_init", "missing"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
-            ["mcp_client_codex", "healthy"],
             ["mcp_client_gemini", "healthy"],
             ["mcp_client_windsurf", "healthy"],
           ]);
@@ -646,6 +648,18 @@ jobs:
             );
             if (hardFailures.length > 0) {
               throw new Error(`${reportPath}: hard failures: ${hardFailures.map((c) => c.id).join(", ")}`);
+            }
+            // Codex is the one agent client Kin cannot configure without a
+            // repository. Its entry binds `mcp start --repo <exact
+            // repository>`, so setup refuses it by design here and never
+            // writes the config, which drops the check from the report
+            // entirely. Asserted as an absence rather than left unmentioned,
+            // so a Codex writer that ever becomes repo-free trips this and
+            // has to come here and say so.
+            if (checks.has("mcp_client_codex")) {
+              throw new Error(
+                `${reportPath}: mcp_client_codex is present without a repository, so the repo-free Codex writer changed`
+              );
             }
           }
 

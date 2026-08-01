@@ -926,7 +926,10 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
     prove their build provenance against the release tag's own public source,
     the platform capability posture is still pinned by name including the
     repair negative control, and setup still writes and validates the shell
-    hook, the install ledger, and all five agent-client MCP configs.
+    hook, the install ledger, and every agent-client MCP config a repo-free
+    install can write. Codex is the exception, excluded by the product because
+    its entry binds an exact repository, and its absence is asserted rather
+    than left unmentioned.
     """
 
     active = "\n".join(active_lines(repo_free))
@@ -953,7 +956,7 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         '["setup_ledger", "healthy"]',
         '["mcp_client_claude", "healthy"]',
         '["mcp_client_cursor", "healthy"]',
-        '["mcp_client_codex", "healthy"]',
+        'if (checks.has("mcp_client_codex")) {',
         '["mcp_client_gemini", "healthy"]',
         '["mcp_client_windsurf", "healthy"]',
     ):
@@ -4043,7 +4046,7 @@ def main() -> None:
         ),
         (
             "the repo-free posture stops proving the agent-client MCP writers",
-            '["mcp_client_codex", "healthy"]',
+            '["mcp_client_windsurf", "healthy"]',
             "",
         ),
     ):
