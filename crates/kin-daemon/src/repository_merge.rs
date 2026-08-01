@@ -1417,7 +1417,7 @@ fn collect_dangling_endpoints(
                             .get(&artifact)
                             .or_else(|| theirs.tree.get(&artifact))
                             .map(|resolved| resolved.path.to_string())
-                            .unwrap_or_else(|| format!("{artifact:?}"));
+                            .unwrap_or_else(|| render_artifact(&artifact));
                         (
                             *endpoint,
                             format!(
@@ -1819,9 +1819,22 @@ pub(crate) fn render_entry(entry: &MergeConflictEntry) -> String {
         MergeDivergence::RemovedOursChangedTheirs => {
             "removed on the active branch and changed on the source branch".to_string()
         }
+        // The claimants are the whole conflict, and naming an owner is the only
+        // way to settle it, so the listing names them. A caller who cannot read
+        // the claimants from the listing has no selector to pass back.
         MergeDivergence::PathCollision { artifacts } => format!(
-            "{} distinct artifacts occupy this path after composing both sides",
-            artifacts.len()
+            "{} distinct artifacts occupy this path after composing both sides ({}); keep one \
+             with `kin resolve --keep-path {}=<ARTIFACT>`",
+            artifacts.len(),
+            artifacts
+                .iter()
+                .map(render_artifact)
+                .collect::<Vec<_>>()
+                .join(", "),
+            match &entry.subject {
+                MergeConflictSubject::Path { path } => path.to_string(),
+                _ => "<PATH>".to_string(),
+            }
         ),
         MergeDivergence::DanglingEndpoint { .. } => entry
             .label
@@ -1829,6 +1842,16 @@ pub(crate) fn render_entry(entry: &MergeConflictEntry) -> String {
             .unwrap_or_else(|| "relates to a node neither composed side kept".to_string()),
     };
     format!("{}: {detail}", render_subject(entry))
+}
+
+/// The one textual form of an artifact identity these commands emit and accept.
+///
+/// It is exactly the form the record serializes, so an identity read out of
+/// `kin conflicts --json` is the string `kin resolve` takes back. `ArtifactId`
+/// has no `Display`, so a `{:?}` rendering here would print a wrapper form that
+/// no surface emits and that therefore cannot round-trip.
+pub(crate) fn render_artifact(artifact: &kin_model::ArtifactId) -> String {
+    artifact.0.to_string()
 }
 
 pub(crate) fn render_subject(entry: &MergeConflictEntry) -> String {
@@ -1839,8 +1862,8 @@ pub(crate) fn render_subject(entry: &MergeConflictEntry) -> String {
         },
         MergeConflictSubject::Relation { relation } => format!("relation {relation}"),
         MergeConflictSubject::Artifact { artifact } => match &entry.label {
-            Some(path) => format!("artifact {path} ({artifact:?})"),
-            None => format!("artifact {artifact:?}"),
+            Some(path) => format!("artifact {path} ({})", render_artifact(artifact)),
+            None => format!("artifact {}", render_artifact(artifact)),
         },
         MergeConflictSubject::Path { path } => format!("path {path}"),
     }
@@ -1998,6 +2021,70 @@ mod tests {
             tree: ResolvedTree::from_artifacts([target, anchor]).unwrap(),
             ..ResolvedGraphState::default()
         }
+    }
+
+    /// The form these commands print is the form the record serializes, so a
+    /// selector can be copied straight out of `kin conflicts --json`. This
+    /// fails the moment a rendering drifts back to the `ArtifactId(..)` wrapper
+    /// form, which no Kin surface emits and which therefore cannot be passed
+    /// back to settle anything.
+    #[test]
+    fn an_artifact_renders_exactly_as_the_record_serializes_it() {
+        let artifact = ArtifactId::new();
+        let serialized = serde_json::to_value(artifact).expect("an artifact identity serializes");
+        assert_eq!(
+            render_artifact(&artifact),
+            serialized
+                .as_str()
+                .expect("an artifact identity serializes as a string"),
+        );
+        assert_ne!(
+            render_artifact(&artifact),
+            format!("{artifact:?}"),
+            "the wrapper debug form is not what the record serializes"
+        );
+    }
+
+    /// A contested path is settled only by naming one claimant, so a listing
+    /// that states the count without naming them leaves the caller no selector
+    /// to pass back.
+    #[test]
+    fn a_contested_path_names_the_claimants_it_accepts_back() {
+        let left = ArtifactId::new();
+        let right = ArtifactId::new();
+        let entry = MergeConflictEntry {
+            subject: MergeConflictSubject::Path {
+                path: RepoPath::from_utf8("docs/notes.md").unwrap(),
+            },
+            divergence: MergeDivergence::PathCollision {
+                artifacts: vec![left, right],
+            },
+            base: MergeSideValue::Absent,
+            ours: MergeSideValue::Absent,
+            theirs: MergeSideValue::Absent,
+            label: Some("docs/notes.md".to_string()),
+            resolution: MergeEntryResolution::Unresolved,
+        };
+        let rendered = render_entry(&entry);
+        assert!(
+            rendered.contains(&render_artifact(&left)),
+            "listing names its first claimant: {rendered}"
+        );
+        assert!(
+            rendered.contains(&render_artifact(&right)),
+            "listing names its second claimant: {rendered}"
+        );
+        assert!(
+            rendered.contains("docs/notes.md"),
+            "listing names the contested path: {rendered}"
+        );
+        // A wrapper rendering contains the bare identity as a substring, so the
+        // assertions above alone would pass on a listing nothing can select
+        // from. The claimants have to appear in the form the resolver accepts.
+        assert!(
+            !rendered.contains("ArtifactId("),
+            "listing carries identities in the form the resolver accepts: {rendered}"
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ use kin_model::{
 use crate::local_repository_authority::ActiveLocalRepositoryAuthority;
 use crate::repository_merge::{
     classify_merge_error, local_workspace, merge_bad_request, merge_bind_refusal, merge_conflict,
-    publish_resolved_merge, render_conflict_lines, render_entry, render_subject,
+    publish_resolved_merge, render_artifact, render_conflict_lines, render_entry, render_subject,
     repository_finalization_error, restore_point, MergeExecution,
 };
 use crate::state::DaemonState;
@@ -523,7 +523,7 @@ fn entry_matches(entry: &kin_model::MergeConflictEntry, needle: &str) -> bool {
     let by_identity = match &entry.subject {
         MergeConflictSubject::Entity { entity } => entity.to_string() == needle,
         MergeConflictSubject::Relation { relation } => relation.to_string() == needle,
-        MergeConflictSubject::Artifact { artifact } => format!("{artifact:?}") == needle,
+        MergeConflictSubject::Artifact { artifact } => render_artifact(artifact) == needle,
         MergeConflictSubject::Path { path } => path.to_string() == needle,
     };
     if by_identity {
@@ -571,14 +571,14 @@ fn resolution_for(
             };
             let owner = artifacts
                 .iter()
-                .find(|claimant| format!("{claimant:?}") == artifact.trim())
+                .find(|claimant| render_artifact(claimant) == artifact.trim())
                 .copied()
                 .ok_or_else(|| {
                     merge_bad_request(format!(
                         "{artifact} does not claim this path; its claimants are {}",
                         artifacts
                             .iter()
-                            .map(|claimant| format!("{claimant:?}"))
+                            .map(render_artifact)
                             .collect::<Vec<_>>()
                             .join(", ")
                     ))

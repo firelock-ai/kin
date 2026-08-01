@@ -185,6 +185,51 @@ fn conflicting_repository(root: &Path) -> std::path::PathBuf {
     repo
 }
 
+/// Both branches add a different file at one path. Artifact identity is seeded
+/// on the commit that introduced the artifact, so each branch allocates its
+/// own, both survive composition, and the merge parks on a contested path whose
+/// only settlement is naming one claimant.
+fn path_colliding_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    initialize_git_repo(&repo);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::create_dir_all(repo.join("docs")).expect("create docs directory on feature");
+    fs::write(repo.join("docs/notes.md"), b"feature notes\n").expect("add notes on feature");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature notes"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::create_dir_all(repo.join("docs")).expect("create docs directory on main");
+    fs::write(repo.join("docs/notes.md"), b"main notes\n").expect("add notes on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main notes"]);
+    repo
+}
+
+/// Every artifact identity claiming one path in the graph a change resolves to.
+fn artifacts_at_path(
+    layout: &kin_core::KinLayout,
+    change: &SemanticChangeId,
+    path: &str,
+) -> Vec<String> {
+    let manager = open_authority(layout);
+    let lease = manager.read_authority();
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
+    drop(lease);
+    let graph =
+        kin_db::InMemoryGraph::from_snapshot(snapshot).expect("prepare graph-owned history");
+    let state = kin_db::ChangeStore::resolve_graph_at(&graph, change)
+        .expect("resolve the exact graph a change publishes");
+    state
+        .tree
+        .artifacts()
+        .filter(|artifact| artifact.path.to_string() == path)
+        .map(|artifact| artifact.artifact_id.0.to_string())
+        .collect()
+}
+
 /// A parked merge is graph truth, not process state. Stopping the daemon and
 /// reading again must return the identical record: same identity, same
 /// conflicts, still in progress.
@@ -596,5 +641,122 @@ fn settling_and_publishing_cannot_be_one_request() {
         String::from_utf8_lossy(&both.stderr).contains("settle conflicts first"),
         "the refusal says why: {}",
         String::from_utf8_lossy(&both.stderr)
+    );
+}
+
+/// A contested path is settled only by naming one claimant, so the identity the
+/// record reports has to be the identity the resolver accepts. When the two
+/// disagreed, every claimant the report emitted was refused and a merge that
+/// collided on a path could only be abandoned.
+#[test]
+fn a_contested_path_settles_from_the_identity_the_record_reports() {
+    let root = tempdir().expect("temp root");
+    let repo = path_colliding_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+
+    let report = conflicts_report(&runtime, &repo);
+    let entries = report["record"]["entries"]
+        .as_array()
+        .expect("the record lists its conflicts");
+    let collision = entries
+        .iter()
+        .find(|entry| entry["divergence"]["divergence"] == "path_collision")
+        .unwrap_or_else(|| panic!("both branches adding one path collide on it: {report}"));
+    let claimants: Vec<String> = collision["divergence"]["artifacts"]
+        .as_array()
+        .expect("a contested path names its claimants")
+        .iter()
+        .map(|claimant| {
+            claimant
+                .as_str()
+                .expect("a claimant identity serializes as a string")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(claimants.len(), 2, "one claimant per branch: {report}");
+
+    // The identity the report emitted is the identity the resolver takes back.
+    let owner = claimants[0].clone();
+    ok(
+        &run_kin(
+            &runtime,
+            &repo,
+            &["resolve", "--keep-path", &format!("docs/notes.md={owner}")],
+        ),
+        "kin resolve --keep-path",
+    );
+    let settled = persisted_record(&layout).expect("the merge record is persisted");
+    assert_eq!(
+        settled.unresolved().count(),
+        0,
+        "naming an owner settles the contested path"
+    );
+
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue"]),
+        "kin resolve --continue",
+    );
+
+    let published = persisted_record(&layout).expect("the terminated record is retained");
+    let merge_change = match published.state {
+        kin_model::MergeTransactionState::Committed { merge_change, .. } => merge_change,
+        other => panic!("a fully settled merge publishes, found {other:?}"),
+    };
+
+    // The artifact that kept the path is exactly the one that was named, and it
+    // is the only one left claiming it.
+    assert_eq!(
+        artifacts_at_path(&layout, &merge_change, "docs/notes.md"),
+        vec![owner],
+        "the named claimant is the artifact the merge published at that path"
+    );
+}
+
+/// The listing has to name the claimants it will accept back. Stating only how
+/// many artifacts collide leaves a caller reading the human surface with no
+/// selector to pass to `--keep-path`.
+#[test]
+fn a_contested_path_listing_names_its_claimants() {
+    let root = tempdir().expect("temp root");
+    let repo = path_colliding_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+
+    let listing = ok(&run_kin(&runtime, &repo, &["conflicts"]), "kin conflicts");
+    let record = persisted_record(&layout).expect("the merge is parked");
+    let claimants: Vec<String> = record
+        .entries
+        .iter()
+        .flat_map(|entry| match &entry.divergence {
+            kin_model::MergeDivergence::PathCollision { artifacts } => artifacts.clone(),
+            _ => Vec::new(),
+        })
+        .map(|artifact| artifact.0.to_string())
+        .collect();
+    assert_eq!(claimants.len(), 2, "one claimant per branch: {listing}");
+    for claimant in claimants {
+        assert!(
+            listing.contains(&claimant),
+            "the listing names claimant {claimant}: {listing}"
+        );
+    }
+    // A wrapper rendering contains the bare identity as a substring, so the
+    // assertions above alone would pass on a listing nothing can select from.
+    // The listing has to carry the identity in the form the resolver accepts
+    // and no other.
+    assert!(
+        !listing.contains("ArtifactId("),
+        "the listing carries identities in the form the resolver accepts: {listing}"
     );
 }
