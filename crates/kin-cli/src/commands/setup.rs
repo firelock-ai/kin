@@ -13028,6 +13028,7 @@ fn remove_full_install_root(
     let script = r#"$ErrorActionPreference = 'Stop'
 $log = $env:KIN_UNINSTALL_LOG
 $ready = $env:KIN_UNINSTALL_READY
+$readyPublishing = $ready + '.publishing'
 $authority = $env:KIN_UNINSTALL_AUTHORITY
 $parentHandle = $null
 $authorityStream = $null
@@ -13150,13 +13151,14 @@ $expectedIdentity = $env:KIN_UNINSTALL_EXPECTED_IDENTITY
 $parentHandle = [KinUninstallIdentity]::LockParent($pidToWait, $expectedParentCreation)
 $authorityStream = [IO.File]::Open($authority, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
 $readyBytes = [Text.Encoding]::UTF8.GetBytes($env:KIN_UNINSTALL_READY_NONCE)
-$readyStream = [IO.File]::Open($ready, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+$readyStream = [IO.File]::Open($readyPublishing, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
     $readyStream.Write($readyBytes, 0, $readyBytes.Length)
     $readyStream.Flush($true)
 } finally {
     $readyStream.Dispose()
 }
+[IO.File]::Move($readyPublishing, $ready)
 [KinUninstallIdentity]::WaitForParentExit($parentHandle)
     $authorityDeadline = [DateTime]::UtcNow.AddMinutes(5)
     while (-not $authorityLocked) {
@@ -13210,6 +13212,7 @@ try {
 } finally {
     if ($null -ne $authorityStream) { $authorityStream.Dispose() }
     if ($null -ne $parentHandle) { $parentHandle.Dispose() }
+    [IO.File]::Delete($readyPublishing)
     Remove-Item -LiteralPath $ready -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }
