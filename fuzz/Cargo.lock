@@ -630,9 +630,9 @@ dependencies = [
 
 [[package]]
 name = "kin-blobs"
-version = "0.1.3"
+version = "0.1.4"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "2783752bbe4fec695c3cd6a008d2b379cc32e24450c279773c7e39742c29a1fe"
+checksum = "83136143d2f8b72f835ca7d9e3d7793e415bd072445a648713d5d797e9e6bc9e"
 dependencies = [
  "hex",
  "schemars",
@@ -640,13 +640,14 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tracing",
+ "windows-sys",
 ]
 
 [[package]]
 name = "kin-model"
-version = "0.7.2"
+version = "0.7.4"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "b3dbb23717e2682e4df5f51aed04123333a9d0667423a312a795c28abe3fceb3"
+checksum = "faabe132c031fdce5f245a65c20771c603821418f24625e66003c2d3a0c1df89"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -701,9 +702,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.7"
+version = "0.1.8"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "59643af64209511b0721f919f4bd4e0defe08c4e8e48055eb291953b4519b582"
+checksum = "ce7d0f0c3323b2cea676e7832d0f553874490cae7e157420dd7ddb8af49f70bd"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -716,6 +717,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1506,6 +1508,15 @@ name = "windows-strings"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
