@@ -749,6 +749,80 @@ def install_proof_step(install_proof: str, name: str) -> str:
     ]
 
 
+def node_heredoc_body(step: str, label: str) -> str:
+    """Extract one literal Node heredoc exactly as the Actions runner executes it."""
+
+    start_marker = "          node <<'NODE'\n"
+    end_marker = "          NODE\n"
+    if step.count(start_marker) != 1:
+        raise AssertionError(f"{label} must contain exactly one literal Node validator")
+    start = step.index(start_marker) + len(start_marker)
+    if step.count(end_marker, start) != 1:
+        raise AssertionError(
+            f"{label} must terminate exactly one literal Node validator"
+        )
+    body = step[start : step.index(end_marker, start)]
+    yaml_indent = "          "
+    lines: list[str] = []
+    for line in body.splitlines():
+        if line and not line.startswith(yaml_indent):
+            raise AssertionError(
+                f"{label} Node validator escaped the run-block indentation: {line!r}"
+            )
+        lines.append(line[len(yaml_indent) :] if line else "")
+    return "\n".join(lines) + "\n"
+
+
+def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
+    """Execute the shipped validator and require an empty proof tree to fail.
+
+    Token checks explain which contract drifted, but cannot prove those tokens
+    remain reachable. Running the extracted program against a deliberately
+    absent evidence tree makes comments, false branches, early exits, and other
+    whole-validator no-ops fail for their actual behavior rather than for one
+    enumerated syntax.
+    """
+
+    script = node_heredoc_body(step, label)
+    try:
+        syntax = subprocess.run(
+            ["node", "--check", "-"],
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AssertionError(f"{label} could not parse under Node: {error}") from error
+    if syntax.returncode != 0:
+        raise AssertionError(
+            f"{label} is not valid Node source: {syntax.stderr.strip()}"
+        )
+    with tempfile.TemporaryDirectory(prefix="kin-proof-validator-") as temporary:
+        proof_dir = Path(temporary) / "proof"
+        proof_dir.mkdir()
+        try:
+            result = subprocess.run(
+                ["node", "-"],
+                input=script,
+                cwd=proof_dir,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AssertionError(
+                f"{label} could not execute under Node: {error}"
+            ) from error
+    if result.returncode == 0:
+        raise AssertionError(
+            f"{label} accepted an empty proof tree; the validator is not "
+            "runtime-falsifiable"
+        )
+
+
 def windows_init_contract_strings() -> dict[str, str]:
     """Return the shipped Windows admission contract's own refusal strings.
 
@@ -5199,6 +5273,9 @@ def main() -> None:
         install_proof, "Windows repo-free provenance and setup proof"
     )
     assert_install_proof_repo_free_windows_proof(repo_free)
+    assert_node_validator_rejects_missing_proof(
+        repo_free, "repo-free Windows install proof"
+    )
     blocked_repo_free = repo_free.replace(
         '          const fs = require("fs");\n',
         '          /*\n          const fs = require("fs");\n',
@@ -5208,6 +5285,18 @@ def main() -> None:
         "a JavaScript block comment disables the entire Windows validator",
         "repo-free Windows install proof",
         lambda: assert_install_proof_repo_free_windows_proof(blocked_repo_free),
+    )
+    false_branch_repo_free = repo_free.replace(
+        '          const fs = require("fs");\n',
+        '          if (false) {\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch disables the entire Windows validator",
+        "validator is not runtime-falsifiable",
+        lambda: assert_node_validator_rejects_missing_proof(
+            false_branch_repo_free, "repo-free Windows install proof"
+        ),
     )
     for label, original, mutation in (
         (
@@ -5254,6 +5343,9 @@ def main() -> None:
             ): assert_install_proof_repo_free_windows_proof(mutated),
         )
     assert_install_proof_status_contract(first_run, graph_query, embedding, validation)
+    assert_node_validator_rejects_missing_proof(
+        validation, "released-byte Unix install proof"
+    )
     blocked_validation = validation.replace(
         '          const fs = require("fs");\n',
         '          /*\n          const fs = require("fs");\n',
@@ -5267,6 +5359,18 @@ def main() -> None:
             graph_query,
             embedding,
             blocked_validation,
+        ),
+    )
+    false_branch_validation = validation.replace(
+        '          const fs = require("fs");\n',
+        '          if (false) {\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch disables the entire Unix validator",
+        "validator is not runtime-falsifiable",
+        lambda: assert_node_validator_rejects_missing_proof(
+            false_branch_validation, "released-byte Unix install proof"
         ),
     )
     expect_assertion(
@@ -5561,6 +5665,17 @@ def main() -> None:
             "bash ./scripts/assert-windows-init-contract.sh",
         ):
             require(ci_jobs[job_id], policy, f"shared Windows admission proof in {job_id}")
+        if ci_jobs[job_id].count("run: ./scripts/test-install-checksum.ps1") != 2:
+            raise AssertionError(
+                f"{job_id} must execute the installer warning/checksum contract "
+                "once under PowerShell 7 and once under Windows PowerShell 5.1"
+            )
+        for shell in ("shell: pwsh", "shell: powershell"):
+            require(
+                ci_jobs[job_id],
+                shell,
+                f"dual-engine Windows installer authority in {job_id}",
+            )
     # The Windows arm of the config writer shares no code with the Unix one, so
     # a leg that never runs its cases proves nothing about the transaction
     # `kin init` depends on.

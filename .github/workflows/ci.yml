@@ -126,6 +126,14 @@ jobs:
 
       - uses: actions/checkout@v7
 
+      - name: Test installer warning and checksum contract (PowerShell 7)
+        shell: pwsh
+        run: ./scripts/test-install-checksum.ps1
+
+      - name: Test installer warning and checksum contract (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./scripts/test-install-checksum.ps1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
         with:
