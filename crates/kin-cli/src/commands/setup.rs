@@ -967,7 +967,9 @@ impl SetupIntent {
             Self::LocalOnly => "shell integration + auto-daemon; no AI client config",
             Self::AgentOnly => "configure Kin's MCP server for detected AI clients + auto-daemon",
             Self::Editor => "local-only, plus how to install the kin-editor extension",
-            Self::Hosted => "local setup, plus the sign-in state and commands for a KinLab workspace",
+            Self::Hosted => {
+                "local setup, plus the sign-in state and commands for a KinLab workspace"
+            }
             Self::Advanced => "choose shell, per-client MCP, and daemon options yourself",
         }
     }
@@ -13024,8 +13026,12 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         for state in states {
             let rendered = hosted_followup_lines("https://kinlab.example", &state).join("\n");
             let lowered = rendered.to_lowercase();
-            for denial in ["coming soon", "no public", "not a first-run flow", "no first-run flow"]
-            {
+            for denial in [
+                "coming soon",
+                "no public",
+                "not a first-run flow",
+                "no first-run flow",
+            ] {
                 assert!(
                     !lowered.contains(denial),
                     "hosted wording for {state:?} must not deny a shipped command: {rendered}"
@@ -13080,9 +13086,12 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     /// promise less than the command surface delivers.
     #[test]
     fn hosted_intent_menu_entry_does_not_deny_the_connect_command() {
-        let entry =
-            format!("{} {}", SetupIntent::Hosted.title(), SetupIntent::Hosted.description())
-                .to_lowercase();
+        let entry = format!(
+            "{} {}",
+            SetupIntent::Hosted.title(),
+            SetupIntent::Hosted.description()
+        )
+        .to_lowercase();
         for denial in ["coming soon", "no first-run flow yet", "not yet"] {
             assert!(
                 !entry.contains(denial),

@@ -246,9 +246,9 @@ async fn resolve_feature_target(work_id: &str) -> Result<String> {
 
 pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<()> {
     let change_id = match (change_id, feature) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "name a change to roll back to, or a work item with --feature, not both"
-        ),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("name a change to roll back to, or a work item with --feature, not both")
+        }
         (None, None) => anyhow::bail!(
             "name the change to roll back to, or the work item whose changes to roll back with \
              --feature <work-id>; `kin log` lists the changes on this line"

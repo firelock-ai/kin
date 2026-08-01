@@ -875,7 +875,11 @@ pub fn execute_work_request(
                 status: item.status,
                 scopes: item.scopes.clone(),
             };
-            let mut out = format!("{} scope(s) recorded for {}\n", report.scopes.len(), work_id);
+            let mut out = format!(
+                "{} scope(s) recorded for {}\n",
+                report.scopes.len(),
+                work_id
+            );
             for scope in &report.scopes {
                 writeln!(out, "  - {scope}")?;
             }
