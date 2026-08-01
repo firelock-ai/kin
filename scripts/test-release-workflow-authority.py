@@ -3035,8 +3035,8 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     # minted at queue time. Real attempts of run 30627672394 returned the two
     # failing legs in the order below: aarch64 first, then x86_64 first, then
     # aarch64 again. Reducing the failing set to its first element reads that
-    # as three different failures and advises a rerun that cannot work, which
-    # is verbatim the advice FIR-1782 exists to eliminate.
+    # as two different failures and advises a rerun that cannot work, which
+    # is verbatim the advice this suite exists to eliminate.
     aarch64 = (
         "Build (kin-linux-aarch64)",
         "Build kin-cli + kin-daemon (native)",
