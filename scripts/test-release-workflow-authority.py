@@ -774,6 +774,20 @@ def node_heredoc_body(step: str, label: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def replace_exactly_once(
+    source: str, original: str, replacement: str, label: str
+) -> str:
+    """Build one source mutation without letting a stale probe become a no-op."""
+
+    matches = source.count(original)
+    if matches != 1:
+        raise AssertionError(
+            f"{label} mutation expected one source anchor, found {matches}: "
+            f"{original!r}"
+        )
+    return source.replace(original, replacement, 1)
+
+
 def write_node_validator_fixture_files(
     root: Path,
     files: dict[str, object],
@@ -956,7 +970,7 @@ def windows_node_validator_fixture() -> tuple[
     )
 
 
-UNIX_VALIDATOR_CHECKS = {
+UNIX_REQUIRED_VALIDATOR_CHECKS = {
     "kin_binary": "healthy",
     "kin_daemon_binary": "healthy",
     "daemon_running": "healthy",
@@ -970,6 +984,9 @@ UNIX_VALIDATOR_CHECKS = {
     "mcp_client_codex": "healthy",
     "mcp_client_gemini": "healthy",
     "mcp_client_windsurf": "healthy",
+}
+UNIX_VALIDATOR_CHECKS = {
+    **UNIX_REQUIRED_VALIDATOR_CHECKS,
     "semantic_query_readiness": "stale",
 }
 
@@ -1125,6 +1142,39 @@ def fixture_with_extra_check(
     return mutated
 
 
+def fixture_with_duplicate_check(
+    fixture: dict[str, object],
+    path: str,
+    check_id: str,
+    status: str,
+) -> dict[str, object]:
+    """Insert a contradictory check before the authoritative fixture entry."""
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    checks = report["checks"]  # type: ignore[index]
+    indexes = [index for index, check in enumerate(checks) if check["id"] == check_id]
+    if len(indexes) != 1:
+        raise AssertionError(
+            f"validator fixture must contain one {check_id!r} check in {path}: "
+            f"{indexes}"
+        )
+    checks.insert(indexes[0], {"id": check_id, "status": status})
+    return mutated
+
+
+def wrong_required_check_status(expected: str) -> str:
+    """Choose a mismatch that preserves generic readiness/failure semantics."""
+
+    if expected == "healthy":
+        return "unsupported"
+    if expected == "unsupported":
+        return "healthy"
+    if expected == "missing":
+        return "misconfigured"
+    raise AssertionError(f"no isolated required-check mutation for {expected!r}")
+
+
 def assert_windows_node_validator_behavior(step: str) -> None:
     """Behaviorally pin every substantive Windows validator obligation."""
 
@@ -1213,54 +1263,55 @@ def assert_windows_node_validator_behavior(step: str) -> None:
         ),
     )
 
-    # Every named repo-free posture is checked behaviorally, not just present as
-    # a token. The doctor file gets its own mutation so both reports must enforce
-    # the map rather than merely be readable.
-    for check_id, expected in WINDOWS_VALIDATOR_CHECKS.items():
-        wrong = "healthy" if expected != "healthy" else "missing"
+    # Every named repo-free posture is checked independently in both reports.
+    # The wrong value deliberately preserves the generic aggregate and hard-
+    # failure predicates, leaving only the required-map comparison able to
+    # reject it.
+    for report_path in ("kin-windows-health.json", "kin-windows-doctor.json"):
+        for check_id, expected in WINDOWS_VALIDATOR_CHECKS.items():
+            wrong = wrong_required_check_status(expected)
+            reject(
+                f"{report_path} required {check_id}={wrong}",
+                fixture_with_check_status(proof, report_path, check_id, wrong),
+            )
         reject(
-            f"health {check_id}={wrong}",
-            fixture_with_check_status(
-                proof, "kin-windows-health.json", check_id, wrong
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "kin_binary", "unsupported"
             ),
         )
-    reject(
-        "doctor required posture mismatch",
-        fixture_with_check_status(
-            proof, "kin-windows-doctor.json", "kin_binary", "missing"
-        ),
-    )
-    reject(
-        "unexpected hard health failure",
-        fixture_with_extra_check(
-            proof, "kin-windows-health.json", "unexpected", "missing"
-        ),
-    )
-    reject(
-        "repo-free Codex writer appears",
-        fixture_with_extra_check(
-            proof, "kin-windows-health.json", "mcp_client_codex", "healthy"
-        ),
-    )
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), True),
+        )
+        reject(
+            f"{report_path} unexpected hard failure",
+            fixture_with_extra_check(proof, report_path, "unexpected", "missing"),
+        )
+        reject(
+            f"{report_path} repo-free Codex writer appears",
+            fixture_with_extra_check(proof, report_path, "mcp_client_codex", "healthy"),
+        )
 
-    reject(
-        "MCP args drift",
-        invalid_home=fixture_with_json_value(
-            home,
-            ".claude.json",
-            ("mcpServers", "kin", "args"),
-            ["mcp", "start", "--repo", "."],
-        ),
-    )
-    reject(
-        "MCP profile drift",
-        invalid_home=fixture_with_json_value(
-            home,
-            ".claude.json",
-            ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
-            "full",
-        ),
-    )
+    for config_path in home:
+        reject(
+            f"{config_path} MCP args drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "args"),
+                ["mcp", "start", "--repo", "."],
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                "full",
+            ),
+        )
 
 
 def assert_unix_node_validator_behavior(step: str) -> None:
@@ -1289,18 +1340,35 @@ def assert_unix_node_validator_behavior(step: str) -> None:
     for path in home:
         reject(f"missing home/{path}", invalid_home=fixture_without_file(home, path))
 
+    malformed_commit = copy.deepcopy(proof)
+    malformed_commit["../expected-commit.txt"] = "bad"
+    malformed_commit = fixture_with_json_value(
+        malformed_commit, "kin-build-meta.json", ("kin_commit",), "bad"
+    )
+    malformed_commit = fixture_with_json_value(
+        malformed_commit, "kin-daemon-health.json", ("build", "sha"), "bad"
+    )
+    reject("matching but malformed build commits", malformed_commit)
+
+    malformed_lock = copy.deepcopy(proof)
+    malformed_lock["../expected-lock-sha.txt"] = "bad"
+    malformed_lock = fixture_with_json_value(
+        malformed_lock, "kin-build-meta.json", ("dependency_provenance",), "bad"
+    )
+    malformed_lock = fixture_with_json_value(
+        malformed_lock,
+        "kin-daemon-health.json",
+        ("build", "dependency_provenance"),
+        "bad",
+    )
+    reject("matching but malformed lock provenance", malformed_lock)
+
     for case, path, keys, value in (
         (
             "CLI schema drift",
             "kin-build-meta.json",
             ("schema",),
             "kin.bench-meta.v1",
-        ),
-        (
-            "CLI malformed commit",
-            "kin-build-meta.json",
-            ("kin_commit",),
-            "bad",
         ),
         (
             "CLI commit mismatch",
@@ -1321,22 +1389,10 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             False,
         ),
         (
-            "CLI malformed lock provenance",
-            "kin-build-meta.json",
-            ("dependency_provenance",),
-            "bad",
-        ),
-        (
             "CLI lock mismatch",
             "kin-build-meta.json",
             ("dependency_provenance",),
             "d" * 64,
-        ),
-        (
-            "daemon malformed commit",
-            "kin-daemon-health.json",
-            ("build", "sha"),
-            "bad",
         ),
         (
             "daemon commit mismatch",
@@ -1355,12 +1411,6 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             "kin-daemon-health.json",
             ("build", "source_known"),
             False,
-        ),
-        (
-            "daemon malformed lock provenance",
-            "kin-daemon-health.json",
-            ("build", "dependency_provenance"),
-            "bad",
         ),
         (
             "daemon lock mismatch",
@@ -1569,66 +1619,87 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             ),
         )
 
-    for check_id, expected in UNIX_VALIDATOR_CHECKS.items():
-        wrong = "healthy" if expected != "healthy" else "missing"
+    for report_path in ("kin-health.json", "kin-doctor.json"):
+        for check_id, expected in UNIX_REQUIRED_VALIDATOR_CHECKS.items():
+            wrong = wrong_required_check_status(expected)
+            reject(
+                f"{report_path} required {check_id}={wrong}",
+                fixture_with_check_status(proof, report_path, check_id, wrong),
+            )
         reject(
-            f"health {check_id}={wrong}",
-            fixture_with_check_status(proof, "kin-health.json", check_id, wrong),
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "kin_binary", "unsupported"
+            ),
         )
-    reject(
-        "doctor required posture mismatch",
-        fixture_with_check_status(
-            proof, "kin-doctor.json", "kin_binary", "missing"
-        ),
-    )
-    reject(
-        "pre-embed aggregate unhealthy for a non-pending reason",
-        fixture_with_check_status(
-            proof, "kin-health.json", "semantic_query_readiness", "healthy"
-        ),
-    )
-    unsupported_readiness = fixture_with_check_status(
-        proof, "kin-health.json", "semantic_query_readiness", "unsupported"
-    )
-    unsupported_readiness = fixture_with_json_value(
-        unsupported_readiness, "kin-health.json", ("healthy",), True
-    )
-    reject("pre-embed semantic readiness unsupported", unsupported_readiness)
-    reject(
-        "unexpected hard pre-embed failure",
-        fixture_with_extra_check(proof, "kin-health.json", "unexpected", "missing"),
-    )
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), True),
+        )
+
+        healthy_readiness = fixture_with_check_status(
+            proof, report_path, "semantic_query_readiness", "healthy"
+        )
+        healthy_readiness = fixture_with_json_value(
+            healthy_readiness, report_path, ("healthy",), True
+        )
+        assert_node_validator_accepts_fixture(
+            step,
+            f"{label} ({report_path} already semantically ready)",
+            healthy_readiness,
+            home,
+            environment,
+        )
+
+        unsupported_readiness = fixture_with_check_status(
+            proof, report_path, "semantic_query_readiness", "unsupported"
+        )
+        unsupported_readiness = fixture_with_json_value(
+            unsupported_readiness, report_path, ("healthy",), True
+        )
+        reject(
+            f"{report_path} semantic readiness unsupported",
+            unsupported_readiness,
+        )
 
     for report_path in ("kin-embedded-health.json", "kin-embedded-doctor.json"):
         reject(
-            f"{report_path} aggregate unhealthy",
+            f"{report_path} inconsistent healthy aggregate",
             fixture_with_json_value(proof, report_path, ("healthy",), False),
         )
         reject(
-            f"{report_path} semantic readiness stale",
-            fixture_with_check_status(
-                proof, report_path, "semantic_query_readiness", "stale"
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "semantic_query_readiness", "unsupported"
             ),
         )
+        unsupported_readiness = fixture_with_check_status(
+            proof, report_path, "semantic_query_readiness", "unsupported"
+        )
+        reject(
+            f"{report_path} semantic readiness unsupported",
+            unsupported_readiness,
+        )
 
-    reject(
-        "MCP args drift",
-        invalid_home=fixture_with_json_value(
-            home,
-            ".claude.json",
-            ("mcpServers", "kin", "args"),
-            ["mcp", "start", "--repo", "."],
-        ),
-    )
-    reject(
-        "MCP profile drift",
-        invalid_home=fixture_with_json_value(
-            home,
-            ".claude.json",
-            ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
-            "full",
-        ),
-    )
+    for config_path in home:
+        reject(
+            f"{config_path} MCP args drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "args"),
+                ["mcp", "start", "--repo", "."],
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                "full",
+            ),
+        )
 
 
 def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
@@ -6163,6 +6234,30 @@ def main() -> None:
         repo_free, "repo-free Windows install proof"
     )
     assert_windows_node_validator_behavior(repo_free)
+    selective_windows_required_bypass = replace_exactly_once(
+        repo_free,
+        "          if (actual !== expected) {\n",
+        '          if (id !== "kin_binary" && actual !== expected) {\n',
+        "Windows selective required-check bypass",
+    )
+    expect_assertion(
+        "the Windows validator selectively skips the kin_binary requirement",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_windows_node_validator_behavior(
+            selective_windows_required_bypass
+        ),
+    )
+    windows_mcp_only_claude = replace_exactly_once(
+        repo_free,
+        '          if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {\n',
+        '          if (configPath.endsWith(".claude.json") && (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default")) {\n',
+        "Windows selective MCP-config bypass",
+    )
+    expect_assertion(
+        "the Windows validator checks MCP values only in Claude's config",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_windows_node_validator_behavior(windows_mcp_only_claude),
+    )
     blocked_repo_free = repo_free.replace(
         '          const fs = require("fs");\n',
         '          /*\n          const fs = require("fs");\n',
@@ -6247,6 +6342,50 @@ def main() -> None:
         validation, "released-byte Unix install proof"
     )
     assert_unix_node_validator_behavior(validation)
+    selective_unix_required_bypass = replace_exactly_once(
+        validation,
+        "          if (actual !== expected) {\n",
+        '          if (id !== "kin_binary" && actual !== expected) {\n',
+        "Unix selective required-check bypass",
+    )
+    expect_assertion(
+        "the Unix validator selectively skips the kin_binary requirement",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(selective_unix_required_bypass),
+    )
+    unix_mcp_only_claude = replace_exactly_once(
+        validation,
+        '          if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {\n',
+        '          if (configPath.endsWith(".claude.json") && (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default")) {\n',
+        "Unix selective MCP-config bypass",
+    )
+    expect_assertion(
+        "the Unix validator checks MCP values only in Claude's config",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(unix_mcp_only_claude),
+    )
+    unix_full_sha_bypass = replace_exactly_once(
+        validation,
+        '          if (!fullSha.test(build.sha ?? "")) {\n',
+        '          if (false && !fullSha.test(build.sha ?? "")) {\n',
+        "Unix full-commit-SHA bypass",
+    )
+    expect_assertion(
+        "the Unix validator disables the full commit SHA comparison",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(unix_full_sha_bypass),
+    )
+    unix_lock_sha_bypass = replace_exactly_once(
+        validation,
+        '          if (!lockSha.test(build.dependencyProvenance ?? "")) {\n',
+        '          if (false && !lockSha.test(build.dependencyProvenance ?? "")) {\n',
+        "Unix lock-SHA bypass",
+    )
+    expect_assertion(
+        "the Unix validator disables the lock SHA comparison",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(unix_lock_sha_bypass),
+    )
     blocked_validation = validation.replace(
         '          const fs = require("fs");\n',
         '          /*\n          const fs = require("fs");\n',

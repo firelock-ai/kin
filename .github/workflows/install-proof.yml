@@ -611,6 +611,27 @@ jobs:
             .filter((check) => check.status !== "healthy")
             .map((check) => `${check.id}=${check.status}`)
             .join(", ") || "none";
+          const validateHealthReport = (report, reportPath) => {
+            if (!Array.isArray(report.checks)) {
+              throw new Error(`${reportPath}: checks is missing or malformed`);
+            }
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            if (checks.size !== report.checks.length) {
+              throw new Error(`${reportPath}: duplicate health-check ids are not authoritative`);
+            }
+            const expectedHealthy = !report.checks.some(
+              (check) =>
+                check.status === "missing" ||
+                check.status === "misconfigured" ||
+                (check.id === "semantic_query_readiness" && check.status === "stale")
+            );
+            if (report.healthy !== expectedHealthy) {
+              throw new Error(
+                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${expectedHealthy}`
+              );
+            }
+            return checks;
+          };
           // The repo-free Windows posture, pinned by name. `repo_init` is
           // missing because there is no repository here, and `daemon_running`
           // is unsupported because the daemon is repo-scoped. Both are the
@@ -635,7 +656,7 @@ jobs:
 
           for (const reportPath of ["kin-windows-health.json", "kin-windows-doctor.json"]) {
             const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            const checks = validateHealthReport(report, reportPath);
             // Missing `repo_init` is the one degradation this repo-free posture
             // expects, and it flips the aggregate report.healthy to false on its
             // own. Accept that single named reason and keep every other
@@ -1207,6 +1228,27 @@ jobs:
             .filter((check) => check.status !== "healthy")
             .map((check) => `${check.id}=${check.status}`)
             .join(", ") || "none";
+          const validateHealthReport = (report, reportPath) => {
+            if (!Array.isArray(report.checks)) {
+              throw new Error(`${reportPath}: checks is missing or malformed`);
+            }
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            if (checks.size !== report.checks.length) {
+              throw new Error(`${reportPath}: duplicate health-check ids are not authoritative`);
+            }
+            const expectedHealthy = !report.checks.some(
+              (check) =>
+                check.status === "missing" ||
+                check.status === "misconfigured" ||
+                (check.id === "semantic_query_readiness" && check.status === "stale")
+            );
+            if (report.healthy !== expectedHealthy) {
+              throw new Error(
+                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${expectedHealthy}`
+              );
+            }
+            return checks;
+          };
           const required = new Map([
             ["kin_binary", "healthy"],
             ["kin_daemon_binary", "healthy"],
@@ -1224,7 +1266,7 @@ jobs:
           ]);
 
           for (const [path, report] of reports) {
-            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            const checks = validateHealthReport(report, path);
             // This capability capture runs before `kin embed`, so the daemon
             // graph still has embeddings pending. Under graph-authoritative
             // health that is semantic_query_readiness=stale, an intentional
@@ -1308,7 +1350,8 @@ jobs:
           }
           for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
             const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-            const readiness = report.checks?.find((check) => check.id === "semantic_query_readiness")?.status;
+            const checks = validateHealthReport(report, reportPath);
+            const readiness = checks.get("semantic_query_readiness")?.status;
             if (report.healthy !== true || readiness !== "healthy") {
               throw new Error(
                 `${reportPath}: overall healthy=${report.healthy}; ` +
