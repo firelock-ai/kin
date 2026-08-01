@@ -4085,6 +4085,71 @@ mod tests {
         );
     }
 
+    /// The focal is added to the entity list only when the store actually holds
+    /// it, so an id that was never upserted yields an empty neighborhood that
+    /// says nothing about isolation. `entity_count` is the name that fact
+    /// travels under from this handler to the guard that reads it, and only an
+    /// end-to-end call pins the two together.
+    #[test]
+    fn graph_neighborhood_missing_focal_is_not_an_absence() {
+        let (store, _, _, _) = neighborhood_fixture();
+        let never_upserted = EntityId::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(never_upserted.to_string()),
+        );
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert_eq!(response["entity_count"], 0);
+        assert_eq!(response["negative"]["kind"], "focal_not_in_graph");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an entity the walk never found must not be certified isolated: {}",
+            response["negative"]
+        );
+    }
+
+    /// `limit: 0` empties the emitted edge array of a neighborhood that really
+    /// has neighbors. The pre-truncation total is the only thing that can tell
+    /// a capped answer from an absence, and `relation_count` is the name it
+    /// travels under from this handler to the guard that reads it.
+    #[test]
+    fn graph_neighborhood_truncated_to_zero_is_not_an_absence() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("limit".to_string(), serde_json::json!(0));
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert!(
+            response["relations"]
+                .as_array()
+                .expect("relations must be an array")
+                .is_empty(),
+            "the caller capped the array to nothing"
+        );
+        assert_eq!(
+            response["relation_count"], 2,
+            "the pre-truncation total still reports the two real edges"
+        );
+        assert!(
+            response.get("negative").is_none(),
+            "a truncated edge array is not an absence and must not be qualified as one: {response}"
+        );
+    }
+
     /// The declared tool schema must offer the parameter the handler honors,
     /// and the description must claim the direction the traversal delivers.
     #[test]
