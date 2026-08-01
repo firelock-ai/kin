@@ -70,6 +70,22 @@ pub enum VfsRequest {
     /// expected (after the child has run). The daemon answers with
     /// [`VfsResponse::CanaryStatus`].
     CanaryVerdict { token: String },
+
+    /// The shim reports that a workspace-owned path was answered by the real
+    /// filesystem through `surface`, a libc entry point interposition does not
+    /// route through the graph. Loading is not enough to make a run
+    /// graph-native, so this is what keeps the verdict falsifiable: a run whose
+    /// shim loaded perfectly still reads back as
+    /// [`InterposeStatus::Bypassed`] once a surface is reported.
+    ///
+    /// Appended last: this enum is the shim/daemon wire format, and a new
+    /// variant in the middle would renumber the ones a peer already decodes.
+    CanaryBypass { token: String, surface: String },
+
+    /// A launcher asks which surfaces were reported for a token, so its
+    /// diagnostic can name them instead of telling the operator only that
+    /// something bypassed. Answered with [`VfsResponse::CanaryBypasses`].
+    CanaryBypassSurfaces { token: String },
 }
 
 /// Response from daemon to VFS shim.
@@ -106,6 +122,11 @@ pub enum VfsResponse {
 
     /// Interposition verdict for a [`VfsRequest::CanaryVerdict`] query.
     CanaryStatus(InterposeStatus),
+
+    /// Surfaces reported as having served a workspace path from raw disk, in
+    /// stable order. Appended last, for the same wire-compatibility reason as
+    /// [`VfsRequest::CanaryBypass`].
+    CanaryBypasses(Vec<String>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

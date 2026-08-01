@@ -37,6 +37,24 @@ pub trait ContentProvider: Send + Sync {
     fn version(&self) -> u64 {
         0
     }
+
+    /// Start one dispatcher-scoped lookup provenance capture.
+    ///
+    /// Providers with a mutable remote endpoint can override this together
+    /// with [`Self::finish_lookup_endpoint`] so diagnostics name the endpoint
+    /// that answered this request rather than rereading shared current state
+    /// after the response. Embedded providers need no capture.
+    fn begin_lookup_endpoint(&self) {}
+
+    /// Finish the dispatcher-scoped capture and return the exact endpoint that
+    /// answered it, if the provider has one.
+    ///
+    /// The returned string may be moved from request-local state already
+    /// allocated for transport; callers retain lazy log formatting and need
+    /// not clone or lock mutable global endpoint state.
+    fn finish_lookup_endpoint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Async counterpart of [`ContentProvider`] for use in async contexts.
