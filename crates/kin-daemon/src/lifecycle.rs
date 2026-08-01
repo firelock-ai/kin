@@ -795,7 +795,7 @@ fn proven_live_other_endpoint_owner_with_probe(
 /// Publish an endpoint attributed to a process other than this one, so tests
 /// can build the state a real successor would leave behind without running a
 /// second daemon.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn publish_foreign_endpoint_for_test(
     kin_root: &Path,
     identity: kin_cli::daemon_client::ProcessIdentity,
@@ -856,7 +856,7 @@ pub fn publish_daemon_endpoint(kin_root: &Path, port: u16) -> std::io::Result<()
 
 /// Publish under an injectable ownership probe, so a test can drive the
 /// indeterminate case that the host's own permissions decide otherwise.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn publish_daemon_endpoint_with_probe(
     kin_root: &Path,
     port: u16,

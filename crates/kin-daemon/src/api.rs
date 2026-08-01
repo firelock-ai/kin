@@ -11750,6 +11750,7 @@ mod tests {
     /// mutation, so native history that introduces artifacts cannot be admitted
     /// by any pull today. Editing an artifact the destination already holds is
     /// what a native transfer can actually carry, so it is what this proves.
+    #[cfg(unix)]
     fn advance_peer_artifact(
         storage: &FsPath,
         repository_id: &RepositoryId,
@@ -12108,6 +12109,7 @@ mod tests {
     /// repository, because a transfer only exists between replicas of the same
     /// repository identity: the ref advertisement refuses anything else. This is
     /// the local half of what a native clone will establish.
+    #[cfg(unix)]
     struct WorkspaceFollowFixture {
         state: Arc<DaemonState>,
         working: PathBuf,
@@ -15182,6 +15184,7 @@ mod tests {
     /// Install one entity into the daemon query graph alone, the way the
     /// asynchronous LSP enrichment worker and parser reconciliation both do:
     /// derived semantics that have not crossed the repository compare-and-swap.
+    #[cfg(unix)]
     fn install_unpublished_derived_entity(state: &DaemonState, name: &str) -> kin_model::EntityId {
         let entity = kin_model::Entity {
             id: kin_model::EntityId::new(),
