@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-08-01
+
+### Changed
+
+- Make the pin prover green on what it finds, and prove it on the substrate rather than in a comment (#555)
+- Guard the kin-cli featureless contract by running its tests with default features off (#550)
+- Keep the install proof's init log out of the worktree it admits (#560)
+- Report five first-touch failures with the detail the code already had (#562)
+- Measure relation evidence span population through the real ingest path (#568)
+- State what a pull that admits no history reports about the working tree (#569)
+- Carry the sections of superseded release tags into the notes that replace them (#564)
+- Keep a test's managed config paths inside the test that resolved them (#571)
+- Report hosted identity, resolve work-item rollback, and narrow the rename refusal (#559)
+- Bind the MCP commit precondition to the authority revision it plans against (#566)
+- Refuse a release archive root file whose name is not a release component (#573)
+- Name artifact identities in the form the merge resolver accepts (#570)
+- Qualify an empty neighborhood by the direction the traversal walked (#565)
+- Record the Windows repository-creation loss in the 0.4.4 release notes (#576)
+- Scan the spec command in the zero-file-search guard and declare its sidecar reads as dated debt (#572)
+- Answer deps, projection healing, graph visualization, and global MCP startup from recorded truth (#561)
+- Assert the Windows admission contract the installed release actually ships (#574)
+- Record v0.4.5 as abandoned and reconcile release recovery through the shipped selector (#563)
+- Adopt released KinVFS 0.3.0 in Kin proof and runtime (#579)
+- Classify authority bind refusals on namespace identity alone (#471)
+- Let only reviewed required checks veto a release, and make a blocked one visible (#567)
+- Report status embedding coverage from the graph that actually holds the vector index (#577)
+- Make refs counts entity-accurate and fail closed (#580)
+- Install and refresh the macOS notification bundle on every channel that delivers Kin (#575)
+- Show bounded first-install download progress (#581)
+- Add bounded graph-native repository rename (#583)
+- Make v0.4.6 install proof behaviorally authoritative (#584)
+
+
 ### Breaking
 
 - The `kin status --json` contract moves from `kin.status.v2` to `kin.status.v3`
