@@ -12754,8 +12754,8 @@ where
 fn cleanup_windows_user_path(root: &Path, requested_root: &Path) -> Result<()> {
     let script = r#"$ErrorActionPreference = 'Stop'
 $bins = @(
-    [IO.Path]::GetFullPath((Join-Path $env:KIN_UNINSTALL_ROOT 'bin')).TrimEnd('\\', '/').ToLowerInvariant()
-    [IO.Path]::GetFullPath((Join-Path $env:KIN_UNINSTALL_PATH_ROOT 'bin')).TrimEnd('\\', '/').ToLowerInvariant()
+    [IO.Path]::GetFullPath((Join-Path $env:KIN_UNINSTALL_ROOT 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath((Join-Path $env:KIN_UNINSTALL_PATH_ROOT 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
 ) | Select-Object -Unique
 $current = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($null -ne $current) {
@@ -12763,7 +12763,7 @@ if ($null -ne $current) {
         if ([string]::IsNullOrWhiteSpace($_)) { return $true }
         $candidate = $_.Trim().Trim('"')
         try { $candidate = [IO.Path]::GetFullPath($candidate) } catch {}
-        $bins -notcontains $candidate.TrimEnd('\\', '/').ToLowerInvariant()
+        $bins -notcontains $candidate.TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
     })
     [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
 }
@@ -13013,8 +13013,8 @@ public static class KinUninstallIdentity {
 $root = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_ROOT)
 $pathRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_PATH_ROOT)
 $bins = @(
-    [IO.Path]::GetFullPath((Join-Path $root 'bin')).TrimEnd('\\', '/').ToLowerInvariant()
-    [IO.Path]::GetFullPath((Join-Path $pathRoot 'bin')).TrimEnd('\\', '/').ToLowerInvariant()
+    [IO.Path]::GetFullPath((Join-Path $root 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath((Join-Path $pathRoot 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
 ) | Select-Object -Unique
 $pidToWait = [int]$env:KIN_UNINSTALL_PID
 $log = $env:KIN_UNINSTALL_LOG
@@ -13029,7 +13029,7 @@ try {
             if ([string]::IsNullOrWhiteSpace($_)) { return $true }
             $candidate = $_.Trim().Trim('"')
             try { $candidate = [IO.Path]::GetFullPath($candidate) } catch {}
-            $bins -notcontains $candidate.TrimEnd('\\', '/').ToLowerInvariant()
+            $bins -notcontains $candidate.TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
         })
         [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
     }
