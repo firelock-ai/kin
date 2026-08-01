@@ -102,7 +102,11 @@ recursively: first run the ledger-scoped uninstall, then review and remove that
 directory explicitly. Modified setup-owned slices block full removal unless you
 add `--force`, so uninstall never silently overwrites a user's edited client or
 shell configuration. On Windows, the CLI schedules its locked install directory
-for deletion immediately after the running process exits.
+for deletion immediately after the running process exits. Windows intentionally
+retains one inert, current-user-only sibling authority sidecar; keeping that lock
+identity stable prevents a crash or concurrent future install from creating two
+independent mutation authorities. The CLI and JSON result disclose this retained
+coordination metadata rather than claiming zero residual bytes.
 
 For manual installation, each archive and its `.sha256` file is published under
 `https://github.com/firelock-ai/kin/releases/latest/download/`. The moving asset

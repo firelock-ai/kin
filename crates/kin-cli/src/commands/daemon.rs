@@ -1105,11 +1105,39 @@ fn command_argument(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
+fn is_managed_daemon_executable(executable: Option<&Path>, managed_bin: &Path) -> bool {
+    let Some(executable) = executable else {
+        return false;
+    };
+    let Ok(executable) = executable.canonicalize() else {
+        return false;
+    };
+    let name_matches = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            #[cfg(windows)]
+            {
+                name.eq_ignore_ascii_case("kin-daemon.exe")
+            }
+            #[cfg(not(windows))]
+            {
+                name == "kin-daemon"
+            }
+        });
+    name_matches && executable.parent() == Some(managed_bin)
+}
+
 fn managed_daemon_processes(install_root: &Path) -> Vec<ManagedDaemonProcess> {
-    let managed_bin = install_root
+    let Ok(managed_bin) = install_root
         .canonicalize()
-        .unwrap_or_else(|_| install_root.to_path_buf())
-        .join("bin");
+        .and_then(|root| root.join("bin").canonicalize())
+    else {
+        // Ownership cannot be proven from a missing or unresolvable install
+        // root. In particular, never recover by trusting argv spelling: a
+        // lexical `bin/../../outside/kin-daemon.exe` prefix is not authority.
+        return Vec::new();
+    };
     let mut system = sysinfo::System::new_all();
     system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut found = Vec::new();
@@ -1123,25 +1151,7 @@ fn managed_daemon_processes(install_root: &Path) -> Vec<ManagedDaemonProcess> {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let name = process.name().to_string_lossy();
-        let executable_name_matches = matches!(name.as_ref(), "kin-daemon" | "kin-daemon.exe")
-            || args.first().is_some_and(|arg| {
-                Path::new(arg)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| matches!(name, "kin-daemon" | "kin-daemon.exe"))
-            });
-        if !executable_name_matches {
-            continue;
-        }
-        let owned_executable = process
-            .exe()
-            .is_some_and(|path| path.starts_with(&managed_bin))
-            || args.first().is_some_and(|arg| {
-                let path = Path::new(arg);
-                path.is_absolute() && path.starts_with(&managed_bin)
-            });
-        if !owned_executable {
+        if !is_managed_daemon_executable(process.exe(), &managed_bin) {
             continue;
         }
         let kind = if args.iter().any(|arg| arg == "--supervisor") {
@@ -1353,6 +1363,46 @@ fn finish_stop_with_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::fs;
+
+    #[cfg(windows)]
+    const WINDOWS_DAEMON_SCAN_CHILD: &str = "KIN_INTERNAL_TEST_WINDOWS_DAEMON_SCAN_CHILD";
+
+    #[cfg(windows)]
+    struct WindowsDaemonScanChild(std::process::Child);
+
+    #[cfg(windows)]
+    impl Drop for WindowsDaemonScanChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows_daemon_scan_child(executable: &Path) -> Result<WindowsDaemonScanChild> {
+        let child = std::process::Command::new(executable)
+            .args([
+                "commands::daemon::tests::native_managed_daemon_scan_canonicalizes_and_rejects_traversal",
+                "--exact",
+                "--nocapture",
+                "--",
+                "--supervisor",
+            ])
+            .env(WINDOWS_DAEMON_SCAN_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to spawn native Windows daemon scan child {}",
+                    executable.display()
+                )
+            })?;
+        Ok(WindowsDaemonScanChild(child))
+    }
 
     #[test]
     fn classify_liveness_covers_every_state() {
@@ -1502,6 +1552,85 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("4242"), "{message}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_managed_daemon_scan_canonicalizes_and_rejects_traversal() -> Result<()> {
+        if std::env::var_os(WINDOWS_DAEMON_SCAN_CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+            return Ok(());
+        }
+
+        let fixture = tempfile::tempdir()?;
+        let install_root = fixture.path().join("install").join(".kin");
+        let managed_bin = install_root.join("bin");
+        let outside_bin = fixture.path().join("outside");
+        fs::create_dir_all(&managed_bin)?;
+        fs::create_dir_all(&outside_bin)?;
+
+        let managed_executable = managed_bin.join("kin-daemon.exe");
+        let outside_executable = outside_bin.join("kin-daemon.exe");
+        fs::copy(std::env::current_exe()?, &managed_executable)?;
+        fs::copy(std::env::current_exe()?, &outside_executable)?;
+
+        let managed_child = spawn_windows_daemon_scan_child(&managed_executable)?;
+        let traversal_executable = managed_bin
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("kin-daemon.exe");
+        let outside_child = spawn_windows_daemon_scan_child(&traversal_executable)?;
+
+        let canonical_bin = managed_bin.canonicalize()?;
+        anyhow::ensure!(
+            is_managed_daemon_executable(Some(&managed_executable), &canonical_bin),
+            "canonical managed executable was not recognized"
+        );
+        anyhow::ensure!(
+            !is_managed_daemon_executable(Some(&traversal_executable), &canonical_bin),
+            "a lexical managed-bin prefix with parent traversal was accepted"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = managed_daemon_processes(&install_root);
+            if found
+                .iter()
+                .any(|process| process.pid == managed_child.0.id())
+            {
+                anyhow::ensure!(
+                    !found
+                        .iter()
+                        .any(|process| process.pid == outside_child.0.id()),
+                    "daemon scan authorized an outside process through lexical traversal"
+                );
+                let mut reports = Vec::new();
+                stop_install_owned_daemons(&install_root, Duration::from_secs(5), &mut reports)?;
+                anyhow::ensure!(
+                    reports.iter().any(|report| {
+                        report.pid == managed_child.0.id() && report.outcome.is_success()
+                    }),
+                    "uninstall sweep did not report a successful stop for the actual managed child"
+                );
+                anyhow::ensure!(
+                    !is_process_alive(managed_child.0.id()),
+                    "managed child remained alive after the uninstall sweep"
+                );
+                anyhow::ensure!(
+                    is_process_alive(outside_child.0.id()),
+                    "uninstall sweep signaled the outside traversal child"
+                );
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "native Windows daemon scan did not discover the actual managed child"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

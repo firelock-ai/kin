@@ -2079,6 +2079,68 @@ pub(crate) fn open_or_create_current_user_private_file_with_status(
     unreachable!("bounded Windows private-file retry loop always returns")
 }
 
+/// Open or create a persistent current-user-only file used for byte-range
+/// locking. Unlike the stricter config sidecar opener, concurrent readers and
+/// writers may open the same object so `fs2` can arbitrate shared/exclusive
+/// authority. Delete sharing remains denied: while any authority handle is
+/// live, the namespace entry cannot be renamed or replaced with a second lock
+/// object.
+pub(crate) fn open_or_create_current_user_private_lock_file(path: &Path) -> Result<(File, bool)> {
+    const ATTEMPTS: usize = 200;
+    const SHARE_FOR_LOCKING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    for attempt in 0..ATTEMPTS {
+        match create_current_user_private_file_with_disposition(
+            path,
+            CREATE_NEW,
+            SHARE_FOR_LOCKING,
+            0,
+            false,
+        ) {
+            Ok(file) => return Ok((file, true)),
+            Err(error)
+                if matches!(
+                    windows_error_code(&error),
+                    Some(code)
+                        if code == ERROR_FILE_EXISTS as i32 || code == ERROR_ALREADY_EXISTS as i32
+                ) =>
+            {
+                match create_current_user_private_file_with_disposition(
+                    path,
+                    OPEN_EXISTING,
+                    SHARE_FOR_LOCKING,
+                    0,
+                    false,
+                ) {
+                    Ok(file) => return Ok((file, false)),
+                    Err(open_error)
+                        if windows_error_code(&open_error)
+                            == Some(ERROR_SHARING_VIOLATION as i32)
+                            && attempt + 1 < ATTEMPTS =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(open_error)
+                        if matches!(
+                            windows_error_code(&open_error),
+                            Some(code)
+                                if code == ERROR_FILE_NOT_FOUND as i32
+                                    || code == ERROR_PATH_NOT_FOUND as i32
+                        ) && attempt + 1 < ATTEMPTS => {}
+                    Err(open_error) => return Err(open_error),
+                }
+            }
+            Err(error)
+                if windows_error_code(&error) == Some(ERROR_SHARING_VIOLATION as i32)
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded Windows private-lock-file retry loop always returns")
+}
+
 /// Reopen an already-created private sidecar without permitting recreation.
 /// This is used to prove that the durable directory entry still names the
 /// full FILE_ID_INFO captured before its identity-keyed WAL is acquired.

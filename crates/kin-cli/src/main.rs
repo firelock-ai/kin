@@ -1804,7 +1804,7 @@ enum SetupAction {
     },
     /// Remove exactly what `kin setup` recorded (ledger-verified)
     Uninstall {
-        /// Remove the complete managed install after ledger cleanup
+        /// Remove the complete managed install after ledger cleanup (Windows retains an inert authority sidecar)
         #[arg(long, default_value_t = false)]
         all: bool,
         /// Show what would be removed without changing anything

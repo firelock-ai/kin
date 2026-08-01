@@ -317,7 +317,19 @@ jobs:
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
           run_required_exact "native full managed uninstall lifecycle" \
-            "commands::setup::tests::native_windows_uninstall_runtime_executes_retirement_and_user_path_cleanup" \
+            "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native managed-daemon ownership scan" \
+            "commands::daemon::tests::native_managed_daemon_scan_canonicalizes_and_rejects_traversal" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native install authority contention and crash recovery" \
+            "commands::update::tests::native_install_authority_contends_across_aliases_and_recovers_after_crash" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native managed-daemon spawn admission" \
+            "commands::update::tests::managed_daemon_spawn_lease_blocks_uninstall_authority_until_readiness" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
           run_required_filter "managed-install spawn fence" \

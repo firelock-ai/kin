@@ -12824,6 +12824,74 @@ fn move_windows_install_root(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn current_windows_process_creation_time() -> Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error())
+            .context("failed to capture the uninstalling Windows process incarnation");
+    }
+    Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_uninstall_helper_ready(
+    child: &mut std::process::Child,
+    ready_path: &Path,
+    ready_nonce: &str,
+    log_path: &Path,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match fs::read_to_string(ready_path) {
+            Ok(observed) if observed == ready_nonce => return Ok(()),
+            Ok(observed) => anyhow::bail!(
+                "deferred Windows uninstall helper published an invalid ready handshake: {observed:?}"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read deferred Windows uninstall helper handshake {}",
+                        ready_path.display()
+                    )
+                })
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect deferred Windows uninstall helper startup")?
+        {
+            let detail = fs::read_to_string(log_path)
+                .unwrap_or_else(|_| "helper did not publish a diagnostic log".to_string());
+            anyhow::bail!(
+                "deferred Windows uninstall helper exited before its incarnation-safe handoff ({status}): {detail}"
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for deferred Windows uninstall helper to pin the parent process incarnation"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
 fn retire_windows_install_root(
     root: &ValidatedInstallRoot,
     retired: &Path,
@@ -12860,6 +12928,10 @@ fn retire_windows_install_root(
     Ok(())
 }
 
+#[cfg(all(test, windows))]
+const WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE: &str =
+    "KIN_INTERNAL_TEST_UNINSTALL_PARENT_CREATED_100NS";
+
 #[cfg(windows)]
 fn remove_full_install_root(
     root: &ValidatedInstallRoot,
@@ -12887,7 +12959,7 @@ fn remove_full_install_root(
             if dry_run {
                 "install root is absent; would remove the exact installer-owned user-PATH segment"
             } else {
-                "managed Kin install root is absent and the exact installer-owned user-PATH segment was removed"
+                "managed Kin install root is absent and the exact installer-owned user-PATH segment was removed; the inert current-user install-authority sidecar remains for race-safe future installs"
             },
         ));
     }
@@ -12896,7 +12968,7 @@ fn remove_full_install_root(
             "install_root",
             &root.path,
             "would_schedule",
-            "would remove the exact Kin user-PATH segment and schedule the validated install root for deletion after this process exits",
+            "would remove the exact Kin user-PATH segment and schedule the validated install root for deletion after this process exits; the inert current-user install-authority sidecar would remain for race-safe future installs",
         ));
     }
 
@@ -12919,13 +12991,26 @@ fn remove_full_install_root(
     }
 
     // Windows does not permit a running executable to unlink itself. A
-    // no-profile PowerShell helper must wait for this exact PID before deleting
-    // its image. Atomically retire the validated root while install authority
-    // is still held, then let the helper delete only that private sibling. A
+    // no-profile PowerShell helper opens this process, validates its creation
+    // time, and publishes a ready handshake while that incarnation is still
+    // alive. It then waits on the pinned process handle before deleting the
+    // image. Atomically retire the validated root while install authority is
+    // still held, then let the helper delete only that private sibling. A
     // replacement install at the public pathname is therefore never followed.
     let token = uuid::Uuid::new_v4();
     let script_path = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
     let log_path = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
+    let ready_path = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
+    let ready_nonce = uuid::Uuid::new_v4().to_string();
+    let parent_creation_time = current_windows_process_creation_time()?;
+    #[cfg(test)]
+    let parent_creation_time = match env::var_os(WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE) {
+        Some(override_value) => override_value
+            .to_string_lossy()
+            .parse::<u64>()
+            .context("invalid Windows uninstall parent-creation test override")?,
+        None => parent_creation_time,
+    };
     let retired_path = root
         .path
         .parent()
@@ -12937,6 +13022,10 @@ fn remove_full_install_root(
         .context("Kin install root has no parent")?
         .join(format!(".kin-uninstall-incomplete-{token}"));
     let script = r#"$ErrorActionPreference = 'Stop'
+$log = $env:KIN_UNINSTALL_LOG
+$ready = $env:KIN_UNINSTALL_READY
+$parentHandle = $null
+try {
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -12965,6 +13054,13 @@ public static class KinUninstallIdentity {
     [DllImport("kernel32.dll", SetLastError=true)]
     static extern bool SetFileInformationByHandle(SafeFileHandle handle,
         int informationClass, ref FILE_DISPOSITION_INFO information, uint size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetProcessTimes(SafeWaitHandle handle, out FILETIME creation,
+        out FILETIME exit, out FILETIME kernel, out FILETIME user);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint WaitForSingleObject(SafeWaitHandle handle, uint milliseconds);
     static string ReadHandle(SafeFileHandle handle) {
         BY_HANDLE_FILE_INFORMATION info;
         if (!GetFileInformationByHandle(handle, out info))
@@ -12999,6 +13095,29 @@ public static class KinUninstallIdentity {
         } catch { handle.Dispose(); throw; }
     }
     public static string ReadLocked(SafeFileHandle handle) { return ReadHandle(handle); }
+    public static SafeWaitHandle LockParent(uint processId, ulong expectedCreation) {
+        const uint SYNCHRONIZE=0x00100000, QUERY_LIMITED_INFORMATION=0x1000;
+        var raw = OpenProcess(SYNCHRONIZE|QUERY_LIMITED_INFORMATION, false, processId);
+        if (raw == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var handle = new SafeWaitHandle(raw, true);
+        try {
+            FILETIME creation, exit, kernel, user;
+            if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            ulong observed = ((ulong)creation.High << 32) | creation.Low;
+            if (observed != expectedCreation)
+                throw new InvalidOperationException("uninstall parent process incarnation changed before helper handoff");
+            return handle;
+        } catch { handle.Dispose(); throw; }
+    }
+    public static void WaitForParentExit(SafeWaitHandle handle) {
+        const uint WAIT_OBJECT_0=0, WAIT_TIMEOUT=258;
+        uint result = WaitForSingleObject(handle, 300000);
+        if (result == WAIT_TIMEOUT)
+            throw new TimeoutException("timed out waiting for uninstall parent process incarnation");
+        if (result != WAIT_OBJECT_0)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
     public static void DeleteLocked(SafeFileHandle handle, string expected) {
         if (ReadHandle(handle) != expected)
             throw new InvalidOperationException("retired root identity changed before handle-bound deletion");
@@ -13017,12 +13136,20 @@ $bins = @(
     [IO.Path]::GetFullPath((Join-Path $pathRoot 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
 ) | Select-Object -Unique
 $pidToWait = [int]$env:KIN_UNINSTALL_PID
-$log = $env:KIN_UNINSTALL_LOG
+$expectedParentCreation = [UInt64]$env:KIN_UNINSTALL_PARENT_CREATED_100NS
 $retired = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_RETIRED)
 $incompleteMarker = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_INCOMPLETE_MARKER)
 $expectedIdentity = $env:KIN_UNINSTALL_EXPECTED_IDENTITY
+$parentHandle = [KinUninstallIdentity]::LockParent($pidToWait, $expectedParentCreation)
+$readyBytes = [Text.Encoding]::UTF8.GetBytes($env:KIN_UNINSTALL_READY_NONCE)
+$readyStream = [IO.File]::Open($ready, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
-    Wait-Process -Id $pidToWait -ErrorAction SilentlyContinue
+    $readyStream.Write($readyBytes, 0, $readyBytes.Length)
+    $readyStream.Flush($true)
+} finally {
+    $readyStream.Dispose()
+}
+[KinUninstallIdentity]::WaitForParentExit($parentHandle)
     $current = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($null -ne $current) {
         $kept = @($current -split ';' | Where-Object {
@@ -13061,6 +13188,8 @@ try {
 } catch {
     $_ | Out-File -LiteralPath $log -Encoding utf8
 } finally {
+    if ($null -ne $parentHandle) { $parentHandle.Dispose() }
+    Remove-Item -LiteralPath $ready -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }
 "#;
@@ -13087,11 +13216,13 @@ try {
     })();
     if let Err(error) = marker_result {
         let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
         let _ = fs::remove_file(&incomplete_marker);
         return Err(error);
     }
     if let Err(error) = retire_windows_install_root(root, &retired_path, expected) {
         let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
         let _ = fs::remove_file(&incomplete_marker);
         return Err(error);
     }
@@ -13099,6 +13230,7 @@ try {
         .and_then(|_| crate::commands::daemon::verify_install_owned_processes_absent(&retired_path))
     {
         let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
         return Err(error).context(format!(
             "post-retirement process fence failed; preserving {}",
             retired_path.display()
@@ -13119,7 +13251,13 @@ try {
         .env("KIN_UNINSTALL_ROOT", &root.path)
         .env("KIN_UNINSTALL_PATH_ROOT", &root.requested)
         .env("KIN_UNINSTALL_PID", std::process::id().to_string())
+        .env(
+            "KIN_UNINSTALL_PARENT_CREATED_100NS",
+            parent_creation_time.to_string(),
+        )
         .env("KIN_UNINSTALL_LOG", &log_path)
+        .env("KIN_UNINSTALL_READY", &ready_path)
+        .env("KIN_UNINSTALL_READY_NONCE", &ready_nonce)
         .env("KIN_UNINSTALL_RETIRED", &retired_path)
         .env("KIN_UNINSTALL_INCOMPLETE_MARKER", &incomplete_marker)
         .env(
@@ -13133,11 +13271,12 @@ try {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-    let child = match child {
+    let mut child = match child {
         Ok(child) => child,
         Err(spawn_error) => {
             let rollback = move_windows_install_root(&retired_path, &root.path);
             let _ = fs::remove_file(&script_path);
+            let _ = fs::remove_file(&ready_path);
             match rollback {
                 Ok(()) => {
                     let _ = fs::remove_file(&incomplete_marker);
@@ -13159,13 +13298,36 @@ try {
             }
         }
     };
+    if let Err(handoff_error) =
+        wait_for_windows_uninstall_helper_ready(&mut child, &ready_path, &ready_nonce, &log_path)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        let rollback = move_windows_install_root(&retired_path, &root.path);
+        let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&log_path);
+        match rollback {
+            Ok(()) => {
+                let _ = fs::remove_file(&incomplete_marker);
+                return Err(handoff_error).context(format!(
+                    "deferred Windows uninstall helper did not complete its incarnation-safe handoff; atomically restored {}",
+                    root.path.display()
+                ));
+            }
+            Err(rollback_error) => anyhow::bail!(
+                "deferred Windows uninstall helper did not complete its incarnation-safe handoff: {handoff_error:#}; the validated install root is preserved at {}, but restoring its public path also failed: {rollback_error:#}",
+                retired_path.display()
+            ),
+        }
+    }
     drop(child);
     Ok(FullUninstallAction::new(
         "install_root",
         &root.path,
         "scheduled",
         format!(
-            "scheduled current-user PATH cleanup and complete install-root deletion after process exit; failures are recorded at {}",
+            "scheduled current-user PATH cleanup and complete install-root deletion after process exit; the inert current-user install-authority sidecar remains for race-safe future installs; failures are recorded at {}",
             log_path.display()
         ),
     ))
@@ -13281,6 +13443,14 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
                 "ledger": outcomes,
                 "full_install": full_actions,
                 "fully_removed": fully_removed,
+                "retained_coordination_metadata": if cfg!(windows) {
+                    serde_json::json!([{
+                        "kind": "windows_install_authority",
+                        "reason": "persistent current-user-only sidecar prevents split install authority across crashes, aliases, and concurrent future installs"
+                    }])
+                } else {
+                    serde_json::json!([])
+                },
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
@@ -14144,6 +14314,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         retired: PathBuf,
         incomplete_marker: PathBuf,
         helper_script: PathBuf,
+        helper_ready: PathBuf,
         helper_log: PathBuf,
         parked_original: Option<PathBuf>,
     }
@@ -14298,6 +14469,36 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             .context("native uninstall child root has no home parent")?;
         let validated = validate_full_uninstall_root_at(&root, home, None)?;
         let lock = crate::commands::update::InstallRootLock::acquire_existing_waiting(&root)?;
+        if mode == "parent-incarnation-mismatch" {
+            let _parent_creation_override =
+                EnvVarGuard::set(WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE, "0");
+            let error = remove_full_install_root(&validated, false, Some(&lock))
+                .expect_err("a mismatched parent incarnation must fail the helper handoff");
+            let message = format!("{error:#}");
+            anyhow::ensure!(
+                message.contains("incarnation-safe handoff")
+                    && message.contains("atomically restored"),
+                "parent-incarnation mismatch produced an unexpected error: {message}"
+            );
+            anyhow::ensure!(
+                install_root_identity(&root)?
+                    == validated
+                        .identity
+                        .context("mismatch fixture lost validated identity")?,
+                "failed parent handoff did not restore the original root incarnation"
+            );
+            anyhow::ensure!(
+                !fs::read_dir(home)?
+                    .filter_map(std::result::Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".kin-uninstall-"))),
+                "failed parent handoff left an uninstall retirement artifact"
+            );
+            fs::write(&result_path, message)?;
+            return Ok(());
+        }
         let outcome = remove_full_install_root(&validated, false, Some(&lock))?;
         anyhow::ensure!(
             outcome.action == "scheduled",
@@ -14315,6 +14516,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             .and_then(|name| name.strip_prefix(".kin-uninstall-incomplete-"))
             .context("native uninstall marker did not carry its helper token")?;
         let helper_script = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
+        let helper_ready = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
         let helper_log = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
         anyhow::ensure!(
             retired.is_dir(),
@@ -14327,6 +14529,11 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         anyhow::ensure!(
             helper_script.is_file(),
             "deferred uninstall helper script was not published"
+        );
+        anyhow::ensure!(
+            fs::read_to_string(&helper_ready)
+                .is_ok_and(|nonce| uuid::Uuid::parse_str(&nonce).is_ok()),
+            "deferred uninstall helper did not publish a valid incarnation-safe ready handshake"
         );
 
         let parked_original = if mode == "identity-mismatch" {
@@ -14358,6 +14565,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             retired,
             incomplete_marker,
             helper_script,
+            helper_ready,
             helper_log,
             parked_original,
         };
@@ -14388,7 +14596,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         result_path: &Path,
     ) -> Result<WindowsFullUninstallChildResult> {
         let test_name =
-            "commands::setup::tests::native_windows_uninstall_runtime_executes_retirement_and_user_path_cleanup";
+            "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup";
         let output = Command::new(env::current_exe()?)
             .args([test_name, "--exact", "--nocapture"])
             .env(WINDOWS_FULL_UNINSTALL_CHILD_MODE, mode)
@@ -14427,6 +14635,33 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             );
         }
         Ok(serde_json::from_slice(&fs::read(result_path)?)?)
+    }
+
+    #[cfg(windows)]
+    fn run_windows_parent_incarnation_mismatch_child(
+        root: &Path,
+        result_path: &Path,
+    ) -> Result<String> {
+        let test_name =
+            "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup";
+        let output = Command::new(env::current_exe()?)
+            .args([test_name, "--exact", "--nocapture"])
+            .env(
+                WINDOWS_FULL_UNINSTALL_CHILD_MODE,
+                "parent-incarnation-mismatch",
+            )
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_ROOT, root)
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_RESULT, result_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("failed to launch the parent-incarnation mismatch test child")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "parent-incarnation mismatch child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(fs::read_to_string(result_path)?)
     }
 
     #[cfg(windows)]
@@ -14496,6 +14731,26 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "synchronous Windows User PATH cleanup was not exact"
         );
 
+        // Present the helper with the current PID but the wrong creation
+        // identity. It must reject the reusable PID immediately, exit without
+        // publishing readiness, and let the parent atomically restore the
+        // original root rather than waiting on that process number.
+        let handoff_home = fixture.path().join("handoff-mismatch").join("home");
+        let handoff_root = handoff_home.join(".kin");
+        fs::create_dir_all(&handoff_home)?;
+        let handoff_identity = prepare_windows_managed_root(&handoff_root)?;
+        let handoff_result_path = fixture.path().join("handoff-mismatch-result.txt");
+        let handoff_error =
+            run_windows_parent_incarnation_mismatch_child(&handoff_root, &handoff_result_path)?;
+        anyhow::ensure!(
+            handoff_error.contains("parent process incarnation changed"),
+            "helper did not explain its parent-incarnation refusal: {handoff_error}"
+        );
+        anyhow::ensure!(
+            install_root_identity(&handoff_root)? == handoff_identity,
+            "parent-incarnation refusal did not preserve the original install root"
+        );
+
         let success_home = fixture.path().join("success").join("home");
         let success_root = success_home.join(".kin");
         fs::create_dir_all(&success_home)?;
@@ -14512,6 +14767,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                 !success.incomplete_marker.exists()
                     && !success.retired.exists()
                     && !success.helper_script.exists()
+                    && !success.helper_ready.exists()
             },
         )?;
         anyhow::ensure!(
@@ -14562,6 +14818,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             || failure.helper_log.is_file() && !failure.helper_script.exists(),
         )?;
         anyhow::ensure!(
+            !failure.helper_ready.exists(),
+            "failed deferred uninstall retained its helper ready handshake"
+        );
+        anyhow::ensure!(
             failure.incomplete_marker.is_file(),
             "failed deferred uninstall cleared its durable incomplete marker"
         );
@@ -14602,7 +14862,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[cfg(windows)]
     #[test]
     #[serial]
-    fn native_windows_uninstall_runtime_executes_retirement_and_user_path_cleanup() -> Result<()> {
+    fn native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup() -> Result<()> {
         if let Some(mode) = env::var_os(WINDOWS_FULL_UNINSTALL_CHILD_MODE) {
             return windows_full_uninstall_child(&mode.to_string_lossy());
         }

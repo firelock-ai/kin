@@ -1546,8 +1546,10 @@ fn ensure_mutating_update_supported(os: &str, check_only: bool) -> Result<()> {
 
 /// OS-level lock held by every writer of a managed Kin install component.
 ///
-/// The lock file is deliberately persistent. Deleting a flock file while it is
-/// held creates a second inode that another process can lock concurrently.
+/// Unix keeps a persistent in-root flock file; deleting it while held would
+/// create a second inode that another process could lock concurrently. Windows
+/// uses a persistent current-user-only sibling lock because an open descendant
+/// handle prevents atomic install-root retirement there.
 pub(crate) struct InstallRootLock {
     file: File,
     root: PathBuf,
@@ -1557,9 +1559,12 @@ pub(crate) struct InstallRootLock {
 
 /// Shared admission lease held from immediately before a managed supervisor or
 /// worker spawn until that child has published readiness. Full uninstall takes
-/// the same `update.lock` exclusively, so a spawn is either wholly before the
-/// uninstall stop sweep or wholly after retirement (where path revalidation
-/// fails because the managed binary no longer exists).
+/// the same install authority exclusively, so a spawn is either wholly before
+/// the uninstall stop sweep or wholly after retirement (where path
+/// revalidation fails because the managed binary no longer exists). Unix uses
+/// `update.lock`; Windows uses the current-user-only sibling authority file
+/// because Windows cannot rename a directory while an open lock remains inside
+/// it.
 pub(crate) struct InstallSpawnFence {
     _file: File,
 }
@@ -1687,14 +1692,11 @@ impl InstallSpawnFence {
             return Ok(Some(Self { _file: file }));
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let path = configured_root.join("update.lock");
-            let (mut file, created) = open_lock_file(&path)?;
-            if created {
-                file.write_all(b"kin-update-lock-v1\n")?;
-                file.sync_all()?;
-            }
+            let authority_path = windows_install_authority_path(&configured_root)?;
+            let (file, _) =
+                windows_update::open_or_create_current_user_private_lock_file(&authority_path)?;
             FileExt::lock_shared(&file).context("failed to acquire managed daemon spawn lease")?;
             if configured_root.canonicalize()? != candidate_root
                 || binary.canonicalize().ok().as_deref() != Some(resolved_binary.as_path())
@@ -1756,7 +1758,58 @@ impl InstallRootLock {
     }
 
     fn acquire_inner(kin_home: &Path, create: bool, wait: bool) -> Result<Self> {
+        #[cfg(windows)]
+        let authority_root = windows_install_authority_root(kin_home)?;
+        #[cfg(windows)]
+        let authority_path = windows_install_authority_path(&authority_root)?;
+        #[cfg(windows)]
+        let (mut file, created) =
+            windows_update::open_or_create_current_user_private_lock_file(&authority_path)?;
+        #[cfg(windows)]
+        if wait {
+            FileExt::lock_exclusive(&file).with_context(|| {
+                format!(
+                    "failed while waiting for Kin install authority {}",
+                    authority_path.display()
+                )
+            })?;
+        } else {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                    anyhow::bail!(
+                        "another Kin install mutation is already active for {} (lock: {})",
+                        kin_home.display(),
+                        authority_path.display()
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to acquire Windows Kin install authority {}",
+                            authority_path.display()
+                        )
+                    });
+                }
+            }
+        }
+        #[cfg(windows)]
+        if created {
+            file.write_all(b"kin-update-lock-v2\n").with_context(|| {
+                format!(
+                    "failed to initialize Windows Kin install authority {}",
+                    authority_path.display()
+                )
+            })?;
+            file.sync_all().with_context(|| {
+                format!(
+                    "failed to sync Windows Kin install authority {}",
+                    authority_path.display()
+                )
+            })?;
+        }
         let root = validate_install_root(kin_home, create)?;
+        #[cfg(unix)]
         let path = root.join("update.lock");
         #[cfg(unix)]
         let parent_path = root.parent().context("Kin install root has no parent")?;
@@ -1774,9 +1827,8 @@ impl InstallRootLock {
         parent_anchor.ensure_child_binding(&root_name, &root_anchor)?;
         #[cfg(unix)]
         let (mut file, created) = open_lock_file_at(&root_anchor)?;
-        #[cfg(not(unix))]
-        let (mut file, created) = open_lock_file(&path)?;
 
+        #[cfg(unix)]
         if wait {
             FileExt::lock_exclusive(&file).with_context(|| {
                 format!(
@@ -1816,15 +1868,13 @@ impl InstallRootLock {
         #[cfg(unix)]
         root_anchor.set_mode(0o700, "managed Kin install root")?;
 
+        #[cfg(unix)]
         if created {
             file.write_all(b"kin-update-lock-v1\n")
                 .with_context(|| format!("failed to initialize update lock {}", path.display()))?;
             file.sync_all()
                 .with_context(|| format!("failed to sync update lock {}", path.display()))?;
-            #[cfg(unix)]
             root_anchor.sync()?;
-            #[cfg(not(unix))]
-            sync_dir(&root)?;
         }
         #[cfg(unix)]
         {
@@ -1848,7 +1898,7 @@ impl InstallRootLock {
                 install,
             });
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             // Managed directories are created only after exclusive lock
             // acquisition, so a contended writer is byte-for-byte read-only.
@@ -1949,6 +1999,50 @@ impl Drop for InstallRootLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+#[cfg(windows)]
+fn windows_install_authority_root(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "Kin install root must be absolute, got {}. Set KIN_HOME to an absolute path",
+            path.display()
+        );
+    }
+    match path.canonicalize() {
+        Ok(root) => return Ok(root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to resolve existing Kin install root for authority {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    let parent = path.parent().context("Kin install root has no parent")?;
+    let name = path
+        .file_name()
+        .context("Kin install root has no final path component")?;
+    let parent = parent.canonicalize().with_context(|| {
+        format!(
+            "parent of Kin install root does not exist or is inaccessible: {}",
+            parent.display()
+        )
+    })?;
+    Ok(parent.join(name))
+}
+
+#[cfg(windows)]
+fn windows_install_authority_path(root: &Path) -> Result<PathBuf> {
+    let root = windows_install_authority_root(root)?;
+    let normalized = root.to_string_lossy().to_lowercase();
+    let digest = hex::encode(Sha256::digest(normalized.as_bytes()));
+    Ok(root
+        .parent()
+        .context("Kin install root has no parent")?
+        .join(format!(".kin-install-authority-{digest}.lock")))
 }
 
 fn validate_existing_install_root(path: &Path) -> Result<PathBuf> {
@@ -2111,67 +2205,6 @@ fn ensure_managed_dirs(root: &Path, create: bool) -> Result<()> {
         }
         Ok(())
     }
-}
-
-#[cfg(not(unix))]
-fn open_lock_file(path: &Path) -> Result<(File, bool)> {
-    let mut create = OpenOptions::new();
-    create.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        create.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-
-    match create.open(path) {
-        Ok(file) => return Ok((file, true)),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to create update lock {}", path.display()));
-        }
-    }
-
-    let before = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect update lock {}", path.display()))?;
-    if before.file_type().is_symlink() || !before.is_file() {
-        anyhow::bail!(
-            "refusing non-regular or symlink update lock {}",
-            path.display()
-        );
-    }
-
-    let mut existing = OpenOptions::new();
-    existing.read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        existing.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let file = existing
-        .open(path)
-        .with_context(|| format!("failed to open update lock {}", path.display()))?;
-    let opened = file
-        .metadata()
-        .with_context(|| format!("failed to inspect opened update lock {}", path.display()))?;
-    if !opened.is_file() {
-        anyhow::bail!(
-            "opened update lock is not a regular file: {}",
-            path.display()
-        );
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.dev() != opened.dev() || before.ino() != opened.ino() {
-            anyhow::bail!(
-                "update lock changed while it was being opened: {}",
-                path.display()
-            );
-        }
-    }
-    Ok((file, false))
 }
 
 #[cfg(unix)]
@@ -11526,6 +11559,16 @@ mod tests {
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
 
+    #[cfg(windows)]
+    const WINDOWS_INSTALL_AUTHORITY_CHILD_MODE: &str =
+        "KIN_INTERNAL_TEST_INSTALL_AUTHORITY_CHILD_MODE";
+    #[cfg(windows)]
+    const WINDOWS_INSTALL_AUTHORITY_CHILD_ROOT: &str =
+        "KIN_INTERNAL_TEST_INSTALL_AUTHORITY_CHILD_ROOT";
+    #[cfg(windows)]
+    const WINDOWS_INSTALL_AUTHORITY_CHILD_MARKER: &str =
+        "KIN_INTERNAL_TEST_INSTALL_AUTHORITY_CHILD_MARKER";
+
     fn test_subprocess_output(command: Command, label: &str) -> Result<std::process::Output> {
         output_with_timeout(command, label, DEFAULT_TEST_SUBPROCESS_TIMEOUT)
     }
@@ -14944,7 +14987,82 @@ cwd = {:?}
         InstallRootLock::acquire(tmp.path()).expect("lock must be reusable after release");
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn native_install_authority_contends_across_aliases_and_recovers_after_crash() -> Result<()> {
+        if std::env::var_os(WINDOWS_INSTALL_AUTHORITY_CHILD_MODE).is_some() {
+            let root = PathBuf::from(
+                std::env::var_os(WINDOWS_INSTALL_AUTHORITY_CHILD_ROOT)
+                    .context("Windows authority child root is missing")?,
+            );
+            let marker = PathBuf::from(
+                std::env::var_os(WINDOWS_INSTALL_AUTHORITY_CHILD_MARKER)
+                    .context("Windows authority child marker is missing")?,
+            );
+            let _lock = InstallRootLock::acquire_existing_waiting(&root)?;
+            fs::write(marker, b"authority-held\n")?;
+            std::process::abort();
+        }
+
+        let fixture = tempfile::tempdir()?;
+        let parent = fixture.path().join("home");
+        let root = parent.join(".kin");
+        fs::create_dir_all(root.join("bin"))?;
+        fs::create_dir(root.join("lib"))?;
+        let alias = parent.join("alias-parent").join("..").join(".kin");
+        fs::create_dir(parent.join("alias-parent"))?;
+        let case_alias = parent.join(".KIN");
+
+        let first = InstallRootLock::acquire_existing(&root)?;
+        let alias_error = InstallRootLock::acquire_existing(&alias)
+            .err()
+            .context("an alias spelling must contend on the same authority")?;
+        anyhow::ensure!(
+            format!("{alias_error:#}").contains("already active"),
+            "alias contention produced an unexpected error: {alias_error:#}"
+        );
+        let case_error = InstallRootLock::acquire_existing(&case_alias)
+            .err()
+            .context("a case-equivalent spelling must contend on the same authority")?;
+        anyhow::ensure!(
+            format!("{case_error:#}").contains("already active"),
+            "case-equivalent contention produced an unexpected error: {case_error:#}"
+        );
+        drop(first);
+
+        let crash_marker = fixture.path().join("crash-authority-held");
+        let test_name = "commands::update::tests::native_install_authority_contends_across_aliases_and_recovers_after_crash";
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([test_name, "--exact", "--nocapture"])
+            .env(WINDOWS_INSTALL_AUTHORITY_CHILD_MODE, "crash")
+            .env(WINDOWS_INSTALL_AUTHORITY_CHILD_ROOT, &root)
+            .env(WINDOWS_INSTALL_AUTHORITY_CHILD_MARKER, &crash_marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crash_marker.exists() && child.try_wait()?.is_none() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "crash child did not publish held-authority evidence"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        anyhow::ensure!(
+            crash_marker.is_file(),
+            "crash child exited before acquiring install authority"
+        );
+        let status = child.wait()?;
+        anyhow::ensure!(!status.success(), "authority crash child did not crash");
+
+        let recovered = InstallRootLock::acquire_existing(&case_alias)
+            .context("kernel did not release Windows install authority after holder crash")?;
+        drop(recovered);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn managed_daemon_spawn_lease_blocks_uninstall_authority_until_readiness() {
         use std::sync::mpsc;
