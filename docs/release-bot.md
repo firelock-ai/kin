@@ -110,20 +110,20 @@ The single job refuses — before any tag is created — unless **all** hold:
    root `Cargo.toml` **at that SHA** must equal the tag minus its `v`. This is
    the same version `release.yml` later asserts against the built packages.
 5. **Required checks are green on that SHA.** Read from
-   `repos/<owner>/<repo>/commits/<sha>/check-runs`. Two independent guards run.
-   First, every context in the **presence-required release-critical set**
+   `repos/<owner>/<repo>/commits/<sha>/check-runs`. A required-context guard and
+   an advisory-evidence audit run. Every context in the
+   **presence-required release-critical set**
    (`REQUIRED_CHECKS`) must be present and green — a SHA missing any of these is
    refused even if nothing failed (a SHA that never ran CI is refused, not passed
    vacuously). Required contexts are bound to the GitHub Actions App identity,
    so another check-writing App cannot satisfy one by copying its name. Every
    required non-DCO context must conclude `success`; `DCO Sign-off` alone may
    be `skipped` on merged `main` because PR-time DCO already gated the merge.
-   Second, **no** check on the SHA may be failing or still in progress. The
-   workflow's own GitHub Actions `Mint release tag` check-run is self-excluded
-   from this second guard — a refused dispatch is recorded as a failed
-   `Mint release tag` check-run on the target SHA, and a gate must not read its
-   own refusals as evidence. `skipped`/`neutral` remain non-failing only for
-   checks outside the presence-required set.
+   This reviewed set is the complete release veto authority. A red or unfinished
+   check outside it is announced in the workflow annotation and step summary,
+   but it neither refuses nor delays the mint. If an advisory check becomes
+   release-critical, add it to this reviewed set so that change is explicit and
+   reviewable rather than granting every check writer an implicit veto.
    The presence-required set is:
    - `Check & Test (ubuntu-latest)`
    - `Check & Test (macos-latest)`
@@ -132,11 +132,11 @@ The single job refuses — before any tag is created — unless **all** hold:
    - `gitleaks (full history)`
    - `Windows installer + vector-free release build`
 
-   This is the `main` branch-protection required contexts **plus** the Windows
-   installer leg, which is release-critical and never optional. Because the
-   second guard already refuses any present check that is failing, this list need
-   not mirror every CI context — extend it only to force *presence* of a
-   release-critical check (add branch-protection additions here too).
+   This reviewed list is the authority for release admission. The active `main`
+   ruleset should carry the same contexts, but the mint does not read mutable
+   ruleset configuration at runtime; keep the two declarations aligned through
+   reviewed changes. The list need not mirror every CI context. It must name
+   every context whose presence and green verdict are required to release.
 6. **The prior release lane is settled.** No Release run may be queued or
    active, and the prior stable must have either a successful exact tag/SHA
    Release run or its attested terminal completion marker. This prevents GitHub
@@ -151,6 +151,14 @@ Only then does it mint the App token, create `refs/tags/<tag>` at the SHA, and
 **post-verify** that the new ref points at the SHA. A run summary records the
 tag, SHA, and actor.
 
+An automatic mint may correctly decline while a prior release is still active
+or unresolved. Such a decline writes a warning annotation, a titled summary,
+and a named reason. The first three consecutive real declines remain green; the
+fourth and every later consecutive decline fail visibly as a blocked lane.
+`workflow_run` invocations whose entire mint job is skipped are controller noise,
+not mint outcomes, and do not reset or increment that count. A completed mint
+job that did not take the decline path resets it.
+
 ## Automatic recovery
 
 The release controller immediately and periodically reconciles failed,
@@ -162,6 +170,15 @@ active release before requesting `rerun-failed-jobs`. The initial attempt plus
 two retries is the hard cap. Cancellation is treated as an operator stop and is
 never retried. If all three attempts fail, the controller opens one
 `Release blocked after automatic retries` issue and stops.
+
+The issue compares the complete failing job/step set across attempts. A repeated
+set is reported as a **repeated failure signature**, not as proof of a
+deterministic root cause: external registries, notarization services, and runner
+infrastructure can repeatedly fail at the same step. Logs and source diagnosis
+decide whether to preserve the tag for a same-release rerun or land a source fix
+and recut. Unreadable attempts are reported as indeterminate. A Release API 404
+is reported as absence; any other API failure is reported as unknown state and
+never rewritten as proof that no Release exists.
 
 There is one exception, and only one: a tag the reviewed record has already
 retired is reconciled instead of alerted. Before retrying or alerting, the
@@ -253,9 +270,10 @@ gh run list --workflow=release-tag.yml -L 1
 gh run watch <run-id>
 ```
 
-On success the tag exists and `release.yml` has started. On any refusal the job
-fails at the offending step with a `::error::` line naming exactly what was
-unmet; nothing is created.
+On mint success the tag exists and `release.yml` has started. A break-glass
+refusal or hard policy failure fails at the offending step with an `::error::`
+line and creates nothing. Correct automatic declines follow the warning and
+four-decline escalation behavior above; they are not successful mints.
 
 ## One-time founder setup
 
