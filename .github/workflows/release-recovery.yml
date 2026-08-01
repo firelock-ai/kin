@@ -161,13 +161,12 @@ jobs:
       # one immutable main snapshot instead of from whatever main becomes while
       # the job runs. Nothing from the failed tag's own head is trusted.
       #
-      # Reading the record is tolerated rather than propagated, on the same
-      # ground base-image-pins.yml states: the alarm must not become the thing
-      # that reds a main sha. Without this a network hiccup fetching the record
-      # would fail the job and publish exactly the check-run that refuses a
-      # release, which is the hazard this step exists to remove. A failed
-      # checkout instead leaves no HEAD for the next step to verify, so it reads
-      # as "not abandoned" and recovery behaves as it did before the record
+      # Reading the record is tolerated rather than propagated. A network hiccup
+      # must not replace the real retry-or-alert decision with a controller
+      # checkout failure. Recovery is not in the mint's reviewed veto set, but a
+      # failed checkout would still hide the actionable release state behind an
+      # advisory red. Leaving no verified HEAD instead reads as "not abandoned",
+      # so recovery remains responsible exactly as it was before the record
       # existed.
       - name: Checkout the abandonment record from the default-branch commit
         if: steps.resolve.outputs.needed == 'true'
@@ -196,11 +195,12 @@ jobs:
           SHA: ${{ steps.resolve.outputs.sha }}
         run: |
           set -euo pipefail
-          # Nothing in this step may end in a non-zero status of its own. The
-          # check-run it would publish is the one the mint gate refuses a
-          # release commit for, so every status is captured rather than left to
-          # the step's implicit errexit, and every unhappy path degrades to "not
-          # abandoned", which leaves the alert armed to fail for the real reason.
+          # Nothing in this step may end in a non-zero status of its own. This
+          # controller is outside the mint's reviewed veto set, but failing here
+          # would still replace the actionable retry-or-alert verdict with an
+          # ingestion error. Every status is therefore captured, and every
+          # unhappy path degrades to "not abandoned", leaving recovery armed to
+          # report the real release failure.
           head=""
           status=0
           head="$(git rev-parse HEAD)" || status=$?

@@ -118,12 +118,11 @@ The single job refuses — before any tag is created — unless **all** hold:
    so another check-writing App cannot satisfy one by copying its name. Every
    required non-DCO context must conclude `success`; `DCO Sign-off` alone may
    be `skipped` on merged `main` because PR-time DCO already gated the merge.
-   Second, **no** check on the SHA may be failing or still in progress. The
-   workflow's own GitHub Actions `Mint release tag` check-run is self-excluded
-   from this second guard — a refused dispatch is recorded as a failed
-   `Mint release tag` check-run on the target SHA, and a gate must not read its
-   own refusals as evidence. `skipped`/`neutral` remain non-failing only for
-   checks outside the presence-required set.
+   This reviewed set is the complete release veto authority. A red or unfinished
+   check outside it is announced in the workflow annotation and step summary,
+   but it neither refuses nor delays the mint. If an advisory check becomes
+   release-critical, add it to this reviewed set so that change is explicit and
+   reviewable rather than granting every check writer an implicit veto.
    The presence-required set is:
    - `Check & Test (ubuntu-latest)`
    - `Check & Test (macos-latest)`
@@ -133,10 +132,9 @@ The single job refuses — before any tag is created — unless **all** hold:
    - `Windows installer + vector-free release build`
 
    This is the `main` branch-protection required contexts **plus** the Windows
-   installer leg, which is release-critical and never optional. Because the
-   second guard already refuses any present check that is failing, this list need
-   not mirror every CI context — extend it only to force *presence* of a
-   release-critical check (add branch-protection additions here too).
+   installer leg, which is release-critical and never optional. It need not
+   mirror every CI context; it must name every context whose presence and green
+   verdict are required to release (add branch-protection additions here too).
 6. **The prior release lane is settled.** No Release run may be queued or
    active, and the prior stable must have either a successful exact tag/SHA
    Release run or its attested terminal completion marker. This prevents GitHub

@@ -3283,6 +3283,25 @@ def assert_recovery_record_authority(release_recovery: str) -> None:
         )
 
 
+def assert_recovery_abandonment_stand_down(release_recovery: str) -> None:
+    """Pin both retry and alert to the active reviewed-abandonment condition."""
+
+    condition = "steps.record.outputs.abandoned != 'true'"
+    for marker, duty in (
+        ("name: Re-run failed jobs", "bounded retry"),
+        (
+            "name: Alert after automatic retries are exhausted",
+            "exhausted-retry alert",
+        ),
+    ):
+        active = "\n".join(job_step_active_lines(release_recovery, "reconcile", marker))
+        if condition not in active:
+            raise AssertionError(
+                f"release recovery's {duty} must actively stand down for a tag "
+                "the tracked abandonment record already retired"
+            )
+
+
 def assert_abandoned_tag_admission(
     release_tag: str,
     release_train: str,
@@ -4322,27 +4341,21 @@ def main() -> None:
     ):
         require(release_recovery, policy, "bounded automatic release recovery")
 
-    # Recovery's failing check-run lands on the default branch head, and the
-    # mint gate refuses a release commit carrying any check-run outside
-    # success/skipped/neutral. An hourly tick that alerts on a tag the reviewed
-    # record has already retired therefore kills the very release that
-    # supersedes it. Both consumers of the record decision are pinned here
-    # rather than trusting one substring: the retry must not spend runners on an
-    # abandoned tag, and the alert must not stamp failure on one.
-    for step, duty in (
-        ("      - name: Re-run failed jobs\n", "bounded retry"),
-        (
-            "      - name: Alert after automatic retries are exhausted\n",
-            "exhausted-retry alert",
-        ),
-    ):
-        start = release_recovery.index(step)
-        end = release_recovery.index("\n        env:", start)
-        if "steps.record.outputs.abandoned != 'true'" not in release_recovery[start:end]:
-            raise AssertionError(
-                f"release recovery's {duty} must stand down for a tag the "
-                "tracked abandonment record already retired"
+    # Recovery is outside the mint's reviewed veto set, but it still must not
+    # spend runners or raise an advisory alarm for a release the reviewed record
+    # retired. Parse active step fields so a comment repeating the condition
+    # cannot satisfy the guard while the YAML `if` omits it.
+    assert_recovery_abandonment_stand_down(release_recovery)
+    expect_assertion(
+        "recovery repeats its stand-down condition only in comments",
+        "must actively stand down",
+        lambda: assert_recovery_abandonment_stand_down(
+            release_recovery.replace(
+                "          steps.record.outputs.abandoned != 'true'",
+                "          # steps.record.outputs.abandoned != 'true'",
             )
+        ),
+    )
     for forbidden in (
         "workflow_dispatch:",
         "contents: write",

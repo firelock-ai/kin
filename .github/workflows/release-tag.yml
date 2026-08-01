@@ -719,11 +719,12 @@ jobs:
         # presence-required release-critical set — a sha missing any of these is
         # refused even if nothing failed. Every required check must conclude
         # success except DCO, which is allowed to report skipped because that
-        # pull-request-only job is inapplicable on a merged main HEAD. Separately,
-        # no check anywhere may be failing or still in progress; the second loop
-        # owns that present-check strictness, so this list need not mirror every
-        # CI context. It is the main branch-protection required contexts plus the
-        # Windows installer leg, which is release-critical and never optional.
+        # pull-request-only job is inapplicable on a merged main HEAD. This
+        # reviewed set is the complete veto authority. Red or unfinished checks
+        # outside it are announced, but they neither refuse nor delay the mint;
+        # add any context that must block a release to this reviewed list. It is
+        # the main branch-protection required contexts plus the Windows installer
+        # leg, which is release-critical and never optional.
         #
         # Evidence is resolved through workflow provenance, not through the
         # context name. A merge-queue landing publishes the same context names
