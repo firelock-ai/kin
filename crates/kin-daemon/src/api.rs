@@ -2461,17 +2461,79 @@ async fn graph_mutations(
 /// Sample embedding coverage from the daemon's own query graph, the one view in
 /// this process that has a validated vector index installed.
 ///
-/// The sample is taken under the embedding-work lock so a pass in flight cannot
-/// span the published counters, matching how `kin_graph_status` observes the
-/// same source. A contended lock reports that state rather than waiting: status
-/// is a read and must not block on an embedding pass.
-fn live_embedding_coverage(state: &DaemonState) -> kin_cli::commands::status::EmbeddingCoverage {
+/// This observes the same source as `kin_graph_status` through the same
+/// mechanism: a stable graph-authority epoch is taken before the sample and
+/// revalidated after it, and the counters themselves are read under the
+/// embedding-work lock. Neither a normal embedding pass nor a graph mutation
+/// batch can therefore span the published triple, which would otherwise pair a
+/// `total` counted mid-batch with an `indexed` measured against an index that
+/// has not seen those keys. The session-scope revalidation the sibling also
+/// performs has no analogue here: status always samples HEAD, whose ownership
+/// is stable for the daemon's lifetime.
+///
+/// Every way of not observing is named rather than collapsed. A held lock is
+/// transient, a poisoned one is permanent and says the embedding loop is dead,
+/// and a mutation outlasting every attempt is a third state.
+async fn live_embedding_coverage(
+    state: &Arc<DaemonState>,
+) -> kin_cli::commands::status::EmbeddingCoverage {
     use kin_cli::commands::status::{EmbeddingCoverage, EmbeddingCoverageUnobserved};
 
-    let Ok(_embedding_guard) = state.embedding_work.try_lock() else {
-        return EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::SamplingContended);
-    };
-    kin_cli::commands::status::observe_embedding_coverage(&state.graph)
+    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+        let coverage = match sample_embedding_coverage(Arc::clone(state)).await {
+            Ok(coverage) => coverage,
+            Err(reason) => return EmbeddingCoverage::unobserved(reason),
+        };
+        if !state.graph_authority_epoch_is_current(authority_epoch) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        return coverage;
+    }
+
+    EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::GraphMutationInFlight)
+}
+
+/// Take one coverage reading on a blocking thread.
+///
+/// `embedding_status` allocates a set of every retrievable key and probes the
+/// vector index once per key, and the embed loop takes this same std mutex from
+/// its own `spawn_blocking`. Sampling inline on a tokio worker would hold the
+/// lock across that whole walk on a thread the runtime cannot reschedule, so
+/// each `kin status` would stall the next embedding batch for the duration of
+/// the walk.
+async fn sample_embedding_coverage(
+    state: Arc<DaemonState>,
+) -> std::result::Result<
+    kin_cli::commands::status::EmbeddingCoverage,
+    kin_cli::commands::status::EmbeddingCoverageUnobserved,
+> {
+    use kin_cli::commands::status::EmbeddingCoverageUnobserved;
+
+    let sampled = tokio::task::spawn_blocking(move || match state.embedding_work.try_lock() {
+        Ok(_embedding_guard) => Ok(kin_cli::commands::status::observe_embedding_coverage(
+            &state.graph,
+        )),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            Err(EmbeddingCoverageUnobserved::SamplingContended)
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            Err(EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned)
+        }
+    })
+    .await;
+
+    match sampled {
+        Ok(coverage) => coverage,
+        Err(error) => {
+            tracing::warn!(%error, "embedding coverage sample did not complete");
+            Err(EmbeddingCoverageUnobserved::SamplingFailed)
+        }
+    }
 }
 
 /// POST /commands/status — render one coherent repository-v6 authority lease.
@@ -2492,7 +2554,7 @@ async fn command_status(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let embedding_coverage = live_embedding_coverage(&state);
+    let embedding_coverage = live_embedding_coverage(&state).await;
     let report = kin_cli::commands::status::inspect(
         &state.layout,
         &repository_authority,
@@ -17995,6 +18057,103 @@ mod tests {
             )),
             "text: {}",
             result.text
+        );
+    }
+
+    /// A held embedding lock is transient and a poisoned one is permanent, so
+    /// the payload has to name them apart.
+    ///
+    /// The embed loop takes this same mutex, so a batch that panics poisons it
+    /// for the daemon's lifetime. Publishing that as contention would tell an
+    /// operator to retry a pass that can never run again, on every status read
+    /// from then on.
+    #[tokio::test]
+    async fn live_coverage_names_a_poisoned_embedding_lock_apart_from_a_contended_one() {
+        let state = test_state();
+
+        // Contention first, while the lock is only held. The guard lives on
+        // another thread so this test never holds a lock across an await.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_state = Arc::clone(&state);
+        let holder = std::thread::spawn(move || {
+            let _embedding_guard = holder_state.embedding_work.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let contended = live_embedding_coverage(&state).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            contended,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::SamplingContended
+            ),
+            "a held embedding lock is the transient state and must say so"
+        );
+
+        // Then poison it exactly as a panicking embedding batch would.
+        let poisoner_state = Arc::clone(&state);
+        let panicked = std::thread::spawn(move || {
+            let _embedding_guard = poisoner_state.embedding_work.lock().unwrap();
+            panic!("embedding batch panicked while holding the embedding work lock");
+        })
+        .join();
+        assert!(panicked.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            matches!(
+                state.embedding_work.try_lock(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ),
+            "the fixture must leave the embedding work lock poisoned"
+        );
+
+        let poisoned = live_embedding_coverage(&state).await;
+        assert_eq!(
+            poisoned,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned
+            ),
+            "a poisoned embedding lock must be published as its own permanent state"
+        );
+        assert_ne!(
+            poisoned, contended,
+            "a dead embedding loop must not be published as a pass in flight"
+        );
+    }
+
+    /// A graph mutation batch must not span the published triple.
+    ///
+    /// `total` is counted from graph truth and `indexed` is measured against the
+    /// index, so a sample taken mid-batch can pair keys the index has not seen
+    /// with an index that has not seen them. Both wire invariants still hold for
+    /// that triple, so no consumer would refuse it; the sampler has to.
+    #[tokio::test]
+    async fn live_coverage_refuses_counters_a_graph_mutation_could_span() {
+        let state = test_state();
+        let mutation_guard = state.begin_graph_authority_mutation();
+
+        let during = live_embedding_coverage(&state).await;
+        assert_eq!(
+            during,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::GraphMutationInFlight
+            ),
+            "coverage sampled across a graph mutation must be refused, not published"
+        );
+
+        // The refusal has to be caused by the mutation rather than by a path
+        // that can no longer observe anything, so the same state answers
+        // differently once the batch completes.
+        drop(mutation_guard);
+        let after = live_embedding_coverage(&state).await;
+        assert_eq!(
+            after,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+            ),
+            "with no mutation in flight the sampler must report the graph's own state"
         );
     }
 

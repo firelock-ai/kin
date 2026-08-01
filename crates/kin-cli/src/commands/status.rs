@@ -232,8 +232,24 @@ pub enum EmbeddingCoverageUnobserved {
     /// This build ships no vector backend, so no index can be attached at all.
     VectorSupportDisabled,
     /// An embedding pass held the work lock, so no counter set could be sampled
-    /// at one instant.
+    /// at one instant. Transient: the next read observes coverage once the pass
+    /// releases.
     SamplingContended,
+    /// The embedding work lock is poisoned, so an embedding pass panicked while
+    /// holding it and no later pass can take it. This is permanent for the
+    /// daemon's lifetime and means the embedding loop is dead, which is why it
+    /// is not reported as contention: an operator told to retry a contended
+    /// sample would wait for a pass that will never run.
+    EmbeddingWorkLockPoisoned,
+    /// A graph mutation batch was in flight across every sampling attempt, so
+    /// no counter set could be paired with a stable graph authority. Transient,
+    /// and distinct from a held embedding lock because the work that has to
+    /// finish first is a different one.
+    GraphMutationInFlight,
+    /// The sampling task did not complete, so nothing was measured. Distinct
+    /// from every state above, all of which are answers about a graph that was
+    /// reachable.
+    SamplingFailed,
 }
 
 /// Embedding coverage of the live view that answers semantic queries.
@@ -625,6 +641,9 @@ impl StatusReport {
                 self.semantic_enrichment.workspace_generation, self.workspace.generation
             ));
         }
+        self.embedding_coverage
+            .validate()
+            .map_err(|error| format!("embedding_coverage is invalid: {error}"))?;
         Ok(())
     }
 }
@@ -721,7 +740,7 @@ pub fn inspect(
         .as_ref()
         .map(AuthorityPayloadReceipt::from_payload_stats);
 
-    Ok(StatusReport {
+    let report = StatusReport {
         schema: STATUS_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),
         repo_root: layout.working_dir().to_path_buf(),
@@ -746,7 +765,15 @@ pub fn inspect(
         semantic_enrichment,
         embedding_coverage,
         authority_payload,
-    })
+    };
+    // Validate on the way out, not only on the way in. The reader already
+    // refuses an illegal report; running the same check here means a future
+    // coverage source that publishes an impossible triple fails in the process
+    // that built it rather than in every consumer that parses it.
+    report
+        .validate()
+        .map_err(|error| anyhow::anyhow!("repository-v6 status report is invalid: {error}"))?;
+    Ok(report)
 }
 
 /// Read status from the daemon that already holds this repository's live query
@@ -758,10 +785,14 @@ pub fn inspect(
 /// fallback will publish, so an unreachable daemon is reported as an
 /// unobserved coverage rather than inferred as an unembedded repository.
 ///
-/// A daemon that answers is not automatically believed. A build mismatch or a
-/// status schema this binary cannot parse both surface here as an unavailable
-/// daemon, so version skew degrades to a named absence instead of failing the
-/// command.
+/// A daemon that answers is not automatically believed. A status response this
+/// binary cannot parse, which includes one carrying a status schema it does not
+/// know, surfaces here as an unavailable daemon, so schema skew degrades to a
+/// named absence instead of failing the command. A build mismatch alone does
+/// not reach that gate: `check_response_build_match` refuses a mismatched
+/// daemon build only under `KIN_STRICT_BUILD_MATCH` and otherwise warns once
+/// and hands back the response. What protects this read from a skewed daemon is
+/// the schema, not the build check.
 async fn live_status_from_running_daemon(
     layout: &kin_core::KinLayout,
 ) -> std::result::Result<StatusReport, EmbeddingCoverageUnobserved> {
@@ -938,6 +969,16 @@ fn render_embedding_coverage(coverage: &EmbeddingCoverage) -> String {
                     "this build ships no vector backend"
                 }
                 EmbeddingCoverageUnobserved::SamplingContended => "an embedding pass was in flight",
+                EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned => {
+                    "the embedding work lock is poisoned; this daemon's embedding loop is dead \
+                     and will not resume without a restart"
+                }
+                EmbeddingCoverageUnobserved::GraphMutationInFlight => {
+                    "a graph mutation was in flight across every sampling attempt"
+                }
+                EmbeddingCoverageUnobserved::SamplingFailed => {
+                    "the coverage sample did not complete"
+                }
             };
             format!("not observed ({explanation})")
         }
@@ -1354,6 +1395,55 @@ mod tests {
                 .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
             "{}",
             render_text(&observed, None)
+        );
+    }
+
+    /// A permanent condition must not read as the transient one. Once the
+    /// embedding work lock is poisoned no later pass can take it, so the text
+    /// has to stop telling the reader an embedding pass is in flight.
+    #[test]
+    fn a_poisoned_embedding_lock_renders_apart_from_a_pass_in_flight() {
+        let contended = render_embedding_coverage(&EmbeddingCoverage::unobserved(
+            EmbeddingCoverageUnobserved::SamplingContended,
+        ));
+        let poisoned = render_embedding_coverage(&EmbeddingCoverage::unobserved(
+            EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned,
+        ));
+
+        assert_ne!(
+            contended, poisoned,
+            "a dead embedding loop and a pass in flight must not render alike"
+        );
+        assert!(poisoned.contains("poisoned"), "{poisoned}");
+        assert!(
+            !poisoned.contains("in flight"),
+            "a poisoned lock has no pass in flight to wait for: {poisoned}"
+        );
+    }
+
+    /// The reader already refuses an impossible triple. The writer has to as
+    /// well, or a future coverage source publishes one and only its consumers
+    /// find out.
+    #[test]
+    fn building_a_report_refuses_an_impossible_coverage_triple() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+
+        let error = inspect(
+            &init.layout,
+            &binding,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 9,
+                pending: 0,
+                total: 3,
+            },
+        )
+        .expect_err("a report indexing more objects than it holds must not be built");
+        assert!(
+            error.to_string().contains("embedding_coverage is invalid"),
+            "{error}"
         );
     }
 
