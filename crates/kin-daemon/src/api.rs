@@ -1638,12 +1638,13 @@ const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 /// request.
 ///
 /// Entity/relation mutations participate in the daemon's graph-authority
-/// seqlock. Normal foreground/background embedding passes use
-/// `embedding_work`; kin-db's own queue/vector locks keep reset and startup
-/// requeue transitions structurally valid. Holding the outer lock while reading
-/// all counters, then revalidating the graph epoch and selected HEAD/session
-/// graph, prevents a normal embedding pass or graph mutation from spanning the
-/// published observation without asking kin-mcp to reread a mutable graph.
+/// seqlock. Normal foreground/background embedding passes and vector-index
+/// reset/requeue transitions use `embedding_work`; kin-db's own queue/vector
+/// locks keep startup requeue transitions structurally valid. Holding the outer
+/// lock while reading all counters, then revalidating the graph epoch and
+/// selected HEAD/session graph, prevents an embedding transition or graph
+/// mutation from spanning the published observation without asking kin-mcp to
+/// reread a mutable graph.
 async fn mcp_graph_status_with_stable_authority(
     state: &DaemonState,
     session_id: Option<&SessionId>,
@@ -2458,6 +2459,102 @@ async fn graph_mutations(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
+/// Sample embedding coverage from the daemon's own query graph, the one view in
+/// this process that has a validated vector index installed.
+///
+/// This observes the same source as `kin_graph_status` through the same
+/// mechanism: a stable graph-authority epoch is taken before the sample and
+/// revalidated after it, and the counters themselves are read under the
+/// embedding-work lock. Neither an embedding pass, a vector-index reset/requeue
+/// transition, nor a graph mutation batch can therefore span the published
+/// triple, which would otherwise pair a `total` counted mid-batch with an
+/// `indexed` measured against an index that has not seen those keys. The
+/// session-scope revalidation the sibling also performs has no analogue here:
+/// status always samples HEAD, whose ownership is stable for the daemon's
+/// lifetime.
+///
+/// Every way of not observing is named rather than collapsed. A held lock is
+/// transient, a poisoned one is permanent and says the embedding loop is dead,
+/// and a mutation outlasting every attempt is a third state.
+async fn live_embedding_coverage(
+    state: &Arc<DaemonState>,
+) -> kin_cli::commands::status::EmbeddingCoverage {
+    use kin_cli::commands::status::{EmbeddingCoverage, EmbeddingCoverageUnobserved};
+
+    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+        let coverage = match sample_embedding_coverage(Arc::clone(state)).await {
+            Ok(coverage) => coverage,
+            Err(reason) => return EmbeddingCoverage::unobserved(reason),
+        };
+        if !state.graph_authority_epoch_is_current(authority_epoch) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        return coverage;
+    }
+
+    EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::GraphMutationInFlight)
+}
+
+/// Take one coverage reading on a blocking thread.
+///
+/// `embedding_status` allocates a set of every retrievable key and probes the
+/// vector index once per key, and the embed loop takes this same std mutex from
+/// its own `spawn_blocking`. Sampling there keeps the O(N) walk off a Tokio
+/// worker, and `try_lock` keeps status from waiting behind embedding work that
+/// already owns the boundary. If status wins first, its sample can delay a
+/// later embedding pass until the walk completes; only a blocking-pool thread
+/// waits, and no std mutex guard is held across an async await.
+async fn sample_embedding_coverage(
+    state: Arc<DaemonState>,
+) -> std::result::Result<
+    kin_cli::commands::status::EmbeddingCoverage,
+    kin_cli::commands::status::EmbeddingCoverageUnobserved,
+> {
+    use kin_cli::commands::status::EmbeddingCoverageUnobserved;
+
+    let sampled = tokio::task::spawn_blocking(move || {
+        try_sample_embedding_coverage_with(&state, |graph| {
+            kin_cli::commands::status::observe_embedding_coverage(graph)
+        })
+    })
+    .await;
+
+    match sampled {
+        Ok(coverage) => coverage,
+        Err(error) => {
+            tracing::warn!(%error, "embedding coverage sample did not complete");
+            Err(EmbeddingCoverageUnobserved::SamplingFailed)
+        }
+    }
+}
+
+/// Synchronous sampling core used by the blocking production path and the
+/// forced reset/sampling interleaving regression.
+fn try_sample_embedding_coverage_with(
+    state: &DaemonState,
+    sample: impl FnOnce(&kin_db::InMemoryGraph) -> kin_cli::commands::status::EmbeddingCoverage,
+) -> std::result::Result<
+    kin_cli::commands::status::EmbeddingCoverage,
+    kin_cli::commands::status::EmbeddingCoverageUnobserved,
+> {
+    use kin_cli::commands::status::EmbeddingCoverageUnobserved;
+
+    match state.embedding_work.try_lock() {
+        Ok(_embedding_guard) => Ok(sample(state.graph.as_ref())),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            Err(EmbeddingCoverageUnobserved::SamplingContended)
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            Err(EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned)
+        }
+    }
+}
+
 /// POST /commands/status — render one coherent repository-v6 authority lease.
 async fn command_status(
     State(state): State<Arc<DaemonState>>,
@@ -2476,8 +2573,13 @@ async fn command_status(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let report = kin_cli::commands::status::inspect(&state.layout, &repository_authority)
-        .map_err(internal_error)?;
+    let embedding_coverage = live_embedding_coverage(&state).await;
+    let report = kin_cli::commands::status::inspect(
+        &state.layout,
+        &repository_authority,
+        embedding_coverage,
+    )
+    .map_err(internal_error)?;
     let daemon_build = kin_buildinfo::get();
     let build = kin_cli::commands::status::BuildStatus {
         cli_sha: request
@@ -11129,6 +11231,23 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    fn unattached_vector_coverage_reason() -> kin_cli::commands::status::EmbeddingCoverageUnobserved
+    {
+        if cfg!(feature = "vector") {
+            kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+        } else {
+            kin_cli::commands::status::EmbeddingCoverageUnobserved::VectorSupportDisabled
+        }
+    }
+
+    fn unattached_vector_coverage_text() -> &'static str {
+        if cfg!(feature = "vector") {
+            "Live embedding coverage: not observed (the live graph carries no vector index)"
+        } else {
+            "Live embedding coverage: not observed (this build ships no vector backend)"
+        }
+    }
+
     fn committed_test_state() -> Arc<DaemonState> {
         let initial = test_state();
         let layout = initial.layout.clone();
@@ -17913,6 +18032,24 @@ mod tests {
         assert!(result.report.repository.source_cas_verified);
         assert!(result.text.contains("Kin repository-v6 status"));
         assert!(result.text.contains("Live graph enrichment"));
+        // This daemon's graph carries entities but no vector index. A vector
+        // build has to name that missing attachment; a featureless build has to
+        // name its deliberately absent backend. Neither may report the zero
+        // that `embedding_status` returns, because that would be
+        // indistinguishable from a repository whose embeddings are complete
+        // and empty.
+        assert_eq!(
+            result.report.embedding_coverage,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                unattached_vector_coverage_reason()
+            ),
+            "status must report why live embedding coverage is unobservable"
+        );
+        assert!(
+            result.text.contains(unattached_vector_coverage_text()),
+            "text: {}",
+            result.text
+        );
 
         let graph_response = app
             .clone()
@@ -17975,6 +18112,315 @@ mod tests {
         );
         assert!(!mcp_status.completion_attested);
         assert!(mcp_status.response_envelope.is_none());
+    }
+
+    /// FIR-1785: the endpoint must publish the coverage of the index this
+    /// daemon is actually holding.
+    ///
+    /// The sibling case above proves an unindexed graph is reported as an
+    /// absence, which a handler that always answered "unobserved" would also
+    /// satisfy. This one attaches a real index to the same daemon graph and
+    /// requires the counts to move, so the handler has to be reading the graph
+    /// rather than describing it.
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    async fn command_status_publishes_the_coverage_of_the_daemon_s_indexed_graph() {
+        install_test_registry_override();
+        let dir =
+            std::env::temp_dir().join(format!("kin-daemon-status-coverage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let initialized = kin_core::init(&dir).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        let entity = test_entity("indexed_symbol", "src/indexed.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        // Seed every retrievable key the graph could ask about, then install the
+        // index through kin-db's own compatibility-checked loader.
+        let snapshot = state.graph.to_snapshot();
+        let mut keys = vec![kin_model::RetrievalKey::Entity(entity.id)];
+        keys.extend(
+            snapshot
+                .entity_revisions
+                .values()
+                .flat_map(|revisions| revisions.iter())
+                .map(|revision| kin_model::RetrievalKey::EntityRevision(revision.revision_id)),
+        );
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        for key in &keys {
+            vectors
+                .upsert_retrievable(*key, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("daemon-status-coverage-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(state.graph.compute_root_hash())),
+        };
+        vectors.set_descriptor(descriptor.clone());
+        let sidecar = dir.join("coverage.kvec");
+        vectors.save(&sidecar).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
+
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/commands/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "json": false }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let result: kin_cli::commands::status::CommandStatusResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        let kin_cli::commands::status::EmbeddingCoverage::Observed {
+            source,
+            indexed,
+            pending,
+            total,
+        } = result.report.embedding_coverage
+        else {
+            panic!(
+                "an indexed daemon graph must publish observed coverage, found {:?}",
+                result.report.embedding_coverage
+            );
+        };
+        assert_eq!(
+            source,
+            kin_cli::commands::status::EmbeddingCoverageSource::LiveQueryGraph
+        );
+        assert!(
+            indexed > 0,
+            "the endpoint reported no indexed objects for an indexed graph \
+             (indexed={indexed}, pending={pending}, total={total})"
+        );
+        assert_eq!(indexed, total, "every retrievable key was seeded");
+        // Not `pending == 0`. `pending` is `max(queue_length, total - indexed)`,
+        // and upserting the entity above put it on the graph's embedding queue,
+        // so a fully covered graph still reports the queued work. Coverage and
+        // outstanding work are different facts; only the first is asserted here.
+        assert!(
+            pending >= total - indexed,
+            "pending ({pending}) must account for the uncovered keys"
+        );
+        assert!(
+            result.text.contains(&format!(
+                "Live embedding coverage: {indexed}/{total} indexed"
+            )),
+            "text: {}",
+            result.text
+        );
+    }
+
+    /// An IndexError reset that starts after status proves an index is attached
+    /// must wait until status has read the matching counters.
+    ///
+    /// The contention callback is reached only after the reset's `try_lock`
+    /// loses to the production sampling boundary. That lets the sampler force
+    /// the exact attachment-check/reset-attempt/counter-read ordering without
+    /// sleeps. Before the reset was part of `embedding_work`, the detach could
+    /// land in that gap and produce the plausible but false observed zero.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_reset_cannot_split_status_attachment_from_coverage_counters() {
+        let state = test_state();
+        let entity = test_entity("reset_race_symbol", "src/reset_race.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let snapshot = state.graph.to_snapshot();
+        let mut keys = vec![kin_model::RetrievalKey::Entity(entity.id)];
+        keys.extend(
+            snapshot
+                .entity_revisions
+                .values()
+                .flat_map(|revisions| revisions.iter())
+                .map(|revision| kin_model::RetrievalKey::EntityRevision(revision.revision_id)),
+        );
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        for key in &keys {
+            vectors
+                .upsert_retrievable(*key, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("daemon-status-reset-race-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(state.graph.compute_root_hash())),
+        };
+        vectors.set_descriptor(descriptor.clone());
+        let sidecar = state.layout.root().join("status-reset-race.kvec");
+        vectors.save(&sidecar).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
+
+        let (attachment_checked_tx, attachment_checked_rx) = std::sync::mpsc::sync_channel(0);
+        let (reset_waiting_tx, reset_waiting_rx) = std::sync::mpsc::sync_channel(0);
+        let sample_state = Arc::clone(&state);
+        let sampler = std::thread::spawn(move || {
+            try_sample_embedding_coverage_with(&sample_state, move |graph| {
+                assert!(
+                    graph.vector_index_stats().is_some(),
+                    "the forced interleaving starts after status proves attachment"
+                );
+                attachment_checked_tx.send(()).unwrap();
+                reset_waiting_rx.recv().unwrap();
+
+                // This is the counter half of `observe_embedding_coverage`,
+                // split out only so the channel can pin the reset attempt in
+                // the otherwise invisible gap between its two kin-db calls.
+                let status = graph.embedding_status();
+                kin_cli::commands::status::EmbeddingCoverage::Observed {
+                    source: kin_cli::commands::status::EmbeddingCoverageSource::LiveQueryGraph,
+                    indexed: status.indexed,
+                    pending: status.pending,
+                    total: status.total,
+                }
+            })
+        });
+
+        attachment_checked_rx.recv().unwrap();
+        let reset_state = Arc::clone(&state);
+        let resetter = std::thread::spawn(move || {
+            crate::daemon::reset_vector_index_and_requeue_after_contention_for_test(
+                &reset_state,
+                move || reset_waiting_tx.send(()).unwrap(),
+            )
+        });
+
+        let sampled = sampler.join().unwrap().unwrap();
+        let kin_cli::commands::status::EmbeddingCoverage::Observed { indexed, total, .. } = sampled
+        else {
+            panic!("the attached index must remain observable until sampling completes")
+        };
+        assert!(indexed > 0, "the forced interleaving fabricated a zero");
+        assert_eq!(indexed, total, "every fixture key was indexed");
+
+        resetter.join().unwrap().unwrap();
+        assert_eq!(
+            kin_cli::commands::status::observe_embedding_coverage(&state.graph),
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+            ),
+            "the reset must run immediately after the sample releases the boundary"
+        );
+    }
+
+    /// A held embedding lock is transient and a poisoned one is permanent, so
+    /// the payload has to name them apart.
+    ///
+    /// The embed loop takes this same mutex, so a batch that panics poisons it
+    /// for the daemon's lifetime. Publishing that as contention would tell an
+    /// operator to retry a pass that can never run again, on every status read
+    /// from then on.
+    #[tokio::test]
+    async fn live_coverage_names_a_poisoned_embedding_lock_apart_from_a_contended_one() {
+        let state = test_state();
+
+        // Contention first, while the lock is only held. The guard lives on
+        // another thread so this test never holds a lock across an await.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_state = Arc::clone(&state);
+        let holder = std::thread::spawn(move || {
+            let _embedding_guard = holder_state.embedding_work.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let contended = live_embedding_coverage(&state).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            contended,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::SamplingContended
+            ),
+            "a held embedding lock is the transient state and must say so"
+        );
+
+        // Then poison it exactly as a panicking embedding batch would.
+        let poisoner_state = Arc::clone(&state);
+        let panicked = std::thread::spawn(move || {
+            let _embedding_guard = poisoner_state.embedding_work.lock().unwrap();
+            panic!("embedding batch panicked while holding the embedding work lock");
+        })
+        .join();
+        assert!(panicked.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            matches!(
+                state.embedding_work.try_lock(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ),
+            "the fixture must leave the embedding work lock poisoned"
+        );
+
+        let poisoned = live_embedding_coverage(&state).await;
+        assert_eq!(
+            poisoned,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned
+            ),
+            "a poisoned embedding lock must be published as its own permanent state"
+        );
+        assert_ne!(
+            poisoned, contended,
+            "a dead embedding loop must not be published as a pass in flight"
+        );
+    }
+
+    /// A graph mutation batch must not span the published triple.
+    ///
+    /// `total` is counted from graph truth and `indexed` is measured against the
+    /// index, so a sample taken mid-batch can pair keys the index has not seen
+    /// with an index that has not seen them. Both wire invariants still hold for
+    /// that triple, so no consumer would refuse it; the sampler has to.
+    #[tokio::test]
+    async fn live_coverage_refuses_counters_a_graph_mutation_could_span() {
+        let state = test_state();
+        let mutation_guard = state.begin_graph_authority_mutation();
+
+        let during = live_embedding_coverage(&state).await;
+        assert_eq!(
+            during,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::GraphMutationInFlight
+            ),
+            "coverage sampled across a graph mutation must be refused, not published"
+        );
+
+        // The refusal has to be caused by the mutation rather than by a path
+        // that can no longer observe anything, so the same state answers
+        // differently once the batch completes.
+        drop(mutation_guard);
+        let after = live_embedding_coverage(&state).await;
+        assert_eq!(
+            after,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                unattached_vector_coverage_reason()
+            ),
+            "with no mutation in flight the sampler must report the build's graph state"
+        );
     }
 
     #[tokio::test]

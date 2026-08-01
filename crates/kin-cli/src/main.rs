@@ -2167,7 +2167,7 @@ fn main() -> Result<()> {
             match cli.command {
                 Command::Capabilities { json } => commands::capabilities::run(json),
                 Command::Init { path, json } => commands::init::run(path, json).await,
-                Command::Status { json } => commands::status::run(json),
+                Command::Status { json } => commands::status::run(json).await,
                 Command::Resources { action } => match action {
                     ResourcesAction::Inspect { json, profile } => {
                         commands::resources::run(json, profile).await

@@ -93,7 +93,7 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     );
     let before_report: Value =
         serde_json::from_slice(&before.stdout).expect("status stdout should be JSON");
-    assert_eq!(before_report["schema"], "kin.status.v2");
+    assert_eq!(before_report["schema"], "kin.status.v3");
     assert_eq!(before_report["authority"], "repository-v6");
     assert_eq!(before_report["repository"]["generation"], 1);
     assert_eq!(before_report["repository"]["source_cas_verified"], true);
@@ -125,6 +125,24 @@ fn status_is_one_exact_authority_lease_and_ignores_checkout_and_git_drift() {
     assert_eq!(
         before_report["semantic_enrichment"]["semantic_change_count"],
         1
+    );
+    // No daemon holds this repository, so there is no live graph to sample and
+    // no vector index behind it. Status has to say that rather than publish the
+    // zero an unindexed graph would produce, which is the reading a fully
+    // embedded repository would be indistinguishable from.
+    assert_eq!(
+        before_report["embedding_coverage"]["state"], "unobserved",
+        "coverage cannot be observed with no daemon running: {}",
+        before_report["embedding_coverage"]
+    );
+    assert_eq!(
+        before_report["embedding_coverage"]["reason"],
+        "no_running_daemon"
+    );
+    assert!(
+        before_report["embedding_coverage"].get("indexed").is_none(),
+        "an unobserved coverage must carry no count: {}",
+        before_report["embedding_coverage"]
     );
 
     // Make the checkout and Git metadata maximally misleading. Status must

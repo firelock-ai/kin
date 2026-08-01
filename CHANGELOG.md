@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- The `kin status --json` contract moves from `kin.status.v2` to `kin.status.v3`
+  and gains a required top-level `embedding_coverage` object. The field carries
+  no serde default, and the report refuses unknown fields, so both parse
+  directions break across binaries: a v2 reader rejects a v3 payload on the
+  schema string, and a v2 payload no longer deserializes as a status report at
+  all. Any consumer pinning the schema string or the exact v2 field set must be
+  updated to read `embedding_coverage.state` before any count, because the
+  payload deliberately omits `indexed`, `pending`, and `total` when coverage was
+  not observed.
+
 ## [0.4.5] - 2026-08-01
 
 ### Changed
