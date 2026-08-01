@@ -88,7 +88,7 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 use windows_sys::Win32::Storage::FileSystem::{
-    MoveFileExW, ReplaceFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    MoveFileExW, ReplaceFileW, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
 };
@@ -560,8 +560,8 @@ impl ConfigAuthority {
 fn open_retained_config_directory(path: &Path) -> Result<File> {
     open_config_directory(
         path,
-        FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_LIST_DIRECTORY | FILE_ADD_FILE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
     )
 }
 
