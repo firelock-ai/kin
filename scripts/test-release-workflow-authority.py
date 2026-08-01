@@ -3458,6 +3458,17 @@ def main() -> None:
         "The only exit from that state is a hand-landed version bump",
         "a tag that has since moved refuses loudly",
         "fails the rail closed rather",
+        # No CI job executes a line of release-recovery.yml: it triggers on
+        # schedule and workflow_run only, so this prose is the whole of what an
+        # operator has when a reconcile goes green while a release is visibly
+        # broken. Each clause is pinned because each is separately droppable:
+        # that the stand-down exists, that it is narrow, that recovery is a
+        # consumer of the record at all, and that a record too weak for the rail
+        # is too weak to quiet the alarm.
+        "is reconciled instead of alerted",
+        "still opens the issue and still fails the reconcile",
+        "automatic recovery stands down for it",
+        "cannot quiet the alarm either",
     ):
         require(
             release_bot_doc,
