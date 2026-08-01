@@ -2791,6 +2791,257 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
                 )
 
 
+def recovery_escalation_source(release_recovery: str) -> str:
+    """Extract the escalation step exactly as the recovery controller runs it."""
+
+    anchor = "      - name: Alert after automatic retries are exhausted\n"
+    if anchor not in release_recovery:
+        raise AssertionError(
+            "release-recovery no longer carries the escalation step"
+        )
+    start = release_recovery.index(anchor)
+    remainder = release_recovery[start + 1 :]
+    end = (
+        release_recovery.index("\n      - name:", start + 1)
+        if "\n      - name:" in remainder
+        else len(release_recovery)
+    )
+    step = release_recovery[start:end]
+    marker = "        run: |\n"
+    return textwrap.dedent(step[step.index(marker) + len(marker) :])
+
+
+def execute_recovery_escalation(
+    source: str,
+    attempt_signatures: list[tuple[str, str] | None],
+    *,
+    release: dict[str, object] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the escalation against scripted attempt jobs and release state.
+
+    The `gh` stub answers `-q` by running the real `jq`, so the workflow's own
+    query decides the signature. A stub that returned canned answers would
+    exercise the shell and leave the jq that does the classifying unproven.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "escalate.sh"
+        script.write_text(source, encoding="utf-8")
+        responses = root / "responses"
+        responses.mkdir()
+        run_id = "4242"
+        for index, signature in enumerate(attempt_signatures, start=1):
+            if signature is None:
+                continue
+            job, step_name = signature
+            payload = {
+                "jobs": [
+                    {
+                        "name": "Preflight",
+                        "conclusion": "success",
+                        "steps": [{"name": "Checkout", "conclusion": "success"}],
+                    },
+                    {
+                        "name": job,
+                        "conclusion": "failure",
+                        "steps": [
+                            {"name": "Checkout", "conclusion": "success"},
+                            {"name": step_name, "conclusion": "failure"},
+                        ],
+                    },
+                ]
+            }
+            target = (
+                f"repos_firelock-ai_kin_actions_runs_{run_id}"
+                f"_attempts_{index}_jobs"
+            )
+            (responses / target).write_text(json.dumps(payload), encoding="utf-8")
+        if release is not None:
+            (responses / "repos_firelock-ai_kin_releases_tags_v9.9.9").write_text(
+                json.dumps(release),
+                encoding="utf-8",
+            )
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "gh").write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -uo pipefail
+                case "$1" in
+                  api)
+                    shift
+                    path=""; query=""
+                    while [ $# -gt 0 ]; do
+                      case "$1" in
+                        -q|--jq) shift; query="$1" ;;
+                        -*) ;;
+                        *) [ -n "$path" ] || path="$1" ;;
+                      esac
+                      shift
+                    done
+                    file="$FIXTURE/responses/$(printf '%s' "$path" | tr '/' '_')"
+                    if [ ! -f "$file" ]; then
+                      echo "gh: Not Found (HTTP 404)" >&2
+                      exit 1
+                    fi
+                    if [ -n "$query" ]; then
+                      jq -r "$query" < "$file"
+                    else
+                      cat "$file"
+                    fi
+                    ;;
+                  issue)
+                    shift
+                    case "$1" in
+                      list) exit 0 ;;
+                      create)
+                        shift
+                        while [ $# -gt 0 ]; do
+                          case "$1" in
+                            --title) shift; printf '%s' "$1" > "$FIXTURE/issue-title" ;;
+                            --body-file) shift; cp "$1" "$FIXTURE/issue-body" ;;
+                          esac
+                          shift
+                        done
+                        ;;
+                    esac
+                    ;;
+                esac
+                """
+            ),
+            encoding="utf-8",
+        )
+        (binaries / "gh").chmod(0o755)
+        environment = dict(os.environ)
+        environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
+        environment.update(
+            {
+                "FIXTURE": str(root),
+                "GH_TOKEN": "fixture",
+                "REPO": "firelock-ai/kin",
+                "TAG": "v9.9.9",
+                "SHA": RELEASE_GATE_FIXTURE_SHA,
+                "RUN_ID": run_id,
+                "RUN_URL": f"https://example.invalid/runs/{run_id}",
+                "ATTEMPTS": str(len(attempt_signatures)),
+            }
+        )
+        completed = subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=60,
+            check=False,
+        )
+        body_path = root / "issue-body"
+        body = body_path.read_text(encoding="utf-8") if body_path.exists() else ""
+        return completed, body
+
+
+def assert_recovery_escalation_classifies(release_recovery: str) -> None:
+    """Recovery must classify before advising, and never advise a dead rerun.
+
+    Advising a rerun for a deterministic failure is the wrong answer in the
+    expensive direction: a lockfile pinning a dependency that cannot build for
+    a release target fails identically every time, and the operator waits for a
+    retry that can never succeed.
+    """
+
+    source = recovery_escalation_source(release_recovery)
+    compile_failure = ("build-artifacts (x86_64-unknown-linux-musl)", "Build release binaries")
+
+    deterministic, body = execute_recovery_escalation(
+        source,
+        [compile_failure, compile_failure, compile_failure],
+    )
+    if deterministic.returncode == 0:
+        raise AssertionError(
+            "recovery escalation stopped failing the run: "
+            f"{deterministic.stdout}{deterministic.stderr}"
+        )
+    for needle in (
+        "Classification: **deterministic**",
+        "a rerun cannot reach a different outcome",
+        "version recut against fixed dependencies",
+        "- attempt 1: build-artifacts (x86_64-unknown-linux-musl) / Build release binaries",
+        "after 3 attempt(s)",
+        "No GitHub Release object exists for `v9.9.9`.",
+    ):
+        if needle not in body:
+            raise AssertionError(
+                f"identical repeated failures were not classified: {needle!r}: {body}"
+            )
+    if "Diagnose and rerun the same release" in body:
+        raise AssertionError(
+            f"a deterministic failure was still advised to rerun: {body}"
+        )
+
+    _, transient_body = execute_recovery_escalation(
+        source,
+        [
+            ("build-artifacts (x86_64-apple-darwin)", "Notarize"),
+            ("publish", "Push image"),
+            compile_failure,
+        ],
+    )
+    for needle in (
+        "Classification: **not proven deterministic**",
+        "Diagnose and rerun the same release",
+    ):
+        if needle not in transient_body:
+            raise AssertionError(
+                f"differing failures lost the rerun advice: {needle!r}: "
+                f"{transient_body}"
+            )
+
+    # An attempt whose jobs cannot be read is not evidence that the failure
+    # repeated. Claiming deterministic from an unreadable attempt would retire
+    # a recoverable release on a transient API error.
+    _, unreadable_body = execute_recovery_escalation(
+        source,
+        [compile_failure, None, compile_failure],
+    )
+    for needle in (
+        "Classification: **not proven deterministic**",
+        "- attempt 2: unrecorded",
+    ):
+        if needle not in unreadable_body:
+            raise AssertionError(
+                "an unreadable attempt was folded into a deterministic verdict: "
+                f"{needle!r}: {unreadable_body}"
+            )
+
+    # Every attempt unreadable is the case that isolates the unknown count.
+    # The signatures all match each other, so nothing but that count stands
+    # between a total read failure and a verdict of "deterministic, recut it".
+    _, blind_body = execute_recovery_escalation(source, [None, None, None])
+    if "Classification: **not proven deterministic**" not in blind_body:
+        raise AssertionError(
+            "a run whose attempts could not be read at all was classified "
+            f"deterministic: {blind_body}"
+        )
+
+    # A mint that reported failure on a release it had already created would
+    # otherwise send this controller to repair a healthy release.
+    _, existing_release_body = execute_recovery_escalation(
+        source,
+        [compile_failure, compile_failure, compile_failure],
+        release={"draft": False, "assets": [{"name": "kin-x86_64.tar.gz"}]},
+    )
+    if (
+        "already exists with 1 asset(s)" not in existing_release_body
+        or "Confirm it is genuinely incomplete before repairing it."
+        not in existing_release_body
+    ):
+        raise AssertionError(
+            "recovery advised repair without saying the release already exists: "
+            f"{existing_release_body}"
+        )
+
+
 def assert_soft_decline_is_legible(release_tag: str) -> None:
     """A decline exits the job green, so it has to be loud, named, and counted.
 
@@ -6507,6 +6758,9 @@ def main() -> None:
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
     assert_soft_decline_is_legible(release_tag)
+    assert_recovery_escalation_classifies(
+        RELEASE_RECOVERY.read_text(encoding="utf-8")
+    )
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)
