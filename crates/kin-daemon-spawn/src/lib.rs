@@ -2949,7 +2949,9 @@ pub async fn register_started_daemon(kin_root: &Path, daemon_url: &str) -> Resul
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    // These are intentionally cross-platform. The permanent native-Windows
+    // authority leg selects this name prefix so Windows proves the same
+    // shared/exclusive lease and retired-root contract as Unix.
     #[test]
     fn managed_spawn_fence_blocks_exclusive_uninstall_authority_until_release() {
         use std::sync::mpsc;
@@ -2989,7 +2991,6 @@ mod tests {
         drop(waiter.join().unwrap());
     }
 
-    #[cfg(unix)]
     #[test]
     fn managed_spawn_fence_rejects_binary_resolved_inside_retired_root() {
         let tmp = tempfile::tempdir().unwrap();
