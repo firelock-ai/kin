@@ -1638,12 +1638,13 @@ const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 /// request.
 ///
 /// Entity/relation mutations participate in the daemon's graph-authority
-/// seqlock. Normal foreground/background embedding passes use
-/// `embedding_work`; kin-db's own queue/vector locks keep reset and startup
-/// requeue transitions structurally valid. Holding the outer lock while reading
-/// all counters, then revalidating the graph epoch and selected HEAD/session
-/// graph, prevents a normal embedding pass or graph mutation from spanning the
-/// published observation without asking kin-mcp to reread a mutable graph.
+/// seqlock. Normal foreground/background embedding passes and vector-index
+/// reset/requeue transitions use `embedding_work`; kin-db's own queue/vector
+/// locks keep startup requeue transitions structurally valid. Holding the outer
+/// lock while reading all counters, then revalidating the graph epoch and
+/// selected HEAD/session graph, prevents an embedding transition or graph
+/// mutation from spanning the published observation without asking kin-mcp to
+/// reread a mutable graph.
 async fn mcp_graph_status_with_stable_authority(
     state: &DaemonState,
     session_id: Option<&SessionId>,
@@ -2464,12 +2465,13 @@ async fn graph_mutations(
 /// This observes the same source as `kin_graph_status` through the same
 /// mechanism: a stable graph-authority epoch is taken before the sample and
 /// revalidated after it, and the counters themselves are read under the
-/// embedding-work lock. Neither a normal embedding pass nor a graph mutation
-/// batch can therefore span the published triple, which would otherwise pair a
-/// `total` counted mid-batch with an `indexed` measured against an index that
-/// has not seen those keys. The session-scope revalidation the sibling also
-/// performs has no analogue here: status always samples HEAD, whose ownership
-/// is stable for the daemon's lifetime.
+/// embedding-work lock. Neither an embedding pass, a vector-index reset/requeue
+/// transition, nor a graph mutation batch can therefore span the published
+/// triple, which would otherwise pair a `total` counted mid-batch with an
+/// `indexed` measured against an index that has not seen those keys. The
+/// session-scope revalidation the sibling also performs has no analogue here:
+/// status always samples HEAD, whose ownership is stable for the daemon's
+/// lifetime.
 ///
 /// Every way of not observing is named rather than collapsed. A held lock is
 /// transient, a poisoned one is permanent and says the embedding loop is dead,
@@ -2502,10 +2504,11 @@ async fn live_embedding_coverage(
 ///
 /// `embedding_status` allocates a set of every retrievable key and probes the
 /// vector index once per key, and the embed loop takes this same std mutex from
-/// its own `spawn_blocking`. Sampling inline on a tokio worker would hold the
-/// lock across that whole walk on a thread the runtime cannot reschedule, so
-/// each `kin status` would stall the next embedding batch for the duration of
-/// the walk.
+/// its own `spawn_blocking`. Sampling there keeps the O(N) walk off a Tokio
+/// worker, and `try_lock` keeps status from waiting behind embedding work that
+/// already owns the boundary. If status wins first, its sample can delay a
+/// later embedding pass until the walk completes; only a blocking-pool thread
+/// waits, and no std mutex guard is held across an async await.
 async fn sample_embedding_coverage(
     state: Arc<DaemonState>,
 ) -> std::result::Result<
@@ -2514,16 +2517,10 @@ async fn sample_embedding_coverage(
 > {
     use kin_cli::commands::status::EmbeddingCoverageUnobserved;
 
-    let sampled = tokio::task::spawn_blocking(move || match state.embedding_work.try_lock() {
-        Ok(_embedding_guard) => Ok(kin_cli::commands::status::observe_embedding_coverage(
-            &state.graph,
-        )),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            Err(EmbeddingCoverageUnobserved::SamplingContended)
-        }
-        Err(std::sync::TryLockError::Poisoned(_)) => {
-            Err(EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned)
-        }
+    let sampled = tokio::task::spawn_blocking(move || {
+        try_sample_embedding_coverage_with(&state, |graph| {
+            kin_cli::commands::status::observe_embedding_coverage(graph)
+        })
     })
     .await;
 
@@ -2532,6 +2529,28 @@ async fn sample_embedding_coverage(
         Err(error) => {
             tracing::warn!(%error, "embedding coverage sample did not complete");
             Err(EmbeddingCoverageUnobserved::SamplingFailed)
+        }
+    }
+}
+
+/// Synchronous sampling core used by the blocking production path and the
+/// forced reset/sampling interleaving regression.
+fn try_sample_embedding_coverage_with(
+    state: &DaemonState,
+    sample: impl FnOnce(&kin_db::InMemoryGraph) -> kin_cli::commands::status::EmbeddingCoverage,
+) -> std::result::Result<
+    kin_cli::commands::status::EmbeddingCoverage,
+    kin_cli::commands::status::EmbeddingCoverageUnobserved,
+> {
+    use kin_cli::commands::status::EmbeddingCoverageUnobserved;
+
+    match state.embedding_work.try_lock() {
+        Ok(_embedding_guard) => Ok(sample(state.graph.as_ref())),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            Err(EmbeddingCoverageUnobserved::SamplingContended)
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            Err(EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned)
         }
     }
 }
@@ -18057,6 +18076,102 @@ mod tests {
             )),
             "text: {}",
             result.text
+        );
+    }
+
+    /// An IndexError reset that starts after status proves an index is attached
+    /// must wait until status has read the matching counters.
+    ///
+    /// The contention callback is reached only after the reset's `try_lock`
+    /// loses to the production sampling boundary. That lets the sampler force
+    /// the exact attachment-check/reset-attempt/counter-read ordering without
+    /// sleeps. Before the reset was part of `embedding_work`, the detach could
+    /// land in that gap and produce the plausible but false observed zero.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_reset_cannot_split_status_attachment_from_coverage_counters() {
+        let state = test_state();
+        let entity = test_entity("reset_race_symbol", "src/reset_race.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let snapshot = state.graph.to_snapshot();
+        let mut keys = vec![kin_model::RetrievalKey::Entity(entity.id)];
+        keys.extend(
+            snapshot
+                .entity_revisions
+                .values()
+                .flat_map(|revisions| revisions.iter())
+                .map(|revision| kin_model::RetrievalKey::EntityRevision(revision.revision_id)),
+        );
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        for key in &keys {
+            vectors
+                .upsert_retrievable(*key, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("daemon-status-reset-race-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(state.graph.compute_root_hash())),
+        };
+        vectors.set_descriptor(descriptor.clone());
+        let sidecar = state.layout.root().join("status-reset-race.kvec");
+        vectors.save(&sidecar).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
+
+        let (attachment_checked_tx, attachment_checked_rx) = std::sync::mpsc::sync_channel(0);
+        let (reset_waiting_tx, reset_waiting_rx) = std::sync::mpsc::sync_channel(0);
+        let sample_state = Arc::clone(&state);
+        let sampler = std::thread::spawn(move || {
+            try_sample_embedding_coverage_with(&sample_state, move |graph| {
+                assert!(
+                    graph.vector_index_stats().is_some(),
+                    "the forced interleaving starts after status proves attachment"
+                );
+                attachment_checked_tx.send(()).unwrap();
+                reset_waiting_rx.recv().unwrap();
+
+                // This is the counter half of `observe_embedding_coverage`,
+                // split out only so the channel can pin the reset attempt in
+                // the otherwise invisible gap between its two kin-db calls.
+                let status = graph.embedding_status();
+                kin_cli::commands::status::EmbeddingCoverage::Observed {
+                    source: kin_cli::commands::status::EmbeddingCoverageSource::LiveQueryGraph,
+                    indexed: status.indexed,
+                    pending: status.pending,
+                    total: status.total,
+                }
+            })
+        });
+
+        attachment_checked_rx.recv().unwrap();
+        let reset_state = Arc::clone(&state);
+        let resetter = std::thread::spawn(move || {
+            crate::daemon::reset_vector_index_and_requeue_after_contention_for_test(
+                &reset_state,
+                move || reset_waiting_tx.send(()).unwrap(),
+            )
+        });
+
+        let sampled = sampler.join().unwrap().unwrap();
+        let kin_cli::commands::status::EmbeddingCoverage::Observed { indexed, total, .. } = sampled
+        else {
+            panic!("the attached index must remain observable until sampling completes")
+        };
+        assert!(indexed > 0, "the forced interleaving fabricated a zero");
+        assert_eq!(indexed, total, "every fixture key was indexed");
+
+        resetter.join().unwrap().unwrap();
+        assert_eq!(
+            kin_cli::commands::status::observe_embedding_coverage(&state.graph),
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+            ),
+            "the reset must run immediately after the sample releases the boundary"
         );
     }
 

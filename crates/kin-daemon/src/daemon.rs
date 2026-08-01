@@ -192,6 +192,62 @@ fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Dura
     current.unwrap_or(base).saturating_mul(2).min(max)
 }
 
+/// Detach a stale vector index and rebuild both embedding queues as one
+/// embedding-work transition.
+///
+/// This function blocks on a std mutex and must therefore run on a blocking
+/// thread when called from async code. The outer mutex is the same boundary
+/// status sampling uses, so a sample cannot observe an attached index and then
+/// have this transition detach it before the counters are read.
+fn reset_vector_index_and_requeue(
+    state: &DaemonState,
+) -> std::result::Result<(), kin_db::KinDbError> {
+    reset_vector_index_and_requeue_with_contention(state, || {})
+}
+
+/// Testable core for [`reset_vector_index_and_requeue`].
+///
+/// `on_contention` runs after `try_lock` proves another embedding-work
+/// transition owns the boundary and immediately before this caller waits. The
+/// production path uses a no-op; the deterministic race regression uses the
+/// callback to force the reset attempt between the sampler's attachment check
+/// and counter read without sleeps or scheduler assumptions.
+fn reset_vector_index_and_requeue_with_contention(
+    state: &DaemonState,
+    on_contention: impl FnOnce(),
+) -> std::result::Result<(), kin_db::KinDbError> {
+    let _embedding_guard = match state.embedding_work.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_contention();
+            state.embedding_work.lock().map_err(|_| {
+                kin_db::KinDbError::ConcurrentAccessError(
+                    "embedding work lock poisoned".to_string(),
+                )
+            })?
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(kin_db::KinDbError::ConcurrentAccessError(
+                "embedding work lock poisoned".to_string(),
+            ));
+        }
+    };
+
+    state.graph.reset_vector_index();
+    #[cfg(feature = "embeddings")]
+    state.graph.queue_missing_for_embedding();
+    state.graph.queue_missing_artifacts_for_embedding();
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
+    state: &DaemonState,
+    on_contention: impl FnOnce(),
+) -> std::result::Result<(), kin_db::KinDbError> {
+    reset_vector_index_and_requeue_with_contention(state, on_contention)
+}
+
 /// Poll `workspace/symbol` with an empty query until the LSP server responds
 /// or the deadline is reached. Language servers like rust-analyzer and pyright
 /// continue background indexing after the `initialize` handshake; this probe
@@ -1463,16 +1519,44 @@ pub async fn run_with_authority(
                                 error = %e,
                                 "embedding worker hit a vector-index error — resetting vector index and re-queueing once"
                             );
-                            embed_state.graph.reset_vector_index();
-                            #[cfg(feature = "embeddings")]
-                            embed_state.graph.queue_missing_for_embedding();
-                            embed_state.graph.queue_missing_artifacts_for_embedding();
-                            index_reset_triggered = true;
-                            error_backoff = None;
-                            error!(
-                                error = %e,
-                                "embedding worker error — reset vector index, retrying next interval"
-                            );
+                            // The failed batch has released `embedding_work`.
+                            // Reacquire it on a blocking thread for the complete
+                            // detach + requeue transition so status sampling can
+                            // never span the vector-only mutation, while no
+                            // Tokio worker blocks on the std mutex.
+                            let state_for_reset = Arc::clone(&embed_state);
+                            let reset_failure = match tokio::task::spawn_blocking(move || {
+                                reset_vector_index_and_requeue(&state_for_reset)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => None,
+                                Ok(Err(reset_error)) => Some(reset_error.to_string()),
+                                Err(reset_error) => {
+                                    Some(format!("vector-index reset task failed: {reset_error}"))
+                                }
+                            };
+                            if let Some(reset_error) = reset_failure {
+                                let next = next_embed_error_backoff(
+                                    error_backoff,
+                                    embed_interval,
+                                    EMBED_ERROR_BACKOFF_MAX,
+                                );
+                                error_backoff = Some(next);
+                                error!(
+                                    error = %e,
+                                    reset_error,
+                                    backoff_s = next.as_secs(),
+                                    "embedding worker error — vector-index reset failed, backing off"
+                                );
+                            } else {
+                                index_reset_triggered = true;
+                                error_backoff = None;
+                                error!(
+                                    error = %e,
+                                    "embedding worker error — reset vector index, retrying next interval"
+                                );
+                            }
                         } else {
                             // The one-shot reset did not clear it (or it is a
                             // non-index error): back off exponentially so the
