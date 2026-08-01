@@ -71,6 +71,13 @@ EXPECTED_REQUIRED_CONTEXT_ACTION_PINS = {
 EXPECTED_SELECTOR_INVOCATIONS = {
     "release-tag": ('"$abandoned"', '"$candidate_tags"', '"$TAG"', '"$admissible"'),
     "release-train": ('"$abandoned"', '"$candidate_tags"', '""', '"$admissible"'),
+    # Recovery asks the same question about one tag, so its candidate listing is
+    # the single pair the failed release ran rather than the whole tag listing,
+    # and its mint intent is empty for a blunter reason than the train's: naming
+    # the tag under reconcile as intent makes the selector refuse exactly the
+    # recorded tag recovery is asking about, so recovery would read a waived tag
+    # as unwaived and re-arm the alert the record exists to stand down.
+    "release-recovery": ('"$RECORD"', '"$candidate"', '""', '"$admissible"'),
 }
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 DOCKERFILE = ROOT / "Dockerfile"
@@ -2751,29 +2758,95 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
                 )
 
 
-def assert_selector_arguments(release_tag: str, release_train: str) -> None:
+def assert_selector_arguments(
+    release_tag: str,
+    release_train: str,
+    release_recovery: str,
+) -> None:
     """Pin which tag each workflow declares it is about to mint."""
 
     actual = {
         "release-tag": selector_invocation("release-tag", release_tag),
         "release-train": selector_invocation("release-train", release_train),
+        "release-recovery": selector_invocation(
+            "release-recovery", release_recovery
+        ),
     }
     if actual != EXPECTED_SELECTOR_INVOCATIONS:
         raise AssertionError(
             "each release workflow must hand the admission selector its own "
             "reviewed arguments. The mint-intent argument names the tag that "
             "workflow is about to create, and only the mint creates one. The "
-            "train resolves drift from a base tag it never mints, so naming "
-            "that base as mint intent refuses exactly when a record covers it, "
+            "train resolves drift from a base tag it never mints, and recovery "
+            "reconciles a tag it never mints either, so naming that tag as "
+            "mint intent refuses exactly when a record covers it, "
             f"which is every abandonment: expected={EXPECTED_SELECTOR_INVOCATIONS} "
             f"actual={actual}"
         )
 
 
-def assert_abandoned_tag_admission(release_tag: str, release_train: str) -> None:
+def assert_recovery_record_authority(release_recovery: str) -> None:
+    """Recovery must decide abandonment through the rail's own selector.
+
+    Two readers of one record is how an alarm gets disarmed in the state that
+    needs it most. A reader of its own accepts entries the selector refuses, so
+    recovery would stand down for a record too malformed to waive the mint: the
+    rail hard stuck, and the check-run that would say so green. Recovery
+    therefore asks the selector the same question the mint asks, and this pins
+    that it keeps asking rather than reading the record itself.
+
+    Recovery is deliberately absent from the protected-main read above. The mint
+    and the train run on a release commit that predates the abandonment it has
+    to honour, so they must reach past their checkout; recovery checks out
+    GITHUB_SHA, which is the default-branch commit itself, and honours no
+    abandonment from a tree whose HEAD is not that commit.
+    """
+
+    step = workflow_step_source(
+        "release-recovery",
+        release_recovery,
+        "      - name: Reconcile against the tracked abandonment record\n",
+    )
+    for policy in (TAG_SELECTOR_POLICY, 'python3 "$selector"'):
+        require(step, policy, "record-aware release recovery")
+    for reader in ("jq ", "python3 -c"):
+        if reader in step:
+            raise AssertionError(
+                "release recovery must decide abandonment through "
+                f"{TAG_SELECTOR_POLICY} and not read the record a second way, "
+                "because a second reader accepts what the rail refuses and "
+                f"quiets the alarm the refusal exists to raise: {reader.strip()}"
+            )
+    # The selector answers by ranking, and it drops a candidate that is not a
+    # vX.Y.Z release tag for the same reason it drops an abandoned one. An empty
+    # ranking therefore means "waived" only while the tag handed to it is known
+    # to be a release tag, which resolve establishes before it declares the
+    # reconcile needed. The order is what makes it true at the ranking.
+    resolve = workflow_step_source(
+        "release-recovery",
+        release_recovery,
+        "      - name: Resolve exact retry candidate\n",
+    )
+    shape = resolve.index(r'[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]')
+    declared = resolve.index('echo "needed=true"')
+    if shape > declared:
+        raise AssertionError(
+            "release recovery must prove its retry candidate is a vX.Y.Z "
+            "release tag before it declares a reconcile needed, because the "
+            "admission selector drops anything else from its ranking and "
+            "recovery reads an empty ranking as a reviewed waiver"
+        )
+
+
+def assert_abandoned_tag_admission(
+    release_tag: str,
+    release_train: str,
+    release_recovery: str,
+) -> None:
     """Only a reviewed record may waive release-lane serialization."""
 
-    assert_selector_arguments(release_tag, release_train)
+    assert_selector_arguments(release_tag, release_train, release_recovery)
+    assert_recovery_record_authority(release_recovery)
 
     for workflow, content, step_anchor, comparison in (
         (
@@ -3692,7 +3765,7 @@ def main() -> None:
         ),
     )
     assert_release_branch_allowlist_covers_generator(release_train)
-    assert_abandoned_tag_admission(release_tag, release_train)
+    assert_abandoned_tag_admission(release_tag, release_train, release_recovery)
     # The release bump must never be resolvable from anything a merged pull
     # request can still change.
     for forbidden in (
@@ -3737,6 +3810,17 @@ def main() -> None:
         "The only exit from that state is a hand-landed version bump",
         "a tag that has since moved refuses loudly",
         "fails the rail closed rather",
+        # No CI job executes a line of release-recovery.yml: it triggers on
+        # schedule and workflow_run only, so this prose is the whole of what an
+        # operator has when a reconcile goes green while a release is visibly
+        # broken. Each clause is pinned because each is separately droppable:
+        # that the stand-down exists, that it is narrow, that recovery is a
+        # consumer of the record at all, and that a record too weak for the rail
+        # is too weak to quiet the alarm.
+        "is reconciled instead of alerted",
+        "still opens the issue and still fails the reconcile",
+        "automatic recovery stands down for it",
+        "cannot quiet the alarm either",
     ):
         require(
             release_bot_doc,
@@ -3786,8 +3870,34 @@ def main() -> None:
         "rerun-failed-jobs",
         '[ "$attempt" -ge 3 ]',
         "Release blocked after automatic retries",
+        "scripts/abandoned-release-tags.json",
+        "scripts/select-admissible-release-tag.py",
+        '[ "$head" != "$GITHUB_SHA" ]',
+        "reconciled by abandonment",
     ):
         require(release_recovery, policy, "bounded automatic release recovery")
+
+    # Recovery's failing check-run lands on the default branch head, and the
+    # mint gate refuses a release commit carrying any check-run outside
+    # success/skipped/neutral. An hourly tick that alerts on a tag the reviewed
+    # record has already retired therefore kills the very release that
+    # supersedes it. Both consumers of the record decision are pinned here
+    # rather than trusting one substring: the retry must not spend runners on an
+    # abandoned tag, and the alert must not stamp failure on one.
+    for step, duty in (
+        ("      - name: Re-run failed jobs\n", "bounded retry"),
+        (
+            "      - name: Alert after automatic retries are exhausted\n",
+            "exhausted-retry alert",
+        ),
+    ):
+        start = release_recovery.index(step)
+        end = release_recovery.index("\n        env:", start)
+        if "steps.record.outputs.abandoned != 'true'" not in release_recovery[start:end]:
+            raise AssertionError(
+                f"release recovery's {duty} must stand down for a tag the "
+                "tracked abandonment record already retired"
+            )
     for forbidden in (
         "workflow_dispatch:",
         "contents: write",

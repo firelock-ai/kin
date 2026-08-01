@@ -153,10 +153,113 @@ jobs:
             echo "exhausted=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # An abandonment is a fact about the default branch, never about the tag
+      # it retires: a tag's tree is frozen before the failure that abandons it,
+      # so the record can only ever exist on main. Both triggers here resolve
+      # GITHUB_SHA to the last commit on the default branch, and checkout with
+      # no `ref:` input fetches exactly that commit, so the record is read from
+      # one immutable main snapshot instead of from whatever main becomes while
+      # the job runs. Nothing from the failed tag's own head is trusted.
+      #
+      # Reading the record is tolerated rather than propagated, on the same
+      # ground base-image-pins.yml states: the alarm must not become the thing
+      # that reds a main sha. Without this a network hiccup fetching the record
+      # would fail the job and publish exactly the check-run that refuses a
+      # release, which is the hazard this step exists to remove. A failed
+      # checkout instead leaves no HEAD for the next step to verify, so it reads
+      # as "not abandoned" and recovery behaves as it did before the record
+      # existed.
+      - name: Checkout the abandonment record from the default-branch commit
+        if: steps.resolve.outputs.needed == 'true'
+        continue-on-error: true
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      # Recovery is the alarm, so nothing weaker than the reviewed record may
+      # quiet it. The question is the one the release rail already answers,
+      # so this asks select-admissible-release-tag.py rather than reading the
+      # record a second way. Two readers of one record is how an alarm gets
+      # disarmed in the state that needs it most: a reader that accepts an
+      # entry the selector refuses would stand recovery down for a record too
+      # malformed to waive the mint, leaving the rail hard stuck while the
+      # check-run that would say so went green. Every other outcome, including
+      # an unreadable record or a checkout that is not the run's own
+      # default-branch commit, leaves the tag unrecorded and the alert armed.
+      - name: Reconcile against the tracked abandonment record
+        id: record
+        if: steps.resolve.outputs.needed == 'true'
+        env:
+          RECORD: scripts/abandoned-release-tags.json
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Nothing in this step may end in a non-zero status of its own. The
+          # check-run it would publish is the one the mint gate refuses a
+          # release commit for, so every status is captured rather than left to
+          # the step's implicit errexit, and every unhappy path degrades to "not
+          # abandoned", which leaves the alert armed to fail for the real reason.
+          head=""
+          status=0
+          head="$(git rev-parse HEAD)" || status=$?
+          if [ "$status" -ne 0 ] || [ "$head" != "$GITHUB_SHA" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::the record checkout resolved '${head}' rather than this run's default-branch commit ${GITHUB_SHA}; no abandonment is honoured from an unverified tree."
+            exit 0
+          fi
+          selector="scripts/select-admissible-release-tag.py"
+          if [ ! -f "$RECORD" ] || [ ! -f "$selector" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${RECORD} or ${selector} is absent from ${GITHUB_SHA}; recovery stays responsible for ${TAG}."
+            exit 0
+          fi
+          # The candidate listing is the one pair this reconcile is about, in
+          # the `<tag> <commit>` form the selector reads from git. The resolve
+          # step has already peeled the tag and required this commit to be what
+          # it names, so the selector is told the truth about the repository and
+          # its tag-moved refusal keeps its meaning here. Mint intent is empty
+          # because recovery creates no tag: naming this tag as intent would
+          # make the selector refuse precisely the recorded tag it is being
+          # asked about, and invert the answer.
+          work="${RUNNER_TEMP:-/tmp}"
+          candidate="$work/release-recovery-candidate-tag"
+          admissible="$work/release-recovery-highest-admissible"
+          printf '%s %s\n' "$TAG" "$SHA" > "$candidate"
+          # Seeded, so a selector run that leaves no answer behind reads as "not
+          # abandoned" rather than as a waiver.
+          printf 'unresolved' > "$admissible"
+          if ! python3 "$selector" \
+            "$RECORD" \
+            "$candidate" \
+            "" \
+            "$admissible"
+          then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${RECORD} does not pass the release lane's own record validation, so it waives nothing for the mint and quiets nothing here; recovery stays responsible for ${TAG}. The selector's refusal above names what is wrong with the record."
+            exit 0
+          fi
+          # The selector answers by ranking, dropping a candidate its record
+          # abandons at the commit under review, so an empty ranking of a
+          # one-tag listing is that drop. It drops a candidate that is not a
+          # vX.Y.Z release tag for its own reasons, which is why resolve proves
+          # that shape before it declares a reconcile needed and the authority
+          # suite pins that order: an empty ranking waives a tag only when the
+          # tag was one the selector would rank at all.
+          if [ ! -f "$admissible" ] || [ -s "$admissible" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "${TAG} at ${SHA} carries no reviewed abandonment record; recovery stays responsible for it."
+            exit 0
+          fi
+          echo "abandoned=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::${TAG} at ${SHA} is reconciled by abandonment: ${RECORD} retires it in favour of its recorded successor, so no retry is dispatched, no alert is filed, and this reconcile concludes success."
+
       - name: Re-run failed jobs
         if: >-
           steps.resolve.outputs.needed == 'true' &&
-          steps.resolve.outputs.retry == 'true'
+          steps.resolve.outputs.retry == 'true' &&
+          steps.record.outputs.abandoned != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -172,7 +275,8 @@ jobs:
       - name: Alert after automatic retries are exhausted
         if: >-
           steps.resolve.outputs.needed == 'true' &&
-          steps.resolve.outputs.exhausted == 'true'
+          steps.resolve.outputs.exhausted == 'true' &&
+          steps.record.outputs.abandoned != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

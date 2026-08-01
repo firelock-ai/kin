@@ -163,6 +163,18 @@ two retries is the hard cap. Cancellation is treated as an operator stop and is
 never retried. If all three attempts fail, the controller opens one
 `Release blocked after automatic retries` issue and stops.
 
+There is one exception, and only one: a tag the reviewed record has already
+retired is reconciled instead of alerted. Before retrying or alerting, the
+controller reads `scripts/abandoned-release-tags.json` from the run's own
+default-branch commit and asks the same selector the mint asks. A tag that
+record waives at exactly the commit the failed release ran gets no retry, no
+issue, and a notice saying so, and that reconcile concludes success.
+
+Every other outcome leaves the tag unrecorded and the alert armed, including a
+record that cannot be read or is under-evidenced: an undiagnosed failure
+still opens the issue and still fails the reconcile. See
+[Abandoning a release tag](#abandoning-a-release-tag).
+
 ## Abandoning a release tag
 
 Recovery stopping is not the end of the story. The rail serializes on the
@@ -178,6 +190,11 @@ the exact `sha` it pointed at, a `reason`, the `superseded_by` tag, and the
 `failed_release_run_id` that evidences it. Both the record and the selector that
 reads it are loaded from protected `main`, never from the checked-out release
 commit, which predates any abandonment it has to honour.
+
+Three consumers read it through that selector: the mint refuses to create a tag
+it names, drift resolution skips that tag when it ranks the highest release the
+rail must wait on, and automatic recovery stands down for it rather than
+retrying and alerting on a release nobody intends to finish.
 
 **Operating rule: record the abandonment and leave the tag in place.**
 
@@ -199,7 +216,8 @@ Two further properties worth knowing before editing the record:
   exact commit its tag pointed at, so a tag that has since moved refuses loudly
   rather than quietly waiving a different object than the one reviewed
 - a malformed, unparsable, or under-evidenced entry fails the rail closed rather
-  than degrading to an empty waiver set
+  than degrading to an empty waiver set, and recovery decides through that same
+  selector, so an entry that cannot waive the rail cannot quiet the alarm either
 
 ## Captain break-glass usage
 
