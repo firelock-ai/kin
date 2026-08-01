@@ -1398,7 +1398,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_discovery_finds_platform_sibling_without_path() {
+    fn windows_daemon_discovery_finds_platform_sibling_without_path() {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory
             .path()
