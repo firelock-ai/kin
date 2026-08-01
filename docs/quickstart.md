@@ -59,11 +59,11 @@ On native Windows, use PowerShell:
 irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
-The native Windows build is a **supported vector-free runtime** for graph, lexical, daemon,
-setup, and MCP workflows. Vector similarity and filesystem projection are unsupported, and
-the installer prints that boundary up front. For the complete vector-enabled/projection
-experience, install under **WSL2** and follow the Linux path inside it. See
-[windows-wsl2.md](./windows-wsl2.md).
+Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+The PowerShell installer prints that boundary before downloading anything. Native
+Windows ARM64 has no release archive; an x64 PowerShell process may use the x86_64
+archive under Windows emulation, but WSL2 is the recommended path. Follow the Linux
+flow inside WSL2; see [windows-wsl2.md](./windows-wsl2.md).
 
 ### Installer options
 
@@ -344,7 +344,7 @@ The checks (IDs as emitted in `--json`):
 | --- | --- |
 | `kin_binary` | The `kin` binary resolved (reports version + path). |
 | `kin_daemon_binary` | `kin-daemon` found beside `kin` or on `PATH`. |
-| `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib` (macOS/Linux). On Windows this is **n/a** — projection uses ProjFS (planned), not the shell-injected shim. |
+| `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib` (macOS/Linux). On native Windows this is **unsupported**; use WSL2. |
 | `repo_init` | The current directory is inside a Kin repository. |
 | `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. |
 | `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok ("nothing to configure"). |

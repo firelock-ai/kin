@@ -29,6 +29,11 @@ RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
 WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
+WINDOWS_WSL2_DOC = ROOT / "docs" / "windows-wsl2.md"
+QUICKSTART_DOC = ROOT / "docs" / "quickstart.md"
+LLMS_DOC = ROOT / "llms.txt"
+NPM_CANONICAL_README = ROOT / "packages" / "kin" / "README.md"
+NPM_MCP_README = ROOT / "packages" / "kin-mcp" / "README.md"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 PREPARE_RELEASE = ROOT / "scripts" / "prepare-release.mjs"
@@ -764,6 +769,121 @@ def windows_init_contract_strings() -> dict[str, str]:
             )
         strings[name] = bindings[0]
     return strings
+
+
+def windows_public_support_notice(contract_source: str) -> str:
+    """Read the one public capability statement from the executable contract."""
+
+    bindings = re.findall(
+        r'(?m)^PUBLIC_SUPPORT_NOTICE="([^"]+)"$', contract_source
+    )
+    if len(bindings) != 1:
+        raise AssertionError(
+            f"{WINDOWS_INIT_CONTRACT_POLICY} must bind PUBLIC_SUPPORT_NOTICE "
+            f"exactly once: {bindings}"
+        )
+    notice = bindings[0]
+    for truth in (
+        "repository-free CLI diagnostics",
+        "repository admission is currently unavailable",
+        "kin init fails closed",
+        "workflows are unsupported",
+        "Use WSL2 for usable Kin repositories",
+    ):
+        if truth not in notice:
+            raise AssertionError(
+                "Windows public support notice no longer states the executable "
+                f"refusal contract: missing {truth!r}"
+            )
+    return notice
+
+
+def assert_windows_public_support_contract(
+    contract_source: str,
+    install_ps1: str,
+    public_surfaces: dict[Path, str],
+    compatibility_mcp_readme: str,
+) -> None:
+    """Keep every install surface inside the native-Windows admission boundary.
+
+    The required Windows jobs prove both `kin init` boundaries refuse. This
+    public notice is therefore owned by the same executable contract rather
+    than by independent prose. Each shipped installer/doc/package copy must be
+    exact, and known larger capability claims are forbidden even if the exact
+    notice remains elsewhere in the file.
+    """
+
+    notice = windows_public_support_notice(contract_source)
+    contract_active = "\n".join(active_lines(contract_source))
+    for refusal in (
+        'require_refused "Windows exact-Git admission"',
+        'require_refused "Windows native-unborn bootstrap"',
+        'fail "$label unexpectedly succeeded" "$log"',
+    ):
+        require(
+            contract_active,
+            refusal,
+            "public Windows support notice tied to executable refusal",
+        )
+
+    all_surfaces = {INSTALL_PS1: install_ps1, **public_surfaces}
+    for path, source in all_surfaces.items():
+        count = source.count(notice)
+        if count != 1:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} must repeat the Windows support notice "
+                f"from {WINDOWS_INIT_CONTRACT_POLICY} exactly once; found {count}"
+            )
+
+    normalized = " ".join("\n".join(all_surfaces.values()).lower().split())
+    for stale_claim in (
+        "native windows is a supported vector-free subset",
+        "native windows build is a supported vector-free runtime",
+        "native windows supports graph + lexical workflows",
+        "supported for graph, lexical retrieval, daemon, setup, mcp",
+        "it ships the supported vector-free runtime",
+        "the graph, lexical, daemon, setup, and mcp surfaces are release-tested",
+    ):
+        if stale_claim in normalized:
+            raise AssertionError(
+                "public native-Windows surface exceeds the executable admission "
+                f"contract: found stale claim {stale_claim!r}"
+            )
+
+    install_active = "\n".join(active_lines(install_ps1))
+    if re.search(r'(?m)^\s*"ARM64"\s*\{\s*return\b', install_ps1):
+        raise AssertionError(
+            "PowerShell installer must never resolve native ARM64 to a release "
+            "archive; only windows-x86_64 is published"
+        )
+    for policy in (
+        '$NativeWindowsSupportNotice = "' + notice + '"',
+        'Write-Host "  ! $NativeWindowsSupportNotice"',
+        "function Resolve-KinWindowsArchiveArchitecture",
+        '"AMD64" { return "x86_64" }',
+        '"ARM64" { throw "No native Windows ARM64 archive is published.',
+        "Not running repository setup: native Windows cannot admit a Kin repository.",
+    ):
+        require(install_ps1, policy, "truthful native-Windows installer")
+    if "windows-aarch64" in install_ps1:
+        raise AssertionError(
+            "PowerShell installer fabricates the nonexistent windows-aarch64 archive"
+        )
+    if "& $KinExe setup" in install_active:
+        raise AssertionError(
+            "native-Windows installer must not configure repository/MCP workflows "
+            "while repository admission is refused"
+        )
+
+    for policy in (
+        "- macOS or Linux",
+        "Windows users should run Kin through WSL2 during the alpha.",
+    ):
+        require(
+            compatibility_mcp_readme,
+            policy,
+            "compatibility MCP package native-Windows boundary",
+        )
 
 
 def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> None:
@@ -4776,6 +4896,77 @@ def main() -> None:
     # stage is created, so it passed on every input in both.
     windows_contract_source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     assert_windows_contract_stage_check_is_reachable(windows_contract_source)
+    windows_public_surfaces = {
+        README: readme,
+        QUICKSTART_DOC: QUICKSTART_DOC.read_text(encoding="utf-8"),
+        WINDOWS_WSL2_DOC: WINDOWS_WSL2_DOC.read_text(encoding="utf-8"),
+        UPDATE_TRUST: update_trust,
+        NPM_CANONICAL_README: NPM_CANONICAL_README.read_text(encoding="utf-8"),
+        LLMS_DOC: LLMS_DOC.read_text(encoding="utf-8"),
+    }
+    compatibility_mcp_readme = NPM_MCP_README.read_text(encoding="utf-8")
+    assert_windows_public_support_contract(
+        windows_contract_source,
+        install_ps1,
+        windows_public_surfaces,
+        compatibility_mcp_readme,
+    )
+    public_notice = windows_public_support_notice(windows_contract_source)
+
+    drifted_readme_surfaces = dict(windows_public_surfaces)
+    drifted_readme_surfaces[README] = readme.replace(
+        public_notice,
+        "Native Windows supports the graph and daemon without vectors.",
+        1,
+    )
+    expect_assertion(
+        "the README restores a larger native-Windows capability claim",
+        "must repeat the Windows support notice",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1,
+            drifted_readme_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
+        "the public notice drifts away from the executable refusal contract",
+        "no longer states the executable refusal contract",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source.replace(
+                "repository admission is currently unavailable",
+                "repository admission is available",
+                1,
+            ),
+            install_ps1,
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
+        "the PowerShell installer maps native ARM64 to a nonexistent archive",
+        "must never resolve native ARM64",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1.replace(
+                '"ARM64" { throw "No native Windows ARM64 archive is published.',
+                '"ARM64" { return "aarch64" # No native Windows ARM64 archive is published.',
+                1,
+            ),
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
+        "the native installer auto-configures an unusable repository setup",
+        "must not configure repository/MCP workflows",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1 + "\n& $KinExe setup\n",
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
     expect_assertion(
         "the contract script counts stages where one can never appear",
         "reachable Windows stage-leak check",
