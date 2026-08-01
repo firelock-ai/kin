@@ -332,6 +332,25 @@ jobs:
           AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
         run: |
           set -euo pipefail
+          # Declining to mint is a real outcome that exits the job green on
+          # purpose, which is what made a blocked release indistinguishable
+          # from a minted one on the board. A decline therefore has to be
+          # legible without reading logs: a warning annotation, a step summary
+          # section, and a named reason the escalation step can quote.
+          decline() { # <reason> <sentence>
+            printf '::warning::release mint declined (%s): %s\n' "$1" "$2"
+            {
+              echo "### Release mint declined"
+              echo
+              echo "Reason: \`$1\`"
+              echo
+              echo "$2"
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "ready=false"
+              echo "decline_reason=$1"
+            } >> "$GITHUB_OUTPUT"
+          }
           runs="$(gh api "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100")"
           active="$(jq '[.workflow_runs[] | select(
             .status == "requested" or .status == "queued" or .status == "in_progress" or
@@ -339,8 +358,7 @@ jobs:
           )] | length' <<< "$runs")"
           if [ "$active" -ne 0 ]; then
             if [ "$AUTOMATIC" = true ]; then
-              echo "::notice::${active} Release run(s) are active; a scheduled reconcile will retry."
-              echo "ready=false" >> "$GITHUB_OUTPUT"
+              decline release-in-flight "${active} Release run(s) are active; a scheduled reconcile will retry."
               exit 0
             fi
             echo "::error::${active} Release run(s) are active"
@@ -389,8 +407,7 @@ jobs:
           highest_tag="$(cat "$admissible")"
           if [ -z "$highest_tag" ] || [ "$highest_tag" != "$latest_tag" ]; then
             if [ "$AUTOMATIC" = true ]; then
-              echo "::notice::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery will reconcile it."
-              echo "ready=false" >> "$GITHUB_OUTPUT"
+              decline unfinalized-latest "highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery will reconcile it."
               exit 0
             fi
             echo "::error::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}"
@@ -431,8 +448,7 @@ jobs:
               <<< "$runs")"
             if [ "$matching_count" -ne 0 ]; then
               if [ "$AUTOMATIC" = true ]; then
-                echo "::notice::latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded; recovery owns this state."
-                echo "ready=false" >> "$GITHUB_OUTPUT"
+                decline unrecovered-latest "latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded; recovery owns this state."
                 exit 0
               fi
               echo "::error::latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded"
@@ -624,6 +640,71 @@ jobs:
             echo "prior stable authority: ${latest_tag}@${latest_sha} run=${successful}"
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Escalate a persistent mint decline
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'false'
+        # One decline is ordinary: a release still in flight blocks its
+        # successor by design, and the next reconcile clears it. A decline that
+        # keeps repeating is a stuck release lane, and because a decline exits
+        # green it looked exactly like a healthy mint on the board while a
+        # release sat blocked.
+        #
+        # This step runs only on the decline path, so its own conclusion on a
+        # prior run is the decline marker. Reading that is what makes the
+        # outcome machine-visible without parsing logs, and it counts an
+        # already-escalated decline too, so a lane that stays blocked stays red
+        # instead of alarming once every few runs.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          DECLINE_REASON: ${{ steps.prior.outputs.decline_reason }}
+          DECLINE_LIMIT: "4"
+        run: |
+          set -euo pipefail
+          if ! runs="$(gh api \
+            "repos/${REPO}/actions/workflows/release-tag.yml/runs?per_page=20&status=completed" \
+            -q '.workflow_runs[]
+                | select(.id != (env.CURRENT_RUN_ID | tonumber))
+                | .id' 2>&1)"; then
+            echo "::notice::could not read prior mint runs, so this decline is not escalated: ${runs}"
+            exit 0
+          fi
+          consecutive=1
+          examined=0
+          while IFS= read -r run_id; do
+            [ -n "$run_id" ] || continue
+            [ "$examined" -lt "$DECLINE_LIMIT" ] || break
+            examined=$((examined + 1))
+            if ! marker="$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
+              -q '[.jobs[]
+                   | select(.name == "Mint release tag")
+                   | .steps[]
+                   | select(.name == "Escalate a persistent mint decline")
+                   | .conclusion] | first // ""' 2>&1)"; then
+              echo "::notice::stopped counting at run ${run_id}: ${marker}"
+              break
+            fi
+            case "$marker" in
+              success|failure) consecutive=$((consecutive + 1)) ;;
+              *) break ;;
+            esac
+          done <<< "$runs"
+          if [ "$consecutive" -ge "$DECLINE_LIMIT" ]; then
+            {
+              echo "### Release mint blocked"
+              echo
+              echo "Declined ${consecutive} times in a row, most recently for \`${DECLINE_REASON}\`."
+              echo
+              echo "The mint is not failing on its own account and would keep reporting"
+              echo "success. Something is holding the release lane closed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::release lane declined ${consecutive} times in a row (${DECLINE_REASON}); it is blocked, not idle"
+            exit 1
+          fi
+          echo "::notice::release mint declined (${DECLINE_REASON}); ${consecutive} in a row, escalating at ${DECLINE_LIMIT}"
 
       - name: Verify required checks are green
         if: >-

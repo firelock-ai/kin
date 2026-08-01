@@ -2791,6 +2791,74 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
                 )
 
 
+def assert_soft_decline_is_legible(release_tag: str) -> None:
+    """A decline exits the job green, so it has to be loud, named, and counted.
+
+    The failure this pins is not a wrong answer but an invisible one: the mint
+    declining to mint concluded success and read on the board exactly like a
+    mint that happened, so a blocked release stayed hidden until somebody read
+    the step conclusions by hand.
+    """
+
+    workflow = ".github/workflows/release-tag.yml"
+    admission = workflow_step_source(
+        workflow,
+        release_tag,
+        "      - name: Admit the serialized release lane",
+    )
+    for needle in (
+        "decline() { # <reason> <sentence>",
+        "printf '::warning::release mint declined (%s): %s\\n' \"$1\" \"$2\"",
+        '} >> "$GITHUB_STEP_SUMMARY"',
+        'echo "decline_reason=$1"',
+    ):
+        require(admission, needle, f"{workflow} soft-decline legibility")
+
+    # Every automatic decline goes through the helper. A bare `ready=false`
+    # beside a `::notice::` is the exact shape that made a blocked release
+    # indistinguishable from a healthy one, so exactly one write may exist and
+    # it is the helper's.
+    ready_false_writes = admission.count('echo "ready=false"')
+    if ready_false_writes != 1:
+        raise AssertionError(
+            f"{workflow} must write ready=false only through the decline helper, "
+            f"so every decline is announced and named: found {ready_false_writes}"
+        )
+    declines = re.findall(r"^\s+decline [a-z][a-z-]* ", admission, re.MULTILINE)
+    if len(declines) != 3:
+        raise AssertionError(
+            f"{workflow} has three automatic soft-decline branches, each of "
+            f"which must announce itself: found {len(declines)}"
+        )
+
+    escalation_name = "Escalate a persistent mint decline"
+    escalation = workflow_step_source(
+        workflow,
+        release_tag,
+        f"      - name: {escalation_name}",
+    )
+    if "steps.prior.outputs.ready == 'false'" not in escalation:
+        raise AssertionError(
+            f"{workflow} must escalate only on the decline path, so an ordinary "
+            "mint is never held against a decline budget"
+        )
+    # The counter's only decline marker is this step's own conclusion on prior
+    # runs, so the name it selects on and the name it runs under have to be the
+    # same string. Renaming the step without renaming the query would silently
+    # reset the count to one on every run and never escalate again.
+    if f'select(.name == "{escalation_name}")' not in escalation:
+        raise AssertionError(
+            f"{workflow} escalation must count prior runs by its own step name, "
+            f"which is the only durable record of a decline: {escalation_name}"
+        )
+    limit = re.search(r'DECLINE_LIMIT: "(\d+)"', escalation)
+    if limit is None or int(limit.group(1)) < 2:
+        raise AssertionError(
+            f"{workflow} needs a decline budget above one, because a single "
+            "decline while a release is in flight is correct behaviour"
+        )
+
+
 def assert_selector_arguments(
     release_tag: str,
     release_train: str,
@@ -6438,6 +6506,7 @@ def main() -> None:
     assert_rust_cache_steps(workflow_sources)
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
+    assert_soft_decline_is_legible(release_tag)
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)
