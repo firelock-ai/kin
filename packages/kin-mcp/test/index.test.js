@@ -34,6 +34,82 @@ async function exists(filePath) {
   }
 }
 
+const fakeKinPreload = [
+  "const fs = require('node:fs');",
+  "const path = require('node:path');",
+  "const command = path.basename(process.argv[1] || '');",
+  "if (command === 'init' || command === 'mcp') {",
+  "  const args = [command, ...process.argv.slice(2)];",
+  "  if (process.env.KIN_MCP_FAKE_LOG) {",
+  "    fs.appendFileSync(process.env.KIN_MCP_FAKE_LOG, `${args.join('\\n')}\\n`);",
+  "  }",
+  "  if (command === 'init') {",
+  "    if (process.env.KIN_MCP_FAKE_INIT_STDOUT) process.stdout.write(process.env.KIN_MCP_FAKE_INIT_STDOUT);",
+  "    if (process.env.KIN_MCP_FAKE_INIT_STDERR) process.stderr.write(process.env.KIN_MCP_FAKE_INIT_STDERR);",
+  "    if (process.env.KIN_MCP_FAKE_REPO) {",
+  "      fs.mkdirSync(path.join(process.env.KIN_MCP_FAKE_REPO, '.kin'), { recursive: true });",
+  "    }",
+  "  }",
+  "  if (command === 'mcp') {",
+  "    if (process.env.KIN_MCP_FAKE_PROFILE) {",
+  "      fs.writeFileSync(process.env.KIN_MCP_FAKE_PROFILE, process.env.KIN_MCP_TOOL_PROFILE || '');",
+  "    }",
+  "    if (process.env.KIN_MCP_FAKE_PROTOCOL_BASE64) {",
+  "      process.stdout.write(Buffer.from(process.env.KIN_MCP_FAKE_PROTOCOL_BASE64, 'base64'));",
+  "    }",
+  "  }",
+  "  process.exit(0);",
+  "}",
+  ""
+].join('\n');
+
+async function fakeKinEnvironment(tmpDir, overrides = {}) {
+  const preloadName = 'fake-kin-preload.cjs';
+  await fs.writeFile(path.join(tmpDir, preloadName), fakeKinPreload);
+  const env = {
+    ...process.env,
+    NODE_OPTIONS: `--require=./${preloadName}`,
+    KIN_MCP_KIN_BINARY: process.execPath,
+    KIN_MCP_FAKE_REPO: tmpDir,
+    ...overrides
+  };
+  delete env.KIN_DAEMON_BIN;
+  return env;
+}
+
+function environmentValue(env, name) {
+  const key = Object.keys(env).find(candidate => candidate.toLowerCase() === name.toLowerCase());
+  return key === undefined ? undefined : env[key];
+}
+
+function windowsSystemTarPath(env = process.env) {
+  const systemRoot = environmentValue(env, 'SystemRoot');
+  assert.ok(systemRoot, 'native Windows ZIP fixtures require SystemRoot');
+  return path.win32.join(systemRoot, 'System32', 'tar.exe');
+}
+
+async function environmentWithHostileTar(tmpDir, overrides = {}) {
+  const hostileBin = path.join(tmpDir, 'hostile-path');
+  await fs.mkdir(hostileBin, { recursive: true });
+  const hostileTar = path.join(
+    hostileBin,
+    process.platform === 'win32' ? 'tar.exe' : 'tar'
+  );
+  if (process.platform === 'win32') {
+    await fs.copyFile(process.execPath, hostileTar);
+  } else {
+    await fs.writeFile(hostileTar, '#!/bin/sh\nexit 97\n', { mode: 0o755 });
+  }
+
+  const env = { ...process.env, ...overrides };
+  const originalPath = environmentValue(env, 'PATH') || '';
+  for (const name of Object.keys(env)) {
+    if (name.toLowerCase() === 'path') delete env[name];
+  }
+  env.PATH = [hostileBin, originalPath].filter(Boolean).join(path.delimiter);
+  return env;
+}
+
 test('first-run smoke scrubs ambient Git, VFS, loader, and binary authority', () => {
   const env = hermeticSmokeEnv({
     sourceEnv: {
@@ -275,18 +351,25 @@ async function buildReleaseArchive(
       members.push(daemonBinaryName);
     }
     if (process.platform === 'win32') {
-      cp.execFileSync('tar', ['-a', '-c', '-f', archivePath, ...members], {
+      cp.execFileSync(
+        windowsSystemTarPath(),
+        ['-a', '-c', '-f', `../${archiveName}`, ...members],
+        { cwd: packageDir }
+      );
+    } else {
+      cp.execFileSync('/usr/bin/zip', ['-q', `../${archiveName}`, ...members], {
         cwd: packageDir
       });
-    } else {
-      cp.execFileSync('zip', ['-q', archivePath, ...members], { cwd: packageDir });
     }
   } else {
-    cp.execFileSync('tar', ['-czf', archivePath, '-C', tmpDir, assetName]);
+    cp.execFileSync('tar', ['-czf', archiveName, assetName], { cwd: tmpDir });
   }
   await fs.rm(packageDir, { recursive: true, force: true });
 
   const archiveBytes = await fs.readFile(archivePath);
+  if (platform === 'win32') {
+    assert.equal(archiveBytes.subarray(0, 4).toString('hex'), '504b0304');
+  }
   await fs.rm(archivePath, { force: true });
   const checksum = crypto.createHash('sha256').update(archiveBytes).digest('hex');
   return { archiveBytes, archiveName, checksum, kinBytes, daemonBytes };
@@ -365,10 +448,10 @@ test('ensureKinBinary installs the flat native Windows zip and .exe pair', async
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  const env = {
+  const env = await environmentWithHostileTar(tmpDir, {
     KIN_MCP_CACHE_DIR: tmpDir,
     KIN_MCP_RELEASE_BASE_URL: baseUrl
-  };
+  });
 
   try {
     const binaryPath = await ensureKinBinary({
@@ -422,20 +505,15 @@ test('ensureKinBinary fails with a precise message when the archive omits kin-da
 
 test('runKinMcp invokes kin mcp start', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-run-'));
-  const binaryPath = path.join(tmpDir, 'kin');
   const argsPath = path.join(tmpDir, 'args.txt');
-  const script = `#!/bin/sh
-printf '%s\\n' "$@" > "${argsPath}"
-`;
-
-  await fs.writeFile(binaryPath, script, { mode: 0o755 });
+  const env = await fakeKinEnvironment(tmpDir, { KIN_MCP_FAKE_LOG: argsPath });
   // Pre-create .kin/ so auto-init is skipped
   await fs.mkdir(path.join(tmpDir, '.kin'));
 
   try {
     const discard = { write() {} };
     const exitCode = await runKinMcp([], {
-      env: { KIN_MCP_KIN_BINARY: binaryPath },
+      env,
       cwd: tmpDir,
       stdout: discard,
       stderr: discard,
@@ -451,13 +529,11 @@ printf '%s\\n' "$@" > "${argsPath}"
 
 test('runKinMcp refuses implicit init when .kin/ is missing', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-no-autoinit-'));
-  const binaryPath = path.join(tmpDir, 'kin');
-  await fs.writeFile(binaryPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
   try {
     let stderr = '';
     const exitCode = await runKinMcp([], {
-      env: { KIN_MCP_KIN_BINARY: binaryPath },
+      env: { ...process.env, KIN_MCP_KIN_BINARY: process.execPath },
       cwd: tmpDir,
       stderr: { write(chunk) { stderr += chunk; } },
       stdio: 'ignore'
@@ -472,10 +548,13 @@ test('runKinMcp refuses implicit init when .kin/ is missing', async () => {
 });
 
 test('childEnv defaults the agent-default tool profile and daemon binary', () => {
-  const kinBinary = '/cache/v1/kin-linux-x86_64/kin';
+  const kinBinary = path.join(path.sep, 'cache', 'v1', 'kin-linux-x86_64', 'kin');
   const next = childEnv({}, kinBinary, 'linux');
   assert.equal(next.KIN_MCP_TOOL_PROFILE, 'agent-default');
-  assert.equal(next.KIN_DAEMON_BIN, '/cache/v1/kin-linux-x86_64/kin-daemon');
+  assert.equal(
+    next.KIN_DAEMON_BIN,
+    path.join(path.dirname(kinBinary), 'kin-daemon')
+  );
 });
 
 test('childEnv respects an explicit tool profile and daemon override', () => {
@@ -501,18 +580,16 @@ test('childEnv does not pin the daemon when a user supplies their own kin binary
 
 test('runKinMcp forwards the agent-default profile to kin mcp start', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-profile-'));
-  const binaryPath = path.join(tmpDir, 'kin');
   const profilePath = path.join(tmpDir, 'profile.txt');
-  const script = `#!/bin/sh
-printf '%s' "$KIN_MCP_TOOL_PROFILE" > "${profilePath}"
-`;
-  await fs.writeFile(binaryPath, script, { mode: 0o755 });
+  const env = await fakeKinEnvironment(tmpDir, {
+    KIN_MCP_FAKE_PROFILE: profilePath
+  });
   await fs.mkdir(path.join(tmpDir, '.kin'));
 
   try {
     const discard = { write() {} };
     const exitCode = await runKinMcp([], {
-      env: { KIN_MCP_KIN_BINARY: binaryPath },
+      env,
       cwd: tmpDir,
       stdout: discard,
       stderr: discard,
@@ -553,22 +630,15 @@ test('runKinMcp emits a guided fix when no binary can be provisioned', async () 
 
 test('runKinMcp auto-inits when explicitly allowed', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-autoinit-'));
-  const binaryPath = path.join(tmpDir, 'kin');
   const logPath = path.join(tmpDir, 'calls.txt');
-  await fs.writeFile(
-    binaryPath,
-    [
-      '#!/bin/sh',
-      `printf '%s\\n' "$@" >> "${logPath}"`,
-      `if [ "$1" = "init" ]; then mkdir -p "${tmpDir}/.kin"; fi`,
-      ''
-    ].join('\n'),
-    { mode: 0o755 }
-  );
+  const env = await fakeKinEnvironment(tmpDir, {
+    KIN_MCP_AUTO_INIT: '1',
+    KIN_MCP_FAKE_LOG: logPath
+  });
 
   try {
     const exitCode = await runKinMcp([], {
-      env: { KIN_MCP_KIN_BINARY: binaryPath, KIN_MCP_AUTO_INIT: '1' },
+      env,
       cwd: tmpDir,
       stdio: 'ignore'
     });
@@ -589,7 +659,6 @@ test('auto-init keeps MCP stdout protocol-only from process start', async () => 
   const tmpDir = await fs.mkdtemp(
     path.join(os.tmpdir(), 'kin-mcp-autoinit-protocol-')
   );
-  const binaryPath = path.join(tmpDir, 'kin');
   const protocolPayload = JSON.stringify({
     jsonrpc: '2.0',
     id: 1,
@@ -597,21 +666,12 @@ test('auto-init keeps MCP stdout protocol-only from process start', async () => 
   });
   const protocolFrame =
     `Content-Length: ${Buffer.byteLength(protocolPayload)}\r\n\r\n${protocolPayload}`;
-  await fs.writeFile(
-    binaryPath,
-    [
-      '#!/bin/sh',
-      'if [ "$1" = "init" ]; then',
-      "  printf '%s\\n' 'init stdout must leave the protocol channel'",
-      "  printf '%s\\n' 'init stderr remains diagnostic' >&2",
-      `  mkdir -p "${tmpDir}/.kin"`,
-      '  exit 0',
-      'fi',
-      `printf '%s' '${protocolFrame}'`,
-      ''
-    ].join('\n'),
-    { mode: 0o755 }
-  );
+  const env = await fakeKinEnvironment(tmpDir, {
+    KIN_MCP_AUTO_INIT: '1',
+    KIN_MCP_FAKE_INIT_STDOUT: 'init stdout must leave the protocol channel\n',
+    KIN_MCP_FAKE_INIT_STDERR: 'init stderr remains diagnostic\n',
+    KIN_MCP_FAKE_PROTOCOL_BASE64: Buffer.from(protocolFrame).toString('base64')
+  });
 
   try {
     const result = cp.spawnSync(
@@ -620,11 +680,7 @@ test('auto-init keeps MCP stdout protocol-only from process start', async () => 
       {
         cwd: tmpDir,
         encoding: 'utf8',
-        env: {
-          ...process.env,
-          KIN_MCP_KIN_BINARY: binaryPath,
-          KIN_MCP_AUTO_INIT: '1'
-        }
+        env
       }
     );
 

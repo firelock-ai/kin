@@ -353,6 +353,53 @@ export function installNotifierBundle(root, env, platform, log) {
   return src ? installNotifierBundleSource(src, env) : false;
 }
 
+function mergeEnvironment(base, overrides) {
+  const merged = { ...base };
+  for (const [name, value] of Object.entries(overrides || {})) {
+    for (const inherited of Object.keys(merged)) {
+      if (inherited.toLowerCase() === name.toLowerCase()) {
+        delete merged[inherited];
+      }
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
+function environmentValue(env, name) {
+  const key = Object.keys(env).find(
+    (candidate) => candidate.toLowerCase() === name.toLowerCase(),
+  );
+  return key === undefined ? undefined : env[key];
+}
+
+function windowsSystemTarPath(env) {
+  const systemRoot = environmentValue(env, 'SystemRoot');
+  if (!systemRoot) {
+    throw new Error('native Windows ZIP extraction requires SystemRoot');
+  }
+  return path.win32.join(systemRoot, 'System32', 'tar.exe');
+}
+
+function archiveExtraction(platform, env, file) {
+  if (platform === 'win32') {
+    if (process.platform === 'win32') {
+      return {
+        executable: windowsSystemTarPath(env),
+        args: ['-xf', file, '-C', '.'],
+      };
+    }
+    // Cross-target tests on Unix exercise genuine ZIP bytes with the host's
+    // deterministic system unzip. Production never installs Windows assets
+    // on a Unix host.
+    return {
+      executable: '/usr/bin/unzip',
+      args: ['-q', file, '-d', '.'],
+    };
+  }
+  return { executable: 'tar', args: ['-xf', file, '-C', '.'] };
+}
+
 /**
  * Download, verify, and install the pinned Kin release. Returns the installed
  * managed `kin` path. Mirrors scripts/install.sh: kin + kin-daemon are
@@ -402,11 +449,20 @@ export async function provision(version, opts = {}) {
       );
     }
 
-    // bsdtar reads both .tar.gz and .zip with -xf, on macOS, Linux, and
-    // Windows 10+ (tar.exe ships in System32).
-    const tar = spawnSync('tar', ['-xf', archivePath, '-C', tmp], { encoding: 'utf8' });
-    if (tar.status !== 0) {
-      throw new Error(`archive extraction failed: ${tar.stderr || tar.error?.message || 'tar exited non-zero'}`);
+    const toolEnv = mergeEnvironment(process.env, env);
+    const extraction = archiveExtraction(platform, toolEnv, file);
+    // Windows authority is the absolute System32 bsdtar, never a Git/MSYS or
+    // user-provided `tar` found through PATH. Relative operands also avoid the
+    // GNU remote-host interpretation of `C:\\...` paths.
+    const extracted = spawnSync(extraction.executable, extraction.args, {
+      cwd: tmp,
+      encoding: 'utf8',
+      env: toolEnv,
+    });
+    if (extracted.status !== 0) {
+      throw new Error(
+        `archive extraction failed: ${extracted.stderr || extracted.error?.message || 'extractor exited non-zero'}`,
+      );
     }
 
     const root = extractionRoot(tmp);

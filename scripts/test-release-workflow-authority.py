@@ -36,6 +36,11 @@ MCP_TOOLS_DOC = ROOT / "docs" / "mcp-tools.md"
 LLMS_DOC = ROOT / "llms.txt"
 NPM_CANONICAL_README = ROOT / "packages" / "kin" / "README.md"
 NPM_MCP_README = ROOT / "packages" / "kin-mcp" / "README.md"
+WINDOWS_NPM_PROOF = ROOT / "scripts" / "prove-windows-npm-first-run.mjs"
+CANONICAL_NPM_PROVISION = ROOT / "packages" / "kin" / "lib" / "provision.mjs"
+CANONICAL_NPM_PROVISION_TEST = ROOT / "packages" / "kin" / "test" / "provision.test.mjs"
+COMPAT_NPM_PROVISION = ROOT / "packages" / "kin-mcp" / "src" / "index.js"
+COMPAT_NPM_PROVISION_TEST = ROOT / "packages" / "kin-mcp" / "test" / "index.test.js"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 PREPARE_RELEASE = ROOT / "scripts" / "prepare-release.mjs"
@@ -2602,6 +2607,164 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
         blocks[job] = jobs[match.start() : end].rstrip()
     return blocks
+
+
+def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
+    """Require both public npm surfaces to pass a real native Windows first run.
+
+    Unit tests on Linux can prove package policy, but not Windows executable
+    names or sibling-daemon discovery. Keep the canonical package, compatibility
+    wrapper, built binary pair, and PATH-free runtime exercise in one required
+    Windows job so none can be inferred from the others.
+    """
+
+    active_job_lines = active_lines(ci_job)
+    active_job = "\n".join(active_job_lines)
+    for command in (
+        "npm test --prefix ./packages/kin",
+        "npm run lint --prefix ./packages/kin",
+        "npm test --prefix ./packages/kin-mcp",
+        "npm run lint --prefix ./packages/kin-mcp",
+    ):
+        if command not in active_job_lines:
+            raise AssertionError(
+                "native Windows npm first-run CI proof is missing exact command: "
+                f"{command}"
+            )
+    for policy in (
+        "actions/setup-node@v7",
+        "node-version: 20",
+        "Test both public npm surfaces on native Windows",
+        "node --check ./scripts/prove-windows-npm-first-run.mjs",
+        "MCP Windows sibling daemon discovery",
+        "daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path",
+        "-p kin-mcp --no-default-features --lib",
+        "Build the Windows binaries the admission and npm assertions drive",
+        "-p kin-cli -p kin-daemon --no-default-features",
+        "--bin kin --bin kin-daemon",
+        "Prove both npm surfaces from built Windows binaries",
+        "KIN_NPM_PROOF_KIN_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin.exe",
+        "KIN_NPM_PROOF_DAEMON_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin-daemon.exe",
+        "node ./scripts/prove-windows-npm-first-run.mjs",
+    ):
+        require(active_job, policy, "native Windows npm first-run CI proof")
+
+    npm_tests = active_job.index("npm test --prefix ./packages/kin")
+    binary_build = active_job.index(
+        "Build the Windows binaries the admission and npm assertions drive"
+    )
+    runtime_proof = active_job.index(
+        "Prove both npm surfaces from built Windows binaries"
+    )
+    if not npm_tests < binary_build < runtime_proof:
+        raise AssertionError(
+            "native Windows npm proof must run package tests before building the "
+            "exact binaries its first-run integration drives"
+        )
+
+    active_proof = "\n".join(active_lines(proof_source))
+    for policy in (
+        "if (process.platform !== 'win32' && !hostOverride) {",
+        "requireBuiltBinary('KIN_NPM_PROOF_KIN_BIN', expectedKinName)",
+        "requireBuiltBinary('KIN_NPM_PROOF_DAEMON_BIN', expectedDaemonName)",
+        "await copyExecutable(builtKin, managedKin)",
+        "await copyExecutable(builtDaemon, managedDaemon)",
+        "writeLauncherStamp(targetKinVersion(), { KIN_HOME: kinHome })",
+        "setEnv(env, 'KIN_NO_PROVISION', '1')",
+        "deleteEnv(env, 'KIN_DAEMON_BIN')",
+        "assertPathExcludes(env, path.dirname(managedKin), '@kinlab/kin')",
+        "assert.ok(path.isAbsolute(managedKin), '@kinlab/kin managed binary must be absolute')",
+        "[canonicalKinLauncher, 'status', '--json']",
+        "[canonicalKinLauncher, 'search', 'greet', '--json']",
+        "launcher: canonicalMcpLauncher",
+        "setEnv(env, 'KIN_MCP_AUTO_INIT', '1')",
+        "launcher: compatibilityMcpLauncher",
+        "name: 'semantic_search'",
+        "assert.match(rendered, /greet/i",
+        "assert.match(rendered, /main\\.rs/i",
+        "['daemon', 'stop', '--all', '--json']",
+    ):
+        require(active_proof, policy, "native Windows npm first-run harness")
+
+    canonical_start = proof_source.index("async function proveCanonical(")
+    compatibility_start = proof_source.index(
+        "async function proveCompatibility(", canonical_start
+    )
+    canonical = "\n".join(
+        active_lines(proof_source[canonical_start:compatibility_start])
+    )
+    if re.search(r"setEnv\(env, ['\"]KIN_DAEMON_BIN['\"]", canonical):
+        raise AssertionError(
+            "canonical Windows npm proof must not inject KIN_DAEMON_BIN; the "
+            "absolute managed kin.exe must discover its sibling daemon"
+        )
+    for policy in (
+        "const hostilePath = [managedBinDir, readEnv(process.env, 'PATH') || '']",
+        "setEnv(env, 'PATH', pathWithoutDirectory(hostilePath, managedBinDir))",
+    ):
+        require(active_proof, policy, "non-vacuous PATH-free Windows npm proof")
+
+
+def assert_windows_npm_archive_authority(
+    canonical_source: str,
+    canonical_test: str,
+    compatibility_source: str,
+    compatibility_test: str,
+) -> None:
+    """Pin real-ZIP extraction to Windows system authority in both packages."""
+
+    for label, source, end_marker in (
+        (
+            "canonical npm provisioner",
+            canonical_source,
+            "/**\n * Download, verify, and install the pinned Kin release.",
+        ),
+        (
+            "compatibility npm provisioner",
+            compatibility_source,
+            "async function installFromArchive(",
+        ),
+    ):
+        start = source.index("function archiveExtraction(")
+        end = source.index(end_marker, start)
+        extraction = "\n".join(active_lines(source[start:end]))
+        require(
+            "\n".join(active_lines(source)),
+            "path.win32.join(systemRoot, 'System32', 'tar.exe')",
+            f"{label} absolute System32 extraction authority",
+        )
+        for policy in (
+            "if (platform === 'win32') {",
+            "if (process.platform === 'win32') {",
+            "executable: windowsSystemTarPath(env)",
+            "executable: '/usr/bin/unzip'",
+        ):
+            require(extraction, policy, f"{label} Windows ZIP extraction authority")
+
+    for label, test_source, test_name in (
+        (
+            "canonical npm provisioner",
+            canonical_test,
+            "provision uses deterministic Windows ZIP extraction under a hostile PATH",
+        ),
+        (
+            "compatibility npm provisioner",
+            compatibility_test,
+            "ensureKinBinary installs the flat native Windows zip and .exe pair",
+        ),
+    ):
+        active_test = "\n".join(active_lines(test_source))
+        for policy in (
+            test_name,
+            "environmentWithHostileTar",
+            "process.platform === 'win32' ? 'tar.exe' : 'tar'",
+            "env.PATH = [hostileBin, originalPath]",
+            "windowsSystemTarPath()",
+            "'/usr/bin/zip'",
+            "subarray(0, 4).toString('hex')",
+            "'504b0304'",
+        ):
+            require(active_test, policy, f"{label} genuine Windows ZIP regression")
 
 
 def job_top_level_mapping_fields(job: str) -> list[tuple[str, str]]:
@@ -7114,6 +7277,162 @@ def main() -> None:
         require(windows_admission, policy, "Windows admission contract assertions")
 
     ci_jobs = workflow_job_blocks(ci_workflow)
+    windows_npm_proof = WINDOWS_NPM_PROOF.read_text(encoding="utf-8")
+    assert_windows_npm_first_run_proof(
+        ci_jobs["windows-authority-tests"], windows_npm_proof
+    )
+    canonical_npm_provision = CANONICAL_NPM_PROVISION.read_text(encoding="utf-8")
+    canonical_npm_provision_test = CANONICAL_NPM_PROVISION_TEST.read_text(
+        encoding="utf-8"
+    )
+    compat_npm_provision = COMPAT_NPM_PROVISION.read_text(encoding="utf-8")
+    compat_npm_provision_test = COMPAT_NPM_PROVISION_TEST.read_text(
+        encoding="utf-8"
+    )
+    assert_windows_npm_archive_authority(
+        canonical_npm_provision,
+        canonical_npm_provision_test,
+        compat_npm_provision,
+        compat_npm_provision_test,
+    )
+    for label, canonical_source, canonical_test, compat_source, compat_test, expected in (
+        (
+            "canonical npm Windows extraction falls back to PATH tar",
+            canonical_npm_provision.replace(
+                "path.win32.join(systemRoot, 'System32', 'tar.exe')", "'tar'", 1
+            ),
+            canonical_npm_provision_test,
+            compat_npm_provision,
+            compat_npm_provision_test,
+            "absolute System32 extraction authority",
+        ),
+        (
+            "compatibility npm Windows extraction falls back to PATH tar",
+            canonical_npm_provision,
+            canonical_npm_provision_test,
+            compat_npm_provision.replace(
+                "path.win32.join(systemRoot, 'System32', 'tar.exe')", "'tar'", 1
+            ),
+            compat_npm_provision_test,
+            "absolute System32 extraction authority",
+        ),
+        (
+            "canonical npm Windows fixture stops proving real ZIP bytes",
+            canonical_npm_provision,
+            canonical_npm_provision_test.replace("'504b0304'", "'00000000'", 1),
+            compat_npm_provision,
+            compat_npm_provision_test,
+            "genuine Windows ZIP regression",
+        ),
+        (
+            "compatibility npm Windows fixture stops proving real ZIP bytes",
+            canonical_npm_provision,
+            canonical_npm_provision_test,
+            compat_npm_provision,
+            compat_npm_provision_test.replace("'504b0304'", "'00000000'", 1),
+            "genuine Windows ZIP regression",
+        ),
+        (
+            "canonical npm ZIP proof loses its hostile PATH",
+            canonical_npm_provision,
+            canonical_npm_provision_test.replace(
+                "env.PATH = [hostileBin, originalPath]",
+                "env.PATH = originalPath",
+                1,
+            ),
+            compat_npm_provision,
+            compat_npm_provision_test,
+            "genuine Windows ZIP regression",
+        ),
+        (
+            "compatibility npm ZIP proof loses its hostile PATH",
+            canonical_npm_provision,
+            canonical_npm_provision_test,
+            compat_npm_provision,
+            compat_npm_provision_test.replace(
+                "env.PATH = [hostileBin, originalPath]",
+                "env.PATH = originalPath",
+                1,
+            ),
+            "genuine Windows ZIP regression",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda canonical_source=canonical_source,
+            canonical_test=canonical_test,
+            compat_source=compat_source,
+            compat_test=compat_test: assert_windows_npm_archive_authority(
+                canonical_source,
+                canonical_test,
+                compat_source,
+                compat_test,
+            ),
+        )
+    for label, mutated_job, mutated_proof, expected in (
+        (
+            "canonical npm tests disappear from native Windows",
+            ci_jobs["windows-authority-tests"].replace(
+                "          npm test --prefix ./packages/kin\n", "", 1
+            ),
+            windows_npm_proof,
+            "native Windows npm first-run CI proof",
+        ),
+        (
+            "MCP sibling daemon discovery is compiled but never executed on Windows",
+            ci_jobs["windows-authority-tests"].replace(
+                "          run_required_exact \"MCP Windows sibling daemon discovery\" \\\n"
+                "            \"daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path\" \\\n"
+                "            --locked --target x86_64-pc-windows-msvc \\\n"
+                "            -p kin-mcp --no-default-features --lib\n",
+                "",
+                1,
+            ),
+            windows_npm_proof,
+            "native Windows npm first-run CI proof",
+        ),
+        (
+            "canonical runtime regains a KIN_DAEMON_BIN rescue",
+            ci_jobs["windows-authority-tests"],
+            windows_npm_proof.replace(
+                "  deleteEnv(env, 'KIN_DAEMON_BIN');\n"
+                "  assert.equal(readEnv(env, 'KIN_DAEMON_BIN'), undefined);\n"
+                "  assertPathExcludes(env, path.dirname(managedKin), '@kinlab/kin');\n",
+                "  setEnv(env, 'KIN_DAEMON_BIN', managedDaemon);\n"
+                "  assertPathExcludes(env, path.dirname(managedKin), '@kinlab/kin');\n",
+                1,
+            ),
+            "must not inject KIN_DAEMON_BIN",
+        ),
+        (
+            "canonical runtime stops proving daemon-backed status",
+            ci_jobs["windows-authority-tests"],
+            windows_npm_proof.replace(
+                "[canonicalKinLauncher, 'status', '--json']",
+                "[canonicalKinLauncher, '--version']",
+                1,
+            ),
+            "native Windows npm first-run harness",
+        ),
+        (
+            "compatibility wrapper is inferred from the canonical MCP entrypoint",
+            ci_jobs["windows-authority-tests"],
+            windows_npm_proof.replace(
+                "launcher: compatibilityMcpLauncher",
+                "launcher: canonicalMcpLauncher",
+                1,
+            ),
+            "native Windows npm first-run harness",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated_job=mutated_job, mutated_proof=mutated_proof: (
+                assert_windows_npm_first_run_proof(mutated_job, mutated_proof)
+            ),
+        )
     for job_id in ("windows-authority-tests", "windows-installer"):
         for policy in (
             "- name: Assert the Windows admission contract",
@@ -7153,7 +7472,7 @@ def main() -> None:
         "pull-request Windows admission proof",
     )
     for policy in (
-        "- name: Test native Windows MCP wrapper provisioning",
+        "- name: Test both public npm surfaces on native Windows",
         "npm test --prefix ./packages/kin-mcp",
         "npm run lint --prefix ./packages/kin-mcp",
     ):

@@ -120,6 +120,38 @@ test('downloadToFile writes each chunk before pulling the next and never buffers
 // containing the archive layout install.sh documents: a kin-* subdirectory
 // with kin + kin-daemon. The fake fetch serves those bytes; no network.
 
+function environmentValue(env, name) {
+  const key = Object.keys(env).find(
+    (candidate) => candidate.toLowerCase() === name.toLowerCase(),
+  );
+  return key === undefined ? undefined : env[key];
+}
+
+function windowsSystemTarPath(env = process.env) {
+  const systemRoot = environmentValue(env, 'SystemRoot');
+  assert.ok(systemRoot, 'native Windows ZIP fixtures require SystemRoot');
+  return path.win32.join(systemRoot, 'System32', 'tar.exe');
+}
+
+function environmentWithHostileTar(work, overrides = {}) {
+  const hostileBin = path.join(work, 'hostile-path');
+  fs.mkdirSync(hostileBin, { recursive: true });
+  const hostileTar = path.join(hostileBin, process.platform === 'win32' ? 'tar.exe' : 'tar');
+  if (process.platform === 'win32') {
+    fs.copyFileSync(process.execPath, hostileTar);
+  } else {
+    fs.writeFileSync(hostileTar, '#!/bin/sh\nexit 97\n', { mode: 0o755 });
+  }
+
+  const env = { ...process.env, ...overrides };
+  const originalPath = environmentValue(env, 'PATH') || '';
+  for (const name of Object.keys(env)) {
+    if (name.toLowerCase() === 'path') delete env[name];
+  }
+  env.PATH = [hostileBin, originalPath].filter(Boolean).join(path.delimiter);
+  return env;
+}
+
 function makeFixture({
   withDaemon = true,
   streamArchive = false,
@@ -146,7 +178,8 @@ function makeFixture({
     }
   }
   const archivePath = path.join(work, 'kin-macos-aarch64.tar.gz');
-  const tar = spawnSync('tar', ['-czf', archivePath, '-C', work, 'kin-macos-aarch64'], {
+  const tar = spawnSync('tar', ['-czf', path.basename(archivePath), 'kin-macos-aarch64'], {
+    cwd: work,
     encoding: 'utf8',
   });
   assert.equal(tar.status, 0, tar.stderr);
@@ -180,6 +213,47 @@ function makeFixture({
   return { work, bytes, sha, fetchImpl };
 }
 
+function makeWindowsFixture() {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-windows-fixture-'));
+  const stage = path.join(work, 'stage');
+  const archiveName = 'kin-windows-x86_64.zip';
+  const archivePath = path.join(work, archiveName);
+  const kinBytes = Buffer.from('native windows kin fixture');
+  const daemonBytes = Buffer.from('native windows daemon fixture');
+  fs.mkdirSync(stage, { recursive: true });
+  fs.writeFileSync(path.join(stage, 'kin.exe'), kinBytes);
+  fs.writeFileSync(path.join(stage, 'kin-daemon.exe'), daemonBytes);
+
+  if (process.platform === 'win32') {
+    const zipped = spawnSync(
+      windowsSystemTarPath(),
+      ['-a', '-c', '-f', `../${archiveName}`, 'kin.exe', 'kin-daemon.exe'],
+      { cwd: stage, encoding: 'utf8' },
+    );
+    assert.equal(zipped.status, 0, zipped.stderr);
+  } else {
+    const zipped = spawnSync(
+      '/usr/bin/zip',
+      ['-q', `../${archiveName}`, 'kin.exe', 'kin-daemon.exe'],
+      { cwd: stage, encoding: 'utf8' },
+    );
+    assert.equal(zipped.status, 0, zipped.stderr);
+  }
+
+  const bytes = fs.readFileSync(archivePath);
+  assert.equal(bytes.subarray(0, 4).toString('hex'), '504b0304');
+  const sha = `${sha256Hex(bytes)}  ${archiveName}\n`;
+  const fetchImpl = async (url) => {
+    const body = url.endsWith('.sha256') ? Buffer.from(sha) : bytes;
+    return {
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    };
+  };
+  return { work, fetchImpl, kinBytes, daemonBytes };
+}
+
 test('provision verifies, installs kin + kin-daemon, and stamps the version', async () => {
   const { work, fetchImpl } = makeFixture();
   const home = path.join(work, 'kin-home');
@@ -197,6 +271,27 @@ test('provision verifies, installs kin + kin-daemon, and stamps the version', as
   assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
   assert.equal(readLauncherStamp(env), '9.9.9');
   fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision uses deterministic Windows ZIP extraction under a hostile PATH', async () => {
+  const { work, fetchImpl, kinBytes, daemonBytes } = makeWindowsFixture();
+  const home = path.join(work, 'kin-home');
+  const env = environmentWithHostileTar(work, { KIN_HOME: home });
+  try {
+    const installed = await provision('9.9.9', {
+      env,
+      platform: 'win32',
+      arch: 'x64',
+      fetchImpl,
+      log: () => {},
+    });
+    assert.equal(installed, path.join(home, 'bin', 'kin.exe'));
+    assert.deepEqual(fs.readFileSync(installed), kinBytes);
+    assert.deepEqual(fs.readFileSync(path.join(home, 'bin', 'kin-daemon.exe')), daemonBytes);
+    assert.equal(readLauncherStamp(env), '9.9.9');
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 });
 
 test('provision streams live archive byte and percent progress without touching checksum semantics', async () => {
