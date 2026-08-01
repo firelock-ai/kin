@@ -92,6 +92,7 @@ def check_product_wiring() -> None:
         "[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead",
         'Write-Progress -Activity "Downloading $ArchiveName"',
         "-ShowProgress:$ShowArchiveProgress",
+        "Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue",
         "function Resolve-ArchiveChecksum",
         "$Filename -cne $ArchiveName",
         "$UniqueHashes.Count -gt 1",

@@ -262,6 +262,7 @@ Write-Info "Downloading $Archive..."
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "kin-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 
+try {
 # `irm ... | iex` still has a real ConsoleHost, so first installs launched from
 # the documented one-liner get live byte/percent feedback. Redirected and CI
 # hosts skip progress records while preserving the exact same download bytes.
@@ -415,7 +416,12 @@ if ($env:KIN_NO_SETUP -eq "1") {
 
 # ── Cleanup ─────────────────────────────────────────────────────────────
 
-Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+} finally {
+    # `finally` runs for success, terminating errors, and every `exit` above.
+    # Cleanup remains best-effort so a filesystem cleanup error cannot replace
+    # the installer failure that the caller actually needs to diagnose.
+    Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
 Write-Ok "Done! Restart your terminal to get started."
