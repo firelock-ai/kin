@@ -86,8 +86,15 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: false,
             class: NegativeClass::Structural,
         },
+        // The neighborhood always returns the focal itself, so an empty
+        // `entities` says the focal is not in the graph rather than that it has
+        // no neighbors, and for an indexed entity the list is never empty at
+        // all. Every neighbor is discovered by traversing an edge, so the
+        // emitted edge set is what "no neighbors" actually reads. `subject` and
+        // `kind` here are the merged-walk defaults; [`negative_for`] narrows
+        // both to the direction the traversal was asked for.
         "graph_neighborhood" => RetrievalSpec {
-            field: "entities",
+            field: "relations",
             kind: "no_neighbors",
             subject: "the entity has no graph neighbors at the requested depth",
             always: false,
@@ -170,10 +177,37 @@ fn coverage_value(envelope: &Envelope) -> Value {
     }
 }
 
+/// What an empty neighborhood means for the side that was actually walked.
+/// Direction became a parameter when the traversal stopped being outgoing-only,
+/// and an absence inherits it: an incoming-only walk that comes back empty is
+/// evidence about dependents and says nothing about the focal's dependencies.
+/// A payload without a direction gets the unnarrowed wording rather than a
+/// guess.
+fn neighborhood_absence_subject(payload: &Value) -> Option<&'static str> {
+    match payload.get("direction").and_then(Value::as_str)? {
+        "in" => Some(
+            "the entity has no dependents at the requested depth; its dependencies were not walked",
+        ),
+        "out" => Some(
+            "the entity has no dependencies at the requested depth; its dependents were not walked",
+        ),
+        "both" => {
+            Some("the entity has no graph neighbors in either direction at the requested depth")
+        }
+        _ => None,
+    }
+}
+
 /// A human sentence spelling out "absent as-of X, coverage Y%, degraded Z" and
 /// the actionable consequence, so the negative is legible without cross-reading
-/// the envelope.
-fn build_advice(spec: &RetrievalSpec, envelope: &Envelope, trustworthy: bool) -> String {
+/// the envelope. `subject` is passed rather than read off `spec` because a tool
+/// may narrow its own framing before the advice is built.
+fn build_advice(
+    spec: &RetrievalSpec,
+    subject: &str,
+    envelope: &Envelope,
+    trustworthy: bool,
+) -> String {
     let as_of = match &envelope.graph_as_of {
         Some(value) => format!("graph as-of {value}"),
         None => "an unversioned graph snapshot".to_string(),
@@ -205,10 +239,7 @@ fn build_advice(spec: &RetrievalSpec, envelope: &Envelope, trustworthy: bool) ->
         "Absence is NOT authoritative: do not conclude the target is unused or deletable — an empty result may mean 'not indexed'. Re-check after embedding is complete and the daemon is healthy."
     };
 
-    format!(
-        "{}, against {as_of} with {coverage} and {degraded}. {consequence}",
-        spec.subject
-    )
+    format!("{subject}, against {as_of} with {coverage} and {degraded}. {consequence}")
 }
 
 /// True when `payload.focal_entity.kind` is a method — the entity kind whose
@@ -403,6 +434,37 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         }
     }
 
+    // An empty edge set has two readings with opposite consequences: a focal
+    // that is in the graph and genuinely has nothing on the side that was
+    // walked, and a focal the walk never found. Only the first is evidence
+    // about the entity — certifying the second as isolation answers a question
+    // the traversal never reached.
+    let mut kind = spec.kind;
+    let mut subject = spec.subject;
+    if tool == "graph_neighborhood" {
+        // The emitted edge array is capped by the caller's `limit`, and a
+        // `limit` of zero empties it while the walk still found neighbors. The
+        // pre-truncation total is what decides whether anything was there, so a
+        // truncated answer is never dressed up as an absence.
+        if payload
+            .get("relation_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > 0)
+        {
+            return None;
+        }
+        if payload.get("entity_count").and_then(Value::as_u64) == Some(0) {
+            kind = "focal_not_in_graph";
+            subject = "the focal entity is not in the graph, so no neighborhood was walked";
+            trustworthy = false;
+            trust_reason = "focal_not_in_graph: the focal entity was not found, so an empty \
+                 neighborhood is not evidence that it is isolated"
+                .to_string();
+        } else if let Some(directional) = neighborhood_absence_subject(payload) {
+            subject = directional;
+        }
+    }
+
     let interpretation = if spec.always {
         "qualified_verdicts"
     } else {
@@ -410,8 +472,8 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     };
 
     let mut negative = Map::new();
-    negative.insert("kind".to_string(), json!(spec.kind));
-    negative.insert("subject".to_string(), json!(spec.subject));
+    negative.insert("kind".to_string(), json!(kind));
+    negative.insert("subject".to_string(), json!(subject));
     negative.insert("result_count".to_string(), json!(count));
     negative.insert("interpretation".to_string(), json!(interpretation));
     negative.insert("safe_to_conclude_absent".to_string(), json!(trustworthy));
@@ -435,7 +497,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     );
     negative.insert(
         "advice".to_string(),
-        json!(build_advice(&spec, envelope, trustworthy)),
+        json!(build_advice(&spec, subject, envelope, trustworthy)),
     );
     Some(Value::Object(negative))
 }
@@ -828,6 +890,137 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("has_references: false"));
+    }
+
+    /// A neighborhood payload for a focal that was found, carrying `count`
+    /// neighbors reached over `count` edges in `direction`.
+    fn neighborhood_payload(direction: &str, count: usize) -> Value {
+        let focal = "00000000-0000-0000-0000-000000000001";
+        let mut entities = vec![json!({ "id": focal, "name": "focal" })];
+        let mut relations = Vec::new();
+        for index in 0..count {
+            entities.push(json!({ "id": focal, "name": format!("neighbor{index}") }));
+            relations.push(json!({ "src": focal, "dst": focal, "direction": "outgoing" }));
+        }
+        json!({
+            "focal_id": focal,
+            "direction": direction,
+            "entity_count": entities.len(),
+            "relation_count": relations.len(),
+            "entities": entities,
+            "relations": relations,
+        })
+    }
+
+    /// The neighborhood always returns the focal itself, so keying its absence
+    /// on the entity list meant the qualifier the tool's own description
+    /// promises never fired for an entity that is in the graph — the only case
+    /// an agent asks "is this really isolated?" about.
+    #[test]
+    fn neighborhood_with_no_neighbors_is_qualified() {
+        let payload = neighborhood_payload("both", 0);
+        let negative = negative_for("graph_neighborhood", &payload, &structural_ready_envelope())
+            .expect("an indexed focal with no neighbors must carry a negative");
+        assert_eq!(negative["kind"], json!("no_neighbors"));
+        assert_eq!(negative["result_count"], json!(0));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+    }
+
+    /// One neighbor is not an absence, whichever side it sits on.
+    #[test]
+    fn neighborhood_with_a_neighbor_gets_no_negative() {
+        let payload = neighborhood_payload("both", 1);
+        assert!(
+            negative_for("graph_neighborhood", &payload, &structural_ready_envelope()).is_none()
+        );
+    }
+
+    /// Since the traversal became directional, an empty walk is empty only on
+    /// the side that was walked: an entity with forty dependencies and no
+    /// dependents must not be handed back as having no neighbors at all.
+    #[test]
+    fn neighborhood_absence_names_the_direction_that_was_walked() {
+        let dependents = neighborhood_payload("in", 0);
+        let negative = negative_for(
+            "graph_neighborhood",
+            &dependents,
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        let subject = negative["subject"].as_str().unwrap().to_string();
+        assert!(
+            subject.contains("dependents") && !subject.contains("no graph neighbors"),
+            "an incoming-only walk must claim only dependents: {subject}"
+        );
+        assert!(
+            negative["advice"].as_str().unwrap().contains("dependents"),
+            "the advice sentence carries the same framing"
+        );
+
+        let dependencies = neighborhood_payload("out", 0);
+        let negative = negative_for(
+            "graph_neighborhood",
+            &dependencies,
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        let subject = negative["subject"].as_str().unwrap().to_string();
+        assert!(
+            subject.contains("dependencies") && !subject.contains("no graph neighbors"),
+            "an outgoing-only walk must claim only dependencies: {subject}"
+        );
+
+        let both = neighborhood_payload("both", 0);
+        let negative =
+            negative_for("graph_neighborhood", &both, &structural_ready_envelope()).unwrap();
+        assert!(
+            negative["subject"]
+                .as_str()
+                .unwrap()
+                .contains("either direction"),
+            "only a merged walk may claim both sides are empty"
+        );
+    }
+
+    /// `limit: 0` empties the edge array of a neighborhood that really has
+    /// neighbors. A truncated answer is not an absence, and the pre-truncation
+    /// total is the only thing that can tell them apart.
+    #[test]
+    fn neighborhood_truncated_to_nothing_is_not_an_absence() {
+        let mut payload = neighborhood_payload("both", 3);
+        payload["entities"] = json!([]);
+        payload["relations"] = json!([]);
+        assert!(
+            negative_for("graph_neighborhood", &payload, &structural_ready_envelope()).is_none(),
+            "a walk that found three edges must not report an absence when the caller capped the output"
+        );
+    }
+
+    /// A focal that is not in the graph produces the same empty edge set as an
+    /// isolated one. Certifying that as authoritative isolation answers a
+    /// question the walk never reached, so report the gap instead.
+    #[test]
+    fn neighborhood_absent_focal_is_a_gap_not_certified_isolation() {
+        let payload = json!({
+            "focal_id": "00000000-0000-0000-0000-000000000001",
+            "direction": "both",
+            "entity_count": 0,
+            "relation_count": 0,
+            "entities": [],
+            "relations": [],
+        });
+        let negative = negative_for("graph_neighborhood", &payload, &structural_ready_envelope())
+            .expect("a missing focal must still be qualified");
+        assert_eq!(negative["kind"], json!("focal_not_in_graph"));
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a graph that never held the focal cannot certify that it is isolated"
+        );
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("focal_not_in_graph"));
     }
 
     #[test]

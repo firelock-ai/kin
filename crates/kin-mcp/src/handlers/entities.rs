@@ -2456,7 +2456,10 @@ neighborhood stays within token budgets even at depth; when you then want to rea
 specific neighbor's implementation, follow up with get_entity_source, and when you want \
 a directional ordered chain with bodies inlined, use trace_data_flow. \
 When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
-flag says whether \"isolated, no dependencies\" is authoritative or merely \"not indexed yet\".";
+flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
+`subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
+read as \"no dependencies\". A focal that is not in the graph is reported as that gap \
+rather than as an isolated entity.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -4016,6 +4019,43 @@ mod tests {
         assert_eq!(neighborhood_names(&response), vec!["lonely"]);
         assert_eq!(response["relation_count"], 0);
         assert_eq!(response["truncated"], false);
+    }
+
+    /// The description promises that when no neighbors come back, the additive
+    /// `negative` object says whether "isolated, no dependencies" is
+    /// authoritative or merely "not indexed yet". The neighborhood always
+    /// returns the focal itself, so that promise was keyed on a list that is
+    /// never empty for an indexed entity and never arrived. Asserted end to end
+    /// through the annotation chokepoint, and on a directional walk, because an
+    /// empty `in` walk is evidence about dependents alone.
+    #[test]
+    fn graph_neighborhood_isolated_focal_carries_the_promised_negative() {
+        let store = InMemoryGraph::new();
+        let lonely = make_entity("lonely", "src/lonely.rs");
+        let lonely_id = lonely.id;
+        store.upsert_entity(&lonely).unwrap();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(lonely_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("in"));
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert_eq!(response["negative"]["kind"], "no_neighbors");
+        assert_eq!(response["negative"]["safe_to_conclude_absent"], true);
+        assert!(
+            response["negative"]["subject"]
+                .as_str()
+                .expect("the negative must carry a subject")
+                .contains("dependents"),
+            "an incoming-only walk must qualify dependents alone: {}",
+            response["negative"]
+        );
     }
 
     /// The declared tool schema must offer the parameter the handler honors,
