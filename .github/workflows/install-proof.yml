@@ -342,7 +342,353 @@ jobs:
           }, null, 2)}\n`);
           NODE
 
+      # WINDOWS COVERAGE REDUCTION, stated here so that no later reader mistakes
+      # this leg for the one it replaces.
+      #
+      # Until 2026-07-20 the Windows leg proved the same first-run surface the
+      # Unix legs still prove: a repository admitted by `kin init`, a daemon
+      # serving it, a graph query, an MCP tool call, and a validated capability
+      # report. Run 29749887140, against the promoted v0.3.6 release, is the
+      # last run in which all of that passed on windows-latest.
+      #
+      # It cannot pass now. `kin init` refuses every admission boundary on
+      # Windows, because the graph store flushes a directory the way Unix does,
+      # by reopening it and syncing, and Windows refuses that open. The refusal
+      # is not an accident: scripts/assert-windows-init-contract.sh asserts it
+      # by name on every pull request as the contract this product ships. A
+      # release gate demanding success while a required check demands refusal
+      # cannot go green on either answer, which is why this leg had no passing
+      # outcome available to it at all.
+      #
+      # So the two steps below assert the contract the product ships, in the
+      # contract's own words, and the three repository-dependent steps after
+      # them became Unix-only. Windows still proves the installer, both
+      # binaries' version, the CLI's own build provenance, every admission
+      # refusal, and the whole repo-free setup surface. It no longer proves a
+      # repository, a running daemon, a graph query, an MCP tool call, or the
+      # daemon's build provenance, which reaches `kin status` from a running
+      # daemon and so needs a repository. That is a real loss of release
+      # coverage on one platform, taken deliberately and meant to be temporary.
+      #
+      # This step is also the tripwire that ends the reduction. When the Windows
+      # transaction-layer port lands and admission succeeds again,
+      # `require_refused` fails with "unexpectedly succeeded", and whoever reads
+      # that failure should delete these two steps, drop the three
+      # `runner.os != 'Windows'` guards below, and flip the contract script back
+      # to asserting a successful admission.
+      - name: Windows admission contract proof
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The shipped Windows admission contract, in the exact words
+          # scripts/assert-windows-init-contract.sh pins on every pull request.
+          # This runner is anonymous and has no checkout, so the strings are
+          # retyped; scripts/test-release-workflow-authority.py requires them to
+          # equal that script's own variables, so wording drifting in either
+          # file fails a required check instead of quietly passing here.
+          CONFIG_REFUSAL="cannot publish repository config"
+          SOURCE_PROOF_STAGE="prove mutable Git workspace"
+          DURABLE_FLUSH_GAP="for durable metadata flush"
+          NON_EMPTY_REFUSAL="requires an empty directory"
+
+          scratch="kin-windows-admission"
+          mkdir -p "$scratch"
+
+          # Every assertion reports and the step exits once at the end. One
+          # Windows round is expensive, so stopping at the first failure would
+          # cost a second round to learn what the second boundary did.
+          failures=0
+          fail() {
+            failures=$((failures + 1))
+            echo "::error::$1"
+            echo "--- captured kin init output: $2 ---"
+            cat "$2" || true
+            echo "--- end $2 ---"
+          }
+          # `grep -c` exits 1 on zero matches, which `set -e` would otherwise
+          # treat as a fatal error rather than as the answer.
+          occurrences() {
+            grep -Fc -- "$1" "$2" || true
+          }
+          require_text() {
+            if [ "$(occurrences "$2" "$3")" -eq 0 ]; then
+              fail "$1 did not report: $2" "$3"
+            fi
+          }
+          refute_text() {
+            if [ "$(occurrences "$2" "$3")" -ne 0 ]; then
+              fail "$1 stopped at a gate this platform no longer has: $2" "$3"
+            fi
+          }
+          # Deliberately not `find`: on a Windows runner that name also belongs
+          # to System32\find.exe, whose arguments mean something else entirely,
+          # and a PATH order resolving to it would report zero for every input
+          # rather than fail. An unmatched glob stays literal here because
+          # nullglob is off, and the `-e` test rejects it.
+          count_matching() {
+            local matches=0
+            local entry
+            for entry in "$1"/$2; do
+              if [ -e "$entry" ]; then
+                matches=$((matches + 1))
+              fi
+            done
+            echo "$matches"
+          }
+          require_refused() {
+            if (cd "$2" && kin init) > "$3" 2>&1; then
+              fail "$1 unexpectedly succeeded" "$3"
+            fi
+            # A refusal publishes nothing. Both boundaries stage into a
+            # `.kin.init-<uuid>` and only move it into place at the end, so a
+            # `.kin` of any shape means a refusal published authority anyway,
+            # and a surviving stage means it did not clean up after itself.
+            if [ -e "$2/.kin" ]; then
+              fail "$1 left a half-created repository at $2/.kin" "$3"
+            fi
+            # WINDOWS CLEANUP GAP, asserted rather than assumed.
+            #
+            # The stage is a sibling of the admitted directory, not a child of
+            # it: crates/kin-core/src/git_init.rs derives it from the source's
+            # parent and crates/kin-core/src/init.rs from the working
+            # directory's, so a count taken inside the admitted directory can
+            # never see one and would report zero on every input. Each boundary
+            # therefore owns a private parent holding nothing but the directory
+            # under test, which keeps a survivor attributable to the boundary
+            # that left it.
+            #
+            # Counted where they actually appear, the two boundaries that reach
+            # the graph store DO leave their unpublished stage and its `.owner`
+            # marker behind, which is two entries each. This is post-refusal
+            # residue measured before any reaper could run: each boundary owns a
+            # freshly created parent and sees one `kin init`, and
+            # recover_orphaned_repository_stages runs against that parent before
+            # the stage exists, so it finds nothing to reap on any platform.
+            # What moves the count is refusal-time cleanup, or the
+            # transaction-layer port fixing cleanup_owned_staging_root on the
+            # failing path, where removal is best-effort against the same open
+            # handles that refuse the admission. Proving the off-unix reaper arm
+            # instead needs a second init against a parent already holding
+            # residue, which is a different fixture from this one. That is a
+            # real defect and it was invisible for as long as the count looked
+            # in the wrong place. It is asserted by exact count in both
+            # directions, so whatever finally drives it to zero trips this and
+            # has to come here and say so, exactly as a restored admission trips
+            # `require_refused` above.
+            local parent
+            parent="$(dirname "$2")"
+            local staged
+            staged="$(count_matching "$parent" '.kin.init-*')"
+            if [ "$staged" != "$4" ]; then
+              fail "$1 left $staged stage entries in $parent, expected $4" "$3"
+            fi
+          }
+
+          git_boundary="$scratch/exact-git/repo"
+          git_log="$scratch/kin-init-exact-git.txt"
+          mkdir -p "$git_boundary"
+          (
+            cd "$git_boundary"
+            git init -q
+            git config user.email ci@firelock.ai
+            git config user.name ci
+            printf 'fn probe() {}\n' > probe.rs
+            git add probe.rs
+            # Hooks and signing are neutralized for this one invocation and NOT
+            # written into the fixture's config. A recorded `core.hooksPath` is
+            # itself a local compatibility blocker that admission refuses on
+            # before it reaches the boundary under test.
+            git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
+          )
+          require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2
+          refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE" "$git_log"
+          refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL" "$git_log"
+          require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP" "$git_log"
+
+          native_boundary="$scratch/native-unborn/repo"
+          native_log="$scratch/kin-init-native-unborn.txt"
+          mkdir -p "$native_boundary"
+          require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2
+          refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL" "$native_log"
+          require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP" "$native_log"
+
+          # A capability Windows now has must not become permission to derive
+          # authority from whatever happens to be lying in the directory.
+          populated_boundary="$scratch/native-populated/repo"
+          populated_log="$scratch/kin-init-native-populated.txt"
+          mkdir -p "$populated_boundary"
+          printf 'untracked\n' > "$populated_boundary/stray.txt"
+          require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0
+          require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL" "$populated_log"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::the installed Windows release did not refuse admission as the shipped contract asserts ($failures check(s) failed)"
+            exit 1
+          fi
+          echo "Installed Windows release refused every admission boundary at the cause it names, published no authority, and left exactly the unreaped stage residue this platform is known to leave."
+
+      # What Windows still proves without a repository. This is the whole
+      # remaining first-run surface on the platform: the CLI's own build
+      # provenance bound to the release tag's public source, the platform
+      # capability posture, and the setup writers for the shell hook, the
+      # install ledger, and every agent-client MCP config a repo-free install
+      # can write, which is four of the five. `kin bench-meta` reports the CLI
+      # build alone, so the daemon's build provenance is not bound here. Codex
+      # is excluded by the product rather than by this proof, because its entry
+      # binds an exact repository, and that exclusion is asserted below.
+      - name: Windows repo-free provenance and setup proof
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PROOF_SHELL: ${{ matrix.setup-shell }}
+        run: |
+          set -euo pipefail
+          kin bench-meta --json > kin-windows-bench-meta.json
+          cat kin-windows-bench-meta.json
+          kin registry authority --json > kin-windows-registry-authority.json
+          cat kin-windows-registry-authority.json
+          # Negative control. An unsupported capability must refuse to be
+          # repaired rather than report a success it cannot deliver, so this
+          # command failing is the assertion.
+          if kin registry authority --fix > kin-windows-registry-fix.txt 2>&1; then
+            cat kin-windows-registry-fix.txt >&2
+            echo "installed Windows kin reported registry authority --fix succeeded on a platform that does not support it" >&2
+            exit 1
+          fi
+          cat kin-windows-registry-fix.txt
+
+          # Prove every supported agent-client config writer without requiring
+          # the proprietary clients on a public runner. Detection is PATH-based;
+          # which-rs follows PATHEXT on Windows, so these inert shims are real
+          # .exe copies rather than shell scripts.
+          fake_agent_bin="$RUNNER_TEMP/kin-proof-agent-bin"
+          mkdir -p "$fake_agent_bin"
+          for agent in claude cursor codex gemini windsurf; do
+            cp "$(command -v kin)" "$fake_agent_bin/$agent.exe"
+          done
+          export PATH="$fake_agent_bin:$PATH"
+
+          kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
+            2>&1 | tee kin-windows-setup.txt
+          kin setup status --json | tee kin-windows-health.json
+          kin doctor --json | tee kin-windows-doctor.json
+
+          node <<'NODE'
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+
+          const expectedCommit = fs.readFileSync("expected-commit.txt", "utf8").trim();
+          const expectedLock = fs.readFileSync("expected-lock-sha.txt", "utf8").trim();
+          const meta = JSON.parse(fs.readFileSync("kin-windows-bench-meta.json", "utf8"));
+          if (meta.kin_commit !== expectedCommit) {
+            throw new Error(`installed Windows build SHA ${meta.kin_commit ?? "missing"} does not match release tag ${expectedCommit}`);
+          }
+          if (meta.kin_dirty !== false) {
+            throw new Error("installed Windows release binary is dirty or did not report a clean build");
+          }
+          if (meta.kin_source_known !== true) {
+            throw new Error("installed Windows release binary did not prove source_known=true");
+          }
+          if (meta.dependency_provenance !== expectedLock) {
+            throw new Error(`installed Windows Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} does not match release source ${expectedLock}`);
+          }
+
+          const authority = JSON.parse(fs.readFileSync("kin-windows-registry-authority.json", "utf8"));
+          if (authority.checks?.length !== 1 || authority.checks[0]?.state !== "unsupported") {
+            throw new Error(`Windows registry authority must report exactly one unsupported capability check: ${JSON.stringify(authority.checks ?? null)}`);
+          }
+
+          const nonHealthyChecks = (report) => (report.checks ?? [])
+            .filter((check) => check.status !== "healthy")
+            .map((check) => `${check.id}=${check.status}`)
+            .join(", ") || "none";
+          // The repo-free Windows posture, pinned by name. `repo_init` is
+          // missing because there is no repository here, and `daemon_running`
+          // is unsupported because the daemon is repo-scoped. Both are the
+          // product's own documented no-repository answers, so both are
+          // required rather than tolerated: a change that turns either into
+          // something else has to come here and say so.
+          const required = new Map([
+            ["kin_binary", "healthy"],
+            ["kin_daemon_binary", "healthy"],
+            ["shell_path", "healthy"],
+            ["setup_ledger", "healthy"],
+            ["registry_authority", "unsupported"],
+            ["vfs_projection", "unsupported"],
+            ["semantic_query_readiness", "unsupported"],
+            ["daemon_running", "unsupported"],
+            ["repo_init", "missing"],
+            ["mcp_client_claude", "healthy"],
+            ["mcp_client_cursor", "healthy"],
+            ["mcp_client_gemini", "healthy"],
+            ["mcp_client_windsurf", "healthy"],
+          ]);
+
+          for (const reportPath of ["kin-windows-health.json", "kin-windows-doctor.json"]) {
+            const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+            const checks = new Map(report.checks.map((check) => [check.id, check]));
+            // Missing `repo_init` is the one degradation this repo-free posture
+            // expects, and it flips the aggregate report.healthy to false on its
+            // own. Accept that single named reason and keep every other
+            // degradation fatal, so a real regression in any other check still
+            // fails this leg.
+            const onlyMissingRepositoryBlocks = report.checks.every(
+              (check) =>
+                check.id === "repo_init" ||
+                check.status === "healthy" ||
+                check.status === "unsupported"
+            );
+            if (!onlyMissingRepositoryBlocks) {
+              throw new Error(
+                `${reportPath}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
+              );
+            }
+            for (const [id, expected] of required) {
+              const actual = checks.get(id)?.status;
+              if (actual !== expected) {
+                throw new Error(`${reportPath}: ${id} is ${actual ?? "missing"}, expected ${expected}`);
+              }
+            }
+            const hardFailures = report.checks.filter((check) =>
+              check.id !== "repo_init" &&
+              (check.status === "missing" || check.status === "misconfigured")
+            );
+            if (hardFailures.length > 0) {
+              throw new Error(`${reportPath}: hard failures: ${hardFailures.map((c) => c.id).join(", ")}`);
+            }
+            // Codex is the one agent client Kin cannot configure without a
+            // repository. Its entry binds `mcp start --repo <exact
+            // repository>`, so setup refuses it by design here and never
+            // writes the config, which drops the check from the report
+            // entirely. Asserted as an absence rather than left unmentioned,
+            // so a Codex writer that ever becomes repo-free trips this and
+            // has to come here and say so.
+            if (checks.has("mcp_client_codex")) {
+              throw new Error(
+                `${reportPath}: mcp_client_codex is present without a repository, so the repo-free Codex writer changed`
+              );
+            }
+          }
+
+          const home = os.homedir();
+          const jsonConfigs = [
+            path.join(home, ".claude.json"),
+            path.join(home, ".cursor", "mcp.json"),
+            path.join(home, ".gemini", "settings.json"),
+            path.join(home, ".codeium", "windsurf", "mcp_config.json"),
+          ];
+          for (const configPath of jsonConfigs) {
+            const entry = JSON.parse(fs.readFileSync(configPath, "utf8"))?.mcpServers?.kin;
+            if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {
+              throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
+            }
+          }
+          NODE
+
       - name: First-run repository, daemon, and setup proof
+        if: runner.os != 'Windows'
         shell: bash
         env:
           PROOF_SHELL: ${{ matrix.setup-shell }}
@@ -414,6 +760,7 @@ jobs:
           kin doctor --json | tee kin-doctor.json
 
       - name: Graph query and MCP tool-call proof
+        if: runner.os != 'Windows'
         shell: bash
         working-directory: kin-install-proof
         run: |
@@ -710,6 +1057,7 @@ jobs:
           kin locate hello --json --explain --max-files 5 | tee kin-semantic-locate.json
 
       - name: Validate installed capability proof
+        if: runner.os != 'Windows'
         shell: bash
         working-directory: kin-install-proof
         run: |
@@ -759,14 +1107,7 @@ jobs:
           if (!semanticCoverage) {
             throw new Error("kin-status.json: semantic_coverage is missing");
           }
-          if (runnerOs === "Windows") {
-            if (semanticCoverage.supported !== false || semanticCoverage.complete !== false) {
-              throw new Error("Windows vector-free status must report semantic coverage as unsupported and incomplete");
-            }
-            if ((semanticCoverage.note ?? "").includes("kin embed")) {
-              throw new Error("Windows vector-free status offers impossible kin embed remediation");
-            }
-          } else if (semanticCoverage.supported !== true) {
+          if (semanticCoverage.supported !== true) {
             throw new Error(`${runnerOs} release unexpectedly lacks semantic vector support`);
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
@@ -784,8 +1125,8 @@ jobs:
             ["repo_init", "healthy"],
             ["shell_path", "healthy"],
             ["setup_ledger", "healthy"],
-            ["registry_authority", runnerOs === "Windows" ? "unsupported" : "healthy"],
-            ["vfs_projection", runnerOs === "Windows" ? "unsupported" : "healthy"],
+            ["registry_authority", "healthy"],
+            ["vfs_projection", "healthy"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
             ["mcp_client_codex", "healthy"],
@@ -805,7 +1146,6 @@ jobs:
             // unhealthy reason fatal: any missing/misconfigured check, or any
             // other check that is neither healthy nor unsupported, still fails.
             const onlyPendingEmbeddingsBlocks =
-              runnerOs !== "Windows" &&
               checks.get("semantic_query_readiness")?.status === "stale" &&
               report.checks.every(
                 (check) =>
@@ -825,11 +1165,7 @@ jobs:
               }
             }
             const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-            if (runnerOs === "Windows") {
-              if (semanticReadiness !== "unsupported") {
-                throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected unsupported`);
-              }
-            } else if (!["healthy", "stale"].includes(semanticReadiness)) {
+            if (!["healthy", "stale"].includes(semanticReadiness)) {
               throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected healthy or stale`);
             }
             const hardFailures = report.checks.filter((check) =>
@@ -862,42 +1198,32 @@ jobs:
               throw new Error(`${configPath}: Kin MCP entry is missing or malformed`);
             }
           }
-          if (runnerOs === "Windows") {
-            const vectorDegradations = (locate.degradations ?? []).filter((entry) => entry.component === "vector_index");
-            if (vectorDegradations.length !== 1 || vectorDegradations[0].reason !== "feature_disabled") {
-              throw new Error(`Windows locate must report one feature_disabled vector degradation: ${JSON.stringify(vectorDegradations)}`);
+          const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
+          if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
+            throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
+          }
+          const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
+          if (embeddedStatus.semantic_coverage?.supported !== true || embeddedStatus.semantic_coverage?.complete !== true) {
+            throw new Error("Unix status did not prove complete semantic coverage after embedding");
+          }
+          for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
+            const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+            const readiness = report.checks?.find((check) => check.id === "semantic_query_readiness")?.status;
+            if (report.healthy !== true || readiness !== "healthy") {
+              throw new Error(
+                `${reportPath}: overall healthy=${report.healthy}; ` +
+                `semantic_query_readiness=${readiness ?? "missing"}; ` +
+                `non-healthy checks: ${nonHealthyChecks(report)}`
+              );
             }
-            if ((vectorDegradations[0].remediation ?? "").includes("kin embed")) {
-              throw new Error("Windows vector-free locate offers impossible kin embed remediation");
-            }
-          } else {
-            const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
-            if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
-              throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
-            }
-            const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
-            if (embeddedStatus.semantic_coverage?.supported !== true || embeddedStatus.semantic_coverage?.complete !== true) {
-              throw new Error("Unix status did not prove complete semantic coverage after embedding");
-            }
-            for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
-              const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-              const readiness = report.checks?.find((check) => check.id === "semantic_query_readiness")?.status;
-              if (report.healthy !== true || readiness !== "healthy") {
-                throw new Error(
-                  `${reportPath}: overall healthy=${report.healthy}; ` +
-                  `semantic_query_readiness=${readiness ?? "missing"}; ` +
-                  `non-healthy checks: ${nonHealthyChecks(report)}`
-                );
-              }
-            }
-            const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));
-            if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
-              throw new Error("semantic kin search did not return the seeded hello entity");
-            }
-            const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
-            if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
-              throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
-            }
+          }
+          const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));
+          if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
+            throw new Error("semantic kin search did not return the seeded hello entity");
+          }
+          const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
+          if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
+            throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
           }
           NODE
 
@@ -920,6 +1246,13 @@ jobs:
             release-provenance-attestation.json
             installed-vfs-provenance.json
             latest-release-url.txt
+            kin-windows-bench-meta.json
+            kin-windows-registry-authority.json
+            kin-windows-registry-fix.txt
+            kin-windows-setup.txt
+            kin-windows-health.json
+            kin-windows-doctor.json
+            kin-windows-admission/*.txt
             kin-install-proof/*.txt
             kin-install-proof/*.json
             kin-install-proof/*.log
