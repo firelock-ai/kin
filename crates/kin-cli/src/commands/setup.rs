@@ -1229,22 +1229,13 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 /// resolves the repo from the agent's working directory (or from
 /// `KIN_DAEMON_URL` when a session launch pinned one), so each agent session
 /// binds to the daemon of the repository it is actually working in.
-fn kin_mcp_entry() -> serde_json::Value {
-    // Try to resolve an absolute path from the running executable.  The
-    // installed binary lives alongside the other kin-* binaries, so
-    // current_exe() gives us the right directory.
-    let command = if let Ok(exe) = env::current_exe() {
-        // current_exe may be e.g. /Users/foo/.cargo/bin/kin — use it directly.
-        exe.to_string_lossy().into_owned()
-    } else {
-        // Fallback: bare name relying on PATH (previous behaviour).
-        "kin".to_string()
-    };
-    serde_json::json!({
+fn kin_mcp_entry() -> Result<serde_json::Value> {
+    let command = configured_mcp_launcher()?;
+    Ok(serde_json::json!({
         "command": command,
         "args": ["mcp", "start"],
         "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
-    })
+    }))
 }
 
 /// Describes an AI assistant we can auto-configure.
@@ -1368,7 +1359,7 @@ fn merge_mcp_config_with_topology(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = kin_mcp_entry();
+    let desired = kin_mcp_entry()?;
     let desired = desired
         .as_object()
         .context("generated Kin MCP entry is not an object")?;
@@ -1479,7 +1470,7 @@ fn merge_mcp_config_toml_with_topology(
     _topology: &McpTopologyLock,
 ) -> Result<()> {
     let lock = ConfigLock::acquire(path)?;
-    let entry = kin_mcp_entry();
+    let entry = kin_mcp_entry()?;
     let command = entry
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -1700,7 +1691,7 @@ fn configure_antigravity() -> Result<PathBuf> {
         .map(|target| target.path.clone())
         .collect::<Vec<_>>();
     let mut locks = ConfigLock::acquire_many(&paths)?;
-    let command = managed_mcp_launcher()?;
+    let command = configured_mcp_launcher()?;
     for (target, lock) in targets.iter().zip(&mut locks) {
         merge_json_mcp_target_locked(target, &command, lock)?;
         lock.refresh_locked_state()?;
@@ -3043,6 +3034,51 @@ pub(crate) fn managed_mcp_launcher() -> Result<String> {
         }
     }
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Resolve the stable launcher that ordinary setup, health, and doctor must
+/// agree on for the installation channel currently running Kin.
+///
+/// Managed curl/npm installs own `$KIN_HOME/bin/kin`, so that stable path wins
+/// when present. Homebrew and manual installs do not create it; for those
+/// channels, prefer the `kin` path on PATH only when it resolves to this exact
+/// running executable, then fall back to `current_exe`. The updater keeps using
+/// [`managed_mcp_launcher`] directly after it has installed managed bytes.
+pub(crate) fn configured_mcp_launcher() -> Result<String> {
+    if let Ok(managed) = managed_mcp_launcher() {
+        return Ok(managed);
+    }
+
+    let current = env::current_exe().context("could not resolve the running Kin executable")?;
+    validate_running_mcp_launcher(&current)?;
+    if let Ok(path_candidate) = which::which(if cfg!(windows) { "kin.exe" } else { "kin" }) {
+        let candidate_target = fs::canonicalize(&path_candidate).ok();
+        let current_target = fs::canonicalize(&current).ok();
+        if candidate_target.is_some() && candidate_target == current_target {
+            validate_running_mcp_launcher(&path_candidate)?;
+            return Ok(path_candidate.to_string_lossy().into_owned());
+        }
+    }
+    Ok(current.to_string_lossy().into_owned())
+}
+
+fn validate_running_mcp_launcher(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("Kin MCP launcher is not absolute: {}", path.display());
+    }
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Kin MCP launcher is unavailable at {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("Kin MCP launcher is not a file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("Kin MCP launcher is not executable: {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -10820,7 +10856,11 @@ fn merge_codex_mcp_target_locked(
     merge_mcp_config_toml_locked(&target.path, repo_root, lock, &target.id, command)
 }
 
-pub(crate) fn remerge_mcp_targets_exact(targets: &[McpRepairTarget]) -> McpRemergeOutcome {
+fn remerge_mcp_targets_with_launcher(
+    targets: &[McpRepairTarget],
+    launcher: impl FnOnce() -> Result<String>,
+    launcher_label: &str,
+) -> McpRemergeOutcome {
     let _topology = match McpTopologyLock::acquire() {
         Ok(topology) => topology,
         Err(error) => {
@@ -10845,11 +10885,13 @@ pub(crate) fn remerge_mcp_targets_exact(targets: &[McpRepairTarget]) -> McpRemer
             }
         }
     };
-    let command = match managed_mcp_launcher() {
+    let command = match launcher() {
         Ok(command) => command,
         Err(error) => {
             return McpRemergeOutcome {
-                errors: vec![format!("managed launcher is unavailable: {error:#}")],
+                errors: vec![format!(
+                    "{launcher_label} launcher is unavailable: {error:#}"
+                )],
                 ..Default::default()
             }
         }
@@ -11055,7 +11097,11 @@ fn mcp_entry_matches_repair_target(
 
 pub(crate) fn remerge_existing_mcp_configs_detailed() -> McpRemergeOutcome {
     match current_mcp_repair_targets() {
-        Ok(targets) if !targets.is_empty() => remerge_mcp_targets_exact(&targets),
+        Ok(targets) if !targets.is_empty() => remerge_mcp_targets_with_launcher(
+            &targets,
+            configured_mcp_launcher,
+            "configured installation",
+        ),
         Ok(_) => McpRemergeOutcome::default(),
         Err(error) => McpRemergeOutcome {
             errors: vec![format!("could not capture MCP targets: {error:#}")],
@@ -13265,6 +13311,59 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         fs::write(&primary, b"{}\n").unwrap();
         assert_eq!(configure_claude_code().unwrap(), primary);
         assert!(read_kin_mcp_entry(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn non_managed_install_setup_health_and_doctor_repair_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _scan_root =
+            EnvVarGuard::set(crate::commands::managed_config_scope::SCAN_ROOT_ENV, &home);
+
+        assert!(
+            !kin_home.join("bin/kin").exists(),
+            "fixture must model Homebrew/manual install without a managed launcher"
+        );
+        let config = configure_cursor().unwrap();
+        let expected = configured_mcp_launcher().unwrap();
+        let entry = read_kin_mcp_entry(&config).unwrap();
+        assert_eq!(entry["command"].as_str(), Some(expected.as_str()));
+        let (status, detail) = crate::commands::health::evaluate_mcp_client(&config, "cursor");
+        assert!(
+            matches!(status, crate::commands::health::HealthStatus::Healthy),
+            "setup output must be accepted by status: {detail}"
+        );
+
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        root["mcpServers"]["kin"]["command"] = serde_json::json!("/stale/kin");
+        fs::write(&config, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        let (status, _) = crate::commands::health::evaluate_mcp_client(&config, "cursor");
+        assert!(matches!(
+            status,
+            crate::commands::health::HealthStatus::Misconfigured
+        ));
+
+        let outcome = remerge_existing_mcp_configs_detailed();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(outcome
+            .repaired
+            .contains(&ConfigLock::normalized_path(&config).unwrap()));
+        let (status, detail) = crate::commands::health::evaluate_mcp_client(&config, "cursor");
+        assert!(
+            matches!(status, crate::commands::health::HealthStatus::Healthy),
+            "doctor repair must converge: {detail}"
+        );
+        assert_eq!(
+            read_kin_mcp_entry(&config).unwrap()["command"].as_str(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]

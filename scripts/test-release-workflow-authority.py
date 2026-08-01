@@ -6834,7 +6834,7 @@ def main() -> None:
         "evaluate_mcp_client(&client.path, client.id)",
         "command != Some(expected_command)",
         '"codex" | "antigravity" | "antigravity_workspace"',
-        "managed_mcp_launcher()",
+        "configured_mcp_launcher()",
     ):
         require(health, policy, "product-owned exact MCP entry health validation")
     require(

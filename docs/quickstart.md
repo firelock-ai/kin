@@ -388,14 +388,16 @@ section is for manual wiring, troubleshooting, and non-standard environments.
 ### Manual MCP client configuration
 
 If you skipped the wizard's agent step, or your client wasn't auto-detected, add Kin's MCP
-server to your client's config by hand. Match the wizard exactly — including the
+server to your client's config by hand. Use `$KIN_HOME/bin/kin` (normally `~/.kin/bin/kin`)
+when that managed launcher exists; otherwise run `command -v kin`. Substitute that exact
+absolute path for `/absolute/path/to/kin` below. Match the wizard exactly — including the
 `agent-default` profile:
 
 ```json
 {
   "mcpServers": {
     "kin": {
-      "command": "kin",
+      "command": "/absolute/path/to/kin",
       "args": ["mcp", "start"],
       "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
@@ -418,8 +420,8 @@ merges this table into `~/.codex/config.toml`, leaving the rest of the file unto
 
 ```toml
 [mcp_servers.kin]
-command = "kin"
-args = ["mcp", "start"]
+command = "/absolute/path/to/kin"
+args = ["mcp", "start", "--repo", "/absolute/path/to/repository"]
 env = { KIN_MCP_TOOL_PROFILE = "agent-default" }
 ```
 

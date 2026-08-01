@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
-    check_binary_in_path, detect_shell, hook_filename, kin_dir, managed_mcp_launcher, shell_rc,
+    check_binary_in_path, configured_mcp_launcher, detect_shell, hook_filename, kin_dir, shell_rc,
     shim_filename,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
@@ -1008,7 +1008,7 @@ fn evaluate_mcp_client_against(
                 return (
                     HealthStatus::Misconfigured,
                     format!(
-                        "{servers_key}.kin command is {} (expected the exact managed Kin launcher {}) in {}",
+                        "{servers_key}.kin command is {} (expected the exact Kin launcher for this installation {}) in {}",
                         command.unwrap_or("unset"),
                         expected_command,
                         path.display()
@@ -1064,13 +1064,13 @@ fn evaluate_mcp_client_against(
 }
 
 pub(crate) fn evaluate_mcp_client(path: &PathBuf, client_id: &str) -> (HealthStatus, String) {
-    let expected_command = match managed_mcp_launcher() {
+    let expected_command = match configured_mcp_launcher() {
         Ok(command) => command,
         Err(error) => {
             return (
                 HealthStatus::Misconfigured,
                 format!(
-                "cannot validate MCP client {} without the exact managed Kin launcher: {error:#}",
+                "cannot validate MCP client {} without the exact Kin launcher for this installation: {error:#}",
                 path.display()
             ),
             )
@@ -1087,7 +1087,7 @@ fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthS
     };
     let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let entry = root.get("mcpServers")?.get("kin")?;
-    let expected_command = managed_mcp_launcher().ok()?;
+    let expected_command = configured_mcp_launcher().ok()?;
     let command_matches =
         entry.get("command").and_then(Value::as_str) == Some(expected_command.as_str());
     let expected_args = serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()]);
@@ -1976,7 +1976,7 @@ mod tests {
 
         let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
         assert!(matches!(status, HealthStatus::Misconfigured));
-        assert!(detail.contains("expected the exact managed Kin launcher"));
+        assert!(detail.contains("expected the exact Kin launcher"));
     }
 
     #[test]
@@ -2034,7 +2034,7 @@ mod tests {
         std::fs::write(&path, config(Path::new("/wrong/kin"))).unwrap();
         let (status, detail) = evaluate_mcp_client(&path, "claude");
         assert!(matches!(status, HealthStatus::Misconfigured));
-        assert!(detail.contains("exact managed Kin launcher"));
+        assert!(detail.contains("exact Kin launcher"));
     }
 
     #[test]
