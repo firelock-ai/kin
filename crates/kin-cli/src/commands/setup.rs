@@ -11154,7 +11154,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     print_intent_followups(&plan, interactive);
 
-    request_notification_authorization(interactive);
+    report_notification_identity(interactive);
 
     // The final checklist is the real first-run health engine — not a parallel
     // set of hardcoded probes. Every line below reflects probed state.
@@ -11167,6 +11167,36 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
 
     Ok(())
+}
+
+/// Get the notification identity working, and say so when it cannot be.
+///
+/// Three things have to be true for a notification to arrive as Kin: the bundle
+/// has to exist, macOS has to know about it, and the user has to have allowed
+/// it. Setup is where all three are settled, because it is the one moment a
+/// person is present. When the first is not true, the remaining two cannot be
+/// fixed here, so the gap is reported instead of silently skipped.
+fn report_notification_identity(interactive: bool) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(notifier) = kin_notify::Notifier::new() else {
+        return;
+    };
+    if let Some(degradation) = notifier.status().degradation() {
+        println!();
+        println!("  {} {degradation}", style("!").yellow());
+        return;
+    }
+    // The managed installer registers what it writes; a channel that installs
+    // into its own prefix, such as a Homebrew formula, cannot, so setup does it
+    // for whichever copy is actually resolved. It is not worth failing setup
+    // over, but a silent failure would leave the authorization step below
+    // asking about a bundle macOS does not know.
+    if let Err(error) = notifier.register_with_launch_services() {
+        println!("  {} {error:#}", style("!").yellow());
+    }
+    request_notification_authorization(interactive);
 }
 
 /// Ask macOS for permission to post notifications, once, from the one place a
@@ -11188,10 +11218,12 @@ fn request_notification_authorization(interactive: bool) {
     let Ok(notifier) = kin_notify::Notifier::new() else {
         return;
     };
-    let executable = notifier.notifier_path();
-    if !executable.is_file() {
+    // Resolved rather than assumed: a channel that cannot write to the home
+    // directory installs its bundle beside the binary, and that copy holds the
+    // same identity the authorization decision is recorded against.
+    let Some(executable) = notifier.resolve_notifier() else {
         return;
-    }
+    };
 
     // Only ask when the decision has not already been made; re-running setup
     // must not nag, and macOS answers from the stored decision anyway.

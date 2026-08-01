@@ -191,6 +191,45 @@ if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
     exit 1
 fi
 
+# The notification identity is part of every macOS release contract. Validate
+# its minimal launchable shape before replacing any installed binary so a
+# malformed archive cannot leave a new CLI paired with an old notifier bundle.
+if [ "$OS" = "macos" ]; then
+    NOTIFIER_ROOT="$EXTRACT_DIR/KinNotifier.app"
+    NOTIFIER_EXEC="$NOTIFIER_ROOT/Contents/MacOS/KinNotifier"
+    NOTIFIER_PLIST="$NOTIFIER_ROOT/Contents/Info.plist"
+    if [ -L "$NOTIFIER_ROOT" ] || [ ! -d "$NOTIFIER_ROOT" ]; then
+        err "KinNotifier.app missing or unsafe in the downloaded macOS archive."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    # `test -f/-d` follows intermediate symlink components, so leaf checks
+    # alone would accept `Contents -> Payload`. Walk the complete extracted
+    # tree without following links and admit only real directories and regular
+    # files before any live path is changed. FIFOs, devices, sockets, and every
+    # symlink (including a directory ancestor) fail this boundary.
+    if ! NOTIFIER_UNSAFE_ENTRY=$(find "$NOTIFIER_ROOT" ! \( -type d -o -type f \) -print -quit 2>/dev/null); then
+        err "KinNotifier.app could not be inspected safely in the downloaded macOS archive."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -n "$NOTIFIER_UNSAFE_ENTRY" ]; then
+        err "KinNotifier.app contains a symlink or special entry: $NOTIFIER_UNSAFE_ENTRY"
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -L "$NOTIFIER_EXEC" ] || [ ! -f "$NOTIFIER_EXEC" ] || [ ! -s "$NOTIFIER_EXEC" ] || [ ! -x "$NOTIFIER_EXEC" ]; then
+        err "KinNotifier.app/Contents/MacOS/KinNotifier is missing, unsafe, empty, or not executable."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -L "$NOTIFIER_PLIST" ] || [ ! -f "$NOTIFIER_PLIST" ] || [ ! -s "$NOTIFIER_PLIST" ]; then
+        err "KinNotifier.app/Contents/Info.plist is missing, unsafe, or empty."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+fi
+
 # The freshly downloaded binary owns the registry-authority contract used by
 # `kin doctor` and `kin update`. Run its content-free check before replacing
 # any installed binary. Unsafe existing state is never silently chmodded or
@@ -254,6 +293,11 @@ if [ "$HAVE_NOTIFIER" = "1" ]; then
     LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
     [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$KIN_LIB/KinNotifier.app" >/dev/null 2>&1 || true
     ok "Notification identity installed (KinNotifier.app)"
+elif [ "$OS" = "macos" ]; then
+    # Every macOS release archive is supposed to carry the bundle. Without it
+    # Kin still runs, but every notification is credited to Script Editor, and
+    # that downgrade is invisible unless it is said out loud here.
+    err "This archive carries no KinNotifier.app; notifications will post as Script Editor, not as Kin"
 fi
 
 if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
