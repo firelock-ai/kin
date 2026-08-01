@@ -978,6 +978,14 @@ jobs:
       - name: Test featureless kin-cli
         run: cargo test -p kin-cli --no-default-features --locked
 
+      # kin-daemon owns feature-dependent status sampling and response tests of
+      # its own. A featureless package check compiles those routes but does not
+      # execute assertions that can accidentally encode the vector-enabled
+      # answer. Run the complete daemon package under the same release feature
+      # set; doctests need no companion step because the crate disables them.
+      - name: Test featureless kin-daemon
+        run: cargo test -p kin-daemon --no-default-features --locked
+
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:

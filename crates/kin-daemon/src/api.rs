@@ -11228,6 +11228,23 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    fn unattached_vector_coverage_reason() -> kin_cli::commands::status::EmbeddingCoverageUnobserved
+    {
+        if cfg!(feature = "vector") {
+            kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+        } else {
+            kin_cli::commands::status::EmbeddingCoverageUnobserved::VectorSupportDisabled
+        }
+    }
+
+    fn unattached_vector_coverage_text() -> &'static str {
+        if cfg!(feature = "vector") {
+            "Live embedding coverage: not observed (the live graph carries no vector index)"
+        } else {
+            "Live embedding coverage: not observed (this build ships no vector backend)"
+        }
+    }
+
     fn committed_test_state() -> Arc<DaemonState> {
         let initial = test_state();
         let layout = initial.layout.clone();
@@ -17881,21 +17898,21 @@ mod tests {
         assert!(result.report.repository.source_cas_verified);
         assert!(result.text.contains("Kin repository-v6 status"));
         assert!(result.text.contains("Live graph enrichment"));
-        // This daemon's graph carries entities but no vector index. The handler
-        // has to say so: reporting the zero that `embedding_status` returns in
-        // that state would be indistinguishable from a repository whose
-        // embeddings are complete and empty.
+        // This daemon's graph carries entities but no vector index. A vector
+        // build has to name that missing attachment; a featureless build has to
+        // name its deliberately absent backend. Neither may report the zero
+        // that `embedding_status` returns, because that would be
+        // indistinguishable from a repository whose embeddings are complete
+        // and empty.
         assert_eq!(
             result.report.embedding_coverage,
             kin_cli::commands::status::EmbeddingCoverage::unobserved(
-                kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+                unattached_vector_coverage_reason()
             ),
-            "status must report an unindexed live graph as unobservable coverage"
+            "status must report why live embedding coverage is unobservable"
         );
         assert!(
-            result.text.contains(
-                "Live embedding coverage: not observed (the live graph carries no vector index)"
-            ),
+            result.text.contains(unattached_vector_coverage_text()),
             "text: {}",
             result.text
         );
@@ -18266,9 +18283,9 @@ mod tests {
         assert_eq!(
             after,
             kin_cli::commands::status::EmbeddingCoverage::unobserved(
-                kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+                unattached_vector_coverage_reason()
             ),
-            "with no mutation in flight the sampler must report the graph's own state"
+            "with no mutation in flight the sampler must report the build's graph state"
         );
     }
 
