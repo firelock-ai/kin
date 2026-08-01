@@ -10,20 +10,23 @@
 //! behavior-env divergence warning tells them to). This command group is that
 //! surface, replacing raw `kill $(cat .kin/daemon.pid)`.
 //!
-//! Neither the worker daemon nor the supervisor exposes an HTTP shutdown route,
-//! so a graceful stop is SIGTERM plus a bounded wait for the process to exit.
-//! The daemon's own shutdown-escalation watchdog guarantees the process dies
-//! within its grace window, so the wait is a ceiling, not a fixed delay.
+//! Neither the worker daemon nor the supervisor exposes an HTTP shutdown route.
+//! Unix uses SIGTERM plus a bounded wait; native Windows opens and revalidates
+//! the exact process-incarnation handle before terminating through that handle.
+//! The wait is a ceiling, not a fixed delay.
 
-use anyhow::{bail, Result};
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::daemon_client::{
-    fetch_registered_daemons, is_port_open, is_process_alive, remove_stale_daemon_files,
-    remove_stale_supervisor_files, repo_daemon_pid_path, repo_daemon_port_path,
-    repo_daemon_recorded_endpoint, supervisor_pid_path, supervisor_port_path,
-    supervisor_recorded_endpoint, RegisteredRepoDaemon,
+    fetch_registered_daemons, is_port_open, is_process_alive, process_identity,
+    process_identity_is_current, read_endpoint_owner_record, read_supervisor_owner_record,
+    remove_stale_daemon_files, remove_stale_supervisor_files, repo_daemon_owner_path,
+    repo_daemon_pid_path, repo_daemon_port_path, repo_daemon_recorded_endpoint,
+    supervisor_owner_path, supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
+    try_acquire_supervisor_startup_lock_in_dir, ProcessIdentity, RegisteredRepoDaemon,
+    SupervisorStartupLock,
 };
 
 /// Liveness of a recorded daemon/supervisor endpoint. Pure classification of the
@@ -85,11 +88,11 @@ fn stop_timeout() -> Duration {
 enum StopOutcome {
     /// No live process was found for the pid — nothing to stop.
     NotRunning,
-    /// SIGTERM delivered and the process exited within the wait window.
+    /// The platform stop request was delivered and the process exited.
     Stopped,
-    /// SIGTERM delivered but the process was still alive after the wait window.
+    /// The stop request was delivered but the process survived the wait window.
     Timeout,
-    /// Delivering SIGTERM failed for a reason other than the process being gone.
+    /// Delivering the platform stop request failed while the owner remained.
     SignalFailed(String),
 }
 
@@ -111,52 +114,227 @@ impl StopOutcome {
 }
 
 #[cfg(unix)]
-fn send_sigterm(pid: u32) -> std::io::Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<bool> {
+    terminate_attributed_process_with(identity, process_identity_is_current, |pid| {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
 }
 
-#[cfg(not(unix))]
-fn send_sigterm(pid: u32) -> std::io::Result<()> {
-    let _ = pid;
+#[cfg(unix)]
+fn terminate_attributed_process_with<C, T>(
+    identity: &ProcessIdentity,
+    is_current: C,
+    terminate: T,
+) -> std::io::Result<bool>
+where
+    C: FnOnce(&ProcessIdentity) -> std::io::Result<bool>,
+    T: FnOnce(u32) -> std::io::Result<()>,
+{
+    if !is_current(identity)? {
+        return Ok(false);
+    }
+    terminate(identity.pid())?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<bool> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE,
+    };
+
+    // Opening a process handle pins the incarnation that PID names. Revalidate
+    // the full creation identity while that handle is live, then terminate via
+    // the handle rather than looking the PID up a second time. PID reuse after
+    // this point can therefore never redirect termination to a successor.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+            0,
+            identity.pid(),
+        )
+    };
+    if handle.is_null() {
+        return if !process_identity_is_current(identity)? {
+            Ok(false)
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+    let still_current = process_identity_is_current(identity);
+    let outcome = match still_current {
+        Ok(false) => Ok(false),
+        Err(error) => Err(error),
+        Ok(true) => {
+            if unsafe { TerminateProcess(handle, 0) } == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(true)
+            }
+        }
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    outcome
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<bool> {
+    let _ = identity;
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "signal-based daemon stop is only supported on unix platforms",
+        "daemon stop is unsupported on this platform",
     ))
 }
 
-/// Send SIGTERM to `pid` and wait up to `wait` for the process to exit. Returns
-/// the classified outcome; never kills a process we did not intend to (the pid
-/// comes from Kin's own endpoint files).
-fn stop_pid_graceful(pid: u32, wait: Duration) -> StopOutcome {
-    if !is_process_alive(pid) {
-        return StopOutcome::NotRunning;
-    }
-    if let Err(error) = send_sigterm(pid) {
-        // A signal failure right after the alive check is almost always a race:
-        // the process exited on its own between the two. Re-check before
-        // reporting a hard failure.
-        if !is_process_alive(pid) {
-            return StopOutcome::NotRunning;
+/// Stop exactly one attributed process incarnation and wait up to `wait` for
+/// that incarnation to disappear. A reused numeric PID compares unequal and is
+/// never signaled or mistaken for a surviving daemon.
+fn stop_identity_graceful(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
+    match terminate_attributed_process(identity) {
+        Ok(false) => return StopOutcome::NotRunning,
+        Ok(true) => {}
+        Err(error) => {
+            if matches!(process_identity_is_current(identity), Ok(false)) {
+                return StopOutcome::NotRunning;
+            }
+            return StopOutcome::SignalFailed(error.to_string());
         }
-        return StopOutcome::SignalFailed(error.to_string());
     }
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
-        if !is_process_alive(pid) {
+        if matches!(process_identity_is_current(identity), Ok(false)) {
             return StopOutcome::Stopped;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if is_process_alive(pid) {
-        StopOutcome::Timeout
-    } else {
+    if matches!(process_identity_is_current(identity), Ok(false)) {
         StopOutcome::Stopped
+    } else {
+        StopOutcome::Timeout
     }
+}
+
+fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<ProcessIdentity>> {
+    let owner = read_endpoint_owner_record(kin_root).with_context(|| {
+        format!(
+            "worker endpoint {} has no valid process-incarnation owner record",
+            repo_daemon_pid_path(kin_root).display()
+        )
+    })?;
+    if owner.identity().pid() != pid {
+        bail!(
+            "worker endpoint ownership is torn at {}: pid file names {}, owner record names {}",
+            kin_root.display(),
+            pid,
+            owner.identity().pid()
+        );
+    }
+    match process_identity_is_current(owner.identity()) {
+        Ok(true) => Ok(Some(owner.identity().clone())),
+        Ok(false) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "could not verify worker process incarnation {} for {}",
+                pid,
+                kin_root.display()
+            )
+        }),
+    }
+}
+
+fn attributed_supervisor_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
+    let owner = read_supervisor_owner_record().with_context(|| {
+        format!(
+            "supervisor endpoint {} has no valid process-incarnation owner record",
+            supervisor_pid_path().display()
+        )
+    })?;
+    if owner.identity().pid() != pid {
+        bail!(
+            "supervisor endpoint ownership is torn: pid file names {}, owner record names {}",
+            pid,
+            owner.identity().pid()
+        );
+    }
+    match process_identity_is_current(owner.identity()) {
+        Ok(true) => Ok(Some(owner.identity().clone())),
+        Ok(false) => Ok(None),
+        Err(error) => Err(error).context("could not verify supervisor process incarnation"),
+    }
+}
+
+fn stop_worker_at(
+    kin_root: &Path,
+    pid: u32,
+    wait: Duration,
+    legacy_install_root: Option<&Path>,
+) -> Result<StopOutcome> {
+    let identity = match attributed_worker_identity(kin_root, pid) {
+        Ok(identity) => identity,
+        Err(error)
+            if legacy_install_root.is_some()
+                && matches!(
+                    std::fs::symlink_metadata(repo_daemon_owner_path(kin_root)),
+                    Err(ref io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+                ) =>
+        {
+            legacy_managed_identity(
+                legacy_install_root.context("legacy install root disappeared")?,
+                pid,
+                Some(kin_root.parent().unwrap_or(kin_root)),
+            )
+            .with_context(|| format!("legacy worker attribution failed after: {error:#}"))?
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(match identity {
+        Some(identity) => stop_identity_graceful(&identity, wait),
+        None => StopOutcome::NotRunning,
+    })
+}
+
+fn supervisor_identity_for_stop(
+    pid: u32,
+    legacy_install_root: Option<&Path>,
+) -> Result<Option<ProcessIdentity>> {
+    match attributed_supervisor_identity(pid) {
+        Ok(identity) => Ok(identity),
+        Err(error)
+            if legacy_install_root.is_some()
+                && matches!(
+                    std::fs::symlink_metadata(supervisor_owner_path()),
+                    Err(ref io_error) if io_error.kind() == std::io::ErrorKind::NotFound
+                ) =>
+        {
+            legacy_managed_identity(
+                legacy_install_root.context("legacy install root disappeared")?,
+                pid,
+                None,
+            )
+            .with_context(|| format!("legacy supervisor attribution failed after: {error:#}"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn stop_supervisor_pid(
+    pid: u32,
+    wait: Duration,
+    legacy_install_root: Option<&Path>,
+) -> Result<StopOutcome> {
+    Ok(
+        match supervisor_identity_for_stop(pid, legacy_install_root)? {
+            Some(identity) => stop_identity_graceful(&identity, wait),
+            None => StopOutcome::NotRunning,
+        },
+    )
 }
 
 /// The supervisor URL if a live supervisor is recorded, without ever spawning
@@ -169,6 +347,22 @@ fn supervisor_url_if_running() -> Option<String> {
     } else {
         None
     }
+}
+
+fn require_supervisor_port_for_stop(
+    pid: u32,
+    recorded_port: Option<u16>,
+    port_open: bool,
+) -> Result<u16> {
+    let port = recorded_port.with_context(|| {
+        format!("live supervisor pid {pid} has no published port; refusing partial stop")
+    })?;
+    if !port_open {
+        bail!(
+            "live supervisor pid {pid} is unresponsive on recorded port {port}; refusing to guess an incomplete daemon topology"
+        );
+    }
+    Ok(port)
 }
 
 fn repo_label(working_dir: &Path) -> String {
@@ -372,6 +566,64 @@ pub(crate) async fn stop_all_quiet() -> Result<()> {
     stop_all(false, true).await
 }
 
+/// Startup authority retained by full uninstall until the install root is
+/// retired. While this value is alive no cooperating CLI can publish a new
+/// supervisor generation. The final process scan closes the remaining direct
+/// worker-spawn gap immediately before root retirement.
+pub(crate) struct UninstallDaemonFence {
+    _startup_authority: SupervisorStartupLock,
+}
+
+impl UninstallDaemonFence {
+    pub(crate) fn verify_quiescent(&self, install_root: &Path) -> Result<()> {
+        let remaining = managed_daemon_processes(install_root);
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        let labels = remaining
+            .iter()
+            .map(ManagedDaemonProcess::description)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "full uninstall refused because managed Kin daemon processes appeared after shutdown: {labels}"
+        )
+    }
+}
+
+/// Stop and verify the complete install-owned daemon topology while retaining
+/// supervisor startup authority for the caller's subsequent root retirement.
+pub(crate) async fn stop_all_for_uninstall(install_root: &Path) -> Result<UninstallDaemonFence> {
+    let supervisor_dir = supervisor_pid_path()
+        .parent()
+        .context("supervisor PID path has no parent")?
+        .to_path_buf();
+    let deadline = Instant::now() + stop_timeout();
+    let startup_authority = loop {
+        match try_acquire_supervisor_startup_lock_in_dir(&supervisor_dir) {
+            Ok(authority) => break authority,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    return Err(error).context(
+                        "timed out waiting for supervisor startup authority before full uninstall",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("failed to acquire supervisor startup authority for full uninstall")
+            }
+        }
+    };
+    stop_all_inner(false, true, Some(install_root)).await?;
+    let fence = UninstallDaemonFence {
+        _startup_authority: startup_authority,
+    };
+    fence.verify_quiescent(install_root)?;
+    Ok(fence)
+}
+
 /// One stopped (or attempted-to-stop) endpoint, for the report.
 struct StopReport {
     kind: &'static str,
@@ -392,7 +644,7 @@ async fn stop_current_repo(json: bool) -> Result<()> {
     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
     let label = repo_label(&working_dir);
 
-    let pid = resolve_repo_worker_pid(&kin_root, &working_dir).await;
+    let pid = resolve_repo_worker_pid(&kin_root, &working_dir).await?;
 
     let Some(pid) = pid else {
         // Nothing live to stop. Clear any stale endpoint files so a later status
@@ -413,7 +665,7 @@ async fn stop_current_repo(json: bool) -> Result<()> {
         return Ok(());
     };
 
-    let outcome = stop_pid_graceful(pid, stop_timeout());
+    let outcome = stop_worker_at(&kin_root, pid, stop_timeout(), None)?;
     if outcome.is_success() {
         remove_stale_daemon_files(&kin_root);
     }
@@ -430,51 +682,111 @@ async fn stop_current_repo(json: bool) -> Result<()> {
 /// client resolves it: prefer the local `.kin/daemon.pid` record, and if that is
 /// absent or dead, fall back to the supervisor's `/daemons` registry (matched by
 /// canonical repo root). Returns a pid only when the process is actually alive.
-async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Option<u32> {
+async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Result<Option<u32>> {
     let (local_pid, _) = repo_daemon_recorded_endpoint(kin_root);
     if let Some(pid) = local_pid {
-        if is_process_alive(pid) {
-            return Some(pid);
+        if attributed_worker_identity(kin_root, pid)?.is_some() {
+            return Ok(Some(pid));
         }
     }
     // Local file missing or stale — ask the supervisor if it still routes a live
     // worker for this repo root.
-    let url = supervisor_url_if_running()?;
-    let daemons = fetch_registered_daemons(&url).await.ok()?;
+    let Some(url) = supervisor_url_if_running() else {
+        return Ok(None);
+    };
+    let daemons = fetch_registered_daemons(&url)
+        .await
+        .with_context(|| format!("failed to fetch authenticated daemon topology from {url}"))?;
     let target = canonical(working_dir);
-    daemons
+    Ok(daemons
         .into_iter()
         .find(|d| canonical(Path::new(&d.repo_root)) == target && is_process_alive(d.pid))
-        .map(|d| d.pid)
+        .map(|d| d.pid))
 }
 
 async fn stop_all(json: bool, quiet: bool) -> Result<()> {
+    stop_all_inner(json, quiet, None).await
+}
+
+async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) -> Result<()> {
     let wait = stop_timeout();
     let mut reports: Vec<StopReport> = Vec::new();
 
-    // Stop every worker the supervisor knows about first, so the supervisor is
-    // the last thing standing (it can prune its own routes as workers die).
-    let supervisor_url = supervisor_url_if_running();
-    if let Some(url) = &supervisor_url {
-        let daemons = fetch_registered_daemons(url).await.unwrap_or_default();
-        for daemon in daemons {
-            let label = if daemon.display_name.trim().is_empty() {
-                daemon.repo_id.clone()
-            } else {
-                daemon.display_name.clone()
-            };
-            let outcome = stop_pid_graceful(daemon.pid, wait);
-            if outcome.is_success() {
-                // Clear the worker's endpoint files too (repo_root/.kin/daemon.*).
-                remove_stale_daemon_files(&Path::new(&daemon.repo_root).join(".kin"));
-            }
+    // A live supervisor is the only authoritative registry of every repo
+    // worker. Missing/closed endpoint components and HTTP/auth/JSON failures
+    // are hard errors, never an empty topology.
+    let (sup_pid, sup_port) = supervisor_recorded_endpoint();
+    let mut supervisor_identity = None;
+    let mut daemons = Vec::new();
+    if let Some(pid) = sup_pid {
+        if !is_process_alive(pid) {
+            remove_stale_supervisor_files();
+        } else if let Some(identity) = supervisor_identity_for_stop(pid, uninstall_root)? {
+            let port = require_supervisor_port_for_stop(
+                pid,
+                sup_port,
+                sup_port.is_some_and(is_port_open),
+            )?;
+            let url = format!("http://127.0.0.1:{port}");
+            daemons = fetch_registered_daemons(&url).await.with_context(|| {
+                format!("failed to fetch the complete authenticated daemon topology from {url}")
+            })?;
+            supervisor_identity = Some(identity);
+        } else {
+            // The recorded owner is affirmatively gone (including PID reuse).
+            // Never signal the process that now has the numeric PID.
+            remove_stale_supervisor_files();
+        }
+    } else if (sup_port.is_some() || std::fs::symlink_metadata(supervisor_owner_path()).is_ok())
+        && uninstall_root.is_none()
+    {
+        remove_stale_supervisor_files();
+        if supervisor_recorded_endpoint() != (None, None)
+            || std::fs::symlink_metadata(supervisor_owner_path()).is_ok()
+        {
+            bail!(
+                "supervisor endpoint is incomplete: a live or indeterminate port/owner record exists without a valid PID"
+            );
+        }
+    }
+
+    // Full uninstall has retained startup authority. If an endpoint is
+    // incomplete, its install-owned process scan below either attributes/stops
+    // the owner-sidecar process or proves no managed supervisor remains.
+
+    // During full uninstall, stop the supervisor first after snapshotting its
+    // complete registry. Retained startup authority prevents a successor, and
+    // the install-owned process scan below catches any worker spawned between
+    // the registry snapshot and supervisor exit.
+    if uninstall_root.is_some() {
+        if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
+            let outcome = stop_identity_graceful(identity, wait);
             reports.push(StopReport {
-                kind: "repo-daemon",
-                label,
-                pid: daemon.pid,
+                kind: "supervisor",
+                label: "supervisor".to_string(),
+                pid,
                 outcome,
             });
         }
+    }
+
+    for daemon in daemons {
+        let label = if daemon.display_name.trim().is_empty() {
+            daemon.repo_id.clone()
+        } else {
+            daemon.display_name.clone()
+        };
+        let kin_root = Path::new(&daemon.repo_root).join(".kin");
+        let outcome = stop_worker_at(&kin_root, daemon.pid, wait, uninstall_root)?;
+        if outcome.is_success() {
+            remove_stale_daemon_files(&kin_root);
+        }
+        reports.push(StopReport {
+            kind: "repo-daemon",
+            label,
+            pid: daemon.pid,
+            outcome,
+        });
     }
 
     // Also stop the current repo's worker if it is not registered with the
@@ -487,7 +799,7 @@ async fn stop_all(json: bool, quiet: bool) -> Result<()> {
                 let already = reports.iter().any(|r| r.pid == pid);
                 if !already && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
-                    let outcome = stop_pid_graceful(pid, wait);
+                    let outcome = stop_worker_at(&kin_root, pid, wait, uninstall_root)?;
                     if outcome.is_success() {
                         remove_stale_daemon_files(&kin_root);
                     }
@@ -502,11 +814,11 @@ async fn stop_all(json: bool, quiet: bool) -> Result<()> {
         }
     }
 
-    // Supervisor last.
-    let (sup_pid, _) = supervisor_recorded_endpoint();
-    if let Some(pid) = sup_pid {
-        if is_process_alive(pid) {
-            let outcome = stop_pid_graceful(pid, wait);
+    // The ordinary `kin daemon stop --all` path keeps the historical order:
+    // workers first, supervisor last. Full uninstall already stopped it above.
+    if uninstall_root.is_none() {
+        if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
+            let outcome = stop_identity_graceful(identity, wait);
             if outcome.is_success() {
                 remove_stale_supervisor_files();
             }
@@ -516,10 +828,11 @@ async fn stop_all(json: bool, quiet: bool) -> Result<()> {
                 pid,
                 outcome,
             });
-        } else {
-            // Recorded but dead — clear stale files.
-            remove_stale_supervisor_files();
         }
+    }
+
+    if let Some(install_root) = uninstall_root {
+        stop_install_owned_daemons(install_root, wait, &mut reports)?;
     }
 
     if reports.is_empty() {
@@ -541,6 +854,215 @@ async fn stop_all(json: bool, quiet: bool) -> Result<()> {
     }
 
     finish_stop_with_output("all", &reports, json, quiet)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedDaemonKind {
+    Supervisor,
+    Worker { repo_root: PathBuf },
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedDaemonProcess {
+    pid: u32,
+    kind: ManagedDaemonKind,
+}
+
+impl ManagedDaemonProcess {
+    fn description(&self) -> String {
+        match &self.kind {
+            ManagedDaemonKind::Supervisor => format!("supervisor pid {}", self.pid),
+            ManagedDaemonKind::Worker { repo_root } => {
+                format!("worker pid {} for {}", self.pid, repo_root.display())
+            }
+            ManagedDaemonKind::Unknown => format!("unclassified kin-daemon pid {}", self.pid),
+        }
+    }
+}
+
+fn command_argument(args: &[String], flag: &str) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == flag {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = args[index]
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(value.to_string());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn managed_daemon_processes(install_root: &Path) -> Vec<ManagedDaemonProcess> {
+    let managed_bin = install_root
+        .canonicalize()
+        .unwrap_or_else(|_| install_root.to_path_buf())
+        .join("bin");
+    let mut system = sysinfo::System::new_all();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut found = Vec::new();
+    for (pid, process) in system.processes() {
+        let pid = pid.as_u32();
+        if pid == std::process::id() {
+            continue;
+        }
+        let args = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let name = process.name().to_string_lossy();
+        let executable_name_matches = matches!(name.as_ref(), "kin-daemon" | "kin-daemon.exe")
+            || args.first().is_some_and(|arg| {
+                Path::new(arg)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| matches!(name, "kin-daemon" | "kin-daemon.exe"))
+            });
+        if !executable_name_matches {
+            continue;
+        }
+        let owned_executable = process
+            .exe()
+            .is_some_and(|path| path.starts_with(&managed_bin))
+            || args.first().is_some_and(|arg| {
+                let path = Path::new(arg);
+                path.is_absolute() && path.starts_with(&managed_bin)
+            });
+        if !owned_executable {
+            continue;
+        }
+        let kind = if args.iter().any(|arg| arg == "--supervisor") {
+            ManagedDaemonKind::Supervisor
+        } else if let Some(repo_root) = command_argument(&args, "--repo") {
+            ManagedDaemonKind::Worker {
+                repo_root: PathBuf::from(repo_root),
+            }
+        } else {
+            ManagedDaemonKind::Unknown
+        };
+        found.push(ManagedDaemonProcess { pid, kind });
+    }
+    found.sort_by_key(|process| process.pid);
+    found
+}
+
+/// Mixed-version bridge for a daemon started before endpoint owner sidecars
+/// existed. Exact install-owned executable provenance plus the expected role
+/// and repo argument establishes the current incarnation; callers additionally
+/// require the authenticated supervisor topology before using this identity.
+/// A present-but-malformed sidecar never reaches this bridge.
+fn legacy_managed_identity(
+    install_root: &Path,
+    pid: u32,
+    expected_repo: Option<&Path>,
+) -> Result<Option<ProcessIdentity>> {
+    let expected_repo = expected_repo.map(canonical);
+    let matched = managed_daemon_processes(install_root)
+        .into_iter()
+        .find(|process| {
+            if process.pid != pid {
+                return false;
+            }
+            match (&process.kind, &expected_repo) {
+                (ManagedDaemonKind::Supervisor, None) => true,
+                (ManagedDaemonKind::Worker { repo_root }, Some(expected)) => {
+                    canonical(repo_root) == *expected
+                }
+                _ => false,
+            }
+        });
+    if matched.is_none() {
+        bail!(
+            "legacy daemon pid {pid} is not an exact install-owned process with the expected role; refusing to signal it"
+        );
+    }
+    let Some(identity) = process_identity(pid)
+        .with_context(|| format!("failed to capture legacy daemon process identity {pid}"))?
+    else {
+        return Ok(None);
+    };
+    if process_identity_is_current(&identity)? {
+        Ok(Some(identity))
+    } else {
+        Ok(None)
+    }
+}
+
+fn stop_install_owned_daemons(
+    install_root: &Path,
+    wait: Duration,
+    reports: &mut Vec<StopReport>,
+) -> Result<()> {
+    // A second pass catches a worker spawned while the supervisor was exiting;
+    // the retained startup authority means no successor supervisor can appear.
+    for _ in 0..3 {
+        let processes = managed_daemon_processes(install_root);
+        if processes.is_empty() {
+            return Ok(());
+        }
+        for process in processes {
+            if reports
+                .iter()
+                .any(|report| report.pid == process.pid && !report.outcome.is_success())
+            {
+                continue;
+            }
+            if reports
+                .iter()
+                .any(|report| report.pid == process.pid && report.outcome.is_success())
+                && !is_process_alive(process.pid)
+            {
+                continue;
+            }
+            match process.kind {
+                ManagedDaemonKind::Worker { repo_root } => {
+                    let kin_root = repo_root.join(".kin");
+                    let outcome = stop_worker_at(&kin_root, process.pid, wait, Some(install_root))?;
+                    if outcome.is_success() {
+                        remove_stale_daemon_files(&kin_root);
+                    }
+                    reports.push(StopReport {
+                        kind: "repo-daemon",
+                        label: repo_label(&repo_root),
+                        pid: process.pid,
+                        outcome,
+                    });
+                }
+                ManagedDaemonKind::Supervisor => {
+                    let outcome = stop_supervisor_pid(process.pid, wait, Some(install_root))?;
+                    reports.push(StopReport {
+                        kind: "supervisor",
+                        label: "supervisor".to_string(),
+                        pid: process.pid,
+                        outcome,
+                    });
+                }
+                ManagedDaemonKind::Unknown => bail!(
+                    "full uninstall found install-owned kin-daemon pid {} but could not attribute it to a supervisor or repo worker",
+                    process.pid
+                ),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let remaining = managed_daemon_processes(install_root);
+    if !remaining.is_empty() {
+        bail!(
+            "install-owned Kin daemons survived shutdown: {}",
+            remaining
+                .iter()
+                .map(ManagedDaemonProcess::description)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Emit the stop report and fail loud (nonzero exit) if any endpoint would not
@@ -587,13 +1109,13 @@ fn finish_stop_with_output(
                     format!("{} (pid {}): was not running", r.label, r.pid)
                 }
                 StopOutcome::Timeout => format!(
-                    "{} (pid {}): STILL ALIVE after SIGTERM + {}s wait",
+                    "{} (pid {}): STILL ALIVE after stop request + {}s wait",
                     r.label,
                     r.pid,
                     stop_timeout().as_secs()
                 ),
                 StopOutcome::SignalFailed(err) => {
-                    format!("{} (pid {}): SIGTERM failed: {}", r.label, r.pid, err)
+                    format!("{} (pid {}): stop request failed: {}", r.label, r.pid, err)
                 }
             };
             println!("  {line}");
@@ -672,6 +1194,28 @@ mod tests {
     }
 
     #[test]
+    fn live_supervisor_requires_a_complete_reachable_endpoint() {
+        let missing = require_supervisor_port_for_stop(42, None, false).unwrap_err();
+        assert!(missing.to_string().contains("no published port"));
+
+        let closed = require_supervisor_port_for_stop(42, Some(51000), false).unwrap_err();
+        assert!(closed.to_string().contains("unresponsive"));
+
+        assert_eq!(
+            require_supervisor_port_for_stop(42, Some(51000), true).unwrap(),
+            51000
+        );
+    }
+
+    #[test]
+    fn uninstall_fence_excludes_a_concurrent_supervisor_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
+        let error = try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
     fn recorded_endpoint_parsing_handles_good_absent_and_garbage() {
         let dir = tempfile::tempdir().unwrap();
         let kin_root = dir.path().join(".kin");
@@ -703,16 +1247,42 @@ mod tests {
     }
 
     #[test]
-    fn stop_pid_graceful_reports_not_running_for_dead_pid() {
-        // A pid that is essentially guaranteed not to exist must classify as
-        // NotRunning without sending a signal anywhere.
-        let outcome = stop_pid_graceful(u32::MAX - 1, Duration::from_millis(50));
+    fn stop_identity_graceful_reports_not_running_for_dead_incarnation() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let identity = process_identity(child.id()).unwrap().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let outcome = stop_identity_graceful(&identity, Duration::from_millis(50));
         assert_eq!(outcome, StopOutcome::NotRunning);
     }
 
     #[cfg(unix)]
     #[test]
-    fn stop_pid_graceful_stops_a_live_process() {
+    fn incarnation_mismatch_never_delivers_a_signal() {
+        let identity = process_identity(std::process::id()).unwrap().unwrap();
+        let delivered = std::cell::Cell::new(false);
+        let result = terminate_attributed_process_with(
+            &identity,
+            |_| Ok(false),
+            |_| {
+                delivered.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!result);
+        assert!(
+            !delivered.get(),
+            "a predecessor identity must never signal the reused PID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_identity_graceful_stops_a_live_process() {
         // Spawn a real process that sleeps, then prove SIGTERM stops it and the
         // wait observes the process actually gone.
         //
@@ -727,12 +1297,13 @@ mod tests {
             .spawn()
             .expect("spawn sleep child");
         let pid = child.id();
+        let identity = process_identity(pid).unwrap().unwrap();
         assert!(is_process_alive(pid));
 
         let reaper = std::thread::spawn(move || {
             let _ = child.wait();
         });
-        let outcome = stop_pid_graceful(pid, Duration::from_secs(10));
+        let outcome = stop_identity_graceful(&identity, Duration::from_secs(10));
         let _ = reaper.join();
 
         assert_eq!(outcome, StopOutcome::Stopped);

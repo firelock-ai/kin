@@ -177,13 +177,12 @@ pub struct RegisteredRepoDaemon {
 /// [`ensure_supervisor_running`] or [`supervisor_recorded_endpoint`]); this does
 /// not itself start a supervisor.
 pub async fn fetch_registered_daemons(supervisor_url: &str) -> Result<Vec<RegisteredRepoDaemon>> {
-    let daemons = reqwest::Client::new()
-        .get(format!("{}/daemons", supervisor_url.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let client = reqwest::Client::new();
+    let mut request = client.get(format!("{}/daemons", supervisor_url.trim_end_matches('/')));
+    if let Some(token) = supervisor_auth_token() {
+        request = request.bearer_auth(token);
+    }
+    let daemons = request.send().await?.error_for_status()?.json().await?;
     Ok(daemons)
 }
 
@@ -2827,6 +2826,8 @@ fn supervisor_dir() -> PathBuf {
 
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
+const SUPERVISOR_OWNER_FILE: &str = "supervisor.owner";
+const SUPERVISOR_TOKEN_FILE: &str = "supervisor.token";
 const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
 const SUPERVISOR_STARTUP_FILE: &str = "supervisor.start.lock";
@@ -2880,6 +2881,40 @@ pub fn supervisor_port_path() -> PathBuf {
     supervisor_dir().join(SUPERVISOR_PORT_FILE)
 }
 
+/// Path to the sidecar attributing the published supervisor endpoint to one
+/// process incarnation.
+pub fn supervisor_owner_path() -> PathBuf {
+    supervisor_dir().join(SUPERVISOR_OWNER_FILE)
+}
+
+/// Read the owner sidecar for the currently configured supervisor directory.
+/// Unknown schemas and malformed records fail closed as `None`.
+pub fn read_supervisor_owner_record() -> Option<EndpointOwnerRecord> {
+    read_supervisor_owner_record_in_dir(&supervisor_dir())
+}
+
+fn read_supervisor_owner_record_in_dir(dir: &Path) -> Option<EndpointOwnerRecord> {
+    let raw = std::fs::read_to_string(dir.join(SUPERVISOR_OWNER_FILE)).ok()?;
+    let record: EndpointOwnerRecord = serde_json::from_str(&raw).ok()?;
+    (record.schema == ENDPOINT_OWNER_SCHEMA).then_some(record)
+}
+
+/// Resolve the bearer token used by an authenticated local supervisor. An
+/// explicit environment override wins; otherwise adopt the already-provisioned
+/// per-install token without creating state on a read-only status/stop path.
+fn supervisor_auth_token() -> Option<String> {
+    std::env::var("KIN_SUPERVISOR_AUTH_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(supervisor_dir().join(SUPERVISOR_TOKEN_FILE))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
 /// Remove the supervisor's pid/port endpoint files. Called after a confirmed
 /// supervisor stop so a later `status` never reports the dead endpoint as stale.
 pub fn remove_stale_supervisor_files() {
@@ -2903,8 +2938,24 @@ pub fn remove_stale_supervisor_files() {
         }
     };
     let recorded = supervisor_endpoint_snapshot(&dir);
+    let owner_is_gone = match (recorded.pid, recorded.owner.as_ref()) {
+        (Some(pid), Some(owner)) if owner.identity().pid() == pid => {
+            matches!(process_identity_is_current(owner.identity()), Ok(false))
+        }
+        (Some(pid), None) if !recorded.owner_exists => {
+            // Mixed-version compatibility: old supervisors did not publish an
+            // owner record, so affirmative PID death is still enough to retire
+            // their stale endpoint. Stop paths never signal from this fallback.
+            process_liveness(pid).authorizes_cleanup()
+        }
+        (None, Some(owner)) if !recorded.pid_exists => {
+            matches!(process_identity_is_current(owner.identity()), Ok(false))
+        }
+        (None, None) if !recorded.pid_exists && !recorded.owner_exists => true,
+        _ => false,
+    };
     match recorded.pid {
-        Some(pid) if process_liveness(pid).authorizes_cleanup() => {
+        Some(_) if owner_is_gone => {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
         Some(_) => {
@@ -2919,9 +2970,13 @@ pub fn remove_stale_supervisor_files() {
                 "preserving supervisor endpoint because its owner is live or indeterminate"
             );
         }
-        None => {
+        None if owner_is_gone => {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
+        None => warn!(
+            ?recorded,
+            "preserving supervisor endpoint because its ownership record is incomplete"
+        ),
     }
 }
 
@@ -2931,12 +2986,14 @@ fn try_acquire_supervisor_startup_lock_for_cleanup(
     try_acquire_supervisor_startup_lock_in_dir(dir)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SupervisorEndpointSnapshot {
     pid: Option<u32>,
     port: Option<u16>,
+    owner: Option<EndpointOwnerRecord>,
     pid_exists: bool,
     port_exists: bool,
+    owner_exists: bool,
 }
 
 fn supervisor_endpoint_snapshot(dir: &Path) -> SupervisorEndpointSnapshot {
@@ -2949,8 +3006,10 @@ fn supervisor_endpoint_snapshot(dir: &Path) -> SupervisorEndpointSnapshot {
         port: std::fs::read_to_string(&port_path)
             .ok()
             .and_then(|value| value.trim().parse().ok()),
+        owner: read_supervisor_owner_record_in_dir(dir),
         pid_exists: pid_path.exists(),
         port_exists: port_path.exists(),
+        owner_exists: dir.join(SUPERVISOR_OWNER_FILE).exists(),
     }
 }
 
@@ -3081,9 +3140,7 @@ where
         return SupervisorEndpointRetirement::Changed { current };
     }
     after_final_snapshot();
-    let pid_path = dir.join(SUPERVISOR_PID_FILE);
-    let port_path = dir.join(SUPERVISOR_PORT_FILE);
-    match remove_endpoint_files_with(&pid_path, &port_path, remove_file) {
+    match remove_supervisor_endpoint_files_with(dir, remove_file) {
         Ok(()) => SupervisorEndpointRetirement::Retired,
         Err(error) => {
             warn!(
@@ -3093,6 +3150,53 @@ where
                 "preserving supervisor startup authority because endpoint retirement failed"
             );
             SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string())
+        }
+    }
+}
+
+fn remove_supervisor_endpoint_files_with<F>(dir: &Path, mut remove_file: F) -> std::io::Result<()>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let owner_path = dir.join(SUPERVISOR_OWNER_FILE);
+    let mut owner_failure = None;
+    if let Err(error) = remove_file(&owner_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            owner_failure = Some(format!("remove {}: {error}", owner_path.display()));
+        }
+    }
+    let endpoint_result = remove_endpoint_files_with(
+        &dir.join(SUPERVISOR_PID_FILE),
+        &dir.join(SUPERVISOR_PORT_FILE),
+        |path| remove_file(path),
+    );
+    match std::fs::symlink_metadata(&owner_path) {
+        Ok(_) => {
+            owner_failure.get_or_insert_with(|| {
+                format!(
+                    "endpoint owner component {} still exists after retirement",
+                    owner_path.display()
+                )
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            owner_failure.get_or_insert_with(|| {
+                format!("verify retirement of {}: {error}", owner_path.display())
+            });
+        }
+    }
+    match (owner_failure, endpoint_result) {
+        (None, Ok(())) => Ok(()),
+        (owner, endpoint) => {
+            let mut failures = Vec::new();
+            if let Some(owner) = owner {
+                failures.push(owner);
+            }
+            if let Err(error) = endpoint {
+                failures.push(error.to_string());
+            }
+            Err(std::io::Error::other(failures.join("; ")))
         }
     }
 }
@@ -8137,8 +8241,10 @@ mod tests {
             SupervisorEndpointSnapshot {
                 pid: Some(std::process::id()),
                 port: Some(legacy_port),
+                owner: None,
                 pid_exists: true,
                 port_exists: true,
+                owner_exists: false,
             },
             "the post-snapshot legacy publication must survive the read-only probe"
         );

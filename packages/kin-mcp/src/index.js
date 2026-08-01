@@ -254,8 +254,8 @@ function guidedProvisioningFailure(error) {
   ].join('\n');
 }
 
-function isTruthyEnv(value) {
-  return ['1', 'true', 'TRUE', 'yes', 'YES'].includes(String(value || ''));
+export function isTruthyEnv(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }
 
 function renderHelp() {

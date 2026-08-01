@@ -21,6 +21,7 @@ import {
   provision,
   probeBinaryVersion,
   ensureProvisioned,
+  isTruthyEnv,
 } from '../lib/provision.mjs';
 import { binaryName, readLauncherStamp, writeLauncherStamp } from '../lib/resolve.mjs';
 
@@ -36,6 +37,15 @@ test('artifactName maps every released host and matches release.yml naming', () 
   assert.equal(artifactName('linux', 'arm64'), 'kin-linux-aarch64.tar.gz');
   assert.equal(artifactName('linux', 'x64'), 'kin-linux-x86_64.tar.gz');
   assert.equal(artifactName('win32', 'x64'), 'kin-windows-x86_64.zip');
+});
+
+test('launcher booleans accept the complete generated env-contract vocabulary', () => {
+  for (const token of ['1', 'true', 'TRUE', 'TrUe', 'yes', 'YES', 'on', 'ON', ' on ']) {
+    assert.equal(isTruthyEnv(token), true, token);
+  }
+  for (const token of ['', '0', 'false', 'no', 'off', 'truthy']) {
+    assert.equal(isTruthyEnv(token), false, token);
+  }
 });
 
 test('artifactName is honest about windows-aarch64 having no artifact', () => {

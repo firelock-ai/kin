@@ -43,6 +43,10 @@ $BaseUrl = if ($env:KIN_BASE_URL) { $env:KIN_BASE_URL } else { "https://github.c
 function Write-Info  { Write-Host "  -> $args" -ForegroundColor Cyan }
 function Write-Ok    { Write-Host "  [ok] $args" -ForegroundColor Green }
 function Write-Err   { Write-Host "  [error] $args" -ForegroundColor Red }
+function Test-KinTruthy([string]$Value) {
+    if ($null -eq $Value) { return $false }
+    return @("1", "true", "yes", "on") -contains $Value.Trim().ToLowerInvariant()
+}
 
 $NativeWindowsSupportNotice = "Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories."
 
@@ -430,7 +434,7 @@ if (Test-Path $KinExe) {
 
 # ── Run setup ───────────────────────────────────────────────────────────
 
-if ($env:KIN_NO_SETUP -eq "1") {
+if (Test-KinTruthy $env:KIN_NO_SETUP) {
     Write-Host ""
     Write-Info "Skipping repository-free setup diagnostics (KIN_NO_SETUP=1)."
 } else {

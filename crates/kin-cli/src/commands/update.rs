@@ -1563,7 +1563,7 @@ impl InstallRootLock {
         Self::acquire_inner(kin_home, false, false)
     }
 
-    fn acquire_existing_waiting(kin_home: &Path) -> Result<Self> {
+    pub(crate) fn acquire_existing_waiting(kin_home: &Path) -> Result<Self> {
         Self::acquire_inner(kin_home, false, true)
     }
 
@@ -1671,6 +1671,52 @@ impl InstallRootLock {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Atomically detach the exact locked install root from its public name so
+    /// recursive cleanup can never follow a replacement placed at that name.
+    /// The returned sibling path names the same anchored directory incarnation
+    /// this lock was acquired against.
+    #[cfg(unix)]
+    pub(crate) fn retire_for_uninstall(&self) -> Result<PathBuf> {
+        let install = self.install()?;
+        let retired_name = format!(".kin-uninstall-retired-{}", uuid::Uuid::new_v4());
+        if install.parent.stat_entry(&retired_name)?.is_some() {
+            anyhow::bail!(
+                "refusing to replace an existing uninstall retirement path {}/{}",
+                install.parent.display.display(),
+                retired_name
+            );
+        }
+        install.ensure_bound()?;
+        rustix::fs::renameat_with(
+            &install.parent.file,
+            install.root_name.as_str(),
+            &install.parent.file,
+            retired_name.as_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .with_context(|| {
+            format!(
+                "failed to atomically retire locked Kin install root {}",
+                self.root.display()
+            )
+        })?;
+        install.parent.sync()?;
+        let retired = install
+            .parent
+            .stat_entry(&retired_name)?
+            .context("retired Kin install root disappeared after atomic rename")?;
+        if rustix::fs::FileType::from_raw_mode(retired.st_mode) != rustix::fs::FileType::Directory
+            || retired.st_dev as u64 != install.root.dev
+            || retired.st_ino as u64 != install.root.ino
+        {
+            anyhow::bail!(
+                "retired Kin install root identity changed after atomic rename; preserving {}",
+                install.parent.display.join(&retired_name).display()
+            );
+        }
+        Ok(install.parent.display.join(retired_name))
     }
 
     #[cfg(unix)]

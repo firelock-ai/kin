@@ -29,6 +29,11 @@ import {
   writeLauncherStamp,
 } from './resolve.mjs';
 
+/** Parse the boolean vocabulary promised by Kin's generated env contract. */
+export function isTruthyEnv(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
 /**
  * Release-artifact file name for a host. Follows the release workflow's
  * naming (kin-{macos|linux|windows}-{x86_64|aarch64}); Windows ships as .zip.
@@ -561,13 +566,13 @@ export async function ensureProvisioned(opts = {}) {
     return resolveManagedBinary('kin', env, platform);
   }
   const existing = resolveManagedBinary('kin', env, platform);
-  if (env.KIN_NO_PROVISION === '1') {
+  if (isTruthyEnv(env.KIN_NO_PROVISION)) {
     return existing;
   }
 
   const doProvision = () => provision(target, { env, platform, arch, fetchImpl, log });
 
-  if (env.KIN_LAUNCHER_ADOPT === '1') {
+  if (isTruthyEnv(env.KIN_LAUNCHER_ADOPT)) {
     return doProvision();
   }
   if (!existing) {

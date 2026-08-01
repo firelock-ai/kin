@@ -35,6 +35,13 @@ info() { printf '  \033[36m→\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 err()  { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; }
 bold() { printf '\033[1m%s\033[0m' "$*"; }
+is_truthy() {
+    normalized=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | awk '{$1=$1};1')
+    case "$normalized" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 detect_os() {
     case "$(uname -s)" in
@@ -245,7 +252,7 @@ fi
 # any installed binary. Unsafe existing state is never silently chmodded or
 # overwritten; the operator must explicitly repair it and rerun the installer.
 chmod +x "$EXTRACT_DIR/kin"
-if [ "${KIN_REGISTRY_REPAIR:-}" = "1" ]; then
+if is_truthy "${KIN_REGISTRY_REPAIR:-}"; then
     REGISTRY_AUTHORITY_STATUS=0
     "$EXTRACT_DIR/kin" registry authority --fix --initialize || REGISTRY_AUTHORITY_STATUS=$?
 else
@@ -379,7 +386,7 @@ fi
 
 # ── Run setup ───────────────────────────────────────────────────────────
 
-if [ "${KIN_NO_SETUP:-}" = "1" ]; then
+if is_truthy "${KIN_NO_SETUP:-}"; then
     printf '\n'
     info "Skipping setup (KIN_NO_SETUP=1). Run 'kin setup' when ready."
 else

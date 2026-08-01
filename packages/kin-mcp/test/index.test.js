@@ -15,8 +15,18 @@ import {
   resolveDaemonBinaryPath,
   resolveReleaseAsset,
   resolveReleaseTag,
-  runKinMcp
+  runKinMcp,
+  isTruthyEnv
 } from '../src/index.js';
+
+test('MCP auto-init boolean accepts the generated env-contract vocabulary', () => {
+  for (const token of ['1', 'true', 'TRUE', 'TrUe', 'yes', 'YES', 'on', 'ON', ' on ']) {
+    assert.equal(isTruthyEnv(token), true, token);
+  }
+  for (const token of ['', '0', 'false', 'no', 'off', 'truthy']) {
+    assert.equal(isTruthyEnv(token), false, token);
+  }
+});
 import {
   absoluteHostPath,
   createSmokeFixtureContext,
