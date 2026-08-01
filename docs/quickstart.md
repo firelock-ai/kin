@@ -455,10 +455,10 @@ For a manually configured MCP client:
 }
 ```
 
-`kin setup status` and `kin doctor` recognize this exact canonical npm topology and
-`kin doctor --fix` preserves a healthy entry. Nearby wrapper shapes and a bare `kin`
-command are not treated as equivalent: agent clients do not reliably inherit your shell
-`PATH`. Codex and Antigravity entries are repository-bound; when configuring
+`kin setup status` and `kin doctor` recognize this exact canonical npm topology instead of
+flagging it for repair. Nearby wrapper shapes and a bare `kin` command are not treated as
+equivalent: agent clients do not reliably inherit your shell `PATH`. Codex and Antigravity
+entries are repository-bound; when configuring
 either by hand, append `"--repo", "/absolute/path/to/repository"` to the argument vector
 (and set Antigravity's workspace `cwd` to that same absolute repository path).
 
