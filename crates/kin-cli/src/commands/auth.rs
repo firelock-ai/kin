@@ -48,11 +48,20 @@ fn project_dirs() -> Result<ProjectDirs> {
         .ok_or_else(|| anyhow::anyhow!("failed to resolve Kin config directory"))
 }
 
+fn fallback_credential_root() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_local_dir().join("auth"))
+}
+
 fn fallback_credential_path(base_url: &str) -> Result<PathBuf> {
-    let dirs = project_dirs()?;
-    let root = dirs.data_local_dir().join("auth");
+    let root = fallback_credential_root()?;
     fs::create_dir_all(&root)?;
     Ok(root.join(format!("{}.json.age", account_key(base_url))))
+}
+
+/// The same path without creating the directory, for read-only probes that
+/// must not leave a directory behind on a machine that never logged in.
+fn fallback_credential_probe_path(base_url: &str) -> Result<PathBuf> {
+    Ok(fallback_credential_root()?.join(format!("{}.json.age", account_key(base_url))))
 }
 
 fn read_passphrase() -> Result<String> {
@@ -155,6 +164,61 @@ fn load_credential(base_url: &str, allow_keyring: bool) -> Result<Option<StoredC
     }
 
     Ok(None)
+}
+
+/// What this machine knows about a KinLab identity, without unlocking it.
+///
+/// The first-run surface reports hosted state, and a report must never raise a
+/// passphrase prompt, so a credential that exists only as an encrypted file is
+/// reported as present and locked rather than decrypted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostedCredentialState {
+    /// Nothing on this machine claims an identity for the workspace.
+    Absent,
+    /// An encrypted credential file exists; reading it needs the passphrase.
+    Locked,
+    /// A credential is readable without a prompt.
+    Ready {
+        user_email: String,
+        expires_at: String,
+    },
+}
+
+/// The workspace URL a hosted command would talk to, resolved the same way
+/// every auth subcommand resolves it.
+pub fn hosted_base_url(base_url: Option<String>) -> String {
+    normalized_base_url(base_url)
+}
+
+/// Report the stored identity for a workspace without prompting or writing.
+pub fn hosted_credential_state(base_url: &str) -> Result<HostedCredentialState> {
+    let key = account_key(base_url);
+    if keyring_enabled() {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            if let Ok(value) = entry.get_password() {
+                let credential: StoredCredential = serde_json::from_str(&value)?;
+                return Ok(HostedCredentialState::Ready {
+                    user_email: credential.user_email,
+                    expires_at: credential.expires_at,
+                });
+            }
+        }
+    }
+
+    let encrypted_path = fallback_credential_probe_path(base_url)?;
+    let plaintext_path = encrypted_path.with_extension("json");
+    if plaintext_path.exists() {
+        let bytes = fs::read(&plaintext_path)?;
+        let credential: StoredCredential = serde_json::from_slice(&bytes)?;
+        return Ok(HostedCredentialState::Ready {
+            user_email: credential.user_email,
+            expires_at: credential.expires_at,
+        });
+    }
+    if encrypted_path.exists() {
+        return Ok(HostedCredentialState::Locked);
+    }
+    Ok(HostedCredentialState::Absent)
 }
 
 fn delete_credential(base_url: &str) -> Result<()> {
@@ -312,7 +376,7 @@ pub(crate) fn default_base_url_for_health() -> String {
 /// block a non-interactive health probe. A keyring-only credential therefore
 /// reads as absent rather than risk hanging.
 pub(crate) fn has_stored_credential(base_url: &str) -> bool {
-    if let Ok(encrypted_path) = fallback_credential_path(base_url) {
+    if let Ok(encrypted_path) = fallback_credential_probe_path(base_url) {
         let plaintext_path = encrypted_path.with_extension("json");
         if plaintext_path.exists() || encrypted_path.exists() {
             return true;
