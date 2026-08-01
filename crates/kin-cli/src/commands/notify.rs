@@ -101,8 +101,12 @@ pub fn status(json: bool) -> Result<i32> {
             "{}",
             serde_json::json!({
                 "notifier": status.notifier.as_ref().map(|p| p.display().to_string()),
+                "expected": status.expected.display().to_string(),
+                "channel": status.channel.as_str(),
                 "identity": status.identity,
+                "notifier_issue": status.notifier_issue,
                 "held_keys": status.held_keys,
+                "degraded": status.degradation(),
             })
         );
         return Ok(0);
@@ -110,8 +114,16 @@ pub fn status(json: bool) -> Result<i32> {
 
     match &status.notifier {
         Some(path) => println!("notifier:  {}", path.display()),
-        // Say what the consequence is, not just that a file is missing.
-        None => println!("notifier:  not installed (notifications post as Script Editor)"),
+        // Say what the consequence is and which install to repair, not just
+        // that a file is missing.
+        None => match &status.notifier_issue {
+            Some(issue) => println!("notifier:  unusable ({issue})"),
+            None => println!("notifier:  not installed"),
+        },
+    }
+    println!("channel:   {}", status.channel);
+    if let Some(degradation) = status.degradation() {
+        println!("degraded:  {degradation}");
     }
     if let Some(identity) = &status.identity {
         println!("identity:  {identity}");

@@ -192,6 +192,84 @@ fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Dura
     current.unwrap_or(base).saturating_mul(2).min(max)
 }
 
+#[derive(Debug)]
+enum BackgroundEmbeddingBatchOutcome {
+    Completed(usize),
+    ResetAfterIndexError(kin_db::KinDbError),
+    Failed(kin_db::KinDbError),
+}
+
+/// Run one background embedding batch and any first-error vector recovery under
+/// one `embedding_work` guard.
+///
+/// The recovery decision belongs inside this critical section. In particular,
+/// a foreground `/embed --rebuild` that is already waiting must not acquire the
+/// guard, publish a fresh index, and then be wiped by recovery from this stale
+/// failed batch.
+fn run_background_embedding_batch(
+    state: &DaemonState,
+    reset_on_index_error: bool,
+    process: impl FnOnce(&DaemonState) -> std::result::Result<usize, kin_db::KinDbError>,
+) -> BackgroundEmbeddingBatchOutcome {
+    let _embedding_guard = match state.embedding_work.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return BackgroundEmbeddingBatchOutcome::Failed(
+                kin_db::KinDbError::ConcurrentAccessError(
+                    "embedding work lock poisoned".to_string(),
+                ),
+            );
+        }
+    };
+
+    match process(state) {
+        Ok(count) => BackgroundEmbeddingBatchOutcome::Completed(count),
+        Err(error)
+            if reset_on_index_error && matches!(&error, kin_db::KinDbError::IndexError(_)) =>
+        {
+            reset_vector_index_and_requeue_under_guard(state);
+            BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(error)
+        }
+        Err(error) => BackgroundEmbeddingBatchOutcome::Failed(error),
+    }
+}
+
+/// Detach a stale vector index and rebuild both embedding queues while the
+/// caller owns `embedding_work`.
+fn reset_vector_index_and_requeue_under_guard(state: &DaemonState) {
+    state.graph.reset_vector_index();
+    #[cfg(feature = "embeddings")]
+    state.graph.queue_missing_for_embedding();
+    state.graph.queue_missing_artifacts_for_embedding();
+}
+
+/// Deterministically expose reset contention to the status/reset race test.
+#[cfg(all(test, feature = "vector"))]
+pub(crate) fn reset_vector_index_and_requeue_after_contention_for_test(
+    state: &DaemonState,
+    on_contention: impl FnOnce(),
+) -> std::result::Result<(), kin_db::KinDbError> {
+    let _embedding_guard = match state.embedding_work.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_contention();
+            state.embedding_work.lock().map_err(|_| {
+                kin_db::KinDbError::ConcurrentAccessError(
+                    "embedding work lock poisoned".to_string(),
+                )
+            })?
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(kin_db::KinDbError::ConcurrentAccessError(
+                "embedding work lock poisoned".to_string(),
+            ));
+        }
+    };
+
+    reset_vector_index_and_requeue_under_guard(state);
+    Ok(())
+}
+
 /// Poll `workspace/symbol` with an empty query until the LSP server responds
 /// or the deadline is reached. Language servers like rust-analyzer and pyright
 /// continue background indexing after the `initialize` handshake; this probe
@@ -1371,6 +1449,7 @@ pub async fn run_with_authority(
                 let batch = embed_batch_size;
                 let state_for_embed = Arc::clone(&embed_state);
                 let is_artifact = pending == 0;
+                let reset_on_index_error = !index_reset_triggered;
                 let label = if is_artifact {
                     "embedded artifacts"
                 } else {
@@ -1383,23 +1462,22 @@ pub async fn run_with_authority(
                 };
 
                 let embed_result = tokio::task::spawn_blocking(move || {
-                    let _guard = state_for_embed.embedding_work.lock().map_err(|_| {
-                        kin_db::KinDbError::ConcurrentAccessError(
-                            "embedding work lock poisoned".to_string(),
-                        )
-                    })?;
-                    if is_artifact {
-                        state_for_embed
-                            .graph
-                            .process_artifact_embedding_queue(batch)
-                    } else {
-                        state_for_embed.graph.process_embedding_queue(batch)
-                    }
+                    run_background_embedding_batch(
+                        &state_for_embed,
+                        reset_on_index_error,
+                        |state| {
+                            if is_artifact {
+                                state.graph.process_artifact_embedding_queue(batch)
+                            } else {
+                                state.graph.process_embedding_queue(batch)
+                            }
+                        },
+                    )
                 })
                 .await;
 
                 match embed_result {
-                    Ok(Ok(count)) if count > 0 => {
+                    Ok(BackgroundEmbeddingBatchOutcome::Completed(count)) if count > 0 => {
                         consecutive_panics = 0;
                         // A successful batch means the index now matches the
                         // embedder — clear any error backoff / reset latch.
@@ -1438,7 +1516,7 @@ pub async fn run_with_authority(
                             drain_pending_flush(&mut pending_flush).await;
                         }
                     }
-                    Ok(Ok(_)) => {
+                    Ok(BackgroundEmbeddingBatchOutcome::Completed(_)) => {
                         // Queue drained out from under us (e.g. an explicit
                         // `/embed` request raced ahead). Stop draining and return
                         // to the idle sleep.
@@ -1447,52 +1525,42 @@ pub async fn run_with_authority(
                         error_backoff = None;
                         break;
                     }
-                    Ok(Err(e)) => {
+                    Ok(BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(e)) => {
+                        warn!(
+                            error = %e,
+                            "embedding worker hit a vector-index error — reset vector index and re-queued once"
+                        );
+                        index_reset_triggered = true;
+                        error_backoff = None;
+                        error!(
+                            error = %e,
+                            "embedding worker error — reset vector index, retrying next interval"
+                        );
+                        break;
+                    }
+                    Ok(BackgroundEmbeddingBatchOutcome::Failed(e)) => {
                         // Distinguish a persistent vector-index error (a stale
                         // loaded index dimension vs the live embedder) from a
-                        // transient one. On the FIRST index error, trigger the
-                        // kin-db reset/re-queue contract exactly once and retry at
-                        // the normal interval — the rebuilt index is sized to the
-                        // live embedder and should succeed next pass. If the error
-                        // persists (reset already attempted) or it is some other
-                        // error, back off exponentially so the worker never
-                        // busy-spins.
-                        let is_index_error = matches!(e, kin_db::KinDbError::IndexError(_));
-                        if is_index_error && !index_reset_triggered {
-                            warn!(
-                                error = %e,
-                                "embedding worker hit a vector-index error — resetting vector index and re-queueing once"
-                            );
-                            embed_state.graph.reset_vector_index();
-                            #[cfg(feature = "embeddings")]
-                            embed_state.graph.queue_missing_for_embedding();
-                            embed_state.graph.queue_missing_artifacts_for_embedding();
-                            index_reset_triggered = true;
-                            error_backoff = None;
-                            error!(
-                                error = %e,
-                                "embedding worker error — reset vector index, retrying next interval"
-                            );
-                        } else {
-                            // The one-shot reset did not clear it (or it is a
-                            // non-index error): back off exponentially so the
-                            // worker never busy-spins. A stale vector index is NOT
-                            // a reason to block the graph snapshot flush — it
-                            // self-heals on load — so shutdown persistence is left
-                            // untouched here; the graph anti-wipe guard is keyed on
-                            // entity-count collapse, not on embed errors.
-                            let next = next_embed_error_backoff(
-                                error_backoff,
-                                embed_interval,
-                                EMBED_ERROR_BACKOFF_MAX,
-                            );
-                            error_backoff = Some(next);
-                            error!(
-                                error = %e,
-                                backoff_s = next.as_secs(),
-                                "embedding worker error — backing off"
-                            );
-                        }
+                        // transient one. The first IndexError was recovered
+                        // inside the failed batch's critical section above. If
+                        // it persists (reset already attempted) or it is some
+                        // other error, back off exponentially so the worker
+                        // never busy-spins. A stale vector index is NOT a reason
+                        // to block the graph snapshot flush — it self-heals on
+                        // load — so shutdown persistence is left untouched
+                        // here; the graph anti-wipe guard is keyed on
+                        // entity-count collapse, not on embed errors.
+                        let next = next_embed_error_backoff(
+                            error_backoff,
+                            embed_interval,
+                            EMBED_ERROR_BACKOFF_MAX,
+                        );
+                        error_backoff = Some(next);
+                        error!(
+                            error = %e,
+                            backoff_s = next.as_secs(),
+                            "embedding worker error — backing off"
+                        );
                         break;
                     }
                     Err(e) => {
@@ -2679,6 +2747,97 @@ mod tests {
         // The backoff is always strictly greater than the idle interval, so a
         // persistent error can never tight-spin at the 5s idle cadence.
         assert!(b1 > base);
+    }
+
+    /// Recovery from a failed background batch must precede a foreground
+    /// rebuild that was already waiting on `embedding_work`.
+    ///
+    /// Both rendezvous channels are zero-capacity: the batch cannot report its
+    /// synthetic IndexError until the foreground thread has observed real lock
+    /// contention, and the foreground cannot acquire until the batch has reset
+    /// under that same guard. No sleeps or scheduler timing are involved.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn background_index_recovery_precedes_already_waiting_foreground_rebuild() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+
+        // Prepare one compatible sidecar for both sides of the race. Attach it
+        // now as the stale index recovery must detach, then let the foreground
+        // `/embed --rebuild` install it fresh after acquiring `embedding_work`.
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("foreground-rebuild-race-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(state.graph.compute_root_hash())),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors
+            .upsert(kin_model::EntityId::new(), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        let sidecar = state.layout.root().join("foreground-rebuild-race.kvec");
+        vectors.save(&sidecar).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(1)
+        ));
+
+        let (batch_started_tx, batch_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (foreground_waiting_tx, foreground_waiting_rx) = std::sync::mpsc::sync_channel(0);
+
+        let batch_state = Arc::clone(&state);
+        let background = std::thread::spawn(move || {
+            super::run_background_embedding_batch(&batch_state, true, move |_| {
+                batch_started_tx.send(()).unwrap();
+                foreground_waiting_rx.recv().unwrap();
+                Err(kin_db::KinDbError::IndexError(
+                    "synthetic stale background index".to_string(),
+                ))
+            })
+        });
+
+        batch_started_rx.recv().unwrap();
+        let foreground_state = Arc::clone(&state);
+        let foreground = std::thread::spawn(move || {
+            let _foreground_guard = match foreground_state.embedding_work.try_lock() {
+                Ok(_) => panic!("background batch must still own embedding_work"),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    foreground_waiting_tx.send(()).unwrap();
+                    foreground_state.embedding_work.lock().unwrap()
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("embedding_work unexpectedly poisoned")
+                }
+            };
+
+            assert!(
+                foreground_state.graph.vector_index_stats().is_none(),
+                "the stale background index must be reset before the waiting rebuild acquires"
+            );
+            assert!(matches!(
+                foreground_state
+                    .graph
+                    .load_vector_index_compatible(&sidecar, &descriptor),
+                kin_db::VectorIndexLoad::Loaded(1)
+            ));
+        });
+
+        let outcome = background.join().unwrap();
+        match outcome {
+            super::BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(error) => {
+                assert!(matches!(error, kin_db::KinDbError::IndexError(_)));
+            }
+            other => panic!("unexpected background batch outcome: {other:?}"),
+        }
+        foreground.join().unwrap();
+
+        assert_eq!(
+            state.graph.vector_index_stats(),
+            Some((4, 1)),
+            "no stale recovery may run after the waiting foreground rebuild publishes"
+        );
     }
 
     #[test]

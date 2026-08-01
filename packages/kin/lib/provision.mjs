@@ -222,6 +222,138 @@ function installFile(src, dest, mode) {
 }
 
 /**
+ * Copy a directory tree, refusing anything that is not a directory or a regular
+ * file. Written out rather than delegating to fs.cpSync so a symlink inside an
+ * extracted archive stops the copy instead of being reproduced under $KIN_HOME,
+ * and so the executable bit is carried across deliberately.
+ */
+function copyTree(src, dest) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`refusing to copy symlink from the release archive: ${src}`);
+  }
+  if (stat.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      copyTree(path.join(src, entry), path.join(dest, entry));
+    }
+    return;
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing to copy a non-regular archive entry: ${src}`);
+  }
+  fs.copyFileSync(src, dest);
+  fs.chmodSync(dest, stat.mode & 0o111 ? 0o755 : 0o644);
+}
+
+/** Read-only counterpart to copyTree, used before any live install mutation. */
+function validateTree(src) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`refusing symlink in the release archive: ${src}`);
+  }
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(src)) {
+      validateTree(path.join(src, entry));
+    }
+    return;
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing a non-regular archive entry: ${src}`);
+  }
+}
+
+/**
+ * Install the macOS notification bundle from an extracted release archive.
+ *
+ * macOS reads a notification's sender name, icon, and grouping from the posting
+ * process's bundle; a CLI has none, so without this every Kin notification is
+ * credited to Script Editor. That is a silent downgrade rather than a visible
+ * failure, which is why its absence is reported here rather than passed over.
+ *
+ * Replaced whole rather than merged, for the same reason install.sh does: a
+ * stale executable left inside a newer bundle breaks the signature seal macOS
+ * checks over the bundle as a unit.
+ *
+ * Returns the validated bundle source, or null on a platform with no bundle.
+ */
+function preflightNotifierBundle(root, platform) {
+  if (platform !== 'darwin') return null;
+  const src = path.join(root, 'KinNotifier.app');
+  if (!fs.existsSync(src)) {
+    throw new Error(
+      'this macOS release archive carries no KinNotifier.app; refusing to replace binaries or ' +
+        'stamp the release with a missing notification identity',
+    );
+  }
+  const rootStat = fs.lstatSync(src);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error('KinNotifier.app in the macOS release archive is not a real directory');
+  }
+  validateTree(src);
+  for (const required of ['Contents/MacOS/KinNotifier', 'Contents/Info.plist']) {
+    const member = path.join(src, required);
+    if (!fs.existsSync(member)) {
+      throw new Error(
+        `this macOS release archive's KinNotifier.app is missing ${required}; refusing to ` +
+          'replace binaries or stamp the release',
+      );
+    }
+    const stat = fs.lstatSync(member);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`KinNotifier.app/${required} is not a regular file`);
+    }
+    if (stat.size === 0) {
+      throw new Error(`KinNotifier.app/${required} is empty`);
+    }
+    if (required.endsWith('/KinNotifier') && (stat.mode & 0o111) === 0) {
+      throw new Error(`KinNotifier.app/${required} is not executable`);
+    }
+  }
+  return src;
+}
+
+function installNotifierBundleSource(src, env) {
+  const libDir = path.join(kinHome(env), 'lib');
+  fs.mkdirSync(libDir, { recursive: true });
+  const dest = path.join(libDir, 'KinNotifier.app');
+  // Build the incoming tree beside the live one and swap, rather than removing
+  // the live one and copying into the gap it leaves. copyTree refuses a symlink
+  // or a non-regular entry part-way down, and a bundle interrupted there has a
+  // launchable executable with no `Info.plist` behind it, which every freshness
+  // check reads as an installed bundle. The updater stages and renames for the
+  // same reason.
+  const staged = path.join(libDir, '.KinNotifier.app.incoming');
+  try {
+    fs.rmSync(staged, { recursive: true, force: true });
+    copyTree(src, staged);
+    fs.chmodSync(path.join(staged, 'Contents', 'MacOS', 'KinNotifier'), 0o755);
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.renameSync(staged, dest);
+  } finally {
+    fs.rmSync(staged, { recursive: true, force: true });
+  }
+
+  // Registering with LaunchServices is what lets the notification daemon
+  // validate the bundle; an unregistered app is refused outright. Authorization
+  // itself is NOT requested here: an unanswered prompt is recorded as a
+  // permanent denial, so it must be raised interactively by `kin setup`.
+  const lsregister =
+    '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
+  if (fs.existsSync(lsregister)) {
+    spawnSync(lsregister, ['-f', dest], { stdio: 'ignore' });
+  }
+  return true;
+}
+
+/** Validate and install the macOS bundle as one tree. */
+export function installNotifierBundle(root, env, platform, log) {
+  void log;
+  const src = preflightNotifierBundle(root, platform);
+  return src ? installNotifierBundleSource(src, env) : false;
+}
+
+/**
  * Download, verify, and install the pinned Kin release. Returns the installed
  * managed `kin` path. Mirrors scripts/install.sh: kin + kin-daemon are
  * mandatory, kin-vfs and the projection shim library are optional extras.
@@ -287,6 +419,12 @@ export async function provision(version, opts = {}) {
       );
     }
 
+    // A macOS bundle is part of the release contract, not an optional extra.
+    // Validate it before creating or replacing anything under KIN_HOME so a
+    // malformed upgrade cannot stamp new binaries while retaining a stale
+    // live notifier from the previous release.
+    const notifierSrc = preflightNotifierBundle(root, platform);
+
     const binDir = path.join(kinHome(env), 'bin');
     const libDir = path.join(kinHome(env), 'lib');
     fs.mkdirSync(binDir, { recursive: true });
@@ -304,6 +442,10 @@ export async function provision(version, opts = {}) {
         fs.mkdirSync(libDir, { recursive: true });
         installFile(libSrc, path.join(libDir, lib), 0o644);
       }
+    }
+
+    if (notifierSrc && installNotifierBundleSource(notifierSrc, env)) {
+      log('kin: notification identity installed (KinNotifier.app)');
     }
 
     writeLauncherStamp(version, env);

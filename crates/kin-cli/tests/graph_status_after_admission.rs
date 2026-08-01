@@ -448,7 +448,12 @@ fn status_reports_durable_admission_enrichment_from_one_authority_generation() {
     let graph_entities = graph.list_all_entities().expect("list entities").len();
     let graph_relations = graph.graph_stats().total_relations;
 
-    let report = status::inspect(&admitted.layout, &admitted.binding).expect("inspect status");
+    let report = status::inspect(
+        &admitted.layout,
+        &admitted.binding,
+        status::EmbeddingCoverage::unobserved(status::EmbeddingCoverageUnobserved::NoRunningDaemon),
+    )
+    .expect("inspect status");
 
     assert_eq!(report.semantic_enrichment.entity_count, graph_entities);
     assert_eq!(report.semantic_enrichment.relation_count, graph_relations);
@@ -472,6 +477,142 @@ fn status_reports_durable_admission_enrichment_from_one_authority_generation() {
     assert!(report.semantic_enrichment.semantic_change_count > 0);
 }
 
+/// Install a real vector index over every retrievable key this graph owns,
+/// through kin-db's own compatibility-checked loader.
+///
+/// The vectors are fixture values; the index, the keys, and the load path are
+/// the production ones. What the caller is measuring is where coverage is read
+/// from, so the index has to be genuinely attached to the graph under test.
+#[cfg(feature = "vector")]
+fn install_full_vector_index(graph: &kin_db::InMemoryGraph, sidecar: &Path) -> usize {
+    let snapshot = graph.to_snapshot();
+    let mut keys: Vec<kin_model::RetrievalKey> = graph
+        .list_all_entities()
+        .expect("list entities")
+        .iter()
+        .map(|entity| kin_model::RetrievalKey::Entity(entity.id))
+        .collect();
+    keys.extend(
+        snapshot
+            .entity_revisions
+            .values()
+            .flat_map(|revisions| revisions.iter())
+            .map(|revision| kin_model::RetrievalKey::EntityRevision(revision.revision_id)),
+    );
+    keys.extend(
+        snapshot
+            .resolved_tree
+            .artifacts()
+            .map(|artifact| kin_model::RetrievalKey::Artifact(artifact.artifact_id)),
+    );
+
+    let vectors = kin_db::VectorIndex::new(4).expect("create vector index");
+    for (index, key) in keys.iter().enumerate() {
+        let embedding = match index % 3 {
+            0 => [1.0, 0.0, 0.0, 0.0],
+            1 => [0.0, 1.0, 0.0, 0.0],
+            _ => [0.0, 0.0, 1.0, 0.0],
+        };
+        vectors
+            .upsert_retrievable(*key, &embedding)
+            .expect("upsert retrievable vector");
+    }
+
+    let descriptor = kin_db::IndexDescriptor {
+        model_id: Some("status-coverage-fixture@v1".to_string()),
+        graph_root: Some(hex::encode(graph.compute_root_hash())),
+    };
+    vectors.set_descriptor(descriptor.clone());
+    vectors.save(sidecar).expect("save vector index");
+    assert!(
+        matches!(
+            graph.load_vector_index_compatible(sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ),
+        "the fixture sidecar must install into the graph it was built from"
+    );
+    keys.len()
+}
+
+/// FIR-1785: coverage must come from a graph that actually holds an index.
+///
+/// The regression this pins is not a wrong number, it is a well-formed one.
+/// `embedding_status` answers `indexed = 0` for every retrievable object when
+/// no vector index is installed, and a graph rebuilt from an authority snapshot
+/// never has one. Reading coverage there reports zero on a fully embedded
+/// repository. So the same graph is measured twice, once before an index is
+/// attached and once after, and the two readings must differ in kind: an
+/// absence first, then real counts.
+#[cfg(feature = "vector")]
+#[test]
+fn status_reports_coverage_from_the_index_the_live_graph_carries() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let admitted = admit(&repo);
+    let graph = workspace_query_graph(&admitted.binding);
+
+    // Exactly the source a snapshot-derived read would have used. It carries no
+    // index, so it must report that rather than counting zero against a total.
+    assert_eq!(
+        status::observe_embedding_coverage(&graph),
+        status::EmbeddingCoverage::unobserved(
+            status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+        ),
+        "a graph with no vector index must report an absence, never a coverage of zero"
+    );
+
+    let seeded = install_full_vector_index(&graph, &root.path().join("coverage.kvec"));
+    assert!(seeded > 0, "the admitted graph must own retrievable keys");
+
+    let coverage = status::observe_embedding_coverage(&graph);
+    let status::EmbeddingCoverage::Observed {
+        source,
+        indexed,
+        pending,
+        total,
+    } = coverage
+    else {
+        panic!("an attached index must produce an observation, found {coverage:?}");
+    };
+    assert_eq!(source, status::EmbeddingCoverageSource::LiveQueryGraph);
+    assert!(
+        indexed > 0,
+        "an embedded repository must not report zero indexed objects \
+         (indexed={indexed}, pending={pending}, total={total}, seeded={seeded})"
+    );
+    assert_eq!(
+        indexed, total,
+        "every retrievable key was seeded (pending={pending}, seeded={seeded})"
+    );
+    assert_eq!(
+        pending, 0,
+        "nothing is outstanding once every key is indexed"
+    );
+
+    // The same numbers have to survive the report and its wire form, or the
+    // payload consumers read is not the observation that was taken.
+    let report = status::inspect(&admitted.layout, &admitted.binding, coverage)
+        .expect("inspect status with observed coverage");
+    let encoded = serde_json::to_value(&report).expect("serialize status report");
+    assert_eq!(encoded["schema"], "kin.status.v3");
+    assert_eq!(encoded["embedding_coverage"]["state"], "observed");
+    assert_eq!(
+        encoded["embedding_coverage"]["indexed"],
+        serde_json::json!(indexed)
+    );
+    assert!(
+        encoded["embedding_coverage"]["indexed"].as_u64().unwrap() > 0,
+        "the serialized payload must carry the nonzero coverage that was observed"
+    );
+    assert_eq!(
+        serde_json::from_value::<status::StatusReport>(encoded)
+            .expect("a report carrying observed coverage must round-trip")
+            .embedding_coverage,
+        coverage
+    );
+}
+
 #[test]
 fn status_reports_enrichment_absent_on_an_unenriched_repository() {
     let root = tempdir().expect("temp root");
@@ -481,7 +622,12 @@ fn status_reports_enrichment_absent_on_an_unenriched_repository() {
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&result.layout)
         .expect("bind published repository authority");
 
-    let report = status::inspect(&result.layout, &binding).expect("inspect status");
+    let report = status::inspect(
+        &result.layout,
+        &binding,
+        status::EmbeddingCoverage::unobserved(status::EmbeddingCoverageUnobserved::NoRunningDaemon),
+    )
+    .expect("inspect status");
 
     assert_eq!(
         report.semantic_enrichment.presence,
