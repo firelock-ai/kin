@@ -160,8 +160,18 @@ jobs:
       # no `ref:` input fetches exactly that commit, so the record is read from
       # one immutable main snapshot instead of from whatever main becomes while
       # the job runs. Nothing from the failed tag's own head is trusted.
+      #
+      # Reading the record is tolerated rather than propagated, on the same
+      # ground base-image-pins.yml states: the alarm must not become the thing
+      # that reds a main sha. Without this a network hiccup fetching the record
+      # would fail the job and publish exactly the check-run that refuses a
+      # release, which is the hazard this step exists to remove. A failed
+      # checkout instead leaves no HEAD for the next step to verify, so it reads
+      # as "not abandoned" and recovery behaves as it did before the record
+      # existed.
       - name: Checkout the abandonment record from the default-branch commit
         if: steps.resolve.outputs.needed == 'true'
+        continue-on-error: true
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           sparse-checkout: scripts
