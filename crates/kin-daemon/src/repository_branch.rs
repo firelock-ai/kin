@@ -223,9 +223,9 @@ pub(crate) fn workspace_behind_ref(state: &DaemonState, name: &RefName) -> Resul
         None => "no admitted head".to_string(),
     };
     Ok(Some(format!(
-        "workspace {} stands at {standing} while {name} is at {}; this pull admitted nothing, so \
-         the gap is one an earlier pull admitted without completing its workspace transition. Run \
-         `kin branch switch {name}` to move this working tree onto it.",
+        "workspace {} stands at {standing} while {name} is at {}, so an earlier run moved that ref \
+         without this workspace following it. Run `kin branch switch {name}` to move this working \
+         tree onto it.",
         workspace.workspace_id,
         render_target(&target)
     )))

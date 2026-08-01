@@ -7794,7 +7794,9 @@ async fn pull_admitted_nothing(
     })
     .await;
     match behind {
-        Ok(Ok(Some(detail))) => WorkspaceFollow::Behind { detail },
+        Ok(Ok(Some(detail))) => WorkspaceFollow::Behind {
+            detail: format!("this pull admitted no history; {detail}"),
+        },
         Ok(Ok(None)) => WorkspaceFollow::NotApplicable {
             detail: "this pull admitted no history, so no ref moved for a working tree to follow"
                 .to_string(),
