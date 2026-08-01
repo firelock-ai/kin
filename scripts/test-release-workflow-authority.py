@@ -2389,6 +2389,39 @@ def assert_release_check_accepted(
             f"{check_name}={conclusion}: {result.stdout}{result.stderr}"
         )
 
+def assert_release_gate_admits(
+    source: str,
+    label: str,
+    expected: tuple[str, ...],
+    mutate_fixture: Callable[
+        [
+            list[dict[str, object]],
+            list[dict[str, object]],
+            dict[str, object],
+        ],
+        None,
+    ],
+) -> None:
+    """Require a fixture to be admitted, and to announce what it admitted over.
+
+    A downgrade that is not announced is worse than the refusal it replaces, so
+    admission and announcement are asserted together and never separately.
+    """
+
+    result = execute_release_check_gate(source, {}, mutate_fixture=mutate_fixture)
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        raise AssertionError(
+            f"release gate refused an admissible fixture: {label}: {output}"
+        )
+    for needle in expected:
+        if needle not in output:
+            raise AssertionError(
+                f"release gate admitted {label} silently, expected {needle!r}: "
+                f"{output}"
+            )
+
+
 def run_tag_selector(
     manifest: str,
     candidates: str,
@@ -2758,6 +2791,630 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
                 )
 
 
+def recovery_escalation_source(release_recovery: str) -> str:
+    """Extract the escalation step exactly as the recovery controller runs it."""
+
+    anchor = "      - name: Alert after automatic retries are exhausted\n"
+    if anchor not in release_recovery:
+        raise AssertionError(
+            "release-recovery no longer carries the escalation step"
+        )
+    start = release_recovery.index(anchor)
+    remainder = release_recovery[start + 1 :]
+    end = (
+        release_recovery.index("\n      - name:", start + 1)
+        if "\n      - name:" in remainder
+        else len(release_recovery)
+    )
+    step = release_recovery[start:end]
+    marker = "        run: |\n"
+    return textwrap.dedent(step[step.index(marker) + len(marker) :])
+
+
+def execute_recovery_escalation(
+    source: str,
+    attempt_signatures: list[tuple[str, str] | None],
+    *,
+    release: dict[str, object] | None = None,
+    release_error: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the escalation against scripted attempt jobs and release state.
+
+    The `gh` stub answers `-q` by running the real `jq`, so the workflow's own
+    query decides the signature. A stub that returned canned answers would
+    exercise the shell and leave the jq that does the classifying unproven.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "escalate.sh"
+        script.write_text(source, encoding="utf-8")
+        responses = root / "responses"
+        responses.mkdir()
+        run_id = "4242"
+        for index, signature in enumerate(attempt_signatures, start=1):
+            if signature is None:
+                continue
+            # A single failing job makes the jobs API's ordering irrelevant,
+            # which is the shape production never produces for a matrix
+            # failure. Every attempt therefore carries its failures in the
+            # order given, so a caller can vary it the way real queue-time job
+            # ids do.
+            failures = [signature] if isinstance(signature, tuple) else list(signature)
+            jobs: list[dict[str, object]] = [
+                {
+                    "name": "Preflight",
+                    "conclusion": "success",
+                    "steps": [{"name": "Checkout", "conclusion": "success"}],
+                }
+            ]
+            for job, step_name in failures:
+                jobs.append(
+                    {
+                        "name": job,
+                        "conclusion": "failure",
+                        "steps": [
+                            {"name": "Checkout", "conclusion": "success"},
+                            {"name": step_name, "conclusion": "failure"},
+                        ],
+                    }
+                )
+            payload = {"jobs": jobs}
+            target = (
+                f"repos_firelock-ai_kin_actions_runs_{run_id}"
+                f"_attempts_{index}_jobs"
+            )
+            (responses / target).write_text(json.dumps(payload), encoding="utf-8")
+        release_response = responses / "repos_firelock-ai_kin_releases_tags_v9.9.9"
+        if release is not None and release_error is not None:
+            raise AssertionError("release fixture cannot be both readable and failed")
+        if release is not None:
+            release_response.write_text(
+                json.dumps(release),
+                encoding="utf-8",
+            )
+        if release_error is not None:
+            Path(f"{release_response}.error").write_text(
+                release_error,
+                encoding="utf-8",
+            )
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "gh").write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -uo pipefail
+                case "$1" in
+                  api)
+                    shift
+                    path=""; query=""; slurp=0
+                    while [ $# -gt 0 ]; do
+                      case "$1" in
+                        -q|--jq) shift; query="$1" ;;
+                        --slurp) slurp=1 ;;
+                        -*) ;;
+                        *) [ -n "$path" ] || path="$1" ;;
+                      esac
+                      shift
+                    done
+                    path="${path%%\\?*}"
+                    file="$FIXTURE/responses/$(printf '%s' "$path" | tr '/' '_')"
+                    if [ -f "$file.error" ]; then
+                      cat "$file.error" >&2
+                      exit 1
+                    fi
+                    if [ ! -f "$file" ]; then
+                      echo "gh: Not Found (HTTP 404)" >&2
+                      exit 1
+                    fi
+                    # `--slurp` returns an array of page responses, which is
+                    # the shape the caller's query has to handle.
+                    if [ "$slurp" = 1 ]; then
+                      body="$(jq -c '[.]' < "$file")"
+                    else
+                      body="$(cat "$file")"
+                    fi
+                    if [ -n "$query" ]; then
+                      jq -r "$query" <<< "$body"
+                    else
+                      printf '%s\n' "$body"
+                    fi
+                    ;;
+                  issue)
+                    shift
+                    case "$1" in
+                      list) exit 0 ;;
+                      create)
+                        shift
+                        while [ $# -gt 0 ]; do
+                          case "$1" in
+                            --title) shift; printf '%s' "$1" > "$FIXTURE/issue-title" ;;
+                            --body-file) shift; cp "$1" "$FIXTURE/issue-body" ;;
+                          esac
+                          shift
+                        done
+                        ;;
+                    esac
+                    ;;
+                esac
+                """
+            ),
+            encoding="utf-8",
+        )
+        (binaries / "gh").chmod(0o755)
+        environment = dict(os.environ)
+        environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
+        environment.update(
+            {
+                "FIXTURE": str(root),
+                "GH_TOKEN": "fixture",
+                "REPO": "firelock-ai/kin",
+                "TAG": "v9.9.9",
+                "SHA": RELEASE_GATE_FIXTURE_SHA,
+                "RUN_ID": run_id,
+                "RUN_URL": f"https://example.invalid/runs/{run_id}",
+                "ATTEMPTS": str(len(attempt_signatures)),
+            }
+        )
+        completed = subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=60,
+            check=False,
+        )
+        body_path = root / "issue-body"
+        body = body_path.read_text(encoding="utf-8") if body_path.exists() else ""
+        return completed, body
+
+
+def assert_recovery_escalation_classifies(release_recovery: str) -> None:
+    """Recovery must classify before advising without inventing root-cause proof.
+
+    A repeated job/step surface is useful evidence that another immediate rerun
+    is unlikely to help, but it cannot distinguish a source-bound failure from
+    an external outage that repeatedly reaches the same step. The issue must
+    preserve that distinction before it tells an operator to burn a version.
+    """
+
+    source = recovery_escalation_source(release_recovery)
+    compile_failure = ("build-artifacts (x86_64-unknown-linux-musl)", "Build release binaries")
+
+    repeated, body = execute_recovery_escalation(
+        source,
+        [compile_failure, compile_failure, compile_failure],
+    )
+    if repeated.returncode == 0:
+        raise AssertionError(
+            "recovery escalation stopped failing the run: "
+            f"{repeated.stdout}{repeated.stderr}"
+        )
+    for needle in (
+        "Classification: **repeated failure signature**",
+        "another immediate rerun is unlikely to help",
+        "recut only after confirming a source-bound defect",
+        "preserve this tag for a same-release rerun if the cause is external",
+        "- attempt 1: build-artifacts (x86_64-unknown-linux-musl) / Build release binaries",
+        "after 3 attempt(s)",
+        "No GitHub Release object exists for `v9.9.9`.",
+    ):
+        if needle not in body:
+            raise AssertionError(
+                f"identical repeated signatures were not reported: {needle!r}: {body}"
+            )
+    if "a rerun cannot reach a different outcome" in body:
+        raise AssertionError(
+            f"step identity was overstated as root-cause proof: {body}"
+        )
+
+    _, transient_body = execute_recovery_escalation(
+        source,
+        [
+            ("build-artifacts (x86_64-apple-darwin)", "Notarize"),
+            ("publish", "Push image"),
+            compile_failure,
+        ],
+    )
+    for needle in (
+        "Classification: **varying failure signatures**",
+        "Diagnose and rerun the same release",
+    ):
+        if needle not in transient_body:
+            raise AssertionError(
+                f"differing failures lost the rerun advice: {needle!r}: "
+                f"{transient_body}"
+            )
+
+    # An attempt whose jobs cannot be read is not evidence that the failure
+    # repeated. Claiming deterministic from an unreadable attempt would retire
+    # a recoverable release on a transient API error.
+    _, unreadable_body = execute_recovery_escalation(
+        source,
+        [compile_failure, None, compile_failure],
+    )
+    for needle in (
+        "Classification: **indeterminate**",
+        "- attempt 2: unrecorded",
+        "neither a deterministic nor a transient cause is established",
+        "Inspect the unrecorded attempts",
+    ):
+        if needle not in unreadable_body:
+            raise AssertionError(
+                "an unreadable attempt was folded into a deterministic verdict: "
+                f"{needle!r}: {unreadable_body}"
+            )
+    if "The attempts did not fail identically" in unreadable_body:
+        raise AssertionError(
+            "an unreadable attempt was reported as an observed difference: "
+            f"{unreadable_body}"
+        )
+
+    # The shape production actually produces. Release builds are a matrix, so
+    # more than one leg fails, and the jobs API orders by job id, which is
+    # minted at queue time. Real attempts of run 30627672394 returned the two
+    # failing legs in the order below: aarch64 first, then x86_64 first, then
+    # aarch64 again. Reducing the failing set to its first element reads that
+    # as two different failures and advises a rerun that cannot work, which
+    # is verbatim the advice this suite exists to eliminate.
+    aarch64 = (
+        "Build (kin-linux-aarch64)",
+        "Build kin-cli + kin-daemon (native)",
+    )
+    x86_64 = (
+        "Build (kin-linux-x86_64)",
+        "Build kin-cli + kin-daemon (native)",
+    )
+    _, matrix_body = execute_recovery_escalation(
+        source,
+        [[aarch64, x86_64], [x86_64, aarch64], [aarch64, x86_64]],
+    )
+    if "Classification: **repeated failure signature**" not in matrix_body:
+        raise AssertionError(
+            "a matrix failure that repeated identically was classified by the "
+            f"order its legs happened to queue in: {matrix_body}"
+        )
+
+    # Every attempt unreadable is the case that isolates the unknown count.
+    # The signatures all match each other, so nothing but that count stands
+    # between a total read failure and a verdict of "deterministic, recut it".
+    _, blind_body = execute_recovery_escalation(source, [None, None, None])
+    if "Classification: **indeterminate**" not in blind_body:
+        raise AssertionError(
+            "a run whose attempts could not be read at all was classified "
+            f"deterministic: {blind_body}"
+        )
+
+    # A mint that reported failure on a release it had already created would
+    # otherwise send this controller to repair a healthy release.
+    _, existing_release_body = execute_recovery_escalation(
+        source,
+        [compile_failure, compile_failure, compile_failure],
+        release={
+            "draft": False,
+            "prerelease": True,
+            "assets": [{"name": "kin-x86_64.tar.gz"}],
+        },
+    )
+    if (
+        "already exists with 1 asset(s)" not in existing_release_body
+        or "prerelease=true" not in existing_release_body
+        or "Confirm it is genuinely incomplete before repairing it."
+        not in existing_release_body
+    ):
+        raise AssertionError(
+            "recovery advised repair without saying the release already exists: "
+            f"{existing_release_body}"
+        )
+
+    # Only a real 404 proves absence. A permissions, rate-limit, server, or
+    # network failure is unknown state and must never be rewritten as "no
+    # Release", which would send repair after an object that may exist.
+    _, unreadable_release_body = execute_recovery_escalation(
+        source,
+        [compile_failure, compile_failure, compile_failure],
+        release_error="gh: API rate limit exceeded (HTTP 403)\n",
+    )
+    for needle in (
+        "GitHub Release state for `v9.9.9` could not be read",
+        "Do not infer that the Release is absent",
+    ):
+        if needle not in unreadable_release_body:
+            raise AssertionError(
+                "recovery converted an unreadable Release API state into absence: "
+                f"{needle!r}: {unreadable_release_body}"
+            )
+    if "No GitHub Release object exists" in unreadable_release_body:
+        raise AssertionError(
+            "recovery claimed Release absence after a non-404 API failure: "
+            f"{unreadable_release_body}"
+        )
+
+
+def assert_required_check_set_is_single_sourced(release_tag: str) -> None:
+    """The env list and the provenance table must name the same contexts.
+
+    Dropping a context from the env alone leaves the table intact, so every
+    literal needle still matches and the suite stays green while the mint has
+    quietly stopped requiring a release-critical check. The workflow's own
+    order check fails that closed at runtime, but only after the drift has
+    landed and started burning mint attempts, which is a log to read rather
+    than a red PR.
+    """
+
+    workflow = ".github/workflows/release-tag.yml"
+    step = workflow_step_source(
+        workflow,
+        release_tag,
+        "      - name: Verify required checks are green",
+    )
+    block = re.search(
+        r"\n          REQUIRED_CHECKS: \|\n((?:            \S.*\n)+)",
+        step,
+    )
+    if block is None:
+        raise AssertionError(
+            f"{workflow} no longer declares REQUIRED_CHECKS as a block scalar"
+        )
+    env_names = tuple(
+        line.strip() for line in block.group(1).splitlines() if line.strip()
+    )
+    table = re.search(
+        r"\nexpected_provenance = \{\n(.*?)\n\}\n",
+        release_check_gate_source(release_tag),
+        re.DOTALL,
+    )
+    if table is None:
+        raise AssertionError(
+            f"{workflow} no longer declares an expected_provenance table"
+        )
+    table_names = tuple(
+        re.findall(r'^    "(.+?)": \(', table.group(1), re.MULTILINE)
+    )
+    if env_names != REQUIRED_RELEASE_CHECKS:
+        raise AssertionError(
+            "the release gate's REQUIRED_CHECKS env no longer matches the "
+            f"reviewed required set: {env_names}"
+        )
+    if table_names != REQUIRED_RELEASE_CHECKS:
+        raise AssertionError(
+            "the release gate's expected_provenance table no longer matches "
+            f"the reviewed required set: {table_names}"
+        )
+
+
+def decline_escalation_source(release_tag: str) -> str:
+    """Extract the persistent-decline shell exactly as the mint runs it."""
+
+    step = workflow_step_source(
+        ".github/workflows/release-tag.yml",
+        release_tag,
+        "      - name: Escalate a persistent mint decline",
+    )
+    marker = "        run: |\n"
+    if marker not in step:
+        raise AssertionError("persistent-decline step no longer has a shell body")
+    return textwrap.dedent(step[step.index(marker) + len(marker) :])
+
+
+def execute_decline_escalation(
+    source: str,
+    prior_runs: list[tuple[int, str, str | None]],
+) -> subprocess.CompletedProcess[str]:
+    """Run the decline counter against production-shaped workflow/job payloads.
+
+    Each tuple is `(run id, Mint release tag job conclusion, escalation-step
+    conclusion)`. A `None` marker models a whole job skipped by the workflow's
+    job-level `workflow_run` guard; that is the high-volume production shape
+    that must be ignored rather than mistaken for a successful mint.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "decline.sh"
+        script.write_text(source, encoding="utf-8")
+        responses = root / "responses"
+        responses.mkdir()
+        list_path = responses / (
+            "repos_firelock-ai_kin_actions_workflows_release-tag.yml_runs"
+        )
+        list_path.write_text(
+            json.dumps({"workflow_runs": [{"id": run_id} for run_id, _, _ in prior_runs]}),
+            encoding="utf-8",
+        )
+        for run_id, job_conclusion, marker in prior_runs:
+            steps = []
+            if marker is not None:
+                steps.append(
+                    {
+                        "name": "Escalate a persistent mint decline",
+                        "conclusion": marker,
+                    }
+                )
+            payload = {
+                "jobs": [
+                    {
+                        "name": "Mint release tag",
+                        "conclusion": job_conclusion,
+                        "steps": steps,
+                    }
+                ]
+            }
+            (responses / f"repos_firelock-ai_kin_actions_runs_{run_id}_jobs").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "gh").write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -uo pipefail
+                [ "$1" = api ] || exit 2
+                shift
+                path=""; query=""
+                while [ $# -gt 0 ]; do
+                  case "$1" in
+                    -q|--jq) shift; query="$1" ;;
+                    -*) ;;
+                    *) [ -n "$path" ] || path="$1" ;;
+                  esac
+                  shift
+                done
+                path="${path%%\\?*}"
+                file="$FIXTURE/responses/$(printf '%s' "$path" | tr '/' '_')"
+                if [ ! -f "$file" ]; then
+                  echo "gh: Not Found (HTTP 404)" >&2
+                  exit 1
+                fi
+                if [ -n "$query" ]; then
+                  jq -r "$query" < "$file"
+                else
+                  cat "$file"
+                fi
+                """
+            ),
+            encoding="utf-8",
+        )
+        (binaries / "gh").chmod(0o755)
+        environment = dict(os.environ)
+        environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
+        environment.update(
+            {
+                "FIXTURE": str(root),
+                "GH_TOKEN": "fixture",
+                "REPO": "firelock-ai/kin",
+                "CURRENT_RUN_ID": "99999",
+                "DECLINE_REASON": "unrecovered-latest",
+                "DECLINE_LIMIT": "4",
+                "DECLINE_SCAN_LIMIT": "100",
+                "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
+            }
+        )
+        return subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=30,
+            check=False,
+        )
+
+
+def assert_soft_decline_is_legible(release_tag: str) -> None:
+    """A decline exits the job green, so it has to be loud, named, and counted.
+
+    The failure this pins is not a wrong answer but an invisible one: the mint
+    declining to mint concluded success and read on the board exactly like a
+    mint that happened, so a blocked release stayed hidden until somebody read
+    the step conclusions by hand.
+    """
+
+    workflow = ".github/workflows/release-tag.yml"
+    admission = workflow_step_source(
+        workflow,
+        release_tag,
+        "      - name: Admit the serialized release lane",
+    )
+    for needle in (
+        "decline() { # <reason> <sentence>",
+        "printf '::warning::release mint declined (%s): %s\\n' \"$1\" \"$2\"",
+        '} >> "$GITHUB_STEP_SUMMARY"',
+        'echo "decline_reason=$1"',
+    ):
+        require(admission, needle, f"{workflow} soft-decline legibility")
+
+    # Every automatic decline goes through the helper. A bare `ready=false`
+    # beside a `::notice::` is the exact shape that made a blocked release
+    # indistinguishable from a healthy one, so exactly one write may exist and
+    # it is the helper's.
+    ready_false_writes = admission.count('echo "ready=false"')
+    if ready_false_writes != 1:
+        raise AssertionError(
+            f"{workflow} must write ready=false only through the decline helper, "
+            f"so every decline is announced and named: found {ready_false_writes}"
+        )
+    declines = re.findall(r"^\s+decline [a-z][a-z-]* ", admission, re.MULTILINE)
+    if len(declines) != 3:
+        raise AssertionError(
+            f"{workflow} has three automatic soft-decline branches, each of "
+            f"which must announce itself: found {len(declines)}"
+        )
+
+    escalation_name = "Escalate a persistent mint decline"
+    escalation = workflow_step_source(
+        workflow,
+        release_tag,
+        f"      - name: {escalation_name}",
+    )
+    if "steps.prior.outputs.ready == 'false'" not in escalation:
+        raise AssertionError(
+            f"{workflow} must escalate only on the decline path, so an ordinary "
+            "mint is never held against a decline budget"
+        )
+    # The counter's only decline marker is this step's own conclusion on prior
+    # runs, so the name it selects on and the name it runs under have to be the
+    # same string. Renaming the step without renaming the query would silently
+    # reset the count to one on every run and never escalate again.
+    if f'select(.name == "{escalation_name}")' not in escalation:
+        raise AssertionError(
+            f"{workflow} escalation must count prior runs by its own step name, "
+            f"which is the only durable record of a decline: {escalation_name}"
+        )
+    limit = re.search(r'DECLINE_LIMIT: "(\d+)"', escalation)
+    if limit is None or int(limit.group(1)) < 2:
+        raise AssertionError(
+            f"{workflow} needs a decline budget above one, because a single "
+            "decline while a release is in flight is correct behaviour"
+        )
+
+    source = decline_escalation_source(release_tag)
+    # `workflow_run` creates skipped controller jobs for unrelated CI
+    # completions. They interleave with real scheduled declines in production
+    # and must not reset the streak. The previous implementation stopped at the
+    # first such run, so this fixture makes the fourth real decline fail only
+    # when the skipped jobs are actively ignored.
+    interleaved = execute_decline_escalation(
+        source,
+        [
+            (910, "skipped", None),
+            (909, "success", "success"),
+            (908, "skipped", None),
+            (907, "success", "success"),
+            (906, "skipped", None),
+            (905, "failure", "failure"),
+        ],
+    )
+    if interleaved.returncode == 0 or "declined 4 times in a row" not in (
+        interleaved.stdout + interleaved.stderr
+    ):
+        raise AssertionError(
+            "whole-job workflow_run skips reset the persistent-decline counter: "
+            f"{interleaved.stdout}{interleaved.stderr}"
+        )
+
+    # A mint job that really ran and skipped the escalation step is a genuine
+    # non-decline (mint/no-op/refusal elsewhere), so it must reset the streak
+    # even when older declines exist behind it.
+    reset = execute_decline_escalation(
+        source,
+        [
+            (920, "success", "skipped"),
+            (919, "success", "success"),
+            (918, "failure", "failure"),
+            (917, "success", "success"),
+        ],
+    )
+    if reset.returncode != 0 or "1 in a row" not in reset.stdout:
+        raise AssertionError(
+            "a completed non-decline mint no longer resets decline escalation: "
+            f"{reset.stdout}{reset.stderr}"
+        )
+
+
 def assert_selector_arguments(
     release_tag: str,
     release_train: str,
@@ -2836,6 +3493,25 @@ def assert_recovery_record_authority(release_recovery: str) -> None:
             "admission selector drops anything else from its ranking and "
             "recovery reads an empty ranking as a reviewed waiver"
         )
+
+
+def assert_recovery_abandonment_stand_down(release_recovery: str) -> None:
+    """Pin both retry and alert to the active reviewed-abandonment condition."""
+
+    condition = "steps.record.outputs.abandoned != 'true'"
+    for marker, duty in (
+        ("name: Re-run failed jobs", "bounded retry"),
+        (
+            "name: Alert after automatic retries are exhausted",
+            "exhausted-retry alert",
+        ),
+    ):
+        active = "\n".join(job_step_active_lines(release_recovery, "reconcile", marker))
+        if condition not in active:
+            raise AssertionError(
+                f"release recovery's {duty} must actively stand down for a tag "
+                "the tracked abandonment record already retired"
+            )
 
 
 def assert_abandoned_tag_admission(
@@ -3877,27 +4553,21 @@ def main() -> None:
     ):
         require(release_recovery, policy, "bounded automatic release recovery")
 
-    # Recovery's failing check-run lands on the default branch head, and the
-    # mint gate refuses a release commit carrying any check-run outside
-    # success/skipped/neutral. An hourly tick that alerts on a tag the reviewed
-    # record has already retired therefore kills the very release that
-    # supersedes it. Both consumers of the record decision are pinned here
-    # rather than trusting one substring: the retry must not spend runners on an
-    # abandoned tag, and the alert must not stamp failure on one.
-    for step, duty in (
-        ("      - name: Re-run failed jobs\n", "bounded retry"),
-        (
-            "      - name: Alert after automatic retries are exhausted\n",
-            "exhausted-retry alert",
-        ),
-    ):
-        start = release_recovery.index(step)
-        end = release_recovery.index("\n        env:", start)
-        if "steps.record.outputs.abandoned != 'true'" not in release_recovery[start:end]:
-            raise AssertionError(
-                f"release recovery's {duty} must stand down for a tag the "
-                "tracked abandonment record already retired"
+    # Recovery is outside the mint's reviewed veto set, but it still must not
+    # spend runners or raise an advisory alarm for a release the reviewed record
+    # retired. Parse active step fields so a comment repeating the condition
+    # cannot satisfy the guard while the YAML `if` omits it.
+    assert_recovery_abandonment_stand_down(release_recovery)
+    expect_assertion(
+        "recovery repeats its stand-down condition only in comments",
+        "must actively stand down",
+        lambda: assert_recovery_abandonment_stand_down(
+            release_recovery.replace(
+                "          steps.record.outputs.abandoned != 'true'",
+                "          # steps.record.outputs.abandoned != 'true'",
             )
+        ),
+    )
     for forbidden in (
         "workflow_dispatch:",
         "contents: write",
@@ -5899,8 +6569,27 @@ def main() -> None:
     assert_release_gate_fixture_rejected(
         release_gate,
         "same-name tag check from another workflow is not self-excluded",
-        "check not green: Mint release tag (conclusion=failure)",
+        "release-tag job name claimed by another producer: Mint release tag",
         add_external_mint_failure,
+    )
+
+    def add_external_mint_success(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """A green namesake is the same authority conflict as a red one."""
+
+        add_external_mint_failure(check_runs, workflow_runs, current_run)
+        for run in check_runs:
+            if run["name"] == "Mint release tag" and run["id"] == 8_101:
+                run["conclusion"] = "success"
+
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "green same-name tag check from another workflow is admitted",
+        "release-tag job name claimed by another producer: Mint release tag",
+        add_external_mint_success,
     )
 
     def add_higher_id_success_collision(
@@ -6069,6 +6758,208 @@ def main() -> None:
                 f"{queue_only_fixture.stderr}"
             )
 
+    def non_required_check(
+        name: str,
+        suite_id: int,
+        check_id: int,
+        *,
+        status: str = "completed",
+        conclusion: str | None = "failure",
+    ) -> dict[str, object]:
+        return {
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "id": check_id,
+            "app_id": GITHUB_ACTIONS_APP_ID,
+            "app_slug": "github-actions",
+            "check_suite_id": suite_id,
+            "head_sha": RELEASE_GATE_FIXTURE_SHA,
+        }
+
+    def add_red_queue_job_after_landing(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        current_run: dict[str, object],
+    ) -> None:
+        """The queue's own build reds on the landing sha, after the merge.
+
+        A solo queue entry's speculative sha IS the landing sha, so a
+        merge_group job no ruleset required keeps running past the merge and
+        concludes on the exact commit being released.
+        """
+
+        add_merge_queue_producer(check_runs, workflow_runs, current_run)
+        check_runs.append(
+            non_required_check("Windows authority tests", 201, 30_001)
+        )
+
+    assert_release_gate_admits(
+        release_gate,
+        "a merge_group job the queue never waited for concluded red",
+        (
+            "discounting a red check that is not this release's evidence: "
+            "Windows authority tests",
+            "the landing push build on the release branch is the evidence",
+        ),
+        add_red_queue_job_after_landing,
+    )
+
+    def add_red_queue_only_job(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A red job from a workflow that never builds the release branch."""
+
+        workflow_runs.append(
+            {
+                "id": 30_100,
+                "workflow_id": 400_200,
+                "path": ".github/workflows/queue-only.yml",
+                "event": "merge_group",
+                "head_branch": "gh-readonly-queue/main/pr-2-" + "0" * 40,
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "failure",
+                "check_suite_id": 302,
+            }
+        )
+        check_runs.append(non_required_check("Queue-only smoke", 302, 30_101))
+
+    assert_release_gate_admits(
+        release_gate,
+        "a red job that only ever runs inside the queue",
+        (
+            "discounting a red check that is not this release's evidence: "
+            "Queue-only smoke",
+            "it has no build on the release branch at this sha",
+        ),
+        add_red_queue_only_job,
+    )
+
+    def add_red_non_required_push_job(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A registry blip reds a landing-push job no ruleset requires."""
+
+        workflow_runs.append(
+            {
+                "id": 31_000,
+                "workflow_id": 400_300,
+                "path": ".github/workflows/docker.yml",
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": RELEASE_GATE_FIXTURE_SHA,
+                "status": "completed",
+                "conclusion": "failure",
+                "check_suite_id": 303,
+            }
+        )
+        check_runs.append(
+            non_required_check("Docker Image Build (no push)", 303, 31_001)
+        )
+
+    assert_release_gate_admits(
+        release_gate,
+        "a red landing-push check that no required context covers",
+        (
+            "admitting over a red check no required context covers: "
+            "Docker Image Build (no push) (conclusion=failure",
+        ),
+        add_red_non_required_push_job,
+    )
+
+    def red_non_required_job_inside_required_producer(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """A red advisory job turns its whole required producer's run red."""
+
+        ci_suite = required_check_fixture(
+            check_runs,
+            "Check & Test (ubuntu-latest)",
+        )["check_suite_id"]
+        workflow_fixture(workflow_runs, ci_suite)["conclusion"] = "failure"
+        check_runs.append(non_required_check("Code Coverage", ci_suite, 32_001))
+
+    assert_release_gate_admits(
+        release_gate,
+        "a red advisory job inside the workflow that produces required contexts",
+        (
+            "admitting over a producing run that concluded failure: "
+            ".github/workflows/ci.yml run 1001",
+            "admitting over a red check no required context covers: "
+            "Code Coverage (conclusion=failure",
+        ),
+        red_non_required_job_inside_required_producer,
+    )
+
+    def unfinished_non_required_check(
+        check_runs: list[dict[str, object]],
+        workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        """An advisory job still running when every required context is green."""
+
+        ci_suite = required_check_fixture(
+            check_runs,
+            "Check & Test (ubuntu-latest)",
+        )["check_suite_id"]
+        # This coupling is mandatory in the real Actions API: while any sibling
+        # job is in progress, its producer workflow cannot be completed/success.
+        # Leaving the fixture completed creates an impossible state and lets the
+        # gate keep waiting on the aggregate without the test noticing.
+        workflow_fixture(workflow_runs, ci_suite).update(
+            {"status": "in_progress", "conclusion": None}
+        )
+        check_runs.append(
+            non_required_check(
+                "npm launcher tests",
+                ci_suite,
+                33_001,
+                status="in_progress",
+                conclusion=None,
+            )
+        )
+
+    assert_release_gate_admits(
+        release_gate,
+        "an unfinished advisory check no required context covers",
+        (
+            "admitting over a producing run that is still in_progress: "
+            ".github/workflows/ci.yml run 1001",
+            "not waiting for a check no required context covers: "
+            "npm launcher tests (status=in_progress)",
+        ),
+        unfinished_non_required_check,
+    )
+
+    def unfinished_required_check(
+        check_runs: list[dict[str, object]],
+        _workflow_runs: list[dict[str, object]],
+        _current_run: dict[str, object],
+    ) -> None:
+        required_check_fixture(check_runs, "cargo-deny").update(
+            {"status": "in_progress", "conclusion": None}
+        )
+
+    unfinished_required_fixture = execute_release_check_gate(
+        release_gate,
+        {},
+        mutate_fixture=unfinished_required_check,
+    )
+    if unfinished_required_fixture.returncode != 2:
+        raise AssertionError(
+            "an unfinished required context no longer holds the mint for retry: "
+            f"rc={unfinished_required_fixture.returncode} "
+            f"{unfinished_required_fixture.stdout}"
+            f"{unfinished_required_fixture.stderr}"
+        )
+
     def change_required_workflow_path(
         check_runs: list[dict[str, object]],
         workflow_runs: list[dict[str, object]],
@@ -6193,6 +7084,11 @@ def main() -> None:
     assert_rust_cache_steps(workflow_sources)
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
+    assert_required_check_set_is_single_sourced(release_tag)
+    assert_soft_decline_is_legible(release_tag)
+    assert_recovery_escalation_classifies(
+        RELEASE_RECOVERY.read_text(encoding="utf-8")
+    )
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)

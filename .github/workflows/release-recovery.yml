@@ -161,13 +161,12 @@ jobs:
       # one immutable main snapshot instead of from whatever main becomes while
       # the job runs. Nothing from the failed tag's own head is trusted.
       #
-      # Reading the record is tolerated rather than propagated, on the same
-      # ground base-image-pins.yml states: the alarm must not become the thing
-      # that reds a main sha. Without this a network hiccup fetching the record
-      # would fail the job and publish exactly the check-run that refuses a
-      # release, which is the hazard this step exists to remove. A failed
-      # checkout instead leaves no HEAD for the next step to verify, so it reads
-      # as "not abandoned" and recovery behaves as it did before the record
+      # Reading the record is tolerated rather than propagated. A network hiccup
+      # must not replace the real retry-or-alert decision with a controller
+      # checkout failure. Recovery is not in the mint's reviewed veto set, but a
+      # failed checkout would still hide the actionable release state behind an
+      # advisory red. Leaving no verified HEAD instead reads as "not abandoned",
+      # so recovery remains responsible exactly as it was before the record
       # existed.
       - name: Checkout the abandonment record from the default-branch commit
         if: steps.resolve.outputs.needed == 'true'
@@ -196,11 +195,12 @@ jobs:
           SHA: ${{ steps.resolve.outputs.sha }}
         run: |
           set -euo pipefail
-          # Nothing in this step may end in a non-zero status of its own. The
-          # check-run it would publish is the one the mint gate refuses a
-          # release commit for, so every status is captured rather than left to
-          # the step's implicit errexit, and every unhappy path degrades to "not
-          # abandoned", which leaves the alert armed to fail for the real reason.
+          # Nothing in this step may end in a non-zero status of its own. This
+          # controller is outside the mint's reviewed veto set, but failing here
+          # would still replace the actionable retry-or-alert verdict with an
+          # ingestion error. Every status is therefore captured, and every
+          # unhappy path degrades to "not abandoned", leaving recovery armed to
+          # report the real release failure.
           head=""
           status=0
           head="$(git rev-parse HEAD)" || status=$?
@@ -284,8 +284,95 @@ jobs:
           SHA: ${{ steps.resolve.outputs.sha }}
           RUN_ID: ${{ steps.resolve.outputs.run_id }}
           RUN_URL: ${{ steps.resolve.outputs.url }}
+          ATTEMPTS: ${{ steps.resolve.outputs.attempt }}
         run: |
           set -euo pipefail
+          # Advice given before classification is wrong in the direction that
+          # costs most. Rerunning is right for the transient failures this
+          # controller exists for and useless for a confirmed source-bound one:
+          # a lockfile pinning a dependency that cannot compile for a release
+          # target needs a recut against fixed dependencies. The controller can
+          # identify a repeated failure surface, but only logs and source
+          # diagnosis can establish that root cause.
+          #
+          # The signature is the whole set of failing job and step pairs per
+          # attempt. It is deliberately not called root-cause proof: step
+          # identity is cheap and needs no log download, but a persistent
+          # registry or notarization outage can repeat at the same step too.
+          # A repeated signature changes the immediate recommendation and tells
+          # the operator where to start; the logs still decide rerun versus recut.
+          #
+          # The set is sorted and joined rather than reduced to its first
+          # element. The jobs API returns jobs in job-id order, ids are minted
+          # at queue time, and parallel matrix legs queue in a different order
+          # on each attempt, so the first failing job of a matrix failure is a
+          # coin flip. Taking it would report three identical failures of the
+          # same step as three different ones and recommend another immediate
+          # rerun without surfacing the repeated shape.
+          #
+          # Pages are slurped and filtered in one pass. `--paginate` with an
+          # inline query applies the query per page, which would emit one line
+          # per page and break the one-line-per-attempt mapping below.
+          signatures="$(mktemp)"
+          unknown=0
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if attempt_jobs="$(gh api --paginate --slurp \
+              "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?per_page=100" \
+              2>/dev/null)"; then
+              signature="$(jq -r '
+                [ .[].jobs[]
+                  | select(.conclusion == "failure")
+                  | { job: .name,
+                      step: ( .steps[]?
+                              | select(.conclusion == "failure")
+                              | .name ) }
+                  | "\(.job) / \(.step)"
+                ] | unique | join("; ")' <<< "$attempt_jobs" 2>/dev/null)" \
+                || signature=""
+            else
+              signature=""
+            fi
+            if [ -z "$signature" ]; then
+              unknown=$((unknown + 1))
+              # Deliberately constant rather than attempt-numbered. A numbered
+              # placeholder would make unreadable attempts differ from each
+              # other, so the distinct-signature count alone would reject them
+              # and the unknown count below would never be what decided it. The
+              # guard against classifying an unreadable run has to be the one
+              # doing the work, not a spare wheel behind an accident of text.
+              signature="unrecorded"
+            fi
+            printf '%s\n' "$signature" >> "$signatures"
+          done
+          distinct="$(sort -u "$signatures" | wc -l | tr -d ' ')"
+          failing_steps="$(head -1 "$signatures")"
+          if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] && [ "$distinct" -eq 1 ]; then
+            verdict="repeated failure signature"
+            advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
+          elif [ "$unknown" -ne 0 ]; then
+            verdict="indeterminate"
+            advice="At least one attempt could not be read or carried no concrete failed step, so neither a deterministic nor a transient cause is established. Inspect the unrecorded attempts before choosing a same-release rerun or a source-fixed recut."
+          else
+            verdict="varying failure signatures"
+            advice="The observed failing job and step sets differed, which is consistent with the transient shape this controller exists for. Diagnose and rerun the same release rather than cutting a newer version unless the logs identify a source-bound defect."
+          fi
+
+          # A mint that reported failure on a release it had already created
+          # would otherwise send this controller to repair a healthy release,
+          # so say what actually exists before advising anything.
+          release_error="$(mktemp)"
+          if release="$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>"$release_error")"; then
+            assets="$(jq '.assets | length' <<< "$release")"
+            draft="$(jq -r '.draft' <<< "$release")"
+            prerelease="$(jq -r '.prerelease' <<< "$release")"
+            release_state="A GitHub Release for \`${TAG}\` already exists with ${assets} asset(s), draft=${draft}, prerelease=${prerelease}. Confirm it is genuinely incomplete before repairing it."
+          elif grep -Eq '\(HTTP 404\)' "$release_error"; then
+            release_state="No GitHub Release object exists for \`${TAG}\`."
+          else
+            release_reason="$(tr -d '\r' < "$release_error" | tail -n 1)"
+            release_state="GitHub Release state for \`${TAG}\` could not be read (${release_reason:-unknown API error}). Do not infer that the Release is absent; inspect it before repairing anything."
+          fi
+
           title="Release blocked after automatic retries: ${TAG}"
           existing="$(gh issue list \
             --repo "$REPO" \
@@ -295,11 +382,26 @@ jobs:
             --jq ".[] | select(.title == \"${title}\") | .number" \
             | head -1)"
           if [ -z "$existing" ]; then
+            body="$(mktemp)"
+            {
+              printf "The automatic release controller exhausted its retries for \`%s\` at \`%s\` after %s attempt(s).\n\n" \
+                "$TAG" "$SHA" "$ATTEMPTS"
+              printf 'Release run: %s (id %s)\n\n' "$RUN_URL" "$RUN_ID"
+              printf 'Classification: **%s**. %s\n\n' "$verdict" "$advice"
+              printf 'Failing step per attempt:\n\n'
+              index=0
+              while IFS= read -r line; do
+                index=$((index + 1))
+                printf -- '- attempt %s: %s\n' "$index" "$line"
+              done < "$signatures"
+              printf '\n%s\n\n' "$release_state"
+              printf 'The tag and any immutable public artifacts remain in place.\n'
+            } > "$body"
             gh issue create \
               --repo "$REPO" \
               --title "$title" \
-              --body "The automatic release controller exhausted two retries for \`${TAG}\` at \`${SHA}\`. Release run: ${RUN_URL} (id ${RUN_ID}). The tag and any immutable public artifacts remain in place; diagnose and rerun the same release rather than cutting a newer version." \
+              --body-file "$body" \
               >/dev/null
           fi
-          echo "::error::${TAG} exhausted its two automatic retries: ${RUN_URL}"
+          echo "::error::${TAG} exhausted its automatic retries after ${ATTEMPTS} attempt(s), ${verdict}, failing steps: ${failing_steps}: ${RUN_URL}"
           exit 1

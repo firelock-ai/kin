@@ -332,6 +332,25 @@ jobs:
           AUTOMATIC: ${{ steps.resolve.outputs.automatic }}
         run: |
           set -euo pipefail
+          # Declining to mint is a real outcome that exits the job green on
+          # purpose, which is what made a blocked release indistinguishable
+          # from a minted one on the board. A decline therefore has to be
+          # legible without reading logs: a warning annotation, a step summary
+          # section, and a named reason the escalation step can quote.
+          decline() { # <reason> <sentence>
+            printf '::warning::release mint declined (%s): %s\n' "$1" "$2"
+            {
+              echo "### Release mint declined"
+              echo
+              echo "Reason: \`$1\`"
+              echo
+              echo "$2"
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "ready=false"
+              echo "decline_reason=$1"
+            } >> "$GITHUB_OUTPUT"
+          }
           runs="$(gh api "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100")"
           active="$(jq '[.workflow_runs[] | select(
             .status == "requested" or .status == "queued" or .status == "in_progress" or
@@ -339,8 +358,7 @@ jobs:
           )] | length' <<< "$runs")"
           if [ "$active" -ne 0 ]; then
             if [ "$AUTOMATIC" = true ]; then
-              echo "::notice::${active} Release run(s) are active; a scheduled reconcile will retry."
-              echo "ready=false" >> "$GITHUB_OUTPUT"
+              decline release-in-flight "${active} Release run(s) are active; a scheduled reconcile will retry."
               exit 0
             fi
             echo "::error::${active} Release run(s) are active"
@@ -389,8 +407,7 @@ jobs:
           highest_tag="$(cat "$admissible")"
           if [ -z "$highest_tag" ] || [ "$highest_tag" != "$latest_tag" ]; then
             if [ "$AUTOMATIC" = true ]; then
-              echo "::notice::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery will reconcile it."
-              echo "ready=false" >> "$GITHUB_OUTPUT"
+              decline unfinalized-latest "highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery will reconcile it."
               exit 0
             fi
             echo "::error::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}"
@@ -431,8 +448,7 @@ jobs:
               <<< "$runs")"
             if [ "$matching_count" -ne 0 ]; then
               if [ "$AUTOMATIC" = true ]; then
-                echo "::notice::latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded; recovery owns this state."
-                echo "ready=false" >> "$GITHUB_OUTPUT"
+                decline unrecovered-latest "latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded; recovery owns this state."
                 exit 0
               fi
               echo "::error::latest stable ${latest_tag}@${latest_sha} has preserved Release attempts but none succeeded"
@@ -625,6 +641,97 @@ jobs:
           fi
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
+      - name: Escalate a persistent mint decline
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'false'
+        # One decline is ordinary: a release still in flight blocks its
+        # successor by design, and the next reconcile clears it. A decline that
+        # keeps repeating is a stuck release lane, and because a decline exits
+        # green it looked exactly like a healthy mint on the board while a
+        # release sat blocked.
+        #
+        # This step runs only on the decline path, so its own conclusion on a
+        # prior run is the decline marker. Reading that is what makes the
+        # outcome machine-visible without parsing logs, and it counts an
+        # already-escalated decline too, so a lane that stays blocked stays red
+        # instead of alarming once every few runs.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          DECLINE_REASON: ${{ steps.prior.outputs.decline_reason }}
+          DECLINE_LIMIT: "4"
+          DECLINE_SCAN_LIMIT: "100"
+        run: |
+          set -euo pipefail
+          # Diagnostics go to their own file rather than into the captured
+          # value. Folding stderr into the success path would let any warning
+          # gh writes be parsed as a run id, and the counter would then be
+          # quietly wrong rather than loudly wrong.
+          read_error="$(mktemp)"
+          if ! runs="$(gh api \
+            "repos/${REPO}/actions/workflows/release-tag.yml/runs?per_page=${DECLINE_SCAN_LIMIT}&status=completed" \
+            -q '.workflow_runs[]
+                | select(.id != (env.CURRENT_RUN_ID | tonumber))
+                | .id' 2>"$read_error")"; then
+            echo "::notice::could not read prior mint runs, so this decline is not escalated: $(cat "$read_error")"
+            exit 0
+          fi
+          consecutive=1
+          scanned=0
+          while IFS= read -r run_id; do
+            [ -n "$run_id" ] || continue
+            [ "$scanned" -lt "$DECLINE_SCAN_LIMIT" ] || break
+            scanned=$((scanned + 1))
+            if ! state="$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
+              -q '[.jobs[]
+                   | select(.name == "Mint release tag")
+                   | {
+                       job: .conclusion,
+                       marker: ([.steps[]?
+                         | select(.name == "Escalate a persistent mint decline")
+                         | .conclusion] | first // "")
+                     }] | first // {job: "", marker: ""}' \
+              2>"$read_error")"; then
+              echo "::notice::stopped counting at run ${run_id}: $(cat "$read_error")"
+              break
+            fi
+            if ! job_conclusion="$(jq -er '.job | strings' <<< "$state")" ||
+               ! marker="$(jq -er '.marker | strings' <<< "$state")"; then
+              echo "::notice::stopped counting at run ${run_id}: unreadable mint job state"
+              break
+            fi
+            # `workflow_run` starts this workflow for every completed CI run.
+            # Its job-level guard skips the whole mint job for unrelated CI
+            # events, and those controller invocations are not mint outcomes at
+            # all. Ignore them. A mint job that did run but skipped this step is
+            # different: it reached a non-decline outcome and resets the streak.
+            if [ "$job_conclusion" = skipped ]; then
+              continue
+            fi
+            case "$marker" in
+              success|failure)
+                consecutive=$((consecutive + 1))
+                [ "$consecutive" -lt "$DECLINE_LIMIT" ] || break
+                ;;
+              *) break ;;
+            esac
+          done <<< "$runs"
+          if [ "$consecutive" -ge "$DECLINE_LIMIT" ]; then
+            {
+              echo "### Release mint blocked"
+              echo
+              echo "Declined ${consecutive} times in a row, most recently for \`${DECLINE_REASON}\`."
+              echo
+              echo "The mint is not failing on its own account and would keep reporting"
+              echo "success. Something is holding the release lane closed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::release lane declined ${consecutive} times in a row (${DECLINE_REASON}); it is blocked, not idle"
+            exit 1
+          fi
+          echo "::notice::release mint declined (${DECLINE_REASON}); ${consecutive} in a row, escalating at ${DECLINE_LIMIT}"
+
       - name: Verify required checks are green
         if: >-
           steps.resolve.outputs.needed == 'true' &&
@@ -633,11 +740,13 @@ jobs:
         # presence-required release-critical set — a sha missing any of these is
         # refused even if nothing failed. Every required check must conclude
         # success except DCO, which is allowed to report skipped because that
-        # pull-request-only job is inapplicable on a merged main HEAD. Separately,
-        # no check anywhere may be failing or still in progress; the second loop
-        # owns that present-check strictness, so this list need not mirror every
-        # CI context. It is the main branch-protection required contexts plus the
-        # Windows installer leg, which is release-critical and never optional.
+        # pull-request-only job is inapplicable on a merged main HEAD. This
+        # reviewed set is the complete veto authority. Red or unfinished checks
+        # outside it are announced, but they neither refuse nor delay the mint;
+        # add any context that must block a release to this reviewed list. The
+        # active main ruleset should carry the same contexts, but this reviewed
+        # source declaration remains the mint's authority rather than mutable
+        # live configuration.
         #
         # Evidence is resolved through workflow provenance, not through the
         # context name. A merge-queue landing publishes the same context names
@@ -809,6 +918,13 @@ jobs:
           non_failing_optional = {"success", "skipped", "neutral"}
           errors = []
           pending = []
+          # Everything the gate declines to treat as a veto. Reported once, on
+          # the pass that admits the release, so a mint is never quiet about
+          # what it chose to look past.
+          degraded_producers = []
+          downgraded = []
+          discounted = []
+          unwaited = []
 
           if required != list(expected_provenance):
               errors.append("required check order does not match its provenance contract")
@@ -964,34 +1080,120 @@ jobs:
                       f"(conclusion={run['conclusion']})"
                   )
               if workflow.get("status") != "completed":
-                  pending.append(
-                      f"required check workflow not completed: {name} "
-                      f"(status={workflow.get('status')})"
+                  # A required job can already be immutable green while an
+                  # advisory sibling keeps their shared workflow in progress.
+                  # Waiting on that aggregate would restore an advisory veto
+                  # through status instead of conclusion. Record it loudly and
+                  # judge the required context itself above.
+                  degraded_producers.append(
+                      (
+                          workflow.get("path"),
+                          workflow.get("id"),
+                          f"is still {workflow.get('status')}",
+                      )
                   )
               elif workflow.get("conclusion") != "success":
-                  errors.append(
-                      f"required check workflow not green: {name} "
-                      f"(conclusion={workflow.get('conclusion')})"
+                  # The producing run carries jobs beyond the release-critical
+                  # ones, so its aggregate conclusion is not a release verdict.
+                  # A red coverage or npm-launcher job turns the whole ci.yml
+                  # run red and would otherwise veto through every required
+                  # context that run produces, which is the same defect the
+                  # sweep below stopped committing per check-run. This
+                  # context's own conclusion is judged directly above; record
+                  # the producer so admitting over it is never silent.
+                  degraded_producers.append(
+                      (
+                          workflow.get("path"),
+                          workflow.get("id"),
+                          f"concluded {workflow.get('conclusion')}",
+                      )
                   )
+
+          # A check-run is this release's evidence only when its producing
+          # workflow run is the landing push on the release branch. The merge
+          # queue builds the same workflows at this exact sha on its own ref,
+          # and for a solo queue entry the speculative sha IS the landing sha,
+          # so a queue job the queue never waited for concludes after the merge
+          # on the commit being released, having gated nothing. Gate 1 already
+          # discounts those for required contexts. The sweep discounts them the
+          # same way instead of letting one poison the mint.
+          evidence_workflows = set()
+          for workflow in workflow_runs:
+              if (
+                  workflow.get("event") == "push"
+                  and workflow.get("head_branch") == release_branch
+              ):
+                  evidence_workflows.add(
+                      (workflow.get("workflow_id"), workflow.get("path"))
+                  )
+          required_names = set(required)
 
           for run in check_runs:
               name = run["name"]
               # Exclude only this exact workflow identity's tag-mint attempts,
-              # including a prior refusal on the same SHA. A same-name check
-              # from another workflow remains visible and must be green.
+              # including a prior refusal on the same SHA.
               if (
                   name == "Mint release tag"
                   and run.get("check_suite_id") in release_tag_suite_ids
               ):
                   continue
-              if run["status"] != "completed":
-                  pending.append(
-                      f"check still in progress: {name} (status={run['status']})"
-                  )
-              elif run["conclusion"] not in non_failing_optional:
+              producers = workflows_by_suite.get(run.get("check_suite_id"), [])
+              producer = producers[0] if len(producers) == 1 else None
+              if name == "Mint release tag":
+                  # The mint's own job name from a producer that is not the
+                  # reviewed release-tag workflow. Never release evidence and
+                  # never merely advisory: a second writer of this name is an
+                  # authority conflict whatever it concluded.
                   errors.append(
-                      f"check not green: {name} "
-                      f"(conclusion={run['conclusion']})"
+                      f"release-tag job name claimed by another producer: {name} "
+                      f"(suite={run.get('check_suite_id')}, "
+                      f"conclusion={run.get('conclusion')})"
+                  )
+                  continue
+              if producer is None:
+                  origin = (
+                      "no unique workflow run for suite "
+                      f"{run.get('check_suite_id')}"
+                  )
+              else:
+                  origin = (
+                      f"{producer.get('path')} run {producer.get('id')} "
+                      f"({producer.get('event')} on {producer.get('head_branch')})"
+                  )
+              is_evidence = (
+                  producer is not None
+                  and producer.get("event") == "push"
+                  and producer.get("head_branch") == release_branch
+              )
+              if not is_evidence:
+                  discounted.append(
+                      {
+                          "name": name,
+                          "origin": origin,
+                          "twin": producer is not None
+                          and (
+                              producer.get("workflow_id"),
+                              producer.get("path"),
+                          )
+                          in evidence_workflows,
+                          "status": run.get("status"),
+                          "conclusion": run.get("conclusion"),
+                      }
+                  )
+                  continue
+              if name in required_names:
+                  # Already judged in full above against its exact provenance.
+                  # Judging it again by name here is what let a queue-side
+                  # namesake decide a release.
+                  continue
+              if run["status"] != "completed":
+                  # Its verdict cannot veto this release, so waiting for one
+                  # would only give a hung advisory job a second way to burn
+                  # the mint once the retry budget runs out.
+                  unwaited.append(f"{name} (status={run['status']})")
+              elif run["conclusion"] not in non_failing_optional:
+                  downgraded.append(
+                      f"{name} (conclusion={run['conclusion']}, from {origin})"
                   )
 
           if errors:
@@ -1005,11 +1207,65 @@ jobs:
                   print(f"  - {item}")
               sys.exit(2)
 
-          print(
+          # The release is admissible. Everything the gate declined to treat as
+          # a veto is announced here, on the one pass that admits it, so a
+          # release is never quietly minted from a commit carrying a red that
+          # nobody was told about. Announcing on the retry passes instead would
+          # repeat every line up to sixty times and train the reader to skip it.
+          announcements = []
+          for path, run_id, state in sorted(set(degraded_producers)):
+              announcements.append(
+                  f"admitting over a producing run that {state}: "
+                  f"{path} run {run_id}; every required context "
+                  "it produces is green"
+              )
+          for item in downgraded:
+              announcements.append(
+                  f"admitting over a red check no required context covers: {item}"
+              )
+          for entry in discounted:
+              if (
+                  entry["status"] == "completed"
+                  and entry["conclusion"] not in non_failing_optional
+              ):
+                  announcements.append(
+                      "discounting a red check that is not this release's "
+                      f"evidence: {entry['name']} "
+                      f"(conclusion={entry['conclusion']}, from {entry['origin']}); "
+                      + (
+                          "the landing push build on the release branch is the "
+                          "evidence"
+                          if entry["twin"]
+                          else "it has no build on the release branch at this sha"
+                      )
+                  )
+          for line in announcements:
+              print(f"::warning::{line}")
+          not_waited = []
+          for item in unwaited:
+              not_waited.append(
+                  f"not waiting for a check no required context covers: {item}"
+              )
+              print(f"::notice::{not_waited[-1]}")
+
+          verdict = (
               f"verified {len(required)} required checks against their workflow "
-              f"provenance; {len(check_runs)} total checks, none failing or in "
-              "progress"
+              f"provenance; {len(check_runs)} check-runs on the sha, "
+              f"{len(discounted)} not this release's evidence, "
+              f"{len(downgraded)} red and covered by no required context, "
+              f"{len(unwaited)} unfinished and not waited for"
           )
+          print(verdict)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as handle:
+                  handle.write("### Release check verification\n\n")
+                  handle.write(f"{verdict}\n")
+                  # Every class the gate declined to act on reaches the summary,
+                  # including the unfinished ones. A downgrade that only shows
+                  # up as an annotation is half a disclosure.
+                  for line in announcements + not_waited:
+                      handle.write(f"\n- {line}\n")
           PY
             status=$?
             set -e
