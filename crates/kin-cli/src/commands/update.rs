@@ -1698,6 +1698,7 @@ impl InstallSpawnFence {
             let (file, _) =
                 windows_update::open_or_create_current_user_private_lock_file(&authority_path)?;
             FileExt::lock_shared(&file).context("failed to acquire managed daemon spawn lease")?;
+            ensure_no_incomplete_windows_uninstall(&configured_root)?;
             if configured_root.canonicalize()? != candidate_root
                 || binary.canonicalize().ok().as_deref() != Some(resolved_binary.as_path())
             {
@@ -1808,6 +1809,8 @@ impl InstallRootLock {
                 )
             })?;
         }
+        #[cfg(windows)]
+        ensure_no_incomplete_windows_uninstall(&authority_root)?;
         let root = validate_install_root(kin_home, create)?;
         #[cfg(unix)]
         let path = root.join("update.lock");
@@ -2035,7 +2038,7 @@ fn windows_install_authority_root(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn windows_install_authority_path(root: &Path) -> Result<PathBuf> {
+pub(crate) fn windows_install_authority_path(root: &Path) -> Result<PathBuf> {
     let root = windows_install_authority_root(root)?;
     let normalized = root.to_string_lossy().to_lowercase();
     let digest = hex::encode(Sha256::digest(normalized.as_bytes()));
@@ -2043,6 +2046,47 @@ fn windows_install_authority_path(root: &Path) -> Result<PathBuf> {
         .parent()
         .context("Kin install root has no parent")?
         .join(format!(".kin-install-authority-{digest}.lock")))
+}
+
+#[cfg(windows)]
+fn ensure_no_incomplete_windows_uninstall(root: &Path) -> Result<()> {
+    let parent = root.parent().context("Kin install root has no parent")?;
+    let mut artifacts = Vec::new();
+    for entry in fs::read_dir(parent).with_context(|| {
+        format!(
+            "failed to inspect {} for incomplete Kin uninstall state",
+            parent.display()
+        )
+    })? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let token = name
+            .strip_prefix(".kin-uninstall-retired-")
+            .or_else(|| name.strip_prefix(".kin-uninstall-delete-"))
+            .or_else(|| name.strip_prefix(".kin-uninstall-incomplete-"));
+        let Some(token) = token else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(token).is_ok_and(|id| {
+            id.get_version() == Some(uuid::Version::Random) && id.hyphenated().to_string() == token
+        }) {
+            artifacts.push(entry.path());
+        }
+    }
+    if !artifacts.is_empty() {
+        artifacts.sort();
+        anyhow::bail!(
+            "a prior Windows Kin uninstall is still completing or requires recovery: {}; refusing install mutation until that identity-bound cleanup finishes",
+            artifacts
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn validate_existing_install_root(path: &Path) -> Result<PathBuf> {

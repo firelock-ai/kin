@@ -13003,6 +13003,8 @@ fn remove_full_install_root(
     let ready_path = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
     let ready_nonce = uuid::Uuid::new_v4().to_string();
     let parent_creation_time = current_windows_process_creation_time()?;
+    let install_authority_path =
+        crate::commands::update::windows_install_authority_path(&root.path)?;
     #[cfg(test)]
     let parent_creation_time = match env::var_os(WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE) {
         Some(override_value) => override_value
@@ -13024,7 +13026,10 @@ fn remove_full_install_root(
     let script = r#"$ErrorActionPreference = 'Stop'
 $log = $env:KIN_UNINSTALL_LOG
 $ready = $env:KIN_UNINSTALL_READY
+$authority = $env:KIN_UNINSTALL_AUTHORITY
 $parentHandle = $null
+$authorityStream = $null
+$authorityLocked = $false
 try {
 Add-Type -TypeDefinition @'
 using System;
@@ -13141,6 +13146,7 @@ $retired = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_RETIRED)
 $incompleteMarker = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_INCOMPLETE_MARKER)
 $expectedIdentity = $env:KIN_UNINSTALL_EXPECTED_IDENTITY
 $parentHandle = [KinUninstallIdentity]::LockParent($pidToWait, $expectedParentCreation)
+$authorityStream = [IO.File]::Open($authority, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
 $readyBytes = [Text.Encoding]::UTF8.GetBytes($env:KIN_UNINSTALL_READY_NONCE)
 $readyStream = [IO.File]::Open($ready, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
@@ -13150,6 +13156,18 @@ try {
     $readyStream.Dispose()
 }
 [KinUninstallIdentity]::WaitForParentExit($parentHandle)
+    $authorityDeadline = [DateTime]::UtcNow.AddMinutes(5)
+    while (-not $authorityLocked) {
+        try {
+            $authorityStream.Lock(0, [Int64]::MaxValue)
+            $authorityLocked = $true
+        } catch [IO.IOException] {
+            if ([DateTime]::UtcNow -ge $authorityDeadline) {
+                throw "timed out acquiring Kin install authority for deferred uninstall cleanup"
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    }
     $current = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($null -ne $current) {
         $kept = @($current -split ';' | Where-Object {
@@ -13188,6 +13206,7 @@ try {
 } catch {
     $_ | Out-File -LiteralPath $log -Encoding utf8
 } finally {
+    if ($null -ne $authorityStream) { $authorityStream.Dispose() }
     if ($null -ne $parentHandle) { $parentHandle.Dispose() }
     Remove-Item -LiteralPath $ready -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
@@ -13258,6 +13277,7 @@ try {
         .env("KIN_UNINSTALL_LOG", &log_path)
         .env("KIN_UNINSTALL_READY", &ready_path)
         .env("KIN_UNINSTALL_READY_NONCE", &ready_nonce)
+        .env("KIN_UNINSTALL_AUTHORITY", &install_authority_path)
         .env("KIN_UNINSTALL_RETIRED", &retired_path)
         .env("KIN_UNINSTALL_INCOMPLETE_MARKER", &incomplete_marker)
         .env(
@@ -14760,6 +14780,15 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let success_result_path = fixture.path().join("success-result.json");
         let success =
             run_windows_full_uninstall_child("success", &success_root, &success_result_path)?;
+        let reinstall_error = crate::commands::update::InstallRootLock::acquire(&success_root)
+            .err()
+            .context("a reinstall must not enter while deferred uninstall cleanup is pending")?;
+        let reinstall_message = format!("{reinstall_error:#}");
+        anyhow::ensure!(
+            reinstall_message.contains("install mutation is already active")
+                || reinstall_message.contains("prior Windows Kin uninstall"),
+            "pending uninstall rejected reinstall for an unexpected reason: {reinstall_message}"
+        );
         wait_for_windows_condition(
             "successful deferred uninstall",
             Duration::from_secs(45),
@@ -14770,6 +14799,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                     && !success.helper_ready.exists()
             },
         )?;
+        let post_cleanup_lock = crate::commands::update::InstallRootLock::acquire(&success_root)
+            .context("reinstall authority did not recover after deferred uninstall cleanup")?;
+        drop(post_cleanup_lock);
         anyhow::ensure!(
             !success.helper_log.exists(),
             "successful deferred uninstall unexpectedly left {}",
