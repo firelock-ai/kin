@@ -74,7 +74,7 @@ The wrapper caches the downloaded `kin` and `kin-daemon` binaries under:
 
 - macOS: `~/Library/Caches/kin-mcp`
 - Linux: `~/.cache/kin-mcp`
-- Windows: `%LOCALAPPDATA%\\kin-mcp\\Cache`
+- Windows: `%LOCALAPPDATA%\kin-mcp\Cache`
 
 Set `KIN_MCP_CACHE_DIR` to override the cache location.
 
