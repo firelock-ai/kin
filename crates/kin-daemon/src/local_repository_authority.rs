@@ -153,8 +153,10 @@ impl ActiveLocalRepositoryAuthority {
 /// same authority generation, it holds no exact tree state authority has not
 /// admitted, and it has neither dropped nor rewritten any entity or relation
 /// that authority owns. Because a derived lead is permitted, every caller must
-/// plan its daemon-side transition from the live graph via
-/// [`plan_daemon_semantic_delta`] rather than reusing the authority-side delta.
+/// plan its daemon-side transition from the live graph rather than reusing the
+/// authority-side delta: repository commands do that through
+/// [`plan_daemon_semantic_delta`], and the exact MCP commit path does it through
+/// its own post-commit live-to-authority correction.
 pub(crate) fn require_fresh_daemon_workspace(
     state: &DaemonState,
     roots: &RootBundle,
@@ -164,8 +166,8 @@ pub(crate) fn require_fresh_daemon_workspace(
     let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if daemon_generation != roots.generation {
         bail!(
-            "daemon repository cursor is at generation {daemon_generation}, but {operation} \
-             authority is at generation {}; reopen from repository authority before mutating",
+            "daemon repository cursor is at generation {daemon_generation}, but the authority for \
+             {operation} is at generation {}; reopen from repository authority before mutating",
             roots.generation
         );
     }
