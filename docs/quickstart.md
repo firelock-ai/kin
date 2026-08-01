@@ -67,15 +67,18 @@ flow inside WSL2; see [windows-wsl2.md](./windows-wsl2.md).
 
 ### Installer options
 
-Configure the installer with environment variables (supported by both `install.sh` and
-`install.ps1`):
+Configure the installers with environment variables (supported by both `install.sh`
+and `install.ps1` unless noted):
 
 - `KIN_VERSION`: pin a specific version (e.g. `0.1.0`); otherwise the latest release is
   resolved automatically.
 - `KIN_HOME`: custom managed install directory (preferred; defaults to `~/.kin`).
 - `KIN_DIR`: compatibility alias for `KIN_HOME`.
-- `KIN_NO_SETUP=1`: skip the `kin setup` wizard after the binaries are installed (run
-  `kin setup` yourself when ready).
+- `KIN_NO_SETUP=1`: on macOS and Linux, skip the `kin setup` wizard after the
+  binaries are installed (run `kin setup` yourself when ready).
+  Native Windows always skips repository setup while admission is unsupported;
+  `KIN_NO_SETUP` is accepted there only for CI compatibility and selects the
+  CI-oriented skip message.
 - `KIN_BASE_URL`: install from a mirror or local path instead of GitHub releases
   (offline / airgapped installs and CI smoke tests).
 
@@ -83,9 +86,10 @@ Configure the installer with environment variables (supported by both `install.s
 
 ## 2. Guided setup (`kin setup`)
 
-`kin setup` is the guided wizard the installer launches for you (run it again any time).
-It opens with **"What do you want Kin for?"** and asks for your **intent** rather than a
-bag of independent toggles:
+On macOS and Linux, `kin setup` is the guided wizard the installer launches for you
+(run it again any time). Native Windows does not launch repository setup; use the
+Linux flow inside WSL2. The wizard opens with **"What do you want Kin for?"** and asks
+for your **intent** rather than a bag of independent toggles:
 
 | Intent | What it configures |
 | --- | --- |

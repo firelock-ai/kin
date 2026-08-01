@@ -717,15 +717,20 @@ def workflow_active_header_source(workflow: str) -> str:
 def active_lines(source: str) -> list[str]:
     """Return a block's non-blank, non-comment lines, stripped of indentation.
 
-    Both comment markers count. These blocks are shell steps that embed
-    JavaScript in `node <<'NODE'` heredocs, so a policy pinned inside a heredoc
-    is commented out with `//`, and dropping only `#` would let that comment-out
-    keep satisfying the substring match instead of breaking it.
+    Shell/YAML line comments, JavaScript line/block comments, PowerShell block
+    comments, and Markdown/HTML comments all count. Install-proof steps embed
+    JavaScript in `node <<'NODE'` heredocs and the Windows installer is
+    PowerShell, so stripping only `#`/`//` still lets an entire validator or
+    user-facing warning become a valid no-op block while satisfying a guard.
     """
+
+    uncommented = source
+    for pattern in (r"<#.*?#>", r"/\*.*?\*/", r"<!--.*?-->"):
+        uncommented = re.sub(pattern, "", uncommented, flags=re.DOTALL)
 
     return [
         line.strip()
-        for line in source.splitlines()
+        for line in uncommented.splitlines()
         if line.strip()
         and not line.strip().startswith("#")
         and not line.strip().startswith("//")
@@ -828,7 +833,7 @@ def assert_windows_public_support_contract(
 
     all_surfaces = {INSTALL_PS1: install_ps1, **public_surfaces}
     for path, source in all_surfaces.items():
-        count = source.count(notice)
+        count = "\n".join(active_lines(source)).count(notice)
         if count != 1:
             raise AssertionError(
                 f"{path.relative_to(ROOT)} must repeat the Windows support notice "
@@ -883,6 +888,20 @@ def assert_windows_public_support_contract(
             compatibility_mcp_readme,
             policy,
             "compatibility MCP package native-Windows boundary",
+        )
+
+    quickstart_active = "\n".join(active_lines(public_surfaces[QUICKSTART_DOC]))
+    for policy in (
+        "on macOS and Linux, skip the `kin setup` wizard",
+        "Native Windows always skips repository setup while admission is unsupported",
+        "`KIN_NO_SETUP` is accepted there only for CI compatibility",
+        "On macOS and Linux, `kin setup` is the guided wizard the installer launches",
+        "Native Windows does not launch repository setup",
+    ):
+        require(
+            quickstart_active,
+            policy,
+            "quickstart platform-specific setup contract",
         )
 
 
@@ -1115,13 +1134,17 @@ def assert_install_proof_status_contract(
     shipped command produces.
     """
 
+    first_run_active = "\n".join(active_lines(first_run))
+    embedding_active = "\n".join(active_lines(embedding))
+    validation_active = "\n".join(active_lines(validation))
+
     require(
-        first_run,
+        first_run_active,
         "kin bench-meta --json > kin-build-meta.json",
         "installed CLI provenance capture",
     )
     require(
-        first_run,
+        first_run_active,
         "printf '%s\\n' \"$fake_agent_bin\" >> \"$GITHUB_PATH\"",
         "cross-step agent-client proof PATH",
     )
@@ -1165,7 +1188,7 @@ def assert_install_proof_status_contract(
         "status.semantic_coverage",
         "embeddedStatus.semantic_coverage",
     ):
-        if stale in validation:
+        if stale in validation_active:
             raise AssertionError(
                 "install proof reads a field the released status report does not "
                 f"emit: {stale}"
@@ -1185,10 +1208,14 @@ def assert_install_proof_status_contract(
         "embeddedCoverage.indexed !== embeddedCoverage.total",
         "embeddedCoverage.pending !== 0",
     ):
-        require(validation, policy, "released-byte status and build proof contract")
+        require(
+            validation_active,
+            policy,
+            "released-byte status and build proof contract",
+        )
 
     require(
-        embedding,
+        embedding_active,
         "kin status --json | tee kin-embedded-status.json",
         "post-embedding repository status capture",
     )
@@ -5005,19 +5032,21 @@ def main() -> None:
             compatibility_mcp_readme,
         ),
     )
-    for label, original in (
+    for label, original, expected in (
         (
             "the native installer comments out its executable support notice binding",
             '$NativeWindowsSupportNotice = "',
+            "must repeat the Windows support notice",
         ),
         (
             "the native installer comments out its visible support warning",
             'Write-Host "  ! $NativeWindowsSupportNotice"',
+            "truthful native-Windows installer",
         ),
     ):
         expect_assertion(
             label,
-            "truthful native-Windows installer",
+            expected,
             lambda original=original: assert_windows_public_support_contract(
                 windows_contract_source,
                 install_ps1.replace(original, f"# {original}", 1),
@@ -5025,6 +5054,52 @@ def main() -> None:
                 compatibility_mcp_readme,
             ),
         )
+    expect_assertion(
+        "a PowerShell block comment disables the visible native-Windows warning",
+        "truthful native-Windows installer",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1.replace(
+                'Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow',
+                '<#\nWrite-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow\n#>',
+                1,
+            ),
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    blocked_quickstart_surfaces = dict(windows_public_surfaces)
+    blocked_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
+        QUICKSTART_DOC
+    ].replace(public_notice, f"<!-- {public_notice} -->", 1)
+    expect_assertion(
+        "the quickstart hides the native-Windows support boundary",
+        "must repeat the Windows support notice",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1,
+            blocked_quickstart_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    drifted_quickstart_surfaces = dict(windows_public_surfaces)
+    drifted_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
+        QUICKSTART_DOC
+    ].replace(
+        "Native Windows always skips repository setup while admission is unsupported",
+        "Both installers launch repository setup unless KIN_NO_SETUP=1",
+        1,
+    )
+    expect_assertion(
+        "the quickstart claims native Windows launches repository setup",
+        "quickstart platform-specific setup contract",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1,
+            drifted_quickstart_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
     expect_assertion(
         "the contract script counts stages where one can never appear",
         "reachable Windows stage-leak check",
@@ -5124,6 +5199,16 @@ def main() -> None:
         install_proof, "Windows repo-free provenance and setup proof"
     )
     assert_install_proof_repo_free_windows_proof(repo_free)
+    blocked_repo_free = repo_free.replace(
+        '          const fs = require("fs");\n',
+        '          /*\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          */\n          NODE\n', 1)
+    expect_assertion(
+        "a JavaScript block comment disables the entire Windows validator",
+        "repo-free Windows install proof",
+        lambda: assert_install_proof_repo_free_windows_proof(blocked_repo_free),
+    )
     for label, original, mutation in (
         (
             "the Windows leg stops binding installed provenance to the release tag",
@@ -5169,6 +5254,21 @@ def main() -> None:
             ): assert_install_proof_repo_free_windows_proof(mutated),
         )
     assert_install_proof_status_contract(first_run, graph_query, embedding, validation)
+    blocked_validation = validation.replace(
+        '          const fs = require("fs");\n',
+        '          /*\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          */\n          NODE\n', 1)
+    expect_assertion(
+        "a JavaScript block comment disables the entire Unix validator",
+        "released-byte status and build proof contract",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query,
+            embedding,
+            blocked_validation,
+        ),
+    )
     expect_assertion(
         "install proof stops capturing CLI build metadata",
         "installed CLI provenance capture",
