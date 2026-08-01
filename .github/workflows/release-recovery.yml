@@ -289,24 +289,26 @@ jobs:
           set -euo pipefail
           # Advice given before classification is wrong in the direction that
           # costs most. Rerunning is right for the transient failures this
-          # controller exists for and useless for a deterministic one: a
-          # lockfile pinning a dependency that cannot compile for a release
-          # target fails identically on every attempt, and the recovery is a
-          # recut against fixed dependencies rather than another run. Telling
-          # an operator to rerun that is telling them to wait for nothing.
+          # controller exists for and useless for a confirmed source-bound one:
+          # a lockfile pinning a dependency that cannot compile for a release
+          # target needs a recut against fixed dependencies. The controller can
+          # identify a repeated failure surface, but only logs and source
+          # diagnosis can establish that root cause.
           #
           # The signature is the whole set of failing job and step pairs per
-          # attempt. It is deliberately not the error text: step identity is
-          # cheap, needs no log download, and is what actually separated the
-          # two cases.
+          # attempt. It is deliberately not called root-cause proof: step
+          # identity is cheap and needs no log download, but a persistent
+          # registry or notarization outage can repeat at the same step too.
+          # A repeated signature changes the immediate recommendation and tells
+          # the operator where to start; the logs still decide rerun versus recut.
           #
           # The set is sorted and joined rather than reduced to its first
           # element. The jobs API returns jobs in job-id order, ids are minted
           # at queue time, and parallel matrix legs queue in a different order
           # on each attempt, so the first failing job of a matrix failure is a
           # coin flip. Taking it would report three identical failures of the
-          # same step as three different ones and advise a rerun that cannot
-          # work, which is the exact advice this classifier exists to stop.
+          # same step as three different ones and recommend another immediate
+          # rerun without surfacing the repeated shape.
           #
           # Pages are slurped and filtered in one pass. `--paginate` with an
           # inline query applies the query per page, which would emit one line
@@ -345,22 +347,30 @@ jobs:
           distinct="$(sort -u "$signatures" | wc -l | tr -d ' ')"
           failing_steps="$(head -1 "$signatures")"
           if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] && [ "$distinct" -eq 1 ]; then
-            verdict="deterministic"
-            advice="Every attempt failed at the same step, so a rerun cannot reach a different outcome. Recovery is a version recut against fixed dependencies, not another run of this release."
+            verdict="repeated failure signature"
+            advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
+          elif [ "$unknown" -ne 0 ]; then
+            verdict="indeterminate"
+            advice="At least one attempt could not be read or carried no concrete failed step, so neither a deterministic nor a transient cause is established. Inspect the unrecorded attempts before choosing a same-release rerun or a source-fixed recut."
           else
-            verdict="not proven deterministic"
-            advice="The attempts did not fail identically, which is the transient shape this controller exists for. Diagnose and rerun the same release rather than cutting a newer version."
+            verdict="varying failure signatures"
+            advice="The observed failing job and step sets differed, which is consistent with the transient shape this controller exists for. Diagnose and rerun the same release rather than cutting a newer version unless the logs identify a source-bound defect."
           fi
 
           # A mint that reported failure on a release it had already created
           # would otherwise send this controller to repair a healthy release,
           # so say what actually exists before advising anything.
-          if release="$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>/dev/null)"; then
+          release_error="$(mktemp)"
+          if release="$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>"$release_error")"; then
             assets="$(jq '.assets | length' <<< "$release")"
             draft="$(jq -r '.draft' <<< "$release")"
-            release_state="A GitHub Release for \`${TAG}\` already exists with ${assets} asset(s), draft=${draft}. Confirm it is genuinely incomplete before repairing it."
-          else
+            prerelease="$(jq -r '.prerelease' <<< "$release")"
+            release_state="A GitHub Release for \`${TAG}\` already exists with ${assets} asset(s), draft=${draft}, prerelease=${prerelease}. Confirm it is genuinely incomplete before repairing it."
+          elif grep -Eq '\(HTTP 404\)' "$release_error"; then
             release_state="No GitHub Release object exists for \`${TAG}\`."
+          else
+            release_reason="$(tr -d '\r' < "$release_error" | tail -n 1)"
+            release_state="GitHub Release state for \`${TAG}\` could not be read (${release_reason:-unknown API error}). Do not infer that the Release is absent; inspect it before repairing anything."
           fi
 
           title="Release blocked after automatic retries: ${TAG}"

@@ -2816,6 +2816,7 @@ def execute_recovery_escalation(
     attempt_signatures: list[tuple[str, str] | None],
     *,
     release: dict[str, object] | None = None,
+    release_error: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     """Run the escalation against scripted attempt jobs and release state.
 
@@ -2864,9 +2865,17 @@ def execute_recovery_escalation(
                 f"_attempts_{index}_jobs"
             )
             (responses / target).write_text(json.dumps(payload), encoding="utf-8")
+        release_response = responses / "repos_firelock-ai_kin_releases_tags_v9.9.9"
+        if release is not None and release_error is not None:
+            raise AssertionError("release fixture cannot be both readable and failed")
         if release is not None:
-            (responses / "repos_firelock-ai_kin_releases_tags_v9.9.9").write_text(
+            release_response.write_text(
                 json.dumps(release),
+                encoding="utf-8",
+            )
+        if release_error is not None:
+            Path(f"{release_response}.error").write_text(
+                release_error,
                 encoding="utf-8",
             )
         binaries = root / "bin"
@@ -2891,6 +2900,10 @@ def execute_recovery_escalation(
                     done
                     path="${path%%\\?*}"
                     file="$FIXTURE/responses/$(printf '%s' "$path" | tr '/' '_')"
+                    if [ -f "$file.error" ]; then
+                      cat "$file.error" >&2
+                      exit 1
+                    fi
                     if [ ! -f "$file" ]; then
                       echo "gh: Not Found (HTTP 404)" >&2
                       exit 1
@@ -2958,41 +2971,42 @@ def execute_recovery_escalation(
 
 
 def assert_recovery_escalation_classifies(release_recovery: str) -> None:
-    """Recovery must classify before advising, and never advise a dead rerun.
+    """Recovery must classify before advising without inventing root-cause proof.
 
-    Advising a rerun for a deterministic failure is the wrong answer in the
-    expensive direction: a lockfile pinning a dependency that cannot build for
-    a release target fails identically every time, and the operator waits for a
-    retry that can never succeed.
+    A repeated job/step surface is useful evidence that another immediate rerun
+    is unlikely to help, but it cannot distinguish a source-bound failure from
+    an external outage that repeatedly reaches the same step. The issue must
+    preserve that distinction before it tells an operator to burn a version.
     """
 
     source = recovery_escalation_source(release_recovery)
     compile_failure = ("build-artifacts (x86_64-unknown-linux-musl)", "Build release binaries")
 
-    deterministic, body = execute_recovery_escalation(
+    repeated, body = execute_recovery_escalation(
         source,
         [compile_failure, compile_failure, compile_failure],
     )
-    if deterministic.returncode == 0:
+    if repeated.returncode == 0:
         raise AssertionError(
             "recovery escalation stopped failing the run: "
-            f"{deterministic.stdout}{deterministic.stderr}"
+            f"{repeated.stdout}{repeated.stderr}"
         )
     for needle in (
-        "Classification: **deterministic**",
-        "a rerun cannot reach a different outcome",
-        "version recut against fixed dependencies",
+        "Classification: **repeated failure signature**",
+        "another immediate rerun is unlikely to help",
+        "recut only after confirming a source-bound defect",
+        "preserve this tag for a same-release rerun if the cause is external",
         "- attempt 1: build-artifacts (x86_64-unknown-linux-musl) / Build release binaries",
         "after 3 attempt(s)",
         "No GitHub Release object exists for `v9.9.9`.",
     ):
         if needle not in body:
             raise AssertionError(
-                f"identical repeated failures were not classified: {needle!r}: {body}"
+                f"identical repeated signatures were not reported: {needle!r}: {body}"
             )
-    if "Diagnose and rerun the same release" in body:
+    if "a rerun cannot reach a different outcome" in body:
         raise AssertionError(
-            f"a deterministic failure was still advised to rerun: {body}"
+            f"step identity was overstated as root-cause proof: {body}"
         )
 
     _, transient_body = execute_recovery_escalation(
@@ -3004,7 +3018,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         ],
     )
     for needle in (
-        "Classification: **not proven deterministic**",
+        "Classification: **varying failure signatures**",
         "Diagnose and rerun the same release",
     ):
         if needle not in transient_body:
@@ -3021,14 +3035,21 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         [compile_failure, None, compile_failure],
     )
     for needle in (
-        "Classification: **not proven deterministic**",
+        "Classification: **indeterminate**",
         "- attempt 2: unrecorded",
+        "neither a deterministic nor a transient cause is established",
+        "Inspect the unrecorded attempts",
     ):
         if needle not in unreadable_body:
             raise AssertionError(
                 "an unreadable attempt was folded into a deterministic verdict: "
                 f"{needle!r}: {unreadable_body}"
             )
+    if "The attempts did not fail identically" in unreadable_body:
+        raise AssertionError(
+            "an unreadable attempt was reported as an observed difference: "
+            f"{unreadable_body}"
+        )
 
     # The shape production actually produces. Release builds are a matrix, so
     # more than one leg fails, and the jobs API orders by job id, which is
@@ -3049,7 +3070,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         source,
         [[aarch64, x86_64], [x86_64, aarch64], [aarch64, x86_64]],
     )
-    if "Classification: **deterministic**" not in matrix_body:
+    if "Classification: **repeated failure signature**" not in matrix_body:
         raise AssertionError(
             "a matrix failure that repeated identically was classified by the "
             f"order its legs happened to queue in: {matrix_body}"
@@ -3059,7 +3080,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     # The signatures all match each other, so nothing but that count stands
     # between a total read failure and a verdict of "deterministic, recut it".
     _, blind_body = execute_recovery_escalation(source, [None, None, None])
-    if "Classification: **not proven deterministic**" not in blind_body:
+    if "Classification: **indeterminate**" not in blind_body:
         raise AssertionError(
             "a run whose attempts could not be read at all was classified "
             f"deterministic: {blind_body}"
@@ -3070,16 +3091,44 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     _, existing_release_body = execute_recovery_escalation(
         source,
         [compile_failure, compile_failure, compile_failure],
-        release={"draft": False, "assets": [{"name": "kin-x86_64.tar.gz"}]},
+        release={
+            "draft": False,
+            "prerelease": True,
+            "assets": [{"name": "kin-x86_64.tar.gz"}],
+        },
     )
     if (
         "already exists with 1 asset(s)" not in existing_release_body
+        or "prerelease=true" not in existing_release_body
         or "Confirm it is genuinely incomplete before repairing it."
         not in existing_release_body
     ):
         raise AssertionError(
             "recovery advised repair without saying the release already exists: "
             f"{existing_release_body}"
+        )
+
+    # Only a real 404 proves absence. A permissions, rate-limit, server, or
+    # network failure is unknown state and must never be rewritten as "no
+    # Release", which would send repair after an object that may exist.
+    _, unreadable_release_body = execute_recovery_escalation(
+        source,
+        [compile_failure, compile_failure, compile_failure],
+        release_error="gh: API rate limit exceeded (HTTP 403)\n",
+    )
+    for needle in (
+        "GitHub Release state for `v9.9.9` could not be read",
+        "Do not infer that the Release is absent",
+    ):
+        if needle not in unreadable_release_body:
+            raise AssertionError(
+                "recovery converted an unreadable Release API state into absence: "
+                f"{needle!r}: {unreadable_release_body}"
+            )
+    if "No GitHub Release object exists" in unreadable_release_body:
+        raise AssertionError(
+            "recovery claimed Release absence after a non-404 API failure: "
+            f"{unreadable_release_body}"
         )
 
 
@@ -3132,6 +3181,126 @@ def assert_required_check_set_is_single_sourced(release_tag: str) -> None:
         raise AssertionError(
             "the release gate's expected_provenance table no longer matches "
             f"the reviewed required set: {table_names}"
+        )
+
+
+def decline_escalation_source(release_tag: str) -> str:
+    """Extract the persistent-decline shell exactly as the mint runs it."""
+
+    step = workflow_step_source(
+        ".github/workflows/release-tag.yml",
+        release_tag,
+        "      - name: Escalate a persistent mint decline",
+    )
+    marker = "        run: |\n"
+    if marker not in step:
+        raise AssertionError("persistent-decline step no longer has a shell body")
+    return textwrap.dedent(step[step.index(marker) + len(marker) :])
+
+
+def execute_decline_escalation(
+    source: str,
+    prior_runs: list[tuple[int, str, str | None]],
+) -> subprocess.CompletedProcess[str]:
+    """Run the decline counter against production-shaped workflow/job payloads.
+
+    Each tuple is `(run id, Mint release tag job conclusion, escalation-step
+    conclusion)`. A `None` marker models a whole job skipped by the workflow's
+    job-level `workflow_run` guard; that is the high-volume production shape
+    that must be ignored rather than mistaken for a successful mint.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "decline.sh"
+        script.write_text(source, encoding="utf-8")
+        responses = root / "responses"
+        responses.mkdir()
+        list_path = responses / (
+            "repos_firelock-ai_kin_actions_workflows_release-tag.yml_runs"
+        )
+        list_path.write_text(
+            json.dumps({"workflow_runs": [{"id": run_id} for run_id, _, _ in prior_runs]}),
+            encoding="utf-8",
+        )
+        for run_id, job_conclusion, marker in prior_runs:
+            steps = []
+            if marker is not None:
+                steps.append(
+                    {
+                        "name": "Escalate a persistent mint decline",
+                        "conclusion": marker,
+                    }
+                )
+            payload = {
+                "jobs": [
+                    {
+                        "name": "Mint release tag",
+                        "conclusion": job_conclusion,
+                        "steps": steps,
+                    }
+                ]
+            }
+            (responses / f"repos_firelock-ai_kin_actions_runs_{run_id}_jobs").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "gh").write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env bash
+                set -uo pipefail
+                [ "$1" = api ] || exit 2
+                shift
+                path=""; query=""
+                while [ $# -gt 0 ]; do
+                  case "$1" in
+                    -q|--jq) shift; query="$1" ;;
+                    -*) ;;
+                    *) [ -n "$path" ] || path="$1" ;;
+                  esac
+                  shift
+                done
+                path="${path%%\\?*}"
+                file="$FIXTURE/responses/$(printf '%s' "$path" | tr '/' '_')"
+                if [ ! -f "$file" ]; then
+                  echo "gh: Not Found (HTTP 404)" >&2
+                  exit 1
+                fi
+                if [ -n "$query" ]; then
+                  jq -r "$query" < "$file"
+                else
+                  cat "$file"
+                fi
+                """
+            ),
+            encoding="utf-8",
+        )
+        (binaries / "gh").chmod(0o755)
+        environment = dict(os.environ)
+        environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
+        environment.update(
+            {
+                "FIXTURE": str(root),
+                "GH_TOKEN": "fixture",
+                "REPO": "firelock-ai/kin",
+                "CURRENT_RUN_ID": "99999",
+                "DECLINE_REASON": "unrecovered-latest",
+                "DECLINE_LIMIT": "4",
+                "DECLINE_SCAN_LIMIT": "100",
+                "GITHUB_STEP_SUMMARY": str(root / "summary.md"),
+            }
+        )
+        return subprocess.run(
+            ["bash", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=30,
+            check=False,
         )
 
 
@@ -3200,6 +3369,49 @@ def assert_soft_decline_is_legible(release_tag: str) -> None:
         raise AssertionError(
             f"{workflow} needs a decline budget above one, because a single "
             "decline while a release is in flight is correct behaviour"
+        )
+
+    source = decline_escalation_source(release_tag)
+    # `workflow_run` creates skipped controller jobs for unrelated CI
+    # completions. They interleave with real scheduled declines in production
+    # and must not reset the streak. The previous implementation stopped at the
+    # first such run, so this fixture makes the fourth real decline fail only
+    # when the skipped jobs are actively ignored.
+    interleaved = execute_decline_escalation(
+        source,
+        [
+            (910, "skipped", None),
+            (909, "success", "success"),
+            (908, "skipped", None),
+            (907, "success", "success"),
+            (906, "skipped", None),
+            (905, "failure", "failure"),
+        ],
+    )
+    if interleaved.returncode == 0 or "declined 4 times in a row" not in (
+        interleaved.stdout + interleaved.stderr
+    ):
+        raise AssertionError(
+            "whole-job workflow_run skips reset the persistent-decline counter: "
+            f"{interleaved.stdout}{interleaved.stderr}"
+        )
+
+    # A mint job that really ran and skipped the escalation step is a genuine
+    # non-decline (mint/no-op/refusal elsewhere), so it must reset the streak
+    # even when older declines exist behind it.
+    reset = execute_decline_escalation(
+        source,
+        [
+            (920, "success", "skipped"),
+            (919, "success", "success"),
+            (918, "failure", "failure"),
+            (917, "success", "success"),
+        ],
+    )
+    if reset.returncode != 0 or "1 in a row" not in reset.stdout:
+        raise AssertionError(
+            "a completed non-decline mint no longer resets decline escalation: "
+            f"{reset.stdout}{reset.stderr}"
         )
 
 
@@ -6697,6 +6909,13 @@ def main() -> None:
             check_runs,
             "Check & Test (ubuntu-latest)",
         )["check_suite_id"]
+        # This coupling is mandatory in the real Actions API: while any sibling
+        # job is in progress, its producer workflow cannot be completed/success.
+        # Leaving the fixture completed creates an impossible state and lets the
+        # gate keep waiting on the aggregate without the test noticing.
+        workflow_fixture(workflow_runs, ci_suite).update(
+            {"status": "in_progress", "conclusion": None}
+        )
         check_runs.append(
             non_required_check(
                 "npm launcher tests",
@@ -6711,6 +6930,8 @@ def main() -> None:
         release_gate,
         "an unfinished advisory check no required context covers",
         (
+            "admitting over a producing run that is still in_progress: "
+            ".github/workflows/ci.yml run 1001",
             "not waiting for a check no required context covers: "
             "npm launcher tests (status=in_progress)",
         ),

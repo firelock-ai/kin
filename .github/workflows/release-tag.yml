@@ -662,6 +662,7 @@ jobs:
           CURRENT_RUN_ID: ${{ github.run_id }}
           DECLINE_REASON: ${{ steps.prior.outputs.decline_reason }}
           DECLINE_LIMIT: "4"
+          DECLINE_SCAN_LIMIT: "100"
         run: |
           set -euo pipefail
           # Diagnostics go to their own file rather than into the captured
@@ -670,7 +671,7 @@ jobs:
           # quietly wrong rather than loudly wrong.
           read_error="$(mktemp)"
           if ! runs="$(gh api \
-            "repos/${REPO}/actions/workflows/release-tag.yml/runs?per_page=20&status=completed" \
+            "repos/${REPO}/actions/workflows/release-tag.yml/runs?per_page=${DECLINE_SCAN_LIMIT}&status=completed" \
             -q '.workflow_runs[]
                 | select(.id != (env.CURRENT_RUN_ID | tonumber))
                 | .id' 2>"$read_error")"; then
@@ -678,22 +679,42 @@ jobs:
             exit 0
           fi
           consecutive=1
-          examined=0
+          scanned=0
           while IFS= read -r run_id; do
             [ -n "$run_id" ] || continue
-            [ "$examined" -lt "$DECLINE_LIMIT" ] || break
-            examined=$((examined + 1))
-            if ! marker="$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
+            [ "$scanned" -lt "$DECLINE_SCAN_LIMIT" ] || break
+            scanned=$((scanned + 1))
+            if ! state="$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
               -q '[.jobs[]
                    | select(.name == "Mint release tag")
-                   | .steps[]
-                   | select(.name == "Escalate a persistent mint decline")
-                   | .conclusion] | first // ""' 2>"$read_error")"; then
+                   | {
+                       job: .conclusion,
+                       marker: ([.steps[]?
+                         | select(.name == "Escalate a persistent mint decline")
+                         | .conclusion] | first // "")
+                     }] | first // {job: "", marker: ""}' \
+              2>"$read_error")"; then
               echo "::notice::stopped counting at run ${run_id}: $(cat "$read_error")"
               break
             fi
+            if ! job_conclusion="$(jq -er '.job | strings' <<< "$state")" ||
+               ! marker="$(jq -er '.marker | strings' <<< "$state")"; then
+              echo "::notice::stopped counting at run ${run_id}: unreadable mint job state"
+              break
+            fi
+            # `workflow_run` starts this workflow for every completed CI run.
+            # Its job-level guard skips the whole mint job for unrelated CI
+            # events, and those controller invocations are not mint outcomes at
+            # all. Ignore them. A mint job that did run but skipped this step is
+            # different: it reached a non-decline outcome and resets the streak.
+            if [ "$job_conclusion" = skipped ]; then
+              continue
+            fi
             case "$marker" in
-              success|failure) consecutive=$((consecutive + 1)) ;;
+              success|failure)
+                consecutive=$((consecutive + 1))
+                [ "$consecutive" -lt "$DECLINE_LIMIT" ] || break
+                ;;
               *) break ;;
             esac
           done <<< "$runs"
@@ -722,9 +743,10 @@ jobs:
         # pull-request-only job is inapplicable on a merged main HEAD. This
         # reviewed set is the complete veto authority. Red or unfinished checks
         # outside it are announced, but they neither refuse nor delay the mint;
-        # add any context that must block a release to this reviewed list. It is
-        # the main branch-protection required contexts plus the Windows installer
-        # leg, which is release-critical and never optional.
+        # add any context that must block a release to this reviewed list. The
+        # active main ruleset should carry the same contexts, but this reviewed
+        # source declaration remains the mint's authority rather than mutable
+        # live configuration.
         #
         # Evidence is resolved through workflow provenance, not through the
         # context name. A merge-queue landing publishes the same context names
@@ -1058,9 +1080,17 @@ jobs:
                       f"(conclusion={run['conclusion']})"
                   )
               if workflow.get("status") != "completed":
-                  pending.append(
-                      f"required check workflow not completed: {name} "
-                      f"(status={workflow.get('status')})"
+                  # A required job can already be immutable green while an
+                  # advisory sibling keeps their shared workflow in progress.
+                  # Waiting on that aggregate would restore an advisory veto
+                  # through status instead of conclusion. Record it loudly and
+                  # judge the required context itself above.
+                  degraded_producers.append(
+                      (
+                          workflow.get("path"),
+                          workflow.get("id"),
+                          f"is still {workflow.get('status')}",
+                      )
                   )
               elif workflow.get("conclusion") != "success":
                   # The producing run carries jobs beyond the release-critical
@@ -1075,7 +1105,7 @@ jobs:
                       (
                           workflow.get("path"),
                           workflow.get("id"),
-                          workflow.get("conclusion"),
+                          f"concluded {workflow.get('conclusion')}",
                       )
                   )
 
@@ -1183,10 +1213,10 @@ jobs:
           # nobody was told about. Announcing on the retry passes instead would
           # repeat every line up to sixty times and train the reader to skip it.
           announcements = []
-          for path, run_id, conclusion in sorted(set(degraded_producers)):
+          for path, run_id, state in sorted(set(degraded_producers)):
               announcements.append(
-                  "admitting over a producing run that concluded "
-                  f"{conclusion}: {path} run {run_id}; every required context "
+                  f"admitting over a producing run that {state}: "
+                  f"{path} run {run_id}; every required context "
                   "it produces is green"
               )
           for item in downgraded:
