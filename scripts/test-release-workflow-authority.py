@@ -1120,23 +1120,45 @@ def assert_install_proof_status_contract(
         "kin bench-meta --json > kin-build-meta.json",
         "installed CLI provenance capture",
     )
+    require(
+        first_run,
+        "printf '%s\\n' \"$fake_agent_bin\" >> \"$GITHUB_PATH\"",
+        "cross-step agent-client proof PATH",
+    )
 
+    graph_active_lines = active_lines(graph_query)
+    graph_active = "\n".join(graph_active_lines)
     for policy in (
         "kin search hello --json | tee kin-search.json",
         "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\"",
         'DAEMON_PORT="$daemon_port" node',
         "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
         "kin-daemon-health.json",
+        "kin setup status --json | tee kin-health.json",
+        "kin doctor --json | tee kin-doctor.json",
     ):
-        require(graph_query, policy, "installed daemon startup and provenance capture")
+        require(graph_active, policy, "installed daemon startup and health capture")
 
-    if graph_query.index("kin search hello --json | tee kin-search.json") > graph_query.index(
-        "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
+    daemon_start = "kin search hello --json | tee kin-search.json"
+    endpoint_capture = "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
+    setup_health = "kin setup status --json | tee kin-health.json"
+    doctor_health = "kin doctor --json | tee kin-doctor.json"
+    daemon_start_index = graph_active_lines.index(daemon_start)
+    if any(
+        daemon_start_index >= graph_active_lines.index(capture)
+        for capture in (endpoint_capture, setup_health, doctor_health)
     ):
         raise AssertionError(
             "install proof must start the daemon through a graph query before "
-            "reading its published endpoint"
+            "reading its endpoint or capturing setup health"
         )
+
+    for stale_capture in (setup_health, doctor_health):
+        if stale_capture in "\n".join(active_lines(first_run)):
+            raise AssertionError(
+                "install proof must capture setup health after the daemon-starting "
+                f"graph query, not in the first-run step: {stale_capture}"
+            )
 
     for stale in (
         "status.build",
@@ -5153,6 +5175,46 @@ def main() -> None:
             ).replace(
                 "cat kin-daemon-health.json",
                 "cat kin-daemon-health.json\n          kin search hello --json | tee kin-search.json",
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "a commented-out daemon-starting query cannot satisfy the proof contract",
+        "installed daemon startup and health capture",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin search hello --json | tee kin-search.json",
+                "# kin search hello --json | tee kin-search.json",
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "setup health is captured before the daemon-starting query",
+        "must start the daemon through a graph query",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin setup status --json | tee kin-health.json",
+                "# setup health moved above daemon startup",
+                1,
+            )
+            .replace(
+                "kin doctor --json | tee kin-doctor.json",
+                "# doctor health moved above daemon startup",
+                1,
+            )
+            .replace(
+                "kin search hello --json | tee kin-search.json",
+                "kin setup status --json | tee kin-health.json\n"
+                "          kin doctor --json | tee kin-doctor.json\n"
+                "          kin search hello --json | tee kin-search.json",
                 1,
             ),
             embedding,
