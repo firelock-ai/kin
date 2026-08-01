@@ -191,10 +191,21 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
     let Some(parent) = normalized_parent(path) else {
         return Ok(());
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = parent;
-        Ok(())
+        // A normal `File::open` cannot open a Windows directory, and a
+        // read-only directory handle cannot be passed to FlushFileBuffers.
+        // Retain the ambient directory without delete sharing, then let the
+        // shared identity-bound CreateFile reopen acquire the write access
+        // needed for the durability barrier.
+        let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+            .map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to retain parent directory {} for durable metadata flush: {error}",
+                    parent.display()
+                ))
+            })?;
+        sync_directory_handle(&directory.into_std_file(), parent)
     }
     #[cfg(unix)]
     {
@@ -205,6 +216,14 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), KinDbError> {
             ))
         })?;
         sync_directory_handle(&dir, parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = parent;
+        Err(KinDbError::StorageError(format!(
+            "durable parent-directory synchronization is unavailable for {} on this platform",
+            parent.display()
+        )))
     }
 }
 
@@ -263,28 +282,83 @@ pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
         use windows_sys::Win32::Storage::FileSystem::{
-            ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
         };
 
-        let reopened = unsafe {
-            ReOpenFile(
-                dir.as_raw_handle(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_FLAG_BACKUP_SEMANTICS,
-            )
+        fn identity(file: &File, display_path: &Path) -> Result<(u64, [u8; 16]), KinDbError> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+            };
+
+            let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle().cast(),
+                    FileIdInfo,
+                    (&raw mut info).cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "failed to inspect retained parent directory {} before durable metadata flush: {}",
+                    display_path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if info.VolumeSerialNumber == 0 || info.FileId.Identifier.iter().all(|byte| *byte == 0)
+            {
+                return Err(KinDbError::StorageError(format!(
+                    "retained parent directory {} returned a zero FILE_ID_128 identity",
+                    display_path.display()
+                )));
+            }
+            Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+        }
+
+        // cap-std opens capability-relative directories through NtCreateFile.
+        // ReOpenFile is documented to accept only handles created by
+        // CreateFile, and Windows rejects the NtCreateFile handle with
+        // ERROR_ACCESS_DENIED. Open the already-pinned ambient name through
+        // CreateFile instead, refuse reparse points, and bind the writable
+        // handle back to the complete FILE_ID_128 before flushing it. Every
+        // retained capability in this path omits FILE_SHARE_DELETE, so neither
+        // the selected directory nor its pinned ancestors can be displaced
+        // during this identity-checked reopen.
+        let ambient_path = if display_path.is_absolute() {
+            display_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "failed to resolve retained parent directory {} for durable metadata flush: {error}",
+                        display_path.display()
+                    ))
+                })?
+                .join(display_path)
         };
-        if reopened == INVALID_HANDLE_VALUE {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let writable = options.open(&ambient_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to open retained parent directory {} for durable metadata flush: {error}",
+                display_path.display()
+            ))
+        })?;
+        if identity(dir, display_path)? != identity(&writable, display_path)? {
             return Err(KinDbError::StorageError(format!(
-                "failed to reopen retained parent directory {} for durable metadata flush: {}",
-                display_path.display(),
-                std::io::Error::last_os_error()
+                "retained parent directory {} changed before durable metadata flush",
+                display_path.display()
             )));
         }
-        let writable = unsafe { File::from_raw_handle(reopened) };
         writable.sync_all().map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to durably flush parent directory {}: {error}",
@@ -318,6 +392,13 @@ fn ensure_regular_path_entry(path: &Path, role: &str) -> Result<(), KinDbError> 
             path.display()
         ))
     })?;
+    #[cfg(windows)]
+    if windows_metadata_is_reparse(&metadata) {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point {role} {}",
+            path.display()
+        )));
+    }
     if !metadata.file_type().is_file() {
         return Err(KinDbError::StorageError(format!(
             "refusing non-regular {role} {}",
@@ -335,28 +416,53 @@ pub(crate) fn open_regular_nofollow(path: &Path, role: &str) -> Result<File, Kin
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        // OPEN_REPARSE_POINT is the Windows no-follow equivalent. Include
+        // BACKUP_SEMANTICS so a directory or directory reparse point opens as
+        // an object we can inspect and reject as non-regular, instead of
+        // surfacing an ambiguous ERROR_ACCESS_DENIED before the type check.
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path).map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to open {role} {} without following links: {error}",
             path.display()
         ))
     })?;
-    if !file
-        .metadata()
-        .map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to inspect opened {role} {}: {error}",
-                path.display()
-            ))
-        })?
-        .is_file()
-    {
+    let metadata = file.metadata().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to inspect opened {role} {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(windows)]
+    if windows_metadata_is_reparse(&metadata) {
+        return Err(KinDbError::StorageError(format!(
+            "refusing reparse-point {role} {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
         return Err(KinDbError::StorageError(format!(
             "refusing non-regular {role} {}",
             path.display()
         )));
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 pub(crate) fn read_regular_bounded(
@@ -1934,6 +2040,62 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn make_non_name_surrogate_file_reparse_point(path: &Path) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::core::GUID;
+        use windows_sys::Wdk::Storage::FileSystem::IO_REPARSE_TAG_IFSTEST_CONGRUENT;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            REPARSE_GUID_DATA_BUFFER,
+        };
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        std::fs::write(path, b"opaque reparse payload").unwrap();
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).unwrap();
+
+        // A third-party tag has its Microsoft bit clear and therefore uses a
+        // GUID buffer. IFSTEST_CONGRUENT is deliberately not a name-surrogate
+        // tag: Rust classifies the resulting object as a file even though the
+        // kernel exposes FILE_ATTRIBUTE_REPARSE_POINT.
+        let mut reparse = REPARSE_GUID_DATA_BUFFER {
+            ReparseTag: IO_REPARSE_TAG_IFSTEST_CONGRUENT as u32,
+            ReparseDataLength: 1,
+            Reserved: 0,
+            ReparseGuid: GUID::from_u128(0x5f7147ca_25e5_45a5_9d6e_d266077ac517),
+            GenericReparseBuffer: Default::default(),
+        };
+        reparse.GenericReparseBuffer.DataBuffer[0] = b'K';
+        let input_len = std::mem::offset_of!(REPARSE_GUID_DATA_BUFFER, GenericReparseBuffer) + 1;
+        let mut bytes_returned = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast(),
+                FSCTL_SET_REPARSE_POINT,
+                (&raw const reparse).cast(),
+                input_len as u32,
+                std::ptr::null_mut(),
+                0,
+                &raw mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            result,
+            0,
+            "failed to create non-name-surrogate file reparse point: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     #[test]
     fn atomic_write_and_mmap_read() {
         let tmp = NamedTempFile::new().unwrap();
@@ -1944,6 +2106,66 @@ mod tests {
         atomic_write(&path, &snap).unwrap();
         let loaded = MmapReader::open(&path).unwrap();
         assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_nt_directory_handle_reopens_by_exact_identity_for_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let capability =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let retained = open_directory_handle_at(&capability, Path::new("."), directory.path())
+            .expect("capability-relative NtCreateFile directory handle must open");
+
+        sync_directory_handle(&retained, directory.path())
+            .expect("identity-bound CreateFile reopen must flush the retained directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_directory_flush_rejects_a_different_ambient_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let capability =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .unwrap();
+        let retained = open_directory_handle_at(&capability, Path::new("."), directory.path())
+            .expect("capability-relative NtCreateFile directory handle must open");
+
+        let error = sync_directory_handle(&retained, other.path())
+            .expect_err("a different FILE_ID_128 must never satisfy the flush binding");
+        assert!(error
+            .to_string()
+            .contains("changed before durable metadata flush"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_open_rejects_non_name_surrogate_file_reparse_point() {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opaque-reparse");
+        make_non_name_surrogate_file_reparse_point(&path);
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert_ne!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "fixture must expose the reparse-point attribute"
+        );
+        assert!(
+            metadata.file_type().is_file(),
+            "fixture must reproduce the non-name-surrogate is_file ambiguity"
+        );
+        let error = ensure_regular_path_entry(&path, "opaque test artifact")
+            .expect_err("path-entry validation must reject every file reparse point");
+        assert!(error.to_string().contains("refusing reparse-point"));
+        let error = open_regular_nofollow(&path, "opaque test artifact")
+            .expect_err("every file reparse point must fail closed");
+        assert!(error.to_string().contains("refusing reparse-point"));
     }
 
     #[test]

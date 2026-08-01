@@ -167,9 +167,6 @@ impl ReadIndex {
             relations = self.relation_count
         )
         .entered();
-        use std::fs::File;
-        use std::io::Write;
-
         let mut buf = Vec::new();
         buf.extend_from_slice(&INDEX_MAGIC);
         buf.extend_from_slice(&INDEX_VERSION.to_le_bytes());
@@ -185,31 +182,19 @@ impl ReadIndex {
         let checksum = Sha256::digest(&buf);
         buf.extend_from_slice(&checksum);
 
-        // Append ".tmp" to the full path instead of replacing the extension.
-        // `with_extension("tmp")` would collapse graph.kidx to graph.tmp, which
-        // collides with the snapshot's recovery tmp and cross-contaminates the
-        // two files. Appending keeps the discriminating extension so the index
-        // tmp (graph.kidx.tmp) stays disjoint from the snapshot tmp
-        // (graph.kndb.tmp).
-        let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
-        tmp_name.push(".tmp");
-        let tmp = std::path::PathBuf::from(tmp_name);
-        {
-            let mut file = File::create(&tmp)
-                .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
-            file.write_all(&buf)
-                .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
-            file.sync_all()
-                .map_err(|e| KinDbError::StorageError(format!("fsync failed: {e}")))?;
-        }
-
-        std::fs::rename(&tmp, path)
-            .map_err(|e| KinDbError::StorageError(format!("rename failed: {e}")))?;
+        // Use the shared unique-stage atomic writer. The former deterministic
+        // `graph.kidx.tmp` path could still be open or memory-mapped by a
+        // concurrent/recovering reader on Windows, where truncating and
+        // flushing that shared stage fails with ERROR_ACCESS_DENIED. A unique
+        // stage also gives the derived index the same exact-byte post-install
+        // verification and recovery discipline as the snapshot writer.
+        crate::storage::mmap::atomic_write_bytes_no_magic(path, &buf)?;
 
         // Defense-in-depth: confirm the promoted file leads with KIDX so a bad
         // promote fails loudly here rather than as a confusing magic error on
         // the next load.
         {
+            use std::fs::File;
             use std::io::Read;
             let mut promoted = File::open(path)
                 .map_err(|e| KinDbError::StorageError(format!("reopen failed: {e}")))?;
@@ -222,13 +207,6 @@ impl ReadIndex {
                     "promoted index {} has magic {magic:?}, expected KIDX",
                     path.display()
                 )));
-            }
-        }
-
-        // fsync the parent directory so the rename is durable
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
             }
         }
 
@@ -408,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn save_uses_append_suffix_tmp_and_round_trips() {
+    fn save_uses_unique_atomic_stages_and_round_trips() {
         let graph = InMemoryGraph::new();
         graph
             .upsert_entity(&make_entity("parseRust", LanguageId::Rust, "src/lib.rs"))
@@ -420,15 +398,24 @@ mod tests {
 
         index.save(&path).unwrap();
 
-        // The promoted index exists; the tmp is consumed and was named with the
-        // extension preserved (graph.kidx.tmp), provably disjoint from the
-        // snapshot's graph.kndb.tmp.
+        // The promoted index exists and every recovery/staging entry was
+        // consumed. The deterministic recovery name still preserves the
+        // extension (graph.kidx.tmp), while the bytes were first written to a
+        // unique candidate so a live stale handle cannot alias the writer.
         assert!(path.exists());
         let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
         tmp_name.push(".tmp");
         let tmp = std::path::PathBuf::from(tmp_name);
         assert!(!tmp.exists(), "index tmp should be consumed after promote");
         assert_eq!(tmp, dir.path().join("graph.kidx.tmp"));
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".candidate-")),
+            "unique index stages must be consumed after promote"
+        );
 
         let loaded = ReadIndex::load(&path).unwrap();
         assert_eq!(loaded.entity_count, 1);
