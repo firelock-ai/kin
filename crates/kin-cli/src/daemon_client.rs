@@ -6220,7 +6220,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_candidates_use_the_target_platform_executable_name() {
+    fn windows_daemon_candidates_use_the_target_platform_executable_name() {
         let executable = Path::new("target")
             .join("debug")
             .join("deps")
