@@ -613,10 +613,22 @@ impl Reconciler {
                 }
             }
 
-            // Try to match by name + kind against existing entities
+            // A graph-authoritative planner may deliberately retain an
+            // existing identity while changing its source name (rename is the
+            // canonical case). Parser-produced identities normally differ
+            // after such a source edit, so the planner must explicitly remap
+            // the parsed entity before reaching this boundary. Honor that
+            // exact id first, while still requiring the entity kind to match;
+            // ordinary filesystem reconciliation continues to match by name
+            // and kind as before.
             let existing_match = existing
                 .iter()
-                .find(|e| e.name == new_entity.name && e.kind == new_entity.kind);
+                .find(|entity| entity.id == new_entity.id && entity.kind == new_entity.kind)
+                .or_else(|| {
+                    existing.iter().find(|entity| {
+                        entity.name == new_entity.name && entity.kind == new_entity.kind
+                    })
+                });
 
             match existing_match {
                 Some(old) => {
@@ -2881,6 +2893,65 @@ mod tests {
             super::validate_entity(&entity).is_some(),
             "an external target is not exempt from the other rules"
         );
+    }
+
+    #[test]
+    fn graph_authoritative_reconcile_retains_explicit_identity_across_rename() {
+        use kin_blobs::BlobStore;
+        use kin_db::InMemoryGraph;
+        use kin_index::IndexedFile;
+        use kin_model::{EntityStore, FileLayout, ImportSection, ParseCompleteness, ParseState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+        let graph = InMemoryGraph::new();
+        let file = FilePathId::new("src/lib.rs");
+        let old = make_entity("before", &file.0);
+        graph.upsert_entity(&old).unwrap();
+
+        let mut renamed = old.clone();
+        renamed.name = "after".to_string();
+        renamed.signature = "fn after()".to_string();
+        let body = b"pub fn after() {}\n";
+        let blob_hash = blob_store.write(body).unwrap();
+        let indexed = IndexedFile {
+            file_id: file.clone(),
+            language: LanguageId::Rust,
+            entities: vec![renamed.clone()],
+            relations: vec![],
+            unresolved_relations: vec![],
+            file_layout: FileLayout {
+                file_id: file,
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![],
+            },
+            parse_state: ParseState::Valid,
+            blob_hash,
+            extracted_relations: vec![],
+            imports: vec![],
+        };
+        let mut reconciler = Reconciler::new(std::path::PathBuf::new());
+        let result = reconciler
+            .reconcile_indexed_content(&indexed, &blob_store, &graph)
+            .unwrap();
+
+        assert_eq!(result.delta.entity_deltas.len(), 1);
+        assert!(matches!(
+            &result.delta.entity_deltas[0],
+            EntityDelta::Modified { old: prior, new }
+                if prior.id == old.id
+                    && prior.name == "before"
+                    && new.id == old.id
+                    && new.name == "after"
+        ));
+        assert!(!result.delta.entity_deltas.iter().any(|delta| matches!(
+            delta,
+            EntityDelta::Added { .. } | EntityDelta::Removed { .. }
+        )));
     }
 
     // ---------------------------------------------------------------

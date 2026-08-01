@@ -419,16 +419,24 @@
     },
     {
       "command": "rename",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready_bounded",
+      "exposure": "enabled",
       "authority": "graph entity identity plus repository-v6 source CAS",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "plan edits from graph relations and immutable repository source bodies only",
+        "require positive versioned graph extraction coverage plus repository-wide source-CAS occurrence accounting for every declaration and reference site",
+        "refuse named-import and qualified-name cases whose graph evidence cannot prove every source token",
         "apply exact workspace tree and semantic deltas through one repository transaction"
       ],
-      "evidence_tests": [],
-      "note": "kin rename has no planner: the retired one read .kin/objects and working-tree files, and nothing reads bodies from repository-v6 source CAS in its place. There is also no apply path that moves the workspace tree and semantic deltas through one repository transaction."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_rename_planner.rs",
+        "kin_cli::commands::rename::tests::token_occurrences_are_byte_exact_and_identifier_bounded",
+        "kin_reconcile::reconciler::tests::graph_authoritative_reconcile_retains_explicit_identity_across_rename",
+        "kin_daemon::repository_rename::tests::repository_rename_commits_tree_and_semantics_and_replays_by_operation",
+        "kin_daemon::repository_rename::tests::repository_rename_refuses_unadmitted_working_tree_drift_without_moving_authority"
+      ],
+      "note": "Rename is enabled only for bounded exact cases whose graph and repository source CAS can prove exhaustive. It is not a claim of fully general all-language refactoring: named imports and qualified declarations without exact occurrence evidence still refuse. Every source must carry a positive versioned full-extraction certificate with no incomplete certificate, then a repository-wide Unicode-safe occurrence census must match declarations and rename-relevant graph edges exactly; comments, strings, hidden dynamic references, count mismatches, overlap, missing layouts, shallow or partial coverage, unsupported lexical forms, cross-file new-name collisions, and unowned occurrences fail closed. Cursor lines are converted once from the CLI's 1-based domain to graph 0-based rows, columns are explicit UTF-8 byte offsets with exclusive span ends, and reference cursors cannot select an unrelated same-named declaration. Changed bodies are reparsed in memory; the renamed declaration retains its graph identity; relation identity topology remains unchanged; and the exact tree, semantic delta, native change, workspace, and branch publish through one compare-and-swap transaction guarded by the projection recovery journal. Durable metadata binds the caller request to the canonical identity, original report, and edit set so immediate, restart, qualified-selector, response-loss, and post-later-generation replays return the same committed outcome without reinstalling old authority."
     },
     {
       "command": "remote plan-push",
