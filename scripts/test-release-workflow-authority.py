@@ -2834,14 +2834,21 @@ def execute_recovery_escalation(
         for index, signature in enumerate(attempt_signatures, start=1):
             if signature is None:
                 continue
-            job, step_name = signature
-            payload = {
-                "jobs": [
-                    {
-                        "name": "Preflight",
-                        "conclusion": "success",
-                        "steps": [{"name": "Checkout", "conclusion": "success"}],
-                    },
+            # A single failing job makes the jobs API's ordering irrelevant,
+            # which is the shape production never produces for a matrix
+            # failure. Every attempt therefore carries its failures in the
+            # order given, so a caller can vary it the way real queue-time job
+            # ids do.
+            failures = [signature] if isinstance(signature, tuple) else list(signature)
+            jobs: list[dict[str, object]] = [
+                {
+                    "name": "Preflight",
+                    "conclusion": "success",
+                    "steps": [{"name": "Checkout", "conclusion": "success"}],
+                }
+            ]
+            for job, step_name in failures:
+                jobs.append(
                     {
                         "name": job,
                         "conclusion": "failure",
@@ -2849,9 +2856,9 @@ def execute_recovery_escalation(
                             {"name": "Checkout", "conclusion": "success"},
                             {"name": step_name, "conclusion": "failure"},
                         ],
-                    },
-                ]
-            }
+                    }
+                )
+            payload = {"jobs": jobs}
             target = (
                 f"repos_firelock-ai_kin_actions_runs_{run_id}"
                 f"_attempts_{index}_jobs"
@@ -2872,24 +2879,33 @@ def execute_recovery_escalation(
                 case "$1" in
                   api)
                     shift
-                    path=""; query=""
+                    path=""; query=""; slurp=0
                     while [ $# -gt 0 ]; do
                       case "$1" in
                         -q|--jq) shift; query="$1" ;;
+                        --slurp) slurp=1 ;;
                         -*) ;;
                         *) [ -n "$path" ] || path="$1" ;;
                       esac
                       shift
                     done
+                    path="${path%%\\?*}"
                     file="$FIXTURE/responses/$(printf '%s' "$path" | tr '/' '_')"
                     if [ ! -f "$file" ]; then
                       echo "gh: Not Found (HTTP 404)" >&2
                       exit 1
                     fi
-                    if [ -n "$query" ]; then
-                      jq -r "$query" < "$file"
+                    # `--slurp` returns an array of page responses, which is
+                    # the shape the caller's query has to handle.
+                    if [ "$slurp" = 1 ]; then
+                      body="$(jq -c '[.]' < "$file")"
                     else
-                      cat "$file"
+                      body="$(cat "$file")"
+                    fi
+                    if [ -n "$query" ]; then
+                      jq -r "$query" <<< "$body"
+                    else
+                      printf '%s\n' "$body"
                     fi
                     ;;
                   issue)
@@ -3014,6 +3030,31 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
                 f"{needle!r}: {unreadable_body}"
             )
 
+    # The shape production actually produces. Release builds are a matrix, so
+    # more than one leg fails, and the jobs API orders by job id, which is
+    # minted at queue time. Real attempts of run 30627672394 returned the two
+    # failing legs in the order below: aarch64 first, then x86_64 first, then
+    # aarch64 again. Reducing the failing set to its first element reads that
+    # as three different failures and advises a rerun that cannot work, which
+    # is verbatim the advice FIR-1782 exists to eliminate.
+    aarch64 = (
+        "Build (kin-linux-aarch64)",
+        "Build kin-cli + kin-daemon (native)",
+    )
+    x86_64 = (
+        "Build (kin-linux-x86_64)",
+        "Build kin-cli + kin-daemon (native)",
+    )
+    _, matrix_body = execute_recovery_escalation(
+        source,
+        [[aarch64, x86_64], [x86_64, aarch64], [aarch64, x86_64]],
+    )
+    if "Classification: **deterministic**" not in matrix_body:
+        raise AssertionError(
+            "a matrix failure that repeated identically was classified by the "
+            f"order its legs happened to queue in: {matrix_body}"
+        )
+
     # Every attempt unreadable is the case that isolates the unknown count.
     # The signatures all match each other, so nothing but that count stands
     # between a total read failure and a verdict of "deterministic, recut it".
@@ -3039,6 +3080,58 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         raise AssertionError(
             "recovery advised repair without saying the release already exists: "
             f"{existing_release_body}"
+        )
+
+
+def assert_required_check_set_is_single_sourced(release_tag: str) -> None:
+    """The env list and the provenance table must name the same contexts.
+
+    Dropping a context from the env alone leaves the table intact, so every
+    literal needle still matches and the suite stays green while the mint has
+    quietly stopped requiring a release-critical check. The workflow's own
+    order check fails that closed at runtime, but only after the drift has
+    landed and started burning mint attempts, which is a log to read rather
+    than a red PR.
+    """
+
+    workflow = ".github/workflows/release-tag.yml"
+    step = workflow_step_source(
+        workflow,
+        release_tag,
+        "      - name: Verify required checks are green",
+    )
+    block = re.search(
+        r"\n          REQUIRED_CHECKS: \|\n((?:            \S.*\n)+)",
+        step,
+    )
+    if block is None:
+        raise AssertionError(
+            f"{workflow} no longer declares REQUIRED_CHECKS as a block scalar"
+        )
+    env_names = tuple(
+        line.strip() for line in block.group(1).splitlines() if line.strip()
+    )
+    table = re.search(
+        r"\nexpected_provenance = \{\n(.*?)\n\}\n",
+        release_check_gate_source(release_tag),
+        re.DOTALL,
+    )
+    if table is None:
+        raise AssertionError(
+            f"{workflow} no longer declares an expected_provenance table"
+        )
+    table_names = tuple(
+        re.findall(r'^    "(.+?)": \(', table.group(1), re.MULTILINE)
+    )
+    if env_names != REQUIRED_RELEASE_CHECKS:
+        raise AssertionError(
+            "the release gate's REQUIRED_CHECKS env no longer matches the "
+            f"reviewed required set: {env_names}"
+        )
+    if table_names != REQUIRED_RELEASE_CHECKS:
+        raise AssertionError(
+            "the release gate's expected_provenance table no longer matches "
+            f"the reviewed required set: {table_names}"
         )
 
 
@@ -6757,6 +6850,7 @@ def main() -> None:
     assert_rust_cache_steps(workflow_sources)
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
+    assert_required_check_set_is_single_sourced(release_tag)
     assert_soft_decline_is_legible(release_tag)
     assert_recovery_escalation_classifies(
         RELEASE_RECOVERY.read_text(encoding="utf-8")

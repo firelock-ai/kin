@@ -295,22 +295,39 @@ jobs:
           # recut against fixed dependencies rather than another run. Telling
           # an operator to rerun that is telling them to wait for nothing.
           #
-          # The signature is the failing job and step per attempt. It is
-          # deliberately not the error text: step identity is cheap, needs no
-          # log download, and is what actually separated the two cases.
+          # The signature is the whole set of failing job and step pairs per
+          # attempt. It is deliberately not the error text: step identity is
+          # cheap, needs no log download, and is what actually separated the
+          # two cases.
+          #
+          # The set is sorted and joined rather than reduced to its first
+          # element. The jobs API returns jobs in job-id order, ids are minted
+          # at queue time, and parallel matrix legs queue in a different order
+          # on each attempt, so the first failing job of a matrix failure is a
+          # coin flip. Taking it would report three identical failures of the
+          # same step as three different ones and advise a rerun that cannot
+          # work, which is the exact advice this classifier exists to stop.
+          #
+          # Pages are slurped and filtered in one pass. `--paginate` with an
+          # inline query applies the query per page, which would emit one line
+          # per page and break the one-line-per-attempt mapping below.
           signatures="$(mktemp)"
           unknown=0
           for attempt in $(seq 1 "$ATTEMPTS"); do
-            if ! signature="$(gh api \
-              "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs" \
-              -q '[ .jobs[]
-                    | select(.conclusion == "failure")
-                    | { job: .name,
-                        step: ( .steps[]?
-                                | select(.conclusion == "failure")
-                                | .name ) }
-                    | "\(.job) / \(.step)"
-                  ] | first // ""' 2>/dev/null)"; then
+            if attempt_jobs="$(gh api --paginate --slurp \
+              "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?per_page=100" \
+              2>/dev/null)"; then
+              signature="$(jq -r '
+                [ .[].jobs[]
+                  | select(.conclusion == "failure")
+                  | { job: .name,
+                      step: ( .steps[]?
+                              | select(.conclusion == "failure")
+                              | .name ) }
+                  | "\(.job) / \(.step)"
+                ] | unique | join("; ")' <<< "$attempt_jobs" 2>/dev/null)" \
+                || signature=""
+            else
               signature=""
             fi
             if [ -z "$signature" ]; then
@@ -326,7 +343,7 @@ jobs:
             printf '%s\n' "$signature" >> "$signatures"
           done
           distinct="$(sort -u "$signatures" | wc -l | tr -d ' ')"
-          first_signature="$(head -1 "$signatures")"
+          failing_steps="$(head -1 "$signatures")"
           if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] && [ "$distinct" -eq 1 ]; then
             verdict="deterministic"
             advice="Every attempt failed at the same step, so a rerun cannot reach a different outcome. Recovery is a version recut against fixed dependencies, not another run of this release."
@@ -376,5 +393,5 @@ jobs:
               --body-file "$body" \
               >/dev/null
           fi
-          echo "::error::${TAG} exhausted its automatic retries after ${ATTEMPTS} attempt(s), ${verdict}, first failing step: ${first_signature}: ${RUN_URL}"
+          echo "::error::${TAG} exhausted its automatic retries after ${ATTEMPTS} attempt(s), ${verdict}, failing steps: ${failing_steps}: ${RUN_URL}"
           exit 1

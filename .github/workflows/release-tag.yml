@@ -664,12 +664,17 @@ jobs:
           DECLINE_LIMIT: "4"
         run: |
           set -euo pipefail
+          # Diagnostics go to their own file rather than into the captured
+          # value. Folding stderr into the success path would let any warning
+          # gh writes be parsed as a run id, and the counter would then be
+          # quietly wrong rather than loudly wrong.
+          read_error="$(mktemp)"
           if ! runs="$(gh api \
             "repos/${REPO}/actions/workflows/release-tag.yml/runs?per_page=20&status=completed" \
             -q '.workflow_runs[]
                 | select(.id != (env.CURRENT_RUN_ID | tonumber))
-                | .id' 2>&1)"; then
-            echo "::notice::could not read prior mint runs, so this decline is not escalated: ${runs}"
+                | .id' 2>"$read_error")"; then
+            echo "::notice::could not read prior mint runs, so this decline is not escalated: $(cat "$read_error")"
             exit 0
           fi
           consecutive=1
@@ -683,8 +688,8 @@ jobs:
                    | select(.name == "Mint release tag")
                    | .steps[]
                    | select(.name == "Escalate a persistent mint decline")
-                   | .conclusion] | first // ""' 2>&1)"; then
-              echo "::notice::stopped counting at run ${run_id}: ${marker}"
+                   | .conclusion] | first // ""' 2>"$read_error")"; then
+              echo "::notice::stopped counting at run ${run_id}: $(cat "$read_error")"
               break
             fi
             case "$marker" in
@@ -1205,11 +1210,12 @@ jobs:
                   )
           for line in announcements:
               print(f"::warning::{line}")
+          not_waited = []
           for item in unwaited:
-              print(
-                  "::notice::not waiting for a check no required context "
-                  f"covers: {item}"
+              not_waited.append(
+                  f"not waiting for a check no required context covers: {item}"
               )
+              print(f"::notice::{not_waited[-1]}")
 
           verdict = (
               f"verified {len(required)} required checks against their workflow "
@@ -1224,7 +1230,10 @@ jobs:
               with open(summary_path, "a") as handle:
                   handle.write("### Release check verification\n\n")
                   handle.write(f"{verdict}\n")
-                  for line in announcements:
+                  # Every class the gate declined to act on reaches the summary,
+                  # including the unfinished ones. A downgrade that only shows
+                  # up as an annotation is half a disclosure.
+                  for line in announcements + not_waited:
                       handle.write(f"\n- {line}\n")
           PY
             status=$?
