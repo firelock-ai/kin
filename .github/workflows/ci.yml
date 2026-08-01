@@ -954,6 +954,25 @@ jobs:
       - name: Test gcs feature
         run: cargo nextest run -p kin-daemon --features gcs --locked
 
+      # Nothing else on these legs resolves kin-cli without its default
+      # features, so a break that appears only with `vector` and `embeddings`
+      # off compiles clean here and reaches main behind a green required
+      # context. The Windows job covers that configuration for the msvc target
+      # and runs three filtered subsets of the library, so the cases asserting
+      # the vector-free path execute in this step and nowhere else.
+      # `RUSTFLAGS: -D warnings` is set at workflow level, so the unused-import
+      # shape this class first took fails the step rather than warning.
+      #
+      # The whole package runs rather than the library alone. The regressions
+      # this is here to catch are library unit tests, but the featureless
+      # configuration is a build configuration before it is a test one: 30 of
+      # the 33 integration targets compile without default features nowhere
+      # else, and scoping to `--lib` would stop compiling exactly the targets
+      # where a test that assumes a feature can next appear.
+      #
+      # `cargo test` rather than the `cargo nextest run` the steps above use.
+      # It is the authority when the two runners disagree, and it covers the
+      # package's doctests in the same pass instead of needing a second step.
       - name: Test featureless kin-cli
         run: cargo test -p kin-cli --no-default-features --locked
 
