@@ -13224,7 +13224,7 @@ try {
         "    $current = [Environment]::GetEnvironmentVariable('Path', 'User')",
         r#"    $testRelease = $env:KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE
     if (-not [string]::IsNullOrEmpty($testRelease)) {
-        $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(120)
         while (-not (Test-Path -LiteralPath $testRelease -PathType Leaf)) {
             if ([DateTime]::UtcNow -ge $testReleaseDeadline) {
                 throw "timed out waiting for the native-test deferred-cleanup release"
