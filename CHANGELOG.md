@@ -69,6 +69,17 @@ it.
   rather than something this release introduces: v0.3.6 accepted only the one
   format it wrote, and so does this one. The accepted range widens when the
   format is declared stable, not before.
+- Windows loses repository creation. `kin init` is refused at both admission
+  boundaries under this release, the exact-Git one and the native bootstrap in
+  an empty directory, so a Windows host cannot create a repository at all, and
+  the daemon, graph queries, and MCP tool calls that v0.3.6 served there have
+  nothing to run against. Both refusals stop in the graph authority store,
+  which makes metadata durable by reopening the containing directory and
+  syncing it, and Windows denies that open unless it carries backup semantics.
+  Neither refusal leaves a partial repository behind. This is where admission
+  stops now, one transaction further than the config writer it stopped at
+  before, and Windows returns as each remaining gate is closed. macOS and
+  Linux are unaffected.
 
 ### Changed
 
