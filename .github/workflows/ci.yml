@@ -866,6 +866,12 @@ jobs:
       - name: Check Private Repo Coupling
         run: bash scripts/check_private_repo_coupling.sh
 
+      # The guard above is invoked from the repository root here and nowhere
+      # else, which is the one working directory that hid a broken exclusion.
+      # These tests run it from a foreign directory in both directions.
+      - name: Test Private Repo Coupling Guard
+        run: python3 scripts/test-private-repo-coupling.py
+
       # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
       # to public source until every crate is registry-published.
       - name: Build

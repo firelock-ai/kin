@@ -1545,6 +1545,14 @@ mod tests {
     }
 
     fn graph_source_fixture(source: Option<&[u8]>) -> GraphSourceFixture {
+        // Publication proves the Git source three times and requires all three
+        // proofs to agree, and the proof deliberately includes the contents of
+        // the user's resolved global excludes file, which is addressed through
+        // `HOME`. A neighbouring test that moves `HOME` between two of those
+        // proofs therefore fails publication as uncertain. Holding the
+        // environment mutation domain, without changing anything in it, is what
+        // keeps `HOME` still for the width of the window.
+        let _domain = kin_core::test_env::EnvVarGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
