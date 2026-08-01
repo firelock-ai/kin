@@ -700,6 +700,9 @@ fn notifier_candidate_issue(executable: &Path) -> Option<&'static str> {
     let Some(executable_metadata) = real_regular_file_metadata(executable) else {
         return Some("Contents/MacOS/KinNotifier is missing or not a regular file");
     };
+    if executable_metadata.len() == 0 {
+        return Some("Contents/MacOS/KinNotifier is empty");
+    }
     #[cfg(not(unix))]
     let _ = executable_metadata;
     #[cfg(unix)]
@@ -1226,6 +1229,39 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(
             status.degradation().unwrap().contains("not executable"),
+            "{:?}",
+            status.degradation()
+        );
+    }
+
+    #[test]
+    fn an_empty_notifier_executable_is_not_reported_as_a_healthy_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        fs::write(&executable, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(&executable).unwrap().permissions().mode() & 0o111,
+                0
+            );
+        }
+
+        let status = Notifier::with_home(kin_home).status();
+        assert!(status.notifier.is_none());
+        assert!(
+            status
+                .notifier_issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("is empty")),
+            "issue: {:?}",
+            status.notifier_issue
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            status.degradation().unwrap().contains("is empty"),
             "{:?}",
             status.degradation()
         );

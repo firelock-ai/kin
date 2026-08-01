@@ -47,8 +47,10 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         vfs_exit: int,
         pretend_macos: bool = False,
         archive_notifier: bool = True,
+        symlinked_notifier_ancestry: bool = False,
         existing_notifier: bool = False,
         seed_current_install: bool = False,
+        seed_launcher_stamp: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -73,7 +75,10 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         )
         (archive_root / shim_name).write_bytes(b"test shim")
         if target.startswith("macos-") and archive_notifier:
-            notifier = archive_root / "KinNotifier.app" / "Contents"
+            bundle_root = archive_root / "KinNotifier.app"
+            notifier = bundle_root / (
+                "Payload" if symlinked_notifier_ancestry else "Contents"
+            )
             (notifier / "MacOS").mkdir(parents=True)
             (notifier / "Resources").mkdir()
             executable(
@@ -81,11 +86,14 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "#!/bin/sh\nprintf 'new-notifier\\n'\n",
             )
             (notifier / "Info.plist").write_text("<plist>new</plist>", encoding="utf-8")
+            if symlinked_notifier_ancestry:
+                (bundle_root / "Contents").symlink_to("Payload", target_is_directory=True)
 
         release_dir = root / "download" / f"v{VERSION}"
         release_dir.mkdir(parents=True)
         archive = release_dir / f"kin-{target}.tar.gz"
         with tarfile.open(archive, "w:gz") as bundle:
+            bundle.dereference = False
             bundle.add(archive_root, arcname=archive_root.name)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         archive.with_suffix(archive.suffix + ".sha256").write_text(
@@ -99,9 +107,14 @@ class OptionalVfsInstallerTests(unittest.TestCase):
             (kin_home / "bin").mkdir(parents=True)
             executable(
                 kin_home / "bin" / "kin",
-                "#!/bin/sh\nprintf 'kin 9.9.9\\n'\n",
+                "#!/bin/sh\n# old-kin\nprintf 'kin 9.9.9\\n'\n",
             )
             executable(kin_home / "bin" / "kin-daemon", "#!/bin/sh\nprintf 'old-daemon\\n'\n")
+        if seed_launcher_stamp:
+            (kin_home / "bin").mkdir(parents=True, exist_ok=True)
+            (kin_home / "bin" / ".kinlab-kin-version").write_text(
+                "8.8.8\n", encoding="utf-8"
+            )
         if existing_notifier:
             old_contents = kin_home / "lib" / "KinNotifier.app" / "Contents"
             (old_contents / "MacOS").mkdir(parents=True)
@@ -207,6 +220,49 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 / "MacOS"
                 / "KinNotifier"
             ).read_text(encoding="utf-8"),
+        )
+
+    def test_symlinked_bundle_ancestor_refuses_before_replacing_install_or_stamp(self) -> None:
+        result, kin_home = self.run_installer(
+            vfs_exit=0,
+            pretend_macos=True,
+            symlinked_notifier_ancestry=True,
+            existing_notifier=True,
+            seed_current_install=True,
+            seed_launcher_stamp=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contains a symlink or special entry", result.stderr)
+        self.assertIn("No installed binary or notification bundle was replaced", result.stderr)
+        self.assertEqual(
+            (kin_home / "bin" / "kin").read_text(encoding="utf-8"),
+            "#!/bin/sh\n# old-kin\nprintf 'kin 9.9.9\\n'\n",
+        )
+        self.assertEqual(
+            (kin_home / "bin" / "kin-daemon").read_text(encoding="utf-8"),
+            "#!/bin/sh\nprintf 'old-daemon\\n'\n",
+        )
+        self.assertEqual(
+            (
+                kin_home
+                / "lib"
+                / "KinNotifier.app"
+                / "Contents"
+                / "MacOS"
+                / "KinNotifier"
+            ).read_text(encoding="utf-8"),
+            "#!/bin/sh\nprintf 'old-notifier\\n'\n",
+        )
+        self.assertEqual(
+            (
+                kin_home / "lib" / "KinNotifier.app" / "Contents" / "Info.plist"
+            ).read_text(encoding="utf-8"),
+            "<plist>old</plist>",
+        )
+        self.assertEqual(
+            (kin_home / "bin" / ".kinlab-kin-version").read_text(encoding="utf-8"),
+            "8.8.8\n",
         )
 
 

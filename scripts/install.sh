@@ -203,6 +203,21 @@ if [ "$OS" = "macos" ]; then
         err "No installed binary or notification bundle was replaced."
         exit 1
     fi
+    # `test -f/-d` follows intermediate symlink components, so leaf checks
+    # alone would accept `Contents -> Payload`. Walk the complete extracted
+    # tree without following links and admit only real directories and regular
+    # files before any live path is changed. FIFOs, devices, sockets, and every
+    # symlink (including a directory ancestor) fail this boundary.
+    if ! NOTIFIER_UNSAFE_ENTRY=$(find "$NOTIFIER_ROOT" ! \( -type d -o -type f \) -print -quit 2>/dev/null); then
+        err "KinNotifier.app could not be inspected safely in the downloaded macOS archive."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -n "$NOTIFIER_UNSAFE_ENTRY" ]; then
+        err "KinNotifier.app contains a symlink or special entry: $NOTIFIER_UNSAFE_ENTRY"
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
     if [ -L "$NOTIFIER_EXEC" ] || [ ! -f "$NOTIFIER_EXEC" ] || [ ! -s "$NOTIFIER_EXEC" ] || [ ! -x "$NOTIFIER_EXEC" ]; then
         err "KinNotifier.app/Contents/MacOS/KinNotifier is missing, unsafe, empty, or not executable."
         err "No installed binary or notification bundle was replaced."
