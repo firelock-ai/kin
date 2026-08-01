@@ -187,14 +187,17 @@ const EMBED_MODEL_DOWNLOAD: &str = "522 MB";
 /// 1.5 GiB, which is why that is the number the guidance names.
 const RECOMMENDED_EMBED_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Phrases a lost connection renders with, as distinct from a refusal the
-/// daemon stayed alive to answer with.
+/// Phrases an established connection renders with when it breaks partway, as
+/// distinct from a refusal the daemon stayed alive to answer with.
 ///
-/// An HTTP status the daemon returned reaches the caller as `daemon embed error
-/// (HTTP ...)` and matches nothing here, and neither does a client-side
-/// timeout. That separation is the point: a disconnect is the only failure
-/// shape a process that was killed can produce, so anything else must keep its
-/// own diagnosis rather than inherit a memory one.
+/// Every entry describes a connection that existed and then broke, which is the
+/// only failure shape a process killed mid-request can produce. The HTTP
+/// client's generic send-failure wrapper is deliberately not here: it also
+/// covers a connection that was refused outright, and a daemon that never
+/// accepted the request was not lost during this pass, whatever the machine's
+/// memory says. An HTTP status the daemon returned reaches the caller as
+/// `daemon embed error (HTTP ...)` and matches nothing here either, and neither
+/// does a client-side timeout, so each keeps its own diagnosis.
 const LOST_CONNECTION_MARKERS: &[&str] = &[
     "connection closed before message completed",
     "connection reset by peer",
@@ -202,7 +205,6 @@ const LOST_CONNECTION_MARKERS: &[&str] = &[
     "broken pipe",
     "IncompleteMessage",
     "channel closed",
-    "error sending request",
 ];
 
 fn lost_the_daemon_mid_request(rendered: &str) -> bool {
@@ -807,6 +809,16 @@ mod tests {
             )
             .is_none(),
             "a client-side timeout keeps its own diagnosis"
+        );
+        assert!(
+            embed_resource_exhaustion(
+                "send daemon embed request: error sending request for url \
+                 (http://127.0.0.1:7654/embed): tcp connect error: Connection refused (os error 61)",
+                &evidence(512 * 1024 * 1024, Some(3)),
+            )
+            .is_none(),
+            "a connection that was never accepted is not a daemon lost during this pass, whatever \
+             the machine's memory says"
         );
     }
 
