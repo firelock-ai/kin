@@ -11461,10 +11461,12 @@ mod tests {
     /// A complete macOS archive: the same component bytes as the Linux fixture
     /// so the shared restart-obligation fixture applies, plus the notification
     /// bundle that only this platform's archive carries.
+    #[cfg(unix)]
     fn full_macos_archive(prefix: &str) -> Vec<u8> {
         macos_archive_with_notifier(prefix, b"new-notifier")
     }
 
+    #[cfg(unix)]
     fn macos_archive_with_notifier(prefix: &str, notifier: &[u8]) -> Vec<u8> {
         make_tar_gz_with_modes(&[
             (&format!("{prefix}/kin"), b"new-kin", 0o755),
@@ -11494,6 +11496,7 @@ mod tests {
     }
 
     /// Write a KinNotifier.app under `root/lib` whose files all carry `prefix`.
+    #[cfg(unix)]
     fn write_notifier_bundle(root: &Path, marker: &[u8]) {
         let bundle = root.join("lib").join(NOTIFIER_BUNDLE_DIR);
         fs::create_dir_all(bundle.join("Contents").join("MacOS")).unwrap();
@@ -11520,6 +11523,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn notifier_executable_bytes(root: &Path) -> Vec<u8> {
         fs::read(
             root.join("lib")
