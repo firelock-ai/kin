@@ -2272,19 +2272,74 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
 
 
 def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
-    """Require native Windows released bytes to prove repo, daemon, and MCP."""
+    """Require native Windows released bytes to prove repo, daemon, and MCP.
+
+    This is deliberately a positive execution proof. Merely rejecting one
+    spelling of ``runner.os != 'Windows'`` lets an equivalent Linux-only
+    expression, a job-level guard, a matrix exclusion, or a fixed non-Windows
+    runner silently remove the Windows leg while the policy test stays green.
+    The three release-critical steps are therefore unconditional inside one
+    canonical matrix job whose runner is the matrix OS and whose include list
+    contains an unexcluded ``windows-latest`` row.
+    """
+
+    jobs = workflow_job_blocks(install_proof)
+    install_job = jobs.get("install-proof")
+    if install_job is None:
+        raise AssertionError("native Windows release proof lost the install-proof job")
+
+    job_fields = job_top_level_mapping_fields(install_job)
+    if any(key == "if" for key, _ in job_fields):
+        raise AssertionError(
+            "native Windows release proof lost repository coverage: install-proof "
+            "must not carry a job-level condition"
+        )
+    runs_on = [value.strip() for key, value in job_fields if key == "runs-on"]
+    if runs_on != ["${{ matrix.os }}"]:
+        raise AssertionError(
+            "native Windows release proof must run on the reviewed OS matrix; "
+            f"found runs-on={runs_on}"
+        )
+
+    strategy = dynamic_job_context_source(install_job)
+    strategy_lines = active_lines(strategy)
+    if any(
+        line == "exclude:" or line.startswith("exclude:")
+        for line in strategy_lines
+    ):
+        raise AssertionError(
+            "native Windows release proof matrix must not exclude a reviewed OS row"
+        )
+    if strategy_lines.count("- os: windows-latest") != 1:
+        raise AssertionError(
+            "native Windows release proof matrix must contain exactly one "
+            "windows-latest row"
+        )
 
     for step in (
         "First-run repository, daemon, and setup proof",
         "Graph query and MCP tool-call proof",
         "Validate installed capability proof",
     ):
-        if "if: runner.os != 'Windows'" in "\n".join(
-            active_lines(install_proof_step(install_proof, step))
-        ):
+        step_source = textwrap.dedent(
+            install_proof_step(install_proof, step)
+        ).strip()
+        top_level_fields: list[str] = []
+        for line in classifier_active_job_source(step_source).splitlines()[1:]:
+            indent = len(line) - len(line.lstrip())
+            if indent != 2:
+                continue
+            match = re.fullmatch(r"  (?P<key>[A-Za-z0-9_-]+):(?:[ \t].*)?", line)
+            if match is None:
+                raise AssertionError(
+                    "install-proof step fields must use canonical unquoted `key:` "
+                    f"syntax: {line.strip()}"
+                )
+            top_level_fields.append(match.group("key"))
+        if "if" in top_level_fields:
             raise AssertionError(
                 f"native Windows release proof lost repository coverage: {step} "
-                "still carries a runner.os != 'Windows' guard"
+                "must run unconditionally for every reviewed matrix row"
             )
 
 
@@ -6454,6 +6509,53 @@ def main() -> None:
                 f"      - name: {repo_step}\n        if: runner.os != 'Windows'\n",
                 1,
             ): assert_install_proof_repo_steps_cover_windows(mutated),
+        )
+        expect_assertion(
+            f"an alternate Linux-only expression removes {repo_step} from Windows",
+            "lost repository coverage",
+            lambda mutated=install_proof.replace(
+                f"      - name: {repo_step}\n",
+                f"      - name: {repo_step}\n        if: runner.os == 'Linux'\n",
+                1,
+            ): assert_install_proof_repo_steps_cover_windows(mutated),
+        )
+
+    for label, original, mutation, expected in (
+        (
+            "a job-level condition removes the Windows install proof",
+            "    name: ${{ matrix.os }}\n",
+            "    name: ${{ matrix.os }}\n    if: runner.os != 'Windows'\n",
+            "job-level condition",
+        ),
+        (
+            "the install proof stops using its OS matrix runner",
+            "    runs-on: ${{ matrix.os }}",
+            "    runs-on: ubuntu-latest",
+            "reviewed OS matrix",
+        ),
+        (
+            "the Windows matrix row disappears",
+            "          - os: windows-latest\n            setup-shell: powershell\n",
+            "",
+            "windows-latest row",
+        ),
+        (
+            "a matrix exclusion removes Windows after retaining its include row",
+            "        include:\n",
+            "        exclude:\n          - os: windows-latest\n        include:\n",
+            "must not exclude",
+        ),
+    ):
+        if original not in install_proof:
+            raise AssertionError(
+                f"Windows install-proof falsification lost fixture for {label}: {original}"
+            )
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=install_proof.replace(original, mutation, 1): (
+                assert_install_proof_repo_steps_cover_windows(mutated)
+            ),
         )
 
     repo_free = install_proof_step(

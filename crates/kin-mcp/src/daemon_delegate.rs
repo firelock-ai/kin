@@ -589,14 +589,34 @@ impl DaemonCallSeam for RealDaemonSeam {
 /// revival path finds the same binary without a `kin-daemon` crate dep
 /// (which would be circular: `kin-daemon` already depends on `kin-mcp`).
 fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
-    if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
+    let explicit = std::env::var_os("KIN_DAEMON_BIN");
+    let executable = std::env::current_exe().ok();
+    let search_path = std::env::var_os("PATH");
+    find_mcp_daemon_binary_from(
+        explicit.as_deref(),
+        executable.as_deref(),
+        search_path.as_deref(),
+    )
+}
+
+#[cfg(windows)]
+const MCP_DAEMON_BINARY_FILE_NAME: &str = "kin-daemon.exe";
+#[cfg(not(windows))]
+const MCP_DAEMON_BINARY_FILE_NAME: &str = "kin-daemon";
+
+fn find_mcp_daemon_binary_from(
+    explicit: Option<&std::ffi::OsStr>,
+    executable: Option<&std::path::Path>,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    if let Some(explicit) = explicit {
         let path = std::path::PathBuf::from(explicit);
         if path.exists() {
             return Some(path);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("kin-daemon");
+    if let Some(exe) = executable {
+        let sibling = exe.with_file_name(MCP_DAEMON_BINARY_FILE_NAME);
         if sibling.exists() {
             return Some(sibling);
         }
@@ -607,7 +627,7 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
             .is_some_and(|name| name == "deps")
         {
             if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
-                let target_sibling = target_dir.join("kin-daemon");
+                let target_sibling = target_dir.join(MCP_DAEMON_BINARY_FILE_NAME);
                 if target_sibling.exists() {
                     return Some(target_sibling);
                 }
@@ -615,9 +635,9 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
         }
     }
     // Walk PATH manually (avoids `which` crate dep).
-    let path_var = std::env::var_os("PATH")?;
+    let path_var = search_path?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("kin-daemon");
+        let candidate = dir.join(MCP_DAEMON_BINARY_FILE_NAME);
         if candidate.exists() {
             return Some(candidate);
         }
@@ -1376,6 +1396,22 @@ pub async fn forward_check_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_discovery_finds_platform_sibling_without_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory
+            .path()
+            .join(if cfg!(windows) { "kin.exe" } else { "kin" });
+        let daemon = directory.path().join(MCP_DAEMON_BINARY_FILE_NAME);
+        std::fs::write(&executable, b"kin fixture").unwrap();
+        std::fs::write(&daemon, b"daemon fixture").unwrap();
+
+        assert_eq!(
+            find_mcp_daemon_binary_from(None, Some(&executable), None),
+            Some(daemon)
+        );
+    }
 
     // ── Revival state machine ──────────────────────────────────────────────
     //

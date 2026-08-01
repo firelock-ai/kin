@@ -882,13 +882,74 @@ jobs:
           kin setup status --json | tee kin-health.json
           kin doctor --json | tee kin-doctor.json
 
-          # Drive the installed MCP stdio server through initialize, tools/list,
-          # and a real graph-backed semantic_search call. Node owns the timeout
-          # so this behaves the same on Linux, macOS, and Windows.
+          # Drive the absolute installed MCP stdio server through initialize,
+          # tools/list, a real graph-backed semantic_search call, daemon loss,
+          # and a second call that must revive the daemon. Remove the install
+          # directory from the child's PATH and clear KIN_DAEMON_BIN: sibling
+          # discovery must work on its own, including kin-daemon.exe on Windows.
+          # Node owns the timeout so this behaves the same on every runner.
           node <<'NODE'
           const fs = require("fs");
           const path = require("path");
-          const { spawn } = require("child_process");
+          const { execFileSync, spawn, spawnSync } = require("child_process");
+
+          const resolver = process.platform === "win32"
+            ? ["where.exe", ["kin"]]
+            : ["sh", ["-c", "command -v kin"]];
+          const resolved = execFileSync(resolver[0], resolver[1], { encoding: "utf8" })
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .find(Boolean);
+          if (!resolved) throw new Error("could not resolve the installed Kin binary");
+          const kinBinary = fs.realpathSync(resolved);
+          const installDir = path.dirname(kinBinary);
+          const normalizePath = (value) => {
+            let normalized;
+            try {
+              normalized = fs.realpathSync(value);
+            } catch {
+              normalized = path.resolve(value);
+            }
+            return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+          };
+          const proofEnv = { ...process.env };
+          delete proofEnv.KIN_DAEMON_BIN;
+          const pathKey = Object.keys(proofEnv).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+          proofEnv[pathKey] = (proofEnv[pathKey] ?? "")
+            .split(path.delimiter)
+            .filter((entry) => entry && normalizePath(entry) !== normalizePath(installDir))
+            .join(path.delimiter);
+          if ((proofEnv[pathKey] ?? "")
+            .split(path.delimiter)
+            .some((entry) => entry && normalizePath(entry) === normalizePath(installDir))) {
+            throw new Error("PATH-free MCP proof still contains the Kin install directory");
+          }
+
+          const stopDaemons = (phase) => {
+            const stopped = spawnSync(
+              kinBinary,
+              ["daemon", "stop", "--all", "--json"],
+              {
+                cwd: process.cwd(),
+                env: proofEnv,
+                encoding: "utf8",
+                timeout: 60_000,
+              },
+            );
+            fs.appendFileSync(
+              "kin-mcp-daemon-stop.txt",
+              `${phase}: status=${stopped.status}\n${stopped.stdout ?? ""}${stopped.stderr ?? ""}\n`,
+            );
+            if (stopped.error || stopped.status !== 0) {
+              throw new Error(
+                `${phase}: failed to stop installed daemons: ${stopped.error ?? stopped.stderr}`,
+              );
+            }
+          };
+
+          // Setup/status already started the installed daemon. Stop it so MCP
+          // startup itself must find the sibling binary without a PATH rescue.
+          stopDaemons("before MCP startup");
 
           const requests = [
             { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
@@ -916,11 +977,13 @@ jobs:
           }
           const child = spawn(entry.command, entry.args, {
             cwd: entry.cwd,
-            env: { ...process.env, ...(entry.env ?? {}) },
+            env: { ...proofEnv, ...(entry.env ?? {}) },
             stdio: ["pipe", "pipe", "pipe"],
           });
           let stdout = "";
           let stderr = "";
+          let lineBuffer = "";
+          let revivalRequested = false;
           let settled = false;
           const finish = (error) => {
             if (settled) return;
@@ -929,6 +992,7 @@ jobs:
             fs.writeFileSync("kin-mcp-out.jsonl", stdout);
             fs.writeFileSync("kin-mcp-err.txt", stderr);
             if (error) {
+              if (!child.killed) child.kill("SIGKILL");
               console.error(error);
               console.error(stderr);
               process.exit(1);
@@ -936,9 +1000,49 @@ jobs:
           };
           const timer = setTimeout(() => {
             child.kill("SIGKILL");
-            finish(new Error("installed MCP server did not exit within 60 seconds"));
-          }, 60_000);
-          child.stdout.on("data", (chunk) => { stdout += chunk; });
+            finish(new Error("installed MCP startup/revival proof did not exit within 120 seconds"));
+          }, 120_000);
+          const validateSearch = (message, label) => {
+            if (!message?.result || message.error || message.result.isError === true) {
+              throw new Error(`${label} failed: ${JSON.stringify(message ?? null)}`);
+            }
+            const rendered = JSON.stringify(message.result);
+            if (!rendered.includes("hello") || !rendered.includes("probe.py")) {
+              throw new Error(`${label} did not return the seeded hello entity`);
+            }
+          };
+          child.stdout.on("data", (chunk) => {
+            const text = chunk.toString();
+            stdout += text;
+            lineBuffer += text;
+            const lines = lineBuffer.split(/\r?\n/);
+            lineBuffer = lines.pop() ?? "";
+            try {
+              for (const line of lines) {
+                if (!line.trim().startsWith("{")) continue;
+                const message = JSON.parse(line);
+                if (message.id === 3 && !revivalRequested) {
+                  validateSearch(message, "initial MCP semantic_search");
+                  stopDaemons("between MCP calls");
+                  revivalRequested = true;
+                  child.stdin.write(`${JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 4,
+                    method: "tools/call",
+                    params: {
+                      name: "semantic_search",
+                      arguments: { query: "hello", compact: true, limit: 5 },
+                    },
+                  })}\n`);
+                } else if (message.id === 4) {
+                  validateSearch(message, "revived MCP semantic_search");
+                  child.stdin.end();
+                }
+              }
+            } catch (error) {
+              finish(error);
+            }
+          });
           child.stderr.on("data", (chunk) => { stderr += chunk; });
           child.on("error", finish);
           child.on("close", (code) => {
@@ -956,19 +1060,15 @@ jobs:
               if (!JSON.stringify(byId.get(2)?.result ?? {}).includes("semantic_search")) {
                 throw new Error("MCP tools/list omitted semantic_search");
               }
-              const call = byId.get(3);
-              if (!call?.result || call.error || call.result.isError === true) {
-                throw new Error(`MCP semantic_search failed: ${JSON.stringify(call ?? null)}`);
-              }
-              if (!JSON.stringify(call.result).includes("hello") || !JSON.stringify(call.result).includes("probe.py")) {
-                throw new Error("MCP semantic_search did not return the seeded hello entity");
-              }
+              validateSearch(byId.get(3), "initial MCP semantic_search");
+              if (!revivalRequested) throw new Error("MCP daemon revival was not exercised");
+              validateSearch(byId.get(4), "revived MCP semantic_search");
               finish();
             } catch (error) {
               finish(error);
             }
           });
-          child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
+          child.stdin.write(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
           NODE
 
       - name: Graph-backed VFS projection proof

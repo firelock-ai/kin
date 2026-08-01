@@ -3256,9 +3256,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.8"
+version = "0.7.11"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "54f65a602410862f1b0b9b6e21682f748f22b26976eca9213d362dd61cdf4c7a"
+checksum = "2532191f03526a5567ef9b63f69f0a47b97612cbd84c74cef3246c7128616e84"
 dependencies = [
  "bincode",
  "bstr",
@@ -3355,9 +3355,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.42"
+version = "0.2.43"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "4da5929f5c6055a21828a807507e7d7dc8db1425d67df25e2474603f05c54bc3"
+checksum = "d3ef97b62bdb2d0a175f9849513fdb29321c784ff4030c108d90d78b86206bd0"
 dependencies = [
  "block",
  "half",
@@ -3473,9 +3473,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.2"
+version = "0.7.4"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "b3dbb23717e2682e4df5f51aed04123333a9d0667423a312a795c28abe3fceb3"
+checksum = "faabe132c031fdce5f245a65c20771c603821418f24625e66003c2d3a0c1df89"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -3728,9 +3728,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.7"
+version = "0.1.8"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "59643af64209511b0721f919f4bd4e0defe08c4e8e48055eb291953b4519b582"
+checksum = "ce7d0f0c3323b2cea676e7832d0f553874490cae7e157420dd7ddb8af49f70bd"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -3743,6 +3743,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6614,7 +6615,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
