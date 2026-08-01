@@ -647,8 +647,10 @@ mod tests {
     #[test]
     fn full_git_oid_is_not_converted_into_a_synthetic_change_id() {
         let graph = kin_db::InMemoryGraph::new();
-        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/absent/.kin"));
-        let binding = absent_binding(&layout);
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(directory.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&initialized.layout)
+            .expect("fixture must carry persisted empty repository authority");
         let error = resolve_ref(
             &graph,
             &binding,

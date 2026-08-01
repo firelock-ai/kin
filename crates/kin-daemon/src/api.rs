@@ -7277,23 +7277,26 @@ pub(crate) fn repository_transfer_authority(
             format!("invalid repository identity: {error}"),
         )
     })?;
-    let backend: Arc<dyn StorageBackend> = if let Some(backend) = &state.storage_backend {
-        Arc::clone(backend)
+    let authority = if let Some(backend) = &state.storage_backend {
+        RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(backend))
+            .map_err(repository_authority_error)?
     } else if repo_id == state.cached_repo_id {
-        state.local_repository_backend().ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "local daemon is missing its startup storage capability".to_string(),
-            )
-        })?
+        let backend: Arc<dyn StorageBackend> =
+            state.local_repository_backend().ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "local daemon is missing its startup storage capability".to_string(),
+                )
+            })?;
+        kin_core::open_persisted_local_repository_authority(repository_id.clone(), backend)
+            .map(|(authority, _payload_stats)| authority)
+            .map_err(repository_authority_error)?
     } else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("repository {repo_id} is unavailable in local daemon mode"),
         ));
     };
-    let authority = RepositoryAuthorityManager::open(repository_id.clone(), backend)
-        .map_err(repository_authority_error)?;
     Ok((repository_id, authority))
 }
 
@@ -11368,6 +11371,19 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    fn remove_local_authority_after_startup(state: &DaemonState) -> PathBuf {
+        let namespace = state.layout.kindb_dir().join(&state.cached_repo_id);
+        assert!(
+            std::fs::read_dir(namespace.join("snapshots"))
+                .unwrap()
+                .any(|entry| entry.unwrap().file_type().unwrap().is_file()),
+            "fixture must retain persisted snapshot material"
+        );
+        let authority_path = namespace.join("authority.json");
+        std::fs::remove_file(&authority_path).unwrap();
+        authority_path
+    }
+
     #[tokio::test]
     async fn repository_transfer_status_preserves_non_utf8_ref_bytes_and_advertises_apply() {
         let state = test_state();
@@ -11397,6 +11413,124 @@ mod tests {
         assert!(status.push_apply_ready);
         assert!(status.bounded_envelope_export_ready);
         assert!(status.pull_apply_ready);
+    }
+
+    #[tokio::test]
+    async fn repository_transfer_status_refuses_authority_record_lost_after_startup() {
+        let state = test_state();
+        let repository_id = state.cached_repo_id.clone();
+        let authority_path = remove_local_authority_after_startup(&state);
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repository_id}/transfer/status"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "destination_ref": destination_ref,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("has no persisted authority record"),
+            "unexpected missing-authority status refusal: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !authority_path.exists(),
+            "a read-only transfer status must not recreate missing authority"
+        );
+    }
+
+    fn transfer_pack_for_unborn_destination(
+        repository_id: &RepositoryId,
+    ) -> kin_remote::repository_transfer::RepositoryTransferPack {
+        let source_storage = tempfile::tempdir().unwrap();
+        let source_head = seed_replica_change(
+            source_storage.path(),
+            repository_id,
+            None,
+            0x471,
+            "root transfer authority bypass regression",
+        );
+        let source = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(source_storage.path())),
+        )
+        .unwrap();
+
+        let unborn_storage = tempfile::tempdir().unwrap();
+        let unborn = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(unborn_storage.path())),
+        )
+        .unwrap();
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let status = kin_remote::repository_transfer::repository_transfer_status(
+            &unborn,
+            repository_id,
+            &destination_ref,
+        )
+        .unwrap();
+        let expectation =
+            kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
+                .unwrap();
+        let segment = kin_remote::repository_transfer::build_repository_transfer_segment(
+            &source,
+            &destination_ref,
+            &expectation,
+        )
+        .unwrap();
+        assert!(segment.is_final());
+        assert_eq!(segment.pack.source_head, source_head);
+        segment.pack
+    }
+
+    #[tokio::test]
+    async fn repository_transfer_receive_cannot_recreate_authority_lost_after_startup() {
+        let state = test_state();
+        let repository_id = RepositoryId::new(state.cached_repo_id.clone()).unwrap();
+        let pack = transfer_pack_for_unborn_destination(&repository_id);
+        let authority_path = remove_local_authority_after_startup(&state);
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repository_id}/transfer/receive"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "destination_ref": destination_ref,
+                            "pack": pack,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("has no persisted authority record"),
+            "unexpected missing-authority receive refusal: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !authority_path.exists(),
+            "a refused transfer receive must not recreate durable authority"
+        );
     }
 
     #[test]
