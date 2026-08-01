@@ -193,6 +193,35 @@ fn available_ram_gb() -> f64 {
     }
 }
 
+/// What the host can say about memory pressure, for a command that has to
+/// decide whether a failure it just saw was the machine running out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryEvidence {
+    /// The ceiling this process actually runs under: the container limit when
+    /// one is set, otherwise the host's physical RAM.
+    pub limit_bytes: u64,
+    /// Kernel OOM kills accounted to this cgroup. `None` means no accounting
+    /// was readable, which is "not observed" and never "did not happen".
+    pub cgroup_oom_kills: Option<u64>,
+}
+
+/// Read what this host will say about memory pressure right now.
+pub fn memory_evidence() -> MemoryEvidence {
+    MemoryEvidence {
+        limit_bytes: effective_memory_limit_bytes(),
+        cgroup_oom_kills: cgroup_oom_kill_count(),
+    }
+}
+
+/// The memory ceiling a Kin process runs under, in bytes.
+fn effective_memory_limit_bytes() -> u64 {
+    let host = (host_ram_gb() * 1024.0 * 1024.0 * 1024.0) as u64;
+    match cgroup_memory_limit_bytes() {
+        Some(limit) => host.min(limit),
+        None => host,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Container (cgroup) quota detection — Linux only
 // ---------------------------------------------------------------------------
@@ -254,6 +283,48 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn cgroup_memory_limit_bytes() -> Option<u64> {
     None
+}
+
+/// How many times the kernel OOM-killed a process accounted to this cgroup, or
+/// `None` when no accounting is readable (off Linux, or neither hierarchy's
+/// file is present).
+///
+/// Both hierarchies publish the counter under the same key, in different files:
+/// cgroup v2 in `memory.events`, v1 in `memory.oom_control`. The distinction
+/// that matters to a caller is `Some(0)` against `None`: the first is the
+/// kernel saying nothing was killed, the second is this process being unable
+/// to ask.
+#[cfg(target_os = "linux")]
+fn cgroup_oom_kill_count() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.events",
+        "/sys/fs/cgroup/memory/memory.oom_control",
+    ] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Some(count) = parse_oom_kill_count(&contents) {
+                return Some(count);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_oom_kill_count() -> Option<u64> {
+    None
+}
+
+/// The `oom_kill` counter out of a cgroup key/value block, or `None` when the
+/// block carries no such key.
+#[cfg(any(target_os = "linux", test))]
+fn parse_oom_kill_count(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("oom_kill"), Some(value)) => value.parse().ok(),
+            _ => None,
+        }
+    })
 }
 
 /// Whole-core count for a cgroup v2 `cpu.max` value ("<quota> <period>" in µs,
@@ -361,6 +432,26 @@ mod tests {
             Some(4 * 1024 * 1024 * 1024)
         );
         assert_eq!(parse_v2_memory_max("max"), None);
+    }
+
+    #[test]
+    fn oom_kill_count_is_read_from_either_cgroup_hierarchy() {
+        // cgroup v2 `memory.events`, which is where the 512 MB constrained
+        // profile's evidence came from.
+        assert_eq!(
+            parse_oom_kill_count("low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n"),
+            Some(1)
+        );
+        // cgroup v1 `memory.oom_control`, same key, different file.
+        assert_eq!(
+            parse_oom_kill_count("oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"),
+            Some(2)
+        );
+        // A group that was never killed says so, which is not the same answer
+        // as a host that cannot be asked.
+        assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
+        assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
+        assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
     }
 
     #[test]

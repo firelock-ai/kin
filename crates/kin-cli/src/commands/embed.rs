@@ -173,6 +173,121 @@ fn format_duration_secs(total: u64) -> String {
     }
 }
 
+/// The embedding model `kin embed` downloads on first use.
+const EMBED_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
+
+/// What that download costs, which is also roughly what the model costs
+/// resident once the daemon has loaded it.
+const EMBED_MODEL_DOWNLOAD_BYTES: u64 = 522 * 1024 * 1024;
+
+/// The smallest memory ceiling a vector embed has been measured to complete a
+/// real repository under. At 1 GiB a tiny repository finishes exactly at the
+/// cap and a 512 MiB cgroup gets the daemon OOM-killed; 2 GiB peaks around
+/// 1.5 GiB, which is why that is the number the guidance names.
+const RECOMMENDED_EMBED_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Phrases a lost connection renders with, as distinct from a refusal the
+/// daemon stayed alive to answer with.
+///
+/// An HTTP status the daemon returned reaches the caller as `daemon embed error
+/// (HTTP ...)` and matches nothing here, and neither does a client-side
+/// timeout. That separation is the point: a disconnect is the only failure
+/// shape a process that was killed can produce, so anything else must keep its
+/// own diagnosis rather than inherit a memory one.
+const LOST_CONNECTION_MARKERS: &[&str] = &[
+    "connection closed before message completed",
+    "connection reset by peer",
+    "connection closed",
+    "broken pipe",
+    "IncompleteMessage",
+    "channel closed",
+    "error sending request",
+];
+
+fn lost_the_daemon_mid_request(rendered: &str) -> bool {
+    LOST_CONNECTION_MARKERS
+        .iter()
+        .any(|marker| rendered.contains(marker))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
+/// Guidance for an embed that lost the daemon under memory pressure, or `None`
+/// when this cannot honestly attribute the failure to memory.
+///
+/// The failure the ticket describes reaches the caller as a bare transport
+/// error: the daemon is OOM-killed mid-pass, the connection drops, and the CLI
+/// reports a closed connection while the cgroup records `oom_kill 1`. Nothing
+/// in that message names memory, the model that needs it, or the fact that
+/// lexical and graph retrieval never did.
+///
+/// Two grades are produced and they are labelled differently on purpose. A
+/// cgroup that recorded a kill is the kernel's own statement and is reported as
+/// observed. A ceiling below what an embed needs is a strong prior and nothing
+/// more, so it is reported as likely. A disconnect with neither is left alone:
+/// a daemon that died for another reason on a large machine keeps its own
+/// error rather than being told it ran out of memory.
+fn embed_resource_exhaustion(
+    rendered: &str,
+    evidence: &crate::capability::MemoryEvidence,
+) -> Option<String> {
+    if !lost_the_daemon_mid_request(rendered) {
+        return None;
+    }
+    let observed_kills = evidence.cgroup_oom_kills.filter(|count| *count > 0);
+    let under_recommendation = evidence.limit_bytes < RECOMMENDED_EMBED_MEMORY_BYTES;
+    let cause = match (observed_kills, under_recommendation) {
+        (Some(count), _) => format!(
+            "the daemon was lost during this embed pass and this container's kernel recorded \
+             {count} out-of-memory kill(s), so the embed ran out of memory"
+        ),
+        (None, true) => format!(
+            "the daemon was lost during this embed pass and only {} of memory is available to \
+             it, so it most likely ran out of memory",
+            human_bytes(evidence.limit_bytes)
+        ),
+        (None, false) => return None,
+    };
+    Some(format!(
+        "{cause}.\n\
+         `kin embed` loads the {} {EMBED_MODEL_ID} model and a real repository peaks well above \
+         that, so give this machine at least {}.\n\
+         Coverage already embedded is persisted, so re-running `kin embed` under a higher limit \
+         resumes rather than starting over.\n\
+         Lexical and graph retrieval need no model: `kin locate` and `kin search` keep answering \
+         without vectors.",
+        human_bytes(EMBED_MODEL_DOWNLOAD_BYTES),
+        human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+    ))
+}
+
+/// What to tell a caller before an embed starts on a machine that cannot
+/// comfortably hold the model, or `None` when the ceiling is adequate.
+///
+/// The download and the ceiling are both knowable before any work begins, and
+/// a caller who learns them from a failed pass learns them too late.
+fn constrained_memory_notice(evidence: &crate::capability::MemoryEvidence) -> Option<String> {
+    if evidence.limit_bytes >= RECOMMENDED_EMBED_MEMORY_BYTES {
+        return None;
+    }
+    Some(format!(
+        "Note: {} of memory is available here. `kin embed` downloads and loads the {} \
+         {EMBED_MODEL_ID} model, and at least {} is recommended; below that the daemon can be \
+         killed mid-pass. Lexical and graph retrieval need no model.",
+        human_bytes(evidence.limit_bytes),
+        human_bytes(EMBED_MODEL_DOWNLOAD_BYTES),
+        human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+    ))
+}
+
 /// Whether the drive-to-completion loop should issue another embed pass.
 ///
 /// Continue only while retrievable work remains AND the last pass actually
@@ -214,6 +329,12 @@ pub async fn run(
     )
     .entered();
     let layout = crate::commands::require_repository_layout()?;
+
+    if !json {
+        if let Some(notice) = constrained_memory_notice(&crate::capability::memory_evidence()) {
+            println!("{notice}");
+        }
+    }
 
     if let Some(seconds) = max_seconds {
         let response = run_daemon_embed(
@@ -344,10 +465,17 @@ async fn run_daemon_embed(
     // (or fail under KIN_STRICT_BEHAVIOR_ENV) if this command's environment
     // diverges from what that worker captured at start.
     client.warn_on_behavior_env_divergence().await?;
-    client
-        .embed(request)
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon embed failed: {e:#}"))
+    client.embed(request).await.map_err(|e| {
+        let rendered = format!("{e:#}");
+        // The transport error stays in the message either way. A caller who
+        // needs to see what the connection actually did still can, and a
+        // failure this cannot attribute to memory is passed through untouched
+        // rather than being given a diagnosis nobody proved.
+        match embed_resource_exhaustion(&rendered, &crate::capability::memory_evidence()) {
+            Some(guidance) => anyhow::anyhow!("daemon embed failed: {rendered}\n\n{guidance}"),
+            None => anyhow::anyhow!("daemon embed failed: {rendered}"),
+        }
+    })
 }
 
 pub fn build_embed_response(
@@ -511,9 +639,10 @@ pub fn build_embed_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_batch_size, embed_pass_should_continue, eta_suffix, format_duration_secs,
-        resolve_total_budget, should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult,
-        DEFAULT_BATCH_SIZE, DEFAULT_CONSTRAINED_TOTAL_SECONDS,
+        constrained_memory_notice, effective_batch_size, embed_pass_should_continue,
+        embed_resource_exhaustion, eta_suffix, format_duration_secs, resolve_total_budget,
+        should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult, DEFAULT_BATCH_SIZE,
+        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_ID, RECOMMENDED_EMBED_MEMORY_BYTES,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
@@ -593,6 +722,106 @@ mod tests {
     #[test]
     fn skips_full_queue_when_embeddings_are_current() {
         assert!(!should_queue_missing_embedding_pass(5, 5));
+    }
+
+    fn evidence(limit_bytes: u64, oom_kills: Option<u64>) -> crate::capability::MemoryEvidence {
+        crate::capability::MemoryEvidence {
+            limit_bytes,
+            cgroup_oom_kills: oom_kills,
+        }
+    }
+
+    /// The exact failure a 512 MB cgroup produced: the daemon is OOM-killed
+    /// mid-pass and the CLI is handed a closed connection.
+    const OOM_KILLED_MID_PASS: &str =
+        "send daemon embed request: error sending request for url (http://127.0.0.1:7654/embed): \
+         connection closed before message completed";
+
+    #[test]
+    fn a_recorded_oom_kill_is_reported_as_observed_with_the_limit_and_the_remedy() {
+        let guidance =
+            embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(512 * 1024 * 1024, Some(1)))
+                .expect("a kernel OOM kill during an embed is not an opaque transport failure");
+
+        assert!(
+            guidance.contains("out-of-memory kill"),
+            "the kernel's own record is what makes this observed: {guidance}"
+        );
+        assert!(
+            guidance.contains("2.0 GiB"),
+            "the failure must name the limit that would fix it: {guidance}"
+        );
+        assert!(
+            guidance.contains(EMBED_MODEL_ID) && guidance.contains("522 MiB"),
+            "the failure must name what is consuming the memory: {guidance}"
+        );
+        assert!(
+            guidance.contains("kin locate") && guidance.contains("kin search"),
+            "a repository without vectors is not a repository without retrieval: {guidance}"
+        );
+        assert!(
+            guidance.contains("persisted"),
+            "the caller must know a re-run resumes rather than restarts: {guidance}"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_below_the_recommendation_is_reported_as_likely_not_as_observed() {
+        // No cgroup accounting is readable, which is every non-Linux host. The
+        // ceiling still says the machine cannot hold the model, and saying so
+        // is not the same as claiming the kernel proved it.
+        let guidance = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(1 << 29, None))
+            .expect("a lost daemon under the recommendation is a memory diagnosis");
+        assert!(
+            guidance.contains("most likely"),
+            "an inference from the ceiling alone must be labelled as one: {guidance}"
+        );
+        assert!(
+            !guidance.contains("kernel recorded"),
+            "nothing may claim a kill this host could not observe: {guidance}"
+        );
+    }
+
+    #[test]
+    fn a_non_memory_daemon_disconnect_keeps_its_own_error() {
+        // The distinguishability the acceptance asks for. A daemon that died
+        // for another reason on a machine with room to spare must not be told
+        // it ran out of memory, and a refusal the daemon stayed alive to answer
+        // with was never a disconnect at all.
+        assert!(
+            embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(64 << 30, Some(0))).is_none(),
+            "a large host with no recorded kill has no memory diagnosis to offer"
+        );
+        assert!(
+            embed_resource_exhaustion(
+                "daemon embed error (HTTP 500): Graph error: kindb foo",
+                &evidence(512 * 1024 * 1024, Some(3)),
+            )
+            .is_none(),
+            "an answered HTTP refusal is not a daemon that was killed, whatever the cgroup says"
+        );
+        assert!(
+            embed_resource_exhaustion(
+                "send daemon embed request: operation timed out",
+                &evidence(512 * 1024 * 1024, Some(3)),
+            )
+            .is_none(),
+            "a client-side timeout keeps its own diagnosis"
+        );
+    }
+
+    #[test]
+    fn a_constrained_machine_is_told_before_the_work_starts_and_a_roomy_one_is_not() {
+        let notice = constrained_memory_notice(&evidence(1 << 30, None))
+            .expect("a machine under the recommendation is warned before the download");
+        assert!(
+            notice.contains("522 MiB") && notice.contains("2.0 GiB"),
+            "{notice}"
+        );
+        assert!(
+            constrained_memory_notice(&evidence(RECOMMENDED_EMBED_MEMORY_BYTES, None)).is_none(),
+            "a machine at the recommendation gets no warning it does not need"
+        );
     }
 
     #[test]
