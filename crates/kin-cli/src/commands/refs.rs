@@ -79,6 +79,9 @@ fn default_bulk_compact() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkRefsResponse {
     pub total_checked: usize,
+    pub classified_count: usize,
+    pub error_count: usize,
+    pub incomplete_verdict_count: usize,
     pub with_references: usize,
     pub without_references: usize,
     #[serde(default)]
@@ -273,37 +276,30 @@ pub fn build_bulk_refs_response(
     let relation_kinds = parse_bulk_relation_kind(&request.kind)?;
     let mut results = Vec::with_capacity(request.entity_ids.len());
     let mut with_references = 0usize;
+    let mut without_references = 0usize;
+    let mut error_count = 0usize;
+    let mut incomplete_verdict_count = 0usize;
 
     for raw_id in &request.entity_ids {
         let parsed = uuid::Uuid::parse_str(raw_id.trim());
         let Ok(uuid) = parsed else {
-            let mut row = serde_json::json!({
-                "entity_id": raw_id,
-                "error": "invalid entity_id (not a UUID)",
-            });
-            if !request.compact {
-                row["has_references"] = serde_json::json!(false);
-                row["reference_count"] = serde_json::json!(0);
-            }
-            results.push(row);
+            error_count += 1;
+            results.push(bulk_refs_error_row(
+                raw_id,
+                "invalid entity_id (not a UUID)",
+                request.compact,
+            ));
             continue;
         };
         let entity_id = EntityId(uuid);
         let entity = graph.get_entity(&entity_id)?;
         let Some(entity) = entity else {
-            let mut row = serde_json::json!({
-                "entity_id": raw_id,
-                "error": "entity not found",
-                "has_references": false,
-                "reference_count": 0,
-            });
-            if !request.compact {
-                row["name"] = serde_json::Value::Null;
-                row["kind"] = serde_json::Value::Null;
-                row["file_path"] = serde_json::Value::Null;
-                row["matched_kinds"] = serde_json::json!([]);
-            }
-            results.push(row);
+            error_count += 1;
+            results.push(bulk_refs_error_row(
+                raw_id,
+                "entity not found",
+                request.compact,
+            ));
             continue;
         };
 
@@ -314,18 +310,45 @@ pub fn build_bulk_refs_response(
         // those edges here made the compact answer disagree with the rows the
         // human-readable command could actually enumerate. Keep one grouping
         // authority for both paths so the count cannot drift again.
-        let references = collect_graph_references(graph, &entity_id, &relation_kinds)?;
-        let reference_count = references.len();
-        let mut matched_kinds: Vec<RelationKind> = references
-            .iter()
-            .flat_map(|entry| entry.relation_kinds.iter().copied())
-            .collect();
-        matched_kinds.sort_by_key(relation_kind_rank);
-        matched_kinds.dedup();
+        let collected = collect_graph_references(graph, &entity_id, &relation_kinds)?;
+        let reference_count = collected.references.len();
+        let matched_kinds = collected.matched_kinds;
+
+        if !collected.missing_source_ids.is_empty() {
+            incomplete_verdict_count += 1;
+            let missing_source_count = collected.missing_source_ids.len();
+            let known_reference_count = reference_count + missing_source_count;
+            let mut row = serde_json::json!({
+                "entity_id": entity_id.to_string(),
+                "has_references": null,
+                "reference_count": null,
+                "known_reference_count": known_reference_count,
+                "reference_count_complete": false,
+                "verdict_complete": false,
+                "verdict_reason": format!(
+                    "graph reference authority incomplete: {missing_source_count} incoming source entity record(s) missing"
+                ),
+                "missing_source_entity_count": missing_source_count,
+            });
+            if !request.compact {
+                row["name"] = serde_json::json!(entity.name);
+                row["kind"] = serde_json::json!(format!("{:?}", entity.kind));
+                row["file_path"] =
+                    serde_json::json!(entity.file_origin.as_ref().map(|p| p.0.clone()));
+                row["matched_kinds"] = serde_json::json!(matched_kinds
+                    .into_iter()
+                    .map(relation_kind_label)
+                    .collect::<Vec<_>>());
+            }
+            results.push(row);
+            continue;
+        }
 
         let has_references = reference_count > 0;
         if has_references {
             with_references += 1;
+        } else {
+            without_references += 1;
         }
 
         if request.compact {
@@ -335,7 +358,6 @@ pub fn build_bulk_refs_response(
                 "reference_count": reference_count,
             }));
         } else {
-            matched_kinds.sort_by_key(relation_kind_rank);
             results.push(serde_json::json!({
                 "entity_id": entity_id.to_string(),
                 "name": entity.name,
@@ -352,10 +374,18 @@ pub fn build_bulk_refs_response(
     }
 
     let total_checked = request.entity_ids.len();
+    let classified_count = with_references + without_references;
+    debug_assert_eq!(
+        total_checked,
+        classified_count + error_count + incomplete_verdict_count
+    );
     Ok(BulkRefsResponse {
         total_checked,
+        classified_count,
+        error_count,
+        incomplete_verdict_count,
         with_references,
-        without_references: total_checked - with_references,
+        without_references,
         relation_kinds: relation_kinds
             .iter()
             .copied()
@@ -364,6 +394,25 @@ pub fn build_bulk_refs_response(
         compact: request.compact,
         results,
     })
+}
+
+fn bulk_refs_error_row(entity_id: &str, error: &str, compact: bool) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "entity_id": entity_id,
+        "error": error,
+        "has_references": null,
+        "reference_count": null,
+        "known_reference_count": null,
+        "reference_count_complete": false,
+        "verdict_complete": false,
+    });
+    if !compact {
+        row["name"] = serde_json::Value::Null;
+        row["kind"] = serde_json::Value::Null;
+        row["file_path"] = serde_json::Value::Null;
+        row["matched_kinds"] = serde_json::json!([]);
+    }
+    row
 }
 
 fn parse_bulk_relation_kind(value: &str) -> Result<Vec<RelationKind>> {
@@ -402,6 +451,13 @@ struct ReferenceEntry {
     relation_kinds: Vec<RelationKind>,
 }
 
+#[derive(Debug, Clone)]
+struct ReferenceCollection {
+    references: Vec<ReferenceEntry>,
+    missing_source_ids: Vec<EntityId>,
+    matched_kinds: Vec<RelationKind>,
+}
+
 /// Collect incoming references to `target` from graph-owned relation edges.
 ///
 /// The graph is the sole authority for what references an entity. There is no
@@ -413,7 +469,24 @@ fn collect_references(
     target: &Entity,
     relation_kinds: &[RelationKind],
 ) -> Result<Vec<ReferenceEntry>> {
-    let mut entries = collect_graph_references(graph, &target.id, relation_kinds)?;
+    let collected = collect_graph_references(graph, &target.id, relation_kinds)?;
+    if !collected.missing_source_ids.is_empty() {
+        let sample = collected
+            .missing_source_ids
+            .iter()
+            .take(3)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "graph reference authority incomplete for entity {}: {} incoming source entity \
+             record(s) missing (sample: {})",
+            target.id,
+            collected.missing_source_ids.len(),
+            sample
+        );
+    }
+    let mut entries = collected.references;
     entries.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
@@ -427,9 +500,10 @@ fn collect_graph_references(
     graph: &impl GraphStore,
     entity_id: &EntityId,
     relation_kinds: &[RelationKind],
-) -> Result<Vec<ReferenceEntry>> {
+) -> Result<ReferenceCollection> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
-    let mut grouped: HashMap<EntityId, ReferenceEntry> = HashMap::new();
+    let mut grouped: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
+    let mut matched_kinds = Vec::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
         if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
@@ -446,37 +520,33 @@ fn collect_graph_references(
         if src_entity_id == *entity_id {
             continue;
         }
-        let Some(entity) = graph.get_entity(&src_entity_id)? else {
+        push_relation_kind(grouped.entry(src_entity_id).or_default(), rel.kind);
+        push_relation_kind(&mut matched_kinds, rel.kind);
+    }
+
+    let mut references = Vec::with_capacity(grouped.len());
+    let mut missing_source_ids = Vec::new();
+    for (source_id, mut source_kinds) in grouped {
+        source_kinds.sort_by_key(relation_kind_rank);
+        let Some(entity) = graph.get_entity(&source_id)? else {
+            missing_source_ids.push(source_id);
             continue;
         };
-
-        let file_path = entity.file_origin.as_ref().map(|f| f.0.clone());
-        // The graph entity id is the grouping authority. File/name are display
-        // metadata and are not unique: overloads and nested declarations may
-        // legitimately share both while remaining distinct callers.
-        let entry = grouped
-            .entry(src_entity_id)
-            .or_insert_with(|| ReferenceEntry {
-                entity_id: src_entity_id,
-                name: entity.name.clone(),
-                file_path: file_path.clone(),
-                start_line: entity.span.as_ref().map(|s| s.start_line),
-                relation_kinds: Vec::new(),
-            });
-        if entry.file_path.is_none() {
-            entry.file_path = file_path;
-        }
-        if entry.start_line.is_none() {
-            entry.start_line = entity.span.as_ref().map(|s| s.start_line);
-        }
-        push_relation_kind(&mut entry.relation_kinds, rel.kind);
+        references.push(ReferenceEntry {
+            entity_id: source_id,
+            name: entity.name.clone(),
+            file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
+            start_line: entity.span.as_ref().map(|s| s.start_line),
+            relation_kinds: source_kinds,
+        });
     }
-
-    let mut entries = grouped.into_values().collect::<Vec<_>>();
-    for entry in &mut entries {
-        entry.relation_kinds.sort_by_key(relation_kind_rank);
-    }
-    Ok(entries)
+    missing_source_ids.sort();
+    matched_kinds.sort_by_key(relation_kind_rank);
+    Ok(ReferenceCollection {
+        references,
+        missing_source_ids,
+        matched_kinds,
+    })
 }
 
 fn push_relation_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
@@ -527,7 +597,7 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 mod tests {
     use super::{
         build_bulk_refs_response, build_refs_response, parse_relation_kinds,
-        refs_not_found_guidance, BulkRefsRequest, RefsRequest,
+        refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse, RefsRequest,
     };
     use kin_model::RelationKind;
 
@@ -822,6 +892,11 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(compact.classified_count, 1);
+        assert_eq!(compact.error_count, 0);
+        assert_eq!(compact.incomplete_verdict_count, 0);
+        assert_eq!(compact.with_references, 1);
+        assert_eq!(compact.without_references, 0);
         assert_eq!(compact.results[0]["reference_count"], 2);
         assert_eq!(compact.results[0]["has_references"], true);
         assert_eq!(compact.results[0]["entity_id"], target.id.to_string());
@@ -859,7 +934,234 @@ mod tests {
         .unwrap();
         assert_eq!(self_only_kind.results[0]["has_references"], false);
         assert_eq!(self_only_kind.results[0]["reference_count"], 0);
+        assert_eq!(self_only_kind.classified_count, 1);
+        assert_eq!(self_only_kind.error_count, 0);
+        assert_eq!(self_only_kind.incomplete_verdict_count, 0);
         assert_eq!(self_only_kind.with_references, 0);
         assert_eq!(self_only_kind.without_references, 1);
+    }
+
+    #[test]
+    fn bulk_invalid_and_missing_targets_are_errors_never_negative_verdicts() {
+        let graph = kin_db::InMemoryGraph::new();
+        let missing_id = kin_model::EntityId::new().to_string();
+
+        for compact in [true, false] {
+            let response = build_bulk_refs_response(
+                &graph,
+                &BulkRefsRequest {
+                    entity_ids: vec!["not-a-uuid".to_string(), missing_id.clone()],
+                    kind: "Any".to_string(),
+                    compact,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(response.total_checked, 2);
+            assert_eq!(response.classified_count, 0);
+            assert_eq!(response.error_count, 2);
+            assert_eq!(response.incomplete_verdict_count, 0);
+            assert_eq!(response.with_references, 0);
+            assert_eq!(response.without_references, 0);
+            assert_bulk_error_row(
+                &response.results[0],
+                compact,
+                "invalid entity_id (not a UUID)",
+            );
+            assert_bulk_error_row(&response.results[1], compact, "entity not found");
+        }
+    }
+
+    #[test]
+    fn dangling_reference_source_is_explicitly_incomplete_in_both_modes() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    equivalence_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let target = entity("target", "target.rs");
+        let materialized_caller = entity("caller", "caller.rs");
+        let missing_source_id = EntityId::new();
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&materialized_caller).unwrap();
+
+        for (source_id, kind) in [
+            (materialized_caller.id, RelationKind::References),
+            (missing_source_id, RelationKind::References),
+            // Repeated/multi-kind observations from the missing source remain
+            // one known caller identity while preserving the known kind union.
+            (missing_source_id, RelationKind::References),
+            (missing_source_id, RelationKind::Calls),
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(source_id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        for compact in [true, false] {
+            let response = build_bulk_refs_response(
+                &graph,
+                &BulkRefsRequest {
+                    entity_ids: vec![target.id.to_string()],
+                    kind: "Any".to_string(),
+                    compact,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(response.total_checked, 1);
+            assert_eq!(response.classified_count, 0);
+            assert_eq!(response.error_count, 0);
+            assert_eq!(response.incomplete_verdict_count, 1);
+            assert_eq!(response.with_references, 0);
+            assert_eq!(response.without_references, 0);
+
+            let row = &response.results[0];
+            assert!(row["has_references"].is_null());
+            assert!(row["reference_count"].is_null());
+            assert_eq!(row["known_reference_count"], 2);
+            assert_eq!(row["reference_count_complete"], false);
+            assert_eq!(row["verdict_complete"], false);
+            assert_eq!(row["missing_source_entity_count"], 1);
+            assert!(row["verdict_reason"]
+                .as_str()
+                .unwrap()
+                .contains("graph reference authority incomplete"));
+            if compact {
+                assert!(row.get("name").is_none());
+                assert!(row.get("matched_kinds").is_none());
+            } else {
+                assert_eq!(row["name"], "target");
+                assert_eq!(row["kind"], "Function");
+                assert_eq!(row["file_path"], "target.rs");
+                assert_eq!(
+                    row["matched_kinds"],
+                    serde_json::json!(["Calls", "References"])
+                );
+            }
+        }
+
+        let layout = kin_core::KinLayout::new(tempfile::tempdir().unwrap().path().join(".kin"));
+        let error = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: target.id.to_string(),
+                kind: "all".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("graph reference authority incomplete"),
+            "ordinary refs must fail loud on the same gap: {error:#}"
+        );
+    }
+
+    #[test]
+    fn request_level_bulk_failures_return_no_classification_response() {
+        let graph = kin_db::InMemoryGraph::new();
+        assert!(build_bulk_refs_response(
+            &graph,
+            &BulkRefsRequest {
+                entity_ids: Vec::new(),
+                kind: "Any".to_string(),
+                compact: true,
+            },
+        )
+        .is_err());
+        assert!(build_bulk_refs_response(
+            &graph,
+            &BulkRefsRequest {
+                entity_ids: vec![kin_model::EntityId::new().to_string()],
+                kind: "unsupported".to_string(),
+                compact: false,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_bulk_response_without_completeness_counts_fails_closed() {
+        let legacy = serde_json::json!({
+            "total_checked": 1,
+            "with_references": 0,
+            "without_references": 1,
+            "relation_kinds": ["Calls", "Imports", "References"],
+            "compact": true,
+            "results": [{
+                "entity_id": kin_model::EntityId::new().to_string(),
+                "has_references": false,
+                "reference_count": 0
+            }]
+        });
+
+        let error = serde_json::from_value::<BulkRefsResponse>(legacy).unwrap_err();
+        assert!(
+            error.to_string().contains("classified_count"),
+            "a version-skewed response must fail instead of recovering unsafe negatives: {error}"
+        );
+    }
+
+    fn assert_bulk_error_row(row: &serde_json::Value, compact: bool, expected_error: &str) {
+        assert_eq!(row["error"], expected_error);
+        assert!(row["has_references"].is_null());
+        assert!(row["reference_count"].is_null());
+        assert!(row["known_reference_count"].is_null());
+        assert_eq!(row["reference_count_complete"], false);
+        assert_eq!(row["verdict_complete"], false);
+        if compact {
+            assert!(row.get("name").is_none());
+            assert!(row.get("kind").is_none());
+            assert!(row.get("file_path").is_none());
+            assert!(row.get("matched_kinds").is_none());
+        } else {
+            assert!(row["name"].is_null());
+            assert!(row["kind"].is_null());
+            assert!(row["file_path"].is_null());
+            assert_eq!(row["matched_kinds"], serde_json::json!([]));
+        }
     }
 }
