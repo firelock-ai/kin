@@ -153,10 +153,80 @@ jobs:
             echo "exhausted=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # An abandonment is a fact about the default branch, never about the tag
+      # it retires: a tag's tree is frozen before the failure that abandons it,
+      # so the record can only ever exist on main. Both triggers here resolve
+      # GITHUB_SHA to the last commit on the default branch, and checkout with
+      # no `ref:` input fetches exactly that commit, so the record is read from
+      # one immutable main snapshot instead of from whatever main becomes while
+      # the job runs. Nothing from the failed tag's own head is trusted.
+      - name: Checkout the abandonment record from the default-branch commit
+        if: steps.resolve.outputs.needed == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      # Recovery is the alarm, so nothing weaker than the reviewed record may
+      # quiet it. A tag is reconciled only when the record abandons that exact
+      # tag at the exact commit the failed release ran, which is the same pair
+      # select-admissible-release-tag.py requires before it will skip a tag.
+      # Every other outcome, including an unreadable record or a checkout that
+      # is not the run's own default-branch commit, leaves the tag unrecorded
+      # and the alert armed.
+      - name: Reconcile against the tracked abandonment record
+        id: record
+        if: steps.resolve.outputs.needed == 'true'
+        env:
+          RECORD: scripts/abandoned-release-tags.json
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Nothing in this step may end in a non-zero status of its own. The
+          # check-run it would publish is the one the mint gate refuses a
+          # release commit for, so every status is captured rather than left to
+          # the step's implicit errexit, and every unhappy path degrades to "not
+          # abandoned", which leaves the alert armed to fail for the real reason.
+          head=""
+          status=0
+          head="$(git rev-parse HEAD)" || status=$?
+          if [ "$status" -ne 0 ] || [ "$head" != "$GITHUB_SHA" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::the record checkout resolved '${head}' rather than this run's default-branch commit ${GITHUB_SHA}; no abandonment is honoured from an unverified tree."
+            exit 0
+          fi
+          if [ ! -f "$RECORD" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${RECORD} is absent from ${GITHUB_SHA}; recovery stays responsible for ${TAG}."
+            exit 0
+          fi
+          # jq exits non-zero on a tag the record does not carry, which is an
+          # ordinary answer here rather than an error.
+          waived=""
+          status=0
+          waived="$(jq -er --arg tag "$TAG" '
+            [.abandoned[] | select(.tag == $tag) | .sha]
+            | if length == 1 then .[0] else empty end
+          ' "$RECORD")" || status=$?
+          if [ "$status" -ne 0 ] || [ -z "$waived" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "${TAG} carries no reviewed abandonment record; recovery stays responsible for it."
+            exit 0
+          fi
+          if [ "$waived" != "$SHA" ]; then
+            echo "abandoned=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${RECORD} abandons ${TAG} at ${waived}, but the failed release ran it at ${SHA}; the record does not cover this failure."
+            exit 0
+          fi
+          echo "abandoned=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::${TAG} at ${SHA} is reconciled by abandonment: ${RECORD} retires it in favour of its recorded successor, so no retry is dispatched, no alert is filed, and this reconcile concludes success."
+
       - name: Re-run failed jobs
         if: >-
           steps.resolve.outputs.needed == 'true' &&
-          steps.resolve.outputs.retry == 'true'
+          steps.resolve.outputs.retry == 'true' &&
+          steps.record.outputs.abandoned != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -172,7 +242,8 @@ jobs:
       - name: Alert after automatic retries are exhausted
         if: >-
           steps.resolve.outputs.needed == 'true' &&
-          steps.resolve.outputs.exhausted == 'true'
+          steps.resolve.outputs.exhausted == 'true' &&
+          steps.record.outputs.abandoned != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

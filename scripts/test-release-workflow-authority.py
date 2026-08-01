@@ -3434,8 +3434,33 @@ def main() -> None:
         "rerun-failed-jobs",
         '[ "$attempt" -ge 3 ]',
         "Release blocked after automatic retries",
+        "scripts/abandoned-release-tags.json",
+        '[ "$head" != "$GITHUB_SHA" ]',
+        "reconciled by abandonment",
     ):
         require(release_recovery, policy, "bounded automatic release recovery")
+
+    # Recovery's failing check-run lands on the default branch head, and the
+    # mint gate refuses a release commit carrying any check-run outside
+    # success/skipped/neutral. An hourly tick that alerts on a tag the reviewed
+    # record has already retired therefore kills the very release that
+    # supersedes it. Both consumers of the record decision are pinned here
+    # rather than trusting one substring: the retry must not spend runners on an
+    # abandoned tag, and the alert must not stamp failure on one.
+    for step, duty in (
+        ("      - name: Re-run failed jobs\n", "bounded retry"),
+        (
+            "      - name: Alert after automatic retries are exhausted\n",
+            "exhausted-retry alert",
+        ),
+    ):
+        start = release_recovery.index(step)
+        end = release_recovery.index("\n        env:", start)
+        if "steps.record.outputs.abandoned != 'true'" not in release_recovery[start:end]:
+            raise AssertionError(
+                f"release recovery's {duty} must stand down for a tag the "
+                "tracked abandonment record already retired"
+            )
     for forbidden in (
         "workflow_dispatch:",
         "contents: write",
