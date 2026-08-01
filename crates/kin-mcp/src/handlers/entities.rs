@@ -2456,7 +2456,10 @@ neighborhood stays within token budgets even at depth; when you then want to rea
 specific neighbor's implementation, follow up with get_entity_source, and when you want \
 a directional ordered chain with bodies inlined, use trace_data_flow. \
 When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
-flag says whether \"isolated, no dependencies\" is authoritative or merely \"not indexed yet\".";
+flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
+`subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
+read as \"no dependencies\". A focal that is not in the graph is reported as that gap \
+rather than as an isolated entity.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -4018,6 +4021,135 @@ mod tests {
         assert_eq!(response["truncated"], false);
     }
 
+    /// The description promises that when no neighbors come back, the additive
+    /// `negative` object says whether "isolated, no dependencies" is
+    /// authoritative or merely "not indexed yet". The neighborhood always
+    /// returns the focal itself, so that promise was keyed on a list that is
+    /// never empty for an indexed entity and never arrived. Asserted end to end
+    /// through the annotation chokepoint, and on a directional walk, because an
+    /// empty `in` walk is evidence about dependents alone.
+    #[test]
+    fn graph_neighborhood_isolated_focal_carries_the_promised_negative() {
+        let store = InMemoryGraph::new();
+        let lonely = make_entity("lonely", "src/lonely.rs");
+        let lonely_id = lonely.id;
+        store.upsert_entity(&lonely).unwrap();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(lonely_id.to_string()),
+        );
+        args.insert("direction".to_string(), serde_json::json!("in"));
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert_eq!(response["negative"]["kind"], "no_neighbors");
+        assert_eq!(response["negative"]["safe_to_conclude_absent"], true);
+        assert!(
+            response["negative"]["subject"]
+                .as_str()
+                .expect("the negative must carry a subject")
+                .contains("dependents"),
+            "an incoming-only walk must qualify dependents alone: {}",
+            response["negative"]
+        );
+    }
+
+    /// At depth 0 the frontier is dropped before a single edge is read, so the
+    /// empty neighborhood describes the request and not the entity. The focal
+    /// here has a dependent and a dependency, and neither is looked at.
+    #[test]
+    fn graph_neighborhood_at_depth_zero_does_not_certify_isolation() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("depth".to_string(), serde_json::json!(0));
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert_eq!(response["relation_count"], 0);
+        assert_eq!(response["negative"]["kind"], "no_traversal");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an entity with both a caller and a callee must never be certified isolated: {}",
+            response["negative"]
+        );
+    }
+
+    /// The focal is added to the entity list only when the store actually holds
+    /// it, so an id that was never upserted yields an empty neighborhood that
+    /// says nothing about isolation. `entity_count` is the name that fact
+    /// travels under from this handler to the guard that reads it, and only an
+    /// end-to-end call pins the two together.
+    #[test]
+    fn graph_neighborhood_missing_focal_is_not_an_absence() {
+        let (store, _, _, _) = neighborhood_fixture();
+        let never_upserted = EntityId::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(never_upserted.to_string()),
+        );
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert_eq!(response["entity_count"], 0);
+        assert_eq!(response["negative"]["kind"], "focal_not_in_graph");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an entity the walk never found must not be certified isolated: {}",
+            response["negative"]
+        );
+    }
+
+    /// `limit: 0` empties the emitted edge array of a neighborhood that really
+    /// has neighbors. The pre-truncation total is the only thing that can tell
+    /// a capped answer from an absence, and `relation_count` is the name it
+    /// travels under from this handler to the guard that reads it.
+    #[test]
+    fn graph_neighborhood_truncated_to_zero_is_not_an_absence() {
+        let (store, _, focal_id, _) = neighborhood_fixture();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        );
+        args.insert("limit".to_string(), serde_json::json!(0));
+        let annotated = crate::finalize_with_envelope(
+            handle_graph_neighborhood(&args, &store).unwrap(),
+            structurally_ready_envelope(),
+            "graph_neighborhood",
+        );
+        let response = parsed_response(&annotated);
+        assert!(
+            response["relations"]
+                .as_array()
+                .expect("relations must be an array")
+                .is_empty(),
+            "the caller capped the array to nothing"
+        );
+        assert_eq!(
+            response["relation_count"], 2,
+            "the pre-truncation total still reports the two real edges"
+        );
+        assert!(
+            response.get("negative").is_none(),
+            "a truncated edge array is not an absence and must not be qualified as one: {response}"
+        );
+    }
+
     /// The declared tool schema must offer the parameter the handler honors,
     /// and the description must claim the direction the traversal delivers.
     #[test]
@@ -4039,10 +4171,11 @@ mod tests {
         );
     }
 
-    /// Nothing in this crate may quietly go back to the outgoing-only
-    /// traversal: `get_dependency_neighborhood` is fed only the outgoing index
-    /// in kin-db, which is what made this tool answer dependencies when it was
-    /// asked for dependents.
+    /// This file may not quietly go back to the outgoing-only traversal:
+    /// `get_dependency_neighborhood` is fed only the outgoing index in kin-db,
+    /// which is what made this tool answer dependencies when it was asked for
+    /// dependents. The scan reads this one file, so it guards the handler that
+    /// regressed rather than every call site in the crate.
     #[test]
     fn graph_neighborhood_does_not_use_the_outgoing_only_traversal() {
         // Split so this guard's own source line is not a match for itself.
