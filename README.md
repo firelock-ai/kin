@@ -94,6 +94,14 @@ built-in MCP server for detected supported clients. Use `--intent local` for CLI
 and filesystem use without MCP configuration, or `--intent editor` for the VS
 Code path.
 
+To remove only setup-managed integrations, run `kin setup uninstall`. To stop
+all Kin daemons, remove exact legacy installer PATH blocks, and delete the
+complete managed install under `KIN_HOME`, use `kin setup uninstall --all`
+(`--dry-run` previews it). Modified setup-owned slices block full removal unless
+you explicitly add `--force`, so uninstall never silently overwrites a user's
+edited client or shell configuration. On Windows, the CLI schedules its locked
+install directory for deletion immediately after the running process exits.
+
 For manual installation, each archive and its `.sha256` file is published under
 `https://github.com/firelock-ai/kin/releases/latest/download/`. The moving asset
 names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,

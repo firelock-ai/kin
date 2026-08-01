@@ -358,10 +358,18 @@ fn current_repo_status() -> Option<CurrentRepoStatus> {
 /// `--all` every worker plus the supervisor (supervisor last).
 pub async fn stop(all: bool, json: bool) -> Result<()> {
     if all {
-        stop_all(json).await
+        stop_all(json, false).await
     } else {
         stop_current_repo(json).await
     }
+}
+
+/// Stop every managed Kin daemon without writing a second command's report to
+/// stdout. Full uninstall uses this before deleting the managed install root;
+/// failures still propagate so it never removes binaries out from under a live
+/// daemon.
+pub(crate) async fn stop_all_quiet() -> Result<()> {
+    stop_all(false, true).await
 }
 
 /// One stopped (or attempted-to-stop) endpoint, for the report.
@@ -440,7 +448,7 @@ async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Option<
         .map(|d| d.pid)
 }
 
-async fn stop_all(json: bool) -> Result<()> {
+async fn stop_all(json: bool, quiet: bool) -> Result<()> {
     let wait = stop_timeout();
     let mut reports: Vec<StopReport> = Vec::new();
 
@@ -515,7 +523,10 @@ async fn stop_all(json: bool) -> Result<()> {
     }
 
     if reports.is_empty() {
-        if json {
+        if quiet {
+            // The absence of managed daemons is a successful precondition for
+            // full uninstall and needs no nested command output.
+        } else if json {
             let payload = serde_json::json!({
                 "schema": "kin.daemon-stop.v1",
                 "scope": "all",
@@ -529,15 +540,27 @@ async fn stop_all(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    finish_stop("all", &reports, json)
+    finish_stop_with_output("all", &reports, json, quiet)
 }
 
 /// Emit the stop report and fail loud (nonzero exit) if any endpoint would not
 /// die, so scripts can trust the exit code.
 fn finish_stop(scope: &str, reports: &[StopReport], json: bool) -> Result<()> {
+    finish_stop_with_output(scope, reports, json, false)
+}
+
+fn finish_stop_with_output(
+    scope: &str,
+    reports: &[StopReport],
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
     let all_stopped = reports.iter().all(|r| r.outcome.is_success());
 
-    if json {
+    if quiet {
+        // The caller owns user-facing output. We still evaluate every result
+        // below and fail loud when a process survived the stop attempt.
+    } else if json {
         let stopped: Vec<_> = reports
             .iter()
             .map(|r| {

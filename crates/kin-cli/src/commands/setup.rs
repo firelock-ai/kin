@@ -12273,21 +12273,554 @@ pub fn ledger_status(json: bool) -> Result<()> {
 /// Ledger-verified: an artifact modified since install is left in place (unless
 /// `--force`) so a user's own edits are never clobbered. `--dry-run` reports
 /// what would be removed without touching disk.
-pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
+#[derive(Debug, Clone, serde::Serialize)]
+struct FullUninstallAction {
+    kind: String,
+    path: PathBuf,
+    action: String,
+    detail: String,
+}
+
+impl FullUninstallAction {
+    fn new(kind: &str, path: impl Into<PathBuf>, action: &str, detail: impl Into<String>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: path.into(),
+            action: action.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedInstallRoot {
+    requested: PathBuf,
+    path: PathBuf,
+    exists: bool,
+}
+
+fn normalize_install_root(path: &Path) -> Result<(PathBuf, bool)> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "full uninstall requires an absolute KIN_HOME, got {}",
+            path.display()
+        );
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing full uninstall through symlink install root {}",
+                    path.display()
+                );
+            }
+            if !metadata.is_dir() {
+                anyhow::bail!(
+                    "refusing full uninstall because KIN_HOME is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok((
+                path.canonicalize().with_context(|| {
+                    format!("failed to resolve Kin install root {}", path.display())
+                })?,
+                true,
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().context("KIN_HOME has no parent directory")?;
+            let name = path
+                .file_name()
+                .context("KIN_HOME has no final path component")?;
+            let parent = parent.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve parent of absent Kin install root {}",
+                    path.display()
+                )
+            })?;
+            Ok((parent.join(name), false))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect Kin install root {}", path.display())),
+    }
+}
+
+fn path_exists_nofollow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn known_custom_install_entry(name: &str) -> bool {
+    matches!(
+        name,
+        "bin"
+            | "lib"
+            | "shell"
+            | "config"
+            | "config-transactions"
+            | "cache"
+            | "state"
+            | "logs"
+            | "objects"
+            | "imports"
+            | "packages"
+            | "bench"
+            | "evidence"
+            | "hooks"
+            | "mnt"
+            | "kindb"
+            | "proof-binaries"
+            | ".DS_Store"
+    ) || name.starts_with("daemon")
+        || name.starts_with("supervisor")
+        || name.starts_with("registry")
+        || name.starts_with("update")
+        || name.starts_with("vfs")
+        || name.starts_with("nfs")
+        || name.starts_with(".mcp-")
+}
+
+fn custom_install_has_only_kin_top_level_entries(root: &Path) -> Result<bool> {
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to inspect custom KIN_HOME {}", root.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect an entry under KIN_HOME {}",
+                root.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        if !known_custom_install_entry(name) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_full_uninstall_root_at(
+    requested: &Path,
+    user_home: &Path,
+    current_exe: Option<&Path>,
+) -> Result<ValidatedInstallRoot> {
+    let (root, exists) = normalize_install_root(requested)?;
+    let canonical_home = user_home
+        .canonicalize()
+        .with_context(|| format!("failed to resolve user home {}", user_home.display()))?;
+
+    // Removing the home directory or one of its ancestors is never a valid Kin
+    // uninstall, regardless of a hostile or accidental KIN_HOME override.
+    if canonical_home.starts_with(&root) {
+        anyhow::bail!(
+            "refusing full uninstall because KIN_HOME {} is the user home or one of its ancestors",
+            root.display()
+        );
+    }
+
+    if !exists {
+        return Ok(ValidatedInstallRoot {
+            requested: requested.to_path_buf(),
+            path: root,
+            exists: false,
+        });
+    }
+
+    let default_root = canonical_home.join(".kin");
+    let active_binary_is_managed = current_exe
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|path| {
+            path.parent()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent == root)
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| matches!(name, "kin" | "kin.exe"))
+        });
+    let has_managed_artifact = [
+        root.join("bin/kin"),
+        root.join("bin/kin.exe"),
+        root.join("bin/kin-daemon"),
+        root.join("bin/kin-daemon.exe"),
+        root.join("bin/.kinlab-kin-version"),
+        root.join("config/setup-ledger.json"),
+        root.join("shell/kin-vfs.zsh"),
+        root.join("shell/kin-vfs.bash"),
+        root.join("shell/kin-vfs.fish"),
+        root.join("shell/kin-vfs.ps1"),
+    ]
+    .iter()
+    .any(|path| path_exists_nofollow(path));
+
+    if root != default_root && !active_binary_is_managed && !has_managed_artifact {
+        anyhow::bail!(
+            "refusing to recursively remove unrecognized custom KIN_HOME {}; no managed Kin artifact was found",
+            root.display()
+        );
+    }
+
+    // A Kin-looking directory name is not proof of exclusive ownership: a
+    // path such as `working` contains "kin", and a user may keep unrelated
+    // data in a directory named `kin-tools`. Every custom root therefore has
+    // to contain only recognized Kin top-level entries before recursive
+    // removal. The conventional ~/.kin root is the only name-based exception.
+    if root != default_root && !custom_install_has_only_kin_top_level_entries(&root)? {
+        anyhow::bail!(
+            "refusing to recursively remove custom KIN_HOME {}; it contains non-Kin top-level entries",
+            root.display()
+        );
+    }
+
+    Ok(ValidatedInstallRoot {
+        requested: requested.to_path_buf(),
+        path: root,
+        exists: true,
+    })
+}
+
+fn validate_full_uninstall_root() -> Result<ValidatedInstallRoot> {
+    let requested = kin_dir()?;
+    let home = home_dir()?;
+    let current_exe = env::current_exe().ok();
+    validate_full_uninstall_root_at(&requested, &home, current_exe.as_deref())
+}
+
+fn legacy_shell_path_targets(home: &Path) -> Vec<(String, PathBuf)> {
+    let mut targets = std::collections::BTreeSet::new();
+    targets.insert(("zsh".to_string(), home.join(".zshrc")));
+    targets.insert(("bash".to_string(), home.join(".bashrc")));
+    targets.insert(("fish".to_string(), home.join(".config/fish/config.fish")));
+    targets.insert((
+        "powershell".to_string(),
+        home.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1"),
+    ));
+    targets.insert((
+        "powershell".to_string(),
+        home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
+    ));
+    if let Some(profile) = env::var_os("PROFILE").filter(|value| !value.is_empty()) {
+        targets.insert(("powershell".to_string(), PathBuf::from(profile)));
+    }
+    targets.into_iter().collect()
+}
+
+fn cleanup_legacy_shell_path_blocks(
+    home: &Path,
+    install_root: &Path,
+    dry_run: bool,
+) -> Result<Vec<FullUninstallAction>> {
+    let bin_dir = install_root.join("bin");
+    let mut actions = Vec::new();
+    for (shell, path) in legacy_shell_path_targets(home) {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect shell config {}", path.display()))
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing legacy PATH cleanup through symlink shell config {}",
+                    path.display()
+                )
+            }
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(_) => {}
+        }
+
+        let block = rc_path_block(&shell, &bin_dir);
+        let lock = if dry_run {
+            None
+        } else {
+            Some(ConfigLock::acquire(&path)?)
+        };
+        let original = match &lock {
+            Some(lock) => lock.original_bytes(&path)?,
+            None => read_config_file_nofollow(&path, false)?.map(|observed| observed.bytes),
+        };
+        let Some(original) = original else {
+            continue;
+        };
+        let content = std::str::from_utf8(&original)
+            .with_context(|| format!("shell config {} is not UTF-8", path.display()))?;
+        let occurrences = content.matches(&block).count();
+        if occurrences == 0 {
+            continue;
+        }
+        if !dry_run {
+            let stripped = content.replace(&block, "");
+            lock.as_ref()
+                .context("legacy shell cleanup lost its config lock")?
+                .write_guarded(&path, stripped.as_bytes(), Some(&original))?;
+        }
+        actions.push(FullUninstallAction::new(
+            "legacy_shell_path",
+            path.clone(),
+            if dry_run { "would_remove" } else { "removed" },
+            format!(
+                "{} {} exact legacy Kin PATH block{}",
+                if dry_run { "would remove" } else { "removed" },
+                occurrences,
+                if occurrences == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    Ok(actions)
+}
+
+fn ledger_blocks_full_uninstall(
+    outcomes: &[crate::commands::setup_ledger::RemovalOutcome],
+) -> usize {
+    use crate::commands::setup_ledger::RemovalAction;
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.action,
+                RemovalAction::SkippedModified | RemovalAction::Failed
+            )
+        })
+        .count()
+}
+
+#[cfg(not(windows))]
+fn remove_full_install_root(
+    root: &ValidatedInstallRoot,
+    dry_run: bool,
+) -> Result<FullUninstallAction> {
+    if !root.exists {
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "already_absent",
+            "managed Kin install root is already absent",
+        ));
+    }
+    if dry_run {
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "would_remove",
+            "would recursively remove the validated managed Kin install root",
+        ));
+    }
+    fs::remove_dir_all(&root.path).with_context(|| {
+        format!(
+            "failed to remove managed Kin install root {}",
+            root.path.display()
+        )
+    })?;
+    Ok(FullUninstallAction::new(
+        "install_root",
+        &root.path,
+        "removed",
+        "removed the complete managed Kin install root",
+    ))
+}
+
+#[cfg(windows)]
+fn remove_full_install_root(
+    root: &ValidatedInstallRoot,
+    dry_run: bool,
+) -> Result<FullUninstallAction> {
+    if !root.exists {
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "already_absent",
+            "managed Kin install root is already absent",
+        ));
+    }
+    if dry_run {
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "would_schedule",
+            "would remove the exact Kin user-PATH segment and schedule the validated install root for deletion after this process exits",
+        ));
+    }
+
+    // Windows does not permit a running executable to unlink itself. A
+    // no-profile PowerShell helper waits for this exact PID, removes only the
+    // normalized Kin bin segment from the current user's PATH, rejects a
+    // reparse-point replacement, and then deletes the validated install root.
+    let token = uuid::Uuid::new_v4();
+    let script_path = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
+    let log_path = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
+    let script = r#"$ErrorActionPreference = 'Stop'
+$root = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_ROOT)
+$pathRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_PATH_ROOT)
+$bins = @(
+    [IO.Path]::GetFullPath((Join-Path $root 'bin')).TrimEnd('\\', '/').ToLowerInvariant()
+    [IO.Path]::GetFullPath((Join-Path $pathRoot 'bin')).TrimEnd('\\', '/').ToLowerInvariant()
+) | Select-Object -Unique
+$pidToWait = [int]$env:KIN_UNINSTALL_PID
+$log = $env:KIN_UNINSTALL_LOG
+try {
+    Wait-Process -Id $pidToWait -ErrorAction SilentlyContinue
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($null -ne $current) {
+        $kept = @($current -split ';' | Where-Object {
+            if ([string]::IsNullOrWhiteSpace($_)) { return $true }
+            $candidate = $_.Trim().Trim('"')
+            try { $candidate = [IO.Path]::GetFullPath($candidate) } catch {}
+            $bins -notcontains $candidate.TrimEnd('\\', '/').ToLowerInvariant()
+        })
+        [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+    }
+    if (Test-Path -LiteralPath $root) {
+        $item = Get-Item -LiteralPath $root -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Kin install root became a reparse point; refusing removal"
+        }
+        for ($attempt = 0; $attempt -lt 50; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $root -Recurse -Force
+                break
+            } catch {
+                if ($attempt -eq 49) { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+} catch {
+    $_ | Out-File -LiteralPath $log -Encoding utf8
+} finally {
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+"#;
+    fs::write(&script_path, script).with_context(|| {
+        format!(
+            "failed to write deferred Windows uninstall helper {}",
+            script_path.display()
+        )
+    })?;
+    let child = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .env("KIN_UNINSTALL_ROOT", &root.path)
+        .env("KIN_UNINSTALL_PATH_ROOT", &root.requested)
+        .env("KIN_UNINSTALL_PID", std::process::id().to_string())
+        .env("KIN_UNINSTALL_LOG", &log_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch deferred Windows uninstall helper {}",
+                script_path.display()
+            )
+        })?;
+    drop(child);
+    Ok(FullUninstallAction::new(
+        "install_root",
+        &root.path,
+        "scheduled",
+        format!(
+            "scheduled current-user PATH cleanup and complete install-root deletion after process exit; failures are recorded at {}",
+            log_path.display()
+        ),
+    ))
+}
+
+pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Result<()> {
     use crate::commands::setup_ledger::{ledger_path, run_uninstall, RemovalAction};
+
+    let install_root = if all {
+        Some(validate_full_uninstall_root()?)
+    } else {
+        None
+    };
+    if let Some(root) = &install_root {
+        if root.exists && !dry_run {
+            crate::commands::daemon::stop_all_quiet()
+                .await
+                .context("full uninstall refused because not every Kin daemon could be stopped")?;
+        }
+    }
 
     let path = ledger_path()?;
     let outcomes = run_uninstall(&path, dry_run, force)?;
+    let blocked = ledger_blocks_full_uninstall(&outcomes);
+    let mut full_actions = Vec::new();
+    if let Some(root) = &install_root {
+        if blocked == 0 {
+            full_actions.extend(cleanup_legacy_shell_path_blocks(
+                &home_dir()?,
+                &root.path,
+                dry_run,
+            )?);
+            if root.requested != root.path {
+                full_actions.extend(cleanup_legacy_shell_path_blocks(
+                    &home_dir()?,
+                    &root.requested,
+                    dry_run,
+                )?);
+            }
+            full_actions.push(remove_full_install_root(root, dry_run)?);
+        } else {
+            full_actions.push(FullUninstallAction::new(
+                "install_root",
+                &root.path,
+                "blocked",
+                format!(
+                    "retained the install root because {blocked} ledger entr{} still require{} reconciliation",
+                    if blocked == 1 { "y" } else { "ies" },
+                    if blocked == 1 { "s" } else { "" }
+                ),
+            ));
+        }
+    }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+        if all {
+            let fully_removed = full_actions.iter().any(|action| {
+                action.kind == "install_root"
+                    && matches!(action.action.as_str(), "removed" | "already_absent")
+            });
+            let payload = serde_json::json!({
+                "schema": "kin.setup-uninstall.v2",
+                "scope": "all",
+                "dry_run": dry_run,
+                "ledger": outcomes,
+                "full_install": full_actions,
+                "fully_removed": fully_removed,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&outcomes)?);
+        }
+        if blocked > 0 && all && !dry_run {
+            anyhow::bail!(
+                "full uninstall retained KIN_HOME because {blocked} ledger entries were modified or failed removal; review them and re-run with --force only if those Kin-owned slices should be removed"
+            );
+        }
         return Ok(());
     }
 
     if outcomes.is_empty() {
-        println!("No install ledger found — nothing recorded to uninstall.");
-        println!("(The ledger is written by `kin setup`; run it first if you expected entries.)");
-        return Ok(());
+        if all {
+            println!("No install ledger found — continuing with full managed-install cleanup.");
+        } else {
+            println!("No install ledger found — nothing recorded to uninstall.");
+            println!(
+                "(The ledger is written by `kin setup`; run it first if you expected entries.)"
+            );
+            return Ok(());
+        }
     }
 
     if dry_run {
@@ -12326,6 +12859,16 @@ pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
         println!("Removed {removed}, skipped {skipped} (modified since install), {failed} failed.");
         if skipped > 0 {
             println!("Re-run with --force to remove entries modified since install.");
+        }
+    }
+    if all {
+        for action in &full_actions {
+            println!("  {}", action.detail);
+        }
+        if blocked > 0 && !dry_run {
+            anyhow::bail!(
+                "full uninstall retained KIN_HOME because {blocked} ledger entries were modified or failed removal; review them and re-run with --force only if those Kin-owned slices should be removed"
+            );
         }
     }
     Ok(())
@@ -13006,6 +13549,100 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
         home.apply("KIN_HOME", Some(&preferred));
         assert_eq!(kin_dir().unwrap(), preferred);
+    }
+
+    #[test]
+    fn full_uninstall_root_rejects_home_and_unrecognized_custom_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let home_error = validate_full_uninstall_root_at(&home, &home, None).unwrap_err();
+        assert!(
+            home_error.to_string().contains("user home"),
+            "unexpected refusal: {home_error:#}"
+        );
+
+        let broad = tmp.path().join("tools");
+        fs::create_dir_all(broad.join("bin")).unwrap();
+        fs::write(broad.join("bin/kin"), b"binary").unwrap();
+        fs::write(broad.join("other-product-data"), b"keep").unwrap();
+        let broad_error = validate_full_uninstall_root_at(&broad, &home, None).unwrap_err();
+        assert!(
+            broad_error.to_string().contains("non-Kin top-level"),
+            "unexpected refusal: {broad_error:#}"
+        );
+
+        let misleading_name = tmp.path().join("working");
+        fs::create_dir_all(misleading_name.join("bin")).unwrap();
+        fs::write(misleading_name.join("bin/kin"), b"binary").unwrap();
+        fs::write(misleading_name.join("user-notes.txt"), b"keep").unwrap();
+        let misleading_error =
+            validate_full_uninstall_root_at(&misleading_name, &home, None).unwrap_err();
+        assert!(
+            misleading_error.to_string().contains("non-Kin top-level"),
+            "a directory name containing 'kin' must not bypass ownership checks: {misleading_error:#}"
+        );
+
+        let managed = tmp.path().join("kin-home");
+        fs::create_dir_all(managed.join("bin")).unwrap();
+        fs::write(managed.join("bin/kin"), b"binary").unwrap();
+        let accepted = validate_full_uninstall_root_at(&managed, &home, None).unwrap();
+        assert!(accepted.exists);
+        assert_eq!(accepted.path, managed.canonicalize().unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn full_uninstall_legacy_path_cleanup_is_exact_and_dry_run_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let install_root = home.join(".kin");
+        fs::create_dir_all(&home).unwrap();
+        let _profile = EnvVarGuard::unset("PROFILE");
+
+        let zsh = home.join(".zshrc");
+        let bash = home.join(".bashrc");
+        let block = rc_path_block("zsh", &install_root.join("bin"));
+        fs::write(&zsh, format!("export KEEP=1\n{block}alias k='kin'\n")).unwrap();
+        fs::write(&bash, format!("# user heading\n{block}{block}")).unwrap();
+        let before_zsh = fs::read(&zsh).unwrap();
+        let before_bash = fs::read(&bash).unwrap();
+
+        let dry = cleanup_legacy_shell_path_blocks(&home, &install_root, true).unwrap();
+        assert_eq!(dry.len(), 2);
+        assert_eq!(fs::read(&zsh).unwrap(), before_zsh);
+        assert_eq!(fs::read(&bash).unwrap(), before_bash);
+        let dry_entries = fs::read_dir(&home).unwrap().count();
+        assert_eq!(
+            dry_entries, 2,
+            "dry-run must not create persistent config-lock sidecars"
+        );
+
+        let removed = cleanup_legacy_shell_path_blocks(&home, &install_root, false).unwrap();
+        assert_eq!(removed.len(), 2);
+        let zsh_after = fs::read_to_string(&zsh).unwrap();
+        let bash_after = fs::read_to_string(&bash).unwrap();
+        assert_eq!(zsh_after, "export KEEP=1\nalias k='kin'\n");
+        assert_eq!(bash_after, "# user heading\n");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn full_uninstall_removes_only_the_validated_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".kin");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/kin"), b"binary").unwrap();
+        let keep = home.join("keep.txt");
+        fs::write(&keep, b"user data").unwrap();
+
+        let validated = validate_full_uninstall_root_at(&root, &home, None).unwrap();
+        let outcome = remove_full_install_root(&validated, false).unwrap();
+        assert_eq!(outcome.action, "removed");
+        assert!(!root.exists());
+        assert_eq!(fs::read(&keep).unwrap(), b"user data");
     }
 
     #[test]
