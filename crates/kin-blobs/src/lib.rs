@@ -123,9 +123,11 @@ struct PendingDirSyncs {
     /// per-shard count is what lets a failed barrier put back exactly the
     /// renames it did not make durable.
     shards: BTreeMap<String, usize>,
-    /// Whether the store root holds a shard directory creation that is not yet
-    /// durable. A lost shard directory loses every blob beneath it the same way
-    /// a lost rename loses one, so the root drains on the same schedule.
+    /// Whether the store root owes a barrier: either it holds a shard directory
+    /// creation that is not yet durable, or a prior root validation/barrier
+    /// failed and must be retried. A lost shard directory loses every blob
+    /// beneath it the same way a lost rename loses one, so the root drains on
+    /// the same schedule.
     root: bool,
     /// Renames awaiting a barrier: the sum of `shards`' counts, cached here so
     /// the drain check stays O(1) per write.
@@ -336,9 +338,11 @@ impl BlobStore {
         let mut root_unsynced = false;
 
         if root {
-            if let Err(e) = sync_dir(&self.root) {
+            match sync_dir(&self.root) {
+                Ok(()) => {}
                 // A removed root has no entry left to make durable.
-                if e.kind() != std::io::ErrorKind::NotFound {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
                     first_error = Some(BlobError::io(&self.root, e));
                     root_unsynced = true;
                 }
@@ -348,8 +352,27 @@ impl BlobStore {
             let shard_dir = self.root.join(&shard);
             match sync_dir(&shard_dir) {
                 Ok(()) => {}
-                // Pruned by compaction, or removed with the store root.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root_unsynced => {
+                    // Pruned by compaction, or removed with the store root. On
+                    // Windows, though, walking through an ordinary file is
+                    // also reported as `NotFound`. An existing-shard write
+                    // does not owe a root-creation barrier, so validate the
+                    // root lazily before forgiving the missing child even
+                    // when `root` was false at the start of this drain.
+                    match validate_dir_type(&self.root) {
+                        Ok(()) => {}
+                        // The store root itself is gone, so the child has no
+                        // namespace entry left to make durable.
+                        Err(root_error) if root_error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(root_error) => {
+                            if first_error.is_none() {
+                                first_error = Some(BlobError::io(&self.root, root_error));
+                            }
+                            root_unsynced = true;
+                            unsynced.push((shard, renames));
+                        }
+                    }
+                }
                 Err(e) => {
                     if first_error.is_none() {
                         first_error = Some(BlobError::io(&shard_dir, e));
@@ -741,6 +764,28 @@ fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Verify that `dir` currently resolves to a directory without issuing a
+/// durability barrier. Used after an ambiguous child `NotFound`: the root's
+/// object type must be established before deciding whether the missing child
+/// was harmlessly pruned, even when no root barrier was pending.
+fn validate_dir_type(dir: &Path) -> std::io::Result<()> {
+    let metadata = fs::metadata(dir)?;
+    ensure_directory_metadata(dir, &metadata)
+}
+
+fn ensure_directory_metadata(dir: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotADirectory,
+        format!(
+            "directory durability barrier target is not a directory: {}",
+            dir.display()
+        ),
+    ))
+}
+
 /// `fsync` a directory so a `rename`/`create` within it is durable.
 ///
 /// Directory fsync is not guaranteed on every platform (and is a no-op on
@@ -748,7 +793,33 @@ fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// can distinguish "nothing left to make durable" (the directory is gone) from
 /// a real failure it must keep pending and report.
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
+    #[cfg(windows)]
+    let directory = {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        // `File::open` requests read access, but Windows FlushFileBuffers
+        // requires a handle opened with write access. Directories also require
+        // FILE_FLAG_BACKUP_SEMANTICS when CreateFile opens them. Preserve the
+        // standard library's default share mode so a durability barrier does
+        // not turn into an unintended delete/rename lock.
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(GENERIC_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+    };
+    #[cfg(not(windows))]
+    let directory = File::open(dir)?;
+
+    // `FILE_FLAG_BACKUP_SEMANTICS` also permits opening an ordinary file on
+    // Windows. A path that stopped being a directory is not a successful
+    // namespace barrier: accepting it would let every missing child barrier be
+    // mistaken for a pruned shard. Reject the wrong object before flushing.
+    ensure_directory_metadata(dir, &directory.metadata()?)?;
+    directory.sync_all()
 }
 
 #[cfg(test)]
@@ -759,6 +830,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path().join("objects")).unwrap();
         (dir, store)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_barrier_opens_a_flushable_windows_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        sync_dir(directory.path())
+            .expect("a CreateFile directory handle with write access must flush on Windows");
     }
 
     #[test]
@@ -1832,6 +1911,55 @@ mod tests {
         assert_eq!(
             renames_after, renames_before,
             "and so must the renames counted against them"
+        );
+    }
+
+    /// A write into an already-synced shard does not owe a root-creation
+    /// barrier. Windows reports a child beneath an ordinary-file root as
+    /// `NotFound`, so `sync` must still validate the root before treating that
+    /// child as a harmless compaction/removal and preserve its rename debt.
+    #[test]
+    fn failed_sync_after_existing_shard_restores_pending_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("objects");
+        let store = BlobStore::with_drain_threshold(root.clone(), usize::MAX).unwrap();
+        let payloads = payloads_in_one_shard(2);
+
+        store.write(&payloads[0]).unwrap();
+        store.sync().unwrap();
+        assert_eq!(store.pending_snapshot(), (0, false, 0));
+
+        store.write(&payloads[1]).unwrap();
+        assert_eq!(
+            store.pending_snapshot(),
+            (1, false, 1),
+            "the existing shard owes one rename but no root-creation barrier"
+        );
+
+        break_barriers_under(&root);
+
+        let err = store.sync().unwrap_err();
+        assert!(
+            matches!(err, BlobError::Io { .. }),
+            "expected the invalid root to fail the barrier, got {err:?}"
+        );
+        let (shards, root_pending, renames) = store.pending_snapshot();
+        assert_eq!(shards, 1, "the failed existing shard must stay pending");
+        assert_eq!(renames, 1, "its rename debt must stay pending too");
+        if cfg!(windows) {
+            assert!(
+                root_pending,
+                "the invalid Windows root must be retried with the shard"
+            );
+        }
+
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        store.sync().unwrap();
+        assert_eq!(
+            store.pending_snapshot(),
+            (0, false, 0),
+            "a restored directory root must let the missing shard debt clear"
         );
     }
 
