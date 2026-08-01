@@ -259,23 +259,159 @@ fn drift_refuses_outside_a_kin_repository_instead_of_scanning_files() {
     );
 }
 
+fn heal_report(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
+    let output = run_kin(runtime, repo, &["doctor", "--heal", "--json"]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("heal report should be JSON")
+}
+
+/// Heal restores diverged tracked members from graph-owned content and proves
+/// the projection clean afterwards.
+///
+/// Both drift shapes are exercised together because they fail differently: an
+/// edited member has to be overwritten from authority, a removed one has to be
+/// recreated. A heal that only handled the first would still report a clean
+/// projection if the second were tested alone and quietly skipped.
 #[test]
-fn heal_stays_fail_closed_and_names_its_open_gate() {
+fn heal_restores_diverged_tracked_members_from_graph_truth() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     initialize_kin_repo(&runtime, &repo);
 
-    let output = run_kin(&runtime, &repo, &["doctor", "--heal"]);
+    let clean = drift_report(&runtime, &repo);
+    assert_eq!(clean["clean"], true);
+
+    // Diverge with no daemon live so the window is deterministic rather than
+    // raced against a watcher entitled to admit the edit.
+    stop_daemon(&runtime, &repo);
+    fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
+    fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
+
+    let dirty = drift_report(&runtime, &repo);
+    assert_eq!(dirty["clean"], false);
+    assert_eq!(
+        dirty["drift_count"].as_u64().expect("drift count"),
+        dirty["drifted_paths_hex"]
+            .as_array()
+            .expect("drifted paths")
+            .len() as u64,
+        "the daemon must name one byte-exact path per reported divergence"
+    );
+
+    let healed = heal_report(&runtime, &repo);
+    assert_eq!(healed["schema"], "kin.projection-heal.v1");
+    assert_eq!(
+        healed["clean"], true,
+        "heal did not prove the projection clean"
+    );
+    assert_eq!(healed["remaining_drift"], 0);
+    assert_eq!(
+        healed["observed_drift"], dirty["drift_count"],
+        "heal must act on the divergences drift reported"
+    );
+
+    let restored: Vec<String> = healed["restored_paths_hex"]
+        .as_array()
+        .expect("restored paths")
+        .iter()
+        .map(|value| {
+            String::from_utf8(
+                hex::decode(value.as_str().expect("restored path is hex")).expect("valid hex"),
+            )
+            .expect("fixture paths are UTF-8")
+        })
+        .collect();
+    assert!(
+        restored.contains(&"README.md".to_string()),
+        "heal did not restore the edited member: {restored:?}"
+    );
+    assert!(
+        restored.contains(&"src/lib.rs".to_string()),
+        "heal did not restore the removed member: {restored:?}"
+    );
+
+    assert_eq!(
+        fs::read(repo.join("README.md")).expect("read healed doc"),
+        b"tracked bytes\n",
+        "heal did not rewrite the edited member from graph-owned content"
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).expect("read healed source"),
+        b"pub fn tracked() -> i32 { 1 }\n",
+        "heal did not recreate the removed member from graph-owned content"
+    );
+
+    assert_eq!(
+        drift_report(&runtime, &repo)["clean"],
+        true,
+        "an independent observation must agree the projection is clean"
+    );
+}
+
+/// Falsification for the test above: on a projection that never drifted, heal
+/// must report restoring nothing. A heal that claimed repairs here would mean
+/// the success assertions above prove nothing about restoration.
+#[test]
+fn healing_a_clean_projection_restores_nothing() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize_kin_repo(&runtime, &repo);
+
+    assert_eq!(drift_report(&runtime, &repo)["clean"], true);
+
+    let healed = heal_report(&runtime, &repo);
+    assert_eq!(healed["observed_drift"], 0);
+    assert_eq!(healed["clean"], true);
+    assert!(
+        healed["restored_paths_hex"]
+            .as_array()
+            .expect("restored paths")
+            .is_empty(),
+        "heal claimed a repair on a projection that never drifted: {healed}"
+    );
+
+    // Untracked host content is not graph-owned, so a heal must leave it alone
+    // rather than treating the working copy as something to reconcile.
+    fs::write(repo.join("untracked.rs"), b"pub fn ghost() {}\n").expect("write untracked source");
+    let with_untracked = heal_report(&runtime, &repo);
+    assert_eq!(with_untracked["observed_drift"], 0);
+    assert_eq!(
+        fs::read(repo.join("untracked.rs")).expect("read untracked source"),
+        b"pub fn ghost() {}\n",
+        "heal touched host content the workspace tree does not track"
+    );
+}
+
+/// Heal owns no authority of its own, so outside a repository it must refuse
+/// with the same repository refusal drift gives rather than scanning files.
+#[test]
+fn heal_refuses_outside_a_kin_repository() {
+    let root = tempdir().expect("temp root");
+    let plain = root.path().join("plain");
+    let runtime_anchor = root.path().join("runtime-anchor");
+    fs::create_dir_all(&runtime_anchor).expect("create runtime anchor");
+    fs::create_dir_all(&plain).expect("create plain directory");
+    fs::write(plain.join("main.rs"), b"fn main() {}\n").expect("write host source");
+    let runtime = common::IsolatedDaemonRuntime::new(&runtime_anchor);
+
+    let output = run_kin(&runtime, &plain, &["doctor", "--heal", "--json"]);
     assert!(
         !output.status.success(),
-        "healing a projection is not implemented and must not report success"
+        "heal answered without repository-v6 authority: stdout={}",
+        String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("fail-closed") && stderr.contains("kin checkout"),
-        "the heal refusal must name its open gate and the explicit transaction that does heal, \
-         got: {stderr}"
+        stderr.contains("not a Kin repository"),
+        "heal must refuse when graph authority is absent, got: {stderr}"
     );
 }

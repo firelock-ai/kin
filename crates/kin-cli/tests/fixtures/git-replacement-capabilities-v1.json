@@ -538,16 +538,23 @@
     },
     {
       "command": "doctor --heal",
-      "status": "open_gate",
-      "exposure": "fail_closed",
-      "authority": "repository-v6 explicit transaction or graph-derived rematerialization",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 exact checkout transactions over the diverged paths a drift observation named",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
-        "rematerialize the complete workspace projection under one retained repository authority freeze",
-        "heal only through an explicit repository transaction or graph-derived rematerialization"
+        "restore every path a drift observation named, each under the exact repository checkout transaction that already publishes its workspace mutation",
+        "select restore targets from byte-exact repository paths the daemon reported, never by parsing them back out of a human message",
+        "refuse rather than heal when the report names a divergence count it did not name paths for",
+        "re-observe drift after restoring and fail unless the projection is proved clean"
       ],
-      "evidence_tests": [],
-      "note": "Reporting drift is enabled; healing is not. The graph-derived rematerialization primitive (kin_core::tree::repair_repository_workspace_subtree_projection) is scoped to one selected RepoPath through CheckoutProjectionReceipt.selected, and RepoPath cannot name the whole workspace, so there is no exact whole-workspace heal scope to commit against today. The only heal is `kin checkout <path>`, which is already that explicit transaction. Closing this gate needs a whole-workspace checkout scope in kin-core, not a new repair path."
+      "evidence_tests": [
+        "commands::drift::tests::drift_with_no_named_paths_refuses_instead_of_healing_nothing",
+        "commands::drift::tests::byte_exact_paths_survive_the_hex_round_trip",
+        "commands::drift::tests::reserved_control_paths_are_refused_before_reaching_the_daemon",
+        "commands::drift::tests::a_partial_heal_reports_the_remainder"
+      ],
+      "note": "Heal is the write half of --drift and owns no authority of its own. It observes drift through the daemon, restores each diverged path through the same exact checkout transaction `kin checkout <path>` publishes, and then re-observes, failing unless the projection is proved clean. This is deliberately weaker than one retained whole-workspace freeze: RepoPath still cannot name the whole workspace, so a heal is a sequence of per-path transactions rather than one atomic rematerialization. Authority that moves between them is refused by the checkout that meets it, and the closing observation is what proves the end state, so a partial heal reports the remainder instead of reading as success."
     },
     {
       "command": "semver",

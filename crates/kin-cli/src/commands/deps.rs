@@ -3,21 +3,237 @@
 
 use anyhow::Result;
 use kin_core::registry::{KinRegistry, RegisteredRepo};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 
-/// Show cross-repo dependencies across all registered Kin repositories.
+pub const DEPS_SCHEMA: &str = "kin.deps.v1";
+
+/// One direction of one repository's recorded cross-repo edges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DependencyEdge {
+    pub repo_id: String,
+    pub source: String,
+}
+
+/// The cross-repo neighbourhood of one registered repository.
 ///
-/// The answer is projected from the dependency records ingestion wrote for each
-/// repo, not re-derived by parsing manifests at query time. A repo that carries
-/// no records reports that gap rather than having it filled in from whatever
+/// `depends_on` is what this repository's own records name as providers.
+/// `consumers` is the inverse: every registered repository whose records name
+/// this one as a provider. Both come from records ingestion wrote, so the
+/// inverse direction is recorded truth rather than a re-derivation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoDependencyView {
+    pub schema: String,
+    pub repo_id: String,
+    pub depends_on: Vec<DependencyEdge>,
+    pub consumers: Vec<DependencyEdge>,
+}
+
+/// Show the cross-repo dependencies of the repository the caller is in.
+///
+/// The answer is projected from the dependency records ingestion wrote, not
+/// re-derived by parsing manifests at query time. A repo that carries no
+/// records reports that gap rather than having it filled in from whatever
 /// manifests happen to be on disk.
-pub async fn run() -> Result<()> {
+///
+/// The default scope is one repository because that is the question a caller
+/// standing in a repository is asking. `--all` keeps the fleet-wide listing,
+/// which on a host with many registered repositories is thousands of lines and
+/// buries the caller's own repository in them.
+pub async fn run(all: bool, json: bool) -> Result<()> {
     let registry =
         KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
 
+    if all {
+        return report_every_registered_repo(&registry, json);
+    }
+
+    let layout = crate::commands::require_repository_layout()?;
+    let repo_id = registered_id_for_path(&registry, layout.working_dir())?;
+    let view = repo_dependency_view(&registry, repo_id)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+        return Ok(());
+    }
+    for line in render_repo_view_lines(&view) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Resolve the registry entry for the repository the caller is standing in.
+///
+/// Registration names an entry after the repository's directory, not after the
+/// manifest's repository id, and one host routinely carries several checkouts
+/// sharing a directory name. The recorded path is the only field that
+/// identifies an entry unambiguously, so that is what this matches on. A miss
+/// refuses and says which path it looked for rather than falling back to a
+/// same-named entry that describes some other checkout.
+pub fn registered_id_for_path<'a>(
+    registry: &'a KinRegistry,
+    working_dir: &std::path::Path,
+) -> Result<&'a str> {
+    let matches: Vec<&RegisteredRepo> = registry
+        .repos
+        .iter()
+        .filter(|repo| repo.path == working_dir)
+        .collect();
+
+    match matches.as_slice() {
+        [only] => Ok(only.id.as_str()),
+        [] => {
+            let same_name = working_dir
+                .file_name()
+                .map(|name| {
+                    registry
+                        .repos
+                        .iter()
+                        .filter(|repo| repo.path.file_name() == Some(name))
+                        .count()
+                })
+                .unwrap_or(0);
+            let named = if same_name > 0 {
+                format!(
+                    " The registry holds {same_name} entry(s) with the same directory name \
+                     recorded at other paths, which describe other checkouts and not this one."
+                )
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "no registry entry records the repository at {};{named} run `kin init` here to \
+                 register it and record its cross-repo dependencies, or `kin deps --all` to list \
+                 the repositories that are registered",
+                working_dir.display()
+            )
+        }
+        several => anyhow::bail!(
+            "{} registry entries record the repository at {} ({}); refusing to pick one, run \
+             `kin registry clean` and re-register it",
+            several.len(),
+            working_dir.display(),
+            several
+                .iter()
+                .map(|repo| repo.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Build the recorded cross-repo neighbourhood of `repo_id`.
+///
+/// Refuses rather than reporting an empty neighbourhood when the registry has
+/// no record for `repo_id`: an unregistered repository has no recorded edges at
+/// all, and printing "no dependencies" for it would read as a proved absence.
+pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<RepoDependencyView> {
+    let known_ids: HashSet<String> = registry.repos.iter().map(|r| r.id.clone()).collect();
+    let selected = registry
+        .repos
+        .iter()
+        .find(|repo| repo.id == repo_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository '{repo_id}' is not in the Kin registry, so no cross-repo dependency \
+                 records exist for it; run `kin init` in this repository to register and record \
+                 them, or `kin deps --all` to list the repositories that are registered"
+            )
+        })?;
+
+    let depends_on = dependencies_for_repo(selected, &known_ids)
+        .into_iter()
+        .map(|(repo_id, dep_type)| DependencyEdge {
+            repo_id,
+            source: dep_type.0,
+        })
+        .collect();
+
+    let mut consumers: Vec<DependencyEdge> = registry
+        .repos
+        .iter()
+        .filter(|candidate| candidate.id != repo_id)
+        .flat_map(|candidate| {
+            candidate.dependencies.iter().filter_map(move |dep| {
+                (dep.provider_repo.as_deref() == Some(repo_id)).then(|| DependencyEdge {
+                    repo_id: candidate.id.clone(),
+                    source: dep.source.clone(),
+                })
+            })
+        })
+        .collect();
+    consumers.sort_by(|a, b| (&a.repo_id, &a.source).cmp(&(&b.repo_id, &b.source)));
+    consumers.dedup();
+
+    Ok(RepoDependencyView {
+        schema: DEPS_SCHEMA.to_string(),
+        repo_id: repo_id.to_string(),
+        depends_on,
+        consumers,
+    })
+}
+
+/// Render one repository's neighbourhood, naming the remedy for each empty
+/// direction rather than letting an absent record read as a proved absence.
+pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
+    let mut lines = vec![
+        format!("Cross-repo dependencies for {}:", view.repo_id),
+        String::new(),
+    ];
+
+    lines.push(format!("  depends on ({}):", view.depends_on.len()));
+    if view.depends_on.is_empty() {
+        lines.push("    (no cross-repo dependencies recorded)".to_string());
+    } else {
+        for edge in &view.depends_on {
+            lines.push(format!(
+                "    -> {} ({})",
+                edge.repo_id,
+                DepType::from_source(&edge.source)
+            ));
+        }
+    }
+    lines.push(String::new());
+
+    lines.push(format!("  consumed by ({}):", view.consumers.len()));
+    if view.consumers.is_empty() {
+        lines.push("    (no registered repository records this one as a provider)".to_string());
+    } else {
+        for edge in &view.consumers {
+            lines.push(format!(
+                "    <- {} ({})",
+                edge.repo_id,
+                DepType::from_source(&edge.source)
+            ));
+        }
+    }
+
+    if view.depends_on.is_empty() || view.consumers.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "note: dependencies are recorded when a repo is registered or re-indexed. Re-run \
+             `kin init` in a repository to refresh its records."
+                .to_string(),
+        );
+    }
+    lines.push("Use `kin deps --all` for every registered repository.".to_string());
+    lines
+}
+
+fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()> {
     if registry.repos.is_empty() {
-        println!("No registered repositories.");
-        println!("hint: run `kin init` in a directory to register it");
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": DEPS_SCHEMA,
+                    "repositories": [],
+                }))?
+            );
+        } else {
+            println!("No registered repositories.");
+            println!("hint: run `kin init` in a directory to register it");
+        }
         return Ok(());
     }
 
@@ -26,6 +242,32 @@ pub async fn run() -> Result<()> {
     let mut repo_deps: BTreeMap<String, Vec<(String, DepType)>> = BTreeMap::new();
     for repo in &registry.repos {
         repo_deps.insert(repo.id.clone(), dependencies_for_repo(repo, &known_ids));
+    }
+
+    if json {
+        let repositories: Vec<serde_json::Value> = repo_deps
+            .iter()
+            .map(|(id, deps)| {
+                serde_json::json!({
+                    "repo_id": id,
+                    "depends_on": deps
+                        .iter()
+                        .map(|(repo_id, dep_type)| serde_json::json!({
+                            "repo_id": repo_id,
+                            "source": dep_type.0,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": DEPS_SCHEMA,
+                "repositories": repositories,
+            }))?
+        );
+        return Ok(());
     }
 
     println!("Cross-repo dependencies:\n");
@@ -151,9 +393,12 @@ impl std::fmt::Display for DepType {
 
 #[cfg(test)]
 mod tests {
-    use super::{dependencies_for_repo, DepType};
+    use super::{
+        dependencies_for_repo, registered_id_for_path, render_repo_view_lines,
+        repo_dependency_view, DepType, DEPS_SCHEMA,
+    };
     use kin_core::dependencies::RepoDependency;
-    use kin_core::registry::RegisteredRepo;
+    use kin_core::registry::{KinRegistry, RegisteredRepo};
     use std::collections::HashSet;
 
     fn repo(path: std::path::PathBuf, dependencies: Vec<RepoDependency>) -> RegisteredRepo {
@@ -164,6 +409,31 @@ mod tests {
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
         }
+    }
+
+    fn named_repo(id: &str, dependencies: Vec<RepoDependency>) -> RegisteredRepo {
+        RegisteredRepo {
+            id: id.to_string(),
+            path: std::path::PathBuf::from(format!("/registered/{id}")),
+            entities: 0,
+            last_commit: "2026-01-01T00:00:00Z".to_string(),
+            dependencies,
+        }
+    }
+
+    /// A registry carrying the selected repository plus noise: the transient
+    /// entries a test host accumulates are exactly what makes the fleet-wide
+    /// listing unreadable, so the scoped answer must not contain them.
+    fn registry_with_noise() -> KinRegistry {
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![
+            named_repo("kin", vec![dep("kin-db", "kin-db", "cargo")]),
+            named_repo("kin-db", Vec::new()),
+            named_repo("kin-vfs", vec![dep("kin", "kin", "cargo")]),
+            named_repo("kin-bench", vec![dep("kin", "kin", "subprocess")]),
+            named_repo(".tmp00M8wK", vec![dep("kin", "kin", "cargo")]),
+        ];
+        registry
     }
 
     fn dep(name: &str, provider: &str, source: &str) -> RepoDependency {
@@ -262,5 +532,156 @@ mod tests {
             assert_eq!(DepType::from_source(source).to_string(), label);
         }
         assert_eq!(DepType::from_source("future").to_string(), "future");
+    }
+
+    /// The scoped answer names only the caller's own recorded edges. The four
+    /// unrelated registry entries, including the transient one, are absent: a
+    /// caller standing in `kin` asked about `kin`.
+    #[test]
+    fn scoped_view_reports_one_repository_in_both_directions() {
+        let view = repo_dependency_view(&registry_with_noise(), "kin").unwrap();
+
+        assert_eq!(view.schema, DEPS_SCHEMA);
+        assert_eq!(view.repo_id, "kin");
+        assert_eq!(
+            view.depends_on
+                .iter()
+                .map(|edge| edge.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kin-db"]
+        );
+        assert_eq!(
+            view.consumers
+                .iter()
+                .map(|edge| (edge.repo_id.as_str(), edge.source.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (".tmp00M8wK", "cargo"),
+                ("kin-bench", "subprocess"),
+                ("kin-vfs", "cargo"),
+            ],
+            "consumers are the registered repositories recording this one as a provider"
+        );
+
+        let rendered = render_repo_view_lines(&view).join("\n");
+        assert!(rendered.contains("Cross-repo dependencies for kin:"));
+        assert!(rendered.contains("kin deps --all"));
+        assert!(
+            !rendered.contains("kin-db\n  "),
+            "the fleet listing's per-repo headings must not appear in a scoped answer"
+        );
+    }
+
+    /// Falsification: were the scope wired to the registry rather than to the
+    /// caller, this would return `kin`'s neighbourhood for `kin-db`.
+    #[test]
+    fn scoped_view_follows_the_named_repository_not_the_registry_order() {
+        let view = repo_dependency_view(&registry_with_noise(), "kin-db").unwrap();
+
+        assert!(
+            view.depends_on.is_empty(),
+            "kin-db records no providers: {:?}",
+            view.depends_on
+        );
+        assert_eq!(
+            view.consumers
+                .iter()
+                .map(|edge| edge.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kin"]
+        );
+    }
+
+    /// An unregistered repository has no records at all. Reporting an empty
+    /// neighbourhood would read as a proved absence, so it refuses and names
+    /// both remedies.
+    #[test]
+    fn an_unregistered_repository_refuses_rather_than_reporting_no_dependencies() {
+        let error = repo_dependency_view(&registry_with_noise(), "not-registered")
+            .expect_err("an unregistered repository must not report an empty neighbourhood");
+        let message = error.to_string();
+
+        assert!(message.contains("not in the Kin registry"), "{message}");
+        assert!(message.contains("kin init"), "{message}");
+        assert!(message.contains("kin deps --all"), "{message}");
+    }
+
+    /// Registration names an entry after the repository's directory, so the
+    /// path is what identifies it. Falsification: the entry chosen here is not
+    /// the one whose directory name matches, which is what a name-keyed lookup
+    /// would have returned.
+    #[test]
+    fn the_caller_resolves_to_the_entry_recording_its_own_path() {
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![
+            named_repo("kin", Vec::new()),
+            RegisteredRepo {
+                id: "kin-checkout-two".to_string(),
+                path: std::path::PathBuf::from("/elsewhere/kin"),
+                entities: 0,
+                last_commit: "2026-01-01T00:00:00Z".to_string(),
+                dependencies: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            registered_id_for_path(&registry, std::path::Path::new("/elsewhere/kin")).unwrap(),
+            "kin-checkout-two"
+        );
+        assert_eq!(
+            registered_id_for_path(&registry, std::path::Path::new("/registered/kin")).unwrap(),
+            "kin"
+        );
+    }
+
+    /// An unregistered checkout that shares a name with a registered one must
+    /// refuse rather than answer about the other checkout, and must say the
+    /// same-named entries exist so the miss is not mistaken for a typo.
+    #[test]
+    fn a_same_named_checkout_elsewhere_never_answers_for_this_one() {
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![named_repo("kin", vec![dep("kin-db", "kin-db", "cargo")])];
+
+        let error = registered_id_for_path(&registry, std::path::Path::new("/other/place/kin"))
+            .expect_err("an unregistered checkout must not borrow another's records");
+        let message = error.to_string();
+
+        assert!(message.contains("/other/place/kin"), "{message}");
+        assert!(message.contains("same directory name"), "{message}");
+        assert!(message.contains("kin init"), "{message}");
+        assert!(message.contains("kin deps --all"), "{message}");
+    }
+
+    /// Two entries recording one path is a corrupted registry, not a choice to
+    /// make silently.
+    #[test]
+    fn duplicate_entries_for_one_path_are_refused() {
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![named_repo("kin", Vec::new()), named_repo("kin", Vec::new())];
+        registry.repos[1].id = "kin-duplicate".to_string();
+
+        let error = registered_id_for_path(&registry, std::path::Path::new("/registered/kin"))
+            .expect_err("a duplicated path must be refused");
+
+        assert!(
+            error.to_string().contains("refusing to pick one"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("kin registry clean"), "{error}");
+    }
+
+    /// Both empty directions still say why they are empty, so "no edges" is
+    /// never mistaken for "records exist and prove there are none".
+    #[test]
+    fn empty_directions_name_the_recording_remedy() {
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![named_repo("solo", Vec::new())];
+
+        let view = repo_dependency_view(&registry, "solo").unwrap();
+        let rendered = render_repo_view_lines(&view).join("\n");
+
+        assert!(rendered.contains("no cross-repo dependencies recorded"));
+        assert!(rendered.contains("no registered repository records this one as a provider"));
+        assert!(rendered.contains("kin init"));
     }
 }

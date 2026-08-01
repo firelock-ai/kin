@@ -599,10 +599,16 @@ pub fn verify_repository_workspace_projection(
 /// back from the working copy, so a caller can report coverage instead of
 /// implying that an empty `drift` list proves every tracked member was
 /// comparable on this host.
+/// `drifted_paths` names the same divergences as `drift`, positionally, as the
+/// byte-exact repository paths that produced them. A caller that wants to act
+/// on a divergence needs the path itself: parsing it back out of a human
+/// message would make the repair depend on message wording, and a repair that
+/// silently matched nothing would look exactly like a clean projection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceProjectionDrift {
     pub compared_entries: usize,
     pub drift: Vec<String>,
+    pub drifted_paths: Vec<RepoPath>,
 }
 
 impl WorkspaceProjectionDrift {
@@ -652,16 +658,21 @@ pub fn report_repository_workspace_projection_drift(
         validate_repository_projection_entries_match_tree("current workspace", tree, &entries)?;
         validate_projection_proof_paths(tree.artifacts_by_path().map(|artifact| &artifact.path))?;
         let mut drift = Vec::new();
+        let mut drifted_paths = Vec::new();
         for entry in &entries {
             match projection.projection.validate_frozen_entry_unchanged(entry) {
                 Ok(_) => {}
-                Err(KinError::ProjectionConflict(message)) => drift.push(message),
+                Err(KinError::ProjectionConflict(message)) => {
+                    drift.push(message);
+                    drifted_paths.push(entry.file_id.clone());
+                }
                 Err(error) => return Err(error),
             }
         }
         Ok(WorkspaceProjectionDrift {
             compared_entries: entries.len(),
             drift,
+            drifted_paths,
         })
     }
     #[cfg(not(any(unix, windows)))]
