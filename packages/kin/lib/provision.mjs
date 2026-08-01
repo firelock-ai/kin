@@ -107,6 +107,85 @@ function installFile(src, dest, mode) {
 }
 
 /**
+ * Copy a directory tree, refusing anything that is not a directory or a regular
+ * file. Written out rather than delegating to fs.cpSync so a symlink inside an
+ * extracted archive stops the copy instead of being reproduced under $KIN_HOME,
+ * and so the executable bit is carried across deliberately.
+ */
+function copyTree(src, dest) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`refusing to copy symlink from the release archive: ${src}`);
+  }
+  if (stat.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      copyTree(path.join(src, entry), path.join(dest, entry));
+    }
+    return;
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing to copy a non-regular archive entry: ${src}`);
+  }
+  fs.copyFileSync(src, dest);
+  fs.chmodSync(dest, stat.mode & 0o111 ? 0o755 : 0o644);
+}
+
+/**
+ * Install the macOS notification bundle from an extracted release archive.
+ *
+ * macOS reads a notification's sender name, icon, and grouping from the posting
+ * process's bundle; a CLI has none, so without this every Kin notification is
+ * credited to Script Editor. That is a silent downgrade rather than a visible
+ * failure, which is why its absence is reported here rather than passed over.
+ *
+ * Replaced whole rather than merged, for the same reason install.sh does: a
+ * stale executable left inside a newer bundle breaks the signature seal macOS
+ * checks over the bundle as a unit.
+ *
+ * Returns true when a bundle was installed.
+ */
+export function installNotifierBundle(root, env, platform, log) {
+  if (platform !== 'darwin') return false;
+
+  const src = path.join(root, 'KinNotifier.app');
+  if (!fs.existsSync(src)) {
+    log(
+      'kin: warning: this release archive carries no KinNotifier.app, so notifications will post ' +
+        'as Script Editor rather than as Kin. Upgrade to a release that ships the bundle, or ' +
+        'install via https://github.com/firelock-ai/kin (scripts/install.sh).',
+    );
+    return false;
+  }
+  // A bundle missing either of these installs cleanly and then misbehaves at
+  // runtime: nothing to launch, or nothing for macOS to attribute the
+  // notification to. Refuse it here, where the cause is still visible.
+  for (const required of ['Contents/MacOS/KinNotifier', 'Contents/Info.plist']) {
+    if (!fs.existsSync(path.join(src, required))) {
+      throw new Error(`release archive KinNotifier.app is missing ${required}; refusing to install it`);
+    }
+  }
+
+  const libDir = path.join(kinHome(env), 'lib');
+  fs.mkdirSync(libDir, { recursive: true });
+  const dest = path.join(libDir, 'KinNotifier.app');
+  fs.rmSync(dest, { recursive: true, force: true });
+  copyTree(src, dest);
+  fs.chmodSync(path.join(dest, 'Contents', 'MacOS', 'KinNotifier'), 0o755);
+
+  // Registering with LaunchServices is what lets the notification daemon
+  // validate the bundle; an unregistered app is refused outright. Authorization
+  // itself is NOT requested here: an unanswered prompt is recorded as a
+  // permanent denial, so it must be raised interactively by `kin setup`.
+  const lsregister =
+    '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
+  if (fs.existsSync(lsregister)) {
+    spawnSync(lsregister, ['-f', dest], { stdio: 'ignore' });
+  }
+  return true;
+}
+
+/**
  * Download, verify, and install the pinned Kin release. Returns the installed
  * managed `kin` path. Mirrors scripts/install.sh: kin + kin-daemon are
  * mandatory, kin-vfs and the projection shim library are optional extras.
@@ -175,6 +254,10 @@ export async function provision(version, opts = {}) {
         fs.mkdirSync(libDir, { recursive: true });
         installFile(libSrc, path.join(libDir, lib), 0o644);
       }
+    }
+
+    if (installNotifierBundle(root, env, platform, log)) {
+      log('kin: notification identity installed (KinNotifier.app)');
     }
 
     writeLauncherStamp(version, env);

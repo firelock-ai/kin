@@ -254,6 +254,11 @@ if [ "$HAVE_NOTIFIER" = "1" ]; then
     LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
     [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$KIN_LIB/KinNotifier.app" >/dev/null 2>&1 || true
     ok "Notification identity installed (KinNotifier.app)"
+elif [ "$OS" = "macos" ]; then
+    # Every macOS release archive is supposed to carry the bundle. Without it
+    # Kin still runs, but every notification is credited to Script Editor, and
+    # that downgrade is invisible unless it is said out loud here.
+    err "This archive carries no KinNotifier.app; notifications will post as Script Editor, not as Kin"
 fi
 
 if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then

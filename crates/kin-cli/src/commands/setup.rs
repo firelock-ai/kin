@@ -11154,7 +11154,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
     print_intent_followups(&plan, interactive);
 
-    request_notification_authorization(interactive);
+    report_notification_identity(interactive);
 
     // The final checklist is the real first-run health engine — not a parallel
     // set of hardcoded probes. Every line below reflects probed state.
@@ -11167,6 +11167,63 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
 
     Ok(())
+}
+
+/// Get the notification identity working, and say so when it cannot be.
+///
+/// Three things have to be true for a notification to arrive as Kin: the bundle
+/// has to exist, macOS has to know about it, and the user has to have allowed
+/// it. Setup is where all three are settled, because it is the one moment a
+/// person is present. When the first is not true, the remaining two cannot be
+/// fixed here, so the gap is reported instead of silently skipped.
+fn report_notification_identity(interactive: bool) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(notifier) = kin_notify::Notifier::new() else {
+        return;
+    };
+    if let Some(degradation) = notifier.status().degradation() {
+        println!();
+        println!("  {} {degradation}", style("!").yellow());
+        return;
+    }
+    register_notification_bundle(&notifier);
+    request_notification_authorization(interactive);
+}
+
+/// Tell LaunchServices where the bundle is.
+///
+/// The notification daemon validates the posting bundle through LaunchServices
+/// and refuses one it does not know, so a bundle that was copied into place
+/// without being registered is present and still useless. The managed installer
+/// registers what it writes; a channel that installs into its own prefix, such
+/// as a Homebrew formula, cannot, so setup does it for whichever copy is
+/// actually resolved. Registration is idempotent and best effort: it is not
+/// worth failing setup over, and the authorization step below reports the
+/// result either way.
+fn register_notification_bundle(notifier: &kin_notify::Notifier) {
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+    let Some(executable) = notifier.resolve_notifier() else {
+        return;
+    };
+    // The bundle root is three levels above Contents/MacOS/<executable>.
+    let Some(bundle) = executable
+        .parent()
+        .and_then(|macos| macos.parent())
+        .and_then(|contents| contents.parent())
+    else {
+        return;
+    };
+    if !Path::new(LSREGISTER).is_file() {
+        return;
+    }
+    let _ = std::process::Command::new(LSREGISTER)
+        .arg("-f")
+        .arg(bundle)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Ask macOS for permission to post notifications, once, from the one place a
@@ -11188,10 +11245,12 @@ fn request_notification_authorization(interactive: bool) {
     let Ok(notifier) = kin_notify::Notifier::new() else {
         return;
     };
-    let executable = notifier.notifier_path();
-    if !executable.is_file() {
+    // Resolved rather than assumed: a channel that cannot write to the home
+    // directory installs its bundle beside the binary, and that copy holds the
+    // same identity the authorization decision is recorded against.
+    let Some(executable) = notifier.resolve_notifier() else {
         return;
-    }
+    };
 
     // Only ask when the decision has not already been made; re-running setup
     // must not nag, and macOS answers from the stored decision anyway.

@@ -52,13 +52,25 @@ test('parseSha256File accepts shasum output and rejects junk', () => {
 // containing the archive layout install.sh documents: a kin-* subdirectory
 // with kin + kin-daemon. The fake fetch serves those bytes; no network.
 
-function makeFixture({ withDaemon = true } = {}) {
+function makeFixture({ withDaemon = true, notifier = 'complete', notifierBody = 'notifier-v1' } = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-fixture-'));
   const stage = path.join(work, 'kin-macos-aarch64');
   fs.mkdirSync(stage, { recursive: true });
   fs.writeFileSync(path.join(stage, 'kin'), '#!/bin/sh\necho "kin 9.9.9 (test)"\n');
   if (withDaemon) {
     fs.writeFileSync(path.join(stage, 'kin-daemon'), '#!/bin/sh\necho daemon\n');
+  }
+  if (notifier !== 'absent') {
+    const bundle = path.join(stage, 'KinNotifier.app');
+    fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+    fs.mkdirSync(path.join(bundle, 'Contents', 'Resources'), { recursive: true });
+    const executable = path.join(bundle, 'Contents', 'MacOS', 'KinNotifier');
+    fs.writeFileSync(executable, `#!/bin/sh\necho ${notifierBody}\n`);
+    fs.chmodSync(executable, 0o755);
+    fs.writeFileSync(path.join(bundle, 'Contents', 'Resources', 'Kin.icns'), 'icns');
+    if (notifier === 'complete') {
+      fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), '<plist/>');
+    }
   }
   const archivePath = path.join(work, 'kin-macos-aarch64.tar.gz');
   const tar = spawnSync('tar', ['-czf', archivePath, '-C', work, 'kin-macos-aarch64'], {
@@ -94,6 +106,105 @@ test('provision verifies, installs kin + kin-daemon, and stamps the version', as
   assert.ok(fs.existsSync(path.join(home, 'bin', 'kin-daemon')));
   assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
   assert.equal(readLauncherStamp(env), '9.9.9');
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision installs the macOS notification bundle so notifications post as Kin', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+  });
+  const executable = path.join(home, 'lib', 'KinNotifier.app', 'Contents', 'MacOS', 'KinNotifier');
+  assert.ok(fs.existsSync(executable), 'the bundle must reach $KIN_HOME/lib');
+  assert.ok(fs.existsSync(path.join(home, 'lib', 'KinNotifier.app', 'Contents', 'Info.plist')));
+  assert.ok(fs.statSync(executable).mode & 0o111, 'a notifier without +x cannot be launched');
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision replaces a stale bundle whole rather than merging into it', async () => {
+  const { work, fetchImpl } = makeFixture({ notifierBody: 'notifier-v2' });
+  const home = path.join(work, 'kin-home');
+  // A previous release's bundle, carrying a file the new one does not have.
+  const dest = path.join(home, 'lib', 'KinNotifier.app');
+  fs.mkdirSync(path.join(dest, 'Contents', 'MacOS'), { recursive: true });
+  fs.writeFileSync(path.join(dest, 'Contents', 'MacOS', 'KinNotifier'), 'stale');
+  fs.writeFileSync(path.join(dest, 'Contents', 'Stale.txt'), 'left over');
+
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+  });
+  assert.match(
+    fs.readFileSync(path.join(dest, 'Contents', 'MacOS', 'KinNotifier'), 'utf8'),
+    /notifier-v2/,
+  );
+  assert.ok(
+    !fs.existsSync(path.join(dest, 'Contents', 'Stale.txt')),
+    'a merged bundle keeps files the new release removed, breaking its signature seal',
+  );
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision says so when a macOS archive carries no bundle', async () => {
+  const { work, fetchImpl } = makeFixture({ notifier: 'absent' });
+  const home = path.join(work, 'kin-home');
+  const lines = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: (line) => lines.push(line),
+  });
+  // The CLI still installs: a missing bundle degrades notifications, it does
+  // not break Kin. It must not degrade quietly, though.
+  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
+  const warning = lines.find((line) => line.includes('KinNotifier.app'));
+  assert.ok(warning, `expected a warning naming the bundle, got: ${lines.join(' | ')}`);
+  assert.match(warning, /Script Editor/);
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision refuses a bundle that has nothing to post under', async () => {
+  const { work, fetchImpl } = makeFixture({ notifier: 'no-plist' });
+  const home = path.join(work, 'kin-home');
+  await assert.rejects(
+    provision('9.9.9', {
+      env: { KIN_HOME: home },
+      platform: 'darwin',
+      arch: 'arm64',
+      fetchImpl,
+      log: () => {},
+    }),
+    /Info\.plist/,
+  );
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision installs no bundle on a platform that has no notification bundle', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const lines = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'linux',
+    arch: 'x64',
+    fetchImpl,
+    log: (line) => lines.push(line),
+  });
+  assert.ok(!fs.existsSync(path.join(home, 'lib', 'KinNotifier.app')));
+  assert.ok(
+    !lines.some((line) => line.includes('KinNotifier.app')),
+    'a platform with no bundle concept has nothing to warn about',
+  );
   fs.rmSync(work, { recursive: true, force: true });
 });
 
