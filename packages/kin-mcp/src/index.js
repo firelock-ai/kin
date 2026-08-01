@@ -320,8 +320,54 @@ async function installKinBinary({ binaryPath, env, platform, arch, version }) {
     binaryName,
     daemonBinaryName,
     binaryPath,
-    platform
+    platform,
+    env
   });
+}
+
+function mergeEnvironment(base, overrides) {
+  const merged = { ...base };
+  for (const [name, value] of Object.entries(overrides || {})) {
+    for (const inherited of Object.keys(merged)) {
+      if (inherited.toLowerCase() === name.toLowerCase()) {
+        delete merged[inherited];
+      }
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
+function environmentValue(env, name) {
+  const key = Object.keys(env).find(candidate => candidate.toLowerCase() === name.toLowerCase());
+  return key === undefined ? undefined : env[key];
+}
+
+function windowsSystemTarPath(env) {
+  const systemRoot = environmentValue(env, 'SystemRoot');
+  if (!systemRoot) {
+    throw new Error('native Windows ZIP extraction requires SystemRoot');
+  }
+  return path.win32.join(systemRoot, 'System32', 'tar.exe');
+}
+
+function archiveExtraction(platform, env, archiveName) {
+  if (platform === 'win32') {
+    if (process.platform === 'win32') {
+      return {
+        executable: windowsSystemTarPath(env),
+        args: ['-xf', archiveName, '-C', '.']
+      };
+    }
+    // Cross-target tests on Unix exercise genuine ZIP bytes with the host's
+    // deterministic system unzip. Production never installs Windows assets
+    // on a Unix host.
+    return {
+      executable: '/usr/bin/unzip',
+      args: ['-q', archiveName, '-d', '.']
+    };
+  }
+  return { executable: 'tar', args: ['-xf', archiveName, '-C', '.'] };
 }
 
 async function installFromArchive({
@@ -331,7 +377,8 @@ async function installFromArchive({
   binaryName,
   daemonBinaryName,
   binaryPath,
-  platform
+  platform,
+  env
 }) {
   const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-install-'));
   const archivePath = path.join(tmpRoot, archiveName);
@@ -341,9 +388,15 @@ async function installFromArchive({
 
   try {
     await fsp.writeFile(archivePath, archiveBytes);
-    // Modern Windows ships bsdtar as `tar`; `-xf` auto-detects both the flat
-    // Windows zip and the wrapped Unix tar.gz release archives.
-    await execFile('tar', ['-xf', archivePath, '-C', tmpRoot]);
+    const toolEnv = mergeEnvironment(process.env, env);
+    const extraction = archiveExtraction(platform, toolEnv, archiveName);
+    // Windows authority is the absolute System32 bsdtar, never a Git/MSYS or
+    // user-provided `tar` found through PATH. Relative operands also avoid the
+    // GNU remote-host interpretation of `C:\\...` paths.
+    await execFile(extraction.executable, extraction.args, {
+      cwd: tmpRoot,
+      env: toolEnv
+    });
 
     const kinStaged = await stageBinary({
       tmpRoot,

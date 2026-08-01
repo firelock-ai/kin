@@ -130,12 +130,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Test native Windows MCP wrapper provisioning
+      - name: Test both public npm surfaces on native Windows
         shell: bash
         run: |
           set -euo pipefail
+          npm test --prefix ./packages/kin
+          npm run lint --prefix ./packages/kin
           npm test --prefix ./packages/kin-mcp
           npm run lint --prefix ./packages/kin-mcp
+          node --check ./scripts/prove-windows-npm-first-run.mjs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
@@ -292,6 +295,10 @@ jobs:
           run_required_filter "kin-cli Windows modules" "windows" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
+          run_required_exact "MCP Windows sibling daemon discovery" \
+            "daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-mcp --no-default-features --lib
           run_required_filter "bounded CLI test subprocesses" \
             "commands::test_subprocess::tests" \
             --locked --target x86_64-pc-windows-msvc \
@@ -330,12 +337,13 @@ jobs:
       # can report an admission change no earlier than a required check
       # failing on a release commit. The feature set matches the installer
       # leg's so both legs drive the same build of the command.
-      - name: Build the Windows CLI the admission assertions drive
+      - name: Build the Windows binaries the admission and npm assertions drive
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --bin kin
+            -p kin-cli -p kin-daemon --no-default-features \
+            --bin kin --bin kin-daemon
 
       - name: Assert the Windows admission contract
         shell: bash
@@ -344,6 +352,15 @@ jobs:
           bash ./scripts/assert-windows-init-contract.sh \
             "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/debug/kin.exe" \
             "$RUNNER_TEMP/kin-windows-admission"
+
+      - name: Prove both npm surfaces from built Windows binaries
+        shell: bash
+        env:
+          KIN_NPM_PROOF_KIN_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin.exe
+          KIN_NPM_PROOF_DAEMON_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin-daemon.exe
+        run: |
+          set -euo pipefail
+          node ./scripts/prove-windows-npm-first-run.mjs
 
   windows-installer:
     name: Windows installer + vector-free release build
