@@ -30,6 +30,29 @@ const MAX_ARCHIVE_MEMBERS = 256;
 const MAX_BUNDLE_ENTRIES = 64;
 const MAX_BUNDLE_DEPTH = 6;
 
+// Component file names a release archive root may carry, by target family.
+//
+// This is the release-build side of a two-sided contract. `kin update` stages a
+// downloaded archive by matching every member's file name against the component
+// list for the running platform and aborts the whole staging on the first name
+// it does not manage. A stray file at the archive root therefore does not
+// degrade an update, it stops every update on that platform until a new release
+// replaces the archive. Naming the sanctioned set here is what keeps that
+// failure inside the release build, where the archive can still be rebuilt.
+//
+// The set is an upper bound rather than a checklist. Which components are
+// mandatory is decided by the packaging step's own presence assertions and by
+// the publish job's per-artifact required list; what this decides is only which
+// names may appear at all, which is why the Windows projection components sit
+// here even though that leg ships them opportunistically. Adding a component to
+// a release archive means adding it to the updater's platform component list
+// and to this set together.
+const ROOT_FILES_BY_FAMILY = {
+  darwin: Object.freeze(["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"]),
+  linux: Object.freeze(["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"]),
+  windows: Object.freeze(["kin.exe", "kin-daemon.exe", "kin-vfs.exe", "kin_vfs_shim.dll"]),
+};
+
 // Whether a target triple is one whose archive may carry the notification
 // bundle. Only macOS has a bundle concept, so every other leg must stay flat.
 function targetCarriesNotifierBundle(target) {
@@ -37,6 +60,26 @@ function targetCarriesNotifierBundle(target) {
     throw new Error("release archive shape requires a target triple");
   }
   return target.endsWith("-apple-darwin");
+}
+
+// The component file names an archive for `target` may carry at its root.
+//
+// An unrecognized triple is refused rather than defaulted onto a family. The
+// release matrix is a closed list that the publish job pins by target, so a
+// triple that reaches here without a family is a matrix change that did not
+// update this file, and judging its archive by another platform's names would
+// admit exactly the entries this set exists to refuse.
+function releaseArchiveRootFiles(target) {
+  if (targetCarriesNotifierBundle(target)) {
+    return ROOT_FILES_BY_FAMILY.darwin;
+  }
+  if (target.includes("-windows-")) {
+    return ROOT_FILES_BY_FAMILY.windows;
+  }
+  if (target.includes("-linux-")) {
+    return ROOT_FILES_BY_FAMILY.linux;
+  }
+  throw new Error(`release archive shape has no component list for target ${target}`);
 }
 
 // Split an archive member path into its segments, rejecting the encodings that
@@ -82,6 +125,7 @@ function assertReleaseArchiveMemberPaths(memberPaths, options) {
     throw new Error("release archive shape requires an artifact name");
   }
   const bundleAllowed = targetCarriesNotifierBundle(target);
+  const rootFiles = releaseArchiveRootFiles(target);
   const label = `${artifact} archive listing`;
   if (!Array.isArray(memberPaths) || memberPaths.length === 0) {
     throw new Error(`${label} is empty`);
@@ -128,6 +172,9 @@ function assertReleaseArchiveMemberPaths(memberPaths, options) {
     }
     if (isDirectory) {
       throw new Error(`${label} declares unexpected directory '${member}'`);
+    }
+    if (!rootFiles.includes(relative[0])) {
+      throw new Error(`${label} declares unexpected file '${member}'`);
     }
   }
 
@@ -204,6 +251,7 @@ function assertNotifierBundle(bundleRoot, bundleName) {
 function classifyReleaseArchiveRoot(contentRoot, options) {
   const { target } = options ?? {};
   const bundleAllowed = targetCarriesNotifierBundle(target);
+  const rootFiles = releaseArchiveRootFiles(target);
   const files = [];
   const bundles = [];
   for (const entry of fs.readdirSync(contentRoot, { withFileTypes: true })) {
@@ -211,6 +259,11 @@ function classifyReleaseArchiveRoot(contentRoot, options) {
       throw new Error(`release archive root entry '${entry.name}' is a symbolic link`);
     }
     if (entry.isFile()) {
+      if (!rootFiles.includes(entry.name)) {
+        throw new Error(
+          `release archive root for ${target} holds unexpected file '${entry.name}'`
+        );
+      }
       files.push(entry.name);
       continue;
     }
@@ -244,5 +297,6 @@ module.exports = {
   NOTIFIER_BUNDLE_DIR,
   assertReleaseArchiveMemberPaths,
   classifyReleaseArchiveRoot,
+  releaseArchiveRootFiles,
   targetCarriesNotifierBundle,
 };
