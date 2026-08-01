@@ -767,6 +767,7 @@ def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> No
     for policy in (
         'parent="$(dirname "$dir")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
+        'if [ "$staged" != "$expected_residue" ]; then',
     ):
         require(active, policy, "reachable Windows stage-leak check")
 
@@ -898,19 +899,20 @@ def assert_install_proof_windows_admission_contract(
                 f"expected {binding}"
             )
     for policy in (
-        'require_refused "Windows exact-Git admission"',
+        'require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2',
         'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
         'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
         'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows native-unborn bootstrap"',
+        'require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2',
         'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
         'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows non-empty native boundary"',
+        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
         'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
         'fail "$1 unexpectedly succeeded" "$3"',
         'if [ -e "$2/.kin" ]; then',
         'parent="$(dirname "$2")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
+        'if [ "$staged" != "$4" ]; then',
     ):
         require(active, policy, "shipped Windows admission contract proof")
 
@@ -3972,6 +3974,10 @@ def main() -> None:
             "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
         ),
         (
+            "the non-empty boundary stops having to leave nothing behind",
+            'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
+        ),
+        (
             "a successful Windows admission stops failing the leg",
             'fail "$1 unexpectedly succeeded" "$3"',
         ),
@@ -4218,9 +4224,9 @@ def main() -> None:
         'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
         'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
         'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows exact-Git admission"',
-        'require_refused "Windows native-unborn bootstrap"',
-        'require_refused "Windows non-empty native boundary"',
+        'require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2',
+        'require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2',
+        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
         'fail "$label unexpectedly succeeded" "$log"',
         'if [ -e "$dir/.kin" ]; then',
         "'.kin.init-*'",

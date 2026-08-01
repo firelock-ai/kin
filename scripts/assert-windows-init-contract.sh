@@ -128,6 +128,7 @@ require_refused() {
   local label="$1"
   local dir="$2"
   local log="$3"
+  local expected_residue="$4"
   if (cd "$dir" && "$kin_bin" init) > "$log" 2>&1; then
     fail "$label unexpectedly succeeded" "$log"
   fi
@@ -138,22 +139,32 @@ require_refused() {
   if [ -e "$dir/.kin" ]; then
     fail "$label left a half-created repository at $dir/.kin" "$log"
   fi
+  # WINDOWS CLEANUP GAP, asserted rather than assumed.
+  #
   # The stage is a sibling of the admitted directory, not a child of it:
   # crates/kin-core/src/git_init.rs derives it from the source's parent and
   # crates/kin-core/src/init.rs from the working directory's, so a count taken
-  # inside the admitted directory can never see one and would pass on every
-  # input. Each boundary therefore owns a private parent holding nothing but
-  # the directory under test, which keeps a survivor attributable to the
-  # boundary that left it. Windows needs this most: orphaned stages are reaped
-  # on the next init only on Unix, and the cleanup that does run there is
-  # best-effort against the same open-handle behavior that refuses the
-  # admission in the first place.
+  # inside the admitted directory can never see one and would report zero on
+  # every input. Each boundary therefore owns a private parent holding nothing
+  # but the directory under test, which keeps a survivor attributable to the
+  # boundary that left it.
+  #
+  # Counted where they actually appear, the two boundaries that reach the graph
+  # store DO leave their unpublished stage and its `.owner` marker behind,
+  # which is two entries each. Nothing reaps them: recover_orphaned_repository_stages
+  # is `#[cfg(not(unix))] => Ok(0)` and the cleanup that does run is best-effort
+  # against the same open handles that refuse the admission. That is a real
+  # defect and it was invisible for as long as the count looked in the wrong
+  # place. It is asserted by exact count in both directions, so the
+  # transaction-layer port that finally drives it to zero trips this and has to
+  # come here and say so, exactly as a restored admission trips the refusal
+  # assertion above.
   local parent
   parent="$(dirname "$dir")"
   local staged
   staged="$(count_matching "$parent" '.kin.init-*')"
-  if [ "$staged" != "0" ]; then
-    fail "$label left $staged unpublished stage directory(s) in $parent" "$log"
+  if [ "$staged" != "$expected_residue" ]; then
+    fail "$label left $staged stage entries in $parent, expected $expected_residue" "$log"
   fi
 }
 
@@ -184,7 +195,7 @@ mkdir -p "$git_boundary"
   # one under test.
   git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
 )
-require_refused "Windows exact-Git admission" "$git_boundary" "$git_log"
+require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2
 refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE" "$git_log"
 refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL" "$git_log"
 require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP" "$git_log"
@@ -192,7 +203,7 @@ require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP" "$git_log"
 native_boundary="$scratch/native-unborn/repo"
 native_log="$scratch/kin-init-native-unborn.txt"
 mkdir -p "$native_boundary"
-require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log"
+require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2
 refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL" "$native_log"
 require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP" "$native_log"
 
@@ -202,11 +213,11 @@ populated_boundary="$scratch/native-populated/repo"
 populated_log="$scratch/kin-init-native-populated.txt"
 mkdir -p "$populated_boundary"
 printf 'untracked\n' > "$populated_boundary/stray.txt"
-require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"
+require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0
 require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL" "$populated_log"
 
 if [ "$failures" -ne 0 ]; then
   echo "::error::Windows admission did not behave as asserted ($failures check(s) failed)"
   exit 1
 fi
-echo "Windows admission refused every boundary at the cause it names, and published nothing."
+echo "Windows admission refused every boundary at the cause it names, published no authority, and left exactly the unreaped stage residue this platform is known to leave."
