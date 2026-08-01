@@ -896,6 +896,25 @@ fn report_successful_install(
         );
     }
 
+    // The transaction replaces the notification bundle by rename, so its path
+    // is unchanged while the inode, the code signature, and the `Info.plist`
+    // behind it are not. LaunchServices still holds the record it built for the
+    // tree that was moved away, and the notification daemon refuses a posting
+    // bundle it cannot validate through that record, so the updater owes the
+    // same registration `scripts/install.sh` and the npm launcher perform for
+    // the copies they write. Only the managed root is registered, because that
+    // is the only copy this transaction maintains; an install with no bundle
+    // resolves nothing and registers nothing.
+    if let Err(error) =
+        kin_notify::Notifier::with_home(kin_home.to_path_buf()).register_with_launch_services()
+    {
+        eprintln!(
+            "WARNING: the update installed the notification bundle but could not register it with \
+             LaunchServices, so notifications may post as Script Editor until `kin setup` runs \
+             again: {error:#}"
+        );
+    }
+
     attempt_pending_mcp_repair(lock)?;
     let pending = restart_pending_path(kin_home);
     println!("Installed v{latest} on disk.");
@@ -6666,11 +6685,17 @@ where
         let mcp_repair_pending = mcp_repair_pending_record(lock, target_version)?;
         let transaction_root = create_transaction_root(kin_home)?;
         let backup_root = transaction_root.join("old");
+        // The schema is what this build writes, not what this platform happens
+        // to fill in. The bundle record stays empty because no archive for a
+        // platform without `spec_carries_notifier_bundle` carries one, and
+        // pinning the literal here is how the constant and the journal drift
+        // apart at the next schema bump.
         let mut journal = TransactionJournal {
-            schema_version: 2,
+            schema_version: TRANSACTION_JOURNAL_SCHEMA,
             target_version: target_version.to_string(),
             phase: TransactionPhase::Prepared,
             components,
+            notifier_bundle: JournalBundle::default(),
             restart_pending: restart_pending.clone(),
             mcp_repair_pending,
         };
@@ -11711,6 +11736,15 @@ mod tests {
         }
     }
 
+    /// Which component contract a crash worker runs under, chosen by the parent
+    /// so one worker can drive both the bundle-free and bundle-carrying paths.
+    fn worker_spec() -> &'static [ComponentSpec] {
+        match std::env::var("KIN_UPDATE_TEST_WORKER_SPEC").as_deref() {
+            Ok("macos") => MACOS_COMPONENTS,
+            _ => LINUX_COMPONENTS,
+        }
+    }
+
     fn run_crash_recovery_case(point: &str, committed: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
@@ -11786,6 +11820,97 @@ mod tests {
             assert!(!restart_pending_path(lock.root()).exists());
         }
         assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+    }
+
+    /// Kill a real update process between two bundle steps and let a later
+    /// recovery reverse it.
+    ///
+    /// A clean failure through the swap hook unwinds inside the process that
+    /// created the transaction, so it proves only the rollback the failing
+    /// process itself performs. A durable recovery has to reach the same state
+    /// from the journal alone, with no live process and no memory of how far it
+    /// got, which is the case a power loss actually produces.
+    #[cfg(unix)]
+    fn run_bundle_crash_recovery_case(point: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        write_notifier_bundle(&kin_home, b"old-notifier");
+        let old = bundle_snapshot(&kin_home, MACOS_COMPONENTS);
+        stage_archive(
+            &full_macos_archive("kin-macos-aarch64"),
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::update::tests::crash_recovery_worker",
+                "--nocapture",
+            ])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("KIN_HOME", &kin_home)
+            .env_remove("KIN_DIR")
+            .env_remove("KIN_MCP_REPO")
+            .env("KIN_UPDATE_TEST_WORKER_HOME", &kin_home)
+            .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
+            .env("KIN_UPDATE_TEST_WORKER_SPEC", "macos")
+            .env("KIN_UPDATE_TEST_CRASH_POINT", point);
+        let output =
+            test_subprocess_output(command, &format!("bundle crash worker at {point}")).unwrap();
+        // Reaching the kill point is itself the evidence that the bundle's
+        // fault-injection labels are live: a worker that never reached one
+        // would exit having completed the update instead.
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "worker output: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!transaction_dirs(&kin_home).unwrap().is_empty());
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        recover_stale_transactions(&lock, MACOS_COMPONENTS).unwrap();
+        assert_eq!(
+            notifier_executable_bytes(&kin_home),
+            b"old-notifier",
+            "recovery after a crash at {point} must restore the previous bundle"
+        );
+        assert!(
+            kin_home
+                .join("lib")
+                .join(NOTIFIER_BUNDLE_DIR)
+                .join("Contents/Resources/Kin.icns")
+                .exists(),
+            "the restored bundle must be the whole original tree"
+        );
+        assert_bundle_matches(&kin_home, MACOS_COMPONENTS, &old);
+        assert!(!restart_pending_path(lock.root()).exists());
+        assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+    }
+
+    /// Both bundle steps happen before the commit fence, so a crash at either
+    /// one has to leave the install on the version it started from.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn subprocess_crashes_around_the_bundle_swap_recover_the_old_bundle() {
+        for point in [
+            "after-backup-notifier-bundle",
+            "after-install-notifier-bundle",
+        ] {
+            run_bundle_crash_recovery_case(point);
+        }
     }
 
     #[cfg(unix)]
@@ -11916,6 +12041,15 @@ cwd = {:?}
     /// A macOS release archive carries KinNotifier.app as a directory. The
     /// stager materializes it under the staging tree's `lib`, preserving the
     /// executable bit its executable needs to be launchable at all.
+    ///
+    /// Unix-only, and not because of the host this runs on: the primitives that
+    /// materialize a bundle tree are `#[cfg(unix)]`, so on Windows the staging
+    /// sink refuses a bundle outright. Every test below that stages or installs
+    /// a bundle-carrying contract is gated for that reason. The rest of the
+    /// bundle rules key on the component contract rather than the host and so
+    /// hold everywhere, including a bundle offered to a contract that carries
+    /// none.
+    #[cfg(unix)]
     #[test]
     fn macos_archive_carrying_the_notifier_bundle_stages() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11979,6 +12113,7 @@ cwd = {:?}
 
     /// A macOS archive whose bundle cannot post as Kin is refused at staging
     /// rather than installed and discovered later as a wrong sender name.
+    #[cfg(unix)]
     #[test]
     fn a_macos_archive_missing_the_bundle_identity_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12097,6 +12232,7 @@ cwd = {:?}
     /// the new archive carries. A bundle that survives an update unchanged is a
     /// silent version skew: the CLI reports the new version while the sender
     /// identity, icon, and any notifier fix stay on the old release.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn update_refreshes_the_installed_notifier_bundle() {
@@ -12135,6 +12271,7 @@ cwd = {:?}
     /// A failed update must leave the bundle as it found it. The bundle is
     /// swapped before the components, so by the time a component swap fails the
     /// new bundle is already live and the rollback has real work to undo.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn a_failed_update_restores_the_previous_notifier_bundle() {
@@ -12193,6 +12330,7 @@ cwd = {:?}
     /// half-way. A rollback that finds such a tree must still finish, because
     /// refusing it would leave every later update blocked behind a state only
     /// manual deletion could clear.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn a_rollback_restores_the_bundle_over_a_partially_removed_tree() {
@@ -12247,6 +12385,7 @@ cwd = {:?}
 
     /// Rolling back the update that brought the very first bundle means leaving
     /// the install without one, not leaving the new one behind.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn a_failed_first_bundle_install_removes_what_it_installed() {
@@ -12991,9 +13130,14 @@ cwd = {:?}
                 libc::umask(mode as libc::mode_t);
             }
         }
+        // The contract under test is a parameter, not a constant: the
+        // notification bundle's transaction steps exist only on a spec that
+        // carries one, so a worker hardcoded to the Linux contract can never
+        // reach their fault-injection points.
+        let spec = worker_spec();
         if std::env::var_os("KIN_UPDATE_TEST_WORKER_RECOVER").is_some() {
             let lock = InstallRootLock::acquire_existing(Path::new(&kin_home)).unwrap();
-            recover_stale_transactions(&lock, LINUX_COMPONENTS)
+            recover_stale_transactions(&lock, spec)
                 .expect("crash worker must reach its configured recovery kill point");
             return;
         }
@@ -13005,7 +13149,7 @@ cwd = {:?}
         install_staged_bundle_with_hook(
             Path::new(&kin_home),
             Path::new(&stage),
-            LINUX_COMPONENTS,
+            spec,
             "0.2.22",
             &test_restart_pending("0.2.22"),
             |index, _| {

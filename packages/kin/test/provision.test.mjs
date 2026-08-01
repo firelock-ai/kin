@@ -173,19 +173,28 @@ test('provision says so when a macOS archive carries no bundle', async () => {
   fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('provision refuses a bundle that has nothing to post under', async () => {
+test('provision refuses a bundle that has nothing to post under, without failing the install', async () => {
   const { work, fetchImpl } = makeFixture({ notifier: 'no-plist' });
   const home = path.join(work, 'kin-home');
-  await assert.rejects(
-    provision('9.9.9', {
-      env: { KIN_HOME: home },
-      platform: 'darwin',
-      arch: 'arm64',
-      fetchImpl,
-      log: () => {},
-    }),
-    /Info\.plist/,
+  const lines = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: (line) => lines.push(line),
+  });
+  // Installing it would report as healthy and post as nothing. Failing the
+  // provisioning over it would leave `npx kin` unusable here and on every
+  // later run.
+  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
+  assert.ok(
+    !fs.existsSync(path.join(home, 'lib', 'KinNotifier.app')),
+    'a bundle with no Info.plist must not be installed',
   );
+  const warning = lines.find((line) => line.includes('Info.plist'));
+  assert.ok(warning, `expected a warning naming the missing member, got: ${lines.join(' | ')}`);
+  assert.match(warning, /Script Editor/);
   fs.rmSync(work, { recursive: true, force: true });
 });
 

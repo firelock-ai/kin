@@ -228,8 +228,11 @@ impl fmt::Display for InstallChannel {
 pub struct Status {
     /// Path to the notifier bundle executable, when it is installed.
     pub notifier: Option<PathBuf>,
-    /// Where a bundle is expected when none was found anywhere on the search
-    /// path. Reported so the gap names a location rather than an absence.
+    /// The canonical managed location, reported unconditionally so a gap names
+    /// a location rather than an absence. It is not where the resolved bundle
+    /// came from: a prefix-relative copy is legitimate and is reported by
+    /// `notifier`, which is the field a consumer should read for the path in
+    /// use.
     pub expected: PathBuf,
     /// How this copy of Kin was installed.
     pub channel: InstallChannel,
@@ -327,18 +330,35 @@ impl Notifier {
     /// cannot write to a user's home directory: a Homebrew formula installs
     /// into its own prefix, so its bundle sits beside the binary rather than
     /// under `$KIN_HOME`.
+    ///
+    /// Prefixes are derived from the reported executable path and from its
+    /// resolved target, for the same reason `install_channel_of` considers
+    /// both. `current_exe` reports the path the process was invoked through,
+    /// and Homebrew invokes a symlink in its own `bin` that points into the
+    /// keg. Homebrew links only `etc`, `bin`, `sbin`, `include`, `share`,
+    /// `lib`, and `Frameworks` out of a keg and never a bare top-level `.app`,
+    /// so a formula's bundle exists at `Cellar/kin/<version>/KinNotifier.app`
+    /// and at no path reachable from the reported prefix.
     fn bundle_candidates(&self) -> Vec<PathBuf> {
         let mut candidates = vec![self.notifier_path()];
-        if let Some(prefix) = self
+        let reported = self.executable.clone();
+        let resolved = self
             .executable
             .as_deref()
-            .and_then(|executable| executable.parent())
-            .and_then(|bin| bin.parent())
-        {
-            candidates.push(bundle_executable(&prefix.join("lib")));
-            candidates.push(bundle_executable(prefix));
+            .and_then(|executable| fs::canonicalize(executable).ok());
+        for executable in [reported, resolved].into_iter().flatten() {
+            let Some(prefix) = executable.parent().and_then(|bin| bin.parent()) else {
+                continue;
+            };
+            for candidate in [
+                bundle_executable(&prefix.join("lib")),
+                bundle_executable(prefix),
+            ] {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
         }
-        candidates.dedup();
         candidates
     }
 
@@ -348,6 +368,51 @@ impl Notifier {
         self.bundle_candidates()
             .into_iter()
             .find(|candidate| candidate.is_file())
+    }
+
+    /// Tell LaunchServices where the resolved bundle is.
+    ///
+    /// The notification daemon validates the posting bundle through
+    /// LaunchServices and refuses one it does not know, so a bundle that was
+    /// copied into place without being registered is present and still
+    /// useless. Every channel that writes a bundle owes this call, including
+    /// one that replaces an already registered bundle: the record LaunchServices
+    /// holds describes the tree that was there, and a replacement carries a new
+    /// signature and a new `Info.plist` behind the same path.
+    ///
+    /// Registration is idempotent, and having nothing to register is not a
+    /// failure: an install with no bundle is reported as a degradation by
+    /// [`Status::degradation`], and a machine with no `lsregister` is not macOS.
+    pub fn register_with_launch_services(&self) -> Result<()> {
+        const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+        let Some(executable) = self.resolve_notifier() else {
+            return Ok(());
+        };
+        // The bundle root is three levels above Contents/MacOS/<executable>.
+        let Some(bundle) = executable
+            .parent()
+            .and_then(|macos| macos.parent())
+            .and_then(|contents| contents.parent())
+        else {
+            return Ok(());
+        };
+        if !Path::new(LSREGISTER).is_file() {
+            return Ok(());
+        }
+        let status = std::process::Command::new(LSREGISTER)
+            .arg("-f")
+            .arg(bundle)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("failed to run {LSREGISTER}"))?;
+        if !status.success() {
+            anyhow::bail!(
+                "{LSREGISTER} refused to register {} ({status})",
+                bundle.display()
+            );
+        }
+        Ok(())
     }
 
     /// Which channel installed the running binary.
@@ -575,10 +640,17 @@ pub fn install_channel_of(executable: &Path, kin_home: &Path) -> InstallChannel 
         return InstallChannel::Managed;
     }
     let resolved = std::fs::canonicalize(executable).ok();
-    if resolved
-        .as_deref()
-        .is_some_and(|path| path.starts_with(kin_home))
-    {
+    // A `KIN_HOME` reached through a symlinked component names the same
+    // directory the resolved executable sits in without sharing its prefix, so
+    // the resolved comparison needs a resolved root to compare against.
+    let resolved_home = std::fs::canonicalize(kin_home).ok();
+    let managed = resolved.as_deref().is_some_and(|path| {
+        path.starts_with(kin_home)
+            || resolved_home
+                .as_deref()
+                .is_some_and(|home| path.starts_with(home))
+    });
+    if managed {
         return InstallChannel::Managed;
     }
     let in_cellar = |path: &Path| {
@@ -842,6 +914,40 @@ mod tests {
         assert_eq!(notifier.install_channel(), InstallChannel::Homebrew);
     }
 
+    /// The shape `current_exe` actually produces for a Homebrew user: the
+    /// reported path is the symlink Homebrew put on `PATH`, not the keg it
+    /// points into. Homebrew links no bare top-level `.app` out of a keg, so
+    /// every prefix derived from the reported path alone misses the bundle the
+    /// formula installed, and resolution has to follow the link to find it.
+    #[test]
+    #[cfg(unix)]
+    fn a_homebrew_bundle_is_found_through_the_symlink_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonical from the start, so the resolved candidate is comparable to
+        // the fixture path rather than to its `/private` twin on macOS.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let brew_prefix = root.join("brew");
+        let cellar = brew_prefix.join("Cellar/kin/0.4.5");
+        let kegged = cellar.join("bin/kin");
+        fs::create_dir_all(kegged.parent().unwrap()).unwrap();
+        fs::write(&kegged, b"kin").unwrap();
+        let bundle = install_fake_bundle(&cellar);
+
+        let linked = brew_prefix.join("bin/kin");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&kegged, &linked).unwrap();
+        assert!(
+            !bundle_executable(&brew_prefix).exists()
+                && !bundle_executable(&brew_prefix.join("lib")).exists(),
+            "the fixture must reproduce Homebrew leaving nothing under its own prefix"
+        );
+
+        let notifier =
+            Notifier::with_home(root.join("kin-home")).with_executable(Some(linked.clone()));
+        assert_eq!(notifier.resolve_notifier(), Some(bundle));
+        assert_eq!(notifier.install_channel(), InstallChannel::Homebrew);
+    }
+
     #[test]
     fn install_channels_are_told_apart_by_where_the_binary_lives() {
         let kin_home = Path::new("/home/dev/.kin");
@@ -865,6 +971,34 @@ mod tests {
         assert_eq!(
             install_channel_of(Path::new("/home/dev/CellarNotes/kin"), kin_home),
             InstallChannel::Unknown
+        );
+    }
+
+    /// A managed install stays managed when `KIN_HOME` is reached through a
+    /// symlink. The consequence of missing it is message-only, but the message
+    /// it produces sends a managed user to reinstall from a script instead of
+    /// running `kin update`.
+    #[test]
+    #[cfg(unix)]
+    fn a_managed_install_is_recognized_through_a_symlinked_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let real_home = root.join("real/.kin");
+        let executable = real_home.join("bin/kin");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"kin").unwrap();
+        let linked_home = root.join("linked-kin");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+
+        assert_eq!(
+            install_channel_of(&linked_home.join("bin/kin"), &linked_home),
+            InstallChannel::Managed
+        );
+        // What `current_exe` reports is the resolved path, while `KIN_HOME`
+        // names the link, so neither raw comparison holds.
+        assert_eq!(
+            install_channel_of(&executable, &linked_home),
+            InstallChannel::Managed
         );
     }
 

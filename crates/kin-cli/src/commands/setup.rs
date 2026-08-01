@@ -11188,42 +11188,15 @@ fn report_notification_identity(interactive: bool) {
         println!("  {} {degradation}", style("!").yellow());
         return;
     }
-    register_notification_bundle(&notifier);
-    request_notification_authorization(interactive);
-}
-
-/// Tell LaunchServices where the bundle is.
-///
-/// The notification daemon validates the posting bundle through LaunchServices
-/// and refuses one it does not know, so a bundle that was copied into place
-/// without being registered is present and still useless. The managed installer
-/// registers what it writes; a channel that installs into its own prefix, such
-/// as a Homebrew formula, cannot, so setup does it for whichever copy is
-/// actually resolved. Registration is idempotent and best effort: it is not
-/// worth failing setup over, and the authorization step below reports the
-/// result either way.
-fn register_notification_bundle(notifier: &kin_notify::Notifier) {
-    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
-    let Some(executable) = notifier.resolve_notifier() else {
-        return;
-    };
-    // The bundle root is three levels above Contents/MacOS/<executable>.
-    let Some(bundle) = executable
-        .parent()
-        .and_then(|macos| macos.parent())
-        .and_then(|contents| contents.parent())
-    else {
-        return;
-    };
-    if !Path::new(LSREGISTER).is_file() {
-        return;
+    // The managed installer registers what it writes; a channel that installs
+    // into its own prefix, such as a Homebrew formula, cannot, so setup does it
+    // for whichever copy is actually resolved. It is not worth failing setup
+    // over, but a silent failure would leave the authorization step below
+    // asking about a bundle macOS does not know.
+    if let Err(error) = notifier.register_with_launch_services() {
+        println!("  {} {error:#}", style("!").yellow());
     }
-    let _ = std::process::Command::new(LSREGISTER)
-        .arg("-f")
-        .arg(bundle)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    request_notification_authorization(interactive);
 }
 
 /// Ask macOS for permission to post notifications, once, from the one place a

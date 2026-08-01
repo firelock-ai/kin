@@ -159,19 +159,42 @@ export function installNotifierBundle(root, env, platform, log) {
   }
   // A bundle missing either of these installs cleanly and then misbehaves at
   // runtime: nothing to launch, or nothing for macOS to attribute the
-  // notification to. Refuse it here, where the cause is still visible.
+  // notification to. It is refused here, where the cause is still visible, but
+  // refused the same way an absent bundle is: an incomplete notification asset
+  // costs the Kin sender identity, while failing the provisioning would cost a
+  // usable `kin` on this run and on every later one, since each re-provisions
+  // and meets the same archive again.
   for (const required of ['Contents/MacOS/KinNotifier', 'Contents/Info.plist']) {
     if (!fs.existsSync(path.join(src, required))) {
-      throw new Error(`release archive KinNotifier.app is missing ${required}; refusing to install it`);
+      log(
+        `kin: warning: this release archive's KinNotifier.app is missing ${required}, so it was ` +
+          'not installed and notifications will post as Script Editor rather than as Kin. ' +
+          'Upgrade to a release that ships a complete bundle, or install via ' +
+          'https://github.com/firelock-ai/kin (scripts/install.sh).',
+      );
+      return false;
     }
   }
 
   const libDir = path.join(kinHome(env), 'lib');
   fs.mkdirSync(libDir, { recursive: true });
   const dest = path.join(libDir, 'KinNotifier.app');
-  fs.rmSync(dest, { recursive: true, force: true });
-  copyTree(src, dest);
-  fs.chmodSync(path.join(dest, 'Contents', 'MacOS', 'KinNotifier'), 0o755);
+  // Build the incoming tree beside the live one and swap, rather than removing
+  // the live one and copying into the gap it leaves. copyTree refuses a symlink
+  // or a non-regular entry part-way down, and a bundle interrupted there has a
+  // launchable executable with no `Info.plist` behind it, which every freshness
+  // check reads as an installed bundle. The updater stages and renames for the
+  // same reason.
+  const staged = path.join(libDir, '.KinNotifier.app.incoming');
+  try {
+    fs.rmSync(staged, { recursive: true, force: true });
+    copyTree(src, staged);
+    fs.chmodSync(path.join(staged, 'Contents', 'MacOS', 'KinNotifier'), 0o755);
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.renameSync(staged, dest);
+  } finally {
+    fs.rmSync(staged, { recursive: true, force: true });
+  }
 
   // Registering with LaunchServices is what lets the notification daemon
   // validate the bundle; an unregistered app is refused outright. Authorization
