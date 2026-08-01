@@ -806,6 +806,11 @@ def write_node_validator_fixture_files(
             ) from error
         target.parent.mkdir(parents=True, exist_ok=True)
         content = value if isinstance(value, str) else json.dumps(value)
+        content = content.replace(
+            "__VALIDATOR_HOME__", str((containment_root / "home").resolve())
+        ).replace(
+            "__VALIDATOR_PROOF__", str((containment_root / "proof").resolve())
+        )
         target.write_text(content, encoding="utf-8")
 
 
@@ -891,21 +896,72 @@ def assert_node_validator_rejects_fixture(
 
 VALIDATOR_FIXTURE_COMMIT = "a" * 40
 VALIDATOR_FIXTURE_LOCK = "b" * 64
-VALIDATOR_MCP_ENTRY = {
-    "args": ["mcp", "start"],
-    "env": {"KIN_MCP_TOOL_PROFILE": "agent-default"},
-}
+VALIDATOR_HOME = "__VALIDATOR_HOME__"
+VALIDATOR_PROOF = "__VALIDATOR_PROOF__"
 
 
-def validator_mcp_home_fixture() -> dict[str, object]:
-    """Return every JSON MCP config the two inline validators inspect."""
+def validator_mcp_entry(
+    executable: str,
+    *,
+    repo: str | None = None,
+    cwd: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, object]:
+    args = ["mcp", "start"]
+    if repo is not None:
+        args.extend(["--repo", repo])
+    entry: dict[str, object] = {
+        "command": executable,
+        "args": args,
+        "env": {
+            **(extra_env or {}),
+            "KIN_MCP_TOOL_PROFILE": "agent-default",
+        },
+    }
+    if cwd is not None:
+        entry["cwd"] = cwd
+    return entry
 
-    config = {"mcpServers": {"kin": VALIDATOR_MCP_ENTRY}}
+
+def validator_mcp_config(entry: dict[str, object]) -> dict[str, object]:
+    return {"mcpServers": {"kin": entry}}
+
+
+def validator_windows_mcp_home_fixture() -> dict[str, object]:
+    """Return every repo-free Windows JSON MCP config."""
+
+    executable = f"{VALIDATOR_HOME}/.kin/bin/kin.exe"
+    config = validator_mcp_config(validator_mcp_entry(executable))
     return {
         ".claude.json": copy.deepcopy(config),
         ".cursor/mcp.json": copy.deepcopy(config),
         ".gemini/settings.json": copy.deepcopy(config),
         ".codeium/windsurf/mcp_config.json": copy.deepcopy(config),
+    }
+
+
+def validator_unix_mcp_home_fixture() -> dict[str, object]:
+    """Return every main-HOME Unix JSON MCP config."""
+
+    executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
+    ordinary = validator_mcp_config(validator_mcp_entry(executable))
+    repository = validator_mcp_config(
+        validator_mcp_entry(
+            executable,
+            repo=VALIDATOR_PROOF,
+            cwd=VALIDATOR_PROOF,
+        )
+    )
+    legacy = copy.deepcopy(repository)
+    legacy["userPolicy"] = "preserve"
+    legacy["mcpServers"]["kin"]["env"]["USER_POLICY"] = "preserve"
+    return {
+        ".claude.json": copy.deepcopy(ordinary),
+        ".cursor/mcp.json": copy.deepcopy(ordinary),
+        ".gemini/settings.json": copy.deepcopy(ordinary),
+        ".codeium/windsurf/mcp_config.json": copy.deepcopy(ordinary),
+        ".gemini/config/mcp_config.json": copy.deepcopy(repository),
+        ".gemini/antigravity-ide/mcp_config.json": legacy,
     }
 
 
@@ -948,6 +1004,7 @@ def windows_node_validator_fixture() -> tuple[
         {
             "expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
             "expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "installed-kin-command.txt": f"{VALIDATOR_HOME}/.kin/bin/kin.exe",
             "kin-windows-bench-meta.json": {
                 "kin_commit": VALIDATOR_FIXTURE_COMMIT,
                 "kin_dirty": False,
@@ -965,7 +1022,7 @@ def windows_node_validator_fixture() -> tuple[
             "kin-windows-health.json": copy.deepcopy(report),
             "kin-windows-doctor.json": copy.deepcopy(report),
         },
-        validator_mcp_home_fixture(),
+        validator_windows_mcp_home_fixture(),
         {"RUNNER_OS": "Windows"},
     )
 
@@ -984,6 +1041,8 @@ UNIX_REQUIRED_VALIDATOR_CHECKS = {
     "mcp_client_codex": "healthy",
     "mcp_client_gemini": "healthy",
     "mcp_client_windsurf": "healthy",
+    "mcp_client_antigravity": "healthy",
+    "mcp_client_antigravity_workspace": "healthy",
 }
 UNIX_VALIDATOR_CHECKS = {
     **UNIX_REQUIRED_VALIDATOR_CHECKS,
@@ -1000,10 +1059,26 @@ def unix_node_validator_fixture() -> tuple[
     embedded_report = validator_health_report(
         {"semantic_query_readiness": "healthy"}, healthy=True
     )
+    fallback_report = validator_health_report(
+        {"mcp_client_claude": "healthy"}, healthy=True
+    )
+    executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
+    ordinary_config = validator_mcp_config(validator_mcp_entry(executable))
+    repository_config = validator_mcp_config(
+        validator_mcp_entry(
+            executable,
+            repo=VALIDATOR_PROOF,
+            cwd=VALIDATOR_PROOF,
+        )
+    )
+    codex_config = validator_mcp_config(
+        validator_mcp_entry(executable, repo=VALIDATOR_PROOF)
+    )
     return (
         {
             "../expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
             "../expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "../installed-kin-command.txt": executable,
             "kin-status.json": {
                 "schema": "kin.status.v3",
                 "embedding_coverage": {
@@ -1032,6 +1107,11 @@ def unix_node_validator_fixture() -> tuple[
             },
             "kin-health.json": copy.deepcopy(pre_embed_report),
             "kin-doctor.json": copy.deepcopy(pre_embed_report),
+            "kin-claude-fallback-health.json": copy.deepcopy(fallback_report),
+            "kin-claude-fallback-doctor.json": copy.deepcopy(fallback_report),
+            "kin-claude-fallback-config.json": copy.deepcopy(ordinary_config),
+            "kin-codex-config.json": copy.deepcopy(codex_config),
+            ".agents/mcp_config.json": copy.deepcopy(repository_config),
             "kin-search.json": [
                 {"name": "hello", "file": "probe.py"}
             ],
@@ -1061,7 +1141,7 @@ def unix_node_validator_fixture() -> tuple[
                 "files": [{"path": "probe.py"}],
             },
         },
-        validator_mcp_home_fixture(),
+        validator_unix_mcp_home_fixture(),
         {"RUNNER_OS": "Linux"},
     )
 
@@ -1288,12 +1368,34 @@ def assert_windows_node_validator_behavior(step: str) -> None:
             f"{report_path} unexpected hard failure",
             fixture_with_extra_check(proof, report_path, "unexpected", "missing"),
         )
-        reject(
-            f"{report_path} repo-free Codex writer appears",
-            fixture_with_extra_check(proof, report_path, "mcp_client_codex", "healthy"),
-        )
+        for repo_bound_id in (
+            "mcp_client_codex",
+            "mcp_client_antigravity",
+            "mcp_client_antigravity_workspace",
+        ):
+            reject(
+                f"{report_path} repo-bound {repo_bound_id} writer appears",
+                fixture_with_extra_check(
+                    proof, report_path, repo_bound_id, "healthy"
+                ),
+            )
 
     for config_path in home:
+        reject(
+            f"{config_path} MCP command missing",
+            invalid_home=fixture_without_json_key(
+                home, config_path, ("mcpServers", "kin", "command")
+            ),
+        )
+        reject(
+            f"{config_path} MCP command drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                "/wrong/kin",
+            ),
+        )
         reject(
             f"{config_path} MCP args drift",
             invalid_home=fixture_with_json_value(
@@ -1311,6 +1413,19 @@ def assert_windows_node_validator_behavior(step: str) -> None:
                 ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
                 "full",
             ),
+        )
+
+    for forbidden_path in (
+        ".gemini/config/mcp_config.json",
+        ".gemini/antigravity-ide/mcp_config.json",
+    ):
+        unexpected_home = copy.deepcopy(home)
+        unexpected_home[forbidden_path] = validator_mcp_config(
+            validator_mcp_entry(f"{VALIDATOR_HOME}/.kin/bin/kin.exe")
+        )
+        reject(
+            f"repo-free Windows wrote {forbidden_path}",
+            invalid_home=unexpected_home,
         )
 
 
@@ -1681,7 +1796,49 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             unsupported_readiness,
         )
 
+    for report_path in (
+        "kin-claude-fallback-health.json",
+        "kin-claude-fallback-doctor.json",
+    ):
+        reject(
+            f"{report_path} Claude fallback not healthy",
+            fixture_with_check_status(
+                proof, report_path, "mcp_client_claude", "unsupported"
+            ),
+        )
+        reject(
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "mcp_client_claude", "misconfigured"
+            ),
+        )
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), False),
+        )
+        reject(
+            f"{report_path} leaks a non-Claude global client",
+            fixture_with_extra_check(
+                proof, report_path, "mcp_client_cursor", "healthy"
+            ),
+        )
+
     for config_path in home:
+        reject(
+            f"{config_path} MCP command missing",
+            invalid_home=fixture_without_json_key(
+                home, config_path, ("mcpServers", "kin", "command")
+            ),
+        )
+        reject(
+            f"{config_path} MCP command drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                "/wrong/kin",
+            ),
+        )
         reject(
             f"{config_path} MCP args drift",
             invalid_home=fixture_with_json_value(
@@ -1700,6 +1857,86 @@ def assert_unix_node_validator_behavior(step: str) -> None:
                 "full",
             ),
         )
+        entry = home[config_path]["mcpServers"]["kin"]  # type: ignore[index]
+        if "cwd" in entry:
+            reject(
+                f"{config_path} MCP cwd drift",
+                invalid_home=fixture_with_json_value(
+                    home,
+                    config_path,
+                    ("mcpServers", "kin", "cwd"),
+                    "/wrong/repo",
+                ),
+            )
+
+    for config_path in (
+        "kin-claude-fallback-config.json",
+        "kin-codex-config.json",
+        ".agents/mcp_config.json",
+    ):
+        reject(
+            f"{config_path} MCP command missing",
+            fixture_without_json_key(
+                proof, config_path, ("mcpServers", "kin", "command")
+            ),
+        )
+        reject(
+            f"{config_path} MCP command drift",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                "/wrong/kin",
+            ),
+        )
+        reject(
+            f"{config_path} MCP args drift",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "args"),
+                ["mcp", "start", "--repo", "/wrong/repo"],
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile drift",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                "full",
+            ),
+        )
+        entry = proof[config_path]["mcpServers"]["kin"]  # type: ignore[index]
+        if "cwd" in entry:
+            reject(
+                f"{config_path} MCP cwd drift",
+                fixture_with_json_value(
+                    proof,
+                    config_path,
+                    ("mcpServers", "kin", "cwd"),
+                    "/wrong/repo",
+                ),
+            )
+
+    reject(
+        "Antigravity legacy top-level policy drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".gemini/antigravity-ide/mcp_config.json",
+            ("userPolicy",),
+            "lost",
+        ),
+    )
+    reject(
+        "Antigravity legacy entry policy drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".gemini/antigravity-ide/mcp_config.json",
+            ("mcpServers", "kin", "env", "USER_POLICY"),
+            "lost",
+        ),
+    )
 
 
 def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
@@ -2113,9 +2350,9 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
     negative control, and setup still writes and validates the shell hook, the
     install ledger, and every agent-client MCP config a repo-free install can
     write. `kin bench-meta` reports the CLI build alone, so the daemon's build
-    provenance is among what this leg no longer binds. Codex is the exception,
-    excluded by the product because its entry binds an exact repository, and
-    its absence is asserted rather than left unmentioned.
+    provenance is among what this leg no longer binds. Codex and Antigravity
+    are the exceptions, excluded by the product because their entries bind an
+    exact repository, and both absences are asserted rather than unmentioned.
     """
 
     active = "\n".join(active_lines(repo_free))
@@ -2126,8 +2363,11 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         'kin setup --no-interactive --intent agent --shell "$PROOF_SHELL"',
         "kin setup status --json | tee kin-windows-health.json",
         "kin doctor --json | tee kin-windows-doctor.json",
+        "for agent in claude cursor codex gemini windsurf agy; do",
         'fs.readFileSync("expected-commit.txt", "utf8").trim()',
         'fs.readFileSync("expected-lock-sha.txt", "utf8").trim()',
+        'fs.readFileSync("installed-kin-command.txt", "utf8").trim()',
+        "installedKin !== expectedInstalledKin",
         "meta.kin_commit !== expectedCommit",
         "meta.kin_dirty !== false",
         "meta.kin_source_known !== true",
@@ -2145,9 +2385,11 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         '["setup_ledger", "healthy"]',
         '["mcp_client_claude", "healthy"]',
         '["mcp_client_cursor", "healthy"]',
-        'if (checks.has("mcp_client_codex")) {',
+        '"mcp_client_codex", "mcp_client_antigravity", "mcp_client_antigravity_workspace"',
         '["mcp_client_gemini", "healthy"]',
         '["mcp_client_windsurf", "healthy"]',
+        "entry.command !== installedKin",
+        'path.join(home, ".gemini", "config", "mcp_config.json")',
     ):
         require(active, policy, "repo-free Windows install proof")
 
@@ -2179,6 +2421,19 @@ def assert_install_proof_status_contract(
         "printf '%s\\n' \"$fake_agent_bin\" >> \"$GITHUB_PATH\"",
         "cross-step agent-client proof PATH",
     )
+    for policy in (
+        "for agent in claude cursor codex gemini windsurf agy; do",
+        'antigravity_legacy="$HOME/.gemini/antigravity-ide/mcp_config.json"',
+        'command: "/stale/kin"',
+        'CODEX_CONFIG="$HOME/.codex/config.toml" python3',
+        'tomllib.load(handle)["mcp_servers"]["kin"]',
+        'claude_fallback_home="$RUNNER_TEMP/kin-proof-claude-fallback-home"',
+        'printf \'{}\\n\' > "$claude_fallback_home/.claude/config.json"',
+        'if [ -e "$claude_fallback_home/.claude.json" ]; then',
+        "kin-claude-fallback-health.json",
+        "kin-claude-fallback-doctor.json",
+    ):
+        require(first_run_active, policy, "complete MCP writer state/path matrix")
 
     graph_active_lines = active_lines(graph_query)
     graph_active = "\n".join(graph_active_lines)
@@ -2190,6 +2445,10 @@ def assert_install_proof_status_contract(
         "kin-daemon-health.json",
         "kin setup status --json | tee kin-health.json",
         "kin doctor --json | tee kin-doctor.json",
+        'path.join(process.cwd(), ".agents", "mcp_config.json")',
+        "spawn(entry.command, entry.args",
+        "cwd: entry.cwd",
+        "env: { ...process.env, ...(entry.env ?? {}) }",
     ):
         require(graph_active, policy, "installed daemon startup and health capture")
 
@@ -2238,6 +2497,15 @@ def assert_install_proof_status_contract(
         "validateEmbeddingCoverage(embeddedStatus.embedding_coverage",
         "embeddedCoverage.indexed !== embeddedCoverage.total",
         "embeddedCoverage.pending !== 0",
+        'fs.readFileSync("../installed-kin-command.txt", "utf8").trim()',
+        "installedKin !== expectedInstalledKin",
+        '["mcp_client_antigravity", "healthy"]',
+        '["mcp_client_antigravity_workspace", "healthy"]',
+        '"kin-claude-fallback-config.json"',
+        '"kin-codex-config.json"',
+        'path.join(repoRoot, ".agents", "mcp_config.json")',
+        "entry.command !== installedKin",
+        'legacy.userPolicy !== "preserve"',
     ):
         require(
             validation_active,
@@ -6249,8 +6517,8 @@ def main() -> None:
     )
     windows_mcp_only_claude = replace_exactly_once(
         repo_free,
-        '          if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {\n',
-        '          if (configPath.endsWith(".claude.json") && (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default")) {\n',
+        "          for (const configPath of jsonConfigs) {\n",
+        "          for (const configPath of jsonConfigs.slice(0, 1)) {\n",
         "Windows selective MCP-config bypass",
     )
     expect_assertion(
@@ -6355,8 +6623,8 @@ def main() -> None:
     )
     unix_mcp_only_claude = replace_exactly_once(
         validation,
-        '          if (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default") {\n',
-        '          if (configPath.endsWith(".claude.json") && (!entry || JSON.stringify(entry.args) !== JSON.stringify(["mcp", "start"]) || entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default")) {\n',
+        "          for (const expected of mcpConfigs) {\n",
+        "          for (const expected of mcpConfigs.slice(0, 1)) {\n",
         "Unix selective MCP-config bypass",
     )
     expect_assertion(
@@ -6555,6 +6823,20 @@ def main() -> None:
         '["mcp_client_codex", "healthy"]',
         "repo-bound Codex MCP install proof",
     )
+    for policy in (
+        'fs.writeFileSync("installed-kin-command.txt", `${installedKin}\\n`)',
+        "execFileSync(installedKin, [\"--version\"]",
+        "for agent in claude cursor codex gemini windsurf agy; do",
+        "spawn(entry.command, entry.args",
+    ):
+        require(install_proof, policy, "installed MCP executable and writer proof")
+    for policy in (
+        "evaluate_mcp_client(&client.path, client.id)",
+        "command != Some(expected_command)",
+        '"codex" | "antigravity" | "antigravity_workspace"',
+        "managed_mcp_launcher()",
+    ):
+        require(health, policy, "product-owned exact MCP entry health validation")
     require(
         health,
         "evaluate_codex_binding(&client.path)",

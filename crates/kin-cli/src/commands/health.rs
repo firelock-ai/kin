@@ -14,7 +14,8 @@ use serde_json::Value;
 
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
-    check_binary_in_path, detect_shell, hook_filename, kin_dir, shell_rc, shim_filename,
+    check_binary_in_path, detect_shell, hook_filename, kin_dir, managed_mcp_launcher, shell_rc,
+    shim_filename,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
@@ -941,7 +942,11 @@ fn current_health_repo() -> Option<PathBuf> {
 /// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
 /// Codex's `~/.codex/config.toml` (`mcp_servers.kin`); TOML is normalized to
 /// JSON so the same checks apply.
-pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
+fn evaluate_mcp_client_against(
+    path: &PathBuf,
+    client_id: &str,
+    expected_command: &str,
+) -> (HealthStatus, String) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
@@ -998,6 +1003,40 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
                     ),
                 );
             }
+            let command = entry.get("command").and_then(Value::as_str);
+            if command != Some(expected_command) {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin command is {} (expected the exact managed Kin launcher {}) in {}",
+                        command.unwrap_or("unset"),
+                        expected_command,
+                        path.display()
+                    ),
+                );
+            }
+            let args = entry.get("args").and_then(Value::as_array);
+            let args_match = match client_id {
+                "codex" | "antigravity" | "antigravity_workspace" => args.is_some_and(|args| {
+                    args.len() == 4
+                        && args[0].as_str() == Some("mcp")
+                        && args[1].as_str() == Some("start")
+                        && args[2].as_str() == Some("--repo")
+                        && args[3]
+                            .as_str()
+                            .is_some_and(|repo| Path::new(repo).is_absolute())
+                }),
+                _ => args == serde_json::json!(["mcp", "start"]).as_array(),
+            };
+            if !args_match {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin does not use the exact supported MCP argument vector for {client_id} in {}",
+                        path.display()
+                    ),
+                );
+            }
             let profile = entry
                 .get("env")
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
@@ -1024,6 +1063,22 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
     }
 }
 
+pub(crate) fn evaluate_mcp_client(path: &PathBuf, client_id: &str) -> (HealthStatus, String) {
+    let expected_command = match managed_mcp_launcher() {
+        Ok(command) => command,
+        Err(error) => {
+            return (
+                HealthStatus::Misconfigured,
+                format!(
+                "cannot validate MCP client {} without the exact managed Kin launcher: {error:#}",
+                path.display()
+            ),
+            )
+        }
+    };
+    evaluate_mcp_client_against(path, client_id, &expected_command)
+}
+
 fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthStatus, String)> {
     let repo_root = if workspace {
         path.parent()?.parent()?.canonicalize().ok()?
@@ -1032,13 +1087,9 @@ fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthS
     };
     let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let entry = root.get("mcpServers")?.get("kin")?;
-    let expected_command =
-        kin_dir()
-            .ok()?
-            .join("bin")
-            .join(if cfg!(windows) { "kin.exe" } else { "kin" });
-    let command_matches = entry.get("command").and_then(Value::as_str)
-        == Some(expected_command.to_string_lossy().as_ref());
+    let expected_command = managed_mcp_launcher().ok()?;
+    let command_matches =
+        entry.get("command").and_then(Value::as_str) == Some(expected_command.as_str());
     let expected_args = serde_json::json!(["mcp", "start", "--repo", repo_root.to_string_lossy()]);
     let args_match = entry.get("args") == Some(&expected_args);
     let cwd_matches = !workspace
@@ -1113,7 +1164,7 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
     clients
         .into_iter()
         .map(|client| {
-            let (mut status, mut detail) = evaluate_mcp_client(&client.path);
+            let (mut status, mut detail) = evaluate_mcp_client(&client.path, client.id);
             if matches!(status, HealthStatus::Healthy)
                 && (client.id == "antigravity" || client.id == "antigravity_workspace")
             {
@@ -1854,7 +1905,7 @@ mod tests {
         )
         .unwrap();
 
-        let (status, _detail) = evaluate_mcp_client(&path);
+        let (status, _detail) = evaluate_mcp_client_against(&path, "claude", "kin");
         assert!(matches!(status, HealthStatus::Misconfigured));
     }
 
@@ -1877,8 +1928,113 @@ mod tests {
         )
         .unwrap();
 
-        let (status, _detail) = evaluate_mcp_client(&path);
+        let (status, _detail) = evaluate_mcp_client_against(&path, "claude", "kin");
         assert!(matches!(status, HealthStatus::Healthy));
+    }
+
+    #[test]
+    fn mcp_config_missing_exact_managed_command_is_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("command is unset"));
+    }
+
+    #[test]
+    fn mcp_config_wrong_managed_command_is_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "/stale/kin",
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("expected the exact managed Kin launcher"));
+    }
+
+    #[test]
+    fn ordinary_mcp_config_with_repository_arguments_is_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "/managed/kin",
+                        "args": ["mcp", "start", "--repo", "/other"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "/managed/kin");
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("exact supported MCP argument vector"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn mcp_health_binds_to_the_exact_managed_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let managed = kin_home.join("bin/kin");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &managed).unwrap();
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let path = dir.path().join("claude.json");
+        let config = |command: &Path| {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": command,
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap()
+        };
+        std::fs::write(&path, config(&managed)).unwrap();
+
+        let (status, detail) = evaluate_mcp_client(&path, "claude");
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+
+        std::fs::write(&path, config(Path::new("/wrong/kin"))).unwrap();
+        let (status, detail) = evaluate_mcp_client(&path, "claude");
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("exact managed Kin launcher"));
     }
 
     #[test]
@@ -1900,7 +2056,7 @@ mod tests {
         )
         .unwrap();
 
-        let (status, detail) = evaluate_mcp_client(&path);
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "kin");
         assert!(matches!(status, HealthStatus::Misconfigured));
         assert!(detail.contains("--global"));
     }
@@ -1909,7 +2065,7 @@ mod tests {
     fn mcp_config_missing_file_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");
-        let (status, _detail) = evaluate_mcp_client(&path);
+        let (status, _detail) = evaluate_mcp_client_against(&path, "claude", "kin");
         assert!(matches!(status, HealthStatus::Missing));
     }
 
@@ -1920,11 +2076,11 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\"]\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-default\" }\n",
+            "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\", \"--repo\", \"/repo\"]\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-default\" }\n",
         )
         .unwrap();
 
-        let (status, detail) = evaluate_mcp_client(&path);
+        let (status, detail) = evaluate_mcp_client_against(&path, "codex", "kin");
         assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
         assert!(detail.contains("mcp_servers.kin"));
     }
@@ -1935,7 +2091,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "model = \"o3\"\n").unwrap();
 
-        let (status, detail) = evaluate_mcp_client(&path);
+        let (status, detail) = evaluate_mcp_client_against(&path, "codex", "kin");
         assert!(matches!(status, HealthStatus::Missing), "got: {detail}");
         assert!(detail.contains("mcp_servers.kin"));
     }

@@ -3024,7 +3024,7 @@ fn capture_mcp_repair_target_excluding(
     }))
 }
 
-fn managed_mcp_launcher() -> Result<String> {
+pub(crate) fn managed_mcp_launcher() -> Result<String> {
     let name = if cfg!(windows) { "kin.exe" } else { "kin" };
     let path = kin_dir()?.join("bin").join(name);
     let metadata = fs::symlink_metadata(&path)
@@ -13206,6 +13206,37 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
     #[test]
     #[serial]
+    fn claude_writer_uses_fallback_only_while_primary_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        let fallback = home.join(".claude/config.json");
+        let primary = home.join(".claude.json");
+        fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        fs::write(&fallback, b"{}\n").unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+
+        assert_eq!(configure_claude_code().unwrap(), fallback);
+        assert!(!primary.exists());
+        let fallback_entry = read_kin_mcp_entry(&fallback).unwrap();
+        assert_eq!(
+            fallback_entry["command"].as_str(),
+            env::current_exe().unwrap().to_str()
+        );
+        assert_eq!(fallback_entry["args"], serde_json::json!(["mcp", "start"]));
+        assert_eq!(
+            fallback_entry["env"]["KIN_MCP_TOOL_PROFILE"],
+            "agent-default"
+        );
+
+        fs::write(&primary, b"{}\n").unwrap();
+        assert_eq!(configure_claude_code().unwrap(), primary);
+        assert!(read_kin_mcp_entry(&primary).is_some());
+    }
+
+    #[test]
+    #[serial]
     fn merge_mcp_config_toml_refuses_to_overwrite_corrupt_toml() {
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
@@ -15764,6 +15795,11 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         fs::create_dir_all(kin_home.join("bin")).unwrap();
         fs::create_dir_all(repo.join(".kin")).unwrap();
         fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        let legacy = home.join(".gemini/antigravity-ide/mcp_config.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let legacy_without_kin =
+            br#"{"mcpServers":{"other":{"command":"other"}},"userPolicy":"preserve"}"#;
+        fs::write(&legacy, legacy_without_kin).unwrap();
         let git = crate::commands::test_subprocess::fixture_git(&repo)
             .args(["init", "-q"])
             .output()
@@ -15780,6 +15816,11 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
         let global = configure_antigravity().unwrap();
         let workspace = repo.join(".agents/mcp_config.json");
+        assert_eq!(
+            fs::read(&legacy).unwrap(),
+            legacy_without_kin,
+            "legacy Antigravity config without a Kin entry must remain untouched"
+        );
         assert_eq!(global, home.join(".gemini/config/mcp_config.json"));
         for path in [&global, &workspace] {
             let entry = read_kin_mcp_entry(path).unwrap();
