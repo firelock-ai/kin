@@ -90,6 +90,7 @@ jobs:
           python3 ./scripts/test-verify-npm-release.py
           node --test \
             ./scripts/check-release-version.test.mjs \
+            ./scripts/extract-release-notes.test.mjs \
             ./scripts/prepare-release.test.mjs \
             ./scripts/read-update-build-identity.test.cjs \
             ./scripts/release-archive-shape.test.cjs \
@@ -634,6 +635,7 @@ jobs:
           python3 scripts/test-release-workflow-authority.py
           node --test \
             scripts/check-release-version.test.mjs \
+            scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \
             scripts/release-archive-shape.test.cjs
           node --check scripts/check-release-version.mjs
