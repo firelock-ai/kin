@@ -1590,7 +1590,7 @@ mod tests {
         let result = ToolCallResult::text(
             serde_json::json!({
                 "report": {
-                    "schema": "kin.status.v2",
+                    "schema": "kin.status.v3",
                     "semantic_enrichment": { "entity_count": 42 }
                 }
             })

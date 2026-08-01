@@ -3,15 +3,26 @@
 
 //! Coherent repository-v6 status.
 //!
-//! Status reads one immutable authority lease. It never inspects checkout
-//! contents, legacy branch sidecars, Git, or a separately opened graph
-//! snapshot. Opening the authority also revalidates every referenced source
-//! body in the repository-owned CAS.
+//! Every count below the enrichment line comes from one immutable authority
+//! lease. Nothing here inspects checkout contents, legacy branch sidecars, Git,
+//! or a separately opened graph snapshot. Opening the authority also
+//! revalidates every referenced source body in the repository-owned CAS.
+//!
+//! The lease may be read in this process or, when a daemon already holds this
+//! repository, by that daemon on this command's behalf. Both read the same
+//! durable authority; only the daemon can additionally observe the live query
+//! graph, which is why the report can come from there.
 //!
 //! Semantic counts are resolved from the workspace's durable first-parent
 //! history and cumulative semantic overlay inside that lease. They deliberately
 //! do not describe the daemon's mutable live graph: runtime reconcile and LSP
 //! work may advance that derived view without changing repository authority.
+//!
+//! Embedding coverage is the one figure here that authority does not carry.
+//! A repository-v6 lease records semantic identities, not which of them a
+//! vector index holds, so coverage is reported as its own object naming the
+//! live view it was sampled from. When no such view is available the object
+//! says so; it never reports the zero that an unindexed graph would produce.
 
 use std::path::PathBuf;
 
@@ -23,10 +34,28 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::repository_authority::ActiveRepositoryAuthority;
 
-/// First status contract whose enrichment counts name their durable view and
-/// exact authority/workspace generations. The earlier, unreleased v1 shape
-/// carried counts with different semantics and cannot be inferred truthfully.
-pub const STATUS_SCHEMA: &str = "kin.status.v2";
+/// First status contract carrying embedding coverage alongside enrichment
+/// counts that name their durable view and exact authority/workspace
+/// generations.
+///
+/// v2 carried no embedding, index, or vector state anywhere in the payload, so
+/// a v2 reader cannot be handed a v3 one: absence of coverage was not a legal
+/// v2 encoding of "coverage unknown", it was the whole shape. The version moves
+/// rather than the field being defaulted, so a version-skewed pair fails naming
+/// the schema instead of silently agreeing on a number neither of them meant.
+/// The earlier, unreleased v1 shape carried counts with different semantics and
+/// cannot be inferred truthfully either.
+pub const STATUS_SCHEMA: &str = "kin.status.v3";
+
+/// How long `kin status` will wait on a live daemon read before falling back to
+/// its own authority read and reporting coverage as unobserved.
+///
+/// Status always has a complete local answer, so this bounds an optional
+/// enrichment rather than the command itself. It is deliberately not shorter:
+/// the daemon performs the same authority open the fallback would, and a budget
+/// tight enough to protect against a stuck handler would also abandon a
+/// legitimate read on a large store.
+const LIVE_STATUS_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn deserialize_status_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -61,7 +90,7 @@ where
     let completion_attested = bool::deserialize(deserializer)?;
     if completion_attested {
         return Err(serde::de::Error::custom(
-            "kin.status.v2 does not carry a semantic-enrichment completion attestation",
+            "kin.status.v3 does not carry a semantic-enrichment completion attestation",
         ));
     }
     Ok(false)
@@ -165,6 +194,205 @@ impl SemanticEnrichmentStatus {
             _ => Ok(()),
         }
     }
+}
+
+/// The live view one coverage observation was sampled from.
+///
+/// Coverage is only meaningful against the graph a query would actually search,
+/// so the reader is told which graph answered rather than being left to assume
+/// the durable authority did.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingCoverageSource {
+    /// A live query graph with a validated vector index installed. This is the
+    /// same view `kin graph status` and `kin_graph_status` report.
+    LiveQueryGraph,
+}
+
+/// Why coverage could not be observed.
+///
+/// Each variant is a distinct, actionable state. Collapsing any of them into
+/// `indexed = 0` would publish a number that a fully embedded repository is
+/// indistinguishable from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingCoverageUnobserved {
+    /// No daemon holds this repository's live query graph. Status does not
+    /// start one: it is a read, and opening a store with pending embeddings
+    /// begins inference.
+    NoRunningDaemon,
+    /// A daemon was reachable but its status response could not be used, which
+    /// includes a daemon built against a different status schema.
+    DaemonStatusUnavailable,
+    /// The live graph carries no vector index, so nothing in it can answer how
+    /// many objects are indexed. `embedding_status` reports zero indexed for
+    /// every retrievable object in this state, which is exactly the reading a
+    /// never-embedded repository produces.
+    NoVectorIndexAttached,
+    /// This build ships no vector backend, so no index can be attached at all.
+    VectorSupportDisabled,
+    /// An embedding pass held the work lock, so no counter set could be sampled
+    /// at one instant.
+    SamplingContended,
+}
+
+/// Embedding coverage of the live view that answers semantic queries.
+///
+/// Reported as a sum type because "nothing is indexed" and "nobody could say"
+/// are different facts and every consumer that gates on progress needs to tell
+/// them apart.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EmbeddingCoverage {
+    Observed {
+        source: EmbeddingCoverageSource,
+        indexed: usize,
+        pending: usize,
+        total: usize,
+    },
+    Unobserved {
+        reason: EmbeddingCoverageUnobserved,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EmbeddingCoverageState {
+    Observed,
+    Unobserved,
+}
+
+/// Deserialized as a flat wire shape rather than a tagged enum so that a
+/// payload carrying the counts of one state under the tag of another is
+/// refused instead of having its extra members dropped.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddingCoverageWire {
+    state: EmbeddingCoverageState,
+    #[serde(default)]
+    source: Option<EmbeddingCoverageSource>,
+    #[serde(default)]
+    reason: Option<EmbeddingCoverageUnobserved>,
+    #[serde(default)]
+    indexed: Option<usize>,
+    #[serde(default)]
+    pending: Option<usize>,
+    #[serde(default)]
+    total: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for EmbeddingCoverage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = EmbeddingCoverageWire::deserialize(deserializer)?;
+        let coverage = match wire.state {
+            EmbeddingCoverageState::Observed => {
+                if wire.reason.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "embedding_coverage is observed but carries an unobserved reason",
+                    ));
+                }
+                let missing = |field: &str| {
+                    serde::de::Error::custom(format!(
+                        "embedding_coverage is observed but carries no {field}"
+                    ))
+                };
+                Self::Observed {
+                    source: wire.source.ok_or_else(|| missing("source"))?,
+                    indexed: wire.indexed.ok_or_else(|| missing("indexed"))?,
+                    pending: wire.pending.ok_or_else(|| missing("pending"))?,
+                    total: wire.total.ok_or_else(|| missing("total"))?,
+                }
+            }
+            EmbeddingCoverageState::Unobserved => {
+                if wire.source.is_some()
+                    || wire.indexed.is_some()
+                    || wire.pending.is_some()
+                    || wire.total.is_some()
+                {
+                    return Err(serde::de::Error::custom(
+                        "embedding_coverage is unobserved but carries coverage counts",
+                    ));
+                }
+                Self::Unobserved {
+                    reason: wire.reason.ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "embedding_coverage is unobserved but carries no reason",
+                        )
+                    })?,
+                }
+            }
+        };
+        coverage.validate().map_err(serde::de::Error::custom)?;
+        Ok(coverage)
+    }
+}
+
+impl EmbeddingCoverage {
+    pub fn unobserved(reason: EmbeddingCoverageUnobserved) -> Self {
+        Self::Unobserved { reason }
+    }
+
+    /// The same triple invariants `kin.graph-status.v1` enforces.
+    ///
+    /// Two surfaces reporting one repository's coverage must not disagree about
+    /// which triples are legal, or a consumer that validates against one of
+    /// them accepts a payload the other calls impossible.
+    fn validate(&self) -> std::result::Result<(), String> {
+        let Self::Observed {
+            indexed,
+            pending,
+            total,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        if indexed > total {
+            return Err(format!(
+                "embedding_coverage.indexed ({indexed}) exceeds embedding_coverage.total ({total})"
+            ));
+        }
+        let uncovered = total.saturating_sub(*indexed);
+        if *pending < uncovered {
+            return Err(format!(
+                "embedding_coverage.pending ({pending}) does not account for the {uncovered} \
+                 retrievable objects that are not indexed"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Sample coverage from a live query graph.
+///
+/// `embedding_status` derives `indexed` by testing every retrievable key
+/// against the graph's vector index and answers zero for all of them when no
+/// index is installed. A graph reconstructed from a snapshot never has one, so
+/// counting it there would report zero coverage on a fully embedded repository
+/// in a well-formed payload. Coverage is therefore published only once an index
+/// is proven attached, and the absence is named otherwise.
+#[cfg(feature = "vector")]
+pub fn observe_embedding_coverage(graph: &kin_db::InMemoryGraph) -> EmbeddingCoverage {
+    if graph.vector_index_stats().is_none() {
+        return EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoVectorIndexAttached);
+    }
+    let status = graph.embedding_status();
+    EmbeddingCoverage::Observed {
+        source: EmbeddingCoverageSource::LiveQueryGraph,
+        indexed: status.indexed,
+        pending: status.pending,
+        total: status.total,
+    }
+}
+
+/// Feature-disabled counterpart: with no vector backend there is no index to
+/// attach and no coverage to observe.
+#[cfg(not(feature = "vector"))]
+pub fn observe_embedding_coverage(_graph: &kin_db::InMemoryGraph) -> EmbeddingCoverage {
+    EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::VectorSupportDisabled)
 }
 
 /// Read the durable enrichment this exact authority lease carries.
@@ -323,6 +551,10 @@ pub struct StatusReport {
     pub repository: RepositoryStatus,
     pub workspace: WorkspaceStatus,
     pub semantic_enrichment: SemanticEnrichmentStatus,
+    /// Coverage of the live query graph, not of the authority lease above.
+    /// Required in v3: a report that omitted it would be one whose reader could
+    /// not tell an unobservable repository from an unembedded one.
+    pub embedding_coverage: EmbeddingCoverage,
     /// Absent only where authority was never persisted and generation zero was
     /// built in memory. A persisted repository always reports the payload its
     /// open recovered.
@@ -341,6 +573,7 @@ struct StatusReportWire {
     repository: RepositoryStatus,
     workspace: WorkspaceStatus,
     semantic_enrichment: SemanticEnrichmentStatus,
+    embedding_coverage: EmbeddingCoverage,
     #[serde(default)]
     authority_payload: Option<AuthorityPayloadReceipt>,
 }
@@ -358,6 +591,7 @@ impl<'de> Deserialize<'de> for StatusReport {
             repository: wire.repository,
             workspace: wire.workspace,
             semantic_enrichment: wire.semantic_enrichment,
+            embedding_coverage: wire.embedding_coverage,
             authority_payload: wire.authority_payload,
         };
         report.validate().map_err(serde::de::Error::custom)?;
@@ -449,9 +683,17 @@ impl CommandStatusRequest {
     }
 }
 
+/// Build one status report from an authority lease plus a stated coverage
+/// observation.
+///
+/// Coverage is a parameter rather than something this function derives, because
+/// nothing reachable from an authority lease can answer it. Making the caller
+/// supply it means every path has to name where its coverage came from, and no
+/// path can reach a default that reads as measured.
 pub fn inspect(
     layout: &kin_core::KinLayout,
     binding: &kin_core::LocalRepositoryAuthorityBinding,
+    embedding_coverage: EmbeddingCoverage,
 ) -> Result<StatusReport> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
@@ -502,14 +744,73 @@ pub fn inspect(
             artifact_count,
         },
         semantic_enrichment,
+        embedding_coverage,
         authority_payload,
     })
 }
 
-pub fn run(json: bool) -> Result<()> {
+/// Read status from the daemon that already holds this repository's live query
+/// graph, so the report carries coverage sampled from a real vector index.
+///
+/// This never starts a daemon. Status is a read, and opening a store whose
+/// embeddings are pending starts inference on its own, which is not something a
+/// status command may do as a side effect. The error is the reason the local
+/// fallback will publish, so an unreachable daemon is reported as an
+/// unobserved coverage rather than inferred as an unembedded repository.
+///
+/// A daemon that answers is not automatically believed. A build mismatch or a
+/// status schema this binary cannot parse both surface here as an unavailable
+/// daemon, so version skew degrades to a named absence instead of failing the
+/// command.
+async fn live_status_from_running_daemon(
+    layout: &kin_core::KinLayout,
+) -> std::result::Result<StatusReport, EmbeddingCoverageUnobserved> {
+    let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
+        .await
+        .ok_or(EmbeddingCoverageUnobserved::NoRunningDaemon)?;
+    let unavailable = |error: anyhow::Error| {
+        tracing::debug!(%error, "live status unavailable; reporting coverage as unobserved");
+        EmbeddingCoverageUnobserved::DaemonStatusUnavailable
+    };
+    // The token is resolved from the repository this command resolved, not from
+    // the process directory, so running status from a subdirectory does not
+    // authenticate against a different repository's daemon.
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)
+        .map_err(unavailable)?;
+    // The client's default request budget is minutes long, which is right for a
+    // mutation and wrong for a read that already has a complete local answer.
+    // Route resolution above only returns an endpoint that answered `/health`,
+    // so what is bounded here is the narrower case of a daemon that is alive but
+    // stuck inside this handler. The budget still has to cover a real authority
+    // open on a large store, which is the same work the fallback would do.
+    match tokio::time::timeout(
+        LIVE_STATUS_READ_BUDGET,
+        client.command_status(&CommandStatusRequest::new(false)),
+    )
+    .await
+    {
+        Ok(response) => response
+            .map(|response| response.report)
+            .map_err(unavailable),
+        Err(_elapsed) => {
+            tracing::debug!(
+                budget_secs = LIVE_STATUS_READ_BUDGET.as_secs(),
+                "live status read exceeded its budget; reporting coverage as unobserved"
+            );
+            Err(EmbeddingCoverageUnobserved::DaemonStatusUnavailable)
+        }
+    }
+}
+
+pub async fn run(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-    let report = inspect(&layout, &binding)?;
+    let report = match live_status_from_running_daemon(&layout).await {
+        Ok(report) => report,
+        Err(reason) => {
+            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
+            inspect(&layout, &binding, EmbeddingCoverage::unobserved(reason))?
+        }
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -579,6 +880,10 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
             report.semantic_enrichment.workspace_generation
         ),
         "Live graph enrichment: see `kin graph status`".to_string(),
+        format!(
+            "Live embedding coverage: {}",
+            render_embedding_coverage(&report.embedding_coverage)
+        ),
         "Source CAS: verified".to_string(),
         match report.authority_payload.as_ref() {
             Some(payload) => format!(
@@ -601,6 +906,42 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
         ));
     }
     lines.into_iter().map(|line| format!("{line}\n")).collect()
+}
+
+/// Render coverage so the text surface states the same distinction the payload
+/// does. An unobserved coverage prints why, never a count.
+fn render_embedding_coverage(coverage: &EmbeddingCoverage) -> String {
+    match coverage {
+        EmbeddingCoverage::Observed {
+            source,
+            indexed,
+            pending,
+            total,
+        } => {
+            let view = match source {
+                EmbeddingCoverageSource::LiveQueryGraph => "live query graph",
+            };
+            format!("{indexed}/{total} indexed, {pending} pending ({view})")
+        }
+        EmbeddingCoverage::Unobserved { reason } => {
+            let explanation = match reason {
+                EmbeddingCoverageUnobserved::NoRunningDaemon => {
+                    "no daemon holds this repository's live graph"
+                }
+                EmbeddingCoverageUnobserved::DaemonStatusUnavailable => {
+                    "the daemon's status response could not be used"
+                }
+                EmbeddingCoverageUnobserved::NoVectorIndexAttached => {
+                    "the live graph carries no vector index"
+                }
+                EmbeddingCoverageUnobserved::VectorSupportDisabled => {
+                    "this build ships no vector backend"
+                }
+                EmbeddingCoverageUnobserved::SamplingContended => "an embedding pass was in flight",
+            };
+            format!("not observed ({explanation})")
+        }
+    }
 }
 
 fn render_head(head: &WorkspaceHead) -> String {
@@ -632,24 +973,31 @@ fn build_id(sha: &str, dirty: bool) -> String {
 mod tests {
     use super::*;
 
+    /// The coverage a bare authority read publishes. These cases exercise the
+    /// durable half of the report, where no live graph was consulted, so this
+    /// is the honest observation for them rather than a stand-in for one.
+    fn unobserved_fixture() -> EmbeddingCoverage {
+        EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoRunningDaemon)
+    }
+
     #[test]
-    fn unreleased_v1_enrichment_is_not_silently_reinterpreted_as_v2() {
+    fn unreleased_v1_enrichment_is_not_silently_reinterpreted_as_v3() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
-        let report = inspect(&init.layout, &binding).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
         let mut legacy = serde_json::to_value(report).unwrap();
         legacy["schema"] = serde_json::Value::String("kin.status.v1".to_string());
 
         let error = serde_json::from_value::<StatusReport>(legacy)
             .expect_err("a complete late-v1 daemon response must be rejected by schema");
 
-        assert_eq!(STATUS_SCHEMA, "kin.status.v2");
+        assert_eq!(STATUS_SCHEMA, "kin.status.v3");
         assert!(
             error
                 .to_string()
                 .contains("unsupported status schema 'kin.status.v1'"),
-            "v1 must fail explicitly even when every v2 payload field is present: {error}"
+            "v1 must fail explicitly even when every v3 payload field is present: {error}"
         );
     }
 
@@ -661,7 +1009,7 @@ mod tests {
         // than reusing the in-memory authority that init constructed.
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
 
-        let report = inspect(&init.layout, &binding).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
         // `None` is legal only where authority was never persisted. Accepting it
         // here would let status report a read whose payload was never measured.
@@ -695,11 +1043,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_accepts_a_report_without_a_payload_receipt_but_rejects_an_incoherent_one() {
+    fn v3_accepts_a_report_without_a_payload_receipt_but_rejects_an_incoherent_one() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
-        let valid = serde_json::to_value(inspect(&init.layout, &binding).unwrap()).unwrap();
+        let valid =
+            serde_json::to_value(inspect(&init.layout, &binding, unobserved_fixture()).unwrap())
+                .unwrap();
 
         let mut without_receipt = valid.clone();
         without_receipt
@@ -708,7 +1058,7 @@ mod tests {
             .remove("authority_payload");
         assert_eq!(
             serde_json::from_value::<StatusReport>(without_receipt)
-                .expect("the receipt is additive over the released v2 shape")
+                .expect("the receipt is additive over the released report shape")
                 .authority_payload,
             None
         );
@@ -742,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_enrichment_round_trip_preserves_view_and_generations() {
+    fn v3_enrichment_round_trip_preserves_view_and_generations() {
         let enrichment = SemanticEnrichmentStatus {
             view: SemanticEnrichmentView::DurableRepositoryAuthority,
             authority_generation: 9,
@@ -765,11 +1115,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_rejects_false_authority_completion_and_generation_claims() {
+    fn v3_rejects_false_authority_completion_and_generation_claims() {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
-        let valid = serde_json::to_value(inspect(&init.layout, &binding).unwrap()).unwrap();
+        let valid =
+            serde_json::to_value(inspect(&init.layout, &binding, unobserved_fixture()).unwrap())
+                .unwrap();
 
         let mut wrong_authority = valid.clone();
         wrong_authority["authority"] = serde_json::json!("live-daemon-graph");
@@ -828,9 +1180,181 @@ mod tests {
             ),
         ] {
             let error = serde_json::from_value::<StatusReport>(payload)
-                .expect_err("a contradictory v2 status claim must fail deserialization");
+                .expect_err("a contradictory v3 status claim must fail deserialization");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn a_v2_payload_is_refused_by_schema_and_a_v3_one_may_not_omit_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let valid =
+            serde_json::to_value(inspect(&init.layout, &binding, unobserved_fixture()).unwrap())
+                .unwrap();
+
+        // A v2 payload is exactly a v3 one without coverage. It must fail
+        // naming the version, not the field: the field's absence is not a v2
+        // statement that coverage was unknown, it is a different contract.
+        let mut released_v2 = valid.clone();
+        let object = released_v2.as_object_mut().unwrap();
+        object.remove("embedding_coverage");
+        object.insert(
+            "schema".to_string(),
+            serde_json::Value::String("kin.status.v2".to_string()),
+        );
+        let error = serde_json::from_value::<StatusReport>(released_v2)
+            .expect_err("a released v2 payload is not a v3 report");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported status schema 'kin.status.v2'"),
+            "version skew must be reported as a schema mismatch: {error}"
+        );
+
+        // Within v3 the field is required, so a truncated payload cannot be
+        // read as a repository whose coverage happened to be absent.
+        let mut without_coverage = valid;
+        without_coverage
+            .as_object_mut()
+            .unwrap()
+            .remove("embedding_coverage");
+        let error = serde_json::from_value::<StatusReport>(without_coverage)
+            .expect_err("v3 coverage is required, not defaulted");
+        assert!(
+            error.to_string().contains("embedding_coverage"),
+            "unexpected missing-coverage error: {error}"
+        );
+    }
+
+    #[test]
+    fn coverage_states_may_not_borrow_each_other_s_members() {
+        let observed = serde_json::to_value(EmbeddingCoverage::Observed {
+            source: EmbeddingCoverageSource::LiveQueryGraph,
+            indexed: 5,
+            pending: 2,
+            total: 7,
+        })
+        .unwrap();
+        assert_eq!(observed["state"], "observed");
+        assert_eq!(observed["source"], "live_query_graph");
+        assert_eq!(
+            serde_json::from_value::<EmbeddingCoverage>(observed.clone()).unwrap(),
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 5,
+                pending: 2,
+                total: 7,
+            }
+        );
+
+        let unobserved = serde_json::to_value(EmbeddingCoverage::unobserved(
+            EmbeddingCoverageUnobserved::NoVectorIndexAttached,
+        ))
+        .unwrap();
+        assert_eq!(unobserved["state"], "unobserved");
+        assert_eq!(unobserved["reason"], "no_vector_index_attached");
+        assert!(
+            unobserved.get("indexed").is_none(),
+            "an unobserved coverage must not serialize a count: {unobserved}"
+        );
+
+        // A count smuggled under the unobserved tag would let a consumer read
+        // zero coverage from a payload that declared it had none to report.
+        let mut counted_absence = unobserved.clone();
+        counted_absence["indexed"] = serde_json::json!(0);
+        let error = serde_json::from_value::<EmbeddingCoverage>(counted_absence)
+            .expect_err("an unobserved coverage carrying counts must be refused");
+        assert!(
+            error.to_string().contains("carries coverage counts"),
+            "{error}"
+        );
+
+        let mut reasoned_observation = observed;
+        reasoned_observation["reason"] = serde_json::json!("no_running_daemon");
+        let error = serde_json::from_value::<EmbeddingCoverage>(reasoned_observation)
+            .expect_err("an observed coverage carrying an absence reason must be refused");
+        assert!(error.to_string().contains("unobserved reason"), "{error}");
+
+        let mut reasonless_absence = unobserved;
+        reasonless_absence.as_object_mut().unwrap().remove("reason");
+        let error = serde_json::from_value::<EmbeddingCoverage>(reasonless_absence)
+            .expect_err("an unobserved coverage must say why");
+        assert!(error.to_string().contains("carries no reason"), "{error}");
+    }
+
+    #[test]
+    fn coverage_rejects_the_triples_graph_status_v1_rejects() {
+        let over_indexed = serde_json::json!({
+            "state": "observed",
+            "source": "live_query_graph",
+            "indexed": 8,
+            "pending": 0,
+            "total": 7,
+        });
+        let error = serde_json::from_value::<EmbeddingCoverage>(over_indexed)
+            .expect_err("more indexed than retrievable is impossible");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+
+        // graph-status.v1 refuses this triple, so status must too: it asserts
+        // that nothing is indexed and nothing is outstanding at once.
+        let unaccounted = serde_json::json!({
+            "state": "observed",
+            "source": "live_query_graph",
+            "indexed": 0,
+            "pending": 0,
+            "total": 7,
+        });
+        let error = serde_json::from_value::<EmbeddingCoverage>(unaccounted)
+            .expect_err("uncovered objects with nothing pending is impossible");
+        assert!(
+            error.to_string().contains("does not account for"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn text_status_states_an_absent_coverage_rather_than_printing_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+
+        let unobserved = inspect(
+            &init.layout,
+            &binding,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoVectorIndexAttached),
+        )
+        .unwrap();
+        let rendered = render_text(&unobserved, None);
+        assert!(
+            rendered.contains(
+                "Live embedding coverage: not observed (the live graph carries no vector index)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("0/0 indexed"),
+            "an unobservable coverage must never render as a measured zero: {rendered}"
+        );
+
+        let observed = inspect(
+            &init.layout,
+            &binding,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 41,
+                pending: 16,
+                total: 57,
+            },
+        )
+        .unwrap();
+        assert!(
+            render_text(&observed, None)
+                .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
+            "{}",
+            render_text(&observed, None)
+        );
     }
 
     #[test]

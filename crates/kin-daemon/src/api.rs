@@ -2458,6 +2458,22 @@ async fn graph_mutations(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
+/// Sample embedding coverage from the daemon's own query graph, the one view in
+/// this process that has a validated vector index installed.
+///
+/// The sample is taken under the embedding-work lock so a pass in flight cannot
+/// span the published counters, matching how `kin_graph_status` observes the
+/// same source. A contended lock reports that state rather than waiting: status
+/// is a read and must not block on an embedding pass.
+fn live_embedding_coverage(state: &DaemonState) -> kin_cli::commands::status::EmbeddingCoverage {
+    use kin_cli::commands::status::{EmbeddingCoverage, EmbeddingCoverageUnobserved};
+
+    let Ok(_embedding_guard) = state.embedding_work.try_lock() else {
+        return EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::SamplingContended);
+    };
+    kin_cli::commands::status::observe_embedding_coverage(&state.graph)
+}
+
 /// POST /commands/status — render one coherent repository-v6 authority lease.
 async fn command_status(
     State(state): State<Arc<DaemonState>>,
@@ -2476,8 +2492,13 @@ async fn command_status(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let report = kin_cli::commands::status::inspect(&state.layout, &repository_authority)
-        .map_err(internal_error)?;
+    let embedding_coverage = live_embedding_coverage(&state);
+    let report = kin_cli::commands::status::inspect(
+        &state.layout,
+        &repository_authority,
+        embedding_coverage,
+    )
+    .map_err(internal_error)?;
     let daemon_build = kin_buildinfo::get();
     let build = kin_cli::commands::status::BuildStatus {
         cli_sha: request
@@ -17779,6 +17800,24 @@ mod tests {
         assert!(result.report.repository.source_cas_verified);
         assert!(result.text.contains("Kin repository-v6 status"));
         assert!(result.text.contains("Live graph enrichment"));
+        // This daemon's graph carries entities but no vector index. The handler
+        // has to say so: reporting the zero that `embedding_status` returns in
+        // that state would be indistinguishable from a repository whose
+        // embeddings are complete and empty.
+        assert_eq!(
+            result.report.embedding_coverage,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::NoVectorIndexAttached
+            ),
+            "status must report an unindexed live graph as unobservable coverage"
+        );
+        assert!(
+            result.text.contains(
+                "Live embedding coverage: not observed (the live graph carries no vector index)"
+            ),
+            "text: {}",
+            result.text
+        );
 
         let graph_response = app
             .clone()
@@ -17841,6 +17880,122 @@ mod tests {
         );
         assert!(!mcp_status.completion_attested);
         assert!(mcp_status.response_envelope.is_none());
+    }
+
+    /// FIR-1785: the endpoint must publish the coverage of the index this
+    /// daemon is actually holding.
+    ///
+    /// The sibling case above proves an unindexed graph is reported as an
+    /// absence, which a handler that always answered "unobserved" would also
+    /// satisfy. This one attaches a real index to the same daemon graph and
+    /// requires the counts to move, so the handler has to be reading the graph
+    /// rather than describing it.
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    async fn command_status_publishes_the_coverage_of_the_daemon_s_indexed_graph() {
+        install_test_registry_override();
+        let dir =
+            std::env::temp_dir().join(format!("kin-daemon-status-coverage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let initialized = kin_core::init(&dir).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        let entity = test_entity("indexed_symbol", "src/indexed.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        // Seed every retrievable key the graph could ask about, then install the
+        // index through kin-db's own compatibility-checked loader.
+        let snapshot = state.graph.to_snapshot();
+        let mut keys = vec![kin_model::RetrievalKey::Entity(entity.id)];
+        keys.extend(
+            snapshot
+                .entity_revisions
+                .values()
+                .flat_map(|revisions| revisions.iter())
+                .map(|revision| kin_model::RetrievalKey::EntityRevision(revision.revision_id)),
+        );
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        for key in &keys {
+            vectors
+                .upsert_retrievable(*key, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        let descriptor = kin_db::IndexDescriptor {
+            model_id: Some("daemon-status-coverage-fixture@v1".to_string()),
+            graph_root: Some(hex::encode(state.graph.compute_root_hash())),
+        };
+        vectors.set_descriptor(descriptor.clone());
+        let sidecar = dir.join("coverage.kvec");
+        vectors.save(&sidecar).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&sidecar, &descriptor),
+            kin_db::VectorIndexLoad::Loaded(_)
+        ));
+
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/commands/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "json": false }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let result: kin_cli::commands::status::CommandStatusResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        let kin_cli::commands::status::EmbeddingCoverage::Observed {
+            source,
+            indexed,
+            pending,
+            total,
+        } = result.report.embedding_coverage
+        else {
+            panic!(
+                "an indexed daemon graph must publish observed coverage, found {:?}",
+                result.report.embedding_coverage
+            );
+        };
+        assert_eq!(
+            source,
+            kin_cli::commands::status::EmbeddingCoverageSource::LiveQueryGraph
+        );
+        assert!(
+            indexed > 0,
+            "the endpoint reported no indexed objects for an indexed graph \
+             (indexed={indexed}, pending={pending}, total={total})"
+        );
+        assert_eq!(indexed, total, "every retrievable key was seeded");
+        // Not `pending == 0`. `pending` is `max(queue_length, total - indexed)`,
+        // and upserting the entity above put it on the graph's embedding queue,
+        // so a fully covered graph still reports the queued work. Coverage and
+        // outstanding work are different facts; only the first is asserted here.
+        assert!(
+            pending >= total - indexed,
+            "pending ({pending}) must account for the uncovered keys"
+        );
+        assert!(
+            result.text.contains(&format!(
+                "Live embedding coverage: {indexed}/{total} indexed"
+            )),
+            "text: {}",
+            result.text
+        );
     }
 
     #[tokio::test]
