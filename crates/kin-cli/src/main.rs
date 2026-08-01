@@ -2505,7 +2505,14 @@ fn main() -> Result<()> {
                     rebuild,
                     json,
                 } => commands::embed::run(batch_size, json, max_seconds, rebuild).await,
-                Command::Rename { .. } => commands::capabilities::require_ready("rename"),
+                Command::Rename {
+                    symbol,
+                    new_name,
+                    file,
+                    line,
+                    column,
+                    json,
+                } => commands::rename::run(symbol, new_name, file, line, column, json).await,
                 Command::Refs {
                     entity,
                     kind,
