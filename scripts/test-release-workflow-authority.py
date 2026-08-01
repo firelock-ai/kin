@@ -962,6 +962,9 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         "meta.kin_dirty !== false",
         "meta.kin_source_known !== true",
         "meta.dependency_provenance !== expectedLock",
+        "meta.embeddings?.vector_enabled !== false",
+        "meta.embeddings?.embeddings_enabled !== false",
+        "meta.embeddings?.metal_enabled !== false",
         'authority.checks[0]?.state !== "unsupported"',
         '["repo_init", "missing"]',
         '["daemon_running", "unsupported"]',
@@ -977,6 +980,61 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         '["mcp_client_windsurf", "healthy"]',
     ):
         require(active, policy, "repo-free Windows install proof")
+
+
+def assert_install_proof_status_contract(
+    first_run: str, embedding: str, validation: str
+) -> None:
+    """Pin install proof to fields the released binaries actually emit.
+
+    `kin status --json` is the repository status report, not the daemon command
+    envelope. Build provenance therefore comes from the CLI's bench metadata
+    and the daemon's public health response, while embedding progress comes
+    from the required `kin.status.v3` coverage sum type. Keeping these sources
+    separate prevents a plausible-looking proof from reading fields that no
+    shipped command produces.
+    """
+
+    for policy in (
+        "kin bench-meta --json > kin-build-meta.json",
+        'DAEMON_PORT="$daemon_port" node',
+        "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
+        "kin-daemon-health.json",
+    ):
+        require(first_run, policy, "installed CLI and daemon provenance capture")
+
+    for stale in (
+        "status.build",
+        "status.semantic_coverage",
+        "embeddedStatus.semantic_coverage",
+    ):
+        if stale in validation:
+            raise AssertionError(
+                "install proof reads a field the released status report does not "
+                f"emit: {stale}"
+            )
+
+    for policy in (
+        'const cliMeta = JSON.parse(fs.readFileSync("kin-build-meta.json", "utf8"))',
+        'const daemonHealth = JSON.parse(fs.readFileSync("kin-daemon-health.json", "utf8"))',
+        "sha: cliMeta.kin_commit",
+        "sha: daemonHealth.build?.sha",
+        'status.schema !== "kin.status.v3"',
+        "validateEmbeddingCoverage(status.embedding_coverage",
+        "cliMeta.embeddings?.vector_enabled !== true",
+        "cliMeta.embeddings?.embeddings_enabled !== true",
+        'embeddedStatus.schema !== "kin.status.v3"',
+        "validateEmbeddingCoverage(embeddedStatus.embedding_coverage",
+        "embeddedCoverage.indexed !== embeddedCoverage.total",
+        "embeddedCoverage.pending !== 0",
+    ):
+        require(validation, policy, "released-byte status and build proof contract")
+
+    require(
+        embedding,
+        "kin status --json | tee kin-embedded-status.json",
+        "post-embedding repository status capture",
+    )
 
 
 def assert_docs_only_classifier_guard(workflow: str) -> None:
@@ -4616,8 +4674,13 @@ def main() -> None:
         "      - name: Validate installed capability proof",
         embedding_start,
     )
+    preserve_start = install_proof.index(
+        "      - name: Preserve proof reports",
+        validation_start,
+    )
     first_run = install_proof[first_run_start:graph_query_start]
     embedding = install_proof[embedding_start:validation_start]
+    validation = install_proof[validation_start:preserve_start]
     for policy in (
         'case "$PROOF_SHELL" in',
         "export SHELL=/bin/bash",
@@ -4824,6 +4887,11 @@ def main() -> None:
             'meta.dependency_provenance !== ""',
         ),
         (
+            "the Windows leg stops proving its vector-free feature contract",
+            "meta.embeddings?.vector_enabled !== false",
+            "meta.embeddings?.vector_enabled !== true",
+        ),
+        (
             "the Windows registry-authority repair negative control disappears",
             "if kin registry authority --fix > kin-windows-registry-fix.txt 2>&1; then",
             "if false; then",
@@ -4851,6 +4919,51 @@ def main() -> None:
                 original, mutation, 1
             ): assert_install_proof_repo_free_windows_proof(mutated),
         )
+    assert_install_proof_status_contract(first_run, embedding, validation)
+    expect_assertion(
+        "install proof stops capturing CLI build metadata",
+        "installed CLI and daemon provenance capture",
+        lambda: assert_install_proof_status_contract(
+            first_run.replace(
+                "kin bench-meta --json > kin-build-meta.json",
+                "kin --version > kin-build-meta.json",
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "install proof reads build provenance from repository status again",
+        "does not emit: status.build",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            embedding,
+            validation.replace("const builds = new Map([", "const stale = status.build;\n          const builds = new Map([", 1),
+        ),
+    )
+    expect_assertion(
+        "install proof accepts the pre-coverage status schema",
+        "released-byte status and build proof contract",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            embedding,
+            validation.replace("kin.status.v3", "kin.status.v2"),
+        ),
+    )
+    expect_assertion(
+        "install proof reads locate coverage from repository status again",
+        "does not emit: status.semantic_coverage",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            embedding,
+            validation.replace(
+                "status.embedding_coverage",
+                "status.semantic_coverage",
+                1,
+            ),
+        ),
+    )
     for policy in (
         "PROOF_SHELL: ${{ matrix.setup-shell }}",
         'case "$PROOF_SHELL" in',
