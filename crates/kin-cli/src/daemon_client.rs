@@ -3339,6 +3339,25 @@ enum DaemonBinaryDiscoveryError {
     Invalid(String),
 }
 
+#[cfg(windows)]
+const DAEMON_BINARY_FILE_NAME: &str = "kin-daemon.exe";
+#[cfg(not(windows))]
+const DAEMON_BINARY_FILE_NAME: &str = "kin-daemon";
+
+fn daemon_binary_candidates_for_executable(exe: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![exe.with_file_name(DAEMON_BINARY_FILE_NAME)];
+    if exe
+        .parent()
+        .and_then(|path| path.file_name())
+        .is_some_and(|name| name == "deps")
+    {
+        if let Some(target_dir) = exe.parent().and_then(|path| path.parent()) {
+            candidates.push(target_dir.join(DAEMON_BINARY_FILE_NAME));
+        }
+    }
+    candidates
+}
+
 fn find_daemon_binary() -> std::result::Result<PathBuf, DaemonBinaryDiscoveryError> {
     if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
         let path = PathBuf::from(explicit);
@@ -3372,24 +3391,13 @@ fn find_daemon_binary() -> std::result::Result<PathBuf, DaemonBinaryDiscoveryErr
     };
 
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("kin-daemon");
-        if let Some(path) = consider(sibling) {
-            return Ok(path);
-        }
-        if exe
-            .parent()
-            .and_then(|path| path.file_name())
-            .is_some_and(|name| name == "deps")
-        {
-            if let Some(target_dir) = exe.parent().and_then(|path| path.parent()) {
-                let target_sibling = target_dir.join("kin-daemon");
-                if let Some(path) = consider(target_sibling) {
-                    return Ok(path);
-                }
+        for candidate in daemon_binary_candidates_for_executable(&exe) {
+            if let Some(path) = consider(candidate) {
+                return Ok(path);
             }
         }
     }
-    if let Ok(path) = which::which("kin-daemon") {
+    if let Ok(path) = which::which(DAEMON_BINARY_FILE_NAME) {
         if let Some(path) = consider(path) {
             return Ok(path);
         }
@@ -4618,11 +4626,7 @@ pub fn installed_kin_startup_protocols() -> Vec<(PathBuf, InstalledStartupProtoc
 /// schema and no supervisor protocol field at all, which is a positive
 /// discriminator rather than an absence of evidence.
 pub fn probe_installed_startup_protocol(kin_binary: &Path) -> InstalledStartupProtocol {
-    let daemon = kin_binary.with_file_name(if cfg!(windows) {
-        "kin-daemon.exe"
-    } else {
-        "kin-daemon"
-    });
+    let daemon = kin_binary.with_file_name(DAEMON_BINARY_FILE_NAME);
     if !daemon.is_file() {
         return InstalledStartupProtocol::Undetermined(format!(
             "no kin-daemon beside {}",
@@ -6214,6 +6218,33 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_candidates_use_the_target_platform_executable_name() {
+        let executable = Path::new("target")
+            .join("debug")
+            .join("deps")
+            .join(if cfg!(windows) {
+                "kin-test.exe"
+            } else {
+                "kin-test"
+            });
+        let candidates = daemon_binary_candidates_for_executable(&executable);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.file_name() == Some(DAEMON_BINARY_FILE_NAME.as_ref())));
+        assert_eq!(
+            candidates[0],
+            executable.with_file_name(DAEMON_BINARY_FILE_NAME)
+        );
+        assert_eq!(
+            candidates[1],
+            Path::new("target")
+                .join("debug")
+                .join(DAEMON_BINARY_FILE_NAME)
+        );
+    }
 
     async fn spawn_fixed_response_server_at(
         route: &'static str,
