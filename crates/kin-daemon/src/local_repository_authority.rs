@@ -117,6 +117,9 @@ impl ActiveLocalRepositoryAuthority {
     /// identity from metadata alone and classifies its own refusal, so a fault
     /// that says nothing about identity stays internal and the bind still pays
     /// exactly one authority load and one exclusive lock, in the open below.
+    /// That same open also refuses a retained namespace whose persisted
+    /// authority record is absent rather than accepting a fresh generation
+    /// zero in its place.
     pub(crate) fn open_bound(
         state: &DaemonState,
     ) -> std::result::Result<Self, RepositoryAuthorityBindRefusal> {

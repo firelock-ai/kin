@@ -228,7 +228,9 @@ impl LocalRepositoryAuthorityBinding {
     /// Establish a binding once for a fresh one-shot CLI/offline process.
     ///
     /// Request handlers in a long-lived daemon must receive an existing
-    /// binding instead of calling this constructor.
+    /// binding instead of calling this constructor. This pins namespace
+    /// identity only; the first authority open below also proves that the
+    /// namespace still carries a persisted authority record.
     pub fn from_layout(layout: &KinLayout) -> Result<Self> {
         layout.check_version()?;
         let manifest = KinManifest::load(&layout.manifest_path())?;
@@ -276,16 +278,24 @@ impl LocalRepositoryAuthorityBinding {
     /// Open a coherent authority manager through the retained storage
     /// capability.
     ///
-    /// KinDB revalidates both the pinned storage-root identity and the
-    /// retained per-repository namespace identity here, and retains the
-    /// per-repository capability on the first successful call. This is the one
-    /// authority load and the one exclusive lock a bind pays: the revalidation
-    /// ahead of it reads namespace identity from metadata alone, so naming a
-    /// replaced namespace as such costs no second load.
+    /// KinDB revalidates both the pinned storage-root identity and the retained
+    /// per-repository namespace identity here, and retains the per-repository
+    /// capability on the first successful call. The same recovery must return
+    /// a payload receipt: a bound repository namespace whose authority record
+    /// disappeared is refused rather than reopened as an unpersisted
+    /// generation-zero repository.
+    ///
+    /// This is the one authority load and the one exclusive lock a bind pays:
+    /// the revalidation ahead of it reads namespace identity from metadata
+    /// alone, so naming a replaced namespace as such costs no second load.
     pub fn open_manager(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
-        RepositoryAuthorityManager::open(self.repository_id.clone(), Arc::clone(&self.backend))
+        open_persisted_local_repository_authority(
+            self.repository_id.clone(),
+            Arc::clone(&self.backend),
+        )
+        .map(|(manager, _payload_stats)| manager)
     }
 
     /// Open a coherent authority manager and keep the payload receipt that the
@@ -296,11 +306,12 @@ impl LocalRepositoryAuthorityBinding {
     /// actually read rather than measuring storage afterwards. It is fixed at
     /// open and does not follow later commits.
     ///
-    /// `None` means recovery found no persisted authority and generation zero
-    /// was constructed only in memory. A reopen of a repository that has
-    /// persisted authority always carries a receipt; treating `None` as an
-    /// ordinary outcome there would report an unmeasured payload as a
-    /// successful read.
+    /// A successful bound-repository open always returns `Some`: recovery that
+    /// finds no persisted authority is refused rather than treating an intact,
+    /// previously initialized namespace as a fresh generation-zero repository.
+    /// The optional shape remains for callers that already expose KinDB's
+    /// payload-receipt type; use KinDB directly when deliberately constructing
+    /// an unpersisted repository before its first commit.
     pub fn open_manager_with_payload_stats(
         &self,
     ) -> std::result::Result<
@@ -310,11 +321,40 @@ impl LocalRepositoryAuthorityBinding {
         ),
         kin_db::KinDbError,
     > {
-        RepositoryAuthorityManager::open_with_payload_stats(
+        open_persisted_local_repository_authority(
             self.repository_id.clone(),
             Arc::clone(&self.backend),
         )
+        .map(|(manager, payload_stats)| (manager, Some(payload_stats)))
     }
+}
+
+/// Open an already initialized local repository through one coherent recovery.
+///
+/// A missing authority record is not a fresh repository when its namespace is
+/// reached through a startup binding. KinDB deliberately permits an absent
+/// record when constructing an unpersisted generation-zero repository, so this
+/// boundary uses the payload receipt from the same recovery to retain the
+/// stricter reopen contract without paying for a second load or lock.
+pub fn open_persisted_local_repository_authority(
+    repository_id: RepositoryId,
+    backend: Arc<LocalFileBackend>,
+) -> std::result::Result<
+    (
+        RepositoryAuthorityManager<LocalFileBackend>,
+        AuthorityPayloadStats,
+    ),
+    kin_db::KinDbError,
+> {
+    let missing_repository_id = repository_id.clone();
+    let (manager, payload_stats) =
+        RepositoryAuthorityManager::open_with_payload_stats(repository_id, backend)?;
+    let payload_stats = payload_stats.ok_or_else(|| {
+        kin_db::KinDbError::StorageError(format!(
+            "local storage authority namespace {missing_repository_id} has no persisted authority record"
+        ))
+    })?;
+    Ok((manager, payload_stats))
 }
 
 /// Why revalidating a startup-pinned repository namespace refused.
@@ -381,7 +421,10 @@ impl std::error::Error for PinnedNamespaceRefusal {}
 /// truncated snapshot, a missing lock file, or a quarantined state on a
 /// namespace this process still reaches was reported as a replaced repository.
 /// A fault that says nothing about identity is [`PinnedNamespaceRefusal::Unavailable`]
-/// here, and the bind stays closed either way.
+/// here, and the bind stays closed either way. An intact namespace whose
+/// persisted authority record is absent passes this identity probe, then is
+/// refused by [`open_persisted_local_repository_authority`] using the receipt
+/// from its single authority recovery.
 ///
 /// Ordering is load-bearing. The first read on a fresh backend is what takes
 /// the pin, so a long-lived process must take it once at startup and revalidate
@@ -391,7 +434,17 @@ pub fn revalidate_pinned_local_namespace(
     backend: &LocalFileBackend,
     repository_id: &RepositoryId,
 ) -> std::result::Result<(), PinnedNamespaceRefusal> {
-    match backend.probe_pinned_repository_namespace(repository_id.as_str()) {
+    classify_pinned_namespace_probe(
+        repository_id,
+        backend.probe_pinned_repository_namespace(repository_id.as_str()),
+    )
+}
+
+fn classify_pinned_namespace_probe(
+    repository_id: &RepositoryId,
+    probe: LocalNamespaceProbe,
+) -> std::result::Result<(), PinnedNamespaceRefusal> {
+    match probe {
         LocalNamespaceProbe::Retained => Ok(()),
         LocalNamespaceProbe::IdentityLost(fault) => {
             Err(PinnedNamespaceRefusal::Identity(fault.into_error()))
@@ -414,13 +467,11 @@ mod payload_receipt_tests {
         let directory = tempfile::tempdir().unwrap();
         let kindb = directory.path().join("kindb");
         std::fs::create_dir_all(&kindb).unwrap();
-        let binding = LocalRepositoryAuthorityBinding::from_parts(
+        let (_manager, receipt) = RepositoryAuthorityManager::open_with_payload_stats(
             RepositoryId::new("payload-receipt-generation-zero").unwrap(),
-            WorkspaceId::from_uuid(uuid::Uuid::from_u128(1)),
             Arc::new(LocalFileBackend::new(&kindb)),
-        );
-
-        let (_manager, receipt) = binding.open_manager_with_payload_stats().unwrap();
+        )
+        .unwrap();
 
         assert!(
             receipt.is_none(),
@@ -458,6 +509,71 @@ mod payload_receipt_tests {
             receipt.total_payload_bytes(),
             receipt.snapshot_bytes() + receipt.acknowledged_delta_bytes(),
             "total payload bytes must be the snapshot plus acknowledged deltas it names"
+        );
+    }
+
+    #[test]
+    fn authority_open_refuses_an_intact_namespace_missing_its_persisted_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let repository_id = RepositoryId::new(
+            KinManifest::load(&initialized.layout.manifest_path())
+                .unwrap()
+                .repo_id,
+        )
+        .unwrap();
+        let namespace = initialized.layout.kindb_dir().join(repository_id.as_str());
+        let snapshots = namespace.join("snapshots");
+        assert!(
+            std::fs::read_dir(&snapshots).unwrap().any(|entry| entry
+                .unwrap()
+                .file_type()
+                .unwrap()
+                .is_file()),
+            "fixture must retain persisted snapshot material"
+        );
+        std::fs::remove_file(namespace.join("authority.json")).unwrap();
+
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        binding
+            .revalidate_pinned_namespace()
+            .expect("the retained namespace identity itself is still intact");
+        let error = match binding.open_manager() {
+            Ok(_) => panic!("a bound namespace missing authority.json must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("has no persisted authority record"),
+            "unexpected missing-authority refusal: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod namespace_probe_classification_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_probe_is_a_non_identity_refusal() {
+        let repository_id = RepositoryId::new("unavailable-probe-classification").unwrap();
+        let refusal = classify_pinned_namespace_probe(
+            &repository_id,
+            LocalNamespaceProbe::Unavailable(kin_db::KinDbError::StorageError(
+                "deterministic probe IO failure".to_string(),
+            )),
+        )
+        .expect_err("an unavailable probe must refuse");
+
+        assert!(
+            matches!(&refusal, PinnedNamespaceRefusal::Unavailable(_)),
+            "unavailable probe must retain the unavailable arm, got {refusal}"
+        );
+        assert!(
+            !refusal.is_identity_refusal(),
+            "an unavailable probe says nothing about namespace identity"
         );
     }
 }

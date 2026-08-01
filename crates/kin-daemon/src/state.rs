@@ -1755,11 +1755,16 @@ impl DaemonState {
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
         ) = Self::pin_registered_local_repository_authorities(&layout);
-        let authority = RepositoryAuthorityManager::open(
-            repository_id.clone(),
-            Arc::clone(&local_repository_backend),
-        )
-        .map_err(DaemonError::Graph)?;
+        // Startup is a reopen of an initialized repository, never construction
+        // of an unpersisted generation-zero authority. Use the receipt from
+        // this same recovery to refuse an intact namespace whose authority
+        // record disappeared without paying for a second load or lock.
+        let (authority, _authority_payload_stats) =
+            kin_core::open_persisted_local_repository_authority(
+                repository_id.clone(),
+                Arc::clone(&local_repository_backend),
+            )
+            .map_err(DaemonError::Graph)?;
         // Startup latency on a large repository is dominated by whether this
         // open replayed the whole history or trusted a durable validation of
         // the exact bytes it loaded. Record which path ran so an operator can
@@ -6215,6 +6220,36 @@ mod tests {
         assert!(
             message.contains(&manifest.repo_id),
             "corruption error must identify the repository namespace: {message}"
+        );
+    }
+
+    #[test]
+    fn open_fails_when_persisted_authority_record_is_missing() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let manifest = kin_core::manifest::KinManifest::load(&layout.manifest_path()).unwrap();
+        let repository_dir = layout.kindb_dir().join(&manifest.repo_id);
+        assert!(
+            std::fs::read_dir(repository_dir.join("snapshots"))
+                .unwrap()
+                .any(|entry| entry.unwrap().file_type().unwrap().is_file()),
+            "fixture must retain the repository's persisted snapshot material"
+        );
+        std::fs::remove_file(repository_dir.join("authority.json")).unwrap();
+
+        let error = match DaemonState::open(layout) {
+            Ok(_) => panic!("startup must fail closed without persisted authority.json"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("has no persisted authority record"),
+            "unexpected missing-authority startup error: {message}"
+        );
+        assert!(
+            message.contains(&manifest.repo_id),
+            "missing-authority error must identify the repository namespace: {message}"
         );
     }
 
