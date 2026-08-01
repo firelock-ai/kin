@@ -703,12 +703,20 @@ def workflow_active_header_source(workflow: str) -> str:
 
 
 def active_lines(source: str) -> list[str]:
-    """Return a block's non-blank, non-comment lines, stripped of indentation."""
+    """Return a block's non-blank, non-comment lines, stripped of indentation.
+
+    Both comment markers count. These blocks are shell steps that embed
+    JavaScript in `node <<'NODE'` heredocs, so a policy pinned inside a heredoc
+    is commented out with `//`, and dropping only `#` would let that comment-out
+    keep satisfying the substring match instead of breaking it.
+    """
 
     return [
         line.strip()
         for line in source.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        if line.strip()
+        and not line.strip().startswith("#")
+        and not line.strip().startswith("//")
     ]
 
 
@@ -922,14 +930,15 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
 
     Windows-gating the repository steps is a reduction in release coverage, so
     what remains has to stay genuinely falsifiable rather than becoming a leg
-    that installs a binary and declares victory. The installed binaries still
-    prove their build provenance against the release tag's own public source,
-    the platform capability posture is still pinned by name including the
-    repair negative control, and setup still writes and validates the shell
-    hook, the install ledger, and every agent-client MCP config a repo-free
-    install can write. Codex is the exception, excluded by the product because
-    its entry binds an exact repository, and its absence is asserted rather
-    than left unmentioned.
+    that installs a binary and declares victory. The installed CLI still proves
+    its own build provenance against the release tag's own public source, the
+    platform capability posture is still pinned by name including the repair
+    negative control, and setup still writes and validates the shell hook, the
+    install ledger, and every agent-client MCP config a repo-free install can
+    write. `kin bench-meta` reports the CLI build alone, so the daemon's build
+    provenance is among what this leg no longer binds. Codex is the exception,
+    excluded by the product because its entry binds an exact repository, and
+    its absence is asserted rather than left unmentioned.
     """
 
     active = "\n".join(active_lines(repo_free))
@@ -4048,6 +4057,11 @@ def main() -> None:
             "the repo-free posture stops proving the agent-client MCP writers",
             '["mcp_client_windsurf", "healthy"]',
             "",
+        ),
+        (
+            "a repo-free posture pin is commented out in the heredoc it lives in",
+            '["repo_init", "missing"]',
+            '// ["repo_init", "missing"]',
         ),
     ):
         expect_assertion(

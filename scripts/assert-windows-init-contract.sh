@@ -151,14 +151,19 @@ require_refused() {
   #
   # Counted where they actually appear, the two boundaries that reach the graph
   # store DO leave their unpublished stage and its `.owner` marker behind,
-  # which is two entries each. Nothing reaps them: recover_orphaned_repository_stages
-  # is `#[cfg(not(unix))] => Ok(0)` and the cleanup that does run is best-effort
-  # against the same open handles that refuse the admission. That is a real
-  # defect and it was invisible for as long as the count looked in the wrong
-  # place. It is asserted by exact count in both directions, so the
-  # transaction-layer port that finally drives it to zero trips this and has to
-  # come here and say so, exactly as a restored admission trips the refusal
-  # assertion above.
+  # which is two entries each. This is post-refusal residue measured before any
+  # reaper could run: each boundary owns a freshly created parent and sees one
+  # `kin init`, and recover_orphaned_repository_stages runs against that parent
+  # before the stage exists, so it finds nothing to reap on any platform. What
+  # moves the count is refusal-time cleanup, or the transaction-layer port
+  # fixing cleanup_owned_staging_root on the failing path, where removal is
+  # best-effort against the same open handles that refuse the admission.
+  # Proving the off-unix reaper arm instead needs a second init against a parent
+  # already holding residue, which is a different fixture from this one. That is
+  # a real defect and it was invisible for as long as the count looked in the
+  # wrong place. It is asserted by exact count in both directions, so whatever
+  # finally drives it to zero trips this and has to come here and say so,
+  # exactly as a restored admission trips the refusal assertion above.
   local parent
   parent="$(dirname "$dir")"
   local staged

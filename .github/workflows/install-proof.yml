@@ -362,12 +362,13 @@ jobs:
       #
       # So the two steps below assert the contract the product ships, in the
       # contract's own words, and the three repository-dependent steps after
-      # them became Unix-only. Windows still proves the installer, the
-      # binaries, their version and provenance, every admission refusal, and
-      # the whole repo-free setup surface. It no longer proves a repository, a
-      # running daemon, a graph query, or an MCP tool call. That is a real loss
-      # of release coverage on one platform, taken deliberately and meant to be
-      # temporary.
+      # them became Unix-only. Windows still proves the installer, both
+      # binaries' version, the CLI's own build provenance, every admission
+      # refusal, and the whole repo-free setup surface. It no longer proves a
+      # repository, a running daemon, a graph query, an MCP tool call, or the
+      # daemon's build provenance, which reaches `kin status` from a running
+      # daemon and so needs a repository. That is a real loss of release
+      # coverage on one platform, taken deliberately and meant to be temporary.
       #
       # This step is also the tripwire that ends the reduction. When the Windows
       # transaction-layer port lands and admission succeeds again,
@@ -459,15 +460,22 @@ jobs:
             #
             # Counted where they actually appear, the two boundaries that reach
             # the graph store DO leave their unpublished stage and its `.owner`
-            # marker behind, which is two entries each. Nothing reaps them:
-            # recover_orphaned_repository_stages is `#[cfg(not(unix))] => Ok(0)`
-            # and the cleanup that does run is best-effort against the same open
-            # handles that refuse the admission. That is a real defect and it
-            # was invisible for as long as the count looked in the wrong place.
-            # It is asserted by exact count in both directions, so the
-            # transaction-layer port that finally drives it to zero trips this
-            # and has to come here and say so, exactly as a restored admission
-            # trips `require_refused` above.
+            # marker behind, which is two entries each. This is post-refusal
+            # residue measured before any reaper could run: each boundary owns a
+            # freshly created parent and sees one `kin init`, and
+            # recover_orphaned_repository_stages runs against that parent before
+            # the stage exists, so it finds nothing to reap on any platform.
+            # What moves the count is refusal-time cleanup, or the
+            # transaction-layer port fixing cleanup_owned_staging_root on the
+            # failing path, where removal is best-effort against the same open
+            # handles that refuse the admission. Proving the off-unix reaper arm
+            # instead needs a second init against a parent already holding
+            # residue, which is a different fixture from this one. That is a
+            # real defect and it was invisible for as long as the count looked
+            # in the wrong place. It is asserted by exact count in both
+            # directions, so whatever finally drives it to zero trips this and
+            # has to come here and say so, exactly as a restored admission trips
+            # `require_refused` above.
             local parent
             parent="$(dirname "$2")"
             local staged
@@ -521,13 +529,14 @@ jobs:
           echo "Installed Windows release refused every admission boundary at the cause it names, published no authority, and left exactly the unreaped stage residue this platform is known to leave."
 
       # What Windows still proves without a repository. This is the whole
-      # remaining first-run surface on the platform: the binaries' own build
+      # remaining first-run surface on the platform: the CLI's own build
       # provenance bound to the release tag's public source, the platform
       # capability posture, and the setup writers for the shell hook, the
       # install ledger, and every agent-client MCP config a repo-free install
-      # can write, which is four of the five. Codex is excluded by the product
-      # rather than by this proof, because its entry binds an exact
-      # repository, and that exclusion is asserted below.
+      # can write, which is four of the five. `kin bench-meta` reports the CLI
+      # build alone, so the daemon's build provenance is not bound here. Codex
+      # is excluded by the product rather than by this proof, because its entry
+      # binds an exact repository, and that exclusion is asserted below.
       - name: Windows repo-free provenance and setup proof
         if: runner.os == 'Windows'
         shell: bash
