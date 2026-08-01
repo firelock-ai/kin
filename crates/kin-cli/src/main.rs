@@ -352,7 +352,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// [OPEN GATE] Build a semantic rename plan from graph and source-CAS truth
+    /// Rename an entity through graph relations and repository source-CAS truth
     Rename {
         /// Entity name or symbol under the cursor
         symbol: String,

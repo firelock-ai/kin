@@ -39,12 +39,12 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_ready"], true);
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
-    assert_eq!(report["full_git_replacement_ready"], false);
+    assert_eq!(report["full_git_replacement_ready"], true);
     // Exact counts, so a silent re-seal cannot pass. They are also the reason
     // two lanes must never flip a gate in the same wave: both bumps merge
     // without conflict and main goes red with every pull request green.
     // Recount from the merged fixture rather than from either branch.
-    assert_eq!(report["ready_commands"], 32);
+    assert_eq!(report["ready_commands"], 33);
     assert_eq!(report["command_total"], 33);
 
     let commands = report["commands"]
@@ -103,7 +103,7 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
 }
 
 #[test]
-fn remaining_open_gate_commands_fail_before_repository_discovery() {
+fn exposed_mutation_commands_reach_repository_discovery() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
@@ -121,6 +121,19 @@ fn remaining_open_gate_commands_fail_before_repository_discovery() {
     assert!(
         !stderr.contains("is fail-closed on repository-v6"),
         "checkout must no longer answer from the capability gate: {stderr}"
+    );
+    assert!(stderr.contains("not a Kin repository"), "{stderr}");
+
+    let output = kin_command(&home)
+        .args(["rename", "before", "after"])
+        .current_dir(root.path())
+        .output()
+        .expect("run exposed rename outside a repository");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is fail-closed on repository-v6"),
+        "rename must no longer answer from the capability gate: {stderr}"
     );
     assert!(stderr.contains("not a Kin repository"), "{stderr}");
 }

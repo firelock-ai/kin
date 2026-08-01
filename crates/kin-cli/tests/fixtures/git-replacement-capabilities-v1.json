@@ -419,16 +419,24 @@
     },
     {
       "command": "rename",
-      "status": "open_gate",
-      "exposure": "fail_closed",
+      "status": "ready",
+      "exposure": "enabled",
       "authority": "graph entity identity plus repository-v6 source CAS",
       "required_for_bounded_dogfood": false,
       "acceptance_spec": [
         "plan edits from graph relations and immutable repository source bodies only",
+        "require exact graph occurrence counts for every selected declaration and reference site, refusing overlap or incomplete coverage",
+        "refuse named-import and qualified-name cases whose graph evidence cannot prove every source token",
         "apply exact workspace tree and semantic deltas through one repository transaction"
       ],
-      "evidence_tests": [],
-      "note": "kin rename has no planner: the retired one read .kin/objects and working-tree files, and nothing reads bodies from repository-v6 source CAS in its place. There is also no apply path that moves the workspace tree and semantic deltas through one repository transaction."
+      "evidence_tests": [
+        "crates/kin-cli/tests/repository_rename_planner.rs",
+        "kin_cli::commands::rename::tests::token_occurrences_are_byte_exact_and_identifier_bounded",
+        "kin_reconcile::reconciler::tests::graph_authoritative_reconcile_retains_explicit_identity_across_rename",
+        "kin_daemon::repository_rename::tests::repository_rename_commits_tree_and_semantics_and_replays_by_operation",
+        "kin_daemon::repository_rename::tests::repository_rename_refuses_unadmitted_working_tree_drift_without_moving_authority"
+      ],
+      "note": "Rename is ready for the bounded exact cases its graph can prove, not as an optimistic all-language text rewrite. The daemon resolves the target and reference-bearing source entities from the exact repository graph, requires every tree-classified source to have full graph-owned parse coverage, and loads every considered body by digest from repository-v6 source CAS. Exact identifier-bound occurrences must equal the graph relation evidence plus the declaration, so mismatched counts, overlapping entity spans, same-source shadowing, missing layouts, shallow or partial coverage, qualified declarations, cross-file new-name collisions, and named imports without exact graph source spans fail closed. The adversarial matrix exercises same-spelling different identities, repeated spanless relation evidence, overlap, coverage gaps, and real Rust, TypeScript, JavaScript, Python, Go, Java, C, and C++ linkers; unsupported shapes are refused rather than skipped. Changed bodies are reparsed in memory; the renamed declaration retains its graph identity; the entire relation identity topology must remain unchanged; and the exact tree, semantic delta, native change, workspace, and branch publish through one compare-and-swap transaction guarded by the projection recovery journal. A caller-stable operation ID provides idempotent receipt recovery, while unadmitted working-tree drift leaves authority untouched."
     },
     {
       "command": "remote plan-push",
