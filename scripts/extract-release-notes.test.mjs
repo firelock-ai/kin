@@ -91,7 +91,7 @@ test('sections are ordered newest first and separated by a blank line', () => {
     'the version being published must lead its superseded sections',
   );
   assert.match(composed.notes, /- the published one\n\n## Carried forward/);
-  assert.match(composed.notes, /first time\.\n\n## \[0\.4\.4\]/);
+  assert.match(composed.notes, /collected here\.\n\n## \[0\.4\.4\]/);
 });
 
 test('carried-forward sections say why a superseded heading is in these notes', () => {
@@ -100,7 +100,13 @@ test('carried-forward sections say why a superseded heading is in these notes', 
   // A bare `## [0.4.4]` under the 0.4.5 release reads as though 0.4.4 shipped.
   // The whole reason its content is here is that it did not.
   assert.match(composed.notes, /## Carried forward from v0\.4\.4/);
-  assert.match(composed.notes, /never published/);
+  assert.match(composed.notes, /superseded before its release completed/);
+  // Number must agree across the whole sentence, not just its opening clause.
+  assert.match(composed.notes, /the notes recorded for it are collected here/);
+  assert.doesNotMatch(composed.notes, /for them are collected/);
+  // v0.4.5 carries a live public prerelease with assets, so the notice must not
+  // claim anything was never published or is shipping for the first time.
+  assert.doesNotMatch(composed.notes, /never published|for the first time/);
   assert.deepEqual(composed.carried, ['v0.4.4']);
 });
 
@@ -148,7 +154,8 @@ test('the notice reads as plural only when several tags are carried', () => {
 
   assert.deepEqual(composed.carried, ['v2.0.1', 'v2.0.0']);
   assert.match(composed.notes, /## Carried forward from v2\.0\.1, v2\.0\.0/);
-  assert.match(composed.notes, /releases were tagged but never published/);
+  assert.match(composed.notes, /tags were superseded before their releases completed/);
+  assert.doesNotMatch(composed.notes, /never published|for the first time/);
 });
 
 test('an abandoned predecessor with no changelog section is reported, not invented', () => {

@@ -193,10 +193,21 @@ export function composeNotes(changelog, version, abandonments) {
   };
 }
 
+/// Say only what the abandonment record proves.
+///
+/// The record proves a tag was superseded; it does not prove nothing was ever
+/// published for it. v0.4.5 is the counterexample: it carries a live public
+/// prerelease with assets, so claiming it was never published, or that its
+/// notes ship here for the first time, is false to anyone who opens the
+/// releases page.
 function carriedForwardNotice(tags) {
   const named = tags.join(', ');
-  const plural = tags.length > 1 ? 'releases were tagged but never published' : 'release was tagged but never published';
-  return `## Carried forward from ${named}\n\nThe following ${plural}, so the notes below ship here for the first time.\n`;
+  // Each branch is a whole sentence so number agreement cannot drift apart
+  // across a shared tail.
+  const sentence = tags.length > 1
+    ? 'The following tags were superseded before their releases completed, so the notes recorded for them are collected here.'
+    : 'The following tag was superseded before its release completed, so the notes recorded for it are collected here.';
+  return `## Carried forward from ${named}\n\n${sentence}\n`;
 }
 
 async function readChangelog(input) {
