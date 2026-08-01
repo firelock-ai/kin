@@ -114,7 +114,7 @@ jobs:
     #
     # This job stays on every event on purpose, and the authority test enforces
     # that it carries no job-level `if:`. It is the merge group's only proof of
-    # the Windows admission refusals, so taking it off the queue to reclaim its
+    # the native Windows admission contract, so taking it off the queue to reclaim its
     # runner minutes would trade a reviewable pre-landing signal for a required
     # context that first fails on main.
     runs-on: windows-latest
@@ -133,6 +133,17 @@ jobs:
       - name: Test installer warning and checksum contract (Windows PowerShell 5.1)
         shell: powershell
         run: ./scripts/test-install-checksum.ps1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Test native Windows MCP wrapper provisioning
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test --prefix ./packages/kin-mcp
+          npm run lint --prefix ./packages/kin-mcp
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
@@ -322,7 +333,7 @@ jobs:
             -p kin-cli --no-default-features --test repository_merge_resolution
 
       # The two steps below are the pull-request half of the Windows admission
-      # contract. The installer leg asserts the same refusals against the
+      # contract. The installer leg asserts the same behavior against the
       # release binary, but it runs only on the landing push, so on its own it
       # can report an admission change no earlier than a required check
       # failing on a release commit. The feature set matches the installer

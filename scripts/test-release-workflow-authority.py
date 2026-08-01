@@ -2020,7 +2020,7 @@ def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
 
 
 def windows_init_contract_strings() -> dict[str, str]:
-    """Return the shipped Windows admission contract's own refusal strings.
+    """Return wording shared by both Windows admission proofs.
 
     The install proof installs a public release anonymously and has no
     checkout, so it cannot run the contract script and retypes these instead.
@@ -2030,12 +2030,7 @@ def windows_init_contract_strings() -> dict[str, str]:
 
     source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     strings: dict[str, str] = {}
-    for name in (
-        "CONFIG_REFUSAL",
-        "SOURCE_PROOF_STAGE",
-        "DURABLE_FLUSH_GAP",
-        "NON_EMPTY_REFUSAL",
-    ):
+    for name in ("NON_EMPTY_REFUSAL",):
         bindings = re.findall(rf'(?m)^{name}="([^"]+)"$', source)
         if len(bindings) != 1:
             raise AssertionError(
@@ -2176,13 +2171,13 @@ def assert_windows_public_support_contract(
 
 
 def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> None:
-    """Keep the shipped contract's published-nothing check able to fail at all.
+    """Keep the shipped contract's stage-residue check able to fail at all.
 
     Both admission paths stage into the PARENT of the directory they admit:
     `crates/kin-core/src/git_init.rs` derives the stage from the source's
     parent and `crates/kin-core/src/init.rs` from the working directory's. A
     stage count taken inside the admitted directory therefore reports zero for
-    every input and passes whether or not the refusal cleaned up after itself.
+    every input and passes whether or not admission cleaned up after itself.
     This script is a required Windows check on every pull request, so a form
     that cannot fail is worse here than no check at all: it reads as proof.
     """
@@ -2191,7 +2186,7 @@ def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> No
     for policy in (
         'parent="$(dirname "$dir")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
-        'if [ "$staged" != "$expected_residue" ]; then',
+        'if [ "$staged" != "0" ]; then',
     ):
         require(active, policy, "reachable Windows stage-leak check")
 
@@ -2276,46 +2271,31 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
         )
 
 
-def assert_install_proof_repo_steps_are_unix_only(install_proof: str) -> None:
-    """Keep every repository-dependent install-proof step off Windows.
-
-    `kin init` refuses every admission boundary on Windows and the contract
-    script asserts that refusal by name on every pull request, so a step
-    needing an admitted repository has no passing outcome available to it
-    there. Without these guards the release gate demands the admission the
-    shipped product refuses, and the Windows leg cannot go green on either
-    answer.
-    """
+def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
+    """Require native Windows released bytes to prove repo, daemon, and MCP."""
 
     for step in (
         "First-run repository, daemon, and setup proof",
         "Graph query and MCP tool-call proof",
         "Validate installed capability proof",
     ):
-        if "if: runner.os != 'Windows'" not in "\n".join(
+        if "if: runner.os != 'Windows'" in "\n".join(
             active_lines(install_proof_step(install_proof, step))
         ):
             raise AssertionError(
-                f"install proof requires a Kin repository on Windows: {step} lost "
-                "its runner.os != 'Windows' guard"
+                f"native Windows release proof lost repository coverage: {step} "
+                "still carries a runner.os != 'Windows' guard"
             )
 
 
 def assert_install_proof_windows_admission_contract(
     windows_admission: str, contract: dict[str, str]
 ) -> None:
-    """Require the install proof to assert the refusal Windows actually ships.
-
-    A release proof that asserted an admission the product refuses can never go
-    green, and one that asserted a refusal the product no longer produces would
-    go green on the wrong behavior. Both failure modes are closed by requiring
-    each boundary to name its own cause in the contract's own words, and by
-    requiring every refusal to have published nothing.
-    """
+    """Require released Windows bytes to assert the native admission contract."""
 
     active = "\n".join(active_lines(windows_admission))
-    for name, refusal in contract.items():
-        binding = f'{name}="{refusal}"'
+    for name, wording in contract.items():
+        binding = f'{name}="{wording}"'
         if binding not in active:
             raise AssertionError(
                 "install proof must assert the shipped Windows admission contract "
@@ -2323,38 +2303,28 @@ def assert_install_proof_windows_admission_contract(
                 f"expected {binding}"
             )
     for policy in (
-        'require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2',
-        'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
-        'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
-        'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2',
-        'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
-        'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
-        'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
+        'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
+        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
+        'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
+        'fail "$1 failed" "$3"',
         'fail "$1 unexpectedly succeeded" "$3"',
+        'if [ ! -d "$2/.kin" ]; then',
         'if [ -e "$2/.kin" ]; then',
         'parent="$(dirname "$2")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
-        'if [ "$staged" != "$4" ]; then',
+        'if [ "$staged" != "0" ]; then',
     ):
         require(active, policy, "shipped Windows admission contract proof")
 
 
 def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
-    """Keep proving every Windows surface that survives without a repository.
+    """Keep the pre-repository Windows setup/provenance checkpoint falsifiable.
 
-    Windows-gating the repository steps is a reduction in release coverage, so
-    what remains has to stay genuinely falsifiable rather than becoming a leg
-    that installs a binary and declares victory. The installed CLI still proves
-    its own build provenance against the release tag's own public source, the
-    platform capability posture is still pinned by name including the repair
-    negative control, and setup still writes and validates the shell hook, the
-    install ledger, and every agent-client MCP config a repo-free install can
-    write. `kin bench-meta` reports the CLI build alone, so the daemon's build
-    provenance is among what this leg no longer binds. Codex and Antigravity
-    are the exceptions, excluded by the product because their entries bind an
-    exact repository, and both absences are asserted rather than unmentioned.
+    The later first-run steps prove the admitted repo, daemon, all five client
+    writers, and MCP. This earlier checkpoint separately proves the CLI's
+    public provenance, unsupported capability posture, and the four client
+    writers that do not require an exact repository binding.
     """
 
     active = "\n".join(active_lines(repo_free))
@@ -6254,16 +6224,14 @@ def main() -> None:
         ),
     )
 
-    # The Windows leg asserts the admission the shipped product refuses, and
-    # everything the platform still proves without a repository.
+    # Native Windows release bytes must admit both supported repository
+    # boundaries, leave no transaction residue, and retain the non-empty
+    # boundary refusal.
     windows_contract = windows_init_contract_strings()
     windows_admission = install_proof_step(
         install_proof, "Windows admission contract proof"
     )
     assert_install_proof_windows_admission_contract(windows_admission, windows_contract)
-    # The published-nothing half of the contract, in both files that state it.
-    # It counted stages inside the directory it admits, which is never where a
-    # stage is created, so it passed on every input in both.
     windows_contract_source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     assert_windows_contract_stage_check_is_reachable(windows_contract_source)
     windows_public_surfaces = {
@@ -6429,19 +6397,7 @@ def main() -> None:
         ),
     )
     expect_assertion(
-        "the install proof's Windows refusal wording drifts from the contract script",
-        "drifted from",
-        lambda: assert_install_proof_windows_admission_contract(
-            windows_admission.replace(
-                windows_contract["DURABLE_FLUSH_GAP"],
-                "for durable metadata sync",
-                1,
-            ),
-            windows_contract,
-        ),
-    )
-    expect_assertion(
-        "the contract script's refusal wording drifts from the install proof",
+        "the contract script's non-empty refusal wording drifts from the install proof",
         "drifted from",
         lambda: assert_install_proof_windows_admission_contract(
             windows_admission,
@@ -6450,28 +6406,28 @@ def main() -> None:
     )
     for label, active_line in (
         (
-            "a Windows refusal may publish a repository anyway",
+            "the non-empty Windows refusal may publish a repository anyway",
             'if [ -e "$2/.kin" ]; then',
         ),
         (
-            "a Windows refusal may leave its unpublished stage behind",
+            "a Windows admission may leave its unpublished stage behind",
             "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
         ),
         (
-            "the non-empty boundary stops having to leave nothing behind",
-            'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
+            "exact Git stops having to succeed",
+            'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
         ),
         (
-            "a successful Windows admission stops failing the leg",
-            'fail "$1 unexpectedly succeeded" "$3"',
+            "native-empty bootstrap stops having to succeed",
+            'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
         ),
         (
-            "the exact-Git refusal stops having to name its own cause",
-            'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
+            "the non-empty boundary stops being refused",
+            'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
         ),
         (
-            "the non-empty native boundary stops being asserted",
-            'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
+            "the non-empty boundary stops naming its safety reason",
+            'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
         ),
     ):
         expect_assertion(
@@ -6484,20 +6440,20 @@ def main() -> None:
             ),
         )
 
-    assert_install_proof_repo_steps_are_unix_only(install_proof)
+    assert_install_proof_repo_steps_cover_windows(install_proof)
     for repo_step in (
         "First-run repository, daemon, and setup proof",
         "Graph query and MCP tool-call proof",
         "Validate installed capability proof",
     ):
         expect_assertion(
-            f"the install proof demands a Kin repository on Windows in {repo_step}",
-            "runner.os != 'Windows' guard",
+            f"the native Windows release proof loses {repo_step}",
+            "lost repository coverage",
             lambda mutated=install_proof.replace(
-                f"      - name: {repo_step}\n        if: runner.os != 'Windows'\n",
                 f"      - name: {repo_step}\n",
+                f"      - name: {repo_step}\n        if: runner.os != 'Windows'\n",
                 1,
-            ): assert_install_proof_repo_steps_are_unix_only(mutated),
+            ): assert_install_proof_repo_steps_cover_windows(mutated),
         )
 
     repo_free = install_proof_step(
@@ -7035,31 +6991,22 @@ def main() -> None:
     # release commit, and letting the two legs carry their own copies restores
     # the drift that made the copies disagree.
     #
-    # Both boundaries now reach the graph authority store, one transaction past
-    # the config writer, so the config-writer refusal is pinned as a REFUTATION
-    # and the store's missing durable-flush capability is pinned by name.
-    # Requiring the absence of the one and the presence of the other is what
-    # keeps a regression to the old fail-closed arm from reading as a pass, and
-    # what forces the change that finally moves this boundary to say so here.
+    # Exact Git and native-empty admission are supported. The contract pins
+    # both successes, zero transaction residue, and the retained non-empty
+    # boundary refusal.
     windows_admission = (ROOT / "scripts" / "assert-windows-init-contract.sh").read_text(
         encoding="utf-8"
     )
     for policy in (
         '"$kin_bin" init',
-        'CONFIG_REFUSAL="cannot publish repository config"',
-        'SOURCE_PROOF_STAGE="prove mutable Git workspace"',
-        'DURABLE_FLUSH_GAP="for durable metadata flush"',
         'NON_EMPTY_REFUSAL="requires an empty directory"',
-        'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
-        'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
-        'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
-        'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
-        'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2',
-        'require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2',
-        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
+        'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
+        'require_non_empty_refused',
+        'if [ ! -d "$dir/.kin" ]; then',
         'fail "$label unexpectedly succeeded" "$log"',
         'if [ -e "$dir/.kin" ]; then',
+        'if [ "$staged" != "0" ]; then',
         "'.kin.init-*'",
     ):
         require(windows_admission, policy, "Windows admission contract assertions")
@@ -7103,6 +7050,16 @@ def main() -> None:
         "target/x86_64-pc-windows-msvc/debug/kin.exe",
         "pull-request Windows admission proof",
     )
+    for policy in (
+        "- name: Test native Windows MCP wrapper provisioning",
+        "npm test --prefix ./packages/kin-mcp",
+        "npm run lint --prefix ./packages/kin-mcp",
+    ):
+        require(
+            ci_jobs["windows-authority-tests"],
+            policy,
+            "native Windows npm MCP provisioning proof",
+        )
     require(
         ci_jobs["windows-installer"],
         "target/x86_64-pc-windows-msvc/release/kin.exe",
@@ -7111,7 +7068,7 @@ def main() -> None:
     if re.search(r"(?m)^    if:", ci_jobs["windows-authority-tests"]) is not None:
         raise AssertionError(
             "the Windows authority job must stay on every event, so admission "
-            "refusals are asserted before a release commit can carry them"
+            "behavior is asserted before a release commit can carry it"
         )
 
     # The Linux release artifacts are the only musl compilation Kin performs,
