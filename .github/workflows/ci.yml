@@ -307,6 +307,26 @@ jobs:
             "daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-mcp --no-default-features --lib
+          # Full uninstall owns native Windows process handles, directory
+          # identity, and deferred self-deletion. Compiling these paths on a
+          # non-Windows host cannot prove their runtime contract, so keep both
+          # the focused unit surface and the real daemon lifecycle in the
+          # permanent Windows authority leg.
+          run_required_filter "full managed uninstall safety" \
+            "commands::setup::tests::full_uninstall" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "managed-install spawn fence" \
+            "managed_spawn_fence" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon-spawn --lib
+          run_required_filter "daemon shutdown identity" "shutdown" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --lib
+          run_required_target "daemon status and stop lifecycle" \
+            "daemon_status_and_stop_lifecycle" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test daemon_stop
           run_required_filter "bounded CLI test subprocesses" \
             "commands::test_subprocess::tests" \
             --locked --target x86_64-pc-windows-msvc \
