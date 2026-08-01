@@ -86,18 +86,18 @@ pub fn durable_semantic_enrichment_summary(
         "workspace semantic overlay",
     )?;
 
-    let (embeddings_indexed, embeddings_pending, embeddings_total) =
-        if let Some(snapshot) = authority
+    let (embeddings_indexed, embeddings_pending, embeddings_total) = if let Some(snapshot) =
+        authority
             .workspace_graph_snapshot(workspace_id)
             .map_err(|error| KinError::Graph(error.to_string()))?
-        {
-            let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
-                .map_err(|error| KinError::Graph(error.to_string()))?;
-            let status = graph.embedding_status();
-            (status.indexed, status.pending, status.total)
-        } else {
-            (0, 0, 0)
-        };
+    {
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
+            .map_err(|error| KinError::Graph(error.to_string()))?;
+        let status = graph.embedding_status();
+        (status.indexed, status.pending, status.total)
+    } else {
+        (0, 0, 0)
+    };
 
     Ok(DurableSemanticEnrichmentSummary {
         authority_generation: authority.roots().generation,
