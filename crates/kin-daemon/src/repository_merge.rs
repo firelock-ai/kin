@@ -1854,18 +1854,33 @@ pub(crate) fn render_artifact(artifact: &kin_model::ArtifactId) -> String {
     artifact.0.to_string()
 }
 
-pub(crate) fn render_subject(entry: &MergeConflictEntry) -> String {
-    match &entry.subject {
-        MergeConflictSubject::Entity { entity } => match &entry.label {
-            Some(name) => format!("entity {name} ({entity})"),
-            None => format!("entity {entity}"),
-        },
+/// Name a subject held without the entry that labels it.
+///
+/// `MergeConflictSubject` has no `Display`, so the alternative at these sites is
+/// a `{:?}` rendering that reaches the caller as `ArtifactId(<uuid>)`. That is
+/// the wrapper form the resolver refuses, quoted by a message the caller is
+/// meant to act on. Routing these sites here keeps one identity form across
+/// every surface, including the refusals.
+pub(crate) fn render_subject_identity(subject: &MergeConflictSubject) -> String {
+    match subject {
+        MergeConflictSubject::Entity { entity } => format!("entity {entity}"),
         MergeConflictSubject::Relation { relation } => format!("relation {relation}"),
-        MergeConflictSubject::Artifact { artifact } => match &entry.label {
-            Some(path) => format!("artifact {path} ({})", render_artifact(artifact)),
-            None => format!("artifact {}", render_artifact(artifact)),
-        },
+        MergeConflictSubject::Artifact { artifact } => {
+            format!("artifact {}", render_artifact(artifact))
+        }
         MergeConflictSubject::Path { path } => format!("path {path}"),
+    }
+}
+
+pub(crate) fn render_subject(entry: &MergeConflictEntry) -> String {
+    match (&entry.subject, &entry.label) {
+        (MergeConflictSubject::Entity { entity }, Some(name)) => {
+            format!("entity {name} ({entity})")
+        }
+        (MergeConflictSubject::Artifact { artifact }, Some(path)) => {
+            format!("artifact {path} ({})", render_artifact(artifact))
+        }
+        (subject, _) => render_subject_identity(subject),
     }
 }
 
@@ -2084,6 +2099,43 @@ mod tests {
         assert!(
             !rendered.contains("ArtifactId("),
             "listing carries identities in the form the resolver accepts: {rendered}"
+        );
+    }
+
+    /// Taking a side for everything names a subject without the entry that
+    /// labels it, and it names it inside a refusal the caller is meant to act
+    /// on. A claimant quoted there has to carry the same form as the listing,
+    /// or the message hands back an identity the resolver rejects.
+    #[test]
+    fn a_subject_named_without_its_entry_carries_the_form_the_resolver_accepts() {
+        let artifact = ArtifactId::new();
+        let rendered = render_subject_identity(&MergeConflictSubject::Artifact { artifact });
+        assert!(
+            rendered.contains(&render_artifact(&artifact)),
+            "a subject names its artifact: {rendered}"
+        );
+        // The wrapper form carries the bare identity as a substring, so the
+        // assertion above alone is satisfied by a rendering nothing can select
+        // from. The form itself is what has to hold.
+        assert!(
+            !rendered.contains("ArtifactId("),
+            "a subject names its artifact in the form the resolver accepts: {rendered}"
+        );
+        // One rendering serves both halves. A second one is precisely how the
+        // wrapper form survived on this surface while every other emitter moved.
+        let entry = MergeConflictEntry {
+            subject: MergeConflictSubject::Artifact { artifact },
+            divergence: MergeDivergence::ChangedBothSides,
+            base: MergeSideValue::Absent,
+            ours: MergeSideValue::Absent,
+            theirs: MergeSideValue::Absent,
+            label: None,
+            resolution: MergeEntryResolution::Unresolved,
+        };
+        assert_eq!(
+            render_subject(&entry),
+            rendered,
+            "the entry path and the bare-subject path render one identity form"
         );
     }
 

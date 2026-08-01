@@ -33,7 +33,7 @@ use crate::local_repository_authority::ActiveLocalRepositoryAuthority;
 use crate::repository_merge::{
     classify_merge_error, local_workspace, merge_bad_request, merge_bind_refusal, merge_conflict,
     publish_resolved_merge, render_artifact, render_conflict_lines, render_entry, render_subject,
-    repository_finalization_error, restore_point, MergeExecution,
+    render_subject_identity, repository_finalization_error, restore_point, MergeExecution,
 };
 use crate::state::DaemonState;
 
@@ -313,7 +313,10 @@ fn settle(
             let resolution =
                 resolution_for(&next, &subject, &ResolveChoice::Side { side }, &provenance)?;
             next = next.resolve_entry(&subject, resolution).with_context(|| {
-                format!("settle merge conflict {subject:?} by taking the {side:?} side")
+                format!(
+                    "settle merge conflict {} by taking the {side:?} side",
+                    render_subject_identity(&subject)
+                )
             })?;
             settled.push(subject);
         }

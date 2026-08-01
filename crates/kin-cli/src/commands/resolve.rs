@@ -202,7 +202,10 @@ fn plan_action(
         });
     }
     for binding in keep_path {
-        let (path, artifact) = binding.split_once('=').ok_or_else(|| {
+        // Split on the last `=`, not the first: an artifact identity never
+        // contains one, but a contested path may, and the listing emits this
+        // binding with the path interpolated raw.
+        let (path, artifact) = binding.rsplit_once('=').ok_or_else(|| {
             anyhow::anyhow!(
                 "--keep-path expects <PATH>=<ARTIFACT>, naming which claimant keeps the contested \
                  path, found {binding}"
@@ -254,6 +257,63 @@ fn parse_record_hash(value: &str) -> Result<Hash256> {
         )
     })?;
     Ok(Hash256::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keep_path_directives(binding: &str) -> Vec<ResolveDirective> {
+        let action = plan_action(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![binding.to_string()],
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect("a keep-path binding plans an action");
+        match action {
+            ResolveAction::Settle { directives, all } => {
+                assert_eq!(all, None, "naming a claimant takes no side");
+                directives
+            }
+            other => panic!("a keep-path binding settles a conflict, got {other:?}"),
+        }
+    }
+
+    /// The contested-path listing emits `--keep-path <PATH>=<ARTIFACT>` with the
+    /// path interpolated raw, so a path holding an `=` reaches this parser with
+    /// two of them. Splitting on the first would name the path `docs/a` and
+    /// refuse it, leaving the contested path unsettleable from the command the
+    /// product just printed. An artifact identity holds no `=`, which is what
+    /// makes the last one the unambiguous separator.
+    #[test]
+    fn a_contested_path_holding_an_equals_sign_still_names_its_claimant() {
+        let artifact = "0b9bdc92-369a-51e9-a45d-3cbbb304dd0a";
+        assert_eq!(
+            keep_path_directives(&format!("docs/a=b.md={artifact}")),
+            vec![ResolveDirective {
+                selector: "docs/a=b.md".to_string(),
+                choice: ResolveChoice::PathOwner {
+                    artifact: artifact.to_string(),
+                },
+            }]
+        );
+        // The ordinary binding keeps its existing reading.
+        assert_eq!(
+            keep_path_directives(&format!("docs/notes.md={artifact}")),
+            vec![ResolveDirective {
+                selector: "docs/notes.md".to_string(),
+                choice: ResolveChoice::PathOwner {
+                    artifact: artifact.to_string(),
+                },
+            }]
+        );
+    }
 }
 
 async fn execute(request: ResolveRequest) -> Result<ResolveResponse> {
