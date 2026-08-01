@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -29,6 +30,12 @@ RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
 WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
+WINDOWS_WSL2_DOC = ROOT / "docs" / "windows-wsl2.md"
+QUICKSTART_DOC = ROOT / "docs" / "quickstart.md"
+MCP_TOOLS_DOC = ROOT / "docs" / "mcp-tools.md"
+LLMS_DOC = ROOT / "llms.txt"
+NPM_CANONICAL_README = ROOT / "packages" / "kin" / "README.md"
+NPM_MCP_README = ROOT / "packages" / "kin-mcp" / "README.md"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 PREPARE_RELEASE = ROOT / "scripts" / "prepare-release.mjs"
@@ -80,6 +87,7 @@ EXPECTED_SELECTOR_INVOCATIONS = {
     "release-recovery": ('"$RECORD"', '"$candidate"', '""', '"$admissible"'),
 }
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
+SETUP = ROOT / "crates" / "kin-cli" / "src" / "commands" / "setup.rs"
 DOCKERFILE = ROOT / "Dockerfile"
 BASE_IMAGE_REGISTRY = "docker.io"
 BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
@@ -712,15 +720,20 @@ def workflow_active_header_source(workflow: str) -> str:
 def active_lines(source: str) -> list[str]:
     """Return a block's non-blank, non-comment lines, stripped of indentation.
 
-    Both comment markers count. These blocks are shell steps that embed
-    JavaScript in `node <<'NODE'` heredocs, so a policy pinned inside a heredoc
-    is commented out with `//`, and dropping only `#` would let that comment-out
-    keep satisfying the substring match instead of breaking it.
+    Shell/YAML line comments, JavaScript line/block comments, PowerShell block
+    comments, and Markdown/HTML comments all count. Install-proof steps embed
+    JavaScript in `node <<'NODE'` heredocs and the Windows installer is
+    PowerShell, so stripping only `#`/`//` still lets an entire validator or
+    user-facing warning become a valid no-op block while satisfying a guard.
     """
+
+    uncommented = source
+    for pattern in (r"<#.*?#>", r"/\*.*?\*/", r"<!--.*?-->"):
+        uncommented = re.sub(pattern, "", uncommented, flags=re.DOTALL)
 
     return [
         line.strip()
-        for line in source.splitlines()
+        for line in uncommented.splitlines()
         if line.strip()
         and not line.strip().startswith("#")
         and not line.strip().startswith("//")
@@ -737,6 +750,1273 @@ def install_proof_step(install_proof: str, name: str) -> str:
     return install_proof[
         start : install_proof.index("\n      - name: ", start + len(anchor))
     ]
+
+
+def node_heredoc_body(step: str, label: str) -> str:
+    """Extract one literal Node heredoc exactly as the Actions runner executes it."""
+
+    start_marker = "          node <<'NODE'\n"
+    end_marker = "          NODE\n"
+    if step.count(start_marker) != 1:
+        raise AssertionError(f"{label} must contain exactly one literal Node validator")
+    start = step.index(start_marker) + len(start_marker)
+    if step.count(end_marker, start) != 1:
+        raise AssertionError(
+            f"{label} must terminate exactly one literal Node validator"
+        )
+    body = step[start : step.index(end_marker, start)]
+    yaml_indent = "          "
+    lines: list[str] = []
+    for line in body.splitlines():
+        if line and not line.startswith(yaml_indent):
+            raise AssertionError(
+                f"{label} Node validator escaped the run-block indentation: {line!r}"
+            )
+        lines.append(line[len(yaml_indent) :] if line else "")
+    return "\n".join(lines) + "\n"
+
+
+def replace_exactly_once(
+    source: str, original: str, replacement: str, label: str
+) -> str:
+    """Build one source mutation without letting a stale probe become a no-op."""
+
+    matches = source.count(original)
+    if matches != 1:
+        raise AssertionError(
+            f"{label} mutation expected one source anchor, found {matches}: "
+            f"{original!r}"
+        )
+    return source.replace(original, replacement, 1)
+
+
+def write_node_validator_fixture_files(
+    root: Path,
+    files: dict[str, object],
+    containment_root: Path,
+    label: str,
+) -> None:
+    """Write one isolated validator fixture without allowing path escape."""
+
+    for relative_path, value in files.items():
+        target = (root / relative_path).resolve()
+        try:
+            target.relative_to(containment_root)
+        except ValueError as error:
+            raise AssertionError(
+                f"{label} fixture path escapes its isolated root: {relative_path!r}"
+            ) from error
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = value if isinstance(value, str) else json.dumps(value)
+        content = content.replace(
+            "__VALIDATOR_HOME__", str((containment_root / "home").resolve())
+        ).replace(
+            "__VALIDATOR_PROOF__", str((containment_root / "proof").resolve())
+        )
+        target.write_text(content, encoding="utf-8")
+
+
+def run_node_validator_fixture(
+    step: str,
+    label: str,
+    proof_files: dict[str, object],
+    home_files: dict[str, object] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the exact inline validator against one deterministic proof fixture."""
+
+    script = node_heredoc_body(step, label)
+    with tempfile.TemporaryDirectory(prefix="kin-proof-validator-fixture-") as temporary:
+        temporary_root = Path(temporary).resolve()
+        proof_dir = temporary_root / "proof"
+        home_dir = temporary_root / "home"
+        proof_dir.mkdir()
+        home_dir.mkdir()
+        write_node_validator_fixture_files(
+            proof_dir, proof_files, temporary_root, label
+        )
+        write_node_validator_fixture_files(
+            home_dir, home_files or {}, temporary_root, label
+        )
+        environment = {
+            **os.environ,
+            "HOME": str(home_dir),
+            "USERPROFILE": str(home_dir),
+            **(extra_env or {}),
+        }
+        try:
+            return subprocess.run(
+                ["node", "-"],
+                input=script,
+                cwd=proof_dir,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AssertionError(
+                f"{label} could not execute its deterministic fixture: {error}"
+            ) from error
+
+
+def assert_node_validator_accepts_fixture(
+    step: str,
+    label: str,
+    proof_files: dict[str, object],
+    home_files: dict[str, object] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """Require the exact validator to accept a complete known-good fixture."""
+
+    result = run_node_validator_fixture(
+        step, label, proof_files, home_files, extra_env
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{label} rejected its known-good fixture with exit {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+
+
+def assert_node_validator_rejects_fixture(
+    step: str,
+    label: str,
+    proof_files: dict[str, object],
+    home_files: dict[str, object] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """Require the exact validator to reject one behaviorally invalid fixture."""
+
+    result = run_node_validator_fixture(
+        step, label, proof_files, home_files, extra_env
+    )
+    if result.returncode == 0:
+        raise AssertionError(f"{label} accepted a behaviorally invalid proof fixture")
+
+
+VALIDATOR_FIXTURE_COMMIT = "a" * 40
+VALIDATOR_FIXTURE_LOCK = "b" * 64
+VALIDATOR_HOME = "__VALIDATOR_HOME__"
+VALIDATOR_PROOF = "__VALIDATOR_PROOF__"
+
+
+def validator_mcp_entry(
+    executable: str,
+    *,
+    repo: str | None = None,
+    cwd: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, object]:
+    args = ["mcp", "start"]
+    if repo is not None:
+        args.extend(["--repo", repo])
+    entry: dict[str, object] = {
+        "command": executable,
+        "args": args,
+        "env": {
+            **(extra_env or {}),
+            "KIN_MCP_TOOL_PROFILE": "agent-default",
+        },
+    }
+    if cwd is not None:
+        entry["cwd"] = cwd
+    return entry
+
+
+def validator_mcp_config(entry: dict[str, object]) -> dict[str, object]:
+    return {"mcpServers": {"kin": entry}}
+
+
+def validator_windows_mcp_home_fixture() -> dict[str, object]:
+    """Return every repo-free Windows JSON MCP config."""
+
+    executable = f"{VALIDATOR_HOME}/.kin/bin/kin.exe"
+    config = validator_mcp_config(validator_mcp_entry(executable))
+    return {
+        ".claude.json": copy.deepcopy(config),
+        ".cursor/mcp.json": copy.deepcopy(config),
+        ".gemini/settings.json": copy.deepcopy(config),
+        ".codeium/windsurf/mcp_config.json": copy.deepcopy(config),
+    }
+
+
+def validator_unix_mcp_home_fixture() -> dict[str, object]:
+    """Return every main-HOME Unix JSON MCP config."""
+
+    executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
+    ordinary = validator_mcp_config(validator_mcp_entry(executable))
+    repository = validator_mcp_config(
+        validator_mcp_entry(
+            executable,
+            repo=VALIDATOR_PROOF,
+            cwd=VALIDATOR_PROOF,
+        )
+    )
+    legacy = copy.deepcopy(repository)
+    legacy["userPolicy"] = "preserve"
+    legacy["mcpServers"]["kin"]["env"]["USER_POLICY"] = "preserve"
+    return {
+        ".claude.json": copy.deepcopy(ordinary),
+        ".cursor/mcp.json": copy.deepcopy(ordinary),
+        ".gemini/settings.json": copy.deepcopy(ordinary),
+        ".codeium/windsurf/mcp_config.json": copy.deepcopy(ordinary),
+        ".gemini/config/mcp_config.json": copy.deepcopy(repository),
+        ".gemini/antigravity-ide/mcp_config.json": legacy,
+    }
+
+
+def validator_health_report(
+    statuses: dict[str, str], *, healthy: bool
+) -> dict[str, object]:
+    return {
+        "healthy": healthy,
+        "checks": [
+            {"id": check_id, "status": status}
+            for check_id, status in statuses.items()
+        ],
+    }
+
+
+WINDOWS_VALIDATOR_CHECKS = {
+    "kin_binary": "healthy",
+    "kin_daemon_binary": "healthy",
+    "shell_path": "healthy",
+    "setup_ledger": "healthy",
+    "registry_authority": "unsupported",
+    "vfs_projection": "unsupported",
+    "semantic_query_readiness": "unsupported",
+    "daemon_running": "unsupported",
+    "repo_init": "missing",
+    "mcp_client_claude": "healthy",
+    "mcp_client_cursor": "healthy",
+    "mcp_client_gemini": "healthy",
+    "mcp_client_windsurf": "healthy",
+}
+
+
+def windows_node_validator_fixture() -> tuple[
+    dict[str, object], dict[str, object], dict[str, str]
+]:
+    """Build a complete valid repository-free Windows proof fixture."""
+
+    report = validator_health_report(WINDOWS_VALIDATOR_CHECKS, healthy=False)
+    return (
+        {
+            "expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
+            "expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "installed-kin-command.txt": f"{VALIDATOR_HOME}/.kin/bin/kin.exe",
+            "kin-windows-bench-meta.json": {
+                "kin_commit": VALIDATOR_FIXTURE_COMMIT,
+                "kin_dirty": False,
+                "kin_source_known": True,
+                "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
+                "embeddings": {
+                    "vector_enabled": False,
+                    "embeddings_enabled": False,
+                    "metal_enabled": False,
+                },
+            },
+            "kin-windows-registry-authority.json": {
+                "checks": [{"state": "unsupported"}]
+            },
+            "kin-windows-health.json": copy.deepcopy(report),
+            "kin-windows-doctor.json": copy.deepcopy(report),
+        },
+        validator_windows_mcp_home_fixture(),
+        {"RUNNER_OS": "Windows"},
+    )
+
+
+UNIX_REQUIRED_VALIDATOR_CHECKS = {
+    "kin_binary": "healthy",
+    "kin_daemon_binary": "healthy",
+    "daemon_running": "healthy",
+    "repo_init": "healthy",
+    "shell_path": "healthy",
+    "setup_ledger": "healthy",
+    "registry_authority": "healthy",
+    "vfs_projection": "healthy",
+    "mcp_client_claude": "healthy",
+    "mcp_client_cursor": "healthy",
+    "mcp_client_codex": "healthy",
+    "mcp_client_gemini": "healthy",
+    "mcp_client_windsurf": "healthy",
+    "mcp_client_antigravity": "healthy",
+    "mcp_client_antigravity_workspace": "healthy",
+}
+UNIX_VALIDATOR_CHECKS = {
+    **UNIX_REQUIRED_VALIDATOR_CHECKS,
+    "semantic_query_readiness": "stale",
+}
+
+
+def unix_node_validator_fixture() -> tuple[
+    dict[str, object], dict[str, object], dict[str, str]
+]:
+    """Build a complete valid Unix release-byte proof fixture."""
+
+    pre_embed_report = validator_health_report(UNIX_VALIDATOR_CHECKS, healthy=False)
+    embedded_report = validator_health_report(
+        {"semantic_query_readiness": "healthy"}, healthy=True
+    )
+    fallback_report = validator_health_report(
+        {"mcp_client_claude": "healthy"}, healthy=True
+    )
+    executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
+    ordinary_config = validator_mcp_config(validator_mcp_entry(executable))
+    repository_config = validator_mcp_config(
+        validator_mcp_entry(
+            executable,
+            repo=VALIDATOR_PROOF,
+            cwd=VALIDATOR_PROOF,
+        )
+    )
+    codex_config = validator_mcp_config(
+        validator_mcp_entry(executable, repo=VALIDATOR_PROOF)
+    )
+    return (
+        {
+            "../expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
+            "../expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "../installed-kin-command.txt": executable,
+            "kin-status.json": {
+                "schema": "kin.status.v3",
+                "embedding_coverage": {
+                    "state": "unobserved",
+                    "reason": "no_running_daemon",
+                },
+            },
+            "kin-build-meta.json": {
+                "schema": "kin.bench-meta.v2",
+                "kin_commit": VALIDATOR_FIXTURE_COMMIT,
+                "kin_dirty": False,
+                "kin_source_known": True,
+                "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
+                "embeddings": {
+                    "vector_enabled": True,
+                    "embeddings_enabled": True,
+                },
+            },
+            "kin-daemon-health.json": {
+                "build": {
+                    "sha": VALIDATOR_FIXTURE_COMMIT,
+                    "dirty": False,
+                    "source_known": True,
+                    "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
+                }
+            },
+            "kin-health.json": copy.deepcopy(pre_embed_report),
+            "kin-doctor.json": copy.deepcopy(pre_embed_report),
+            "kin-claude-fallback-health.json": copy.deepcopy(fallback_report),
+            "kin-claude-fallback-doctor.json": copy.deepcopy(fallback_report),
+            "kin-claude-fallback-config.json": copy.deepcopy(ordinary_config),
+            "kin-codex-config.json": copy.deepcopy(codex_config),
+            ".agents/mcp_config.json": copy.deepcopy(repository_config),
+            "kin-search.json": [
+                {"name": "hello", "file": "probe.py"}
+            ],
+            "kin-locate.json": {"files": [{"path": "probe.py"}]},
+            "kin-embed.json": {
+                "pending_entities": 0,
+                "pending_artifacts": 0,
+                "time_limited": False,
+            },
+            "kin-embedded-status.json": {
+                "schema": "kin.status.v3",
+                "embedding_coverage": {
+                    "state": "observed",
+                    "source": "live_query_graph",
+                    "indexed": 2,
+                    "pending": 0,
+                    "total": 2,
+                },
+            },
+            "kin-embedded-health.json": copy.deepcopy(embedded_report),
+            "kin-embedded-doctor.json": copy.deepcopy(embedded_report),
+            "kin-semantic-search.json": [
+                {"name": "hello", "file": "probe.py"}
+            ],
+            "kin-semantic-locate.json": {
+                "semantic_coverage": {"supported": True, "complete": True},
+                "files": [{"path": "probe.py"}],
+            },
+        },
+        validator_unix_mcp_home_fixture(),
+        {"RUNNER_OS": "Linux"},
+    )
+
+
+def fixture_with_json_value(
+    fixture: dict[str, object],
+    path: str,
+    keys: tuple[str | int, ...],
+    value: object,
+) -> dict[str, object]:
+    """Deep-copy a fixture and replace one nested JSON value."""
+
+    mutated = copy.deepcopy(fixture)
+    cursor: object = mutated[path]
+    for key in keys[:-1]:
+        cursor = cursor[key]  # type: ignore[index]
+    cursor[keys[-1]] = value  # type: ignore[index]
+    return mutated
+
+
+def fixture_without_file(
+    fixture: dict[str, object], path: str
+) -> dict[str, object]:
+    mutated = copy.deepcopy(fixture)
+    del mutated[path]
+    return mutated
+
+
+def fixture_without_json_key(
+    fixture: dict[str, object],
+    path: str,
+    keys: tuple[str | int, ...],
+) -> dict[str, object]:
+    """Deep-copy a fixture and remove one nested JSON key."""
+
+    mutated = copy.deepcopy(fixture)
+    cursor: object = mutated[path]
+    for key in keys[:-1]:
+        cursor = cursor[key]  # type: ignore[index]
+    del cursor[keys[-1]]  # type: ignore[index]
+    return mutated
+
+
+def fixture_with_check_status(
+    fixture: dict[str, object],
+    path: str,
+    check_id: str,
+    status: str,
+) -> dict[str, object]:
+    """Deep-copy a health fixture and change exactly one named check."""
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    checks = report["checks"]  # type: ignore[index]
+    matches = [check for check in checks if check["id"] == check_id]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"validator fixture must contain one {check_id!r} check in {path}: "
+            f"{matches}"
+        )
+    matches[0]["status"] = status
+    return mutated
+
+
+def fixture_with_extra_check(
+    fixture: dict[str, object],
+    path: str,
+    check_id: str,
+    status: str,
+) -> dict[str, object]:
+    """Deep-copy a health fixture and append one unexpected check."""
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    report["checks"].append(  # type: ignore[index,union-attr]
+        {"id": check_id, "status": status}
+    )
+    return mutated
+
+
+def fixture_with_duplicate_check(
+    fixture: dict[str, object],
+    path: str,
+    check_id: str,
+    status: str,
+) -> dict[str, object]:
+    """Insert a contradictory check before the authoritative fixture entry."""
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    checks = report["checks"]  # type: ignore[index]
+    indexes = [index for index, check in enumerate(checks) if check["id"] == check_id]
+    if len(indexes) != 1:
+        raise AssertionError(
+            f"validator fixture must contain one {check_id!r} check in {path}: "
+            f"{indexes}"
+        )
+    checks.insert(indexes[0], {"id": check_id, "status": status})
+    return mutated
+
+
+def wrong_required_check_status(expected: str) -> str:
+    """Choose a mismatch that preserves generic readiness/failure semantics."""
+
+    if expected == "healthy":
+        return "unsupported"
+    if expected == "unsupported":
+        return "healthy"
+    if expected == "missing":
+        return "misconfigured"
+    raise AssertionError(f"no isolated required-check mutation for {expected!r}")
+
+
+def assert_windows_node_validator_behavior(step: str) -> None:
+    """Behaviorally pin every substantive Windows validator obligation."""
+
+    proof, home, environment = windows_node_validator_fixture()
+    label = "repo-free Windows install proof"
+    assert_node_validator_accepts_fixture(step, label, proof, home, environment)
+
+    def reject(
+        case: str,
+        invalid_proof: dict[str, object] | None = None,
+        invalid_home: dict[str, object] | None = None,
+    ) -> None:
+        assert_node_validator_rejects_fixture(
+            step,
+            f"{label} ({case})",
+            invalid_proof if invalid_proof is not None else proof,
+            invalid_home if invalid_home is not None else home,
+            environment,
+        )
+
+    # Every proof and home input is independently load-bearing on the valid path.
+    for path in proof:
+        reject(f"missing {path}", fixture_without_file(proof, path))
+    for path in home:
+        reject(f"missing home/{path}", invalid_home=fixture_without_file(home, path))
+
+    for case, path, keys, value in (
+        (
+            "installed commit mismatch",
+            "kin-windows-bench-meta.json",
+            ("kin_commit",),
+            "c" * 40,
+        ),
+        (
+            "dirty installed build",
+            "kin-windows-bench-meta.json",
+            ("kin_dirty",),
+            True,
+        ),
+        (
+            "unknown installed source",
+            "kin-windows-bench-meta.json",
+            ("kin_source_known",),
+            False,
+        ),
+        (
+            "lock provenance mismatch",
+            "kin-windows-bench-meta.json",
+            ("dependency_provenance",),
+            "d" * 64,
+        ),
+        (
+            "vector feature enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "vector_enabled"),
+            True,
+        ),
+        (
+            "embedding feature enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "embeddings_enabled"),
+            True,
+        ),
+        (
+            "Metal feature enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "metal_enabled"),
+            True,
+        ),
+        (
+            "registry authority falsely healthy",
+            "kin-windows-registry-authority.json",
+            ("checks", 0, "state"),
+            "healthy",
+        ),
+    ):
+        reject(case, fixture_with_json_value(proof, path, keys, value))
+
+    reject(
+        "registry authority reports more than one capability",
+        fixture_with_json_value(
+            proof,
+            "kin-windows-registry-authority.json",
+            ("checks",),
+            [{"state": "unsupported"}, {"state": "unsupported"}],
+        ),
+    )
+
+    # Every named repo-free posture is checked independently in both reports.
+    # The wrong value deliberately preserves the generic aggregate and hard-
+    # failure predicates, leaving only the required-map comparison able to
+    # reject it.
+    for report_path in ("kin-windows-health.json", "kin-windows-doctor.json"):
+        for check_id, expected in WINDOWS_VALIDATOR_CHECKS.items():
+            wrong = wrong_required_check_status(expected)
+            reject(
+                f"{report_path} required {check_id}={wrong}",
+                fixture_with_check_status(proof, report_path, check_id, wrong),
+            )
+        reject(
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "kin_binary", "unsupported"
+            ),
+        )
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), True),
+        )
+        reject(
+            f"{report_path} unexpected hard failure",
+            fixture_with_extra_check(proof, report_path, "unexpected", "missing"),
+        )
+        for repo_bound_id in (
+            "mcp_client_codex",
+            "mcp_client_antigravity",
+            "mcp_client_antigravity_workspace",
+        ):
+            reject(
+                f"{report_path} repo-bound {repo_bound_id} writer appears",
+                fixture_with_extra_check(
+                    proof, report_path, repo_bound_id, "healthy"
+                ),
+            )
+
+    for config_path in home:
+        reject(
+            f"{config_path} MCP command missing",
+            invalid_home=fixture_without_json_key(
+                home, config_path, ("mcpServers", "kin", "command")
+            ),
+        )
+        reject(
+            f"{config_path} MCP command drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                "/wrong/kin",
+            ),
+        )
+        reject(
+            f"{config_path} MCP args drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "args"),
+                ["mcp", "start", "--repo", "."],
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                "full",
+            ),
+        )
+
+    for forbidden_path in (
+        ".gemini/config/mcp_config.json",
+        ".gemini/antigravity-ide/mcp_config.json",
+    ):
+        unexpected_home = copy.deepcopy(home)
+        unexpected_home[forbidden_path] = validator_mcp_config(
+            validator_mcp_entry(f"{VALIDATOR_HOME}/.kin/bin/kin.exe")
+        )
+        reject(
+            f"repo-free Windows wrote {forbidden_path}",
+            invalid_home=unexpected_home,
+        )
+
+
+def assert_unix_node_validator_behavior(step: str) -> None:
+    """Behaviorally pin every substantive Unix validator obligation."""
+
+    proof, home, environment = unix_node_validator_fixture()
+    label = "released-byte Unix install proof"
+    assert_node_validator_accepts_fixture(step, label, proof, home, environment)
+
+    def reject(
+        case: str,
+        invalid_proof: dict[str, object] | None = None,
+        invalid_home: dict[str, object] | None = None,
+    ) -> None:
+        assert_node_validator_rejects_fixture(
+            step,
+            f"{label} ({case})",
+            invalid_proof if invalid_proof is not None else proof,
+            invalid_home if invalid_home is not None else home,
+            environment,
+        )
+
+    # Removing each input independently proves the complete success path reads it.
+    for path in proof:
+        reject(f"missing {path}", fixture_without_file(proof, path))
+    for path in home:
+        reject(f"missing home/{path}", invalid_home=fixture_without_file(home, path))
+
+    malformed_commit = copy.deepcopy(proof)
+    malformed_commit["../expected-commit.txt"] = "bad"
+    malformed_commit = fixture_with_json_value(
+        malformed_commit, "kin-build-meta.json", ("kin_commit",), "bad"
+    )
+    malformed_commit = fixture_with_json_value(
+        malformed_commit, "kin-daemon-health.json", ("build", "sha"), "bad"
+    )
+    reject("matching but malformed build commits", malformed_commit)
+
+    malformed_lock = copy.deepcopy(proof)
+    malformed_lock["../expected-lock-sha.txt"] = "bad"
+    malformed_lock = fixture_with_json_value(
+        malformed_lock, "kin-build-meta.json", ("dependency_provenance",), "bad"
+    )
+    malformed_lock = fixture_with_json_value(
+        malformed_lock,
+        "kin-daemon-health.json",
+        ("build", "dependency_provenance"),
+        "bad",
+    )
+    reject("matching but malformed lock provenance", malformed_lock)
+
+    for case, path, keys, value in (
+        (
+            "CLI schema drift",
+            "kin-build-meta.json",
+            ("schema",),
+            "kin.bench-meta.v1",
+        ),
+        (
+            "CLI commit mismatch",
+            "kin-build-meta.json",
+            ("kin_commit",),
+            "c" * 40,
+        ),
+        (
+            "CLI dirty build",
+            "kin-build-meta.json",
+            ("kin_dirty",),
+            True,
+        ),
+        (
+            "CLI unknown source",
+            "kin-build-meta.json",
+            ("kin_source_known",),
+            False,
+        ),
+        (
+            "CLI lock mismatch",
+            "kin-build-meta.json",
+            ("dependency_provenance",),
+            "d" * 64,
+        ),
+        (
+            "daemon commit mismatch",
+            "kin-daemon-health.json",
+            ("build", "sha"),
+            "c" * 40,
+        ),
+        (
+            "daemon dirty build",
+            "kin-daemon-health.json",
+            ("build", "dirty"),
+            True,
+        ),
+        (
+            "daemon unknown source",
+            "kin-daemon-health.json",
+            ("build", "source_known"),
+            False,
+        ),
+        (
+            "daemon lock mismatch",
+            "kin-daemon-health.json",
+            ("build", "dependency_provenance"),
+            "d" * 64,
+        ),
+        (
+            "status schema drift",
+            "kin-status.json",
+            ("schema",),
+            "kin.status.v2",
+        ),
+        (
+            "vector feature absent",
+            "kin-build-meta.json",
+            ("embeddings", "vector_enabled"),
+            False,
+        ),
+        (
+            "embedding feature absent",
+            "kin-build-meta.json",
+            ("embeddings", "embeddings_enabled"),
+            False,
+        ),
+        (
+            "lexical search misses entity",
+            "kin-search.json",
+            (0, "name"),
+            "other",
+        ),
+        (
+            "locate misses artifact",
+            "kin-locate.json",
+            ("files", 0, "path"),
+            "other.py",
+        ),
+        (
+            "pending entities remain",
+            "kin-embed.json",
+            ("pending_entities",),
+            1,
+        ),
+        (
+            "pending artifacts remain",
+            "kin-embed.json",
+            ("pending_artifacts",),
+            1,
+        ),
+        (
+            "embedding is time limited",
+            "kin-embed.json",
+            ("time_limited",),
+            True,
+        ),
+        (
+            "embedded status schema drift",
+            "kin-embedded-status.json",
+            ("schema",),
+            "kin.status.v2",
+        ),
+        (
+            "embedded coverage unobserved",
+            "kin-embedded-status.json",
+            ("embedding_coverage",),
+            {"state": "unobserved", "reason": "missing"},
+        ),
+        (
+            "embedded coverage has wrong source",
+            "kin-embedded-status.json",
+            ("embedding_coverage", "source"),
+            "snapshot",
+        ),
+        (
+            "embedded coverage has zero total",
+            "kin-embedded-status.json",
+            ("embedding_coverage", "total"),
+            0,
+        ),
+        (
+            "embedded coverage incomplete",
+            "kin-embedded-status.json",
+            ("embedding_coverage",),
+            {
+                "state": "observed",
+                "source": "live_query_graph",
+                "indexed": 1,
+                "pending": 1,
+                "total": 2,
+            },
+        ),
+        (
+            "embedded coverage still pending",
+            "kin-embedded-status.json",
+            ("embedding_coverage", "pending"),
+            1,
+        ),
+        (
+            "semantic search misses entity",
+            "kin-semantic-search.json",
+            (0, "name"),
+            "other",
+        ),
+        (
+            "semantic locate unsupported",
+            "kin-semantic-locate.json",
+            ("semantic_coverage", "supported"),
+            False,
+        ),
+        (
+            "semantic locate incomplete",
+            "kin-semantic-locate.json",
+            ("semantic_coverage", "complete"),
+            False,
+        ),
+        (
+            "semantic locate misses artifact",
+            "kin-semantic-locate.json",
+            ("files", 0, "path"),
+            "other.py",
+        ),
+    ):
+        reject(case, fixture_with_json_value(proof, path, keys, value))
+
+    reject(
+        "pre-embed coverage missing",
+        fixture_without_json_key(
+            proof, "kin-status.json", ("embedding_coverage",)
+        ),
+    )
+    reject(
+        "pre-embed coverage malformed",
+        fixture_with_json_value(
+            proof, "kin-status.json", ("embedding_coverage",), []
+        ),
+    )
+    reject(
+        "pre-embed coverage has unknown state",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "state"),
+            "unknown",
+        ),
+    )
+    reject(
+        "unobserved coverage has no reason",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "reason"),
+            "",
+        ),
+    )
+    reject(
+        "unobserved coverage leaks counts",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "indexed"),
+            0,
+        ),
+    )
+    reject(
+        "unobserved coverage leaks source",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "source"),
+            "live_query_graph",
+        ),
+    )
+    observed_pre_embed = fixture_with_json_value(
+        proof,
+        "kin-status.json",
+        ("embedding_coverage",),
+        {
+            "state": "observed",
+            "source": "live_query_graph",
+            "indexed": 0,
+            "pending": 2,
+            "total": 2,
+        },
+    )
+    assert_node_validator_accepts_fixture(
+        step,
+        f"{label} (observed pre-embed coverage)",
+        observed_pre_embed,
+        home,
+        environment,
+    )
+    for case, keys, value in (
+        ("observed coverage wrong source", ("source",), "snapshot"),
+        ("observed coverage negative count", ("indexed",), -1),
+        ("observed coverage carries reason", ("reason",), "stale"),
+        ("observed coverage indexed exceeds total", ("indexed",), 3),
+        ("observed coverage pending undercounts gap", ("pending",), 1),
+    ):
+        reject(
+            case,
+            fixture_with_json_value(
+                observed_pre_embed,
+                "kin-status.json",
+                ("embedding_coverage", *keys),
+                value,
+            ),
+        )
+
+    for report_path in ("kin-health.json", "kin-doctor.json"):
+        for check_id, expected in UNIX_REQUIRED_VALIDATOR_CHECKS.items():
+            wrong = wrong_required_check_status(expected)
+            reject(
+                f"{report_path} required {check_id}={wrong}",
+                fixture_with_check_status(proof, report_path, check_id, wrong),
+            )
+        reject(
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "kin_binary", "unsupported"
+            ),
+        )
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), True),
+        )
+
+        healthy_readiness = fixture_with_check_status(
+            proof, report_path, "semantic_query_readiness", "healthy"
+        )
+        healthy_readiness = fixture_with_json_value(
+            healthy_readiness, report_path, ("healthy",), True
+        )
+        assert_node_validator_accepts_fixture(
+            step,
+            f"{label} ({report_path} already semantically ready)",
+            healthy_readiness,
+            home,
+            environment,
+        )
+
+        unsupported_readiness = fixture_with_check_status(
+            proof, report_path, "semantic_query_readiness", "unsupported"
+        )
+        unsupported_readiness = fixture_with_json_value(
+            unsupported_readiness, report_path, ("healthy",), True
+        )
+        reject(
+            f"{report_path} semantic readiness unsupported",
+            unsupported_readiness,
+        )
+
+    for report_path in ("kin-embedded-health.json", "kin-embedded-doctor.json"):
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), False),
+        )
+        reject(
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "semantic_query_readiness", "unsupported"
+            ),
+        )
+        unsupported_readiness = fixture_with_check_status(
+            proof, report_path, "semantic_query_readiness", "unsupported"
+        )
+        reject(
+            f"{report_path} semantic readiness unsupported",
+            unsupported_readiness,
+        )
+
+    for report_path in (
+        "kin-claude-fallback-health.json",
+        "kin-claude-fallback-doctor.json",
+    ):
+        reject(
+            f"{report_path} Claude fallback not healthy",
+            fixture_with_check_status(
+                proof, report_path, "mcp_client_claude", "unsupported"
+            ),
+        )
+        reject(
+            f"{report_path} contradictory duplicate check",
+            fixture_with_duplicate_check(
+                proof, report_path, "mcp_client_claude", "misconfigured"
+            ),
+        )
+        reject(
+            f"{report_path} inconsistent healthy aggregate",
+            fixture_with_json_value(proof, report_path, ("healthy",), False),
+        )
+        reject(
+            f"{report_path} leaks a non-Claude global client",
+            fixture_with_extra_check(
+                proof, report_path, "mcp_client_cursor", "healthy"
+            ),
+        )
+
+    for config_path in home:
+        reject(
+            f"{config_path} MCP command missing",
+            invalid_home=fixture_without_json_key(
+                home, config_path, ("mcpServers", "kin", "command")
+            ),
+        )
+        reject(
+            f"{config_path} MCP command drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                "/wrong/kin",
+            ),
+        )
+        reject(
+            f"{config_path} MCP args drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "args"),
+                ["mcp", "start", "--repo", "."],
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile drift",
+            invalid_home=fixture_with_json_value(
+                home,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                "full",
+            ),
+        )
+        entry = home[config_path]["mcpServers"]["kin"]  # type: ignore[index]
+        if "cwd" in entry:
+            reject(
+                f"{config_path} MCP cwd drift",
+                invalid_home=fixture_with_json_value(
+                    home,
+                    config_path,
+                    ("mcpServers", "kin", "cwd"),
+                    "/wrong/repo",
+                ),
+            )
+
+    for config_path in (
+        "kin-claude-fallback-config.json",
+        "kin-codex-config.json",
+        ".agents/mcp_config.json",
+    ):
+        reject(
+            f"{config_path} MCP command missing",
+            fixture_without_json_key(
+                proof, config_path, ("mcpServers", "kin", "command")
+            ),
+        )
+        reject(
+            f"{config_path} MCP command drift",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "command"),
+                "/wrong/kin",
+            ),
+        )
+        reject(
+            f"{config_path} MCP args drift",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "args"),
+                ["mcp", "start", "--repo", "/wrong/repo"],
+            ),
+        )
+        reject(
+            f"{config_path} MCP profile drift",
+            fixture_with_json_value(
+                proof,
+                config_path,
+                ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+                "full",
+            ),
+        )
+        entry = proof[config_path]["mcpServers"]["kin"]  # type: ignore[index]
+        if "cwd" in entry:
+            reject(
+                f"{config_path} MCP cwd drift",
+                fixture_with_json_value(
+                    proof,
+                    config_path,
+                    ("mcpServers", "kin", "cwd"),
+                    "/wrong/repo",
+                ),
+            )
+
+    reject(
+        "Antigravity legacy top-level policy drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".gemini/antigravity-ide/mcp_config.json",
+            ("userPolicy",),
+            "lost",
+        ),
+    )
+    reject(
+        "Antigravity legacy entry policy drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".gemini/antigravity-ide/mcp_config.json",
+            ("mcpServers", "kin", "env", "USER_POLICY"),
+            "lost",
+        ),
+    )
+
+
+def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
+    """Execute the shipped validator and require incomplete proof trees to fail.
+
+    Token checks explain which contract drifted, but cannot prove those tokens
+    remain reachable. Running the extracted program against a deliberately
+    absent evidence tree catches whole-validator no-ops. Running it again after
+    seeding only the first expected-commit input gets beyond that first read and
+    catches a false branch or early exit around every substantive validation.
+    Both controls fail for runtime behavior rather than one enumerated syntax.
+    """
+
+    script = node_heredoc_body(step, label)
+    try:
+        syntax = subprocess.run(
+            ["node", "--check", "-"],
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AssertionError(f"{label} could not parse under Node: {error}") from error
+    if syntax.returncode != 0:
+        raise AssertionError(
+            f"{label} is not valid Node source: {syntax.stderr.strip()}"
+        )
+    expected_commit_reads = re.findall(
+        r'const expectedCommit = fs\.readFileSync\("([^"]+)", "utf8"\)\.trim\(\);',
+        script,
+    )
+    if len(expected_commit_reads) != 1:
+        raise AssertionError(
+            f"{label} must read exactly one expected-commit proof input: "
+            f"{expected_commit_reads}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="kin-proof-validator-") as temporary:
+        temporary_root = Path(temporary).resolve()
+        proof_dir = temporary_root / "proof"
+        proof_dir.mkdir()
+
+        def require_runtime_rejection(scenario: str) -> None:
+            try:
+                result = subprocess.run(
+                    ["node", "-"],
+                    input=script,
+                    cwd=proof_dir,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise AssertionError(
+                    f"{label} could not execute under Node for {scenario}: {error}"
+                ) from error
+            if result.returncode == 0:
+                raise AssertionError(
+                    f"{label} accepted {scenario}; the validator is not "
+                    "runtime-falsifiable"
+                )
+
+        require_runtime_rejection("an empty proof tree")
+
+        expected_commit_path = (proof_dir / expected_commit_reads[0]).resolve()
+        try:
+            expected_commit_path.relative_to(temporary_root)
+        except ValueError as error:
+            raise AssertionError(
+                f"{label} expected-commit input escapes its isolated proof tree: "
+                f"{expected_commit_reads[0]!r}"
+            ) from error
+        expected_commit_path.parent.mkdir(parents=True, exist_ok=True)
+        expected_commit_path.write_text("0" * 40 + "\n", encoding="utf-8")
+        require_runtime_rejection("an expected-commit-only proof tree")
 
 
 def windows_init_contract_strings() -> dict[str, str]:
@@ -764,6 +2044,135 @@ def windows_init_contract_strings() -> dict[str, str]:
             )
         strings[name] = bindings[0]
     return strings
+
+
+def windows_public_support_notice(contract_source: str) -> str:
+    """Read the one public capability statement from the executable contract."""
+
+    bindings = re.findall(
+        r'(?m)^PUBLIC_SUPPORT_NOTICE="([^"]+)"$', contract_source
+    )
+    if len(bindings) != 1:
+        raise AssertionError(
+            f"{WINDOWS_INIT_CONTRACT_POLICY} must bind PUBLIC_SUPPORT_NOTICE "
+            f"exactly once: {bindings}"
+        )
+    notice = bindings[0]
+    for truth in (
+        "repository-free CLI diagnostics",
+        "repository admission is currently unavailable",
+        "kin init fails closed",
+        "workflows are unsupported",
+        "Use WSL2 for usable Kin repositories",
+    ):
+        if truth not in notice:
+            raise AssertionError(
+                "Windows public support notice no longer states the executable "
+                f"refusal contract: missing {truth!r}"
+            )
+    return notice
+
+
+def assert_windows_public_support_contract(
+    contract_source: str,
+    install_ps1: str,
+    public_surfaces: dict[Path, str],
+    compatibility_mcp_readme: str,
+) -> None:
+    """Keep every install surface inside the native-Windows admission boundary.
+
+    The required Windows jobs prove both `kin init` boundaries refuse. This
+    public notice is therefore owned by the same executable contract rather
+    than by independent prose. Each shipped installer/doc/package copy must be
+    exact, and known larger capability claims are forbidden even if the exact
+    notice remains elsewhere in the file.
+    """
+
+    notice = windows_public_support_notice(contract_source)
+    contract_active = "\n".join(active_lines(contract_source))
+    for refusal in (
+        'require_refused "Windows exact-Git admission"',
+        'require_refused "Windows native-unborn bootstrap"',
+        'fail "$label unexpectedly succeeded" "$log"',
+    ):
+        require(
+            contract_active,
+            refusal,
+            "public Windows support notice tied to executable refusal",
+        )
+
+    all_surfaces = {INSTALL_PS1: install_ps1, **public_surfaces}
+    for path, source in all_surfaces.items():
+        count = "\n".join(active_lines(source)).count(notice)
+        if count != 1:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} must repeat the Windows support notice "
+                f"from {WINDOWS_INIT_CONTRACT_POLICY} exactly once; found {count}"
+            )
+
+    normalized = " ".join("\n".join(all_surfaces.values()).lower().split())
+    for stale_claim in (
+        "native windows is a supported vector-free subset",
+        "native windows build is a supported vector-free runtime",
+        "native windows supports graph + lexical workflows",
+        "supported for graph, lexical retrieval, daemon, setup, mcp",
+        "it ships the supported vector-free runtime",
+        "the graph, lexical, daemon, setup, and mcp surfaces are release-tested",
+    ):
+        if stale_claim in normalized:
+            raise AssertionError(
+                "public native-Windows surface exceeds the executable admission "
+                f"contract: found stale claim {stale_claim!r}"
+            )
+
+    install_active = "\n".join(active_lines(install_ps1))
+    if re.search(r'(?m)^\s*"ARM64"\s*\{\s*return\b', install_ps1):
+        raise AssertionError(
+            "PowerShell installer must never resolve native ARM64 to a release "
+            "archive; only windows-x86_64 is published"
+        )
+    for policy in (
+        '$NativeWindowsSupportNotice = "' + notice + '"',
+        'Write-Host "  ! $NativeWindowsSupportNotice"',
+        "function Resolve-KinWindowsArchiveArchitecture",
+        '"AMD64" { return "x86_64" }',
+        '"ARM64" { throw "No native Windows ARM64 archive is published.',
+        "Not running repository setup: native Windows cannot admit a Kin repository.",
+    ):
+        require(install_active, policy, "truthful native-Windows installer")
+    if "windows-aarch64" in install_ps1:
+        raise AssertionError(
+            "PowerShell installer fabricates the nonexistent windows-aarch64 archive"
+        )
+    if "& $KinExe setup" in install_active:
+        raise AssertionError(
+            "native-Windows installer must not configure repository/MCP workflows "
+            "while repository admission is refused"
+        )
+
+    for policy in (
+        "- macOS or Linux",
+        "Windows users should run Kin through WSL2 during the alpha.",
+    ):
+        require(
+            compatibility_mcp_readme,
+            policy,
+            "compatibility MCP package native-Windows boundary",
+        )
+
+    quickstart_active = "\n".join(active_lines(public_surfaces[QUICKSTART_DOC]))
+    for policy in (
+        "on macOS and Linux, skip the `kin setup` wizard",
+        "Native Windows always skips repository setup while admission is unsupported",
+        "`KIN_NO_SETUP` is accepted there only for CI compatibility",
+        "On macOS and Linux, `kin setup` is the guided wizard the installer launches",
+        "Native Windows does not launch repository setup",
+    ):
+        require(
+            quickstart_active,
+            policy,
+            "quickstart platform-specific setup contract",
+        )
 
 
 def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> None:
@@ -943,9 +2352,9 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
     negative control, and setup still writes and validates the shell hook, the
     install ledger, and every agent-client MCP config a repo-free install can
     write. `kin bench-meta` reports the CLI build alone, so the daemon's build
-    provenance is among what this leg no longer binds. Codex is the exception,
-    excluded by the product because its entry binds an exact repository, and
-    its absence is asserted rather than left unmentioned.
+    provenance is among what this leg no longer binds. Codex and Antigravity
+    are the exceptions, excluded by the product because their entries bind an
+    exact repository, and both absences are asserted rather than unmentioned.
     """
 
     active = "\n".join(active_lines(repo_free))
@@ -956,12 +2365,18 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         'kin setup --no-interactive --intent agent --shell "$PROOF_SHELL"',
         "kin setup status --json | tee kin-windows-health.json",
         "kin doctor --json | tee kin-windows-doctor.json",
+        "for agent in claude cursor codex gemini windsurf agy; do",
         'fs.readFileSync("expected-commit.txt", "utf8").trim()',
         'fs.readFileSync("expected-lock-sha.txt", "utf8").trim()',
+        'fs.readFileSync("installed-kin-command.txt", "utf8").trim()',
+        "installedKin !== expectedInstalledKin",
         "meta.kin_commit !== expectedCommit",
         "meta.kin_dirty !== false",
         "meta.kin_source_known !== true",
         "meta.dependency_provenance !== expectedLock",
+        "meta.embeddings?.vector_enabled !== false",
+        "meta.embeddings?.embeddings_enabled !== false",
+        "meta.embeddings?.metal_enabled !== false",
         'authority.checks[0]?.state !== "unsupported"',
         '["repo_init", "missing"]',
         '["daemon_running", "unsupported"]',
@@ -972,11 +2387,139 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         '["setup_ledger", "healthy"]',
         '["mcp_client_claude", "healthy"]',
         '["mcp_client_cursor", "healthy"]',
-        'if (checks.has("mcp_client_codex")) {',
+        '"mcp_client_codex", "mcp_client_antigravity", "mcp_client_antigravity_workspace"',
         '["mcp_client_gemini", "healthy"]',
         '["mcp_client_windsurf", "healthy"]',
+        "entry.command !== installedKin",
+        'path.join(home, ".gemini", "config", "mcp_config.json")',
     ):
         require(active, policy, "repo-free Windows install proof")
+
+
+def assert_install_proof_status_contract(
+    first_run: str, graph_query: str, embedding: str, validation: str
+) -> None:
+    """Pin install proof to fields the released binaries actually emit.
+
+    `kin status --json` is the repository status report, not the daemon command
+    envelope. Build provenance therefore comes from the CLI's bench metadata
+    and the daemon's public health response, while embedding progress comes
+    from the required `kin.status.v3` coverage sum type. Keeping these sources
+    separate prevents a plausible-looking proof from reading fields that no
+    shipped command produces.
+    """
+
+    first_run_active = "\n".join(active_lines(first_run))
+    embedding_active = "\n".join(active_lines(embedding))
+    validation_active = "\n".join(active_lines(validation))
+
+    require(
+        first_run_active,
+        "kin bench-meta --json > kin-build-meta.json",
+        "installed CLI provenance capture",
+    )
+    require(
+        first_run_active,
+        "printf '%s\\n' \"$fake_agent_bin\" >> \"$GITHUB_PATH\"",
+        "cross-step agent-client proof PATH",
+    )
+    for policy in (
+        "for agent in claude cursor codex gemini windsurf agy; do",
+        'antigravity_legacy="$HOME/.gemini/antigravity-ide/mcp_config.json"',
+        'command: "/stale/kin"',
+        'CODEX_CONFIG="$HOME/.codex/config.toml" python3',
+        'tomllib.load(handle)["mcp_servers"]["kin"]',
+        'claude_fallback_home="$RUNNER_TEMP/kin-proof-claude-fallback-home"',
+        'printf \'{}\\n\' > "$claude_fallback_home/.claude/config.json"',
+        'if [ -e "$claude_fallback_home/.claude.json" ]; then',
+        "kin-claude-fallback-health.json",
+        "kin-claude-fallback-doctor.json",
+    ):
+        require(first_run_active, policy, "complete MCP writer state/path matrix")
+
+    graph_active_lines = active_lines(graph_query)
+    graph_active = "\n".join(graph_active_lines)
+    for policy in (
+        "kin search hello --json | tee kin-search.json",
+        "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\"",
+        'DAEMON_PORT="$daemon_port" node',
+        "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
+        "kin-daemon-health.json",
+        "kin setup status --json | tee kin-health.json",
+        "kin doctor --json | tee kin-doctor.json",
+        'path.join(process.cwd(), ".agents", "mcp_config.json")',
+        "spawn(entry.command, entry.args",
+        "cwd: entry.cwd",
+        "env: { ...process.env, ...(entry.env ?? {}) }",
+    ):
+        require(graph_active, policy, "installed daemon startup and health capture")
+
+    daemon_start = "kin search hello --json | tee kin-search.json"
+    endpoint_capture = "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
+    setup_health = "kin setup status --json | tee kin-health.json"
+    doctor_health = "kin doctor --json | tee kin-doctor.json"
+    daemon_start_index = graph_active_lines.index(daemon_start)
+    if any(
+        daemon_start_index >= graph_active_lines.index(capture)
+        for capture in (endpoint_capture, setup_health, doctor_health)
+    ):
+        raise AssertionError(
+            "install proof must start the daemon through a graph query before "
+            "reading its endpoint or capturing setup health"
+        )
+
+    for stale_capture in (setup_health, doctor_health):
+        if stale_capture in "\n".join(active_lines(first_run)):
+            raise AssertionError(
+                "install proof must capture setup health after the daemon-starting "
+                f"graph query, not in the first-run step: {stale_capture}"
+            )
+
+    for stale in (
+        "status.build",
+        "status.semantic_coverage",
+        "embeddedStatus.semantic_coverage",
+    ):
+        if stale in validation_active:
+            raise AssertionError(
+                "install proof reads a field the released status report does not "
+                f"emit: {stale}"
+            )
+
+    for policy in (
+        'const cliMeta = JSON.parse(fs.readFileSync("kin-build-meta.json", "utf8"))',
+        'const daemonHealth = JSON.parse(fs.readFileSync("kin-daemon-health.json", "utf8"))',
+        "sha: cliMeta.kin_commit",
+        "sha: daemonHealth.build?.sha",
+        'status.schema !== "kin.status.v3"',
+        "validateEmbeddingCoverage(status.embedding_coverage",
+        "cliMeta.embeddings?.vector_enabled !== true",
+        "cliMeta.embeddings?.embeddings_enabled !== true",
+        'embeddedStatus.schema !== "kin.status.v3"',
+        "validateEmbeddingCoverage(embeddedStatus.embedding_coverage",
+        "embeddedCoverage.indexed !== embeddedCoverage.total",
+        "embeddedCoverage.pending !== 0",
+        'fs.readFileSync("../installed-kin-command.txt", "utf8").trim()',
+        "installedKin !== expectedInstalledKin",
+        '["mcp_client_antigravity", "healthy"]',
+        '["mcp_client_antigravity_workspace", "healthy"]',
+        '"kin-claude-fallback-config.json"',
+        '"kin-codex-config.json"',
+        'path.join(repoRoot, ".agents", "mcp_config.json")',
+        "entry.command !== installedKin",
+        'legacy.userPolicy !== "preserve"',
+    ):
+        require(
+            validation_active,
+            policy,
+            "released-byte status and build proof contract",
+        )
+
+    require(
+        embedding_active,
+        "kin status --json | tee kin-embedded-status.json",
+        "post-embedding repository status capture",
+    )
 
 
 def assert_docs_only_classifier_guard(workflow: str) -> None:
@@ -4011,6 +5554,10 @@ def main() -> None:
     install_sh = INSTALL_SH.read_text(encoding="utf-8")
     install_ps1 = INSTALL_PS1.read_text(encoding="utf-8")
     health = HEALTH.read_text(encoding="utf-8")
+    setup = SETUP.read_text(encoding="utf-8")
+    quickstart = QUICKSTART_DOC.read_text(encoding="utf-8")
+    mcp_tools = MCP_TOOLS_DOC.read_text(encoding="utf-8")
+    npm_canonical_readme = NPM_CANONICAL_README.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
     workflow_sources = {
         workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
@@ -4616,8 +6163,14 @@ def main() -> None:
         "      - name: Validate installed capability proof",
         embedding_start,
     )
+    preserve_start = install_proof.index(
+        "      - name: Preserve proof reports",
+        validation_start,
+    )
     first_run = install_proof[first_run_start:graph_query_start]
+    graph_query = install_proof[graph_query_start:embedding_start]
     embedding = install_proof[embedding_start:validation_start]
+    validation = install_proof[validation_start:preserve_start]
     for policy in (
         'case "$PROOF_SHELL" in',
         "export SHELL=/bin/bash",
@@ -4713,6 +6266,145 @@ def main() -> None:
     # stage is created, so it passed on every input in both.
     windows_contract_source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     assert_windows_contract_stage_check_is_reachable(windows_contract_source)
+    windows_public_surfaces = {
+        README: readme,
+        QUICKSTART_DOC: QUICKSTART_DOC.read_text(encoding="utf-8"),
+        WINDOWS_WSL2_DOC: WINDOWS_WSL2_DOC.read_text(encoding="utf-8"),
+        UPDATE_TRUST: update_trust,
+        NPM_CANONICAL_README: NPM_CANONICAL_README.read_text(encoding="utf-8"),
+        LLMS_DOC: LLMS_DOC.read_text(encoding="utf-8"),
+    }
+    compatibility_mcp_readme = NPM_MCP_README.read_text(encoding="utf-8")
+    assert_windows_public_support_contract(
+        windows_contract_source,
+        install_ps1,
+        windows_public_surfaces,
+        compatibility_mcp_readme,
+    )
+    public_notice = windows_public_support_notice(windows_contract_source)
+
+    drifted_readme_surfaces = dict(windows_public_surfaces)
+    drifted_readme_surfaces[README] = readme.replace(
+        public_notice,
+        "Native Windows supports the graph and daemon without vectors.",
+        1,
+    )
+    expect_assertion(
+        "the README restores a larger native-Windows capability claim",
+        "must repeat the Windows support notice",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1,
+            drifted_readme_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
+        "the public notice drifts away from the executable refusal contract",
+        "no longer states the executable refusal contract",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source.replace(
+                "repository admission is currently unavailable",
+                "repository admission is available",
+                1,
+            ),
+            install_ps1,
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
+        "the PowerShell installer maps native ARM64 to a nonexistent archive",
+        "must never resolve native ARM64",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1.replace(
+                '"ARM64" { throw "No native Windows ARM64 archive is published.',
+                '"ARM64" { return "aarch64" # No native Windows ARM64 archive is published.',
+                1,
+            ),
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
+        "the native installer auto-configures an unusable repository setup",
+        "must not configure repository/MCP workflows",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1 + "\n& $KinExe setup\n",
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    for label, original, expected in (
+        (
+            "the native installer comments out its executable support notice binding",
+            '$NativeWindowsSupportNotice = "',
+            "must repeat the Windows support notice",
+        ),
+        (
+            "the native installer comments out its visible support warning",
+            'Write-Host "  ! $NativeWindowsSupportNotice"',
+            "truthful native-Windows installer",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda original=original: assert_windows_public_support_contract(
+                windows_contract_source,
+                install_ps1.replace(original, f"# {original}", 1),
+                windows_public_surfaces,
+                compatibility_mcp_readme,
+            ),
+        )
+    expect_assertion(
+        "a PowerShell block comment disables the visible native-Windows warning",
+        "truthful native-Windows installer",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1.replace(
+                'Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow',
+                '<#\nWrite-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow\n#>',
+                1,
+            ),
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    blocked_quickstart_surfaces = dict(windows_public_surfaces)
+    blocked_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
+        QUICKSTART_DOC
+    ].replace(public_notice, f"<!-- {public_notice} -->", 1)
+    expect_assertion(
+        "the quickstart hides the native-Windows support boundary",
+        "must repeat the Windows support notice",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1,
+            blocked_quickstart_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    drifted_quickstart_surfaces = dict(windows_public_surfaces)
+    drifted_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
+        QUICKSTART_DOC
+    ].replace(
+        "Native Windows always skips repository setup while admission is unsupported",
+        "Both installers launch repository setup unless KIN_NO_SETUP=1",
+        1,
+    )
+    expect_assertion(
+        "the quickstart claims native Windows launches repository setup",
+        "quickstart platform-specific setup contract",
+        lambda: assert_windows_public_support_contract(
+            windows_contract_source,
+            install_ps1,
+            drifted_quickstart_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
     expect_assertion(
         "the contract script counts stages where one can never appear",
         "reachable Windows stage-leak check",
@@ -4812,6 +6504,69 @@ def main() -> None:
         install_proof, "Windows repo-free provenance and setup proof"
     )
     assert_install_proof_repo_free_windows_proof(repo_free)
+    assert_node_validator_rejects_missing_proof(
+        repo_free, "repo-free Windows install proof"
+    )
+    assert_windows_node_validator_behavior(repo_free)
+    selective_windows_required_bypass = replace_exactly_once(
+        repo_free,
+        "          if (actual !== expected) {\n",
+        '          if (id !== "kin_binary" && actual !== expected) {\n',
+        "Windows selective required-check bypass",
+    )
+    expect_assertion(
+        "the Windows validator selectively skips the kin_binary requirement",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_windows_node_validator_behavior(
+            selective_windows_required_bypass
+        ),
+    )
+    windows_mcp_only_claude = replace_exactly_once(
+        repo_free,
+        "          for (const configPath of jsonConfigs) {\n",
+        "          for (const configPath of jsonConfigs.slice(0, 1)) {\n",
+        "Windows selective MCP-config bypass",
+    )
+    expect_assertion(
+        "the Windows validator checks MCP values only in Claude's config",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_windows_node_validator_behavior(windows_mcp_only_claude),
+    )
+    blocked_repo_free = repo_free.replace(
+        '          const fs = require("fs");\n',
+        '          /*\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          */\n          NODE\n', 1)
+    expect_assertion(
+        "a JavaScript block comment disables the entire Windows validator",
+        "repo-free Windows install proof",
+        lambda: assert_install_proof_repo_free_windows_proof(blocked_repo_free),
+    )
+    false_branch_repo_free = repo_free.replace(
+        '          const fs = require("fs");\n',
+        '          if (false) {\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch disables the entire Windows validator",
+        "validator is not runtime-falsifiable",
+        lambda: assert_node_validator_rejects_missing_proof(
+            false_branch_repo_free, "repo-free Windows install proof"
+        ),
+    )
+    partial_false_branch_repo_free = repo_free.replace(
+        '          const expectedCommit = fs.readFileSync("expected-commit.txt", "utf8").trim();\n',
+        '          const expectedCommit = fs.readFileSync("expected-commit.txt", "utf8").trim();\n'
+        '          if (false) {\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch after expected-commit disables the substantive Windows validator",
+        "accepted an expected-commit-only proof tree",
+        lambda: assert_node_validator_rejects_missing_proof(
+            partial_false_branch_repo_free, "repo-free Windows install proof"
+        ),
+    )
     for label, original, mutation in (
         (
             "the Windows leg stops binding installed provenance to the release tag",
@@ -4822,6 +6577,11 @@ def main() -> None:
             "the Windows leg stops proving the release Cargo.lock provenance",
             "meta.dependency_provenance !== expectedLock",
             'meta.dependency_provenance !== ""',
+        ),
+        (
+            "the Windows leg stops proving its vector-free feature contract",
+            "meta.embeddings?.vector_enabled !== false",
+            "meta.embeddings?.vector_enabled !== true",
         ),
         (
             "the Windows registry-authority repair negative control disappears",
@@ -4851,6 +6611,201 @@ def main() -> None:
                 original, mutation, 1
             ): assert_install_proof_repo_free_windows_proof(mutated),
         )
+    assert_install_proof_status_contract(first_run, graph_query, embedding, validation)
+    assert_node_validator_rejects_missing_proof(
+        validation, "released-byte Unix install proof"
+    )
+    assert_unix_node_validator_behavior(validation)
+    selective_unix_required_bypass = replace_exactly_once(
+        validation,
+        "          if (actual !== expected) {\n",
+        '          if (id !== "kin_binary" && actual !== expected) {\n',
+        "Unix selective required-check bypass",
+    )
+    expect_assertion(
+        "the Unix validator selectively skips the kin_binary requirement",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(selective_unix_required_bypass),
+    )
+    unix_mcp_only_claude = replace_exactly_once(
+        validation,
+        "          for (const expected of mcpConfigs) {\n",
+        "          for (const expected of mcpConfigs.slice(0, 1)) {\n",
+        "Unix selective MCP-config bypass",
+    )
+    expect_assertion(
+        "the Unix validator checks MCP values only in Claude's config",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(unix_mcp_only_claude),
+    )
+    unix_full_sha_bypass = replace_exactly_once(
+        validation,
+        '          if (!fullSha.test(build.sha ?? "")) {\n',
+        '          if (false && !fullSha.test(build.sha ?? "")) {\n',
+        "Unix full-commit-SHA bypass",
+    )
+    expect_assertion(
+        "the Unix validator disables the full commit SHA comparison",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(unix_full_sha_bypass),
+    )
+    unix_lock_sha_bypass = replace_exactly_once(
+        validation,
+        '          if (!lockSha.test(build.dependencyProvenance ?? "")) {\n',
+        '          if (false && !lockSha.test(build.dependencyProvenance ?? "")) {\n',
+        "Unix lock-SHA bypass",
+    )
+    expect_assertion(
+        "the Unix validator disables the lock SHA comparison",
+        "accepted a behaviorally invalid proof fixture",
+        lambda: assert_unix_node_validator_behavior(unix_lock_sha_bypass),
+    )
+    blocked_validation = validation.replace(
+        '          const fs = require("fs");\n',
+        '          /*\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          */\n          NODE\n', 1)
+    expect_assertion(
+        "a JavaScript block comment disables the entire Unix validator",
+        "released-byte status and build proof contract",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query,
+            embedding,
+            blocked_validation,
+        ),
+    )
+    false_branch_validation = validation.replace(
+        '          const fs = require("fs");\n',
+        '          if (false) {\n          const fs = require("fs");\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch disables the entire Unix validator",
+        "validator is not runtime-falsifiable",
+        lambda: assert_node_validator_rejects_missing_proof(
+            false_branch_validation, "released-byte Unix install proof"
+        ),
+    )
+    partial_false_branch_validation = validation.replace(
+        '          const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();\n',
+        '          const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();\n'
+        '          if (false) {\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch after expected-commit disables the substantive Unix validator",
+        "accepted an expected-commit-only proof tree",
+        lambda: assert_node_validator_rejects_missing_proof(
+            partial_false_branch_validation, "released-byte Unix install proof"
+        ),
+    )
+    expect_assertion(
+        "install proof stops capturing CLI build metadata",
+        "installed CLI provenance capture",
+        lambda: assert_install_proof_status_contract(
+            first_run.replace(
+                "kin bench-meta --json > kin-build-meta.json",
+                "kin --version > kin-build-meta.json",
+                1,
+            ),
+            graph_query,
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "install proof reads daemon endpoint before a daemon-starting query",
+        "must start the daemon through a graph query",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin search hello --json | tee kin-search.json",
+                "# graph query moved below daemon provenance capture",
+                1,
+            ).replace(
+                "cat kin-daemon-health.json",
+                "cat kin-daemon-health.json\n          kin search hello --json | tee kin-search.json",
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "a commented-out daemon-starting query cannot satisfy the proof contract",
+        "installed daemon startup and health capture",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin search hello --json | tee kin-search.json",
+                "# kin search hello --json | tee kin-search.json",
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "setup health is captured before the daemon-starting query",
+        "must start the daemon through a graph query",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin setup status --json | tee kin-health.json",
+                "# setup health moved above daemon startup",
+                1,
+            )
+            .replace(
+                "kin doctor --json | tee kin-doctor.json",
+                "# doctor health moved above daemon startup",
+                1,
+            )
+            .replace(
+                "kin search hello --json | tee kin-search.json",
+                "kin setup status --json | tee kin-health.json\n"
+                "          kin doctor --json | tee kin-doctor.json\n"
+                "          kin search hello --json | tee kin-search.json",
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "install proof reads build provenance from repository status again",
+        "does not emit: status.build",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query,
+            embedding,
+            validation.replace("const builds = new Map([", "const stale = status.build;\n          const builds = new Map([", 1),
+        ),
+    )
+    expect_assertion(
+        "install proof accepts the pre-coverage status schema",
+        "released-byte status and build proof contract",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query,
+            embedding,
+            validation.replace("kin.status.v3", "kin.status.v2"),
+        ),
+    )
+    expect_assertion(
+        "install proof reads locate coverage from repository status again",
+        "does not emit: status.semantic_coverage",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query,
+            embedding,
+            validation.replace(
+                "status.embedding_coverage",
+                "status.semantic_coverage",
+                1,
+            ),
+        ),
+    )
     for policy in (
         "PROOF_SHELL: ${{ matrix.setup-shell }}",
         'case "$PROOF_SHELL" in',
@@ -4874,6 +6829,24 @@ def main() -> None:
         '["mcp_client_codex", "healthy"]',
         "repo-bound Codex MCP install proof",
     )
+    for policy in (
+        'fs.writeFileSync("installed-kin-command.txt", `${installedKin}\\n`)',
+        "execFileSync(installedKin, [\"--version\"]",
+        "for agent in claude cursor codex gemini windsurf agy; do",
+        "spawn(entry.command, entry.args",
+    ):
+        require(install_proof, policy, "installed MCP executable and writer proof")
+    for policy in (
+        "evaluate_mcp_client(&client.path, client.id)",
+        "McpLauncherTopology::Native",
+        "McpLauncherTopology::CanonicalNpm",
+        "CANONICAL_NPM_MCP_COMMAND",
+        "CANONICAL_NPM_MCP_PACKAGE",
+        "mcp_argument_vector_matches(entry, client_id, topology)",
+        '"codex" | "antigravity" | "antigravity_workspace"',
+        "configured_mcp_launcher()",
+    ):
+        require(health, policy, "product-owned exact MCP entry health validation")
     require(
         health,
         "evaluate_codex_binding(&client.path)",
@@ -4884,6 +6857,67 @@ def main() -> None:
         "super::setup::codex_entry_has_exact_repo_binding(&content, expected_repo)",
         "shared TOML parser for Codex MCP binding validation",
     )
+    for policy in (
+        "CANONICAL_NPM_MCP_PACKAGE",
+        'args[0].as_str() == Some("-y")',
+        'args[2].as_str() == Some("mcp")',
+        'args[4].as_str() == Some("--repo")',
+    ):
+        require(setup, policy, "canonical npm Codex repository binding")
+
+    ordinary_repair_start = setup.index(
+        "pub(crate) fn remerge_existing_mcp_configs_detailed()"
+    )
+    ordinary_repair_end = setup.index(
+        "#[cfg(all(test, unix))]", ordinary_repair_start
+    )
+    ordinary_repair = setup[ordinary_repair_start:ordinary_repair_end]
+    require(
+        ordinary_repair,
+        "configured_mcp_launcher",
+        "doctor repair uses the configured installation launcher",
+    )
+    updater_repair_start = setup.index(
+        "pub(crate) fn remerge_mcp_targets_exact_with_topology_and_finalizer"
+    )
+    updater_repair_end = setup.index(
+        "fn validate_mcp_repair_precondition", updater_repair_start
+    )
+    updater_repair = setup[updater_repair_start:updater_repair_end]
+    require(
+        updater_repair,
+        "let command = managed_mcp_launcher()?;",
+        "updater repair stays pinned to the managed launcher",
+    )
+    if "configured_mcp_launcher" in updater_repair:
+        raise AssertionError(
+            "updater MCP repair must not accept the ordinary configured launcher resolver"
+        )
+
+    for path, source in (
+        (QUICKSTART_DOC, quickstart),
+        (MCP_TOOLS_DOC, mcp_tools),
+        (NPM_CANONICAL_README, npm_canonical_readme),
+    ):
+        if '"command": "kin"' in "\n".join(active_lines(source)):
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} must not document a PATH-dependent bare Kin MCP launcher"
+            )
+    for source, label in (
+        (quickstart, "quickstart canonical npm MCP launcher"),
+        (npm_canonical_readme, "canonical npm package MCP launcher"),
+    ):
+        require(source, '"command": "npx"', label)
+        require(
+            source,
+            '"args": ["-y", "@kinlab/kin", "mcp", "start"]',
+            label,
+        )
+    for source, label in (
+        (quickstart, "quickstart native MCP launcher"),
+        (mcp_tools, "MCP tools native launcher"),
+    ):
+        require(source, '"command": "/absolute/path/to/kin"', label)
     if "JSON.parse(codexArgsMatch[1])" in install_proof:
         raise AssertionError(
             "install proof must not parse TOML as JSON; the product health check owns Codex binding validation"
@@ -5037,6 +7071,17 @@ def main() -> None:
             "bash ./scripts/assert-windows-init-contract.sh",
         ):
             require(ci_jobs[job_id], policy, f"shared Windows admission proof in {job_id}")
+        if ci_jobs[job_id].count("run: ./scripts/test-install-checksum.ps1") != 2:
+            raise AssertionError(
+                f"{job_id} must execute the installer warning/checksum contract "
+                "once under PowerShell 7 and once under Windows PowerShell 5.1"
+            )
+        for shell in ("shell: pwsh", "shell: powershell"):
+            require(
+                ci_jobs[job_id],
+                shell,
+                f"dual-engine Windows installer authority in {job_id}",
+            )
     # The Windows arm of the config writer shares no code with the Unix one, so
     # a leg that never runs its cases proves nothing about the transaction
     # `kin init` depends on.

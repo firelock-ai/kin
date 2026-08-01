@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload deliberately omits `indexed`, `pending`, and `total` when coverage was
   not observed.
 
+### Changed
+
+- Make native-Windows installers and public guidance match the shipped
+  repository-admission refusal, and fail before requesting the nonexistent
+  Windows ARM64 archive.
+
 ## [0.4.5] - 2026-08-01
 
 ### Changed

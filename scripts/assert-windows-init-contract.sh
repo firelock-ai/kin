@@ -64,6 +64,11 @@ DURABLE_FLUSH_GAP="for durable metadata flush"
 # The one `kin init` refusal that is not about platform capability at all: Kin
 # never derives authority from filesystem contents it was not given exactly.
 NON_EMPTY_REFUSAL="requires an empty directory"
+# User-facing support wording lives beside the executable refusal contract so
+# docs and installers cannot describe a larger product than this script proves.
+# scripts/test-release-workflow-authority.py requires every public copy to stay
+# byte-for-byte equal to this binding.
+PUBLIC_SUPPORT_NOTICE="Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories."
 
 # Every assertion reports and the script exits once at the end. One CI round on
 # a Windows runner is expensive, so a run that stops at the first failure buys a
@@ -226,3 +231,4 @@ if [ "$failures" -ne 0 ]; then
   exit 1
 fi
 echo "Windows admission refused every boundary at the cause it names, published no authority, and left exactly the unreaped stage residue this platform is known to leave."
+echo "$PUBLIC_SUPPORT_NOTICE"
