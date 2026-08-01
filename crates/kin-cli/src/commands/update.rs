@@ -4731,6 +4731,16 @@ fn is_notifier_bundle_entry(path: &Path) -> bool {
         .any(|component| component.as_os_str() == NOTIFIER_BUNDLE_DIR)
 }
 
+/// Whether this archive record names the bundle directory itself rather than
+/// a member below it. Release tarballs contain this structural record because
+/// the packaging workflow archives the whole artifact directory.
+fn is_notifier_bundle_root_entry(path: &Path) -> bool {
+    let mut components = path
+        .components()
+        .skip_while(|component| component.as_os_str() != std::ffi::OsStr::new(NOTIFIER_BUNDLE_DIR));
+    components.next().is_some() && components.next().is_none()
+}
+
 /// The part of an archive member path that lies inside the bundle.
 ///
 /// Returns the path relative to `KinNotifier.app` itself, which is what gets
@@ -4857,6 +4867,7 @@ fn bundle_identity_from_members(members: &mut Vec<BundleMember>) -> Result<Bundl
 struct NotifierBundleCollector<'a> {
     members: Vec<BundleMember>,
     total_bytes: u64,
+    root_entry_seen: bool,
     sink: &'a mut dyn FnMut(&BundleMember, &[u8]) -> Result<()>,
 }
 
@@ -4865,6 +4876,7 @@ impl<'a> NotifierBundleCollector<'a> {
         Self {
             members: Vec::new(),
             total_bytes: 0,
+            root_entry_seen: false,
             sink,
         }
     }
@@ -4896,6 +4908,30 @@ impl<'a> NotifierBundleCollector<'a> {
     /// so an archive that omits directory entries still produces the same
     /// identity as one that includes them.
     fn accept(&mut self, entry: &SimpleTarEntry) -> Result<()> {
+        if is_notifier_bundle_root_entry(&entry.path) {
+            if entry.kind != SimpleTarEntryKind::Directory {
+                anyhow::bail!(
+                    "notification bundle root '{}' must be a directory record",
+                    entry.path.display()
+                );
+            }
+            if entry.declared_size != 0 {
+                anyhow::bail!(
+                    "notification bundle root '{}' must have zero expanded size",
+                    entry.path.display()
+                );
+            }
+            if std::mem::replace(&mut self.root_entry_seen, true) {
+                anyhow::bail!(
+                    "notification bundle contains duplicate root entry '{}'",
+                    entry.path.display()
+                );
+            }
+            // The root is archive structure, not a member of the signed app
+            // tree. It still consumed the archive walker's global entry budget,
+            // but must not consume the bundle member budget or change identity.
+            return Ok(());
+        }
         let relative = notifier_bundle_member_path(&entry.path)?;
         let mut ancestor = PathBuf::new();
         let segments: Vec<_> = relative
@@ -11153,9 +11189,12 @@ mod tests {
         make_tar_gz_with_modes(&with_modes)
     }
 
-    /// Build an archive that carries per-entry permissions. The notification
-    /// bundle's executable is refused unless it is actually executable, so a
-    /// fixture standing in for a real macOS archive has to say so.
+    /// Build an archive that carries per-entry permissions. A name ending in
+    /// `/` describes an explicit zero-sized directory record, matching the
+    /// release tarballs produced by the macOS packaging workflow. The
+    /// notification bundle's executable is refused unless it is actually
+    /// executable, so a fixture standing in for a real macOS archive has to say
+    /// so as well.
     fn make_tar_gz_with_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
@@ -11164,6 +11203,10 @@ mod tests {
             let mut builder = tar::Builder::new(&mut gz);
             for (name, data, mode) in entries {
                 let mut header = tar::Header::new_gnu();
+                if name.ends_with('/') {
+                    assert!(data.is_empty(), "directory fixture must be empty: {name}");
+                    header.set_entry_type(tar::EntryType::Directory);
+                }
                 header.set_size(data.len() as u64);
                 header.set_mode(*mode);
                 header.set_cksum();
@@ -11469,6 +11512,7 @@ mod tests {
     #[cfg(unix)]
     fn macos_archive_with_notifier(prefix: &str, notifier: &[u8]) -> Vec<u8> {
         make_tar_gz_with_modes(&[
+            (&format!("{prefix}/"), b"", 0o755),
             (&format!("{prefix}/kin"), b"new-kin", 0o755),
             (&format!("{prefix}/kin-daemon"), b"new-daemon", 0o755),
             (&format!("{prefix}/kin-vfs"), b"new-vfs", 0o755),
@@ -11476,6 +11520,18 @@ mod tests {
                 &format!("{prefix}/libkin_vfs_shim.dylib"),
                 b"new-shim",
                 0o644,
+            ),
+            (&format!("{prefix}/KinNotifier.app/"), b"", 0o755),
+            (&format!("{prefix}/KinNotifier.app/Contents/"), b"", 0o755),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/MacOS/"),
+                b"",
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Resources/"),
+                b"",
+                0o755,
             ),
             (
                 &format!("{prefix}/KinNotifier.app/Contents/Info.plist"),
@@ -12411,6 +12467,53 @@ cwd = {:?}
             ["a"; MAX_NOTIFIER_BUNDLE_DEPTH + 1].join("/")
         );
         assert!(notifier_bundle_member_path(Path::new(&deep)).is_err());
+    }
+
+    #[test]
+    fn notifier_bundle_root_acceptance_is_structural_and_fail_closed() {
+        let regular_root =
+            make_tar_gz_with_modes(&[("kin-macos-aarch64/KinNotifier.app", b"", 0o755)]);
+        let regular_error = stage_archive(
+            &regular_root,
+            "kin-macos-aarch64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a regular file cannot stand in for the bundle root");
+        assert!(
+            format!("{regular_error:#}").contains("must be a directory record"),
+            "{regular_error:#}"
+        );
+
+        let nonempty_header = make_test_tar_header("kin-macos-aarch64/KinNotifier.app/", 1, b'5');
+        let nonempty_root = make_raw_test_tar(nonempty_header, b"x");
+        let nonempty_error = stage_archive(
+            &nonempty_root,
+            "kin-macos-aarch64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a directory root carrying payload bytes must be rejected");
+        assert!(
+            format!("{nonempty_error:#}").contains("has nonzero expanded size"),
+            "{nonempty_error:#}"
+        );
+
+        let duplicate_root = make_tar_gz_with_modes(&[
+            ("kin-macos-aarch64/KinNotifier.app/", b"", 0o755),
+            ("kin-macos-aarch64/KinNotifier.app/", b"", 0o755),
+        ]);
+        let duplicate_error = stage_archive(
+            &duplicate_root,
+            "kin-macos-aarch64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("duplicate structural roots must not be normalized away");
+        assert!(
+            format!("{duplicate_error:#}").contains("duplicate root entry"),
+            "{duplicate_error:#}"
+        );
     }
 
     /// An update must leave the installed notification bundle holding the bytes

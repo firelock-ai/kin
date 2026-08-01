@@ -208,7 +208,9 @@ impl InstallChannel {
     /// What to do to get the bundle back on this channel.
     fn remedy(self) -> &'static str {
         match self {
-            Self::Managed => "run `kin update` to reinstall the managed release",
+            Self::Managed => {
+                "rerun the managed installer: `curl -fsSL https://get.kinlab.dev/install | sh`"
+            }
             Self::Homebrew => "run `brew reinstall kin`",
             Self::Unknown => {
                 "reinstall Kin from https://github.com/firelock-ai/kin (scripts/install.sh)"
@@ -238,6 +240,9 @@ pub struct Status {
     pub channel: InstallChannel,
     /// Raw authorization report from the bundle, when it could be queried.
     pub identity: Option<String>,
+    /// Why a bundle present on the search path could not be launched. `None`
+    /// means either a healthy bundle was selected or no bundle exists at all.
+    pub notifier_issue: Option<String>,
     /// Keys currently holding back a repeat.
     pub held_keys: Vec<String>,
 }
@@ -251,8 +256,13 @@ impl Status {
         if !cfg!(target_os = "macos") || self.notifier.is_some() {
             return None;
         }
+        let state = self
+            .notifier_issue
+            .as_deref()
+            .map(|issue| format!("is present but unusable ({issue})"))
+            .unwrap_or_else(|| "is not installed".to_string());
         Some(format!(
-            "KinNotifier.app is not installed (looked for {}); this {} install did not deliver it, \
+            "KinNotifier.app {state} (looked for {}); this {} install did not deliver a launchable bundle, \
              so notifications post as Script Editor instead of Kin. To fix: {}.",
             self.expected.display(),
             self.channel,
@@ -367,7 +377,7 @@ impl Notifier {
     pub fn resolve_notifier(&self) -> Option<PathBuf> {
         self.bundle_candidates()
             .into_iter()
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| notifier_candidate_issue(candidate).is_none())
     }
 
     /// Tell LaunchServices where the resolved bundle is.
@@ -445,7 +455,20 @@ impl Notifier {
 
     /// Report what is installed and what is currently held back.
     pub fn status(&self) -> Status {
-        let installed = self.resolve_notifier();
+        let candidates = self.bundle_candidates();
+        let installed = candidates
+            .iter()
+            .find(|candidate| notifier_candidate_issue(candidate).is_none())
+            .cloned();
+        let notifier_issue = if installed.is_none() {
+            candidates.iter().find_map(|candidate| {
+                let bundle = notifier_bundle_root(candidate)?;
+                fs::symlink_metadata(bundle).ok()?;
+                notifier_candidate_issue(candidate).map(str::to_string)
+            })
+        } else {
+            None
+        };
         let identity = installed.as_ref().and_then(|path| query_identity(path));
         let mut held_keys: Vec<String> = fs::read_dir(self.state_dir())
             .map(|entries| {
@@ -461,6 +484,7 @@ impl Notifier {
             expected: self.notifier_path(),
             channel: self.install_channel(),
             identity,
+            notifier_issue,
             held_keys,
         }
     }
@@ -629,6 +653,63 @@ fn bundle_executable(parent: &Path) -> PathBuf {
         .join("Contents")
         .join("MacOS")
         .join("KinNotifier")
+}
+
+/// Root of the app that owns a candidate executable.
+fn notifier_bundle_root(executable: &Path) -> Option<&Path> {
+    executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn real_regular_file_metadata(path: &Path) -> Option<fs::Metadata> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+}
+
+/// Minimal shape LaunchServices and the router need before a bundle can be
+/// called usable. Installers enforce the same two leaves; checking them again
+/// here catches corruption and interrupted/non-transactional installs instead
+/// of presenting a lone executable as healthy.
+fn notifier_candidate_issue(executable: &Path) -> Option<&'static str> {
+    let Some(macos) = executable.parent() else {
+        return Some("the app executable path is malformed");
+    };
+    let Some(contents) = macos.parent() else {
+        return Some("the app executable path is malformed");
+    };
+    let Some(bundle) = contents.parent() else {
+        return Some("the app executable path is malformed");
+    };
+    if !is_real_directory(bundle) || !is_real_directory(contents) || !is_real_directory(macos) {
+        return Some("the app directory shape is missing or unsafe");
+    }
+    let plist = contents.join("Info.plist");
+    let Some(plist_metadata) = real_regular_file_metadata(&plist) else {
+        return Some("Contents/Info.plist is missing or not a regular file");
+    };
+    if plist_metadata.len() == 0 {
+        return Some("Contents/Info.plist is empty");
+    }
+    let Some(executable_metadata) = real_regular_file_metadata(executable) else {
+        return Some("Contents/MacOS/KinNotifier is missing or not a regular file");
+    };
+    #[cfg(not(unix))]
+    let _ = executable_metadata;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if executable_metadata.permissions().mode() & 0o111 == 0 {
+            return Some("Contents/MacOS/KinNotifier is not executable");
+        }
+    }
+    None
 }
 
 /// Classify an install from where its executable lives.
@@ -877,7 +958,14 @@ mod tests {
     fn install_fake_bundle(parent: &Path) -> PathBuf {
         let executable = bundle_executable(parent);
         fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let contents = executable.parent().unwrap().parent().unwrap();
+        fs::write(contents.join("Info.plist"), b"<plist/>").unwrap();
         fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         executable
     }
 
@@ -1021,8 +1109,7 @@ mod tests {
 
     /// A managed install stays managed when `KIN_HOME` is reached through a
     /// symlink. The consequence of missing it is message-only, but the message
-    /// it produces sends a managed user to reinstall from a script instead of
-    /// running `kin update`.
+    /// it produces sends a managed user to the wrong reinstall channel.
     #[test]
     #[cfg(unix)]
     fn a_managed_install_is_recognized_through_a_symlinked_home() {
@@ -1073,6 +1160,75 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert!(status.degradation().is_none());
+    }
+
+    #[test]
+    fn the_managed_remedy_names_a_reinstaller_not_the_same_version_update_noop() {
+        let remedy = InstallChannel::Managed.remedy();
+        assert!(
+            remedy.contains("https://get.kinlab.dev/install"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("| sh"), "{remedy}");
+        assert!(!remedy.contains("kin update"), "{remedy}");
+    }
+
+    #[test]
+    fn a_lone_notifier_executable_is_not_reported_as_a_healthy_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        let plist = executable
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("Info.plist");
+        fs::remove_file(plist).unwrap();
+
+        let status = Notifier::with_home(kin_home).status();
+        assert!(status.notifier.is_none());
+        assert!(
+            status
+                .notifier_issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("Info.plist")),
+            "issue: {:?}",
+            status.notifier_issue
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            status.degradation().unwrap().contains("Info.plist"),
+            "{:?}",
+            status.degradation()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_notifier_is_not_reported_as_a_healthy_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let status = Notifier::with_home(kin_home).status();
+        assert!(status.notifier.is_none());
+        assert!(
+            status
+                .notifier_issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("not executable")),
+            "issue: {:?}",
+            status.notifier_issue
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            status.degradation().unwrap().contains("not executable"),
+            "{:?}",
+            status.degradation()
+        );
     }
 
     #[test]

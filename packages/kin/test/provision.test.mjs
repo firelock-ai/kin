@@ -153,49 +153,55 @@ test('provision replaces a stale bundle whole rather than merging into it', asyn
   fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('provision says so when a macOS archive carries no bundle', async () => {
-  const { work, fetchImpl } = makeFixture({ notifier: 'absent' });
+function seedExistingManagedInstall(home) {
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  const bundle = path.join(home, 'lib', 'KinNotifier.app');
+  fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), 'old-kin');
+  fs.writeFileSync(path.join(binDir, 'kin-daemon'), 'old-daemon');
+  fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), '<plist>old</plist>');
+  fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'KinNotifier'), 'old-notifier');
+  writeLauncherStamp('8.8.8', env);
+  return env;
+}
+
+async function assertMalformedBundleUpgradeIsPreflightOnly(notifier, expectedError) {
+  const { work, fetchImpl } = makeFixture({ notifier });
   const home = path.join(work, 'kin-home');
-  const lines = [];
-  await provision('9.9.9', {
-    env: { KIN_HOME: home },
-    platform: 'darwin',
-    arch: 'arm64',
-    fetchImpl,
-    log: (line) => lines.push(line),
-  });
-  // The CLI still installs: a missing bundle degrades notifications, it does
-  // not break Kin. It must not degrade quietly, though.
-  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
-  const warning = lines.find((line) => line.includes('KinNotifier.app'));
-  assert.ok(warning, `expected a warning naming the bundle, got: ${lines.join(' | ')}`);
-  assert.match(warning, /Script Editor/);
+  const env = seedExistingManagedInstall(home);
+
+  await assert.rejects(
+    provision('9.9.9', {
+      env,
+      platform: 'darwin',
+      arch: 'arm64',
+      fetchImpl,
+      log: () => {},
+    }),
+    expectedError,
+  );
+
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin'), 'utf8'), 'old-kin');
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin-daemon'), 'utf8'), 'old-daemon');
+  assert.equal(
+    fs.readFileSync(
+      path.join(home, 'lib', 'KinNotifier.app', 'Contents', 'MacOS', 'KinNotifier'),
+      'utf8',
+    ),
+    'old-notifier',
+  );
+  assert.equal(readLauncherStamp(env), '8.8.8');
   fs.rmSync(work, { recursive: true, force: true });
+}
+
+test('provision refuses an absent macOS bundle before mutating a previous install', async () => {
+  await assertMalformedBundleUpgradeIsPreflightOnly('absent', /carries no KinNotifier\.app/);
 });
 
-test('provision refuses a bundle that has nothing to post under, without failing the install', async () => {
-  const { work, fetchImpl } = makeFixture({ notifier: 'no-plist' });
-  const home = path.join(work, 'kin-home');
-  const lines = [];
-  await provision('9.9.9', {
-    env: { KIN_HOME: home },
-    platform: 'darwin',
-    arch: 'arm64',
-    fetchImpl,
-    log: (line) => lines.push(line),
-  });
-  // Installing it would report as healthy and post as nothing. Failing the
-  // provisioning over it would leave `npx kin` unusable here and on every
-  // later run.
-  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
-  assert.ok(
-    !fs.existsSync(path.join(home, 'lib', 'KinNotifier.app')),
-    'a bundle with no Info.plist must not be installed',
-  );
-  const warning = lines.find((line) => line.includes('Info.plist'));
-  assert.ok(warning, `expected a warning naming the missing member, got: ${lines.join(' | ')}`);
-  assert.match(warning, /Script Editor/);
-  fs.rmSync(work, { recursive: true, force: true });
+test('provision refuses an incomplete macOS bundle before mutating a previous install', async () => {
+  await assertMalformedBundleUpgradeIsPreflightOnly('no-plist', /missing Contents\/Info\.plist/);
 });
 
 test('provision installs no bundle on a platform that has no notification bundle', async () => {

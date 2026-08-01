@@ -131,6 +131,23 @@ function copyTree(src, dest) {
   fs.chmodSync(dest, stat.mode & 0o111 ? 0o755 : 0o644);
 }
 
+/** Read-only counterpart to copyTree, used before any live install mutation. */
+function validateTree(src) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`refusing symlink in the release archive: ${src}`);
+  }
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(src)) {
+      validateTree(path.join(src, entry));
+    }
+    return;
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing a non-regular archive entry: ${src}`);
+  }
+}
+
 /**
  * Install the macOS notification bundle from an extracted release archive.
  *
@@ -143,39 +160,45 @@ function copyTree(src, dest) {
  * stale executable left inside a newer bundle breaks the signature seal macOS
  * checks over the bundle as a unit.
  *
- * Returns true when a bundle was installed.
+ * Returns the validated bundle source, or null on a platform with no bundle.
  */
-export function installNotifierBundle(root, env, platform, log) {
-  if (platform !== 'darwin') return false;
-
+function preflightNotifierBundle(root, platform) {
+  if (platform !== 'darwin') return null;
   const src = path.join(root, 'KinNotifier.app');
   if (!fs.existsSync(src)) {
-    log(
-      'kin: warning: this release archive carries no KinNotifier.app, so notifications will post ' +
-        'as Script Editor rather than as Kin. Upgrade to a release that ships the bundle, or ' +
-        'install via https://github.com/firelock-ai/kin (scripts/install.sh).',
+    throw new Error(
+      'this macOS release archive carries no KinNotifier.app; refusing to replace binaries or ' +
+        'stamp the release with a missing notification identity',
     );
-    return false;
   }
-  // A bundle missing either of these installs cleanly and then misbehaves at
-  // runtime: nothing to launch, or nothing for macOS to attribute the
-  // notification to. It is refused here, where the cause is still visible, but
-  // refused the same way an absent bundle is: an incomplete notification asset
-  // costs the Kin sender identity, while failing the provisioning would cost a
-  // usable `kin` on this run and on every later one, since each re-provisions
-  // and meets the same archive again.
+  const rootStat = fs.lstatSync(src);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error('KinNotifier.app in the macOS release archive is not a real directory');
+  }
+  validateTree(src);
   for (const required of ['Contents/MacOS/KinNotifier', 'Contents/Info.plist']) {
-    if (!fs.existsSync(path.join(src, required))) {
-      log(
-        `kin: warning: this release archive's KinNotifier.app is missing ${required}, so it was ` +
-          'not installed and notifications will post as Script Editor rather than as Kin. ' +
-          'Upgrade to a release that ships a complete bundle, or install via ' +
-          'https://github.com/firelock-ai/kin (scripts/install.sh).',
+    const member = path.join(src, required);
+    if (!fs.existsSync(member)) {
+      throw new Error(
+        `this macOS release archive's KinNotifier.app is missing ${required}; refusing to ` +
+          'replace binaries or stamp the release',
       );
-      return false;
+    }
+    const stat = fs.lstatSync(member);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`KinNotifier.app/${required} is not a regular file`);
+    }
+    if (stat.size === 0) {
+      throw new Error(`KinNotifier.app/${required} is empty`);
+    }
+    if (required.endsWith('/KinNotifier') && (stat.mode & 0o111) === 0) {
+      throw new Error(`KinNotifier.app/${required} is not executable`);
     }
   }
+  return src;
+}
 
+function installNotifierBundleSource(src, env) {
   const libDir = path.join(kinHome(env), 'lib');
   fs.mkdirSync(libDir, { recursive: true });
   const dest = path.join(libDir, 'KinNotifier.app');
@@ -206,6 +229,13 @@ export function installNotifierBundle(root, env, platform, log) {
     spawnSync(lsregister, ['-f', dest], { stdio: 'ignore' });
   }
   return true;
+}
+
+/** Validate and install the macOS bundle as one tree. */
+export function installNotifierBundle(root, env, platform, log) {
+  void log;
+  const src = preflightNotifierBundle(root, platform);
+  return src ? installNotifierBundleSource(src, env) : false;
 }
 
 /**
@@ -260,6 +290,12 @@ export async function provision(version, opts = {}) {
       );
     }
 
+    // A macOS bundle is part of the release contract, not an optional extra.
+    // Validate it before creating or replacing anything under KIN_HOME so a
+    // malformed upgrade cannot stamp new binaries while retaining a stale
+    // live notifier from the previous release.
+    const notifierSrc = preflightNotifierBundle(root, platform);
+
     const binDir = path.join(kinHome(env), 'bin');
     const libDir = path.join(kinHome(env), 'lib');
     fs.mkdirSync(binDir, { recursive: true });
@@ -279,7 +315,7 @@ export async function provision(version, opts = {}) {
       }
     }
 
-    if (installNotifierBundle(root, env, platform, log)) {
+    if (notifierSrc && installNotifierBundleSource(notifierSrc, env)) {
       log('kin: notification identity installed (KinNotifier.app)');
     }
 

@@ -191,6 +191,30 @@ if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
     exit 1
 fi
 
+# The notification identity is part of every macOS release contract. Validate
+# its minimal launchable shape before replacing any installed binary so a
+# malformed archive cannot leave a new CLI paired with an old notifier bundle.
+if [ "$OS" = "macos" ]; then
+    NOTIFIER_ROOT="$EXTRACT_DIR/KinNotifier.app"
+    NOTIFIER_EXEC="$NOTIFIER_ROOT/Contents/MacOS/KinNotifier"
+    NOTIFIER_PLIST="$NOTIFIER_ROOT/Contents/Info.plist"
+    if [ -L "$NOTIFIER_ROOT" ] || [ ! -d "$NOTIFIER_ROOT" ]; then
+        err "KinNotifier.app missing or unsafe in the downloaded macOS archive."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -L "$NOTIFIER_EXEC" ] || [ ! -f "$NOTIFIER_EXEC" ] || [ ! -s "$NOTIFIER_EXEC" ] || [ ! -x "$NOTIFIER_EXEC" ]; then
+        err "KinNotifier.app/Contents/MacOS/KinNotifier is missing, unsafe, empty, or not executable."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -L "$NOTIFIER_PLIST" ] || [ ! -f "$NOTIFIER_PLIST" ] || [ ! -s "$NOTIFIER_PLIST" ]; then
+        err "KinNotifier.app/Contents/Info.plist is missing, unsafe, or empty."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+fi
+
 # The freshly downloaded binary owns the registry-authority contract used by
 # `kin doctor` and `kin update`. Run its content-free check before replacing
 # any installed binary. Unsafe existing state is never silently chmodded or
