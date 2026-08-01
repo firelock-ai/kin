@@ -453,13 +453,13 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         {
             return None;
         }
-        if payload.get("entity_count").and_then(Value::as_u64) == Some(0) {
+        let neighborhood_gap = if payload.get("entity_count").and_then(Value::as_u64) == Some(0) {
             kind = "focal_not_in_graph";
             subject = "the focal entity is not in the graph, so no neighborhood was walked";
-            trustworthy = false;
-            trust_reason = "focal_not_in_graph: the focal entity was not found, so an empty \
-                 neighborhood is not evidence that it is isolated"
-                .to_string();
+            Some(
+                "focal_not_in_graph: the focal entity was not found, so an empty \
+                 neighborhood is not evidence that it is isolated",
+            )
         } else if payload.get("depth").and_then(Value::as_u64) == Some(0) {
             // A depth of zero expands no edges at all, so the empty result is a
             // fact about the request and not about the entity. Certifying that
@@ -468,12 +468,29 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
             kind = "no_traversal";
             subject = "no traversal was performed at depth 0, so nothing was examined \
                  about the entity's neighbors";
+            Some(
+                "depth_zero: the walk expanded no edges, so an empty neighborhood \
+                 is not evidence of isolation",
+            )
+        } else {
+            if let Some(directional) = neighborhood_absence_subject(payload) {
+                subject = directional;
+            }
+            None
+        };
+
+        // A neighborhood gap describes this request or this focal; the
+        // envelope's gap describes the substrate underneath both. When the
+        // substrate was already untrustworthy it is the reason everything looks
+        // absent, so it leads and the specific gap follows rather than being
+        // overwritten by it.
+        if let Some(gap) = neighborhood_gap {
+            trust_reason = if trustworthy {
+                gap.to_string()
+            } else {
+                format!("{trust_reason}; {gap}")
+            };
             trustworthy = false;
-            trust_reason = "depth_zero: the walk expanded no edges, so an empty neighborhood \
-                 is not evidence of isolation"
-                .to_string();
-        } else if let Some(directional) = neighborhood_absence_subject(payload) {
-            subject = directional;
         }
     }
 
@@ -1015,6 +1032,33 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("depth_zero"));
+    }
+
+    /// A degraded substrate is the reason every entity looks absent, so it is
+    /// the reason that explains the neighborhood's own. Reporting only the
+    /// specific gap would name a fact about the graph's contents where the
+    /// truth is that the graph could not be trusted to answer at all.
+    #[test]
+    fn neighborhood_gap_keeps_the_substrate_reason_beside_it() {
+        let mut env = structural_ready_envelope();
+        env.degraded = Degraded {
+            embed_worker_failed: Some(true),
+            ..Degraded::default()
+        };
+        let mut payload = neighborhood_payload("both", 0);
+        payload["entity_count"] = json!(0);
+        let negative = negative_for("graph_neighborhood", &payload, &env)
+            .expect("a focal the walk never found must still be qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("degraded"),
+            "the substrate gap that explains the absence must survive: {reason}"
+        );
+        assert!(
+            reason.contains("focal_not_in_graph"),
+            "the neighborhood's own gap must still be reported: {reason}"
+        );
     }
 
     /// `limit: 0` empties the edge array of a neighborhood that really has
