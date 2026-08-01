@@ -981,7 +981,8 @@ enum Command {
         /// Compare an explicit projection observation with graph truth
         #[arg(long, default_value_t = false)]
         drift: bool,
-        /// Rematerialize the derived projection from graph truth
+        /// Rematerialize the derived projection from graph truth, DISCARDING
+        /// uncommitted changes to tracked files that diverge from it
         #[arg(long, default_value_t = false)]
         heal: bool,
     },

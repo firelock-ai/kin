@@ -102,9 +102,10 @@ pub fn registered_id_for_path<'a>(
                 String::new()
             };
             anyhow::bail!(
-                "no registry entry records the repository at {};{named} run `kin init` here to \
-                 register it and record its cross-repo dependencies, or `kin deps --all` to list \
-                 the repositories that are registered",
+                "no registry entry records the repository at {};{named} no shipped command writes \
+                 one, so the scoped view cannot answer here: `kin registry` only lists and cleans, \
+                 and the migration writer that records an entry has no caller. Use `kin deps \
+                 --all` to list the repositories that are registered",
                 working_dir.display()
             )
         }
@@ -136,8 +137,9 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "repository '{repo_id}' is not in the Kin registry, so no cross-repo dependency \
-                 records exist for it; run `kin init` in this repository to register and record \
-                 them, or `kin deps --all` to list the repositories that are registered"
+                 records exist for it, and no shipped command writes an entry that would create \
+                 them: `kin registry` only lists and cleans. Use `kin deps --all` to list the \
+                 repositories that are registered"
             )
         })?;
 
@@ -173,8 +175,8 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
     })
 }
 
-/// Render one repository's neighbourhood, naming the remedy for each empty
-/// direction rather than letting an absent record read as a proved absence.
+/// Render one repository's neighbourhood, saying plainly that an empty
+/// direction may be unrecorded rather than letting it read as a proved absence.
 pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
     let mut lines = vec![
         format!("Cross-repo dependencies for {}:", view.repo_id),
@@ -211,8 +213,9 @@ pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
     if view.depends_on.is_empty() || view.consumers.is_empty() {
         lines.push(String::new());
         lines.push(
-            "note: dependencies are recorded when a repo is registered or re-indexed. Re-run \
-             `kin init` in a repository to refresh its records."
+            "note: dependency records are written when a repository is registered, and no \
+             shipped command writes a registry entry today, so empty directions here may mean \
+             the records were never written rather than that none exist."
                 .to_string(),
         );
     }
@@ -232,7 +235,9 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
             );
         } else {
             println!("No registered repositories.");
-            println!("hint: run `kin init` in a directory to register it");
+            println!(
+                "hint: no shipped command writes a registry entry; `kin registry` only lists and cleans"
+            );
         }
         return Ok(());
     }
@@ -287,7 +292,7 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
 
     if !unrecorded.is_empty() {
         println!(
-            "note: dependencies are recorded when a repo is registered or re-indexed. If a repo above should have dependencies, re-run `kin init` in it to refresh its records: {}",
+            "note: dependency records are written at registration, and no shipped command writes a registry entry today, so these may be unrecorded rather than dependency-free: {}",
             unrecorded.join(", ")
         );
     }
@@ -593,8 +598,8 @@ mod tests {
     }
 
     /// An unregistered repository has no records at all. Reporting an empty
-    /// neighbourhood would read as a proved absence, so it refuses and names
-    /// both remedies.
+    /// neighbourhood would read as a proved absence, so it refuses and states
+    /// the true state: nothing ships that would register it.
     #[test]
     fn an_unregistered_repository_refuses_rather_than_reporting_no_dependencies() {
         let error = repo_dependency_view(&registry_with_noise(), "not-registered")
@@ -602,7 +607,11 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("not in the Kin registry"), "{message}");
-        assert!(message.contains("kin init"), "{message}");
+        assert!(
+            message.contains("no shipped command writes an entry"),
+            "the refusal must not name a remedy that cannot register: {message}"
+        );
+        assert!(!message.contains("kin init"), "{message}");
         assert!(message.contains("kin deps --all"), "{message}");
     }
 
@@ -648,7 +657,11 @@ mod tests {
 
         assert!(message.contains("/other/place/kin"), "{message}");
         assert!(message.contains("same directory name"), "{message}");
-        assert!(message.contains("kin init"), "{message}");
+        assert!(
+            message.contains("no shipped command writes"),
+            "the refusal must not name a remedy that cannot register: {message}"
+        );
+        assert!(!message.contains("kin init"), "{message}");
         assert!(message.contains("kin deps --all"), "{message}");
     }
 
@@ -673,7 +686,7 @@ mod tests {
     /// Both empty directions still say why they are empty, so "no edges" is
     /// never mistaken for "records exist and prove there are none".
     #[test]
-    fn empty_directions_name_the_recording_remedy() {
+    fn empty_directions_read_as_possibly_unrecorded_not_proved_absent() {
         let mut registry = KinRegistry::default();
         registry.repos = vec![named_repo("solo", Vec::new())];
 
@@ -682,6 +695,7 @@ mod tests {
 
         assert!(rendered.contains("no cross-repo dependencies recorded"));
         assert!(rendered.contains("no registered repository records this one as a provider"));
-        assert!(rendered.contains("kin init"));
+        assert!(rendered.contains("no shipped command writes a registry entry"));
+        assert!(!rendered.contains("kin init"));
     }
 }

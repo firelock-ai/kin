@@ -116,6 +116,13 @@ pub struct HealReport {
 /// It refuses rather than reporting success whenever it cannot prove the
 /// projection ended clean: a heal that quietly restored nothing is
 /// indistinguishable from a projection that never drifted.
+///
+/// This DISCARDS uncommitted changes to any tracked file that diverges, with no
+/// undo. It is not a merge. There is deliberately no dirty-tree refusal in front
+/// of it: divergence is exactly what drift reports, so a check that refused on a
+/// modified tracked file would refuse every heal this command exists to perform.
+/// The warning therefore lives in the help text and the capability note, where a
+/// caller reads it before running rather than after losing an edit.
 pub async fn heal(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
