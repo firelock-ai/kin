@@ -13003,6 +13003,8 @@ fn remove_full_install_root(
     let script_path = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
     let log_path = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
     let ready_path = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
+    let ready_publishing_path =
+        env::temp_dir().join(format!("kin-uninstall-{token}.ready.publishing"));
     let ready_nonce = uuid::Uuid::new_v4().to_string();
     let parent_creation_time = current_windows_process_creation_time()?;
     let install_authority_path =
@@ -13028,7 +13030,7 @@ fn remove_full_install_root(
     let script = r#"$ErrorActionPreference = 'Stop'
 $log = $env:KIN_UNINSTALL_LOG
 $ready = $env:KIN_UNINSTALL_READY
-$readyPublishing = $ready + '.publishing'
+$readyPublishing = $env:KIN_UNINSTALL_READY_PUBLISHING
 $authority = $env:KIN_UNINSTALL_AUTHORITY
 $parentHandle = $null
 $authorityStream = $null
@@ -13256,12 +13258,14 @@ try {
     if let Err(error) = marker_result {
         let _ = fs::remove_file(&script_path);
         let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
         let _ = fs::remove_file(&incomplete_marker);
         return Err(error);
     }
     if let Err(error) = retire_windows_install_root(root, &retired_path, expected) {
         let _ = fs::remove_file(&script_path);
         let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
         let _ = fs::remove_file(&incomplete_marker);
         return Err(error);
     }
@@ -13270,6 +13274,7 @@ try {
     {
         let _ = fs::remove_file(&script_path);
         let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
         return Err(error).context(format!(
             "post-retirement process fence failed; preserving {}",
             retired_path.display()
@@ -13296,6 +13301,7 @@ try {
         )
         .env("KIN_UNINSTALL_LOG", &log_path)
         .env("KIN_UNINSTALL_READY", &ready_path)
+        .env("KIN_UNINSTALL_READY_PUBLISHING", &ready_publishing_path)
         .env("KIN_UNINSTALL_READY_NONCE", &ready_nonce)
         .env("KIN_UNINSTALL_AUTHORITY", &install_authority_path)
         .env("KIN_UNINSTALL_RETIRED", &retired_path)
@@ -13317,6 +13323,7 @@ try {
             let rollback = move_windows_install_root(&retired_path, &root.path);
             let _ = fs::remove_file(&script_path);
             let _ = fs::remove_file(&ready_path);
+            let _ = fs::remove_file(&ready_publishing_path);
             match rollback {
                 Ok(()) => {
                     let _ = fs::remove_file(&incomplete_marker);
@@ -13346,6 +13353,7 @@ try {
         let rollback = move_windows_install_root(&retired_path, &root.path);
         let _ = fs::remove_file(&script_path);
         let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
         let _ = fs::remove_file(&log_path);
         match rollback {
             Ok(()) => {
@@ -14355,6 +14363,7 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         incomplete_marker: PathBuf,
         helper_script: PathBuf,
         helper_ready: PathBuf,
+        helper_ready_publishing: PathBuf,
         helper_log: PathBuf,
         parked_original: Option<PathBuf>,
     }
@@ -14557,6 +14566,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             .context("native uninstall marker did not carry its helper token")?;
         let helper_script = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
         let helper_ready = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
+        let helper_ready_publishing =
+            env::temp_dir().join(format!("kin-uninstall-{token}.ready.publishing"));
         let helper_log = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
         anyhow::ensure!(
             retired.is_dir(),
@@ -14606,6 +14617,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             incomplete_marker,
             helper_script,
             helper_ready,
+            helper_ready_publishing,
             helper_log,
             parked_original,
         };
@@ -14834,6 +14846,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                     && !success.retired.exists()
                     && !success.helper_script.exists()
                     && !success.helper_ready.exists()
+                    && !success.helper_ready_publishing.exists()
             },
         )?;
         let post_cleanup_lock = crate::commands::update::InstallRootLock::acquire(&success_root)
@@ -14890,6 +14903,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         anyhow::ensure!(
             !failure.helper_ready.exists(),
             "failed deferred uninstall retained its helper ready handshake"
+        );
+        anyhow::ensure!(
+            !failure.helper_ready_publishing.exists(),
+            "failed deferred uninstall retained its partial helper ready handshake"
         );
         anyhow::ensure!(
             failure.incomplete_marker.is_file(),
