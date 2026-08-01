@@ -16,12 +16,19 @@
 //! exists to be that bundle; this crate prefers it and falls back only when it
 //! cannot deliver.
 //!
-//! # Fallback, never silence
+//! # Fallback, never silence, but never quiet about it
 //!
 //! Every backend failure degrades to a worse-looking notification rather than
 //! to nothing. A missing bundle, a revoked authorization, or a platform without
 //! a notification daemon must still reach the user somehow, because the alerts
 //! routed through here are the ones that say a machine is about to freeze.
+//!
+//! A degraded notification still looks like a working one, so the degradation
+//! is stated rather than left to be inferred: [`Status::degradation`] names the
+//! bundle that is missing, the install channel that should have delivered it,
+//! and what to do about it. Not every channel installs the bundle to the same
+//! place, so the bundle is looked for along a short search path rather than at
+//! one hardcoded location.
 //!
 //! # Suppression is declared, not inferred
 //!
@@ -171,20 +178,106 @@ impl Outcome {
     }
 }
 
+/// How this copy of Kin was installed.
+///
+/// Which channel delivered the CLI decides where its notification bundle should
+/// have landed, and therefore what a user has to do to get it back. Reporting
+/// "not installed" without saying which install to repair leaves them guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallChannel {
+    /// The managed root: the `install.sh` installer, the npm launcher, and
+    /// anything `kin update` has since replaced. The bundle belongs in
+    /// `$KIN_HOME/lib`.
+    Managed,
+    /// A Homebrew cellar. The bundle travels inside the formula's prefix,
+    /// because a formula must not write into a user's home directory.
+    Homebrew,
+    /// Somewhere else: a hand-placed binary, a build tree, a distro package.
+    Unknown,
+}
+
+impl InstallChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Homebrew => "homebrew",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// What to do to get the bundle back on this channel.
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Managed => {
+                "rerun the managed installer: `curl -fsSL https://get.kinlab.dev/install | sh`"
+            }
+            Self::Homebrew => "run `brew reinstall kin`",
+            Self::Unknown => {
+                "reinstall Kin from https://github.com/firelock-ai/kin (scripts/install.sh)"
+            }
+        }
+    }
+}
+
+impl fmt::Display for InstallChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Current routing state, for `kin notify status` and `kin doctor`.
 #[derive(Debug, Clone)]
 pub struct Status {
     /// Path to the notifier bundle executable, when it is installed.
     pub notifier: Option<PathBuf>,
+    /// The canonical managed location, reported unconditionally so a gap names
+    /// a location rather than an absence. It is not where the resolved bundle
+    /// came from: a prefix-relative copy is legitimate and is reported by
+    /// `notifier`, which is the field a consumer should read for the path in
+    /// use.
+    pub expected: PathBuf,
+    /// How this copy of Kin was installed.
+    pub channel: InstallChannel,
     /// Raw authorization report from the bundle, when it could be queried.
     pub identity: Option<String>,
+    /// Why a bundle present on the search path could not be launched. `None`
+    /// means either a healthy bundle was selected or no bundle exists at all.
+    pub notifier_issue: Option<String>,
     /// Keys currently holding back a repeat.
     pub held_keys: Vec<String>,
+}
+
+impl Status {
+    /// One line stating the degradation, or `None` when there is none.
+    ///
+    /// Only macOS has a bundle to miss. Everywhere else the absence is not a
+    /// degradation, it is simply how the platform works.
+    pub fn degradation(&self) -> Option<String> {
+        if !cfg!(target_os = "macos") || self.notifier.is_some() {
+            return None;
+        }
+        let state = self
+            .notifier_issue
+            .as_deref()
+            .map(|issue| format!("is present but unusable ({issue})"))
+            .unwrap_or_else(|| "is not installed".to_string());
+        Some(format!(
+            "KinNotifier.app {state} (looked for {}); this {} install did not deliver a launchable bundle, \
+             so notifications post as Script Editor instead of Kin. To fix: {}.",
+            self.expected.display(),
+            self.channel,
+            self.channel.remedy()
+        ))
+    }
 }
 
 /// Routes notifications and remembers what it already said.
 pub struct Notifier {
     kin_home: PathBuf,
+    /// The running Kin executable, when it is known. Used only to find a bundle
+    /// that a non-managed channel installed beside the binary rather than into
+    /// the managed root.
+    executable: Option<PathBuf>,
 }
 
 impl Notifier {
@@ -192,23 +285,34 @@ impl Notifier {
     /// hooks do: `KIN_HOME`, then the `KIN_DIR` compatibility alias, then
     /// `~/.kin`.
     pub fn new() -> Result<Self> {
+        let executable = std::env::current_exe().ok();
         for key in ["KIN_HOME", "KIN_DIR"] {
             if let Some(value) = std::env::var_os(key) {
                 if !value.is_empty() {
-                    return Ok(Self::with_home(PathBuf::from(value)));
+                    return Ok(Self::with_home(PathBuf::from(value)).with_executable(executable));
                 }
             }
         }
         let home = directories::BaseDirs::new()
             .map(|d| d.home_dir().to_path_buf())
             .context("could not determine home directory")?;
-        Ok(Self::with_home(home.join(".kin")))
+        Ok(Self::with_home(home.join(".kin")).with_executable(executable))
     }
 
     /// Build against an explicit root. Every path this type touches derives from
     /// it, so tests never reach a real `$HOME`.
     pub fn with_home(kin_home: PathBuf) -> Self {
-        Self { kin_home }
+        Self {
+            kin_home,
+            executable: None,
+        }
+    }
+
+    /// Tell the router which binary is running, so it can find a bundle
+    /// installed beside that binary instead of under the managed root.
+    pub fn with_executable(mut self, executable: Option<PathBuf>) -> Self {
+        self.executable = executable;
+        self
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -219,14 +323,119 @@ impl Notifier {
         self.kin_home.join("logs").join("notify.log")
     }
 
-    /// Path to the macOS notifier bundle's executable.
+    /// Where a managed install keeps the notifier bundle's executable.
+    ///
+    /// This is the canonical location: what `install.sh`, the npm launcher, and
+    /// `kin update` all write. It is reported when no bundle was found at all,
+    /// so the gap names a path instead of just being an absence.
     pub fn notifier_path(&self) -> PathBuf {
-        self.kin_home
-            .join("lib")
-            .join("KinNotifier.app")
-            .join("Contents")
-            .join("MacOS")
-            .join("KinNotifier")
+        bundle_executable(&self.kin_home.join("lib"))
+    }
+
+    /// Every place a bundle could legitimately have been installed, in the
+    /// order they are preferred.
+    ///
+    /// The managed root wins because it is the only location `kin update`
+    /// maintains. The two prefix-relative candidates cover a channel that
+    /// cannot write to a user's home directory: a Homebrew formula installs
+    /// into its own prefix, so its bundle sits beside the binary rather than
+    /// under `$KIN_HOME`.
+    ///
+    /// Prefixes are derived from the reported executable path and from its
+    /// resolved target, for the same reason `install_channel_of` considers
+    /// both. `current_exe` reports the path the process was invoked through,
+    /// and Homebrew invokes a symlink in its own `bin` that points into the
+    /// keg. Homebrew links only `etc`, `bin`, `sbin`, `include`, `share`,
+    /// `lib`, and `Frameworks` out of a keg and never a bare top-level `.app`,
+    /// so a formula's bundle exists at `Cellar/kin/<version>/KinNotifier.app`
+    /// and at no path reachable from the reported prefix.
+    fn bundle_candidates(&self) -> Vec<PathBuf> {
+        let mut candidates = vec![self.notifier_path()];
+        let reported = self.executable.clone();
+        let resolved = self
+            .executable
+            .as_deref()
+            .and_then(|executable| fs::canonicalize(executable).ok());
+        for executable in [reported, resolved].into_iter().flatten() {
+            let Some(prefix) = executable.parent().and_then(|bin| bin.parent()) else {
+                continue;
+            };
+            for candidate in [
+                bundle_executable(&prefix.join("lib")),
+                bundle_executable(prefix),
+            ] {
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The bundle executable to post through, if one is installed anywhere on
+    /// the search path.
+    pub fn resolve_notifier(&self) -> Option<PathBuf> {
+        self.bundle_candidates()
+            .into_iter()
+            .find(|candidate| notifier_candidate_issue(candidate).is_none())
+    }
+
+    /// Tell LaunchServices where the resolved bundle is.
+    ///
+    /// The notification daemon validates the posting bundle through
+    /// LaunchServices and refuses one it does not know, so a bundle that was
+    /// copied into place without being registered is present and still
+    /// useless. Every channel that writes a bundle owes this call, including
+    /// one that replaces an already registered bundle: the record LaunchServices
+    /// holds describes the tree that was there, and a replacement carries a new
+    /// signature and a new `Info.plist` behind the same path.
+    ///
+    /// Registration is idempotent, and having nothing to register is not a
+    /// failure: an install with no bundle is reported as a degradation by
+    /// [`Status::degradation`], and a machine with no `lsregister` is not macOS.
+    pub fn register_with_launch_services(&self) -> Result<()> {
+        const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+        self.register_with_launch_services_at(Path::new(LSREGISTER))
+    }
+
+    fn register_with_launch_services_at(&self, lsregister: &Path) -> Result<()> {
+        let Some(executable) = self.resolve_notifier() else {
+            return Ok(());
+        };
+        // The bundle root is three levels above Contents/MacOS/<executable>.
+        let Some(bundle) = executable
+            .parent()
+            .and_then(|macos| macos.parent())
+            .and_then(|contents| contents.parent())
+        else {
+            return Ok(());
+        };
+        if !lsregister.is_file() {
+            return Ok(());
+        }
+        let status = std::process::Command::new(lsregister)
+            .arg("-f")
+            .arg(bundle)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("failed to run {}", lsregister.display()))?;
+        if !status.success() {
+            anyhow::bail!(
+                "{} refused to register {} ({status})",
+                lsregister.display(),
+                bundle.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Which channel installed the running binary.
+    pub fn install_channel(&self) -> InstallChannel {
+        let Some(executable) = self.executable.as_deref() else {
+            return InstallChannel::Unknown;
+        };
+        install_channel_of(executable, &self.kin_home)
     }
 
     fn state_path(&self, key: &str) -> PathBuf {
@@ -246,8 +455,20 @@ impl Notifier {
 
     /// Report what is installed and what is currently held back.
     pub fn status(&self) -> Status {
-        let notifier = self.notifier_path();
-        let installed = notifier.is_file().then_some(notifier.clone());
+        let candidates = self.bundle_candidates();
+        let installed = candidates
+            .iter()
+            .find(|candidate| notifier_candidate_issue(candidate).is_none())
+            .cloned();
+        let notifier_issue = if installed.is_none() {
+            candidates.iter().find_map(|candidate| {
+                let bundle = notifier_bundle_root(candidate)?;
+                fs::symlink_metadata(bundle).ok()?;
+                notifier_candidate_issue(candidate).map(str::to_string)
+            })
+        } else {
+            None
+        };
         let identity = installed.as_ref().and_then(|path| query_identity(path));
         let mut held_keys: Vec<String> = fs::read_dir(self.state_dir())
             .map(|entries| {
@@ -260,7 +481,10 @@ impl Notifier {
         held_keys.sort();
         Status {
             notifier: installed,
+            expected: self.notifier_path(),
+            channel: self.install_channel(),
             identity,
+            notifier_issue,
             held_keys,
         }
     }
@@ -356,10 +580,19 @@ impl Notifier {
         for attempt in backends() {
             match attempt {
                 Backend::KinNotifier => {
-                    let path = self.notifier_path();
-                    if !path.is_file() {
+                    let Some(path) = self.resolve_notifier() else {
+                        // Not an error the caller can act on mid-alert, but not
+                        // something to pass over in silence either: the log is
+                        // where a wrong sender name gets explained afterwards.
+                        self.log(&format!(
+                            "FALLBACK KinNotifier (not installed at {}; channel={}) level={} key={}",
+                            self.notifier_path().display(),
+                            self.install_channel(),
+                            notification.level,
+                            notification.key.as_deref().unwrap_or("-")
+                        ));
                         continue;
-                    }
+                    };
                     match post_via_bundle(&path, notification) {
                         Ok(()) => return Outcome::Delivered(Backend::KinNotifier),
                         Err(reason) => {
@@ -411,6 +644,112 @@ fn backends() -> &'static [Backend] {
     {
         &[]
     }
+}
+
+/// The bundle executable inside a directory that holds `KinNotifier.app`.
+fn bundle_executable(parent: &Path) -> PathBuf {
+    parent
+        .join("KinNotifier.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("KinNotifier")
+}
+
+/// Root of the app that owns a candidate executable.
+fn notifier_bundle_root(executable: &Path) -> Option<&Path> {
+    executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn real_regular_file_metadata(path: &Path) -> Option<fs::Metadata> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+}
+
+/// Minimal shape LaunchServices and the router need before a bundle can be
+/// called usable. Installers enforce the same two leaves; checking them again
+/// here catches corruption and interrupted/non-transactional installs instead
+/// of presenting a lone executable as healthy.
+fn notifier_candidate_issue(executable: &Path) -> Option<&'static str> {
+    let Some(macos) = executable.parent() else {
+        return Some("the app executable path is malformed");
+    };
+    let Some(contents) = macos.parent() else {
+        return Some("the app executable path is malformed");
+    };
+    let Some(bundle) = contents.parent() else {
+        return Some("the app executable path is malformed");
+    };
+    if !is_real_directory(bundle) || !is_real_directory(contents) || !is_real_directory(macos) {
+        return Some("the app directory shape is missing or unsafe");
+    }
+    let plist = contents.join("Info.plist");
+    let Some(plist_metadata) = real_regular_file_metadata(&plist) else {
+        return Some("Contents/Info.plist is missing or not a regular file");
+    };
+    if plist_metadata.len() == 0 {
+        return Some("Contents/Info.plist is empty");
+    }
+    let Some(executable_metadata) = real_regular_file_metadata(executable) else {
+        return Some("Contents/MacOS/KinNotifier is missing or not a regular file");
+    };
+    if executable_metadata.len() == 0 {
+        return Some("Contents/MacOS/KinNotifier is empty");
+    }
+    #[cfg(not(unix))]
+    let _ = executable_metadata;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if executable_metadata.permissions().mode() & 0o111 == 0 {
+            return Some("Contents/MacOS/KinNotifier is not executable");
+        }
+    }
+    None
+}
+
+/// Classify an install from where its executable lives.
+///
+/// Kept as a free function over explicit paths so it can be tested without a
+/// real install of any channel on the machine running the tests.
+///
+/// Homebrew is recognized by the `Cellar` path component every formula install
+/// sits under. The symlink Homebrew puts on `PATH` points into that cellar, and
+/// `current_exe` may report either, so both the reported path and its resolved
+/// target are considered.
+pub fn install_channel_of(executable: &Path, kin_home: &Path) -> InstallChannel {
+    if executable.starts_with(kin_home) {
+        return InstallChannel::Managed;
+    }
+    let resolved = std::fs::canonicalize(executable).ok();
+    // A `KIN_HOME` reached through a symlinked component names the same
+    // directory the resolved executable sits in without sharing its prefix, so
+    // the resolved comparison needs a resolved root to compare against.
+    let resolved_home = std::fs::canonicalize(kin_home).ok();
+    let managed = resolved.as_deref().is_some_and(|path| {
+        path.starts_with(kin_home)
+            || resolved_home
+                .as_deref()
+                .is_some_and(|home| path.starts_with(home))
+    });
+    if managed {
+        return InstallChannel::Managed;
+    }
+    let in_cellar = |path: &Path| {
+        path.components()
+            .any(|component| component.as_os_str() == "Cellar")
+    };
+    if in_cellar(executable) || resolved.as_deref().is_some_and(in_cellar) {
+        return InstallChannel::Homebrew;
+    }
+    InstallChannel::Unknown
 }
 
 /// Keys name files in the state directory, so they are restricted to a safe
@@ -616,6 +955,325 @@ mod tests {
         let (_dir, notifier) = notifier();
         assert!(notifier.status().notifier.is_none());
         assert!(notifier.status().identity.is_none());
+    }
+
+    /// Install a fake bundle executable under `parent` and return its path.
+    fn install_fake_bundle(parent: &Path) -> PathBuf {
+        let executable = bundle_executable(parent);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let contents = executable.parent().unwrap().parent().unwrap();
+        fs::write(contents.join("Info.plist"), b"<plist/>").unwrap();
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        executable
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_services_registration_forces_the_resolved_bundle_and_reports_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        let bundle = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .unwrap()
+            .to_path_buf();
+        let notifier = Notifier::with_home(kin_home);
+        let registrar = dir.path().join("lsregister");
+        let arguments = PathBuf::from(format!("{}.args", registrar.display()));
+        fs::write(
+            &registrar,
+            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&registrar, fs::Permissions::from_mode(0o755)).unwrap();
+
+        notifier
+            .register_with_launch_services_at(&registrar)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&arguments).unwrap(),
+            format!("-f\n{}\n", bundle.display()),
+            "registration must force-refresh exactly the app that owns the resolved executable"
+        );
+
+        fs::write(&registrar, b"#!/bin/sh\nexit 9\n").unwrap();
+        let error = notifier
+            .register_with_launch_services_at(&registrar)
+            .expect_err("a registrar refusal must be reported to the update/setup caller");
+        assert!(format!("{error:#}").contains("refused to register"));
+    }
+
+    #[test]
+    fn the_managed_root_is_preferred_over_a_bundle_beside_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let prefix = dir.path().join("opt/kin");
+        let executable = prefix.join("bin/kin");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"kin").unwrap();
+
+        let notifier =
+            Notifier::with_home(kin_home.clone()).with_executable(Some(executable.clone()));
+        assert_eq!(notifier.resolve_notifier(), None);
+
+        // A prefix-relative bundle is found when the managed root has none.
+        let beside = install_fake_bundle(&prefix);
+        assert_eq!(notifier.resolve_notifier(), Some(beside));
+
+        // Once the managed root has one, it wins: that is the only copy `kin
+        // update` maintains.
+        let managed = install_fake_bundle(&kin_home.join("lib"));
+        assert_eq!(notifier.resolve_notifier(), Some(managed));
+    }
+
+    #[test]
+    fn a_homebrew_prefix_bundle_is_found_beside_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let cellar = dir.path().join("brew/Cellar/kin/0.4.5");
+        let executable = cellar.join("bin/kin");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"kin").unwrap();
+        let bundle = install_fake_bundle(&cellar);
+
+        let notifier = Notifier::with_home(kin_home).with_executable(Some(executable));
+        assert_eq!(notifier.resolve_notifier(), Some(bundle));
+        assert_eq!(notifier.install_channel(), InstallChannel::Homebrew);
+    }
+
+    /// The shape `current_exe` actually produces for a Homebrew user: the
+    /// reported path is the symlink Homebrew put on `PATH`, not the keg it
+    /// points into. Homebrew links no bare top-level `.app` out of a keg, so
+    /// every prefix derived from the reported path alone misses the bundle the
+    /// formula installed, and resolution has to follow the link to find it.
+    #[test]
+    #[cfg(unix)]
+    fn a_homebrew_bundle_is_found_through_the_symlink_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Canonical from the start, so the resolved candidate is comparable to
+        // the fixture path rather than to its `/private` twin on macOS.
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let brew_prefix = root.join("brew");
+        let cellar = brew_prefix.join("Cellar/kin/0.4.5");
+        let kegged = cellar.join("bin/kin");
+        fs::create_dir_all(kegged.parent().unwrap()).unwrap();
+        fs::write(&kegged, b"kin").unwrap();
+        let bundle = install_fake_bundle(&cellar);
+
+        let linked = brew_prefix.join("bin/kin");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&kegged, &linked).unwrap();
+        assert!(
+            !bundle_executable(&brew_prefix).exists()
+                && !bundle_executable(&brew_prefix.join("lib")).exists(),
+            "the fixture must reproduce Homebrew leaving nothing under its own prefix"
+        );
+
+        let notifier =
+            Notifier::with_home(root.join("kin-home")).with_executable(Some(linked.clone()));
+        assert_eq!(notifier.resolve_notifier(), Some(bundle));
+        assert_eq!(notifier.install_channel(), InstallChannel::Homebrew);
+    }
+
+    #[test]
+    fn install_channels_are_told_apart_by_where_the_binary_lives() {
+        let kin_home = Path::new("/home/dev/.kin");
+        assert_eq!(
+            install_channel_of(Path::new("/home/dev/.kin/bin/kin"), kin_home),
+            InstallChannel::Managed
+        );
+        assert_eq!(
+            install_channel_of(
+                Path::new("/opt/homebrew/Cellar/kin/0.4.5/bin/kin"),
+                kin_home
+            ),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            install_channel_of(Path::new("/usr/local/bin/kin"), kin_home),
+            InstallChannel::Unknown
+        );
+        // A path merely containing the word must not be mistaken for the
+        // cellar's own directory component.
+        assert_eq!(
+            install_channel_of(Path::new("/home/dev/CellarNotes/kin"), kin_home),
+            InstallChannel::Unknown
+        );
+    }
+
+    /// A managed install stays managed when `KIN_HOME` is reached through a
+    /// symlink. The consequence of missing it is message-only, but the message
+    /// it produces sends a managed user to the wrong reinstall channel.
+    #[test]
+    #[cfg(unix)]
+    fn a_managed_install_is_recognized_through_a_symlinked_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let real_home = root.join("real/.kin");
+        let executable = real_home.join("bin/kin");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"kin").unwrap();
+        let linked_home = root.join("linked-kin");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+
+        assert_eq!(
+            install_channel_of(&linked_home.join("bin/kin"), &linked_home),
+            InstallChannel::Managed
+        );
+        // What `current_exe` reports is the resolved path, while `KIN_HOME`
+        // names the link, so neither raw comparison holds.
+        assert_eq!(
+            install_channel_of(&executable, &linked_home),
+            InstallChannel::Managed
+        );
+    }
+
+    /// The whole point of reporting a gap is that somebody can close it, so the
+    /// message has to name the file, the channel, and the fix.
+    #[test]
+    fn a_missing_bundle_degradation_names_the_channel_and_the_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("brew/Cellar/kin/0.4.5/bin/kin");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"kin").unwrap();
+        let notifier =
+            Notifier::with_home(dir.path().join("kin-home")).with_executable(Some(executable));
+
+        let status = notifier.status();
+        // Only macOS has a bundle to miss; elsewhere there is no degradation to
+        // report and saying otherwise would be noise.
+        #[cfg(target_os = "macos")]
+        {
+            let message = status
+                .degradation()
+                .expect("a macOS install with no bundle anywhere is degraded");
+            assert!(message.contains("KinNotifier.app"), "{message}");
+            assert!(message.contains("homebrew"), "{message}");
+            assert!(message.contains("brew reinstall kin"), "{message}");
+            assert!(message.contains("Script Editor"), "{message}");
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert!(status.degradation().is_none());
+    }
+
+    #[test]
+    fn the_managed_remedy_names_a_reinstaller_not_the_same_version_update_noop() {
+        let remedy = InstallChannel::Managed.remedy();
+        assert!(
+            remedy.contains("https://get.kinlab.dev/install"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("| sh"), "{remedy}");
+        assert!(!remedy.contains("kin update"), "{remedy}");
+    }
+
+    #[test]
+    fn a_lone_notifier_executable_is_not_reported_as_a_healthy_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        let plist = executable
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("Info.plist");
+        fs::remove_file(plist).unwrap();
+
+        let status = Notifier::with_home(kin_home).status();
+        assert!(status.notifier.is_none());
+        assert!(
+            status
+                .notifier_issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("Info.plist")),
+            "issue: {:?}",
+            status.notifier_issue
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            status.degradation().unwrap().contains("Info.plist"),
+            "{:?}",
+            status.degradation()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_notifier_is_not_reported_as_a_healthy_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let status = Notifier::with_home(kin_home).status();
+        assert!(status.notifier.is_none());
+        assert!(
+            status
+                .notifier_issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("not executable")),
+            "issue: {:?}",
+            status.notifier_issue
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            status.degradation().unwrap().contains("not executable"),
+            "{:?}",
+            status.degradation()
+        );
+    }
+
+    #[test]
+    fn an_empty_notifier_executable_is_not_reported_as_a_healthy_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        let executable = install_fake_bundle(&kin_home.join("lib"));
+        fs::write(&executable, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(&executable).unwrap().permissions().mode() & 0o111,
+                0
+            );
+        }
+
+        let status = Notifier::with_home(kin_home).status();
+        assert!(status.notifier.is_none());
+        assert!(
+            status
+                .notifier_issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("is empty")),
+            "issue: {:?}",
+            status.notifier_issue
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            status.degradation().unwrap().contains("is empty"),
+            "{:?}",
+            status.degradation()
+        );
+    }
+
+    #[test]
+    fn an_installed_bundle_reports_no_degradation() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_home = dir.path().join("kin-home");
+        install_fake_bundle(&kin_home.join("lib"));
+        let notifier = Notifier::with_home(kin_home);
+        assert!(notifier.status().degradation().is_none());
     }
 
     #[test]
