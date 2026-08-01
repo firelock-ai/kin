@@ -79,12 +79,127 @@ export function sha256Hex(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+/** Compact, stable byte count for first-install progress. */
+export function formatByteCount(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let amount = value;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : 1;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+
+/** Pure rendering helper so progress wording remains testable without a TTY. */
+export function formatDownloadProgress(file, received, total = null) {
+  const transferred = formatByteCount(received);
+  if (Number.isFinite(total) && total > 0) {
+    const percent = Math.min(100, Math.floor((received * 100) / total));
+    return `kin: downloading ${file}: ${percent}% (${transferred} / ${formatByteCount(total)})`;
+  }
+  return `kin: downloading ${file}: ${transferred} received`;
+}
+
+export function createDownloadProgress(file, stream = process.stderr) {
+  let lastAt = 0;
+  let lastBytes = 0;
+  let lastPercent = -1;
+  let active = false;
+  return ({ received, total, done = false, failed = false }) => {
+    if (failed) {
+      if (active) stream.write('\r\x1b[2K\n');
+      active = false;
+      return;
+    }
+    const now = Date.now();
+    const percent = Number.isFinite(total) && total > 0 ? Math.floor((received * 100) / total) : null;
+    if (!done) {
+      if (percent !== null && percent === lastPercent && now - lastAt < 250) return;
+      if (percent === null && received - lastBytes < 1024 * 1024 && now - lastAt < 250) return;
+    }
+    stream.write(`\r\x1b[2K${formatDownloadProgress(file, received, total)}${done ? '\n' : ''}`);
+    active = !done;
+    lastAt = now;
+    lastBytes = received;
+    lastPercent = percent;
+  };
+}
+
 async function fetchBuffer(url, fetchImpl) {
   const res = await fetchImpl(url);
   if (!res.ok) {
     throw new Error(`download failed (${res.status}) for ${url}`);
   }
+
   return Buffer.from(await res.arrayBuffer());
+}
+
+/**
+ * Download one response directly into a staging file while hashing it. The
+ * streaming path consumes and writes one chunk before requesting the next, so
+ * archive-sized data is never accumulated in JavaScript memory. Lightweight
+ * injected fetches that expose only arrayBuffer() retain their existing one-
+ * buffer contract.
+ */
+export async function downloadToFile(url, destination, fetchImpl, onProgress = null) {
+  let received = 0;
+  let total = null;
+  try {
+    const res = await fetchImpl(url);
+    if (!res.ok) {
+      throw new Error(`download failed (${res.status}) for ${url}`);
+    }
+
+    const contentLength = Number(res.headers?.get?.('content-length'));
+    total = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null;
+    const hash = crypto.createHash('sha256');
+
+    if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+      const fd = fs.openSync(destination, 'w', 0o600);
+      try {
+        for await (const chunk of res.body) {
+          const bytes = ArrayBuffer.isView(chunk)
+            ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+            : Buffer.from(chunk);
+          let offset = 0;
+          while (offset < bytes.byteLength) {
+            const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+            if (written <= 0) throw new Error(`archive staging made no progress for ${url}`);
+            offset += written;
+          }
+          hash.update(bytes);
+          received += bytes.byteLength;
+          onProgress?.({ received, total, done: false });
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      // Preserve offline/injected fetch compatibility without adding a second
+      // archive-sized allocation: Buffer.from(ArrayBuffer) is a shared view.
+      const bytes = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(destination, bytes, { mode: 0o600 });
+      hash.update(bytes);
+      received = bytes.length;
+    }
+
+    if (total !== null && received !== total) {
+      throw new Error(`download truncated for ${url}: expected ${total} bytes, received ${received}`);
+    }
+
+    onProgress?.({ received, total: total ?? received, done: true });
+    return { bytes: received, sha256: hash.digest('hex') };
+  } catch (error) {
+    try {
+      onProgress?.({ received, total, done: true, failed: true });
+    } catch {
+      // Progress cleanup is best-effort and must not hide the download error.
+    }
+    throw error;
+  }
 }
 
 /**
@@ -107,6 +222,138 @@ function installFile(src, dest, mode) {
 }
 
 /**
+ * Copy a directory tree, refusing anything that is not a directory or a regular
+ * file. Written out rather than delegating to fs.cpSync so a symlink inside an
+ * extracted archive stops the copy instead of being reproduced under $KIN_HOME,
+ * and so the executable bit is carried across deliberately.
+ */
+function copyTree(src, dest) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`refusing to copy symlink from the release archive: ${src}`);
+  }
+  if (stat.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      copyTree(path.join(src, entry), path.join(dest, entry));
+    }
+    return;
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing to copy a non-regular archive entry: ${src}`);
+  }
+  fs.copyFileSync(src, dest);
+  fs.chmodSync(dest, stat.mode & 0o111 ? 0o755 : 0o644);
+}
+
+/** Read-only counterpart to copyTree, used before any live install mutation. */
+function validateTree(src) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`refusing symlink in the release archive: ${src}`);
+  }
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(src)) {
+      validateTree(path.join(src, entry));
+    }
+    return;
+  }
+  if (!stat.isFile()) {
+    throw new Error(`refusing a non-regular archive entry: ${src}`);
+  }
+}
+
+/**
+ * Install the macOS notification bundle from an extracted release archive.
+ *
+ * macOS reads a notification's sender name, icon, and grouping from the posting
+ * process's bundle; a CLI has none, so without this every Kin notification is
+ * credited to Script Editor. That is a silent downgrade rather than a visible
+ * failure, which is why its absence is reported here rather than passed over.
+ *
+ * Replaced whole rather than merged, for the same reason install.sh does: a
+ * stale executable left inside a newer bundle breaks the signature seal macOS
+ * checks over the bundle as a unit.
+ *
+ * Returns the validated bundle source, or null on a platform with no bundle.
+ */
+function preflightNotifierBundle(root, platform) {
+  if (platform !== 'darwin') return null;
+  const src = path.join(root, 'KinNotifier.app');
+  if (!fs.existsSync(src)) {
+    throw new Error(
+      'this macOS release archive carries no KinNotifier.app; refusing to replace binaries or ' +
+        'stamp the release with a missing notification identity',
+    );
+  }
+  const rootStat = fs.lstatSync(src);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error('KinNotifier.app in the macOS release archive is not a real directory');
+  }
+  validateTree(src);
+  for (const required of ['Contents/MacOS/KinNotifier', 'Contents/Info.plist']) {
+    const member = path.join(src, required);
+    if (!fs.existsSync(member)) {
+      throw new Error(
+        `this macOS release archive's KinNotifier.app is missing ${required}; refusing to ` +
+          'replace binaries or stamp the release',
+      );
+    }
+    const stat = fs.lstatSync(member);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`KinNotifier.app/${required} is not a regular file`);
+    }
+    if (stat.size === 0) {
+      throw new Error(`KinNotifier.app/${required} is empty`);
+    }
+    if (required.endsWith('/KinNotifier') && (stat.mode & 0o111) === 0) {
+      throw new Error(`KinNotifier.app/${required} is not executable`);
+    }
+  }
+  return src;
+}
+
+function installNotifierBundleSource(src, env) {
+  const libDir = path.join(kinHome(env), 'lib');
+  fs.mkdirSync(libDir, { recursive: true });
+  const dest = path.join(libDir, 'KinNotifier.app');
+  // Build the incoming tree beside the live one and swap, rather than removing
+  // the live one and copying into the gap it leaves. copyTree refuses a symlink
+  // or a non-regular entry part-way down, and a bundle interrupted there has a
+  // launchable executable with no `Info.plist` behind it, which every freshness
+  // check reads as an installed bundle. The updater stages and renames for the
+  // same reason.
+  const staged = path.join(libDir, '.KinNotifier.app.incoming');
+  try {
+    fs.rmSync(staged, { recursive: true, force: true });
+    copyTree(src, staged);
+    fs.chmodSync(path.join(staged, 'Contents', 'MacOS', 'KinNotifier'), 0o755);
+    fs.rmSync(dest, { recursive: true, force: true });
+    fs.renameSync(staged, dest);
+  } finally {
+    fs.rmSync(staged, { recursive: true, force: true });
+  }
+
+  // Registering with LaunchServices is what lets the notification daemon
+  // validate the bundle; an unregistered app is refused outright. Authorization
+  // itself is NOT requested here: an unanswered prompt is recorded as a
+  // permanent denial, so it must be raised interactively by `kin setup`.
+  const lsregister =
+    '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
+  if (fs.existsSync(lsregister)) {
+    spawnSync(lsregister, ['-f', dest], { stdio: 'ignore' });
+  }
+  return true;
+}
+
+/** Validate and install the macOS bundle as one tree. */
+export function installNotifierBundle(root, env, platform, log) {
+  void log;
+  const src = preflightNotifierBundle(root, platform);
+  return src ? installNotifierBundleSource(src, env) : false;
+}
+
+/**
  * Download, verify, and install the pinned Kin release. Returns the installed
  * managed `kin` path. Mirrors scripts/install.sh: kin + kin-daemon are
  * mandatory, kin-vfs and the projection shim library are optional extras.
@@ -118,29 +365,43 @@ export async function provision(version, opts = {}) {
     arch = process.arch,
     fetchImpl = fetch,
     log = (line) => process.stderr.write(`${line}\n`),
+    onProgress,
   } = opts;
 
   const file = artifactName(platform, arch);
   const url = releaseDownloadUrl(version, file);
   log(`kin: provisioning managed kin ${version} (${file})...`);
 
-  const [archive, shaText] = await Promise.all([
-    fetchBuffer(url, fetchImpl),
-    fetchBuffer(`${url}.sha256`, fetchImpl),
-  ]);
-  const expected = parseSha256File(shaText.toString('utf8'));
-  const actual = sha256Hex(archive);
-  if (actual !== expected) {
-    throw new Error(
-      `SHA-256 mismatch for ${file}: expected ${expected}, got ${actual}. ` +
-        'The download may be corrupted or tampered with; refusing to install.',
-    );
-  }
+  // Interactive first runs show live bytes/percent; redirected/non-TTY npm
+  // invocations stay line-oriented. An injected callback keeps streaming fully
+  // testable without coupling fake fetch implementations to terminal behavior.
+  const archiveProgress =
+    onProgress === undefined && fetchImpl === globalThis.fetch && process.stderr.isTTY
+      ? createDownloadProgress(file)
+      : onProgress;
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kinlab-kin-'));
   try {
     const archivePath = path.join(tmp, file);
-    fs.writeFileSync(archivePath, archive);
+    // Wait for both concurrent fetches to settle before removing the staging
+    // directory. Promise.all would race cleanup against an archive stream when
+    // the small checksum request fails first.
+    const [archiveResult, checksumResult] = await Promise.allSettled([
+      downloadToFile(url, archivePath, fetchImpl, archiveProgress),
+      fetchBuffer(`${url}.sha256`, fetchImpl),
+    ]);
+    if (archiveResult.status === 'rejected') throw archiveResult.reason;
+    if (checksumResult.status === 'rejected') throw checksumResult.reason;
+
+    const expected = parseSha256File(checksumResult.value.toString('utf8'));
+    const actual = archiveResult.value.sha256;
+    if (actual !== expected) {
+      throw new Error(
+        `SHA-256 mismatch for ${file}: expected ${expected}, got ${actual}. ` +
+          'The download may be corrupted or tampered with; refusing to install.',
+      );
+    }
+
     // bsdtar reads both .tar.gz and .zip with -xf, on macOS, Linux, and
     // Windows 10+ (tar.exe ships in System32).
     const tar = spawnSync('tar', ['-xf', archivePath, '-C', tmp], { encoding: 'utf8' });
@@ -157,6 +418,12 @@ export async function provision(version, opts = {}) {
           'the MCP server require the daemon; refusing a daemon-less install.',
       );
     }
+
+    // A macOS bundle is part of the release contract, not an optional extra.
+    // Validate it before creating or replacing anything under KIN_HOME so a
+    // malformed upgrade cannot stamp new binaries while retaining a stale
+    // live notifier from the previous release.
+    const notifierSrc = preflightNotifierBundle(root, platform);
 
     const binDir = path.join(kinHome(env), 'bin');
     const libDir = path.join(kinHome(env), 'lib');
@@ -175,6 +442,10 @@ export async function provision(version, opts = {}) {
         fs.mkdirSync(libDir, { recursive: true });
         installFile(libSrc, path.join(libDir, lib), 0o644);
       }
+    }
+
+    if (notifierSrc && installNotifierBundleSource(notifierSrc, env)) {
+      log('kin: notification identity installed (KinNotifier.app)');
     }
 
     writeLauncherStamp(version, env);

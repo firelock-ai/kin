@@ -120,16 +120,26 @@ info "Downloading $ARCHIVE..."
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Download the archive and its per-artifact checksum. The release workflow
-# publishes "<archive>.sha256" next to every archive (shasum -a 256 format:
-# "<hash>  <filename>"). Both downloads must succeed.
+# Download the archive and its per-artifact checksum. Interactive terminals get
+# the downloader's live byte/percent meter for the large archive; piped and CI
+# installs stay quiet. The checksum fetch remains quiet in both modes. The
+# release workflow publishes "<archive>.sha256" next to every archive (shasum
+# -a 256 format: "<hash>  <filename>"). Both downloads must succeed.
 if has_cmd curl; then
-    curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
+    if [ -t 2 ]; then
+        curl -fL "$URL" -o "$TMPDIR/$ARCHIVE"
+    else
+        curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
+    fi
     # Tolerate a failed checksum fetch here so the explicit, friendly error
     # below fires (instead of a bare curl error under `set -e`).
     curl -fsSL "$CHECKSUM_URL" -o "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
 elif has_cmd wget; then
-    wget -q "$URL" -O "$TMPDIR/$ARCHIVE"
+    if [ -t 2 ]; then
+        wget "$URL" -O "$TMPDIR/$ARCHIVE"
+    else
+        wget -q "$URL" -O "$TMPDIR/$ARCHIVE"
+    fi
     wget -q "$CHECKSUM_URL" -O "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
 fi
 
@@ -189,6 +199,45 @@ if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
     err "kin-daemon missing from the downloaded archive."
     err "kin status/search and the MCP server require it. Refusing a daemon-less install. Aborting."
     exit 1
+fi
+
+# The notification identity is part of every macOS release contract. Validate
+# its minimal launchable shape before replacing any installed binary so a
+# malformed archive cannot leave a new CLI paired with an old notifier bundle.
+if [ "$OS" = "macos" ]; then
+    NOTIFIER_ROOT="$EXTRACT_DIR/KinNotifier.app"
+    NOTIFIER_EXEC="$NOTIFIER_ROOT/Contents/MacOS/KinNotifier"
+    NOTIFIER_PLIST="$NOTIFIER_ROOT/Contents/Info.plist"
+    if [ -L "$NOTIFIER_ROOT" ] || [ ! -d "$NOTIFIER_ROOT" ]; then
+        err "KinNotifier.app missing or unsafe in the downloaded macOS archive."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    # `test -f/-d` follows intermediate symlink components, so leaf checks
+    # alone would accept `Contents -> Payload`. Walk the complete extracted
+    # tree without following links and admit only real directories and regular
+    # files before any live path is changed. FIFOs, devices, sockets, and every
+    # symlink (including a directory ancestor) fail this boundary.
+    if ! NOTIFIER_UNSAFE_ENTRY=$(find "$NOTIFIER_ROOT" ! \( -type d -o -type f \) -print -quit 2>/dev/null); then
+        err "KinNotifier.app could not be inspected safely in the downloaded macOS archive."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -n "$NOTIFIER_UNSAFE_ENTRY" ]; then
+        err "KinNotifier.app contains a symlink or special entry: $NOTIFIER_UNSAFE_ENTRY"
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -L "$NOTIFIER_EXEC" ] || [ ! -f "$NOTIFIER_EXEC" ] || [ ! -s "$NOTIFIER_EXEC" ] || [ ! -x "$NOTIFIER_EXEC" ]; then
+        err "KinNotifier.app/Contents/MacOS/KinNotifier is missing, unsafe, empty, or not executable."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
+    if [ -L "$NOTIFIER_PLIST" ] || [ ! -f "$NOTIFIER_PLIST" ] || [ ! -s "$NOTIFIER_PLIST" ]; then
+        err "KinNotifier.app/Contents/Info.plist is missing, unsafe, or empty."
+        err "No installed binary or notification bundle was replaced."
+        exit 1
+    fi
 fi
 
 # The freshly downloaded binary owns the registry-authority contract used by
@@ -254,6 +303,11 @@ if [ "$HAVE_NOTIFIER" = "1" ]; then
     LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
     [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$KIN_LIB/KinNotifier.app" >/dev/null 2>&1 || true
     ok "Notification identity installed (KinNotifier.app)"
+elif [ "$OS" = "macos" ]; then
+    # Every macOS release archive is supposed to carry the bundle. Without it
+    # Kin still runs, but every notification is credited to Script Editor, and
+    # that downgrade is invisible unless it is said out loud here.
+    err "This archive carries no KinNotifier.app; notifications will post as Script Editor, not as Kin"
 fi
 
 if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
@@ -276,9 +330,9 @@ fi
 
 # ── PATH setup ──────────────────────────────────────────────────────────
 
-add_to_path() {
-    local rc_file="$1"
-    local line="export PATH=\"$KIN_BIN:\$PATH\""
+add_to_path() (
+    rc_file="$1"
+    line="export PATH=\"$KIN_BIN:\$PATH\""
 
     if [ -f "$rc_file" ] && grep -F -q "$KIN_BIN" "$rc_file" 2>/dev/null; then
         return 0  # Already configured
@@ -286,7 +340,7 @@ add_to_path() {
 
     printf '\n# Kin\n%s\n' "$line" >> "$rc_file"
     ok "Added $KIN_BIN to PATH in $rc_file"
-}
+)
 
 case "$OS" in
     macos)

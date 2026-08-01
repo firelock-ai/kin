@@ -896,6 +896,25 @@ fn report_successful_install(
         );
     }
 
+    // The transaction replaces the notification bundle by rename, so its path
+    // is unchanged while the inode, the code signature, and the `Info.plist`
+    // behind it are not. LaunchServices still holds the record it built for the
+    // tree that was moved away, and the notification daemon refuses a posting
+    // bundle it cannot validate through that record, so the updater owes the
+    // same registration `scripts/install.sh` and the npm launcher perform for
+    // the copies they write. Only the managed root is registered, because that
+    // is the only copy this transaction maintains; an install with no bundle
+    // resolves nothing and registers nothing.
+    if let Err(error) =
+        kin_notify::Notifier::with_home(kin_home.to_path_buf()).register_with_launch_services()
+    {
+        eprintln!(
+            "WARNING: the update installed the notification bundle but could not register it with \
+             LaunchServices, so notifications may post as Script Editor until `kin setup` runs \
+             again: {error:#}"
+        );
+    }
+
     attempt_pending_mcp_repair(lock)?;
     let pending = restart_pending_path(kin_home);
     println!("Installed v{latest} on disk.");
@@ -2141,8 +2160,8 @@ impl AnchoredDir {
                 name
             );
         }
-        // mkdir honors umask, so explicitly restore the required private mode
-        // before opening the directory and verify it again on the descriptor.
+        // mkdir honors umask, so explicitly restore the requested mode before
+        // opening the directory and verify it again on the descriptor.
         match rustix::fs::chmodat(
             &self.file,
             name,
@@ -3069,6 +3088,20 @@ fn cleanup_staging_tree_at(install: &InstallLayout, name: &str, root: &AnchoredD
             let stat = directory
                 .stat_entry(&entry)?
                 .context("staging entry disappeared during cleanup")?;
+            // The staged notification bundle is the one directory the staging
+            // tree may hold. It is removed as a tree; every other non-file entry
+            // is still refused rather than walked.
+            if entry == NOTIFIER_BUNDLE_DIR
+                && directory_name == "lib"
+                && rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Directory
+            {
+                install.ensure_bound()?;
+                install.root.ensure_child_binding(name, root)?;
+                root.ensure_child_binding(directory_name, &directory)?;
+                remove_bundle_tree(&directory, &entry)?;
+                continue;
+            }
             if rustix::fs::FileType::from_raw_mode(stat.st_mode)
                 != rustix::fs::FileType::RegularFile
             {
@@ -3093,6 +3126,247 @@ fn cleanup_staging_tree_at(install: &InstallLayout, name: &str, root: &AnchoredD
     install.ensure_bound()?;
     install.root.ensure_child_binding(name, root)?;
     install.root.remove_child_dir(name)
+}
+
+/// Open a bundle subdirectory, creating it when it is not there yet.
+///
+/// Bundle members arrive one at a time and in archive order, so the directories
+/// they need are created on demand. Every step re-proves the binding it just
+/// used, the same way the component paths do, so a swapped directory cannot
+/// redirect a later write.
+#[cfg(unix)]
+fn open_or_create_bundle_dir(parent: &AnchoredDir, name: &str) -> Result<AnchoredDir> {
+    match parent.stat_entry(name)? {
+        Some(stat)
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                == rustix::fs::FileType::Directory =>
+        {
+            let child = parent.open_child(name)?;
+            parent.ensure_child_binding(name, &child)?;
+            Ok(child)
+        }
+        Some(_) => anyhow::bail!(
+            "notification bundle path is not a real non-symlink directory: {}/{}",
+            parent.display.display(),
+            name
+        ),
+        None => {
+            // The install root remains private, while the app tree itself uses
+            // the same conventional directory mode as the script and npm
+            // installers. Keeping all delivery channels byte-and-mode
+            // equivalent avoids an update silently changing bundle shape.
+            let child = parent.create_child(name, 0o755)?;
+            parent.ensure_child_binding(name, &child)?;
+            Ok(child)
+        }
+    }
+}
+
+/// Materialize one bundle member beneath `bundle_root`.
+#[cfg(unix)]
+fn write_bundle_member(
+    bundle_root: &AnchoredDir,
+    member: &BundleMember,
+    contents: &[u8],
+    check_binding: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    check_binding()?;
+    let segments: Vec<&str> = member.path.split('/').collect();
+    let (leaf, directories) = if member.directory {
+        (None, segments.as_slice())
+    } else {
+        let (leaf, rest) = segments
+            .split_last()
+            .context("notification bundle member has no name")?;
+        (Some(*leaf), rest)
+    };
+    let mut current = bundle_root.try_clone()?;
+    for directory in directories {
+        current = open_or_create_bundle_dir(&current, directory)?;
+    }
+    let Some(leaf) = leaf else {
+        return Ok(());
+    };
+    let mode = if member.executable { 0o755 } else { 0o644 };
+    current.atomic_write_checked(leaf, contents, mode, || check_binding())
+}
+
+/// Read back the identity of an installed or staged bundle tree.
+///
+/// This is the read side of the same fold the archive walk computes, so a
+/// bundle staged from an archive and the bundle later found on disk produce the
+/// same `tree_sha256` when they hold the same thing.
+#[cfg(unix)]
+fn read_bundle_members(root: &AnchoredDir) -> Result<Vec<BundleMember>> {
+    let mut members = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut pending = vec![(root.try_clone()?, String::new(), 0_usize)];
+    while let Some((directory, prefix, depth)) = pending.pop() {
+        if depth > MAX_NOTIFIER_BUNDLE_DEPTH {
+            anyhow::bail!(
+                "notification bundle is nested deeper than {MAX_NOTIFIER_BUNDLE_DEPTH} levels"
+            );
+        }
+        let mut names = directory.entry_names()?;
+        names.sort();
+        for name in names {
+            if members.len() >= MAX_NOTIFIER_BUNDLE_MEMBERS {
+                anyhow::bail!(
+                    "notification bundle exceeds its member limit of {MAX_NOTIFIER_BUNDLE_MEMBERS}"
+                );
+            }
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let stat = directory
+                .stat_entry(&name)?
+                .context("notification bundle entry disappeared while it was read")?;
+            match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+                rustix::fs::FileType::Directory => {
+                    let child = directory.open_child(&name)?;
+                    directory.ensure_child_binding(&name, &child)?;
+                    members.push(BundleMember {
+                        path: path.clone(),
+                        directory: true,
+                        executable: false,
+                        size_bytes: 0,
+                        sha256: String::new(),
+                    });
+                    pending.push((child, path, depth + 1));
+                }
+                rustix::fs::FileType::RegularFile => {
+                    let identity = directory
+                        .identity(&name, "notification bundle member")?
+                        .context("notification bundle member disappeared while it was hashed")?;
+                    total_bytes = total_bytes
+                        .checked_add(identity.size_bytes)
+                        .context("notification bundle size overflow")?;
+                    if total_bytes > MAX_NOTIFIER_BUNDLE_BYTES {
+                        anyhow::bail!(
+                            "notification bundle exceeds its expanded-size limit of {MAX_NOTIFIER_BUNDLE_BYTES} bytes"
+                        );
+                    }
+                    members.push(BundleMember {
+                        path,
+                        directory: false,
+                        executable: stat.st_mode as u32 & 0o111 != 0,
+                        size_bytes: identity.size_bytes,
+                        sha256: identity.sha256,
+                    });
+                }
+                _ => anyhow::bail!(
+                    "notification bundle contains an entry that is neither a directory nor a regular file: {}/{}",
+                    directory.display.display(),
+                    name
+                ),
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// Identity of the bundle named `name` under `parent`, or `None` when there is
+/// none. A non-directory sitting at that name is an error rather than an
+/// absence: something else owns the path and must not be silently replaced.
+#[cfg(unix)]
+fn bundle_identity_at(parent: &AnchoredDir, name: &str) -> Result<Option<BundleIdentity>> {
+    let Some(stat) = parent.stat_entry(name)? else {
+        return Ok(None);
+    };
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        anyhow::bail!(
+            "managed notification bundle path is not a real non-symlink directory: {}/{}",
+            parent.display.display(),
+            name
+        );
+    }
+    let root = parent.open_child(name)?;
+    parent.ensure_child_binding(name, &root)?;
+    let mut members = read_bundle_members(&root)?;
+    Ok(Some(bundle_identity_from_members(&mut members)?))
+}
+
+/// Identity of a bundle that must also be able to do its job.
+///
+/// Used for the staged bundle and for the bundle immediately after it is
+/// installed. The live bundle being replaced is read with `bundle_identity_at`
+/// instead: a previously broken bundle is a reason to update, not a reason to
+/// refuse one.
+#[cfg(unix)]
+fn staged_bundle_identity_at(parent: &AnchoredDir, name: &str) -> Result<Option<BundleIdentity>> {
+    let Some(stat) = parent.stat_entry(name)? else {
+        return Ok(None);
+    };
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        anyhow::bail!(
+            "staged notification bundle path is not a real non-symlink directory: {}/{}",
+            parent.display.display(),
+            name
+        );
+    }
+    let root = parent.open_child(name)?;
+    parent.ensure_child_binding(name, &root)?;
+    let mut members = read_bundle_members(&root)?;
+    validate_notifier_bundle_shape(&members)?;
+    Ok(Some(bundle_identity_from_members(&mut members)?))
+}
+
+/// Remove a bundle tree, refusing anything the tree should not contain.
+///
+/// Written against anchored handles rather than `remove_dir_all` so a symlink
+/// or a device node swapped into the tree stops the removal instead of
+/// redirecting it somewhere outside the managed root.
+#[cfg(unix)]
+fn remove_bundle_tree(parent: &AnchoredDir, name: &str) -> Result<()> {
+    let Some(stat) = parent.stat_entry(name)? else {
+        return Ok(());
+    };
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        anyhow::bail!(
+            "refusing to remove a notification bundle path that is not a directory: {}/{}",
+            parent.display.display(),
+            name
+        );
+    }
+    let root = parent.open_child(name)?;
+    parent.ensure_child_binding(name, &root)?;
+    remove_bundle_contents(&root, 0)?;
+    root.ensure_empty()?;
+    parent.ensure_child_binding(name, &root)?;
+    parent.remove_child_dir(name)
+}
+
+#[cfg(unix)]
+fn remove_bundle_contents(directory: &AnchoredDir, depth: usize) -> Result<()> {
+    if depth > MAX_NOTIFIER_BUNDLE_DEPTH {
+        anyhow::bail!(
+            "notification bundle is nested deeper than {MAX_NOTIFIER_BUNDLE_DEPTH} levels"
+        );
+    }
+    for name in directory.entry_names()? {
+        let stat = directory
+            .stat_entry(&name)?
+            .context("notification bundle entry disappeared during removal")?;
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+            rustix::fs::FileType::Directory => {
+                let child = directory.open_child(&name)?;
+                directory.ensure_child_binding(&name, &child)?;
+                remove_bundle_contents(&child, depth + 1)?;
+                child.ensure_empty()?;
+                directory.ensure_child_binding(&name, &child)?;
+                directory.remove_child_dir(&name)?;
+            }
+            rustix::fs::FileType::RegularFile => directory.unlink_file(&name)?,
+            _ => anyhow::bail!(
+                "refusing to remove an unexpected notification bundle entry: {}/{}",
+                directory.display.display(),
+                name
+            ),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -4414,19 +4688,38 @@ struct ComponentSpec {
     required: bool,
 }
 
-/// Directory name of the macOS notification bundle inside a release archive.
+/// Directory name of the macOS notification bundle, both inside a release
+/// archive and under the managed `lib` directory once installed.
 ///
 /// The bundle travels as a directory rather than as a component file because
 /// replacing only its executable would break the seal `codesign` places over
 /// the whole bundle, and an unsealed bundle is refused by the notification
-/// system. It is therefore deliberately NOT a `ComponentSpec`: the transaction
-/// swaps regular files with inode identities, which a directory cannot supply.
-///
-/// Archive walks skip it so that an archive carrying it can still be staged.
-/// The updater does not yet replace the bundle, so it keeps whatever version
-/// the installer wrote until a refresh step is added; a stale notifier still
-/// posts correctly, it simply misses newer notifier fixes.
+/// system. It is therefore deliberately NOT a `ComponentSpec`: those are swapped
+/// by inode identity over a single regular file, which a directory cannot
+/// supply. It is instead a whole-tree participant with its own identity, staged,
+/// backed up, swapped, and rolled back alongside the components.
 const NOTIFIER_BUNDLE_DIR: &str = "KinNotifier.app";
+
+/// Bundle members whose absence leaves nothing to launch or nothing to credit
+/// the notification to. The same two the release archive shape check requires.
+const NOTIFIER_BUNDLE_EXECUTABLE: &[&str] = &["Contents", "MacOS", "KinNotifier"];
+const NOTIFIER_BUNDLE_PLIST: &[&str] = &["Contents", "Info.plist"];
+
+/// A bundle is a fixed, small shape, so its walk is bounded rather than
+/// unbounded over attacker-chosen structure. These match the caps the release
+/// workflow's archive shape check applies on the publishing side.
+const MAX_NOTIFIER_BUNDLE_MEMBERS: usize = 64;
+const MAX_NOTIFIER_BUNDLE_DEPTH: usize = 6;
+const MAX_NOTIFIER_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether this platform's release archive carries the notification bundle.
+///
+/// Keyed on the component contract rather than on the host, so a test that
+/// drives the Linux or Windows contract from a macOS host still gets that
+/// platform's rules.
+fn spec_carries_notifier_bundle(spec: &[ComponentSpec]) -> bool {
+    spec == MACOS_COMPONENTS
+}
 
 /// Whether an archive entry belongs to the notification bundle.
 ///
@@ -4436,6 +4729,294 @@ const NOTIFIER_BUNDLE_DIR: &str = "KinNotifier.app";
 fn is_notifier_bundle_entry(path: &Path) -> bool {
     path.components()
         .any(|component| component.as_os_str() == NOTIFIER_BUNDLE_DIR)
+}
+
+/// Whether this archive record names the bundle directory itself rather than
+/// a member below it. Release tarballs contain this structural record because
+/// the packaging workflow archives the whole artifact directory.
+fn is_notifier_bundle_root_entry(path: &Path) -> bool {
+    let mut components = path
+        .components()
+        .skip_while(|component| component.as_os_str() != std::ffi::OsStr::new(NOTIFIER_BUNDLE_DIR));
+    components.next().is_some() && components.next().is_none()
+}
+
+/// The part of an archive member path that lies inside the bundle.
+///
+/// Returns the path relative to `KinNotifier.app` itself, which is what gets
+/// recreated under the staging tree. Rejects the shapes that would let a member
+/// land outside the bundle root or name something the bundle cannot contain.
+fn notifier_bundle_member_path(path: &Path) -> Result<PathBuf> {
+    let mut components = path
+        .components()
+        .skip_while(|component| component.as_os_str() != std::ffi::OsStr::new(NOTIFIER_BUNDLE_DIR));
+    components
+        .next()
+        .context("archive entry is not inside the notification bundle")?;
+    let mut relative = PathBuf::new();
+    let mut depth = 0_usize;
+    for component in components {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!(
+                "notification bundle entry '{}' has an unsupported path component",
+                path.display()
+            );
+        };
+        let Some(name) = name.to_str() else {
+            anyhow::bail!("notification bundle entry has a non-UTF-8 name");
+        };
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            anyhow::bail!("notification bundle entry '{}' is not a plain name", name);
+        }
+        depth += 1;
+        if depth > MAX_NOTIFIER_BUNDLE_DEPTH {
+            anyhow::bail!(
+                "notification bundle entry '{}' is nested deeper than {MAX_NOTIFIER_BUNDLE_DEPTH} levels",
+                path.display()
+            );
+        }
+        relative.push(name);
+    }
+    if relative.as_os_str().is_empty() {
+        anyhow::bail!("notification bundle entry names the bundle root itself");
+    }
+    Ok(relative)
+}
+
+/// Identity of a whole notification bundle.
+///
+/// The transaction proves a component is the intended one by hashing its bytes.
+/// A bundle has no single stream of bytes, so its identity is the fold of every
+/// member in sorted order: relative path, whether it is a directory, its
+/// executable bit, its size, and its content digest. Adding, removing, moving,
+/// truncating, or de-executabling any member changes `tree_sha256`, which is
+/// what makes it usable as a journal identity.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BundleIdentity {
+    tree_sha256: String,
+    file_count: u64,
+    total_bytes: u64,
+}
+
+/// One member of a bundle being assembled or measured.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BundleMember {
+    /// Path relative to the bundle root, as `/`-joined segments. Stored in this
+    /// canonical form so an identity computed on one platform's separator
+    /// conventions matches one computed on another's.
+    path: String,
+    directory: bool,
+    executable: bool,
+    size_bytes: u64,
+    sha256: String,
+}
+
+/// Fold a sorted member list into a bundle identity.
+///
+/// Sorting first is what makes the digest independent of archive order and of
+/// directory-read order, so the identity recorded when the bundle was staged is
+/// the identity recomputed after it was installed.
+fn bundle_identity_from_members(members: &mut Vec<BundleMember>) -> Result<BundleIdentity> {
+    members.sort();
+    members.dedup();
+    let mut seen = HashSet::new();
+    let mut hasher = Sha256::new();
+    let mut file_count = 0_u64;
+    let mut total_bytes = 0_u64;
+    for member in members.iter() {
+        if !seen.insert(member.path.as_str()) {
+            anyhow::bail!(
+                "notification bundle contains conflicting entries for '{}'",
+                member.path
+            );
+        }
+        hasher.update(member.path.as_bytes());
+        hasher.update([0]);
+        hasher.update([u8::from(member.directory), u8::from(member.executable)]);
+        hasher.update(member.size_bytes.to_le_bytes());
+        hasher.update(member.sha256.as_bytes());
+        hasher.update([0]);
+        if !member.directory {
+            file_count += 1;
+            total_bytes = total_bytes
+                .checked_add(member.size_bytes)
+                .context("notification bundle size overflow")?;
+        }
+    }
+    // A tree with no files still gets an identity rather than an error. Identity
+    // is a pure description of what is there; whether what is there can post a
+    // notification is `validate_notifier_bundle_shape`'s question. Keeping them
+    // separate is what lets a rollback recognize a half-removed tree instead of
+    // failing to describe it, and the journal separately refuses to record an
+    // empty identity as anything's original or staged bundle.
+    Ok(BundleIdentity {
+        tree_sha256: hex::encode(hasher.finalize()),
+        file_count,
+        total_bytes,
+    })
+}
+
+/// Collects the notification bundle out of an archive walk.
+///
+/// The bundle carries its own budget because it is deliberately absent from the
+/// release manifest's per-file inventory: the manifest covers swappable
+/// components, and the bundle's bytes are authenticated by the archive digest
+/// that was verified before any of this ran. Counting bundle members against
+/// the inventory-derived expanded-size bound would therefore fail every macOS
+/// archive, and counting them against nothing would leave them unbounded.
+struct NotifierBundleCollector<'a> {
+    members: Vec<BundleMember>,
+    total_bytes: u64,
+    root_entry_seen: bool,
+    sink: &'a mut dyn FnMut(&BundleMember, &[u8]) -> Result<()>,
+}
+
+impl<'a> NotifierBundleCollector<'a> {
+    fn new(sink: &'a mut dyn FnMut(&BundleMember, &[u8]) -> Result<()>) -> Self {
+        Self {
+            members: Vec::new(),
+            total_bytes: 0,
+            root_entry_seen: false,
+            sink,
+        }
+    }
+
+    fn record(&mut self, member: BundleMember, contents: &[u8]) -> Result<()> {
+        if self.members.len() >= MAX_NOTIFIER_BUNDLE_MEMBERS {
+            anyhow::bail!(
+                "notification bundle exceeds its member limit of {MAX_NOTIFIER_BUNDLE_MEMBERS}"
+            );
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(member.size_bytes)
+            .context("notification bundle size overflow")?;
+        if self.total_bytes > MAX_NOTIFIER_BUNDLE_BYTES {
+            anyhow::bail!(
+                "notification bundle exceeds its expanded-size limit of {MAX_NOTIFIER_BUNDLE_BYTES} bytes"
+            );
+        }
+        (self.sink)(&member, contents)?;
+        self.members.push(member);
+        Ok(())
+    }
+
+    /// Take one archive entry that lives inside the bundle.
+    ///
+    /// Every ancestor directory is recorded alongside the file so that the
+    /// identity covers the tree's shape and not merely its leaf contents, and
+    /// so an archive that omits directory entries still produces the same
+    /// identity as one that includes them.
+    fn accept(&mut self, entry: &SimpleTarEntry) -> Result<()> {
+        if is_notifier_bundle_root_entry(&entry.path) {
+            if entry.kind != SimpleTarEntryKind::Directory {
+                anyhow::bail!(
+                    "notification bundle root '{}' must be a directory record",
+                    entry.path.display()
+                );
+            }
+            if entry.declared_size != 0 {
+                anyhow::bail!(
+                    "notification bundle root '{}' must have zero expanded size",
+                    entry.path.display()
+                );
+            }
+            if std::mem::replace(&mut self.root_entry_seen, true) {
+                anyhow::bail!(
+                    "notification bundle contains duplicate root entry '{}'",
+                    entry.path.display()
+                );
+            }
+            // The root is archive structure, not a member of the signed app
+            // tree. It still consumed the archive walker's global entry budget,
+            // but must not consume the bundle member budget or change identity.
+            return Ok(());
+        }
+        let relative = notifier_bundle_member_path(&entry.path)?;
+        let mut ancestor = PathBuf::new();
+        let segments: Vec<_> = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let leaf_is_directory = entry.kind == SimpleTarEntryKind::Directory;
+        let directory_depth = if leaf_is_directory {
+            segments.len()
+        } else {
+            segments.len().saturating_sub(1)
+        };
+        for segment in segments.iter().take(directory_depth) {
+            ancestor.push(segment);
+            let path = ancestor.to_string_lossy().replace('\\', "/");
+            if self.members.iter().any(|member| member.path == path) {
+                continue;
+            }
+            self.record(
+                BundleMember {
+                    path,
+                    directory: true,
+                    executable: false,
+                    size_bytes: 0,
+                    sha256: String::new(),
+                },
+                &[],
+            )?;
+        }
+        if leaf_is_directory {
+            return Ok(());
+        }
+        let path = relative.to_string_lossy().replace('\\', "/");
+        if self.members.iter().any(|member| member.path == path) {
+            anyhow::bail!("notification bundle contains duplicate member '{path}'");
+        }
+        self.record(
+            BundleMember {
+                path,
+                directory: false,
+                executable: entry.mode & 0o111 != 0,
+                size_bytes: entry.declared_size,
+                sha256: hex::encode(Sha256::digest(&entry.contents)),
+            },
+            &entry.contents,
+        )
+    }
+
+    /// Nothing at all was seen, which is what a Linux or Windows archive looks
+    /// like and what a macOS archive must never look like.
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn finish(mut self) -> Result<BundleIdentity> {
+        validate_notifier_bundle_shape(&self.members)?;
+        bundle_identity_from_members(&mut self.members)
+    }
+}
+
+/// Reject a bundle that could not do its job once installed.
+///
+/// A bundle missing its executable has nothing to launch, and one missing its
+/// `Info.plist` has no identity for macOS to credit the notification to. Both
+/// failures are invisible at install time and show up only as a wrong sender
+/// name, so they are refused here instead.
+fn validate_notifier_bundle_shape(members: &[BundleMember]) -> Result<()> {
+    for required in [NOTIFIER_BUNDLE_EXECUTABLE, NOTIFIER_BUNDLE_PLIST] {
+        let path = required.join("/");
+        let member = members
+            .iter()
+            .find(|member| member.path == path && !member.directory)
+            .with_context(|| format!("notification bundle is missing '{path}'"))?;
+        if member.size_bytes == 0 {
+            anyhow::bail!("notification bundle member '{path}' is empty");
+        }
+    }
+    let executable = NOTIFIER_BUNDLE_EXECUTABLE.join("/");
+    if !members
+        .iter()
+        .any(|member| member.path == executable && member.executable)
+    {
+        anyhow::bail!("notification bundle member '{executable}' is not executable");
+    }
+    Ok(())
 }
 
 const MACOS_COMPONENTS: &[ComponentSpec] = &[
@@ -4782,7 +5363,27 @@ fn stage_archive_locked(
         let mut writer = |component, contents: &[u8], seen: &mut HashSet<&'static str>| {
             write_staged_component_locked(install, layout, component, contents, seen)
         };
-        stage_archive_payload(bytes, archive_name, spec, &mut seen, &mut writer)?;
+        let mut bundle_sink = |member: &BundleMember, contents: &[u8]| -> Result<()> {
+            let bundle_root = open_or_create_bundle_dir(&layout.lib, NOTIFIER_BUNDLE_DIR)?;
+            write_bundle_member(&bundle_root, member, contents, &mut || {
+                install.ensure_bound()?;
+                layout.ensure_bound()
+            })
+        };
+        let mut bundle = NotifierBundleCollector::new(&mut bundle_sink);
+        stage_archive_payload(
+            bytes,
+            archive_name,
+            spec,
+            &mut seen,
+            &mut writer,
+            &mut bundle,
+        )?;
+        if spec_carries_notifier_bundle(spec) {
+            bundle.finish()?;
+        } else if !bundle.is_empty() {
+            anyhow::bail!("release archive carries a notification bundle this platform cannot use");
+        }
         validate_staged_bundle_locked(install, layout, spec)
     }
 
@@ -4886,7 +5487,33 @@ fn stage_archive(
     let mut writer = |component, contents: &[u8], seen: &mut HashSet<&'static str>| {
         write_staged_component(stage_root, component, contents, seen)
     };
-    stage_archive_payload(bytes, archive_name, spec, &mut seen, &mut writer)?;
+    let mut bundle_sink = |member: &BundleMember, contents: &[u8]| -> Result<()> {
+        #[cfg(unix)]
+        {
+            let lib = stage_anchor.open_child("lib")?;
+            let bundle_root = open_or_create_bundle_dir(&lib, NOTIFIER_BUNDLE_DIR)?;
+            return write_bundle_member(&bundle_root, member, contents, &mut || Ok(()));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (member, contents);
+            anyhow::bail!("this platform's release archive carries no notification bundle")
+        }
+    };
+    let mut bundle = NotifierBundleCollector::new(&mut bundle_sink);
+    stage_archive_payload(
+        bytes,
+        archive_name,
+        spec,
+        &mut seen,
+        &mut writer,
+        &mut bundle,
+    )?;
+    if spec_carries_notifier_bundle(spec) {
+        bundle.finish()?;
+    } else if !bundle.is_empty() {
+        anyhow::bail!("release archive carries a notification bundle this platform cannot use");
+    }
     validate_staged_bundle(stage_root, spec)
 }
 
@@ -4896,6 +5523,7 @@ fn stage_archive_payload<W>(
     spec: &[ComponentSpec],
     seen: &mut HashSet<&'static str>,
     writer: &mut W,
+    bundle: &mut NotifierBundleCollector<'_>,
 ) -> Result<()>
 where
     W: FnMut(ComponentSpec, &[u8], &mut HashSet<&'static str>) -> Result<()>,
@@ -4908,6 +5536,7 @@ where
         RELEASE_ARCHIVE_LIMITS,
         seen,
         writer,
+        bundle,
     )
 }
 
@@ -4920,6 +5549,7 @@ fn stage_archive_payload_with_limits<W>(
     limits: ArchiveSizeLimits,
     seen: &mut HashSet<&'static str>,
     writer: &mut W,
+    bundle: &mut NotifierBundleCollector<'_>,
 ) -> Result<()>
 where
     W: FnMut(ComponentSpec, &[u8], &mut HashSet<&'static str>) -> Result<()>,
@@ -4946,6 +5576,7 @@ where
             &mut entry_count,
             seen,
             writer,
+            bundle,
         )
     } else if archive_name.ends_with(".zip") {
         stage_zip(
@@ -5149,6 +5780,12 @@ fn validate_archive_payload_provenance_and_static_identity(
             }
             Ok(())
         };
+    // The notification bundle is authenticated by the archive digest rather than
+    // by the per-file inventory, so nothing here reads its bytes. Its shape is
+    // still judged, because a macOS archive whose bundle cannot launch or cannot
+    // be attributed should fail before an install, not after one.
+    let mut inspect_only = |_: &BundleMember, _: &[u8]| Ok(());
+    let mut bundle = NotifierBundleCollector::new(&mut inspect_only);
     stage_archive_payload_with_limits(
         archive_bytes,
         archive_name,
@@ -5157,7 +5794,11 @@ fn validate_archive_payload_provenance_and_static_identity(
         RELEASE_ARCHIVE_LIMITS,
         &mut seen,
         &mut verifier,
+        &mut bundle,
     )?;
+    if spec_carries_notifier_bundle(spec) {
+        bundle.finish()?;
+    }
     if !seen.contains(cli_name) || !seen.contains(daemon_name) {
         anyhow::bail!("release archive lacks the CLI or daemon static build identity");
     }
@@ -5203,6 +5844,8 @@ fn validate_archive_payload_provenance_with_limits(
             verified.insert(component.name.to_string(), actual);
             Ok(())
         };
+    let mut inspect_only = |_: &BundleMember, _: &[u8]| Ok(());
+    let mut bundle = NotifierBundleCollector::new(&mut inspect_only);
     stage_archive_payload_with_limits(
         archive_bytes,
         archive_name,
@@ -5211,7 +5854,11 @@ fn validate_archive_payload_provenance_with_limits(
         limits,
         &mut seen,
         &mut verifier,
+        &mut bundle,
     )?;
+    if spec_carries_notifier_bundle(spec) {
+        bundle.finish()?;
+    }
 
     for component in spec.iter().filter(|component| component.required) {
         if !verified.contains_key(component.name) {
@@ -5240,6 +5887,11 @@ struct SimpleTarEntry {
     path: PathBuf,
     kind: SimpleTarEntryKind,
     declared_size: u64,
+    /// Permission bits as recorded by the archive. Components are written with
+    /// the mode their location dictates and ignore this; the notification
+    /// bundle carries its own executable bit and needs it preserved, because a
+    /// bundle whose executable lost `+x` cannot be launched to post anything.
+    mode: u32,
     contents: Vec<u8>,
 }
 
@@ -5498,16 +6150,21 @@ where
         if padding_bytes[..padding].iter().any(|byte| *byte != 0) {
             anyhow::bail!("tar entry '{}' has nonzero padding", path.display());
         }
+        let mode = u32::try_from(parse_tar_octal(&header[100..108], "entry mode")?)
+            .context("tar entry mode does not fit in a permission word")?
+            & 0o7777;
         visitor(SimpleTarEntry {
             path,
             kind,
             declared_size,
+            mode,
             contents,
         })?;
     }
     anyhow::bail!("tar ended without two zero end-of-archive blocks")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_tar_gz<W>(
     bytes: &[u8],
     spec: &[ComponentSpec],
@@ -5518,24 +6175,33 @@ fn stage_tar_gz<W>(
     entry_count: &mut usize,
     seen: &mut HashSet<&'static str>,
     writer: &mut W,
+    bundle: &mut NotifierBundleCollector<'_>,
 ) -> Result<()>
 where
     W: FnMut(ComponentSpec, &[u8], &mut HashSet<&'static str>) -> Result<()>,
 {
+    let carries_bundle = spec_carries_notifier_bundle(spec);
     walk_simple_tar_gz(bytes, limits, |entry| {
         *entry_count = entry_count
             .checked_add(1)
             .context("release archive entry-count overflow")?;
+        // The notification bundle is a whole-tree participant rather than a
+        // swappable component, so it is collected here under its own budget and
+        // installed by the transaction as one directory. On a platform whose
+        // archive has no bundle, a member of one is simply an unexpected entry.
+        if is_notifier_bundle_entry(&entry.path) {
+            if !carries_bundle {
+                anyhow::bail!(
+                    "release archive contains unexpected file '{}'",
+                    entry.path.display()
+                );
+            }
+            return bundle.accept(&entry);
+        }
         if entry.kind == SimpleTarEntryKind::Directory {
             return Ok(());
         }
         let path = entry.path;
-        // The notification bundle is not a swappable component; it is
-        // materialized after the transaction commits. Skipping it here is what
-        // keeps a macOS archive that carries it stageable at all.
-        if is_notifier_bundle_entry(&path) {
-            return Ok(());
-        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             anyhow::bail!("release archive contains a non-UTF-8 file name");
         };
@@ -5594,6 +6260,16 @@ where
         if !entry.is_file() {
             anyhow::bail!(
                 "release archive contains non-regular entry '{}'",
+                enclosed_path.display()
+            );
+        }
+        // Only macOS carries the notification bundle and only its tar archives
+        // do. Rejecting the shape here also stops a zip from smuggling a
+        // component past the flat-name lookup below by nesting it in a
+        // bundle-shaped directory.
+        if is_notifier_bundle_entry(&enclosed_path) {
+            anyhow::bail!(
+                "release zip contains a notification bundle entry '{}'",
                 enclosed_path.display()
             );
         }
@@ -5731,7 +6407,26 @@ fn validate_staged_bundle_locked(
             None => {}
         }
     }
+    if spec_carries_notifier_bundle(spec)
+        && staged_bundle_identity_at(&staging.lib, NOTIFIER_BUNDLE_DIR)?.is_none()
+    {
+        anyhow::bail!("release archive is incomplete: the notification bundle is missing");
+    }
     Ok(())
+}
+
+/// Prove the staged tree holds a usable notification bundle.
+#[cfg(unix)]
+fn validate_staged_notifier_bundle(stage_root: &Path) -> Result<()> {
+    let lib = AnchoredDir::open_ambient(&stage_root.join("lib"))?;
+    staged_bundle_identity_at(&lib, NOTIFIER_BUNDLE_DIR)?
+        .context("release archive is incomplete: the notification bundle is missing")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_staged_notifier_bundle(_stage_root: &Path) -> Result<()> {
+    anyhow::bail!("this platform cannot stage a notification bundle")
 }
 
 fn validate_staged_bundle(stage_root: &Path, spec: &[ComponentSpec]) -> Result<()> {
@@ -5754,6 +6449,9 @@ fn validate_staged_bundle(stage_root: &Path, spec: &[ComponentSpec]) -> Result<(
                 component.name
             );
         }
+    }
+    if spec_carries_notifier_bundle(spec) {
+        validate_staged_notifier_bundle(stage_root)?;
     }
     Ok(())
 }
@@ -5784,12 +6482,43 @@ struct JournalComponent {
     staged_identity: Option<FileIdentity>,
 }
 
+/// The notification bundle's place in a transaction.
+///
+/// Both fields are absent on a platform whose archive carries no bundle, and
+/// `original_identity` is absent on the first install that brings one. A
+/// default-empty record is what a journal written before the bundle joined the
+/// transaction deserializes to, which is exactly what it means: that
+/// transaction did not touch a bundle.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct JournalBundle {
+    original_identity: Option<BundleIdentity>,
+    staged_identity: Option<BundleIdentity>,
+}
+
+impl JournalBundle {
+    fn is_empty(&self) -> bool {
+        self.original_identity.is_none() && self.staged_identity.is_none()
+    }
+}
+
+/// Journal schema written by this build.
+///
+/// Schema 2 is still accepted on read: a crash during an update leaves the
+/// journal written by the older CLI that started it, and the newer CLI that
+/// becomes live afterwards has to be able to finish or reverse that work. A
+/// schema-2 journal never touched a notification bundle, so recovering one is
+/// exactly the component-only behavior it recorded.
+const TRANSACTION_JOURNAL_SCHEMA: u32 = 3;
+const TRANSACTION_JOURNAL_SCHEMA_WITHOUT_BUNDLE: u32 = 2;
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct TransactionJournal {
     schema_version: u32,
     target_version: String,
     phase: TransactionPhase,
     components: Vec<JournalComponent>,
+    #[serde(default)]
+    notifier_bundle: JournalBundle,
     restart_pending: RestartPending,
     mcp_repair_pending: McpRepairPending,
 }
@@ -5996,11 +6725,17 @@ where
         let mcp_repair_pending = mcp_repair_pending_record(lock, target_version)?;
         let transaction_root = create_transaction_root(kin_home)?;
         let backup_root = transaction_root.join("old");
+        // The schema is what this build writes, not what this platform happens
+        // to fill in. The bundle record stays empty because no archive for a
+        // platform without `spec_carries_notifier_bundle` carries one, and
+        // pinning the literal here is how the constant and the journal drift
+        // apart at the next schema bump.
         let mut journal = TransactionJournal {
-            schema_version: 2,
+            schema_version: TRANSACTION_JOURNAL_SCHEMA,
             target_version: target_version.to_string(),
             phase: TransactionPhase::Prepared,
             components,
+            notifier_bundle: JournalBundle::default(),
             restart_pending: restart_pending.clone(),
             mcp_repair_pending,
         };
@@ -6279,6 +7014,21 @@ fn validate_installed_bundle_at(
             (None, None) => {}
         }
     }
+    let installed = if journal.notifier_bundle.staged_identity.is_some() {
+        staged_bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?
+    } else {
+        bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?
+    };
+    match (&journal.notifier_bundle.staged_identity, installed) {
+        (Some(expected), Some(actual)) if expected == &actual => {}
+        (Some(_), Some(_)) => anyhow::bail!(
+            "the installed notification bundle does not match its recorded staged identity"
+        ),
+        (Some(_), None) => anyhow::bail!("the notification bundle is missing after the update"),
+        // Nothing was staged, so whatever is there predates this transaction
+        // and is none of its business.
+        (None, _) => {}
+    }
     Ok(())
 }
 
@@ -6302,8 +7052,24 @@ fn validate_backup_tree_at(
         &transaction.old_lib,
         spec.iter()
             .filter(|component| component.location == ComponentLocation::Lib)
-            .map(|component| component.name),
+            .map(|component| component.name)
+            .chain(spec_carries_notifier_bundle(spec).then_some(NOTIFIER_BUNDLE_DIR)),
     )?;
+    match (
+        &journal.notifier_bundle.original_identity,
+        bundle_identity_at(&transaction.old_lib, NOTIFIER_BUNDLE_DIR)?,
+    ) {
+        (Some(expected), Some(actual)) if expected == &actual => {}
+        (Some(_), Some(_)) => {
+            anyhow::bail!("the notification bundle backup identity changed")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "unexpected notification bundle backup for a transaction that recorded none"
+            )
+        }
+        (_, None) => {}
+    }
     for component in spec {
         let record = journal_component(journal, component.name)?;
         let actual = transaction
@@ -6451,16 +7217,33 @@ where
         );
     }
 
+    // The notification bundle is read before the transaction exists for the
+    // same reason the components are: a fallible read must not strand a
+    // half-created transaction directory.
+    let notifier_bundle = if spec_carries_notifier_bundle(spec) {
+        let staged_identity = staged_bundle_identity_at(&staging.lib, NOTIFIER_BUNDLE_DIR)?;
+        if staged_identity.is_none() {
+            anyhow::bail!("the staged release is missing its notification bundle");
+        }
+        JournalBundle {
+            original_identity: bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?,
+            staged_identity,
+        }
+    } else {
+        JournalBundle::default()
+    };
+
     // Resolve the durable repair manifest before transaction creation so a
     // fallible config/ledger read cannot strand an unjournaled directory.
     let mcp_repair_pending = mcp_repair_pending_record(lock, target_version)?;
     let transaction = TransactionLayout::create(install)?;
     let transaction_root = kin_home.join(&transaction.name);
     let mut journal = TransactionJournal {
-        schema_version: 2,
+        schema_version: TRANSACTION_JOURNAL_SCHEMA,
         target_version: target_version.to_string(),
         phase: TransactionPhase::Prepared,
         components,
+        notifier_bundle,
         restart_pending: restart_pending.clone(),
         mcp_repair_pending,
     };
@@ -6471,6 +7254,44 @@ where
     let precommit = (|| -> Result<()> {
         journal.phase = TransactionPhase::BackingUp;
         persist_journal_at(install, &transaction, &journal)?;
+
+        // The bundle moves first in both phases. It is the only participant
+        // made of many files, so doing it while nothing else has been disturbed
+        // keeps the window in which a failure has work to undo as small as the
+        // component swaps allow, and it leaves the running CLI's swap last.
+        if let Some(expected) = journal.notifier_bundle.original_identity.clone() {
+            install.ensure_bound()?;
+            staging.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            if bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?.as_ref() != Some(&expected) {
+                anyhow::bail!(
+                    "the live notification bundle changed after its journal identity was recorded"
+                );
+            }
+            if transaction
+                .old_lib
+                .stat_entry(NOTIFIER_BUNDLE_DIR)?
+                .is_some()
+            {
+                anyhow::bail!("a transaction backup of the notification bundle already exists");
+            }
+            transaction.ensure_bound(install)?;
+            install.lib.rename_to(
+                NOTIFIER_BUNDLE_DIR,
+                &transaction.old_lib,
+                NOTIFIER_BUNDLE_DIR,
+            )?;
+            after_precommit_mutation("after-backup-mutation-notifier-bundle")?;
+            transaction.ensure_bound(install)?;
+            if bundle_identity_at(&transaction.old_lib, NOTIFIER_BUNDLE_DIR)?.as_ref()
+                != Some(&expected)
+            {
+                anyhow::bail!(
+                    "the notification bundle backup does not match the recorded original identity"
+                );
+            }
+            maybe_crash_at("after-backup-notifier-bundle");
+        }
 
         for (index, component) in spec.iter().enumerate() {
             let record = journal_component(&journal, component.name)?;
@@ -6532,6 +7353,39 @@ where
 
         journal.phase = TransactionPhase::Installing;
         persist_journal_at(install, &transaction, &journal)?;
+        if let Some(expected) = journal.notifier_bundle.staged_identity.clone() {
+            install.ensure_bound()?;
+            staging.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            if staged_bundle_identity_at(&staging.lib, NOTIFIER_BUNDLE_DIR)?.as_ref()
+                != Some(&expected)
+            {
+                anyhow::bail!(
+                    "the staged notification bundle changed after its journal identity was recorded"
+                );
+            }
+            if install.lib.stat_entry(NOTIFIER_BUNDLE_DIR)?.is_some() {
+                anyhow::bail!(
+                    "the live notification bundle path is not in its expected pre-install state"
+                );
+            }
+            install.ensure_bound()?;
+            staging.ensure_bound()?;
+            transaction.ensure_bound(install)?;
+            staging
+                .lib
+                .rename_to(NOTIFIER_BUNDLE_DIR, &install.lib, NOTIFIER_BUNDLE_DIR)?;
+            after_precommit_mutation("after-install-mutation-notifier-bundle")?;
+            install.ensure_bound()?;
+            if staged_bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?.as_ref()
+                != Some(&expected)
+            {
+                anyhow::bail!(
+                    "the installed notification bundle does not match its staged identity"
+                );
+            }
+            maybe_crash_at("after-install-notifier-bundle");
+        }
         let mut install_index = 0;
         for component in spec {
             let record = journal_component(&journal, component.name)?;
@@ -6841,9 +7695,95 @@ fn rollback_transaction_at(
             }
         }
     }
+    rollback_notifier_bundle_at(install, transaction, journal)?;
     journal.phase = TransactionPhase::RolledBack;
     persist_journal_at(install, transaction, journal)?;
     cleanup_transaction_at(install, transaction, journal, spec)
+}
+
+/// Reverse the bundle swap, last, because it moved first.
+///
+/// The decision is made from what is actually on disk rather than from how far
+/// the transaction believed it had got, so a crash between any two steps
+/// resolves the same way a clean failure does.
+///
+/// A component is one file swapped by one atomic rename, so it is only ever the
+/// old bytes or the new bytes, and anything else is refused as ambiguous. A
+/// bundle is a tree removed file by file, so an interrupted rollback genuinely
+/// can leave a partial tree that is neither. Refusing that outright would wedge
+/// every later update behind a state only manual deletion could clear. So the
+/// rule is narrower than the components': a live tree that matches neither is
+/// discarded only while the recorded original is proven present in the backup,
+/// which is precisely when discarding it loses nothing. With no backup to
+/// restore, removal would be irreversible, so the tree is left alone and the
+/// gap is reported instead.
+#[cfg(unix)]
+fn rollback_notifier_bundle_at(
+    install: &InstallLayout,
+    transaction: &TransactionLayout,
+    journal: &TransactionJournal,
+) -> Result<()> {
+    let record = &journal.notifier_bundle;
+    if record.is_empty() {
+        return Ok(());
+    }
+    transaction.ensure_bound(install)?;
+    let live = bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?;
+    let backup = bundle_identity_at(&transaction.old_lib, NOTIFIER_BUNDLE_DIR)?;
+    let backup_holds_original = record
+        .original_identity
+        .as_ref()
+        .is_some_and(|original| backup.as_ref() == Some(original));
+
+    let remove_live = match (&live, &record.original_identity, &record.staged_identity) {
+        (None, _, _) => false,
+        // Already the bundle to end on: either the original was never moved, or
+        // it has been restored by an earlier attempt at this rollback.
+        (Some(actual), Some(original), _) if actual == original => return Ok(()),
+        (Some(actual), _, Some(staged)) if actual == staged => true,
+        // Neither, but the original is proven recoverable: an interrupted
+        // rollback's partial tree, about to be replaced by bytes we hold.
+        (Some(_), Some(_), _) if backup_holds_original => true,
+        (Some(_), _, _) => anyhow::bail!(
+            "refusing an ambiguous notification bundle rollback: the bundle at {}/{} is neither the recorded original nor the recorded staged bundle, and no verified backup is held to replace it. Remove it to let the next update reinstall one.",
+            install.lib.display.display(),
+            NOTIFIER_BUNDLE_DIR
+        ),
+    };
+
+    let Some(original) = &record.original_identity else {
+        // Nothing to restore: this transaction brought the first bundle, so
+        // undoing it means leaving the install without one, exactly as before.
+        if remove_live {
+            transaction.ensure_bound(install)?;
+            remove_bundle_tree(&install.lib, NOTIFIER_BUNDLE_DIR)?;
+            maybe_crash_at("after-rollback-remove-notifier-bundle");
+        }
+        return Ok(());
+    };
+    if !backup_holds_original {
+        anyhow::bail!("the notification bundle backup changed immediately before it was restored");
+    }
+    if remove_live {
+        transaction.ensure_bound(install)?;
+        remove_bundle_tree(&install.lib, NOTIFIER_BUNDLE_DIR)?;
+        maybe_crash_at("after-rollback-remove-notifier-bundle");
+    }
+    // Recheck after the live removal: a concurrent swap of the backup must never
+    // be renamed into the managed install.
+    if bundle_identity_at(&transaction.old_lib, NOTIFIER_BUNDLE_DIR)?.as_ref() != Some(original) {
+        anyhow::bail!("the notification bundle backup changed before the rollback rename");
+    }
+    transaction.ensure_bound(install)?;
+    transaction
+        .old_lib
+        .rename_to(NOTIFIER_BUNDLE_DIR, &install.lib, NOTIFIER_BUNDLE_DIR)?;
+    install.ensure_bound()?;
+    if bundle_identity_at(&install.lib, NOTIFIER_BUNDLE_DIR)?.as_ref() != Some(original) {
+        anyhow::bail!("the restored notification bundle does not match its original identity");
+    }
+    maybe_crash_at("after-rollback-restore-notifier-bundle");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -6889,6 +7829,18 @@ fn cleanup_transaction_at(
             transaction.ensure_bound(install)?;
             backup_dir.unlink_file(component.name)?;
         }
+    }
+    if let Some(actual) = bundle_identity_at(&transaction.old_lib, NOTIFIER_BUNDLE_DIR)? {
+        let expected = journal
+            .notifier_bundle
+            .original_identity
+            .as_ref()
+            .context("unexpected notification bundle backup without a recorded original")?;
+        if &actual != expected {
+            anyhow::bail!("the notification bundle backup changed before cleanup");
+        }
+        transaction.ensure_bound(install)?;
+        remove_bundle_tree(&transaction.old_lib, NOTIFIER_BUNDLE_DIR)?;
     }
     transaction.old_bin.ensure_empty()?;
     transaction.old_lib.ensure_empty()?;
@@ -7014,11 +7966,37 @@ fn journal_component<'a>(
 }
 
 fn validate_journal(journal: &TransactionJournal, spec: &[ComponentSpec]) -> Result<()> {
-    if journal.schema_version != 2 {
-        anyhow::bail!(
-            "unsupported update journal schema {}",
-            journal.schema_version
-        );
+    match journal.schema_version {
+        TRANSACTION_JOURNAL_SCHEMA => {}
+        TRANSACTION_JOURNAL_SCHEMA_WITHOUT_BUNDLE => {
+            if !journal.notifier_bundle.is_empty() {
+                anyhow::bail!(
+                    "update journal schema {TRANSACTION_JOURNAL_SCHEMA_WITHOUT_BUNDLE} carries a notification bundle record it cannot describe"
+                );
+            }
+        }
+        other => anyhow::bail!("unsupported update journal schema {other}"),
+    }
+    if !spec_carries_notifier_bundle(spec) && !journal.notifier_bundle.is_empty() {
+        anyhow::bail!("update journal records a notification bundle this platform does not carry");
+    }
+    // Only the digest is checked. A bundle identity describes whatever tree was
+    // there, including a husk left by an interrupted removal, and refusing to
+    // describe that state is what would strand a rollback that has to reverse
+    // it. That the bundle being installed is a usable one is proven separately,
+    // by the shape check that runs when it is staged and again once it is live.
+    for identity in [
+        journal.notifier_bundle.original_identity.as_ref(),
+        journal.notifier_bundle.staged_identity.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_hex(
+            &identity.tree_sha256,
+            64,
+            "journal notification bundle SHA-256",
+        )?;
     }
     if journal.components.len() != spec.len() {
         anyhow::bail!("update journal component inventory does not match this platform");
@@ -10114,6 +11092,27 @@ mod tests {
         output_with_timeout(command, label, DEFAULT_TEST_SUBPROCESS_TIMEOUT)
     }
 
+    /// Keep update fixtures from deriving MCP repair authority from the
+    /// developer's real client configuration.
+    ///
+    /// `install_staged_bundle*` captures every configured MCP target before it
+    /// creates the transaction. These tests used to inherit `HOME`, which made
+    /// nextest exercise a developer's live `.claude.json` while `cargo test`
+    /// could see a temporary home installed by another in-process fixture. The two
+    /// runners were therefore testing different transactions. Bind every home
+    /// spelling used by the supported hosts, and clear the legacy Kin aliases,
+    /// so both runners prove only the fixture assembled by the test.
+    fn isolated_update_environment(root: &Path, kin_home: &Path) -> EnvVarGuard {
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        EnvVarGuard::set("HOME", &home)
+            .with("USERPROFILE", &home)
+            .with("XDG_CONFIG_HOME", home.join(".config"))
+            .with("KIN_HOME", kin_home)
+            .without("KIN_DIR")
+            .without("KIN_MCP_REPO")
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_marker_guard_denies_path_replacement_and_disposes_exact_handle() {
@@ -10183,15 +11182,33 @@ mod tests {
 
     /// Build an in-memory `.tar.gz` with the given (name, bytes) entries.
     fn make_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let with_modes: Vec<_> = entries
+            .iter()
+            .map(|(name, data)| (*name, *data, 0o644_u32))
+            .collect();
+        make_tar_gz_with_modes(&with_modes)
+    }
+
+    /// Build an archive that carries per-entry permissions. A name ending in
+    /// `/` describes an explicit zero-sized directory record, matching the
+    /// release tarballs produced by the macOS packaging workflow. The
+    /// notification bundle's executable is refused unless it is actually
+    /// executable, so a fixture standing in for a real macOS archive has to say
+    /// so as well.
+    fn make_tar_gz_with_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
         let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
         {
             let mut builder = tar::Builder::new(&mut gz);
-            for (name, data) in entries {
+            for (name, data, mode) in entries {
                 let mut header = tar::Header::new_gnu();
+                if name.ends_with('/') {
+                    assert!(data.is_empty(), "directory fixture must be empty: {name}");
+                    header.set_entry_type(tar::EntryType::Directory);
+                }
                 header.set_size(data.len() as u64);
-                header.set_mode(0o644);
+                header.set_mode(*mode);
                 header.set_cksum();
                 builder.append_data(&mut header, name, *data).unwrap();
             }
@@ -10355,7 +11372,28 @@ mod tests {
         let archive = if archive_name.ends_with(".zip") {
             make_zip(&archive_entries)
         } else {
-            make_tar_gz(&archive_entries)
+            // A real macOS release archive carries the notification bundle, and
+            // the stager requires it, so this fixture carries one too. It stays
+            // out of `entries`: the bundle is deliberately absent from the
+            // manifest's per-file inventory, and adding it there would make the
+            // fixture describe an archive the release workflow never produces.
+            let mut with_modes = archive_entries
+                .iter()
+                .map(|(name, bytes)| (*name, *bytes, 0o755_u32))
+                .collect::<Vec<_>>();
+            if spec_carries_notifier_bundle(spec) {
+                with_modes.push((
+                    "KinNotifier.app/Contents/Info.plist",
+                    b"<plist/>".as_slice(),
+                    0o644,
+                ));
+                with_modes.push((
+                    "KinNotifier.app/Contents/MacOS/KinNotifier",
+                    b"fixture-notifier".as_slice(),
+                    0o755,
+                ));
+            }
+            make_tar_gz_with_modes(&with_modes)
         };
         let identities = entries
             .iter()
@@ -10461,6 +11499,96 @@ mod tests {
             (&format!("{prefix}/kin-vfs"), b"new-vfs"),
             (&format!("{prefix}/libkin_vfs_shim.so"), b"new-shim"),
         ])
+    }
+
+    /// A complete macOS archive: the same component bytes as the Linux fixture
+    /// so the shared restart-obligation fixture applies, plus the notification
+    /// bundle that only this platform's archive carries.
+    #[cfg(unix)]
+    fn full_macos_archive(prefix: &str) -> Vec<u8> {
+        macos_archive_with_notifier(prefix, b"new-notifier")
+    }
+
+    #[cfg(unix)]
+    fn macos_archive_with_notifier(prefix: &str, notifier: &[u8]) -> Vec<u8> {
+        make_tar_gz_with_modes(&[
+            (&format!("{prefix}/"), b"", 0o755),
+            (&format!("{prefix}/kin"), b"new-kin", 0o755),
+            (&format!("{prefix}/kin-daemon"), b"new-daemon", 0o755),
+            (&format!("{prefix}/kin-vfs"), b"new-vfs", 0o755),
+            (
+                &format!("{prefix}/libkin_vfs_shim.dylib"),
+                b"new-shim",
+                0o644,
+            ),
+            (&format!("{prefix}/KinNotifier.app/"), b"", 0o755),
+            (&format!("{prefix}/KinNotifier.app/Contents/"), b"", 0o755),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/MacOS/"),
+                b"",
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Resources/"),
+                b"",
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Info.plist"),
+                b"<plist>new</plist>",
+                0o644,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/MacOS/KinNotifier"),
+                notifier,
+                0o755,
+            ),
+            (
+                &format!("{prefix}/KinNotifier.app/Contents/Resources/Kin.icns"),
+                b"new-icns",
+                0o644,
+            ),
+        ])
+    }
+
+    /// Write a KinNotifier.app under `root/lib` whose files all carry `prefix`.
+    #[cfg(unix)]
+    fn write_notifier_bundle(root: &Path, marker: &[u8]) {
+        let bundle = root.join("lib").join(NOTIFIER_BUNDLE_DIR);
+        fs::create_dir_all(bundle.join("Contents").join("MacOS")).unwrap();
+        fs::create_dir_all(bundle.join("Contents").join("Resources")).unwrap();
+        fs::write(bundle.join("Contents").join("Info.plist"), marker).unwrap();
+        fs::write(
+            bundle.join("Contents").join("MacOS").join("KinNotifier"),
+            marker,
+        )
+        .unwrap();
+        fs::write(
+            bundle.join("Contents").join("Resources").join("Kin.icns"),
+            marker,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                bundle.join("Contents").join("MacOS").join("KinNotifier"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn notifier_executable_bytes(root: &Path) -> Vec<u8> {
+        fs::read(
+            root.join("lib")
+                .join(NOTIFIER_BUNDLE_DIR)
+                .join("Contents")
+                .join("MacOS")
+                .join("KinNotifier"),
+        )
+        .unwrap()
     }
 
     #[cfg(unix)]
@@ -10693,6 +11821,15 @@ mod tests {
         }
     }
 
+    /// Which component contract a crash worker runs under, chosen by the parent
+    /// so one worker can drive both the bundle-free and bundle-carrying paths.
+    fn worker_spec() -> &'static [ComponentSpec] {
+        match std::env::var("KIN_UPDATE_TEST_WORKER_SPEC").as_deref() {
+            Ok("macos") => MACOS_COMPONENTS,
+            _ => LINUX_COMPONENTS,
+        }
+    }
+
     fn run_crash_recovery_case(point: &str, committed: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
@@ -10768,6 +11905,240 @@ mod tests {
             assert!(!restart_pending_path(lock.root()).exists());
         }
         assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+    }
+
+    /// Kill a real update process between two bundle steps and let a later
+    /// recovery reverse it.
+    ///
+    /// A clean failure through the swap hook unwinds inside the process that
+    /// created the transaction, so it proves only the rollback the failing
+    /// process itself performs. A durable recovery has to reach the same state
+    /// from the journal alone, with no live process and no memory of how far it
+    /// got, which is the case a power loss actually produces.
+    #[cfg(unix)]
+    fn run_bundle_crash_recovery_case(point: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        write_notifier_bundle(&kin_home, b"old-notifier");
+        let old = bundle_snapshot(&kin_home, MACOS_COMPONENTS);
+        stage_archive(
+            &full_macos_archive("kin-macos-aarch64"),
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "commands::update::tests::crash_recovery_worker",
+                "--nocapture",
+            ])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("KIN_HOME", &kin_home)
+            .env_remove("KIN_DIR")
+            .env_remove("KIN_MCP_REPO")
+            .env("KIN_UPDATE_TEST_WORKER_HOME", &kin_home)
+            .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
+            .env("KIN_UPDATE_TEST_WORKER_SPEC", "macos")
+            .env("KIN_UPDATE_TEST_CRASH_POINT", point);
+        let output =
+            test_subprocess_output(command, &format!("bundle crash worker at {point}")).unwrap();
+        // Reaching the kill point is itself the evidence that the bundle's
+        // fault-injection labels are live: a worker that never reached one
+        // would exit having completed the update instead.
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "worker output: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!transaction_dirs(&kin_home).unwrap().is_empty());
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        recover_stale_transactions(&lock, MACOS_COMPONENTS).unwrap();
+        assert_eq!(
+            notifier_executable_bytes(&kin_home),
+            b"old-notifier",
+            "recovery after a crash at {point} must restore the previous bundle"
+        );
+        assert!(
+            kin_home
+                .join("lib")
+                .join(NOTIFIER_BUNDLE_DIR)
+                .join("Contents/Resources/Kin.icns")
+                .exists(),
+            "the restored bundle must be the whole original tree"
+        );
+        assert_bundle_matches(&kin_home, MACOS_COMPONENTS, &old);
+        assert!(!restart_pending_path(lock.root()).exists());
+        assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+    }
+
+    /// Both bundle steps happen before the commit fence, so a crash at either
+    /// one has to leave the install on the version it started from.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn subprocess_crashes_around_the_bundle_swap_recover_the_old_bundle() {
+        for point in [
+            "after-backup-notifier-bundle",
+            "after-install-notifier-bundle",
+        ] {
+            run_bundle_crash_recovery_case(point);
+        }
+    }
+
+    /// A restart during rollback must be idempotent at both bundle mutations:
+    /// after the staged tree is removed and after the original is restored.
+    /// The first-install case has no backup to restore, so its remove point is
+    /// exercised separately from the refresh case.
+    #[cfg(unix)]
+    fn run_bundle_rollback_crash_case(point: &str, had_original: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        if had_original {
+            write_notifier_bundle(&kin_home, b"old-notifier");
+        }
+        let old = bundle_snapshot(&kin_home, MACOS_COMPONENTS);
+        stage_archive(
+            &full_macos_archive("kin-macos-aarch64"),
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+
+        let worker = |crash_point: &str, recover: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "commands::update::tests::crash_recovery_worker",
+                    "--nocapture",
+                ])
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("KIN_HOME", &kin_home)
+                .env_remove("KIN_DIR")
+                .env_remove("KIN_MCP_REPO")
+                .env("KIN_UPDATE_TEST_WORKER_HOME", &kin_home)
+                .env("KIN_UPDATE_TEST_WORKER_STAGE", &stage)
+                .env("KIN_UPDATE_TEST_WORKER_SPEC", "macos")
+                .env("KIN_UPDATE_TEST_CRASH_POINT", crash_point);
+            if recover {
+                command.env("KIN_UPDATE_TEST_WORKER_RECOVER", "1");
+            }
+            let output = test_subprocess_output(
+                command,
+                &format!("bundle rollback worker at {crash_point}"),
+            )
+            .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "worker output: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // Leave a pre-commit transaction with the staged bundle live and the
+        // original, when present, held in the journaled backup.
+        worker("after-install-notifier-bundle", false);
+        worker(point, true);
+
+        let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+        recover_stale_transactions(&lock, MACOS_COMPONENTS).unwrap();
+        assert_bundle_matches(&kin_home, MACOS_COMPONENTS, &old);
+        if had_original {
+            assert_eq!(notifier_executable_bytes(&kin_home), b"old-notifier");
+        } else {
+            assert!(
+                !kin_home.join("lib").join(NOTIFIER_BUNDLE_DIR).exists(),
+                "recovery of a first bundle install must end without a bundle"
+            );
+        }
+        assert!(transaction_dirs(lock.root()).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn subprocess_crashes_during_bundle_rollback_recover_idempotently() {
+        run_bundle_rollback_crash_case("after-rollback-remove-notifier-bundle", true);
+        run_bundle_rollback_crash_case("after-rollback-restore-notifier-bundle", true);
+        run_bundle_rollback_crash_case("after-rollback-remove-notifier-bundle", false);
+    }
+
+    /// The non-crash failure hooks immediately after each bundle mutation are
+    /// also live, and each one unwinds the whole transaction before returning.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn bundle_post_mutation_failures_restore_the_old_install_immediately() {
+        for failure_point in [
+            "after-backup-mutation-notifier-bundle",
+            "after-install-mutation-notifier-bundle",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let kin_home = tmp.path().join("kin-home");
+            let stage = tmp.path().join("stage");
+            let _environment = isolated_update_environment(tmp.path(), &kin_home);
+            write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+            write_notifier_bundle(&kin_home, b"old-notifier");
+            let old = bundle_snapshot(&kin_home, MACOS_COMPONENTS);
+            stage_archive(
+                &full_macos_archive("kin-macos-aarch64"),
+                "kin-macos-aarch64.tar.gz",
+                &stage,
+                MACOS_COMPONENTS,
+            )
+            .unwrap();
+            let lock = InstallRootLock::acquire_existing(&kin_home).unwrap();
+            let staged_identities = staged_identities_for_test(&stage, MACOS_COMPONENTS).unwrap();
+
+            let error = install_staged_bundle_unix_with_hooks(
+                &lock,
+                &StagingLayout::open(&stage).unwrap(),
+                MACOS_COMPONENTS,
+                &staged_identities,
+                "0.2.22",
+                &test_restart_pending("0.2.22"),
+                |_, _| Ok(()),
+                |_, _| Ok(()),
+                |point| {
+                    if point == failure_point {
+                        anyhow::bail!("injected bundle mutation failure at {point}");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("the bundle mutation failure must abort the transaction");
+            let message = format!("{error:#}");
+            assert!(message.contains(failure_point), "{message}");
+            assert!(
+                message.contains("previous bundle was restored"),
+                "{message}"
+            );
+            assert_bundle_matches(&kin_home, MACOS_COMPONENTS, &old);
+            assert_eq!(notifier_executable_bytes(&kin_home), b"old-notifier");
+            assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+        }
     }
 
     #[cfg(unix)]
@@ -10896,29 +12267,21 @@ cwd = {:?}
     }
 
     /// A macOS release archive carries KinNotifier.app as a directory. The
-    /// stager must accept it, stage none of it as a component, and still reject
-    /// anything merely shaped like it.
+    /// stager materializes it under the staging tree's `lib`, preserving the
+    /// executable bit its executable needs to be launchable at all.
+    ///
+    /// Unix-only, and not because of the host this runs on: the primitives that
+    /// materialize a bundle tree are `#[cfg(unix)]`, so on Windows the staging
+    /// sink refuses a bundle outright. Every test below that stages or installs
+    /// a bundle-carrying contract is gated for that reason. The rest of the
+    /// bundle rules key on the component contract rather than the host and so
+    /// hold everywhere, including a bundle offered to a contract that carries
+    /// none.
+    #[cfg(unix)]
     #[test]
     fn macos_archive_carrying_the_notifier_bundle_stages() {
         let tmp = tempfile::tempdir().unwrap();
-        let archive = make_tar_gz(&[
-            ("kin-macos-aarch64/kin", b"new-kin"),
-            ("kin-macos-aarch64/kin-daemon", b"new-daemon"),
-            ("kin-macos-aarch64/kin-vfs", b"new-vfs"),
-            ("kin-macos-aarch64/libkin_vfs_shim.dylib", b"new-shim"),
-            (
-                "kin-macos-aarch64/KinNotifier.app/Contents/Info.plist",
-                b"<plist/>",
-            ),
-            (
-                "kin-macos-aarch64/KinNotifier.app/Contents/MacOS/KinNotifier",
-                b"notifier",
-            ),
-            (
-                "kin-macos-aarch64/KinNotifier.app/Contents/Resources/Kin.icns",
-                b"icns",
-            ),
-        ]);
+        let archive = full_macos_archive("kin-macos-aarch64");
         stage_archive(
             &archive,
             "kin-macos-aarch64.tar.gz",
@@ -10927,25 +12290,494 @@ cwd = {:?}
         )
         .expect("an archive carrying the notification bundle must stage");
 
-        // The bundle is materialized after the swap, so none of it may appear
-        // in the staging tree: a directory there would fail staging cleanup.
-        for staged in ["bin", "lib"] {
-            let dir = tmp.path().join(staged);
-            if let Ok(entries) = fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    assert_ne!(
-                        name.to_string_lossy(),
-                        NOTIFIER_BUNDLE_DIR,
-                        "the bundle must never be staged"
-                    );
-                    assert!(
-                        entry.file_type().unwrap().is_file(),
-                        "staging must contain only regular files, found {name:?}"
-                    );
-                }
+        let staged = tmp.path().join("lib").join(NOTIFIER_BUNDLE_DIR);
+        assert_eq!(
+            fs::read(staged.join("Contents/MacOS/KinNotifier")).unwrap(),
+            b"new-notifier"
+        );
+        assert_eq!(
+            fs::read(staged.join("Contents/Info.plist")).unwrap(),
+            b"<plist>new</plist>"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for relative in ["", "Contents", "Contents/MacOS", "Contents/Resources"] {
+                let mode = fs::metadata(staged.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    mode,
+                    0o755,
+                    "bundle directory {} must match every other install channel",
+                    staged.join(relative).display()
+                );
             }
+            let mode = fs::metadata(staged.join("Contents/MacOS/KinNotifier"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(
+                mode & 0o111 != 0,
+                "a staged notifier that lost +x cannot be launched, mode {mode:o}"
+            );
         }
+    }
+
+    /// The bundle belongs to the macOS archive alone. A Linux archive carrying
+    /// one is not quietly skipped: skipping is how a member could smuggle
+    /// itself past the component inventory unexamined.
+    #[test]
+    fn a_notifier_bundle_in_a_linux_archive_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_tar_gz(&[
+            ("kin-linux-x86_64/kin", b"new-kin"),
+            ("kin-linux-x86_64/kin-daemon", b"new-daemon"),
+            ("kin-linux-x86_64/kin-vfs", b"new-vfs"),
+            ("kin-linux-x86_64/libkin_vfs_shim.so", b"new-shim"),
+            (
+                "kin-linux-x86_64/KinNotifier.app/Contents/MacOS/KinNotifier",
+                b"notifier",
+            ),
+        ]);
+        let error = stage_archive(
+            &archive,
+            "kin-linux-x86_64.tar.gz",
+            tmp.path(),
+            LINUX_COMPONENTS,
+        )
+        .expect_err("a platform with no bundle must refuse one");
+        assert!(format!("{error:#}").contains("unexpected file"));
+    }
+
+    /// A macOS archive whose bundle cannot post as Kin is refused at staging
+    /// rather than installed and discovered later as a wrong sender name.
+    #[cfg(unix)]
+    #[test]
+    fn a_macos_archive_missing_the_bundle_identity_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_tar_gz_with_modes(&[
+            ("kin-macos-aarch64/kin", b"new-kin", 0o755),
+            ("kin-macos-aarch64/kin-daemon", b"new-daemon", 0o755),
+            ("kin-macos-aarch64/kin-vfs", b"new-vfs", 0o755),
+            (
+                "kin-macos-aarch64/libkin_vfs_shim.dylib",
+                b"new-shim",
+                0o644,
+            ),
+            (
+                "kin-macos-aarch64/KinNotifier.app/Contents/MacOS/KinNotifier",
+                b"notifier",
+                0o755,
+            ),
+        ]);
+        let error = stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            tmp.path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a bundle with no Info.plist has no identity to post under");
+        assert!(format!("{error:#}").contains("Info.plist"), "{error:#}");
+    }
+
+    /// A macOS archive with no bundle at all is incomplete, not merely thinner:
+    /// installing it would silently downgrade every notification to Script
+    /// Editor for as long as that release stayed installed.
+    #[test]
+    fn a_macos_archive_without_a_bundle_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_tar_gz(&[
+            ("kin-macos-aarch64/kin", b"new-kin"),
+            ("kin-macos-aarch64/kin-daemon", b"new-daemon"),
+            ("kin-macos-aarch64/kin-vfs", b"new-vfs"),
+            ("kin-macos-aarch64/libkin_vfs_shim.dylib", b"new-shim"),
+        ]);
+        let error = stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            tmp.path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a macOS archive must carry the notification bundle");
+        assert!(
+            format!("{error:#}").contains("notification bundle is missing"),
+            "{error:#}"
+        );
+    }
+
+    /// The identity is a fold over the whole tree, so it has to notice a change
+    /// that leaves every path and size alone.
+    #[test]
+    fn bundle_identity_distinguishes_content_and_shape() {
+        let member = |path: &str, executable: bool, sha: &str| BundleMember {
+            path: path.to_string(),
+            directory: false,
+            executable,
+            size_bytes: 4,
+            sha256: sha.to_string(),
+        };
+        let base = vec![
+            member("Contents/Info.plist", false, "aa"),
+            member("Contents/MacOS/KinNotifier", true, "bb"),
+        ];
+
+        let identity = bundle_identity_from_members(&mut base.clone()).unwrap();
+        // Reordering is not a change: the fold sorts first.
+        let mut reversed = base.clone();
+        reversed.reverse();
+        assert_eq!(
+            bundle_identity_from_members(&mut reversed).unwrap(),
+            identity
+        );
+
+        // Content, the executable bit, and tree shape each move the digest.
+        let mut edited = base.clone();
+        edited[1].sha256 = "cc".to_string();
+        assert_ne!(bundle_identity_from_members(&mut edited).unwrap(), identity);
+
+        let mut unexecutable = base.clone();
+        unexecutable[1].executable = false;
+        assert_ne!(
+            bundle_identity_from_members(&mut unexecutable).unwrap(),
+            identity
+        );
+
+        let mut extra = base.clone();
+        extra.push(member("Contents/Resources/Kin.icns", false, "dd"));
+        assert_ne!(bundle_identity_from_members(&mut extra).unwrap(), identity);
+    }
+
+    #[test]
+    fn bundle_member_paths_cannot_escape_the_bundle() {
+        assert_eq!(
+            notifier_bundle_member_path(Path::new(
+                "kin-macos-aarch64/KinNotifier.app/Contents/MacOS/KinNotifier"
+            ))
+            .unwrap(),
+            PathBuf::from("Contents/MacOS/KinNotifier")
+        );
+        // The bundle root itself carries no member.
+        assert!(notifier_bundle_member_path(Path::new("KinNotifier.app")).is_err());
+        assert!(notifier_bundle_member_path(Path::new("kin-macos-aarch64/kin")).is_err());
+        let deep = format!(
+            "KinNotifier.app/{}",
+            ["a"; MAX_NOTIFIER_BUNDLE_DEPTH + 1].join("/")
+        );
+        assert!(notifier_bundle_member_path(Path::new(&deep)).is_err());
+    }
+
+    #[test]
+    fn notifier_bundle_root_acceptance_is_structural_and_fail_closed() {
+        let regular_root =
+            make_tar_gz_with_modes(&[("kin-macos-aarch64/KinNotifier.app", b"", 0o755)]);
+        let regular_error = stage_archive(
+            &regular_root,
+            "kin-macos-aarch64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a regular file cannot stand in for the bundle root");
+        assert!(
+            format!("{regular_error:#}").contains("must be a directory record"),
+            "{regular_error:#}"
+        );
+
+        let nonempty_header = make_test_tar_header("kin-macos-aarch64/KinNotifier.app/", 1, b'5');
+        let nonempty_root = make_raw_test_tar(nonempty_header, b"x");
+        let nonempty_error = stage_archive(
+            &nonempty_root,
+            "kin-macos-aarch64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("a directory root carrying payload bytes must be rejected");
+        assert!(
+            format!("{nonempty_error:#}").contains("has nonzero expanded size"),
+            "{nonempty_error:#}"
+        );
+
+        let duplicate_root = make_tar_gz_with_modes(&[
+            ("kin-macos-aarch64/KinNotifier.app/", b"", 0o755),
+            ("kin-macos-aarch64/KinNotifier.app/", b"", 0o755),
+        ]);
+        let duplicate_error = stage_archive(
+            &duplicate_root,
+            "kin-macos-aarch64.tar.gz",
+            tempfile::tempdir().unwrap().path(),
+            MACOS_COMPONENTS,
+        )
+        .expect_err("duplicate structural roots must not be normalized away");
+        assert!(
+            format!("{duplicate_error:#}").contains("duplicate root entry"),
+            "{duplicate_error:#}"
+        );
+    }
+
+    /// An update must leave the installed notification bundle holding the bytes
+    /// the new archive carries. A bundle that survives an update unchanged is a
+    /// silent version skew: the CLI reports the new version while the sender
+    /// identity, icon, and any notifier fix stay on the old release.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn update_refreshes_the_installed_notifier_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        write_notifier_bundle(&kin_home, b"old-notifier");
+        assert_eq!(notifier_executable_bytes(&kin_home), b"old-notifier");
+
+        let archive = full_macos_archive("kin-macos-aarch64");
+        stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+        install_staged_bundle(
+            &kin_home,
+            &stage,
+            MACOS_COMPONENTS,
+            "0.2.22",
+            &test_restart_pending("0.2.22"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), b"new-kin");
+        assert_eq!(
+            notifier_executable_bytes(&kin_home),
+            b"new-notifier",
+            "the update left the previous notification bundle in place"
+        );
+    }
+
+    /// A failed update must leave the bundle as it found it. The bundle is
+    /// swapped before the components, so by the time a component swap fails the
+    /// new bundle is already live and the rollback has real work to undo.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_failed_update_restores_the_previous_notifier_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        write_notifier_bundle(&kin_home, b"old-notifier");
+
+        let archive = full_macos_archive("kin-macos-aarch64");
+        stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+        let error = install_staged_bundle_with_hook(
+            &kin_home,
+            &stage,
+            MACOS_COMPONENTS,
+            "0.2.22",
+            &test_restart_pending("0.2.22"),
+            |index, _| {
+                if index == 2 {
+                    anyhow::bail!("injected swap failure");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the injected failure must fail the update");
+        assert!(
+            format!("{error:#}").contains("previous bundle was restored"),
+            "{error:#}"
+        );
+
+        assert_eq!(
+            notifier_executable_bytes(&kin_home),
+            b"old-notifier",
+            "a rolled-back update must not leave the new bundle installed"
+        );
+        assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), b"old-kin");
+        // The rollback also removes its own backup: a bundle left behind under a
+        // transaction directory would be reported as an unexpected entry by the
+        // next recovery.
+        let leftovers: Vec<_> = fs::read_dir(&kin_home)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(TRANSACTION_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "retained transaction: {leftovers:?}");
+    }
+
+    /// A bundle is removed file by file, so unlike a component it can be caught
+    /// half-way. A rollback that finds such a tree must still finish, because
+    /// refusing it would leave every later update blocked behind a state only
+    /// manual deletion could clear.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_rollback_restores_the_bundle_over_a_partially_removed_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+        write_notifier_bundle(&kin_home, b"old-notifier");
+
+        let archive = full_macos_archive("kin-macos-aarch64");
+        stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+        let live_bundle = kin_home.join("lib").join(NOTIFIER_BUNDLE_DIR);
+        install_staged_bundle_with_hook(
+            &kin_home,
+            &stage,
+            MACOS_COMPONENTS,
+            "0.2.22",
+            &test_restart_pending("0.2.22"),
+            |index, _| {
+                // The bundle is installed before any component, so by the first
+                // component swap the new bundle is live. Tear a file out of it
+                // to stand in for a rollback interrupted mid-removal, then fail.
+                if index == 0 {
+                    fs::remove_file(live_bundle.join("Contents/Resources/Kin.icns")).unwrap();
+                    anyhow::bail!("injected swap failure");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the injected failure must fail the update");
+
+        assert_eq!(
+            notifier_executable_bytes(&kin_home),
+            b"old-notifier",
+            "a partial tree must not stop the original bundle being restored"
+        );
+        assert!(
+            kin_home
+                .join("lib")
+                .join(NOTIFIER_BUNDLE_DIR)
+                .join("Contents/Resources/Kin.icns")
+                .exists(),
+            "the restored bundle must be the whole original, not a repaired remnant"
+        );
+    }
+
+    /// Rolling back the update that brought the very first bundle means leaving
+    /// the install without one, not leaving the new one behind.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_failed_first_bundle_install_removes_what_it_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
+        write_bundle(&kin_home, MACOS_COMPONENTS, b"old-");
+
+        let archive = full_macos_archive("kin-macos-aarch64");
+        stage_archive(
+            &archive,
+            "kin-macos-aarch64.tar.gz",
+            &stage,
+            MACOS_COMPONENTS,
+        )
+        .unwrap();
+        install_staged_bundle_with_hook(
+            &kin_home,
+            &stage,
+            MACOS_COMPONENTS,
+            "0.2.22",
+            &test_restart_pending("0.2.22"),
+            |index, _| {
+                if index == 2 {
+                    anyhow::bail!("injected swap failure");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the injected failure must fail the update");
+
+        assert!(
+            !kin_home.join("lib").join(NOTIFIER_BUNDLE_DIR).exists(),
+            "a rolled-back first install must not leave its bundle behind"
+        );
+        assert_eq!(fs::read(kin_home.join("bin/kin")).unwrap(), b"old-kin");
+    }
+
+    /// A journal written before the bundle joined the transaction still has to
+    /// be recoverable: the CLI that finishes a crashed update is often a newer
+    /// one than the CLI that started it.
+    #[test]
+    fn a_journal_without_a_bundle_record_is_still_accepted() {
+        let mut journal = TransactionJournal {
+            schema_version: TRANSACTION_JOURNAL_SCHEMA_WITHOUT_BUNDLE,
+            target_version: "0.2.22".to_string(),
+            phase: TransactionPhase::Prepared,
+            components: LINUX_COMPONENTS
+                .iter()
+                .map(|component| JournalComponent {
+                    name: component.name.to_string(),
+                    location: component.location,
+                    required: component.required,
+                    had_original: false,
+                    install_new: true,
+                    original_identity: None,
+                    staged_identity: Some(bytes_identity(
+                        format!("new-{}", component.name).as_bytes(),
+                    )),
+                })
+                .collect(),
+            notifier_bundle: JournalBundle::default(),
+            restart_pending: test_restart_pending("0.2.22"),
+            mcp_repair_pending: McpRepairPending {
+                schema_version: MCP_REPAIR_MARKER_SCHEMA_VERSION,
+                installed_version: "0.2.22".to_string(),
+                recorded_at: "2026-07-16T00:00:00Z".to_string(),
+                repair_required: false,
+                targets: Vec::new(),
+            },
+        };
+        // Fix the staged identities the restart obligations pin.
+        for (name, bytes) in [
+            ("kin", b"new-kin".as_slice()),
+            ("kin-daemon", b"new-daemon".as_slice()),
+            ("kin-vfs", b"new-vfs".as_slice()),
+        ] {
+            let component = journal
+                .components
+                .iter_mut()
+                .find(|component| component.name == name)
+                .unwrap();
+            component.staged_identity = Some(bytes_identity(bytes));
+        }
+        validate_journal(&journal, LINUX_COMPONENTS)
+            .expect("a schema 2 journal predates the bundle and must still recover");
+
+        // The same schema claiming a bundle record it cannot describe is not a
+        // journal this build wrote, so it is refused rather than guessed at.
+        journal.notifier_bundle.staged_identity = Some(BundleIdentity {
+            tree_sha256: "d".repeat(64),
+            file_count: 3,
+            total_bytes: 9,
+        });
+        let error = validate_journal(&journal, LINUX_COMPONENTS)
+            .expect_err("a schema 2 journal cannot carry a bundle record");
+        assert!(
+            format!("{error:#}").contains("cannot describe"),
+            "{error:#}"
+        );
     }
 
     /// The skip must key on a whole path component. A file merely prefixed with
@@ -11310,10 +13142,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let custom_home = tmp.path().join("custom-kin-home");
         let stage = tmp.path().join("stage");
-        let home = tmp.path().join("home");
-        fs::create_dir(&home).unwrap();
-        let _kin_home = EnvVarGuard::set("KIN_HOME", &custom_home);
-        let _home = EnvVarGuard::set("HOME", &home);
+        let _environment = isolated_update_environment(tmp.path(), &custom_home);
         let _cwd = CwdGuard::set(tmp.path());
         write_bundle(&custom_home, LINUX_COMPONENTS, b"old-");
 
@@ -11360,6 +13189,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
         let _env = fixture_home(&tmp, &kin_home);
         let expected: Vec<_> = LINUX_COMPONENTS
@@ -11590,9 +13420,14 @@ cwd = {:?}
                 libc::umask(mode as libc::mode_t);
             }
         }
+        // The contract under test is a parameter, not a constant: the
+        // notification bundle's transaction steps exist only on a spec that
+        // carries one, so a worker hardcoded to the Linux contract can never
+        // reach their fault-injection points.
+        let spec = worker_spec();
         if std::env::var_os("KIN_UPDATE_TEST_WORKER_RECOVER").is_some() {
             let lock = InstallRootLock::acquire_existing(Path::new(&kin_home)).unwrap();
-            recover_stale_transactions(&lock, LINUX_COMPONENTS)
+            recover_stale_transactions(&lock, spec)
                 .expect("crash worker must reach its configured recovery kill point");
             return;
         }
@@ -11604,7 +13439,7 @@ cwd = {:?}
         install_staged_bundle_with_hook(
             Path::new(&kin_home),
             Path::new(&stage),
-            LINUX_COMPONENTS,
+            spec,
             "0.2.22",
             &test_restart_pending("0.2.22"),
             |index, _| {
@@ -12106,6 +13941,7 @@ cwd = {:?}
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
+        let _environment = isolated_update_environment(tmp.path(), &kin_home);
         let outside = tmp.path().join("outside-bin");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
         let _env = fixture_home(&tmp, &kin_home);

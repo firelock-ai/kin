@@ -81,12 +81,21 @@ def check_fixtures() -> int:
 
 def check_product_wiring() -> None:
     installer = (SCRIPTS_DIR / "install.ps1").read_text(encoding="utf-8")
+    powershell_harness = (SCRIPTS_DIR / "test-install-checksum.ps1").read_text(
+        encoding="utf-8"
+    )
     ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     release_workflow = (ROOT / ".github/workflows/release.yml").read_text(
         encoding="utf-8"
     )
 
     installer_requirements = (
+        "function Format-ByteCount",
+        "function Invoke-ArchiveDownload",
+        "[System.Net.Http.HttpCompletionOption]::ResponseHeadersRead",
+        'Write-Progress -Activity "Downloading $ArchiveName"',
+        "-ShowProgress:$ShowArchiveProgress",
+        "Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue",
         "function Resolve-ArchiveChecksum",
         "$Filename -cne $ArchiveName",
         "$UniqueHashes.Count -gt 1",
@@ -100,6 +109,26 @@ def check_product_wiring() -> None:
             raise AssertionError(
                 f"install.ps1 is missing checksum guard wiring: {requirement}"
             )
+
+    harness_requirements = (
+        "function Invoke-PowerShellFile",
+        "$Child = Start-Process",
+        "ExitCode = [int]$Child.ExitCode",
+        "if ($global:LASTEXITCODE -ne 0)",
+        "PASS: expected child failures leave the harness exit status clean",
+        "exit 0",
+    )
+    for requirement in harness_requirements:
+        if requirement not in powershell_harness:
+            raise AssertionError(
+                "test-install-checksum.ps1 can leak an intentional child failure "
+                f"into the successful harness exit: missing {requirement}"
+            )
+    if re.search(r"(?m)^\s*&\s+\$PowerShellExe(?:cutable)?\b", powershell_harness):
+        raise AssertionError(
+            "test-install-checksum.ps1 must capture intentional child failures "
+            "through Start-Process rather than session-wide $LASTEXITCODE"
+        )
 
     release_requirements = (
         '$ArchivePath = "$env:ARTIFACT.zip"',

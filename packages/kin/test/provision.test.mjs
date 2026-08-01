@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,10 @@ import {
   releaseDownloadUrl,
   parseSha256File,
   sha256Hex,
+  formatByteCount,
+  formatDownloadProgress,
+  createDownloadProgress,
+  downloadToFile,
   provision,
   probeBinaryVersion,
   ensureProvisioned,
@@ -46,19 +51,99 @@ test('parseSha256File accepts shasum output and rejects junk', () => {
   assert.throws(() => parseSha256File(''), /malformed \.sha256/);
 });
 
+test('download progress reports stable bytes and percent', () => {
+  assert.equal(formatByteCount(0), '0 B');
+  assert.equal(formatByteCount(1536), '1.5 KiB');
+  assert.equal(
+    formatDownloadProgress('kin-test.tar.gz', 524288, 1048576),
+    'kin: downloading kin-test.tar.gz: 50% (512.0 KiB / 1.0 MiB)',
+  );
+  assert.equal(
+    formatDownloadProgress('kin-test.tar.gz', 1536),
+    'kin: downloading kin-test.tar.gz: 1.5 KiB received',
+  );
+});
+
+test('downloadToFile writes each chunk before pulling the next and never buffers the archive', async () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-download-bounded-'));
+  try {
+    const destination = path.join(work, 'archive.tar.gz');
+    const chunkSize = 64 * 1024;
+    const chunkCount = 16;
+    const expectedHash = crypto.createHash('sha256');
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => String(chunkSize * chunkCount) },
+      body: (async function* boundedFixture() {
+        for (let index = 0; index < chunkCount; index += 1) {
+          const stagedBytes = fs.existsSync(destination) ? fs.statSync(destination).size : 0;
+          assert.equal(
+            stagedBytes,
+            index * chunkSize,
+            'the prior chunk must be flushed before the next pull',
+          );
+          const chunk = Buffer.alloc(chunkSize, index);
+          expectedHash.update(chunk);
+          yield chunk;
+        }
+      })(),
+      arrayBuffer: async () => {
+        throw new Error('streaming archive must not be accumulated through arrayBuffer()');
+      },
+    });
+
+    const originalBufferFrom = Buffer.from;
+    let result;
+    try {
+      Buffer.from = function rejectStreamChunkCopy(value, ...args) {
+        if (ArrayBuffer.isView(value)) {
+          throw new Error('stream chunks must be staged without an archive-sized copy');
+        }
+        return Reflect.apply(originalBufferFrom, this, [value, ...args]);
+      };
+      result = await downloadToFile('https://example.test/archive', destination, fetchImpl);
+    } finally {
+      Buffer.from = originalBufferFrom;
+    }
+    assert.equal(result.bytes, chunkSize * chunkCount);
+    assert.equal(result.sha256, expectedHash.digest('hex'));
+    assert.equal(fs.statSync(destination).size, chunkSize * chunkCount);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
 // ── offline provision fixture ──────────────────────────────────────────────
 //
 // Builds a real tar.gz in a tempdir (via the same `tar` the provisioner uses)
 // containing the archive layout install.sh documents: a kin-* subdirectory
 // with kin + kin-daemon. The fake fetch serves those bytes; no network.
 
-function makeFixture({ withDaemon = true } = {}) {
+function makeFixture({
+  withDaemon = true,
+  streamArchive = false,
+  notifier = 'complete',
+  notifierBody = 'notifier-v1',
+} = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-fixture-'));
   const stage = path.join(work, 'kin-macos-aarch64');
   fs.mkdirSync(stage, { recursive: true });
   fs.writeFileSync(path.join(stage, 'kin'), '#!/bin/sh\necho "kin 9.9.9 (test)"\n');
   if (withDaemon) {
     fs.writeFileSync(path.join(stage, 'kin-daemon'), '#!/bin/sh\necho daemon\n');
+  }
+  if (notifier !== 'absent') {
+    const bundle = path.join(stage, 'KinNotifier.app');
+    fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+    fs.mkdirSync(path.join(bundle, 'Contents', 'Resources'), { recursive: true });
+    const executable = path.join(bundle, 'Contents', 'MacOS', 'KinNotifier');
+    fs.writeFileSync(executable, `#!/bin/sh\necho ${notifierBody}\n`);
+    fs.chmodSync(executable, 0o755);
+    fs.writeFileSync(path.join(bundle, 'Contents', 'Resources', 'Kin.icns'), 'icns');
+    if (notifier === 'complete') {
+      fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), '<plist/>');
+    }
   }
   const archivePath = path.join(work, 'kin-macos-aarch64.tar.gz');
   const tar = spawnSync('tar', ['-czf', archivePath, '-C', work, 'kin-macos-aarch64'], {
@@ -69,6 +154,23 @@ function makeFixture({ withDaemon = true } = {}) {
   const sha = `${sha256Hex(bytes)}  kin-macos-aarch64.tar.gz\n`;
   const fetchImpl = async (url) => {
     const body = url.endsWith('.sha256') ? Buffer.from(sha) : bytes;
+    if (streamArchive && !url.endsWith('.sha256')) {
+      const split = Math.floor(body.length / 2);
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) => (name.toLowerCase() === 'content-length' ? String(body.length) : null),
+        },
+        body: (async function* streamFixture() {
+          yield body.subarray(0, split);
+          yield body.subarray(split);
+        })(),
+        arrayBuffer: async () => {
+          throw new Error('streaming archive must not be buffered through arrayBuffer()');
+        },
+      };
+    }
     return {
       ok: true,
       status: 200,
@@ -94,6 +196,194 @@ test('provision verifies, installs kin + kin-daemon, and stamps the version', as
   assert.ok(fs.existsSync(path.join(home, 'bin', 'kin-daemon')));
   assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
   assert.equal(readLauncherStamp(env), '9.9.9');
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision streams live archive byte and percent progress without touching checksum semantics', async () => {
+  const { work, bytes, fetchImpl } = makeFixture({ streamArchive: true });
+  const home = path.join(work, 'kin-home');
+  const progress = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+    onProgress: (event) => progress.push({ ...event }),
+  });
+
+  assert.ok(
+    progress.some((event) => !event.done && event.received > 0 && event.received < bytes.length),
+  );
+  assert.deepEqual(progress.at(-1), {
+    received: bytes.length,
+    total: bytes.length,
+    done: true,
+  });
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('a mid-stream failure clears and terminates the active TTY progress line', async () => {
+  const { work, bytes, sha } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const writes = [];
+  const progress = createDownloadProgress('kin-macos-aarch64.tar.gz', {
+    write: (value) => writes.push(String(value)),
+  });
+  const fetchImpl = async (url) => {
+    if (url.endsWith('.sha256')) {
+      const body = Buffer.from(sha);
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => String(bytes.length) },
+      body: (async function* failingFixture() {
+        yield bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2)));
+        throw new Error('simulated connection reset');
+      })(),
+      arrayBuffer: async () => {
+        throw new Error('failing stream must not use arrayBuffer()');
+      },
+    };
+  };
+
+  await assert.rejects(
+    provision('9.9.9', {
+      env: { KIN_HOME: home },
+      platform: 'darwin',
+      arch: 'arm64',
+      fetchImpl,
+      log: () => {},
+      onProgress: progress,
+    }),
+    /simulated connection reset/,
+  );
+
+  assert.match(writes[0], /kin: downloading kin-macos-aarch64\.tar\.gz:/);
+  assert.equal(writes.at(-1), '\r\x1b[2K\n');
+  const launcherOutput = `${writes.join('')}kin: provisioning failed: simulated connection reset\n`;
+  assert.match(launcherOutput, /\r\x1b\[2K\nkin: provisioning failed:/);
+  assert.ok(!fs.existsSync(path.join(home, 'bin', 'kin')));
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision installs the macOS notification bundle so notifications post as Kin', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+  });
+  const executable = path.join(home, 'lib', 'KinNotifier.app', 'Contents', 'MacOS', 'KinNotifier');
+  assert.ok(fs.existsSync(executable), 'the bundle must reach $KIN_HOME/lib');
+  assert.ok(fs.existsSync(path.join(home, 'lib', 'KinNotifier.app', 'Contents', 'Info.plist')));
+  assert.ok(fs.statSync(executable).mode & 0o111, 'a notifier without +x cannot be launched');
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision replaces a stale bundle whole rather than merging into it', async () => {
+  const { work, fetchImpl } = makeFixture({ notifierBody: 'notifier-v2' });
+  const home = path.join(work, 'kin-home');
+  // A previous release's bundle, carrying a file the new one does not have.
+  const dest = path.join(home, 'lib', 'KinNotifier.app');
+  fs.mkdirSync(path.join(dest, 'Contents', 'MacOS'), { recursive: true });
+  fs.writeFileSync(path.join(dest, 'Contents', 'MacOS', 'KinNotifier'), 'stale');
+  fs.writeFileSync(path.join(dest, 'Contents', 'Stale.txt'), 'left over');
+
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+  });
+  assert.match(
+    fs.readFileSync(path.join(dest, 'Contents', 'MacOS', 'KinNotifier'), 'utf8'),
+    /notifier-v2/,
+  );
+  assert.ok(
+    !fs.existsSync(path.join(dest, 'Contents', 'Stale.txt')),
+    'a merged bundle keeps files the new release removed, breaking its signature seal',
+  );
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+function seedExistingManagedInstall(home) {
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  const bundle = path.join(home, 'lib', 'KinNotifier.app');
+  fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), 'old-kin');
+  fs.writeFileSync(path.join(binDir, 'kin-daemon'), 'old-daemon');
+  fs.writeFileSync(path.join(bundle, 'Contents', 'Info.plist'), '<plist>old</plist>');
+  fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'KinNotifier'), 'old-notifier');
+  writeLauncherStamp('8.8.8', env);
+  return env;
+}
+
+async function assertMalformedBundleUpgradeIsPreflightOnly(notifier, expectedError) {
+  const { work, fetchImpl } = makeFixture({ notifier });
+  const home = path.join(work, 'kin-home');
+  const env = seedExistingManagedInstall(home);
+
+  await assert.rejects(
+    provision('9.9.9', {
+      env,
+      platform: 'darwin',
+      arch: 'arm64',
+      fetchImpl,
+      log: () => {},
+    }),
+    expectedError,
+  );
+
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin'), 'utf8'), 'old-kin');
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin-daemon'), 'utf8'), 'old-daemon');
+  assert.equal(
+    fs.readFileSync(
+      path.join(home, 'lib', 'KinNotifier.app', 'Contents', 'MacOS', 'KinNotifier'),
+      'utf8',
+    ),
+    'old-notifier',
+  );
+  assert.equal(readLauncherStamp(env), '8.8.8');
+  fs.rmSync(work, { recursive: true, force: true });
+}
+
+test('provision refuses an absent macOS bundle before mutating a previous install', async () => {
+  await assertMalformedBundleUpgradeIsPreflightOnly('absent', /carries no KinNotifier\.app/);
+});
+
+test('provision refuses an incomplete macOS bundle before mutating a previous install', async () => {
+  await assertMalformedBundleUpgradeIsPreflightOnly('no-plist', /missing Contents\/Info\.plist/);
+});
+
+test('provision installs no bundle on a platform that has no notification bundle', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const lines = [];
+  await provision('9.9.9', {
+    env: { KIN_HOME: home },
+    platform: 'linux',
+    arch: 'x64',
+    fetchImpl,
+    log: (line) => lines.push(line),
+  });
+  assert.ok(!fs.existsSync(path.join(home, 'lib', 'KinNotifier.app')));
+  assert.ok(
+    !lines.some((line) => line.includes('KinNotifier.app')),
+    'a platform with no bundle concept has nothing to warn about',
+  );
   fs.rmSync(work, { recursive: true, force: true });
 });
 
