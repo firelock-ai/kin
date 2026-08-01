@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report status embedding coverage from the graph that actually holds the vector index (#577)
 - Make refs counts entity-accurate and fail closed (#580)
 - Install and refresh the macOS notification bundle on every channel that delivers Kin (#575)
+- Show bounded first-install download progress (#581)
 
 
 ### Breaking
