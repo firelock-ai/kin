@@ -2763,9 +2763,9 @@ mod tests {
         let initialized = kin_core::init(repo.path()).unwrap();
         let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
 
-        // Prepare the fresh index that stands in for a successful foreground
-        // `/embed --rebuild`. It is installed only after that request acquires
-        // `embedding_work` below.
+        // Prepare one compatible sidecar for both sides of the race. Attach it
+        // now as the stale index recovery must detach, then let the foreground
+        // `/embed --rebuild` install it fresh after acquiring `embedding_work`.
         let descriptor = kin_db::IndexDescriptor {
             model_id: Some("foreground-rebuild-race-fixture@v1".to_string()),
             graph_root: Some(hex::encode(state.graph.compute_root_hash())),
