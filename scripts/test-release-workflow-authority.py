@@ -699,6 +699,42 @@ def workflow_active_header_source(workflow: str) -> str:
     return classifier_active_job_source(workflow.split(marker, 1)[0])
 
 
+def assert_install_proof_init_log_authority(first_run: str) -> None:
+    """Keep the install proof's own report files out of the worktree kin init admits.
+
+    kin init proves the Git worktree exactly, repeats that proof immediately
+    before publication, and repeats it again afterwards, refusing when the two
+    differ. A report file written into that worktree therefore breaks admission
+    twice over: it is an untracked non-ignored path, and an ignored one would
+    still change size between the repeats.
+    """
+
+    active = [
+        line.strip()
+        for line in first_run.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    init_lines = [line for line in active if line.startswith("kin init")]
+    if len(init_lines) != 1:
+        raise AssertionError(
+            "install proof must invoke kin init exactly once in the first-run step"
+        )
+    if init_lines[0] != 'kin init > "$init_log" 2>&1 || init_status=$?':
+        raise AssertionError(
+            "kin init must write its log outside the worktree it admits rather "
+            f"than through a relative redirect or pipe: {init_lines[0]}"
+        )
+    for policy in (
+        'init_log="$RUNNER_TEMP/kin-init.txt"',
+        'cp "$init_log" kin-init.txt',
+        'if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi',
+    ):
+        if policy not in active:
+            raise AssertionError(
+                f"install-proof init log capture lost an active line: {policy}"
+            )
+
+
 def assert_docs_only_classifier_guard(workflow: str) -> None:
     """Require the exact workflow header, classifier job, and classifier shell."""
 
@@ -3486,6 +3522,42 @@ def main() -> None:
         'printf \'SHELL=%s\\n\' "$SHELL" >> "$GITHUB_ENV"',
     ):
         require(first_run, policy, "cross-step install-proof shell pin")
+    assert_install_proof_init_log_authority(first_run)
+    expect_assertion(
+        "kin init writes its log into the worktree it admits",
+        "outside the worktree it admits",
+        lambda: assert_install_proof_init_log_authority(
+            first_run.replace(
+                'kin init > "$init_log" 2>&1 || init_status=$?',
+                "kin init 2>&1 | tee kin-init.txt",
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "a second kin init escapes the admitted-worktree contract",
+        "exactly once",
+        lambda: assert_install_proof_init_log_authority(
+            f"{first_run}\n          kin init\n"
+        ),
+    )
+    for label, active_line in (
+        (
+            "the captured init log never reaches the proof reports",
+            'cp "$init_log" kin-init.txt',
+        ),
+        (
+            "a refused init stops failing the install proof",
+            'if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi',
+        ),
+    ):
+        expect_assertion(
+            label,
+            "install-proof init log capture",
+            lambda mutated=first_run.replace(
+                active_line, f"# {active_line}", 1
+            ): assert_install_proof_init_log_authority(mutated),
+        )
     for policy in (
         "PROOF_SHELL: ${{ matrix.setup-shell }}",
         'case "$PROOF_SHELL" in',

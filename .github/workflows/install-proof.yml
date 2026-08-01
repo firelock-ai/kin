@@ -372,7 +372,17 @@ jobs:
           git init -q && git config user.email ci@firelock.ai && git config user.name ci
           printf 'def hello():\n    return 42\n' > probe.py
           git add -A && git commit -qm "probe"
-          kin init 2>&1 | tee kin-init.txt
+          # kin init admits this worktree exactly and repeats that proof across
+          # publication, so a report file must neither exist in it nor grow
+          # while init runs. Capture outside the admitted tree and copy the log
+          # back afterwards, on success and on failure alike, so a refusal still
+          # reaches the uploaded proof reports.
+          init_log="$RUNNER_TEMP/kin-init.txt"
+          init_status=0
+          kin init > "$init_log" 2>&1 || init_status=$?
+          cat "$init_log"
+          cp "$init_log" kin-init.txt
+          if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi
           # Do not pipe this command through tee. On Windows, the daemon child
           # inherits the pipe and keeps it open until idle shutdown, which makes
           # the shell wait for the daemon and then tests a process that just exited.
