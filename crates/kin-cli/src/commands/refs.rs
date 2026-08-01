@@ -395,6 +395,7 @@ fn relation_kind_label(kind: RelationKind) -> String {
 
 #[derive(Debug, Clone)]
 struct ReferenceEntry {
+    entity_id: EntityId,
     name: String,
     file_path: Option<String>,
     start_line: Option<u32>,
@@ -417,6 +418,7 @@ fn collect_references(
         left.file_path
             .cmp(&right.file_path)
             .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
     });
     Ok(entries)
 }
@@ -427,7 +429,7 @@ fn collect_graph_references(
     relation_kinds: &[RelationKind],
 ) -> Result<Vec<ReferenceEntry>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
-    let mut grouped: HashMap<String, ReferenceEntry> = HashMap::new();
+    let mut grouped: HashMap<EntityId, ReferenceEntry> = HashMap::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
         if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
@@ -436,18 +438,31 @@ fn collect_graph_references(
         let Some(src_entity_id) = rel.src.as_entity() else {
             continue;
         };
+        // A recursive/self relation does not establish reachability from
+        // another entity. Bulk refs has always excluded it for dead-code and
+        // caller classification; keeping that rule in the shared collector
+        // makes the ordinary and bulk surfaces agree without turning a
+        // self-recursive orphan into a referenced entity.
+        if src_entity_id == *entity_id {
+            continue;
+        }
         let Some(entity) = graph.get_entity(&src_entity_id)? else {
             continue;
         };
 
         let file_path = entity.file_origin.as_ref().map(|f| f.0.clone());
-        let key = reference_key(file_path.as_deref(), &entity.name);
-        let entry = grouped.entry(key).or_insert_with(|| ReferenceEntry {
-            name: entity.name.clone(),
-            file_path: file_path.clone(),
-            start_line: entity.span.as_ref().map(|s| s.start_line),
-            relation_kinds: Vec::new(),
-        });
+        // The graph entity id is the grouping authority. File/name are display
+        // metadata and are not unique: overloads and nested declarations may
+        // legitimately share both while remaining distinct callers.
+        let entry = grouped
+            .entry(src_entity_id)
+            .or_insert_with(|| ReferenceEntry {
+                entity_id: src_entity_id,
+                name: entity.name.clone(),
+                file_path: file_path.clone(),
+                start_line: entity.span.as_ref().map(|s| s.start_line),
+                relation_kinds: Vec::new(),
+            });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
         }
@@ -468,16 +483,6 @@ fn push_relation_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
     if !kinds.contains(&kind) {
         kinds.push(kind);
     }
-}
-
-fn reference_key(file_path: Option<&str>, name: &str) -> String {
-    // Keyed by (file, name), not by file alone: two entities in the same file
-    // that both reference the target are two rows, not one row wearing the
-    // first entity's name. The listing enumerates referencing entities, and
-    // the count line above it says so.
-    file_path
-        .map(|path| format!("{path}\u{1f}{name}"))
-        .unwrap_or_else(|| format!("name:{name}"))
 }
 
 fn parse_relation_kinds(kind: &str) -> Result<Vec<RelationKind>> {
@@ -681,11 +686,11 @@ mod tests {
         assert_eq!(kinds, vec![RelationKind::Imports]);
     }
 
-    /// Two callers in one file are two rows. The per-file grouping this
-    /// replaces collapsed them into a single row wearing the first caller's
-    /// name, under a count line that then miscounted the referencing entities.
+    /// Distinct entity ids are distinct callers even when their display
+    /// metadata is identical. Duplicate/multi-kind edges from one caller enrich
+    /// that caller's row, and self-edges do not establish external reachability.
     #[test]
-    fn refs_and_bulk_count_referencing_entities_not_relation_edges() {
+    fn refs_and_bulk_count_distinct_external_entities_not_relation_edges_or_self_edges() {
         use kin_db::InMemoryGraph;
         use kin_model::relation::{Relation, RelationOrigin};
         use kin_model::{
@@ -725,8 +730,10 @@ mod tests {
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
         let target = entity("probe_symbol", "target_mod.rs");
-        let caller_a = entity("caller_a", "callers.rs");
-        let caller_b = entity("caller_b", "callers.rs");
+        // Same file and same name are deliberate: display metadata cannot be
+        // the grouping key. These remain two semantic entities by id.
+        let caller_a = entity("shared_caller", "callers.rs");
+        let caller_b = entity("shared_caller", "callers.rs");
 
         let graph = InMemoryGraph::new();
         for e in [&target, &caller_a, &caller_b] {
@@ -764,6 +771,27 @@ mod tests {
                 })
                 .unwrap();
         }
+        // A recursive-only edge does not make the target reachable from some
+        // other entity and must not affect either count or matched_kinds.
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(target.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
 
         let response = build_refs_response(
             &layout,
@@ -781,8 +809,8 @@ mod tests {
             "count line must count entities: {joined}"
         );
         assert!(
-            joined.contains("caller_a") && joined.contains("caller_b"),
-            "both same-file callers must be listed: {joined}"
+            joined.matches("shared_caller @ callers.rs:0").count() == 2,
+            "both same-metadata entity ids must be listed separately: {joined}"
         );
 
         let compact = build_bulk_refs_response(
@@ -795,6 +823,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(compact.results[0]["reference_count"], 2);
+        assert_eq!(compact.results[0]["has_references"], true);
+        assert_eq!(compact.results[0]["entity_id"], target.id.to_string());
+        assert!(compact.results[0].get("matched_kinds").is_none());
+        assert!(compact.results[0].get("name").is_none());
 
         let verbose = build_bulk_refs_response(
             &graph,
@@ -806,9 +838,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verbose.results[0]["reference_count"], 2);
+        assert_eq!(verbose.results[0]["has_references"], true);
+        assert_eq!(verbose.results[0]["entity_id"], target.id.to_string());
+        assert_eq!(verbose.results[0]["name"], "probe_symbol");
+        assert_eq!(verbose.results[0]["kind"], "Function");
+        assert_eq!(verbose.results[0]["file_path"], "target_mod.rs");
         assert_eq!(
             verbose.results[0]["matched_kinds"],
             serde_json::json!(["Calls", "References"])
         );
+
+        let self_only_kind = build_bulk_refs_response(
+            &graph,
+            &BulkRefsRequest {
+                entity_ids: vec![target.id.to_string()],
+                kind: "Imports".to_string(),
+                compact: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(self_only_kind.results[0]["has_references"], false);
+        assert_eq!(self_only_kind.results[0]["reference_count"], 0);
+        assert_eq!(self_only_kind.with_references, 0);
+        assert_eq!(self_only_kind.without_references, 1);
     }
 }
