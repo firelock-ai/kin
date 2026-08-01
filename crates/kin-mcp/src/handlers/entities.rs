@@ -4171,10 +4171,11 @@ mod tests {
         );
     }
 
-    /// Nothing in this crate may quietly go back to the outgoing-only
-    /// traversal: `get_dependency_neighborhood` is fed only the outgoing index
-    /// in kin-db, which is what made this tool answer dependencies when it was
-    /// asked for dependents.
+    /// This file may not quietly go back to the outgoing-only traversal:
+    /// `get_dependency_neighborhood` is fed only the outgoing index in kin-db,
+    /// which is what made this tool answer dependencies when it was asked for
+    /// dependents. The scan reads this one file, so it guards the handler that
+    /// regressed rather than every call site in the crate.
     #[test]
     fn graph_neighborhood_does_not_use_the_outgoing_only_traversal() {
         // Split so this guard's own source line is not a match for itself.
