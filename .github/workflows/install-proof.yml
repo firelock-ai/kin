@@ -594,6 +594,13 @@ jobs:
           if (meta.dependency_provenance !== expectedLock) {
             throw new Error(`installed Windows Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} does not match release source ${expectedLock}`);
           }
+          if (
+            meta.embeddings?.vector_enabled !== false ||
+            meta.embeddings?.embeddings_enabled !== false ||
+            meta.embeddings?.metal_enabled !== false
+          ) {
+            throw new Error("installed Windows CLI does not prove the vector-free feature contract");
+          }
 
           const authority = JSON.parse(fs.readFileSync("kin-windows-registry-authority.json", "utf8"));
           if (authority.checks?.length !== 1 || authority.checks[0]?.state !== "unsupported") {
@@ -736,6 +743,42 @@ jobs:
           cat kin-status.txt
           kin status --json > kin-status.json 2>&1
           cat kin-status.json
+          kin bench-meta --json > kin-build-meta.json
+          cat kin-build-meta.json
+          daemon_port="$(tr -d '[:space:]' < .kin/daemon.port)"
+          case "$daemon_port" in
+            ''|*[!0-9]*)
+              echo "installed daemon published an invalid port: $daemon_port" >&2
+              exit 1
+              ;;
+          esac
+          DAEMON_PORT="$daemon_port" node <<'NODE' > kin-daemon-health.json
+          const http = require("http");
+          const request = http.get(
+            `http://127.0.0.1:${process.env.DAEMON_PORT}/health`,
+            (response) => {
+              const chunks = [];
+              response.on("data", (chunk) => chunks.push(chunk));
+              response.on("end", () => {
+                const body = Buffer.concat(chunks);
+                if (response.statusCode !== 200) {
+                  console.error(`daemon health returned HTTP ${response.statusCode}: ${body}`);
+                  process.exitCode = 1;
+                  return;
+                }
+                process.stdout.write(body);
+              });
+            }
+          );
+          request.setTimeout(30000, () => {
+            request.destroy(new Error("daemon health request exceeded 30 seconds"));
+          });
+          request.on("error", (error) => {
+            console.error(error.message);
+            process.exitCode = 1;
+          });
+          NODE
+          cat kin-daemon-health.json
           # Prove every supported agent-client config writer without requiring
           # the proprietary clients on a public runner. Detection is PATH-based;
           # these inert shims make setup exercise the real merge paths while the
@@ -1070,45 +1113,86 @@ jobs:
           const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
           const status = JSON.parse(fs.readFileSync("kin-status.json", "utf8"));
-          const build = status.build;
-          if (!build) {
-            throw new Error("kin-status.json: build provenance is missing");
-          }
+          const cliMeta = JSON.parse(fs.readFileSync("kin-build-meta.json", "utf8"));
+          const daemonHealth = JSON.parse(fs.readFileSync("kin-daemon-health.json", "utf8"));
           const fullSha = /^[0-9a-f]{40}$/;
           const lockSha = /^[0-9a-f]{64}$/;
-          for (const side of ["cli", "daemon"]) {
-            const sha = build[`${side}_sha`];
-            const dirty = build[`${side}_dirty`];
-            const sourceKnown = build[`${side}_source_known`];
-            const provenance = build[`${side}_dependency_provenance`];
-            if (!fullSha.test(sha ?? "")) {
-              throw new Error(`${side} build SHA is not a full 40-hex commit: ${sha ?? "missing"}`);
+          if (cliMeta.schema !== "kin.bench-meta.v2") {
+            throw new Error(`kin-build-meta.json: unsupported schema ${cliMeta.schema ?? "missing"}`);
+          }
+          const builds = new Map([
+            ["cli", {
+              sha: cliMeta.kin_commit,
+              dirty: cliMeta.kin_dirty,
+              sourceKnown: cliMeta.kin_source_known,
+              dependencyProvenance: cliMeta.dependency_provenance,
+            }],
+            ["daemon", {
+              sha: daemonHealth.build?.sha,
+              dirty: daemonHealth.build?.dirty,
+              sourceKnown: daemonHealth.build?.source_known,
+              dependencyProvenance: daemonHealth.build?.dependency_provenance,
+            }],
+          ]);
+          for (const [side, build] of builds) {
+            if (!fullSha.test(build.sha ?? "")) {
+              throw new Error(`${side} build SHA is not a full 40-hex commit: ${build.sha ?? "missing"}`);
             }
-            if (sha !== expectedCommit) {
-              throw new Error(`${side} build SHA ${sha} does not match release tag ${expectedCommit}`);
+            if (build.sha !== expectedCommit) {
+              throw new Error(`${side} build SHA ${build.sha} does not match release tag ${expectedCommit}`);
             }
-            if (dirty !== false) {
+            if (build.dirty !== false) {
               throw new Error(`${side} release binary is dirty or did not report a clean build`);
             }
-            if (sourceKnown !== true) {
+            if (build.sourceKnown !== true) {
               throw new Error(`${side} release binary did not prove source_known=true`);
             }
-            if (!lockSha.test(provenance ?? "")) {
+            if (!lockSha.test(build.dependencyProvenance ?? "")) {
               throw new Error(`${side} Cargo.lock provenance is missing or malformed`);
             }
-            if (provenance !== expectedLock) {
-              throw new Error(`${side} Cargo.lock provenance ${provenance} does not match release source ${expectedLock}`);
+            if (build.dependencyProvenance !== expectedLock) {
+              throw new Error(`${side} Cargo.lock provenance ${build.dependencyProvenance} does not match release source ${expectedLock}`);
             }
           }
-          if (build.cli_dependency_provenance !== build.daemon_dependency_provenance) {
+          if (builds.get("cli").dependencyProvenance !== builds.get("daemon").dependencyProvenance) {
             throw new Error("CLI and daemon were built from different Cargo.lock provenance");
           }
-          const semanticCoverage = status.semantic_coverage;
-          if (!semanticCoverage) {
-            throw new Error("kin-status.json: semantic_coverage is missing");
+
+          if (status.schema !== "kin.status.v3") {
+            throw new Error(`kin-status.json: unsupported schema ${status.schema ?? "missing"}`);
           }
-          if (semanticCoverage.supported !== true) {
-            throw new Error(`${runnerOs} release unexpectedly lacks semantic vector support`);
+          const validateEmbeddingCoverage = (coverage, label) => {
+            if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
+              throw new Error(`${label}: embedding_coverage is missing or malformed`);
+            }
+            if (coverage.state === "observed") {
+              if (coverage.source !== "live_query_graph") {
+                throw new Error(`${label}: observed coverage has source ${coverage.source ?? "missing"}`);
+              }
+              for (const field of ["indexed", "pending", "total"]) {
+                if (!Number.isSafeInteger(coverage[field]) || coverage[field] < 0) {
+                  throw new Error(`${label}: embedding_coverage.${field} is not a non-negative integer`);
+                }
+              }
+              if (coverage.reason !== undefined || coverage.indexed > coverage.total || coverage.pending < coverage.total - coverage.indexed) {
+                throw new Error(`${label}: observed embedding coverage violates kin.status.v3 invariants`);
+              }
+            } else if (coverage.state === "unobserved") {
+              if (typeof coverage.reason !== "string" || coverage.reason.length === 0) {
+                throw new Error(`${label}: unobserved embedding coverage carries no reason`);
+              }
+              for (const field of ["source", "indexed", "pending", "total"]) {
+                if (coverage[field] !== undefined) {
+                  throw new Error(`${label}: unobserved embedding coverage carries ${field}`);
+                }
+              }
+            } else {
+              throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
+            }
+          };
+          validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
+          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
+            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
@@ -1203,8 +1287,19 @@ jobs:
             throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
           }
           const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
-          if (embeddedStatus.semantic_coverage?.supported !== true || embeddedStatus.semantic_coverage?.complete !== true) {
-            throw new Error("Unix status did not prove complete semantic coverage after embedding");
+          if (embeddedStatus.schema !== "kin.status.v3") {
+            throw new Error(`kin-embedded-status.json: unsupported schema ${embeddedStatus.schema ?? "missing"}`);
+          }
+          validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
+          const embeddedCoverage = embeddedStatus.embedding_coverage;
+          if (
+            embeddedCoverage.state !== "observed" ||
+            embeddedCoverage.source !== "live_query_graph" ||
+            embeddedCoverage.total === 0 ||
+            embeddedCoverage.indexed !== embeddedCoverage.total ||
+            embeddedCoverage.pending !== 0
+          ) {
+            throw new Error(`Unix status did not prove complete observed embedding coverage: ${JSON.stringify(embeddedCoverage)}`);
           }
           for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
             const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
