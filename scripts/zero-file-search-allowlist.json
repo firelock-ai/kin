@@ -363,7 +363,7 @@
       "allow_match": [
         {
           "expr": ".metadata()",
-          "count": 9
+          "count": 10
         }
       ]
     },

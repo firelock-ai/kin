@@ -2146,17 +2146,23 @@ mod tests {
             },
         )
         .unwrap();
-        // `kin history` gives the author column 20 characters and ellipsizes
-        // past that, so "claude-code/one-change-demo" (27) renders cut. Asserted
-        // in its rendered form rather than on a prefix, so the truncation is a
-        // stated property of this surface instead of an accident the assertion
-        // happens to survive.
+        // `kin history` sizes its author column to the widest author it is
+        // rendering, so a 27-character agent identity arrives whole. Asserted on
+        // the rendered line rather than on a prefix, so a column that started
+        // cutting the client name again would fail here: the client name is the
+        // half that tells two sessions of one vendor apart, and it is the half a
+        // fixed column removed.
         assert!(
             history
                 .lines
                 .iter()
-                .any(|line| line.contains("claude-code/one-cha\u{2026}")),
-            "history must name the committing agent, truncated to its column: {:#?}",
+                .any(|line| line.contains("claude-code/one-change-demo")),
+            "history must name the committing agent in full: {:#?}",
+            history.lines
+        );
+        assert!(
+            !history.lines.iter().any(|line| line.contains('\u{2026}')),
+            "no identity may be ellipsized: {:#?}",
             history.lines
         );
 
