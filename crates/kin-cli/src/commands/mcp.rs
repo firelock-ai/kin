@@ -196,8 +196,9 @@ async fn bind_from_registry() -> bool {
     match registry_startup_choice(&registry) {
         RegistryStartupChoice::NoneRegistered => {
             eprintln!(
-                "Kin MCP: registry mode found no registered repositories. Run `kin init` in a \
-                 repository to register it, or pass --repo <path> (or set KIN_MCP_REPO=<path>)."
+                "Kin MCP: registry mode found no registered repositories, and no shipped command \
+                 writes a registry entry. Pass --repo <path> (or set KIN_MCP_REPO=<path>) to \
+                 serve a repository directly."
             );
             false
         }
