@@ -14948,6 +14948,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     /// PowerShell helper can perform identity-bound deferred deletion.
     #[cfg(windows)]
     #[test]
+    #[cfg(windows)]
     #[serial]
     fn native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup() -> Result<()> {
         if let Some(mode) = env::var_os(WINDOWS_FULL_UNINSTALL_CHILD_MODE) {
