@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -773,14 +774,872 @@ def node_heredoc_body(step: str, label: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def write_node_validator_fixture_files(
+    root: Path,
+    files: dict[str, object],
+    containment_root: Path,
+    label: str,
+) -> None:
+    """Write one isolated validator fixture without allowing path escape."""
+
+    for relative_path, value in files.items():
+        target = (root / relative_path).resolve()
+        try:
+            target.relative_to(containment_root)
+        except ValueError as error:
+            raise AssertionError(
+                f"{label} fixture path escapes its isolated root: {relative_path!r}"
+            ) from error
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = value if isinstance(value, str) else json.dumps(value)
+        target.write_text(content, encoding="utf-8")
+
+
+def run_node_validator_fixture(
+    step: str,
+    label: str,
+    proof_files: dict[str, object],
+    home_files: dict[str, object] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the exact inline validator against one deterministic proof fixture."""
+
+    script = node_heredoc_body(step, label)
+    with tempfile.TemporaryDirectory(prefix="kin-proof-validator-fixture-") as temporary:
+        temporary_root = Path(temporary).resolve()
+        proof_dir = temporary_root / "proof"
+        home_dir = temporary_root / "home"
+        proof_dir.mkdir()
+        home_dir.mkdir()
+        write_node_validator_fixture_files(
+            proof_dir, proof_files, temporary_root, label
+        )
+        write_node_validator_fixture_files(
+            home_dir, home_files or {}, temporary_root, label
+        )
+        environment = {
+            **os.environ,
+            "HOME": str(home_dir),
+            "USERPROFILE": str(home_dir),
+            **(extra_env or {}),
+        }
+        try:
+            return subprocess.run(
+                ["node", "-"],
+                input=script,
+                cwd=proof_dir,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AssertionError(
+                f"{label} could not execute its deterministic fixture: {error}"
+            ) from error
+
+
+def assert_node_validator_accepts_fixture(
+    step: str,
+    label: str,
+    proof_files: dict[str, object],
+    home_files: dict[str, object] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """Require the exact validator to accept a complete known-good fixture."""
+
+    result = run_node_validator_fixture(
+        step, label, proof_files, home_files, extra_env
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{label} rejected its known-good fixture with exit {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+
+
+def assert_node_validator_rejects_fixture(
+    step: str,
+    label: str,
+    proof_files: dict[str, object],
+    home_files: dict[str, object] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """Require the exact validator to reject one behaviorally invalid fixture."""
+
+    result = run_node_validator_fixture(
+        step, label, proof_files, home_files, extra_env
+    )
+    if result.returncode == 0:
+        raise AssertionError(f"{label} accepted a behaviorally invalid proof fixture")
+
+
+VALIDATOR_FIXTURE_COMMIT = "a" * 40
+VALIDATOR_FIXTURE_LOCK = "b" * 64
+VALIDATOR_MCP_ENTRY = {
+    "args": ["mcp", "start"],
+    "env": {"KIN_MCP_TOOL_PROFILE": "agent-default"},
+}
+
+
+def validator_mcp_home_fixture() -> dict[str, object]:
+    """Return every JSON MCP config the two inline validators inspect."""
+
+    config = {"mcpServers": {"kin": VALIDATOR_MCP_ENTRY}}
+    return {
+        ".claude.json": copy.deepcopy(config),
+        ".cursor/mcp.json": copy.deepcopy(config),
+        ".gemini/settings.json": copy.deepcopy(config),
+        ".codeium/windsurf/mcp_config.json": copy.deepcopy(config),
+    }
+
+
+def validator_health_report(
+    statuses: dict[str, str], *, healthy: bool
+) -> dict[str, object]:
+    return {
+        "healthy": healthy,
+        "checks": [
+            {"id": check_id, "status": status}
+            for check_id, status in statuses.items()
+        ],
+    }
+
+
+WINDOWS_VALIDATOR_CHECKS = {
+    "kin_binary": "healthy",
+    "kin_daemon_binary": "healthy",
+    "shell_path": "healthy",
+    "setup_ledger": "healthy",
+    "registry_authority": "unsupported",
+    "vfs_projection": "unsupported",
+    "semantic_query_readiness": "unsupported",
+    "daemon_running": "unsupported",
+    "repo_init": "missing",
+    "mcp_client_claude": "healthy",
+    "mcp_client_cursor": "healthy",
+    "mcp_client_gemini": "healthy",
+    "mcp_client_windsurf": "healthy",
+}
+
+
+def windows_node_validator_fixture() -> tuple[
+    dict[str, object], dict[str, object], dict[str, str]
+]:
+    """Build a complete valid repository-free Windows proof fixture."""
+
+    report = validator_health_report(WINDOWS_VALIDATOR_CHECKS, healthy=False)
+    return (
+        {
+            "expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
+            "expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "kin-windows-bench-meta.json": {
+                "kin_commit": VALIDATOR_FIXTURE_COMMIT,
+                "kin_dirty": False,
+                "kin_source_known": True,
+                "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
+                "embeddings": {
+                    "vector_enabled": False,
+                    "embeddings_enabled": False,
+                    "metal_enabled": False,
+                },
+            },
+            "kin-windows-registry-authority.json": {
+                "checks": [{"state": "unsupported"}]
+            },
+            "kin-windows-health.json": copy.deepcopy(report),
+            "kin-windows-doctor.json": copy.deepcopy(report),
+        },
+        validator_mcp_home_fixture(),
+        {"RUNNER_OS": "Windows"},
+    )
+
+
+UNIX_VALIDATOR_CHECKS = {
+    "kin_binary": "healthy",
+    "kin_daemon_binary": "healthy",
+    "daemon_running": "healthy",
+    "repo_init": "healthy",
+    "shell_path": "healthy",
+    "setup_ledger": "healthy",
+    "registry_authority": "healthy",
+    "vfs_projection": "healthy",
+    "mcp_client_claude": "healthy",
+    "mcp_client_cursor": "healthy",
+    "mcp_client_codex": "healthy",
+    "mcp_client_gemini": "healthy",
+    "mcp_client_windsurf": "healthy",
+    "semantic_query_readiness": "stale",
+}
+
+
+def unix_node_validator_fixture() -> tuple[
+    dict[str, object], dict[str, object], dict[str, str]
+]:
+    """Build a complete valid Unix release-byte proof fixture."""
+
+    pre_embed_report = validator_health_report(UNIX_VALIDATOR_CHECKS, healthy=False)
+    embedded_report = validator_health_report(
+        {"semantic_query_readiness": "healthy"}, healthy=True
+    )
+    return (
+        {
+            "../expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
+            "../expected-lock-sha.txt": VALIDATOR_FIXTURE_LOCK,
+            "kin-status.json": {
+                "schema": "kin.status.v3",
+                "embedding_coverage": {
+                    "state": "unobserved",
+                    "reason": "no_running_daemon",
+                },
+            },
+            "kin-build-meta.json": {
+                "schema": "kin.bench-meta.v2",
+                "kin_commit": VALIDATOR_FIXTURE_COMMIT,
+                "kin_dirty": False,
+                "kin_source_known": True,
+                "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
+                "embeddings": {
+                    "vector_enabled": True,
+                    "embeddings_enabled": True,
+                },
+            },
+            "kin-daemon-health.json": {
+                "build": {
+                    "sha": VALIDATOR_FIXTURE_COMMIT,
+                    "dirty": False,
+                    "source_known": True,
+                    "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
+                }
+            },
+            "kin-health.json": copy.deepcopy(pre_embed_report),
+            "kin-doctor.json": copy.deepcopy(pre_embed_report),
+            "kin-search.json": [
+                {"name": "hello", "file": "probe.py"}
+            ],
+            "kin-locate.json": {"files": [{"path": "probe.py"}]},
+            "kin-embed.json": {
+                "pending_entities": 0,
+                "pending_artifacts": 0,
+                "time_limited": False,
+            },
+            "kin-embedded-status.json": {
+                "schema": "kin.status.v3",
+                "embedding_coverage": {
+                    "state": "observed",
+                    "source": "live_query_graph",
+                    "indexed": 2,
+                    "pending": 0,
+                    "total": 2,
+                },
+            },
+            "kin-embedded-health.json": copy.deepcopy(embedded_report),
+            "kin-embedded-doctor.json": copy.deepcopy(embedded_report),
+            "kin-semantic-search.json": [
+                {"name": "hello", "file": "probe.py"}
+            ],
+            "kin-semantic-locate.json": {
+                "semantic_coverage": {"supported": True, "complete": True},
+                "files": [{"path": "probe.py"}],
+            },
+        },
+        validator_mcp_home_fixture(),
+        {"RUNNER_OS": "Linux"},
+    )
+
+
+def fixture_with_json_value(
+    fixture: dict[str, object],
+    path: str,
+    keys: tuple[str | int, ...],
+    value: object,
+) -> dict[str, object]:
+    """Deep-copy a fixture and replace one nested JSON value."""
+
+    mutated = copy.deepcopy(fixture)
+    cursor: object = mutated[path]
+    for key in keys[:-1]:
+        cursor = cursor[key]  # type: ignore[index]
+    cursor[keys[-1]] = value  # type: ignore[index]
+    return mutated
+
+
+def fixture_without_file(
+    fixture: dict[str, object], path: str
+) -> dict[str, object]:
+    mutated = copy.deepcopy(fixture)
+    del mutated[path]
+    return mutated
+
+
+def fixture_without_json_key(
+    fixture: dict[str, object],
+    path: str,
+    keys: tuple[str | int, ...],
+) -> dict[str, object]:
+    """Deep-copy a fixture and remove one nested JSON key."""
+
+    mutated = copy.deepcopy(fixture)
+    cursor: object = mutated[path]
+    for key in keys[:-1]:
+        cursor = cursor[key]  # type: ignore[index]
+    del cursor[keys[-1]]  # type: ignore[index]
+    return mutated
+
+
+def fixture_with_check_status(
+    fixture: dict[str, object],
+    path: str,
+    check_id: str,
+    status: str,
+) -> dict[str, object]:
+    """Deep-copy a health fixture and change exactly one named check."""
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    checks = report["checks"]  # type: ignore[index]
+    matches = [check for check in checks if check["id"] == check_id]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"validator fixture must contain one {check_id!r} check in {path}: "
+            f"{matches}"
+        )
+    matches[0]["status"] = status
+    return mutated
+
+
+def fixture_with_extra_check(
+    fixture: dict[str, object],
+    path: str,
+    check_id: str,
+    status: str,
+) -> dict[str, object]:
+    """Deep-copy a health fixture and append one unexpected check."""
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    report["checks"].append(  # type: ignore[index,union-attr]
+        {"id": check_id, "status": status}
+    )
+    return mutated
+
+
+def assert_windows_node_validator_behavior(step: str) -> None:
+    """Behaviorally pin every substantive Windows validator obligation."""
+
+    proof, home, environment = windows_node_validator_fixture()
+    label = "repo-free Windows install proof"
+    assert_node_validator_accepts_fixture(step, label, proof, home, environment)
+
+    def reject(
+        case: str,
+        invalid_proof: dict[str, object] | None = None,
+        invalid_home: dict[str, object] | None = None,
+    ) -> None:
+        assert_node_validator_rejects_fixture(
+            step,
+            f"{label} ({case})",
+            invalid_proof if invalid_proof is not None else proof,
+            invalid_home if invalid_home is not None else home,
+            environment,
+        )
+
+    # Every proof and home input is independently load-bearing on the valid path.
+    for path in proof:
+        reject(f"missing {path}", fixture_without_file(proof, path))
+    for path in home:
+        reject(f"missing home/{path}", invalid_home=fixture_without_file(home, path))
+
+    for case, path, keys, value in (
+        (
+            "installed commit mismatch",
+            "kin-windows-bench-meta.json",
+            ("kin_commit",),
+            "c" * 40,
+        ),
+        (
+            "dirty installed build",
+            "kin-windows-bench-meta.json",
+            ("kin_dirty",),
+            True,
+        ),
+        (
+            "unknown installed source",
+            "kin-windows-bench-meta.json",
+            ("kin_source_known",),
+            False,
+        ),
+        (
+            "lock provenance mismatch",
+            "kin-windows-bench-meta.json",
+            ("dependency_provenance",),
+            "d" * 64,
+        ),
+        (
+            "vector feature enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "vector_enabled"),
+            True,
+        ),
+        (
+            "embedding feature enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "embeddings_enabled"),
+            True,
+        ),
+        (
+            "Metal feature enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "metal_enabled"),
+            True,
+        ),
+        (
+            "registry authority falsely healthy",
+            "kin-windows-registry-authority.json",
+            ("checks", 0, "state"),
+            "healthy",
+        ),
+    ):
+        reject(case, fixture_with_json_value(proof, path, keys, value))
+
+    reject(
+        "registry authority reports more than one capability",
+        fixture_with_json_value(
+            proof,
+            "kin-windows-registry-authority.json",
+            ("checks",),
+            [{"state": "unsupported"}, {"state": "unsupported"}],
+        ),
+    )
+
+    # Every named repo-free posture is checked behaviorally, not just present as
+    # a token. The doctor file gets its own mutation so both reports must enforce
+    # the map rather than merely be readable.
+    for check_id, expected in WINDOWS_VALIDATOR_CHECKS.items():
+        wrong = "healthy" if expected != "healthy" else "missing"
+        reject(
+            f"health {check_id}={wrong}",
+            fixture_with_check_status(
+                proof, "kin-windows-health.json", check_id, wrong
+            ),
+        )
+    reject(
+        "doctor required posture mismatch",
+        fixture_with_check_status(
+            proof, "kin-windows-doctor.json", "kin_binary", "missing"
+        ),
+    )
+    reject(
+        "unexpected hard health failure",
+        fixture_with_extra_check(
+            proof, "kin-windows-health.json", "unexpected", "missing"
+        ),
+    )
+    reject(
+        "repo-free Codex writer appears",
+        fixture_with_extra_check(
+            proof, "kin-windows-health.json", "mcp_client_codex", "healthy"
+        ),
+    )
+
+    reject(
+        "MCP args drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".claude.json",
+            ("mcpServers", "kin", "args"),
+            ["mcp", "start", "--repo", "."],
+        ),
+    )
+    reject(
+        "MCP profile drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".claude.json",
+            ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+            "full",
+        ),
+    )
+
+
+def assert_unix_node_validator_behavior(step: str) -> None:
+    """Behaviorally pin every substantive Unix validator obligation."""
+
+    proof, home, environment = unix_node_validator_fixture()
+    label = "released-byte Unix install proof"
+    assert_node_validator_accepts_fixture(step, label, proof, home, environment)
+
+    def reject(
+        case: str,
+        invalid_proof: dict[str, object] | None = None,
+        invalid_home: dict[str, object] | None = None,
+    ) -> None:
+        assert_node_validator_rejects_fixture(
+            step,
+            f"{label} ({case})",
+            invalid_proof if invalid_proof is not None else proof,
+            invalid_home if invalid_home is not None else home,
+            environment,
+        )
+
+    # Removing each input independently proves the complete success path reads it.
+    for path in proof:
+        reject(f"missing {path}", fixture_without_file(proof, path))
+    for path in home:
+        reject(f"missing home/{path}", invalid_home=fixture_without_file(home, path))
+
+    for case, path, keys, value in (
+        (
+            "CLI schema drift",
+            "kin-build-meta.json",
+            ("schema",),
+            "kin.bench-meta.v1",
+        ),
+        (
+            "CLI malformed commit",
+            "kin-build-meta.json",
+            ("kin_commit",),
+            "bad",
+        ),
+        (
+            "CLI commit mismatch",
+            "kin-build-meta.json",
+            ("kin_commit",),
+            "c" * 40,
+        ),
+        (
+            "CLI dirty build",
+            "kin-build-meta.json",
+            ("kin_dirty",),
+            True,
+        ),
+        (
+            "CLI unknown source",
+            "kin-build-meta.json",
+            ("kin_source_known",),
+            False,
+        ),
+        (
+            "CLI malformed lock provenance",
+            "kin-build-meta.json",
+            ("dependency_provenance",),
+            "bad",
+        ),
+        (
+            "CLI lock mismatch",
+            "kin-build-meta.json",
+            ("dependency_provenance",),
+            "d" * 64,
+        ),
+        (
+            "daemon malformed commit",
+            "kin-daemon-health.json",
+            ("build", "sha"),
+            "bad",
+        ),
+        (
+            "daemon commit mismatch",
+            "kin-daemon-health.json",
+            ("build", "sha"),
+            "c" * 40,
+        ),
+        (
+            "daemon dirty build",
+            "kin-daemon-health.json",
+            ("build", "dirty"),
+            True,
+        ),
+        (
+            "daemon unknown source",
+            "kin-daemon-health.json",
+            ("build", "source_known"),
+            False,
+        ),
+        (
+            "daemon malformed lock provenance",
+            "kin-daemon-health.json",
+            ("build", "dependency_provenance"),
+            "bad",
+        ),
+        (
+            "daemon lock mismatch",
+            "kin-daemon-health.json",
+            ("build", "dependency_provenance"),
+            "d" * 64,
+        ),
+        (
+            "status schema drift",
+            "kin-status.json",
+            ("schema",),
+            "kin.status.v2",
+        ),
+        (
+            "vector feature absent",
+            "kin-build-meta.json",
+            ("embeddings", "vector_enabled"),
+            False,
+        ),
+        (
+            "embedding feature absent",
+            "kin-build-meta.json",
+            ("embeddings", "embeddings_enabled"),
+            False,
+        ),
+        (
+            "lexical search misses entity",
+            "kin-search.json",
+            (0, "name"),
+            "other",
+        ),
+        (
+            "locate misses artifact",
+            "kin-locate.json",
+            ("files", 0, "path"),
+            "other.py",
+        ),
+        (
+            "pending entities remain",
+            "kin-embed.json",
+            ("pending_entities",),
+            1,
+        ),
+        (
+            "pending artifacts remain",
+            "kin-embed.json",
+            ("pending_artifacts",),
+            1,
+        ),
+        (
+            "embedding is time limited",
+            "kin-embed.json",
+            ("time_limited",),
+            True,
+        ),
+        (
+            "embedded status schema drift",
+            "kin-embedded-status.json",
+            ("schema",),
+            "kin.status.v2",
+        ),
+        (
+            "embedded coverage unobserved",
+            "kin-embedded-status.json",
+            ("embedding_coverage",),
+            {"state": "unobserved", "reason": "missing"},
+        ),
+        (
+            "embedded coverage has wrong source",
+            "kin-embedded-status.json",
+            ("embedding_coverage", "source"),
+            "snapshot",
+        ),
+        (
+            "embedded coverage has zero total",
+            "kin-embedded-status.json",
+            ("embedding_coverage", "total"),
+            0,
+        ),
+        (
+            "embedded coverage incomplete",
+            "kin-embedded-status.json",
+            ("embedding_coverage",),
+            {
+                "state": "observed",
+                "source": "live_query_graph",
+                "indexed": 1,
+                "pending": 1,
+                "total": 2,
+            },
+        ),
+        (
+            "embedded coverage still pending",
+            "kin-embedded-status.json",
+            ("embedding_coverage", "pending"),
+            1,
+        ),
+        (
+            "semantic search misses entity",
+            "kin-semantic-search.json",
+            (0, "name"),
+            "other",
+        ),
+        (
+            "semantic locate unsupported",
+            "kin-semantic-locate.json",
+            ("semantic_coverage", "supported"),
+            False,
+        ),
+        (
+            "semantic locate incomplete",
+            "kin-semantic-locate.json",
+            ("semantic_coverage", "complete"),
+            False,
+        ),
+        (
+            "semantic locate misses artifact",
+            "kin-semantic-locate.json",
+            ("files", 0, "path"),
+            "other.py",
+        ),
+    ):
+        reject(case, fixture_with_json_value(proof, path, keys, value))
+
+    reject(
+        "pre-embed coverage missing",
+        fixture_without_json_key(
+            proof, "kin-status.json", ("embedding_coverage",)
+        ),
+    )
+    reject(
+        "pre-embed coverage malformed",
+        fixture_with_json_value(
+            proof, "kin-status.json", ("embedding_coverage",), []
+        ),
+    )
+    reject(
+        "pre-embed coverage has unknown state",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "state"),
+            "unknown",
+        ),
+    )
+    reject(
+        "unobserved coverage has no reason",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "reason"),
+            "",
+        ),
+    )
+    reject(
+        "unobserved coverage leaks counts",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "indexed"),
+            0,
+        ),
+    )
+    reject(
+        "unobserved coverage leaks source",
+        fixture_with_json_value(
+            proof,
+            "kin-status.json",
+            ("embedding_coverage", "source"),
+            "live_query_graph",
+        ),
+    )
+    observed_pre_embed = fixture_with_json_value(
+        proof,
+        "kin-status.json",
+        ("embedding_coverage",),
+        {
+            "state": "observed",
+            "source": "live_query_graph",
+            "indexed": 0,
+            "pending": 2,
+            "total": 2,
+        },
+    )
+    assert_node_validator_accepts_fixture(
+        step,
+        f"{label} (observed pre-embed coverage)",
+        observed_pre_embed,
+        home,
+        environment,
+    )
+    for case, keys, value in (
+        ("observed coverage wrong source", ("source",), "snapshot"),
+        ("observed coverage negative count", ("indexed",), -1),
+        ("observed coverage carries reason", ("reason",), "stale"),
+        ("observed coverage indexed exceeds total", ("indexed",), 3),
+        ("observed coverage pending undercounts gap", ("pending",), 1),
+    ):
+        reject(
+            case,
+            fixture_with_json_value(
+                observed_pre_embed,
+                "kin-status.json",
+                ("embedding_coverage", *keys),
+                value,
+            ),
+        )
+
+    for check_id, expected in UNIX_VALIDATOR_CHECKS.items():
+        wrong = "healthy" if expected != "healthy" else "missing"
+        reject(
+            f"health {check_id}={wrong}",
+            fixture_with_check_status(proof, "kin-health.json", check_id, wrong),
+        )
+    reject(
+        "doctor required posture mismatch",
+        fixture_with_check_status(
+            proof, "kin-doctor.json", "kin_binary", "missing"
+        ),
+    )
+    reject(
+        "pre-embed aggregate unhealthy for a non-pending reason",
+        fixture_with_check_status(
+            proof, "kin-health.json", "semantic_query_readiness", "healthy"
+        ),
+    )
+    unsupported_readiness = fixture_with_check_status(
+        proof, "kin-health.json", "semantic_query_readiness", "unsupported"
+    )
+    unsupported_readiness = fixture_with_json_value(
+        unsupported_readiness, "kin-health.json", ("healthy",), True
+    )
+    reject("pre-embed semantic readiness unsupported", unsupported_readiness)
+    reject(
+        "unexpected hard pre-embed failure",
+        fixture_with_extra_check(proof, "kin-health.json", "unexpected", "missing"),
+    )
+
+    for report_path in ("kin-embedded-health.json", "kin-embedded-doctor.json"):
+        reject(
+            f"{report_path} aggregate unhealthy",
+            fixture_with_json_value(proof, report_path, ("healthy",), False),
+        )
+        reject(
+            f"{report_path} semantic readiness stale",
+            fixture_with_check_status(
+                proof, report_path, "semantic_query_readiness", "stale"
+            ),
+        )
+
+    reject(
+        "MCP args drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".claude.json",
+            ("mcpServers", "kin", "args"),
+            ["mcp", "start", "--repo", "."],
+        ),
+    )
+    reject(
+        "MCP profile drift",
+        invalid_home=fixture_with_json_value(
+            home,
+            ".claude.json",
+            ("mcpServers", "kin", "env", "KIN_MCP_TOOL_PROFILE"),
+            "full",
+        ),
+    )
+
+
 def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
-    """Execute the shipped validator and require an empty proof tree to fail.
+    """Execute the shipped validator and require incomplete proof trees to fail.
 
     Token checks explain which contract drifted, but cannot prove those tokens
     remain reachable. Running the extracted program against a deliberately
-    absent evidence tree makes comments, false branches, early exits, and other
-    whole-validator no-ops fail for their actual behavior rather than for one
-    enumerated syntax.
+    absent evidence tree catches whole-validator no-ops. Running it again after
+    seeding only the first expected-commit input gets beyond that first read and
+    catches a false branch or early exit around every substantive validation.
+    Both controls fail for runtime behavior rather than one enumerated syntax.
     """
 
     script = node_heredoc_body(step, label)
@@ -799,28 +1658,55 @@ def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
         raise AssertionError(
             f"{label} is not valid Node source: {syntax.stderr.strip()}"
         )
-    with tempfile.TemporaryDirectory(prefix="kin-proof-validator-") as temporary:
-        proof_dir = Path(temporary) / "proof"
-        proof_dir.mkdir()
-        try:
-            result = subprocess.run(
-                ["node", "-"],
-                input=script,
-                cwd=proof_dir,
-                text=True,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise AssertionError(
-                f"{label} could not execute under Node: {error}"
-            ) from error
-    if result.returncode == 0:
+    expected_commit_reads = re.findall(
+        r'const expectedCommit = fs\.readFileSync\("([^"]+)", "utf8"\)\.trim\(\);',
+        script,
+    )
+    if len(expected_commit_reads) != 1:
         raise AssertionError(
-            f"{label} accepted an empty proof tree; the validator is not "
-            "runtime-falsifiable"
+            f"{label} must read exactly one expected-commit proof input: "
+            f"{expected_commit_reads}"
         )
+
+    with tempfile.TemporaryDirectory(prefix="kin-proof-validator-") as temporary:
+        temporary_root = Path(temporary).resolve()
+        proof_dir = temporary_root / "proof"
+        proof_dir.mkdir()
+
+        def require_runtime_rejection(scenario: str) -> None:
+            try:
+                result = subprocess.run(
+                    ["node", "-"],
+                    input=script,
+                    cwd=proof_dir,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise AssertionError(
+                    f"{label} could not execute under Node for {scenario}: {error}"
+                ) from error
+            if result.returncode == 0:
+                raise AssertionError(
+                    f"{label} accepted {scenario}; the validator is not "
+                    "runtime-falsifiable"
+                )
+
+        require_runtime_rejection("an empty proof tree")
+
+        expected_commit_path = (proof_dir / expected_commit_reads[0]).resolve()
+        try:
+            expected_commit_path.relative_to(temporary_root)
+        except ValueError as error:
+            raise AssertionError(
+                f"{label} expected-commit input escapes its isolated proof tree: "
+                f"{expected_commit_reads[0]!r}"
+            ) from error
+        expected_commit_path.parent.mkdir(parents=True, exist_ok=True)
+        expected_commit_path.write_text("0" * 40 + "\n", encoding="utf-8")
+        require_runtime_rejection("an expected-commit-only proof tree")
 
 
 def windows_init_contract_strings() -> dict[str, str]:
@@ -5276,6 +6162,7 @@ def main() -> None:
     assert_node_validator_rejects_missing_proof(
         repo_free, "repo-free Windows install proof"
     )
+    assert_windows_node_validator_behavior(repo_free)
     blocked_repo_free = repo_free.replace(
         '          const fs = require("fs");\n',
         '          /*\n          const fs = require("fs");\n',
@@ -5296,6 +6183,19 @@ def main() -> None:
         "validator is not runtime-falsifiable",
         lambda: assert_node_validator_rejects_missing_proof(
             false_branch_repo_free, "repo-free Windows install proof"
+        ),
+    )
+    partial_false_branch_repo_free = repo_free.replace(
+        '          const expectedCommit = fs.readFileSync("expected-commit.txt", "utf8").trim();\n',
+        '          const expectedCommit = fs.readFileSync("expected-commit.txt", "utf8").trim();\n'
+        '          if (false) {\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch after expected-commit disables the substantive Windows validator",
+        "accepted an expected-commit-only proof tree",
+        lambda: assert_node_validator_rejects_missing_proof(
+            partial_false_branch_repo_free, "repo-free Windows install proof"
         ),
     )
     for label, original, mutation in (
@@ -5346,6 +6246,7 @@ def main() -> None:
     assert_node_validator_rejects_missing_proof(
         validation, "released-byte Unix install proof"
     )
+    assert_unix_node_validator_behavior(validation)
     blocked_validation = validation.replace(
         '          const fs = require("fs");\n',
         '          /*\n          const fs = require("fs");\n',
@@ -5371,6 +6272,19 @@ def main() -> None:
         "validator is not runtime-falsifiable",
         lambda: assert_node_validator_rejects_missing_proof(
             false_branch_validation, "released-byte Unix install proof"
+        ),
+    )
+    partial_false_branch_validation = validation.replace(
+        '          const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();\n',
+        '          const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();\n'
+        '          if (false) {\n',
+        1,
+    ).replace('          NODE\n', '          }\n          NODE\n', 1)
+    expect_assertion(
+        "a false branch after expected-commit disables the substantive Unix validator",
+        "accepted an expected-commit-only proof tree",
+        lambda: assert_node_validator_rejects_missing_proof(
+            partial_false_branch_validation, "released-byte Unix install proof"
         ),
     )
     expect_assertion(
