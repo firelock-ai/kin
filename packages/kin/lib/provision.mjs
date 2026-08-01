@@ -103,11 +103,17 @@ export function formatDownloadProgress(file, received, total = null) {
   return `kin: downloading ${file}: ${transferred} received`;
 }
 
-function createDownloadProgress(file, stream = process.stderr) {
+export function createDownloadProgress(file, stream = process.stderr) {
   let lastAt = 0;
   let lastBytes = 0;
   let lastPercent = -1;
-  return ({ received, total, done = false }) => {
+  let active = false;
+  return ({ received, total, done = false, failed = false }) => {
+    if (failed) {
+      if (active) stream.write('\r\x1b[2K\n');
+      active = false;
+      return;
+    }
     const now = Date.now();
     const percent = Number.isFinite(total) && total > 0 ? Math.floor((received * 100) / total) : null;
     if (!done) {
@@ -115,39 +121,85 @@ function createDownloadProgress(file, stream = process.stderr) {
       if (percent === null && received - lastBytes < 1024 * 1024 && now - lastAt < 250) return;
     }
     stream.write(`\r\x1b[2K${formatDownloadProgress(file, received, total)}${done ? '\n' : ''}`);
+    active = !done;
     lastAt = now;
     lastBytes = received;
     lastPercent = percent;
   };
 }
 
-async function fetchBuffer(url, fetchImpl, onProgress = null) {
+async function fetchBuffer(url, fetchImpl) {
   const res = await fetchImpl(url);
   if (!res.ok) {
     throw new Error(`download failed (${res.status}) for ${url}`);
   }
 
-  const contentLength = Number(res.headers?.get?.('content-length'));
-  const total = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null;
-  if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
-    const chunks = [];
-    let received = 0;
-    for await (const chunk of res.body) {
-      const bytes = Buffer.from(chunk);
-      chunks.push(bytes);
-      received += bytes.length;
-      onProgress?.({ received, total, done: false });
-    }
-    onProgress?.({ received, total: total ?? received, done: true });
-    return Buffer.concat(chunks, received);
-  }
+  return Buffer.from(await res.arrayBuffer());
+}
 
-  // Injected/offline test fetches and lightweight fetch shims may expose only
-  // arrayBuffer(). Keep that contract intact; they receive one completion event
-  // when a caller explicitly asks for progress.
-  const buffer = Buffer.from(await res.arrayBuffer());
-  onProgress?.({ received: buffer.length, total: total ?? buffer.length, done: true });
-  return buffer;
+/**
+ * Download one response directly into a staging file while hashing it. The
+ * streaming path consumes and writes one chunk before requesting the next, so
+ * archive-sized data is never accumulated in JavaScript memory. Lightweight
+ * injected fetches that expose only arrayBuffer() retain their existing one-
+ * buffer contract.
+ */
+export async function downloadToFile(url, destination, fetchImpl, onProgress = null) {
+  let received = 0;
+  let total = null;
+  try {
+    const res = await fetchImpl(url);
+    if (!res.ok) {
+      throw new Error(`download failed (${res.status}) for ${url}`);
+    }
+
+    const contentLength = Number(res.headers?.get?.('content-length'));
+    total = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : null;
+    const hash = crypto.createHash('sha256');
+
+    if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+      const fd = fs.openSync(destination, 'w', 0o600);
+      try {
+        for await (const chunk of res.body) {
+          const bytes = ArrayBuffer.isView(chunk)
+            ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+            : Buffer.from(chunk);
+          let offset = 0;
+          while (offset < bytes.byteLength) {
+            const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+            if (written <= 0) throw new Error(`archive staging made no progress for ${url}`);
+            offset += written;
+          }
+          hash.update(bytes);
+          received += bytes.byteLength;
+          onProgress?.({ received, total, done: false });
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      // Preserve offline/injected fetch compatibility without adding a second
+      // archive-sized allocation: Buffer.from(ArrayBuffer) is a shared view.
+      const bytes = Buffer.from(await res.arrayBuffer());
+      fs.writeFileSync(destination, bytes, { mode: 0o600 });
+      hash.update(bytes);
+      received = bytes.length;
+    }
+
+    if (total !== null && received !== total) {
+      throw new Error(`download truncated for ${url}: expected ${total} bytes, received ${received}`);
+    }
+
+    onProgress?.({ received, total: total ?? received, done: true });
+    return { bytes: received, sha256: hash.digest('hex') };
+  } catch (error) {
+    try {
+      onProgress?.({ received, total, done: true, failed: true });
+    } catch {
+      // Progress cleanup is best-effort and must not hide the download error.
+    }
+    throw error;
+  }
 }
 
 /**
@@ -196,23 +248,28 @@ export async function provision(version, opts = {}) {
       ? createDownloadProgress(file)
       : onProgress;
 
-  const [archive, shaText] = await Promise.all([
-    fetchBuffer(url, fetchImpl, archiveProgress),
-    fetchBuffer(`${url}.sha256`, fetchImpl),
-  ]);
-  const expected = parseSha256File(shaText.toString('utf8'));
-  const actual = sha256Hex(archive);
-  if (actual !== expected) {
-    throw new Error(
-      `SHA-256 mismatch for ${file}: expected ${expected}, got ${actual}. ` +
-        'The download may be corrupted or tampered with; refusing to install.',
-    );
-  }
-
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kinlab-kin-'));
   try {
     const archivePath = path.join(tmp, file);
-    fs.writeFileSync(archivePath, archive);
+    // Wait for both concurrent fetches to settle before removing the staging
+    // directory. Promise.all would race cleanup against an archive stream when
+    // the small checksum request fails first.
+    const [archiveResult, checksumResult] = await Promise.allSettled([
+      downloadToFile(url, archivePath, fetchImpl, archiveProgress),
+      fetchBuffer(`${url}.sha256`, fetchImpl),
+    ]);
+    if (archiveResult.status === 'rejected') throw archiveResult.reason;
+    if (checksumResult.status === 'rejected') throw checksumResult.reason;
+
+    const expected = parseSha256File(checksumResult.value.toString('utf8'));
+    const actual = archiveResult.value.sha256;
+    if (actual !== expected) {
+      throw new Error(
+        `SHA-256 mismatch for ${file}: expected ${expected}, got ${actual}. ` +
+          'The download may be corrupted or tampered with; refusing to install.',
+      );
+    }
+
     // bsdtar reads both .tar.gz and .zip with -xf, on macOS, Linux, and
     // Windows 10+ (tar.exe ships in System32).
     const tar = spawnSync('tar', ['-xf', archivePath, '-C', tmp], { encoding: 'utf8' });
