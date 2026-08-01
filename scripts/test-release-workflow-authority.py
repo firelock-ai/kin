@@ -27,6 +27,8 @@ RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
+WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
+WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 PREPARE_RELEASE = ROOT / "scripts" / "prepare-release.mjs"
@@ -700,6 +702,55 @@ def workflow_active_header_source(workflow: str) -> str:
     return classifier_active_job_source(workflow.split(marker, 1)[0])
 
 
+def active_lines(source: str) -> list[str]:
+    """Return a block's non-blank, non-comment lines, stripped of indentation."""
+
+    return [
+        line.strip()
+        for line in source.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def install_proof_step(install_proof: str, name: str) -> str:
+    """Return one install-proof step, from its name to the next step's name."""
+
+    anchor = f"      - name: {name}\n"
+    if install_proof.count(anchor) != 1:
+        raise AssertionError(f"install proof must declare one step named {name}")
+    start = install_proof.index(anchor)
+    return install_proof[
+        start : install_proof.index("\n      - name: ", start + len(anchor))
+    ]
+
+
+def windows_init_contract_strings() -> dict[str, str]:
+    """Return the shipped Windows admission contract's own refusal strings.
+
+    The install proof installs a public release anonymously and has no
+    checkout, so it cannot run the contract script and retypes these instead.
+    Reading the script here is the only thing that keeps the two statements of
+    one contract from drifting apart.
+    """
+
+    source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
+    strings: dict[str, str] = {}
+    for name in (
+        "CONFIG_REFUSAL",
+        "SOURCE_PROOF_STAGE",
+        "DURABLE_FLUSH_GAP",
+        "NON_EMPTY_REFUSAL",
+    ):
+        bindings = re.findall(rf'(?m)^{name}="([^"]+)"$', source)
+        if len(bindings) != 1:
+            raise AssertionError(
+                f"{WINDOWS_INIT_CONTRACT_POLICY} must bind {name} exactly once: "
+                f"{bindings}"
+            )
+        strings[name] = bindings[0]
+    return strings
+
+
 def assert_install_proof_init_log_authority(first_run: str) -> None:
     """Keep the install proof's own report files out of the worktree kin init admits.
 
@@ -708,32 +759,182 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
     differ. A report file written into that worktree therefore breaks admission
     twice over: it is an untracked non-ignored path, and an ignored one would
     still change size between the repeats.
+
+    Pinning the capture lines is not enough on its own, because the property is
+    about the whole span between entering that worktree and admitting it. Three
+    mutations leave every pinned line in place and still break admission or the
+    evidence it produces: an unrelated write into the worktree before init, a
+    copy-back reordered above init, and a second init that an exact-prefix count
+    cannot see. So the span is closed-form, the capture order is asserted, and
+    an `init` this function does not recognize is refused by name.
     """
 
-    active = [
-        line.strip()
-        for line in first_run.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+    active = active_lines(first_run)
+    admission = 'kin init > "$init_log" 2>&1 || init_status=$?'
+    bootstrap = (
+        "git init -q && git config user.email ci@firelock.ai && git config user.name ci"
+    )
+    entry = "mkdir -p kin-install-proof && cd kin-install-proof"
+    copy_back = 'cp "$init_log" kin-init.txt'
+    propagate = 'if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi'
+    # An `init` token anywhere in an active line, not a prefix of one:
+    # `(cd sub && kin init)`, `eval kin init`, and `"$KIN" init` all admit a
+    # worktree and none of them starts with `kin init`.
+    init_token = re.compile(r"(?<![\w./-])init(?![\w-])")
+    admissions = [
+        line for line in active if init_token.search(line) and line != bootstrap
     ]
-    init_lines = [line for line in active if line.startswith("kin init")]
-    if len(init_lines) != 1:
+    if len(admissions) != 1:
         raise AssertionError(
-            "install proof must invoke kin init exactly once in the first-run step"
+            "install proof must invoke kin init exactly once in the first-run "
+            f"step: {admissions}"
         )
-    if init_lines[0] != 'kin init > "$init_log" 2>&1 || init_status=$?':
+    if admissions[0] != admission:
         raise AssertionError(
             "kin init must write its log outside the worktree it admits rather "
-            f"than through a relative redirect or pipe: {init_lines[0]}"
+            f"than through a relative redirect or pipe: {admissions[0]}"
         )
     for policy in (
+        entry,
         'init_log="$RUNNER_TEMP/kin-init.txt"',
-        'cp "$init_log" kin-init.txt',
-        'if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi',
+        copy_back,
+        propagate,
     ):
         if policy not in active:
             raise AssertionError(
                 f"install-proof init log capture lost an active line: {policy}"
             )
+    # The log is copied back after admission and kin's own exit status is
+    # propagated after that. Reordering the copy above init leaves every pinned
+    # line present, and only `set -e` on a not-yet-created file catches it.
+    order = [active.index(step) for step in (admission, copy_back, propagate)]
+    if order != sorted(order):
+        raise AssertionError(
+            "install-proof init log capture must admit, then copy the log back, "
+            f"then propagate kin's own exit status; found line order {order}"
+        )
+    # Nothing may write into the worktree between entering it and admitting it.
+    # A line-presence check cannot see an inserted write, and an inserted write
+    # is byte-for-byte the class that broke the v0.4.5 release proof.
+    prelude = active[active.index(entry) + 1 : order[0]]
+    committed_prelude = [
+        bootstrap,
+        "printf 'def hello():\\n    return 42\\n' > probe.py",
+        'git add -A && git commit -qm "probe"',
+        'init_log="$RUNNER_TEMP/kin-init.txt"',
+        "init_status=0",
+    ]
+    if prelude != committed_prelude:
+        raise AssertionError(
+            "only the committed Git bootstrap may run between entering the "
+            f"worktree kin init admits and admitting it; found {prelude}"
+        )
+
+
+def assert_install_proof_repo_steps_are_unix_only(install_proof: str) -> None:
+    """Keep every repository-dependent install-proof step off Windows.
+
+    `kin init` refuses every admission boundary on Windows and the contract
+    script asserts that refusal by name on every pull request, so a step
+    needing an admitted repository has no passing outcome available to it
+    there. Without these guards the release gate demands the admission the
+    shipped product refuses, and the Windows leg cannot go green on either
+    answer.
+    """
+
+    for step in (
+        "First-run repository, daemon, and setup proof",
+        "Graph query and MCP tool-call proof",
+        "Validate installed capability proof",
+    ):
+        if "if: runner.os != 'Windows'" not in "\n".join(
+            active_lines(install_proof_step(install_proof, step))
+        ):
+            raise AssertionError(
+                f"install proof requires a Kin repository on Windows: {step} lost "
+                "its runner.os != 'Windows' guard"
+            )
+
+
+def assert_install_proof_windows_admission_contract(
+    windows_admission: str, contract: dict[str, str]
+) -> None:
+    """Require the install proof to assert the refusal Windows actually ships.
+
+    A release proof that asserted an admission the product refuses can never go
+    green, and one that asserted a refusal the product no longer produces would
+    go green on the wrong behavior. Both failure modes are closed by requiring
+    each boundary to name its own cause in the contract's own words, and by
+    requiring every refusal to have published nothing.
+    """
+
+    active = "\n".join(active_lines(windows_admission))
+    for name, refusal in contract.items():
+        binding = f'{name}="{refusal}"'
+        if binding not in active:
+            raise AssertionError(
+                "install proof must assert the shipped Windows admission contract "
+                f"verbatim; {name} drifted from {WINDOWS_INIT_CONTRACT_POLICY}: "
+                f"expected {binding}"
+            )
+    for policy in (
+        'require_refused "Windows exact-Git admission"',
+        'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
+        'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
+        'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
+        'require_refused "Windows native-unborn bootstrap"',
+        'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
+        'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
+        'require_refused "Windows non-empty native boundary"',
+        'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
+        'fail "$1 unexpectedly succeeded" "$3"',
+        'if [ -e "$2/.kin" ]; then',
+        "staged=\"$(count_matching \"$2\" '.kin.init-*')\"",
+    ):
+        require(active, policy, "shipped Windows admission contract proof")
+
+
+def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
+    """Keep proving every Windows surface that survives without a repository.
+
+    Windows-gating the repository steps is a reduction in release coverage, so
+    what remains has to stay genuinely falsifiable rather than becoming a leg
+    that installs a binary and declares victory. The installed binaries still
+    prove their build provenance against the release tag's own public source,
+    the platform capability posture is still pinned by name including the
+    repair negative control, and setup still writes and validates the shell
+    hook, the install ledger, and all five agent-client MCP configs.
+    """
+
+    active = "\n".join(active_lines(repo_free))
+    for policy in (
+        "kin bench-meta --json > kin-windows-bench-meta.json",
+        "kin registry authority --json > kin-windows-registry-authority.json",
+        "if kin registry authority --fix > kin-windows-registry-fix.txt 2>&1; then",
+        'kin setup --no-interactive --intent agent --shell "$PROOF_SHELL"',
+        "kin setup status --json | tee kin-windows-health.json",
+        "kin doctor --json | tee kin-windows-doctor.json",
+        'fs.readFileSync("expected-commit.txt", "utf8").trim()',
+        'fs.readFileSync("expected-lock-sha.txt", "utf8").trim()',
+        "meta.kin_commit !== expectedCommit",
+        "meta.kin_dirty !== false",
+        "meta.kin_source_known !== true",
+        "meta.dependency_provenance !== expectedLock",
+        'authority.checks[0]?.state !== "unsupported"',
+        '["repo_init", "missing"]',
+        '["daemon_running", "unsupported"]',
+        '["registry_authority", "unsupported"]',
+        '["vfs_projection", "unsupported"]',
+        '["semantic_query_readiness", "unsupported"]',
+        '["shell_path", "healthy"]',
+        '["setup_ledger", "healthy"]',
+        '["mcp_client_claude", "healthy"]',
+        '["mcp_client_cursor", "healthy"]',
+        '["mcp_client_codex", "healthy"]',
+        '["mcp_client_gemini", "healthy"]',
+        '["mcp_client_windsurf", "healthy"]',
+    ):
+        require(active, policy, "repo-free Windows install proof")
 
 
 def assert_docs_only_classifier_guard(workflow: str) -> None:
@@ -3585,15 +3786,22 @@ def main() -> None:
     first_run_start = install_proof.index(
         "      - name: First-run repository, daemon, and setup proof"
     )
+    # The guarded span ends at the next step rather than three steps later, so
+    # the failure message naming the first-run step describes the region it
+    # actually covers and a legitimate later `kin init` is not misdiagnosed.
+    graph_query_start = install_proof.index(
+        "      - name: Graph query and MCP tool-call proof",
+        first_run_start,
+    )
     embedding_start = install_proof.index(
         "      - name: Unix embedding and semantic retrieval proof",
-        first_run_start,
+        graph_query_start,
     )
     validation_start = install_proof.index(
         "      - name: Validate installed capability proof",
         embedding_start,
     )
-    first_run = install_proof[first_run_start:embedding_start]
+    first_run = install_proof[first_run_start:graph_query_start]
     embedding = install_proof[embedding_start:validation_start]
     for policy in (
         'case "$PROOF_SHELL" in',
@@ -3637,6 +3845,159 @@ def main() -> None:
             lambda mutated=first_run.replace(
                 active_line, f"# {active_line}", 1
             ): assert_install_proof_init_log_authority(mutated),
+        )
+    for label, wrapped_init in (
+        ("a wrapped second kin init", "(cd sub && kin init)"),
+        ("an indirect second admission", '"$KIN" init'),
+        ("an evaluated second admission", "eval kin init"),
+    ):
+        expect_assertion(
+            f"{wrapped_init} escapes the exactly-once count",
+            "exactly once",
+            lambda mutated=f"{first_run}\n          {wrapped_init}\n": (
+                assert_install_proof_init_log_authority(mutated)
+            ),
+        )
+    expect_assertion(
+        "an unrelated write into the admitted worktree escapes the guard",
+        "only the committed Git bootstrap may run",
+        lambda: assert_install_proof_init_log_authority(
+            first_run.replace(
+                '          init_log="$RUNNER_TEMP/kin-init.txt"\n',
+                "          echo scratch > proof-note.txt\n"
+                '          init_log="$RUNNER_TEMP/kin-init.txt"\n',
+                1,
+            )
+        ),
+    )
+    expect_assertion(
+        "the init log is copied back before the worktree is admitted",
+        "must admit, then copy the log back",
+        lambda: assert_install_proof_init_log_authority(
+            first_run.replace(
+                '          kin init > "$init_log" 2>&1 || init_status=$?\n'
+                '          cat "$init_log"\n'
+                '          cp "$init_log" kin-init.txt\n',
+                '          cp "$init_log" kin-init.txt\n'
+                '          kin init > "$init_log" 2>&1 || init_status=$?\n'
+                '          cat "$init_log"\n',
+                1,
+            )
+        ),
+    )
+
+    # The Windows leg asserts the admission the shipped product refuses, and
+    # everything the platform still proves without a repository.
+    windows_contract = windows_init_contract_strings()
+    windows_admission = install_proof_step(
+        install_proof, "Windows admission contract proof"
+    )
+    assert_install_proof_windows_admission_contract(windows_admission, windows_contract)
+    expect_assertion(
+        "the install proof's Windows refusal wording drifts from the contract script",
+        "drifted from",
+        lambda: assert_install_proof_windows_admission_contract(
+            windows_admission.replace(
+                windows_contract["DURABLE_FLUSH_GAP"],
+                "for durable metadata sync",
+                1,
+            ),
+            windows_contract,
+        ),
+    )
+    expect_assertion(
+        "the contract script's refusal wording drifts from the install proof",
+        "drifted from",
+        lambda: assert_install_proof_windows_admission_contract(
+            windows_admission,
+            {**windows_contract, "NON_EMPTY_REFUSAL": "requires an empty folder"},
+        ),
+    )
+    for label, active_line in (
+        (
+            "a Windows refusal may publish a repository anyway",
+            'if [ -e "$2/.kin" ]; then',
+        ),
+        (
+            "a Windows refusal may leave its unpublished stage behind",
+            "staged=\"$(count_matching \"$2\" '.kin.init-*')\"",
+        ),
+        (
+            "a successful Windows admission stops failing the leg",
+            'fail "$1 unexpectedly succeeded" "$3"',
+        ),
+        (
+            "the exact-Git refusal stops having to name its own cause",
+            'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
+        ),
+        (
+            "the non-empty native boundary stops being asserted",
+            'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
+        ),
+    ):
+        expect_assertion(
+            label,
+            "shipped Windows admission contract proof",
+            lambda mutated=windows_admission.replace(
+                active_line, f"# {active_line}", 1
+            ): assert_install_proof_windows_admission_contract(
+                mutated, windows_contract
+            ),
+        )
+
+    assert_install_proof_repo_steps_are_unix_only(install_proof)
+    for repo_step in (
+        "First-run repository, daemon, and setup proof",
+        "Graph query and MCP tool-call proof",
+        "Validate installed capability proof",
+    ):
+        expect_assertion(
+            f"the install proof demands a Kin repository on Windows in {repo_step}",
+            "runner.os != 'Windows' guard",
+            lambda mutated=install_proof.replace(
+                f"      - name: {repo_step}\n        if: runner.os != 'Windows'\n",
+                f"      - name: {repo_step}\n",
+                1,
+            ): assert_install_proof_repo_steps_are_unix_only(mutated),
+        )
+
+    repo_free = install_proof_step(
+        install_proof, "Windows repo-free provenance and setup proof"
+    )
+    assert_install_proof_repo_free_windows_proof(repo_free)
+    for label, original, mutation in (
+        (
+            "the Windows leg stops binding installed provenance to the release tag",
+            "meta.kin_commit !== expectedCommit",
+            'meta.kin_commit !== "0000000000000000000000000000000000000000"',
+        ),
+        (
+            "the Windows leg stops proving the release Cargo.lock provenance",
+            "meta.dependency_provenance !== expectedLock",
+            'meta.dependency_provenance !== ""',
+        ),
+        (
+            "the Windows registry-authority repair negative control disappears",
+            "if kin registry authority --fix > kin-windows-registry-fix.txt 2>&1; then",
+            "if false; then",
+        ),
+        (
+            "the repo-free posture stops requiring a missing repository",
+            '["repo_init", "missing"]',
+            '["repo_init", "healthy"]',
+        ),
+        (
+            "the repo-free posture stops proving the agent-client MCP writers",
+            '["mcp_client_codex", "healthy"]',
+            "",
+        ),
+    ):
+        expect_assertion(
+            label,
+            "repo-free Windows install proof",
+            lambda mutated=repo_free.replace(
+                original, mutation, 1
+            ): assert_install_proof_repo_free_windows_proof(mutated),
         )
     for policy in (
         "PROOF_SHELL: ${{ matrix.setup-shell }}",
@@ -3724,6 +4085,16 @@ def main() -> None:
         "release-provenance.json.sha256",
         "release-provenance-attestation.json",
         "installed-vfs-provenance.json",
+        # The Windows leg's whole evidence trail. Its admission logs are the
+        # only record of what each refusal actually said, and the v0.4.5
+        # incident was diagnosed from exactly this kind of uploaded log.
+        "kin-windows-bench-meta.json",
+        "kin-windows-registry-authority.json",
+        "kin-windows-registry-fix.txt",
+        "kin-windows-setup.txt",
+        "kin-windows-health.json",
+        "kin-windows-doctor.json",
+        "kin-windows-admission/*.txt",
     ):
         require(proof_upload, report, "preserved installed-artifact proof report")
 
