@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (411 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (421 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -24,6 +24,27 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | --- | --- | --- | --- | --- |
 | `KIN_ENV_VALIDATION` | enum | warn | operational | startup env validation mode: off, warn (default), or strict |
 
+## Install & launch
+
+| Variable | Kind | Default | Sensitivity | Description |
+| --- | --- | --- | --- | --- |
+| `KIN_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the shell and PowerShell installers |
+| `KIN_BINARY_PATH` | path | *(unset)* | operational | override the kin binary path for bench dispatch |
+| `KIN_DIR` | path | *(unset)* | operational | compatibility alias for the managed Kin install root; KIN_HOME wins when both are set |
+| `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks |
+| `KIN_LAUNCHER_ADOPT` | bool | false | operational | force the @kinlab/kin launcher to provision its pinned release, including an intentional downgrade |
+| `KIN_MANAGED_BIN` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin launcher instead of provisioning |
+| `KIN_MCP_AUTO_INIT` | bool | false | operational | allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup |
+| `KIN_MCP_CACHE_DIR` | path | *(unset)* | operational | cache directory override for the npm MCP wrapper's managed Kin binary |
+| `KIN_MCP_KIN_BINARY` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin-mcp wrapper |
+| `KIN_MCP_RELEASE_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the @kinlab/kin-mcp wrapper |
+| `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
+| `KIN_MCP_TOOL_PROFILE` | string | *(unset)* | operational | MCP tool exposure profile |
+| `KIN_NO_PROVISION` | bool | false | operational | forbid network provisioning by the @kinlab/kin launcher |
+| `KIN_NO_SETUP` | bool | false | operational | skip the installer's post-install setup wizard when set truthy |
+| `KIN_REGISTRY_REPAIR` | bool | false | operational | allow the POSIX installer to repair safe registry ownership modes |
+| `KIN_VERSION` | string | latest | operational | release version selected by the shell and PowerShell installers |
+
 ## General
 
 | Variable | Kind | Default | Sensitivity | Description |
@@ -35,16 +56,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ALLOW_PARENT_STORE` | bool | false | operational | allow discovering a store in a parent directory |
 | `KIN_API_URL` | url | *(unset)* | operational | hosted API base URL (release/pipeline commands) |
 | `KIN_BENCHMARK` | bool | false | diagnostic | benchmark-mode marker for with-sessions |
-| `KIN_BINARY_PATH` | path | *(unset)* | operational | override the kin binary path for bench dispatch |
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_CLAUDE_DISALLOWED_TOOLS` | string | *(unset)* | operational | comma-separated tool names disallowed in a with-session |
-| `KIN_DIR` | path | *(unset)* | operational | compatibility alias for the managed Kin install root; KIN_HOME wins when both are set |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
-| `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks |
-| `KIN_MCP_CACHE_DIR` | path | *(unset)* | operational | cache directory override for the npm MCP wrapper's managed Kin binary |
-| `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
-| `KIN_MCP_TOOL_PROFILE` | string | *(unset)* | operational | MCP tool exposure profile |
 | `KIN_NO_DAEMON` | bool | false | operational | force in-process execution instead of the daemon |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
 | `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |
