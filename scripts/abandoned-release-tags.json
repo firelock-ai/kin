@@ -14,6 +14,13 @@
       "reason": "The workflow snapshot frozen at this tag verifies a published archive by asserting that every entry at its root is a regular file, and the same snapshot packages KinNotifier.app, the signed and stapled macOS notification bundle, into both macOS archives as a directory. Every macOS leg is therefore refused at the Publish Release step by the tag's own workflow, which no later change to main can alter. All three attempts of the cited run failed and no GitHub Release object was ever created.",
       "superseded_by": "v0.4.5",
       "failed_release_run_id": "30647442701"
+    },
+    {
+      "tag": "v0.4.5",
+      "sha": "93a74a91af929a340d9ec90999601843d0b325b1",
+      "reason": "The public install proof frozen at this tag pipes kin init through tee into kin-init.txt inside the worktree it asks kin to admit, so an untracked non-ignored path exists before admission runs and admission is refused on every platform. The proof is called as a local reusable workflow and therefore resolves from the tag rather than from main, so no later change to main can reach the failing step. All three attempts of the cited run failed on all five platforms, and the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, so the tag never became the finalized Latest release and nothing downstream of admission ever ran.",
+      "superseded_by": "v0.4.6",
+      "failed_release_run_id": "30678146368"
     }
   ]
 }
