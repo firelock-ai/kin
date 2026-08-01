@@ -1212,7 +1212,11 @@ fn acquire_write_lock(path: &Path, label: &str) -> Result<File, VectorError> {
 }
 
 fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), VectorError> {
-    let file = File::open(tmp_path).map_err(|e| {
+    // `File::open` is read-only. Unix accepts `fsync` on that descriptor, but
+    // Windows implements `File::sync_all` with `FlushFileBuffers`, whose handle
+    // must carry GENERIC_WRITE. Reopen without create/truncate so the already
+    // written candidate is flushed exactly as-is on every platform.
+    let file = OpenOptions::new().write(true).open(tmp_path).map_err(|e| {
         VectorError::IndexError(format!(
             "failed to reopen for fsync {}: {e}",
             tmp_path.display()
@@ -1228,20 +1232,16 @@ fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), VectorError> {
             path.display()
         ))
     })?;
-
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-
-    Ok(())
+    sync_parent_dir(path)
 }
 
 fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), VectorError> {
     fs::write(path, bytes)
         .map_err(|e| VectorError::IndexError(format!("failed to write {}: {e}", path.display())))?;
-    let file = File::open(path).map_err(|e| {
+    // Keep the reopen writable for the same cross-platform reason as
+    // `fsync_and_rename`: Windows refuses FlushFileBuffers on a read-only
+    // handle with ERROR_ACCESS_DENIED.
+    let file = OpenOptions::new().write(true).open(path).map_err(|e| {
         VectorError::IndexError(format!(
             "failed to reopen for fsync {}: {e}",
             path.display()
@@ -1252,17 +1252,63 @@ fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), VectorError> 
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+fn sync_directory(path: &Path) -> Result<(), VectorError> {
+    #[cfg(windows)]
+    let dir = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+        // Opening a directory on Windows requires BACKUP_SEMANTICS, while
+        // FlushFileBuffers requires a handle carrying GENERIC_WRITE. A normal
+        // File::open supplies neither guarantee and can therefore turn this
+        // durability barrier into ERROR_ACCESS_DENIED.
+        OpenOptions::new()
+            .access_mode(GENERIC_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    #[cfg(not(windows))]
+    let dir = File::open(path);
+
+    let dir = dir.map_err(|e| {
+        VectorError::IndexError(format!(
+            "failed to open directory for fsync {}: {e}",
+            path.display()
+        ))
+    })?;
+    let metadata = dir.metadata().map_err(|e| {
+        VectorError::IndexError(format!(
+            "failed to verify fsync directory {}: {e}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(VectorError::IndexError(format!(
+            "fsync path is not a directory: {}",
+            path.display()
+        )));
     }
+    dir.sync_all().map_err(|e| {
+        VectorError::IndexError(format!("failed to fsync directory {}: {e}", path.display()))
+    })
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), VectorError> {
+    // A relative leaf such as `vectors.hnsw` has an empty parent path. Treat
+    // that as the current directory so the namespace update still gets a
+    // durability barrier.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_directory(parent)
 }
 
 fn clear_recovery_candidate(path: &Path, label: &str) -> Result<(), VectorError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
+    let mut removed = false;
     if tmp_path.exists() {
         fs::remove_file(&tmp_path).map_err(|e| {
             VectorError::IndexError(format!(
@@ -1270,6 +1316,7 @@ fn clear_recovery_candidate(path: &Path, label: &str) -> Result<(), VectorError>
                 tmp_path.display()
             ))
         })?;
+        removed = true;
     }
     if marker_path.exists() {
         fs::remove_file(&marker_path).map_err(|e| {
@@ -1278,6 +1325,10 @@ fn clear_recovery_candidate(path: &Path, label: &str) -> Result<(), VectorError>
                 marker_path.display()
             ))
         })?;
+        removed = true;
+    }
+    if removed {
+        sync_parent_dir(path)?;
     }
     Ok(())
 }
@@ -1296,8 +1347,7 @@ fn write_recovery_marker(path: &Path, bytes: &[u8]) -> Result<(), VectorError> {
         ))
     })?;
     write_bytes_with_fsync(&marker_path, &marker_bytes)?;
-    sync_parent_dir(path);
-    Ok(())
+    sync_parent_dir(path)
 }
 
 fn write_bytes_recovery_candidate(
@@ -1322,7 +1372,7 @@ fn promote_recovery_candidate(path: &Path) -> Result<(), VectorError> {
                 marker_path.display()
             ))
         })?;
-        sync_parent_dir(path);
+        sync_parent_dir(path)?;
     }
     Ok(())
 }
@@ -2849,6 +2899,59 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, e1);
         assert_eq!(results[1].0, e3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistence_flushes_writable_windows_handles_before_promotion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.hnsw");
+        let tmp_path = recovery_tmp_path(&path);
+
+        write_bytes_with_fsync(&tmp_path, b"durable vector candidate")
+            .expect("FlushFileBuffers must receive a writable temporary-file handle");
+        fsync_and_rename(&tmp_path, &path)
+            .expect("the writable candidate must flush before atomic promotion");
+
+        assert_eq!(fs::read(path).unwrap(), b"durable vector candidate");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistence_flushes_windows_parent_directory_with_writable_handle() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // This is the exact legacy barrier: File::open creates a read-only
+        // handle and does not request directory semantics. It cannot provide a
+        // Windows namespace durability guarantee.
+        let legacy_barrier = File::open(dir.path()).and_then(|dir| dir.sync_all());
+        assert!(
+            legacy_barrier.is_err(),
+            "the regression proof expects the legacy read-only directory barrier to fail"
+        );
+
+        sync_directory(dir.path()).expect(
+            "the Windows directory barrier must use GENERIC_WRITE and FILE_FLAG_BACKUP_SEMANTICS",
+        );
+
+        let path = dir.path().join("vectors.hnsw");
+        let tmp_path = recovery_tmp_path(&path);
+        write_bytes_with_fsync(&tmp_path, b"durable namespace candidate").unwrap();
+        fsync_and_rename(&tmp_path, &path)
+            .expect("atomic promotion must propagate a successful parent-directory barrier");
+    }
+
+    #[test]
+    fn persistence_directory_barrier_rejects_regular_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("not-a-directory");
+        fs::write(&path, b"ordinary file").unwrap();
+
+        let error = sync_directory(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("not a directory"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
