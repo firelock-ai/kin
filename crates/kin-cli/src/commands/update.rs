@@ -6,6 +6,8 @@ use fs2::FileExt;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
@@ -1553,6 +1555,192 @@ pub(crate) struct InstallRootLock {
     install: InstallLayout,
 }
 
+/// Shared admission lease held from immediately before a managed supervisor or
+/// worker spawn until that child has published readiness. Full uninstall takes
+/// the same `update.lock` exclusively, so a spawn is either wholly before the
+/// uninstall stop sweep or wholly after retirement (where path revalidation
+/// fails because the managed binary no longer exists).
+pub(crate) struct InstallSpawnFence {
+    _file: File,
+}
+
+impl InstallSpawnFence {
+    pub(crate) fn acquire_for_daemon_binary(binary: &Path) -> Result<Option<Self>> {
+        let configured_root = crate::commands::setup::kin_dir()?;
+        Self::acquire_for_daemon_binary_at(binary, &configured_root)
+    }
+
+    fn acquire_for_daemon_binary_at(binary: &Path, configured_root: &Path) -> Result<Option<Self>> {
+        let Some(bin_dir) = binary.parent() else {
+            return Ok(None);
+        };
+        if bin_dir.file_name().and_then(|name| name.to_str()) != Some("bin") {
+            return Ok(None);
+        }
+        let Some(candidate_root) = bin_dir.parent() else {
+            return Ok(None);
+        };
+        let candidate_root = candidate_root.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve managed daemon install root {}",
+                candidate_root.display()
+            )
+        })?;
+        let candidate_root_name = candidate_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let retired_token = candidate_root_name
+            .strip_prefix(".kin-uninstall-retired-")
+            .or_else(|| candidate_root_name.strip_prefix(".kin-uninstall-delete-"));
+        if retired_token.is_some_and(|token| uuid::Uuid::parse_str(token).is_ok()) {
+            anyhow::bail!(
+                "refusing to spawn a managed daemon from retired uninstall state: {}",
+                binary.display()
+            );
+        }
+        let configured_root = match configured_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve configured Kin install root {}",
+                        configured_root.display()
+                    )
+                })
+            }
+        };
+        if candidate_root != configured_root {
+            return Ok(None);
+        }
+        let expected_binary = configured_root.join("bin").join(
+            binary
+                .file_name()
+                .context("managed daemon binary has no file name")?,
+        );
+        let binary_metadata = fs::symlink_metadata(binary).with_context(|| {
+            format!(
+                "failed to inspect managed daemon binary {}",
+                binary.display()
+            )
+        })?;
+        if binary_metadata.file_type().is_symlink() || !binary_metadata.is_file() {
+            anyhow::bail!(
+                "managed daemon binary is not a real non-symlink file: {}",
+                binary.display()
+            );
+        }
+        let resolved_binary = binary.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve managed daemon binary {}",
+                binary.display()
+            )
+        })?;
+        if resolved_binary
+            != expected_binary.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve expected managed daemon binary {}",
+                    expected_binary.display()
+                )
+            })?
+        {
+            anyhow::bail!(
+                "managed daemon binary changed while acquiring spawn admission: {}",
+                binary.display()
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let parent_path = configured_root
+                .parent()
+                .context("Kin install root has no parent")?;
+            let root_name = configured_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("Kin install root name is not UTF-8")?;
+            let parent = AnchoredDir::open_ambient(parent_path)?;
+            let root = parent.open_child(root_name)?;
+            parent.ensure_child_binding(root_name, &root)?;
+            let (mut file, created) = open_lock_file_at(&root)?;
+            if created {
+                file.write_all(b"kin-update-lock-v1\n")?;
+                file.sync_all()?;
+                root.sync()?;
+            }
+            FileExt::lock_shared(&file).context("failed to acquire managed daemon spawn lease")?;
+            let lock = rustix::fs::fstat(&file)?;
+            ensure_root_lock_binding(
+                &parent,
+                root_name,
+                &root,
+                lock.st_dev as u64,
+                lock.st_ino as u64,
+            )?;
+            if binary.canonicalize().ok().as_deref() != Some(resolved_binary.as_path()) {
+                anyhow::bail!(
+                    "managed daemon binary changed after spawn admission: {}",
+                    binary.display()
+                );
+            }
+            return Ok(Some(Self { _file: file }));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let path = configured_root.join("update.lock");
+            let (mut file, created) = open_lock_file(&path)?;
+            if created {
+                file.write_all(b"kin-update-lock-v1\n")?;
+                file.sync_all()?;
+            }
+            FileExt::lock_shared(&file).context("failed to acquire managed daemon spawn lease")?;
+            if configured_root.canonicalize()? != candidate_root
+                || binary.canonicalize().ok().as_deref() != Some(resolved_binary.as_path())
+            {
+                anyhow::bail!("managed daemon install changed after spawn admission");
+            }
+            Ok(Some(Self { _file: file }))
+        }
+    }
+}
+
+/// An install root detached from its public pathname while the exact directory
+/// incarnation remains pinned by open descriptors. Cleanup is descriptor-
+/// relative; callers never reopen the retired tree by pathname.
+#[cfg(unix)]
+pub(crate) struct RetiredInstallRoot {
+    parent: AnchoredDir,
+    root: AnchoredDir,
+    name: String,
+    incomplete_marker: String,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl RetiredInstallRoot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove only the directory incarnation pinned at retirement. If any
+    /// binding changes, preserve the replacement and fail closed.
+    pub(crate) fn remove(self) -> Result<()> {
+        self.root.remove_contents_recursive()?;
+        self.root.ensure_empty()?;
+        self.parent
+            .ensure_child_binding(&self.name, &self.root)
+            .context("retired Kin install root binding changed before final removal")?;
+        self.parent.remove_child_dir(&self.name)?;
+        self.parent.quarantine_verified_regular(
+            &self.incomplete_marker,
+            "Kin uninstall incomplete marker",
+            || Ok(()),
+        )
+    }
+}
+
 impl InstallRootLock {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn acquire(kin_home: &Path) -> Result<Self> {
@@ -1678,9 +1866,11 @@ impl InstallRootLock {
     /// The returned sibling path names the same anchored directory incarnation
     /// this lock was acquired against.
     #[cfg(unix)]
-    pub(crate) fn retire_for_uninstall(&self) -> Result<PathBuf> {
+    pub(crate) fn retire_for_uninstall(&self) -> Result<RetiredInstallRoot> {
         let install = self.install()?;
-        let retired_name = format!(".kin-uninstall-retired-{}", uuid::Uuid::new_v4());
+        let token = uuid::Uuid::new_v4();
+        let retired_name = format!(".kin-uninstall-retired-{token}");
+        let incomplete_marker = format!(".kin-uninstall-incomplete-{token}");
         if install.parent.stat_entry(&retired_name)?.is_some() {
             anyhow::bail!(
                 "refusing to replace an existing uninstall retirement path {}/{}",
@@ -1688,20 +1878,35 @@ impl InstallRootLock {
                 retired_name
             );
         }
+        if install.parent.stat_entry(&incomplete_marker)?.is_some() {
+            anyhow::bail!(
+                "refusing to replace an existing uninstall incomplete marker {}/{}",
+                install.parent.display.display(),
+                incomplete_marker
+            );
+        }
         install.ensure_bound()?;
-        rustix::fs::renameat_with(
+        install.parent.create_exclusive_file(
+            &incomplete_marker,
+            b"kin-uninstall-incomplete-v1\n",
+            0o600,
+        )?;
+        let rename = rustix::fs::renameat_with(
             &install.parent.file,
             install.root_name.as_str(),
             &install.parent.file,
             retired_name.as_str(),
             rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .with_context(|| {
-            format!(
-                "failed to atomically retire locked Kin install root {}",
-                self.root.display()
-            )
-        })?;
+        );
+        if let Err(error) = rename {
+            let _ = install.parent.unlink_file(&incomplete_marker);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to atomically retire locked Kin install root {}",
+                    self.root.display()
+                )
+            });
+        }
         install.parent.sync()?;
         let retired = install
             .parent
@@ -1716,7 +1921,14 @@ impl InstallRootLock {
                 install.parent.display.join(&retired_name).display()
             );
         }
-        Ok(install.parent.display.join(retired_name))
+        let path = install.parent.display.join(&retired_name);
+        Ok(RetiredInstallRoot {
+            parent: install.parent.try_clone()?,
+            root: install.root.try_clone()?,
+            name: retired_name,
+            incomplete_marker,
+            path,
+        })
     }
 
     #[cfg(unix)]
@@ -2629,6 +2841,37 @@ impl AnchoredDir {
         }
     }
 
+    fn create_exclusive_file(&self, name: &str, bytes: &[u8], mode: u32) -> Result<()> {
+        let fd = rustix::fs::openat(
+            &self.file,
+            name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(mode as _),
+        )
+        .with_context(|| {
+            format!(
+                "failed to create exclusive anchored file {}/{}",
+                self.display.display(),
+                name
+            )
+        })?;
+        let result = (|| -> Result<()> {
+            let mut file = File::from(fd);
+            set_and_verify_file_mode(&file, mode, "exclusive anchored file")?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            self.sync()
+        })();
+        if result.is_err() {
+            let _ = self.unlink_file(name);
+        }
+        result
+    }
+
     fn quarantine_verified_regular<C>(
         &self,
         name: &str,
@@ -2726,6 +2969,155 @@ impl AnchoredDir {
                 )
             }),
         }
+    }
+
+    /// Empty this exact open directory without following a pathname back to
+    /// it. Every child is first moved to an unpredictable quarantine name and
+    /// its inode is revalidated there. Concurrent additions or substitutions
+    /// therefore make cleanup fail closed instead of deleting the newcomer.
+    fn remove_contents_recursive(&self) -> Result<()> {
+        let mut directory = rustix::fs::Dir::read_from(&self.file).with_context(|| {
+            format!(
+                "failed to enumerate anchored directory {}",
+                self.display.display()
+            )
+        })?;
+        let mut names = Vec::<CString>::new();
+        for entry in &mut directory {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to enumerate anchored directory {}",
+                    self.display.display()
+                )
+            })?;
+            let name = entry.file_name();
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                names.push(name.to_owned());
+            }
+        }
+        drop(directory);
+
+        for name in names {
+            let before = match rustix::fs::statat(
+                &self.file,
+                name.as_c_str(),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect anchored uninstall entry {}/{}",
+                            self.display.display(),
+                            name.to_string_lossy()
+                        )
+                    })
+                }
+            };
+            let quarantine = CString::new(format!(".kin-uninstall-entry-{}", uuid::Uuid::new_v4()))
+                .expect("generated uninstall quarantine name contains no NUL");
+            rustix::fs::renameat_with(
+                &self.file,
+                name.as_c_str(),
+                &self.file,
+                quarantine.as_c_str(),
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to quarantine anchored uninstall entry {}/{}",
+                    self.display.display(),
+                    name.to_string_lossy()
+                )
+            })?;
+            let quarantined = rustix::fs::statat(
+                &self.file,
+                quarantine.as_c_str(),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .context("quarantined uninstall entry disappeared")?;
+            if quarantined.st_dev != before.st_dev
+                || quarantined.st_ino != before.st_ino
+                || quarantined.st_mode != before.st_mode
+            {
+                anyhow::bail!(
+                    "uninstall entry changed while being quarantined; preserving {}/{}",
+                    self.display.display(),
+                    quarantine.to_string_lossy()
+                );
+            }
+
+            let is_directory = rustix::fs::FileType::from_raw_mode(quarantined.st_mode)
+                == rustix::fs::FileType::Directory;
+            if is_directory {
+                let fd = rustix::fs::openat(
+                    &self.file,
+                    quarantine.as_c_str(),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .context("failed to pin quarantined uninstall directory")?;
+                let child = Self::from_file(
+                    File::from(fd),
+                    self.display.join(quarantine.to_string_lossy().as_ref()),
+                )?;
+                if child.dev != quarantined.st_dev as u64 || child.ino != quarantined.st_ino as u64
+                {
+                    anyhow::bail!(
+                        "quarantined uninstall directory changed while being opened; preserving {}/{}",
+                        self.display.display(),
+                        quarantine.to_string_lossy()
+                    );
+                }
+                child.remove_contents_recursive()?;
+                child.ensure_empty()?;
+                let current = rustix::fs::statat(
+                    &self.file,
+                    quarantine.as_c_str(),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .context("quarantined uninstall directory disappeared before removal")?;
+                if current.st_dev as u64 != child.dev || current.st_ino as u64 != child.ino {
+                    anyhow::bail!(
+                        "quarantined uninstall directory binding changed; preserving {}/{}",
+                        self.display.display(),
+                        quarantine.to_string_lossy()
+                    );
+                }
+                rustix::fs::unlinkat(
+                    &self.file,
+                    quarantine.as_c_str(),
+                    rustix::fs::AtFlags::REMOVEDIR,
+                )
+                .context("failed to remove quarantined uninstall directory")?;
+            } else {
+                let current = rustix::fs::statat(
+                    &self.file,
+                    quarantine.as_c_str(),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .context("quarantined uninstall entry disappeared before removal")?;
+                if current.st_dev != quarantined.st_dev || current.st_ino != quarantined.st_ino {
+                    anyhow::bail!(
+                        "quarantined uninstall entry binding changed; preserving {}/{}",
+                        self.display.display(),
+                        quarantine.to_string_lossy()
+                    );
+                }
+                rustix::fs::unlinkat(
+                    &self.file,
+                    quarantine.as_c_str(),
+                    rustix::fs::AtFlags::empty(),
+                )
+                .context("failed to remove quarantined uninstall entry")?;
+            }
+        }
+        self.sync()?;
+        self.ensure_empty()
     }
 
     fn ensure_empty(&self) -> Result<()> {
@@ -14550,6 +14942,66 @@ cwd = {:?}
         assert!(format!("{err:#}").contains("already active"));
         drop(first);
         InstallRootLock::acquire(tmp.path()).expect("lock must be reusable after release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_daemon_spawn_lease_blocks_uninstall_authority_until_readiness() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kin-home");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir(root.join("lib")).unwrap();
+        let daemon = root.join("bin/kin-daemon");
+        fs::write(&daemon, b"managed daemon fixture").unwrap();
+
+        let spawn_lease = InstallSpawnFence::acquire_for_daemon_binary_at(&daemon, &root)
+            .unwrap()
+            .expect("a daemon under the configured install root must take a spawn lease");
+        let waiting_root = root.clone();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let uninstall_authority =
+                InstallRootLock::acquire_existing_waiting(&waiting_root).unwrap();
+            acquired_tx.send(()).unwrap();
+            uninstall_authority
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "exclusive uninstall authority must wait while a managed child is being spawned"
+        );
+        drop(spawn_lease);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("uninstall authority must proceed once child readiness releases admission");
+        drop(waiter.join().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_managed_root_cannot_obtain_spawn_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".kin");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir(root.join("lib")).unwrap();
+        fs::write(root.join("bin/kin-daemon"), b"managed daemon fixture").unwrap();
+        let retired = tmp
+            .path()
+            .join(format!(".kin-uninstall-retired-{}", uuid::Uuid::new_v4()));
+        fs::rename(&root, &retired).unwrap();
+
+        let error = InstallSpawnFence::acquire_for_daemon_binary_at(
+            &retired.join("bin/kin-daemon"),
+            &root,
+        )
+        .err()
+        .expect("retirement must revoke spawn admission even when the CLI resolves its new path");
+        assert!(format!("{error:#}").contains("retired uninstall state"));
     }
 
     #[cfg(unix)]

@@ -5776,6 +5776,11 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     // cleanup or spawn authority. In particular, an immutable base daemon is
     // rejected here and is never started under a marker it cannot adopt.
     let daemon_bin = find_daemon_binary()?;
+    // Lock order is install lease -> supervisor startup authority, matching
+    // full uninstall (exclusive install lease -> startup authority). Taking
+    // these in the opposite order would deadlock a spawn racing uninstall.
+    let _install_spawn_fence =
+        crate::commands::update::InstallSpawnFence::acquire_for_daemon_binary(&daemon_bin)?;
     let mut startup_authority = match acquire_supervisor_startup_lock().await? {
         SupervisorStartupAcquisition::Connected(base_url) => return Ok(base_url),
         SupervisorStartupAcquisition::Authority(authority) => authority,
@@ -6170,6 +6175,9 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         DaemonBinaryDiscoveryError::NotFound => AutoStartError::BinaryNotFound,
         DaemonBinaryDiscoveryError::Invalid(detail) => AutoStartError::SpawnFailed(detail),
     })?;
+    let _install_spawn_fence =
+        crate::commands::update::InstallSpawnFence::acquire_for_daemon_binary(&daemon_bin)
+            .map_err(AutoStartError::spawn)?;
     let working_dir = kin_root
         .parent()
         .ok_or_else(|| AutoStartError::InvalidLayout("no parent".to_string()))?;

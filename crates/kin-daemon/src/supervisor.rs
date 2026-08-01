@@ -22,7 +22,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -933,6 +933,47 @@ struct SupervisorAuthState {
     auth_token: Option<String>,
 }
 
+#[derive(Clone)]
+struct SupervisorShutdownControl(Option<tokio::sync::watch::Sender<bool>>);
+
+async fn request_supervisor_shutdown(
+    Extension(control): Extension<SupervisorShutdownControl>,
+    Json(expected): Json<kin_cli::daemon_client::ProcessIdentity>,
+) -> Response {
+    let current = match kin_cli::daemon_client::current_process_identity() {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("current process identity unavailable: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    if current != expected {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "supervisor process incarnation changed"})),
+        )
+            .into_response();
+    }
+    let Some(shutdown) = control.0 else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "cooperative shutdown is unavailable"})),
+        )
+            .into_response();
+    };
+    match shutdown.send(true) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("shutdown channel closed: {error}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// Bearer-token guard for the supervisor control plane. No-ops when no token is
 /// enforced and on public liveness routes; otherwise requires a matching
 /// `Authorization: Bearer <token>`. Mirrors `api::daemon_auth`.
@@ -1035,9 +1076,18 @@ pub fn router(state: Arc<SupervisorState>) -> Router {
 }
 
 fn router_with_auth(state: Arc<SupervisorState>, auth_token: Option<String>) -> Router {
+    router_with_auth_and_shutdown(state, auth_token, None)
+}
+
+fn router_with_auth_and_shutdown(
+    state: Arc<SupervisorState>,
+    auth_token: Option<String>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) -> Router {
     let app = Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
+        .route("/shutdown", post(request_supervisor_shutdown))
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/route", get(route_repo))
         .route("/daemons", get(list_repos))
@@ -1045,6 +1095,7 @@ fn router_with_auth(state: Arc<SupervisorState>, auth_token: Option<String>) -> 
         .route("/daemons/{repo_id}/heartbeat", post(heartbeat_daemon))
         .route("/daemons/{repo_id}", delete(deregister_daemon))
         .with_state(state)
+        .layer(Extension(SupervisorShutdownControl(shutdown)))
         .layer(middleware::from_fn_with_state(
             SupervisorAuthState { auth_token },
             supervisor_auth,
@@ -1329,15 +1380,18 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     }
 
     info!(port = bound_port, "kin supervisor listening");
-    let result = axum::serve(listener, router_with_auth(state, auth_token))
-        .with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
+    let result = axum::serve(
+        listener,
+        router_with_auth_and_shutdown(state, auth_token, Some(shutdown_tx.clone())),
+    )
+    .with_graceful_shutdown(async move {
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
             }
-        })
-        .await;
+        }
+    })
+    .await;
     remove_supervisor_endpoint_files_if_current_process(&state_dir, bound_port);
     result
 }
@@ -3314,6 +3368,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_is_bound_to_the_expected_process_incarnation() {
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let mut stale = serde_json::to_value(&identity).unwrap();
+        stale["birth_token"] = serde_json::Value::String("reused-pid-successor".to_string());
+
+        let (rejected_tx, rejected_rx) = tokio::sync::watch::channel(false);
+        let rejected_app = router_with_auth_and_shutdown(
+            Arc::new(SupervisorState::new()),
+            Some("shutdown-token".to_string()),
+            Some(rejected_tx),
+        );
+        let rejected = rejected_app
+            .oneshot(
+                Request::post("/shutdown")
+                    .header("authorization", "Bearer shutdown-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(stale.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(
+            !*rejected_rx.borrow(),
+            "mismatched identity requested shutdown"
+        );
+
+        let (accepted_tx, accepted_rx) = tokio::sync::watch::channel(false);
+        let accepted_app = router_with_auth_and_shutdown(
+            Arc::new(SupervisorState::new()),
+            Some("shutdown-token".to_string()),
+            Some(accepted_tx),
+        );
+        let accepted = accepted_app
+            .oneshot(
+                Request::post("/shutdown")
+                    .header("authorization", "Bearer shutdown-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&identity).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert!(
+            *accepted_rx.borrow(),
+            "matching identity did not request shutdown"
+        );
     }
 
     #[tokio::test]

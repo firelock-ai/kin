@@ -10,10 +10,10 @@
 //! behavior-env divergence warning tells them to). This command group is that
 //! surface, replacing raw `kill $(cat .kin/daemon.pid)`.
 //!
-//! Neither the worker daemon nor the supervisor exposes an HTTP shutdown route.
-//! Unix uses SIGTERM plus a bounded wait; native Windows opens and revalidates
-//! the exact process-incarnation handle before terminating through that handle.
-//! The wait is a ceiling, not a fixed delay.
+//! Stop authority is always bound to one process incarnation. Linux uses a
+//! pidfd, native Windows uses a process handle, and macOS uses an authenticated
+//! cooperative endpoint whose request names the expected birth identity. The
+//! wait is a ceiling, not a fixed delay.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -113,33 +113,51 @@ impl StopOutcome {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<bool> {
-    terminate_attributed_process_with(identity, process_identity_is_current, |pid| {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if rc == 0 {
-            Ok(())
+    // pidfd_open pins the task incarnation before identity revalidation. PID
+    // reuse after this point cannot redirect pidfd_send_signal to a successor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid(), 0) as libc::c_int };
+    if fd < 0 {
+        return if !process_identity_is_current(identity)? {
+            Ok(false)
         } else {
             Err(std::io::Error::last_os_error())
+        };
+    }
+    let outcome = if !process_identity_is_current(identity)? {
+        Ok(false)
+    } else {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(true)
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
         }
-    })
+    };
+    let _ = unsafe { libc::close(fd) };
+    outcome
 }
 
-#[cfg(unix)]
-fn terminate_attributed_process_with<C, T>(
-    identity: &ProcessIdentity,
-    is_current: C,
-    terminate: T,
-) -> std::io::Result<bool>
-where
-    C: FnOnce(&ProcessIdentity) -> std::io::Result<bool>,
-    T: FnOnce(u32) -> std::io::Result<()>,
-{
-    if !is_current(identity)? {
-        return Ok(false);
-    }
-    terminate(identity.pid())?;
-    Ok(true)
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn terminate_attributed_process(_identity: &ProcessIdentity) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "incarnation-bound daemon stop is unsupported on this Unix platform",
+    ))
 }
 
 #[cfg(windows)]
@@ -196,6 +214,7 @@ fn terminate_attributed_process(identity: &ProcessIdentity) -> std::io::Result<b
 /// Stop exactly one attributed process incarnation and wait up to `wait` for
 /// that incarnation to disappear. A reused numeric PID compares unequal and is
 /// never signaled or mistaken for a surviving daemon.
+#[cfg(not(target_os = "macos"))]
 fn stop_identity_graceful(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
     match terminate_attributed_process(identity) {
         Ok(false) => return StopOutcome::NotRunning,
@@ -219,6 +238,170 @@ fn stop_identity_graceful(identity: &ProcessIdentity, wait: Duration) -> StopOut
     } else {
         StopOutcome::Timeout
     }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_identity_cooperatively<F>(
+    identity: &ProcessIdentity,
+    wait: Duration,
+    request_shutdown: F,
+) -> StopOutcome
+where
+    F: FnOnce(&ProcessIdentity) -> std::io::Result<bool>,
+{
+    if matches!(process_identity_is_current(identity), Ok(false)) {
+        return StopOutcome::NotRunning;
+    }
+    match request_shutdown(identity) {
+        Ok(false) => return StopOutcome::NotRunning,
+        Ok(true) => {}
+        Err(error) => {
+            if matches!(process_identity_is_current(identity), Ok(false)) {
+                return StopOutcome::NotRunning;
+            }
+            return StopOutcome::SignalFailed(error.to_string());
+        }
+    }
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if matches!(process_identity_is_current(identity), Ok(false)) {
+            return StopOutcome::Stopped;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if matches!(process_identity_is_current(identity), Ok(false)) {
+        StopOutcome::Stopped
+    } else {
+        StopOutcome::Timeout
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cooperative_shutdown_request(
+    port: u16,
+    token: Option<String>,
+    identity: &ProcessIdentity,
+) -> std::io::Result<bool> {
+    use std::io::{Read as _, Write as _};
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let body = serde_json::to_vec(identity).map_err(std::io::Error::other)?;
+    let authorization = match token {
+        Some(token) if token.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "daemon auth token contains a forbidden newline",
+            ))
+        }
+        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
+    let head = format!(
+        "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        body.len(),
+        authorization
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.take(16 * 1024).read_to_end(&mut response)?;
+    let status = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::other("invalid cooperative shutdown HTTP response"))?;
+    match status {
+        200..=299 => Ok(true),
+        409 | 410 => Ok(false),
+        _ => Err(std::io::Error::other(format!(
+            "cooperative shutdown endpoint returned HTTP {status}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_worker_identity(
+    kin_root: &Path,
+    identity: &ProcessIdentity,
+    wait: Duration,
+) -> StopOutcome {
+    let (recorded_pid, recorded_port) = repo_daemon_recorded_endpoint(kin_root);
+    if recorded_pid != Some(identity.pid()) {
+        return StopOutcome::SignalFailed(format!(
+            "worker endpoint changed before cooperative shutdown for pid {}",
+            identity.pid()
+        ));
+    }
+    let Some(port) = recorded_port else {
+        return StopOutcome::SignalFailed(format!(
+            "worker pid {} has no recorded cooperative shutdown port",
+            identity.pid()
+        ));
+    };
+    let token = std::env::var("KIN_DAEMON_AUTH_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(kin_root.join("daemon.token"))
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+    stop_identity_cooperatively(identity, wait, |expected| {
+        cooperative_shutdown_request(port, token, expected)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_worker_identity(
+    _kin_root: &Path,
+    identity: &ProcessIdentity,
+    wait: Duration,
+) -> StopOutcome {
+    stop_identity_graceful(identity, wait)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
+    let (recorded_pid, recorded_port) = supervisor_recorded_endpoint();
+    if recorded_pid != Some(identity.pid()) {
+        return StopOutcome::SignalFailed(format!(
+            "supervisor endpoint changed before cooperative shutdown for pid {}",
+            identity.pid()
+        ));
+    }
+    let Some(port) = recorded_port else {
+        return StopOutcome::SignalFailed(format!(
+            "supervisor pid {} has no recorded cooperative shutdown port",
+            identity.pid()
+        ));
+    };
+    let token = std::env::var("KIN_SUPERVISOR_AUTH_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let path = supervisor_owner_path().with_file_name("supervisor.token");
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+    stop_identity_cooperatively(identity, wait, |expected| {
+        cooperative_shutdown_request(port, token, expected)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_supervisor_identity(identity: &ProcessIdentity, wait: Duration) -> StopOutcome {
+    stop_identity_graceful(identity, wait)
 }
 
 fn attributed_worker_identity(kin_root: &Path, pid: u32) -> Result<Option<ProcessIdentity>> {
@@ -295,7 +478,7 @@ fn stop_worker_at(
         Err(error) => return Err(error),
     };
     Ok(match identity {
-        Some(identity) => stop_identity_graceful(&identity, wait),
+        Some(identity) => stop_worker_identity(kin_root, &identity, wait),
         None => StopOutcome::NotRunning,
     })
 }
@@ -331,7 +514,7 @@ fn stop_supervisor_pid(
 ) -> Result<StopOutcome> {
     Ok(
         match supervisor_identity_for_stop(pid, legacy_install_root)? {
-            Some(identity) => stop_identity_graceful(&identity, wait),
+            Some(identity) => stop_supervisor_identity(&identity, wait),
             None => StopOutcome::NotRunning,
         },
     )
@@ -591,6 +774,30 @@ impl UninstallDaemonFence {
     }
 }
 
+/// Fail closed when an install root is already absent but a process still
+/// advertises an executable or argv path owned by that root. This is the
+/// absent-root counterpart to `UninstallDaemonFence::verify_quiescent` and
+/// prevents a retry from turning an incomplete prior uninstall into a false
+/// `fully_removed` result.
+pub(crate) fn verify_install_owned_processes_absent(install_root: &Path) -> Result<()> {
+    let remaining = managed_daemon_processes(install_root);
+    verify_no_install_owned_processes(remaining)
+}
+
+fn verify_no_install_owned_processes(remaining: Vec<ManagedDaemonProcess>) -> Result<()> {
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "full uninstall is incomplete: install-owned Kin processes remain after the public root disappeared: {}; refusing to report fully_removed",
+        remaining
+            .iter()
+            .map(ManagedDaemonProcess::description)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// Stop and verify the complete install-owned daemon topology while retaining
 /// supervisor startup authority for the caller's subsequent root retirement.
 pub(crate) async fn stop_all_for_uninstall(install_root: &Path) -> Result<UninstallDaemonFence> {
@@ -760,7 +967,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     // the registry snapshot and supervisor exit.
     if uninstall_root.is_some() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_identity_graceful(identity, wait);
+            let outcome = stop_supervisor_identity(identity, wait);
             reports.push(StopReport {
                 kind: "supervisor",
                 label: "supervisor".to_string(),
@@ -818,7 +1025,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     // workers first, supervisor last. Full uninstall already stopped it above.
     if uninstall_root.is_none() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_identity_graceful(identity, wait);
+            let outcome = stop_supervisor_identity(identity, wait);
             if outcome.is_success() {
                 remove_stale_supervisor_files();
             }
@@ -962,6 +1169,15 @@ fn legacy_managed_identity(
     pid: u32,
     expected_repo: Option<&Path>,
 ) -> Result<Option<ProcessIdentity>> {
+    // Capture the incarnation before inspecting its executable/arguments. The
+    // old order scanned one process and then captured whatever later reused
+    // its PID, accidentally lending the predecessor's provenance to a
+    // successor.
+    let Some(identity) = process_identity(pid)
+        .with_context(|| format!("failed to capture legacy daemon process identity {pid}"))?
+    else {
+        return Ok(None);
+    };
     let expected_repo = expected_repo.map(canonical);
     let matched = managed_daemon_processes(install_root)
         .into_iter()
@@ -982,11 +1198,6 @@ fn legacy_managed_identity(
             "legacy daemon pid {pid} is not an exact install-owned process with the expected role; refusing to signal it"
         );
     }
-    let Some(identity) = process_identity(pid)
-        .with_context(|| format!("failed to capture legacy daemon process identity {pid}"))?
-    else {
-        return Ok(None);
-    };
     if process_identity_is_current(&identity)? {
         Ok(Some(identity))
     } else {
@@ -1247,6 +1458,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn stop_identity_graceful_reports_not_running_for_dead_incarnation() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -1259,28 +1471,40 @@ mod tests {
         assert_eq!(outcome, StopOutcome::NotRunning);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn incarnation_mismatch_never_delivers_a_signal() {
+    fn cooperative_incarnation_mismatch_never_authorizes_shutdown() {
         let identity = process_identity(std::process::id()).unwrap().unwrap();
         let delivered = std::cell::Cell::new(false);
-        let result = terminate_attributed_process_with(
-            &identity,
-            |_| Ok(false),
-            |_| {
-                delivered.set(true);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(!result);
+        let outcome = stop_identity_cooperatively(&identity, Duration::from_millis(10), |_| {
+            delivered.set(true);
+            Ok(false)
+        });
+        assert_eq!(outcome, StopOutcome::NotRunning);
         assert!(
-            !delivered.get(),
-            "a predecessor identity must never signal the reused PID"
+            delivered.get(),
+            "the endpoint must receive the expected identity and reject the mismatch"
         );
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn fully_removed_gate_rejects_any_owned_process_inventory() {
+        let error = verify_no_install_owned_processes(vec![ManagedDaemonProcess {
+            pid: 4242,
+            kind: ManagedDaemonKind::Worker {
+                repo_root: PathBuf::from("/tmp/owned-repo"),
+            },
+        }])
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("refusing to report fully_removed"),
+            "{message}"
+        );
+        assert!(message.contains("4242"), "{message}");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn stop_identity_graceful_stops_a_live_process() {
         // Spawn a real process that sleeps, then prove SIGTERM stops it and the

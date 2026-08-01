@@ -3247,11 +3247,13 @@ dependencies = [
 name = "kin-daemon-spawn"
 version = "0.4.6"
 dependencies = [
+ "fs2",
  "libc",
  "pretty_assertions",
  "tempfile",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

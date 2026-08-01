@@ -645,6 +645,15 @@ fn find_mcp_daemon_binary_from(
     None
 }
 
+fn configured_managed_install_root() -> Option<std::path::PathBuf> {
+    for key in ["KIN_HOME", "KIN_DIR"] {
+        if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            return Some(std::path::PathBuf::from(value));
+        }
+    }
+    kin_core::layout::global_home_kin_dir()
+}
+
 /// Spawn a fresh daemon and wait for it to pass `/health`.
 ///
 /// Uses the MCP-path idle timeout (30 min) unless the user has set
@@ -684,6 +693,11 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
         "MCP revival: kin-daemon binary not found (not in PATH or next to kin binary)".to_string()
     })?;
+    let _install_spawn_fence = configured_managed_install_root()
+        .map(|root| kin_daemon_spawn::ManagedInstallSpawnFence::acquire(&daemon_bin, &root))
+        .transpose()
+        .map_err(|error| format!("MCP revival: managed install spawn admission failed: {error}"))?
+        .flatten();
 
     // A port record with no PID owner beside it belongs to a daemon that is
     // already gone. Left in place, the port we are about to read back would be
