@@ -22,7 +22,13 @@ import {
   probeBinaryVersion,
   ensureProvisioned,
 } from '../lib/provision.mjs';
-import { readLauncherStamp, writeLauncherStamp } from '../lib/resolve.mjs';
+import { binaryName, readLauncherStamp, writeLauncherStamp } from '../lib/resolve.mjs';
+
+// The native Windows job must execute the package suite, but NTFS does not
+// expose the POSIX execute bits required to falsify a macOS app bundle. Those
+// bundle-only assertions remain authoritative on macOS/Linux; Windows runs the
+// native ZIP path and all platform-neutral provisioning policy below.
+const macArchiveModeTest = process.platform === 'win32' ? test.skip : test;
 
 test('artifactName maps every released host and matches release.yml naming', () => {
   assert.equal(artifactName('darwin', 'arm64'), 'kin-macos-aarch64.tar.gz');
@@ -213,12 +219,12 @@ function makeFixture({
   return { work, bytes, sha, fetchImpl };
 }
 
-function makeWindowsFixture() {
+function makeWindowsFixture({ streamArchive = false } = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-windows-fixture-'));
   const stage = path.join(work, 'stage');
   const archiveName = 'kin-windows-x86_64.zip';
   const archivePath = path.join(work, archiveName);
-  const kinBytes = Buffer.from('native windows kin fixture');
+  const kinBytes = Buffer.from('native windows kin fixture 9.9.9');
   const daemonBytes = Buffer.from('native windows daemon fixture');
   fs.mkdirSync(stage, { recursive: true });
   fs.writeFileSync(path.join(stage, 'kin.exe'), kinBytes);
@@ -245,30 +251,64 @@ function makeWindowsFixture() {
   const sha = `${sha256Hex(bytes)}  ${archiveName}\n`;
   const fetchImpl = async (url) => {
     const body = url.endsWith('.sha256') ? Buffer.from(sha) : bytes;
+    if (streamArchive && !url.endsWith('.sha256')) {
+      const split = Math.floor(body.length / 2);
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name) => (name.toLowerCase() === 'content-length' ? String(body.length) : null),
+        },
+        body: (async function* streamFixture() {
+          yield body.subarray(0, split);
+          yield body.subarray(split);
+        })(),
+        arrayBuffer: async () => {
+          throw new Error('streaming archive must not be buffered through arrayBuffer()');
+        },
+      };
+    }
     return {
       ok: true,
       status: 200,
       arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
     };
   };
-  return { work, fetchImpl, kinBytes, daemonBytes };
+  return { work, bytes, fetchImpl, kinBytes, daemonBytes };
+}
+
+function makeHostProvisionFixture(options = {}) {
+  if (process.platform === 'win32') {
+    return {
+      ...makeWindowsFixture(options),
+      platform: 'win32',
+      arch: 'x64',
+    };
+  }
+  return {
+    ...makeFixture(options),
+    platform: 'darwin',
+    arch: 'arm64',
+  };
 }
 
 test('provision verifies, installs kin + kin-daemon, and stamps the version', async () => {
-  const { work, fetchImpl } = makeFixture();
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
   const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home };
   const installed = await provision('9.9.9', {
     env,
-    platform: 'darwin',
-    arch: 'arm64',
+    platform,
+    arch,
     fetchImpl,
     log: () => {},
   });
-  assert.equal(installed, path.join(home, 'bin', 'kin'));
-  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
-  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin-daemon')));
-  assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
+  assert.equal(installed, path.join(home, 'bin', binaryName('kin', platform)));
+  assert.ok(fs.existsSync(path.join(home, 'bin', binaryName('kin', platform))));
+  assert.ok(fs.existsSync(path.join(home, 'bin', binaryName('kin-daemon', platform))));
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
+  }
   assert.equal(readLauncherStamp(env), '9.9.9');
   fs.rmSync(work, { recursive: true, force: true });
 });
@@ -295,13 +335,15 @@ test('provision uses deterministic Windows ZIP extraction under a hostile PATH',
 });
 
 test('provision streams live archive byte and percent progress without touching checksum semantics', async () => {
-  const { work, bytes, fetchImpl } = makeFixture({ streamArchive: true });
+  const { work, bytes, fetchImpl, platform, arch } = makeHostProvisionFixture({
+    streamArchive: true,
+  });
   const home = path.join(work, 'kin-home');
   const progress = [];
   await provision('9.9.9', {
     env: { KIN_HOME: home },
-    platform: 'darwin',
-    arch: 'arm64',
+    platform,
+    arch,
     fetchImpl,
     log: () => {},
     onProgress: (event) => progress.push({ ...event }),
@@ -368,7 +410,7 @@ test('a mid-stream failure clears and terminates the active TTY progress line', 
   fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('provision installs the macOS notification bundle so notifications post as Kin', async () => {
+macArchiveModeTest('provision installs the macOS notification bundle so notifications post as Kin', async () => {
   const { work, fetchImpl } = makeFixture();
   const home = path.join(work, 'kin-home');
   await provision('9.9.9', {
@@ -385,7 +427,7 @@ test('provision installs the macOS notification bundle so notifications post as 
   fs.rmSync(work, { recursive: true, force: true });
 });
 
-test('provision replaces a stale bundle whole rather than merging into it', async () => {
+macArchiveModeTest('provision replaces a stale bundle whole rather than merging into it', async () => {
   const { work, fetchImpl } = makeFixture({ notifierBody: 'notifier-v2' });
   const home = path.join(work, 'kin-home');
   // A previous release's bundle, carrying a file the new one does not have.
@@ -459,7 +501,7 @@ test('provision refuses an absent macOS bundle before mutating a previous instal
   await assertMalformedBundleUpgradeIsPreflightOnly('absent', /carries no KinNotifier\.app/);
 });
 
-test('provision refuses an incomplete macOS bundle before mutating a previous install', async () => {
+macArchiveModeTest('provision refuses an incomplete macOS bundle before mutating a previous install', async () => {
   await assertMalformedBundleUpgradeIsPreflightOnly('no-plist', /missing Contents\/Info\.plist/);
 });
 
@@ -557,9 +599,10 @@ test('ensureProvisioned runs a stamped current install without probing or networ
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stamped-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', process.platform);
   fs.mkdirSync(binDir, { recursive: true });
   const { targetKinVersion } = await import('../lib/resolve.mjs');
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   writeLauncherStamp(targetKinVersion(), env);
   const result = await ensureProvisioned({
     env,
@@ -572,7 +615,7 @@ test('ensureProvisioned runs a stamped current install without probing or networ
     },
     log: () => {},
   });
-  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(result, path.join(binDir, kinName));
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -585,23 +628,24 @@ test('ensureProvisioned runs a stamped current install without probing or networ
 // KIN_LAUNCHER_ADOPT=1 forces a re-provision regardless.
 
 test('ensureProvisioned auto-provisions over an older foreign install (no ADOPT needed)', async () => {
-  const { work, fetchImpl } = makeFixture();
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
   const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   const notices = [];
   const result = await ensureProvisioned({
     env,
-    platform: 'darwin',
-    arch: 'arm64',
+    platform,
+    arch,
     fetchImpl,
     spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1-foreign (x)\n' }),
     log: (line) => notices.push(line),
   });
   const { targetKinVersion } = await import('../lib/resolve.mjs');
-  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(result, path.join(binDir, kinName));
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   assert.equal(readLauncherStamp(env), targetKinVersion());
   assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
@@ -609,18 +653,19 @@ test('ensureProvisioned auto-provisions over an older foreign install (no ADOPT 
 });
 
 test('ensureProvisioned auto-provisions when a stamped install is older than the pin', async () => {
-  const { work, fetchImpl } = makeFixture();
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
   const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   writeLauncherStamp('0.0.1', env);
   const notices = [];
   const result = await ensureProvisioned({
     env,
-    platform: 'darwin',
-    arch: 'arm64',
+    platform,
+    arch,
     fetchImpl,
     spawnImpl: () => {
       throw new Error('a stamped install must not be probed');
@@ -628,7 +673,7 @@ test('ensureProvisioned auto-provisions when a stamped install is older than the
     log: (line) => notices.push(line),
   });
   const { targetKinVersion } = await import('../lib/resolve.mjs');
-  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(result, path.join(binDir, kinName));
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   assert.equal(readLauncherStamp(env), targetKinVersion());
   assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
@@ -639,8 +684,9 @@ test('ensureProvisioned refuses to downgrade a newer foreign install (fail loud,
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-foreign-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', process.platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   await assert.rejects(
     ensureProvisioned({
       env,
@@ -654,7 +700,10 @@ test('ensureProvisioned refuses to downgrade a newer foreign install (fail loud,
     /refusing to downgrade.*KIN_LAUNCHER_ADOPT=1/s,
   );
   assert.equal(readLauncherStamp(env), null);
-  assert.ok(fs.existsSync(path.join(binDir, 'kin')), 'the existing binary must be left in place');
+  assert.ok(
+    fs.existsSync(path.join(binDir, kinName)),
+    'the existing binary must be left in place',
+  );
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -662,8 +711,9 @@ test('ensureProvisioned refuses to downgrade when the stamp itself is newer than
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-stamped-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', process.platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   writeLauncherStamp('99.0.0', env);
   await assert.rejects(
     ensureProvisioned({
@@ -687,8 +737,9 @@ test('ensureProvisioned adopts a foreign install when its version already matche
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-foreign-equal-'));
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', process.platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   const { targetKinVersion } = await import('../lib/resolve.mjs');
   const result = await ensureProvisioned({
     env,
@@ -699,55 +750,57 @@ test('ensureProvisioned adopts a foreign install when its version already matche
     spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()} (foreign)\n` }),
     log: () => {},
   });
-  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(result, path.join(binDir, kinName));
   assert.equal(readLauncherStamp(env), targetKinVersion());
   fs.rmSync(home, { recursive: true, force: true });
 });
 
 test('KIN_LAUNCHER_ADOPT=1 forces re-provisioning even when the stamped version already matches', async () => {
-  const { work, fetchImpl } = makeFixture();
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
   const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   const { targetKinVersion } = await import('../lib/resolve.mjs');
   writeLauncherStamp(targetKinVersion(), env);
   const result = await ensureProvisioned({
     env,
-    platform: 'darwin',
-    arch: 'arm64',
+    platform,
+    arch,
     fetchImpl,
     spawnImpl: () => {
       throw new Error('ADOPT must skip the probe and provision unconditionally');
     },
     log: () => {},
   });
-  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(result, path.join(binDir, kinName));
   // Reprovisioned from the fixture archive, not the pre-existing stub.
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   fs.rmSync(work, { recursive: true, force: true });
 });
 
 test('KIN_LAUNCHER_ADOPT=1 forces the downgrade it would otherwise refuse', async () => {
-  const { work, fetchImpl } = makeFixture();
+  const { work, fetchImpl, platform, arch } = makeHostProvisionFixture();
   const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };
   const binDir = path.join(home, 'bin');
+  const kinName = binaryName('kin', platform);
   fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  fs.writeFileSync(path.join(binDir, kinName), '#!/bin/sh\n');
   writeLauncherStamp('99.0.0', env);
   const result = await ensureProvisioned({
     env,
-    platform: 'darwin',
-    arch: 'arm64',
+    platform,
+    arch,
     fetchImpl,
     spawnImpl: () => {
       throw new Error('ADOPT must skip the probe and provision unconditionally');
     },
     log: () => {},
   });
-  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(result, path.join(binDir, kinName));
   assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
   fs.rmSync(work, { recursive: true, force: true });
 });
