@@ -810,10 +810,12 @@ async fn live_status_from_running_daemon(
         .map_err(unavailable)?;
     // The client's default request budget is minutes long, which is right for a
     // mutation and wrong for a read that already has a complete local answer.
-    // Route resolution above only returns an endpoint that answered `/health`,
-    // so what is bounded here is the narrower case of a daemon that is alive but
-    // stuck inside this handler. The budget still has to cover a real authority
-    // open on a large store, which is the same work the fallback would do.
+    // Supervisor-derived route resolution above returns only an endpoint that
+    // answered `/health`; an explicit `KIN_DAEMON_URL` is trusted as supplied.
+    // The budget therefore covers both an explicit unreachable route and the
+    // narrower case of a healthy daemon stuck inside this handler. It still has
+    // to allow a real authority open on a large store, which is the same work
+    // the fallback would do.
     match tokio::time::timeout(
         LIVE_STATUS_READ_BUDGET,
         client.command_status(&CommandStatusRequest::new(false)),
