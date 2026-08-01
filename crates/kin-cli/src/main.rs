@@ -740,9 +740,9 @@ enum Command {
     /// Publish an exact restoration of a previous change
     #[command(visible_alias = "revert")]
     Rollback {
-        /// Change ID to rollback to
-        change_id: String,
-        /// Rollback all changes linked to a work item ID
+        /// Change ID to rollback to. Omit when naming a work item with --feature.
+        change_id: Option<String>,
+        /// Roll back every change the named work item records
         #[arg(long)]
         feature: Option<String>,
     },
@@ -3729,6 +3729,34 @@ mod tests {
                 } if output.as_path() == std::path::Path::new("../export.git")
             ));
             assert!(Cli::try_parse_from(["kin", "git", "export", "--in-place"]).is_err());
+        });
+    }
+
+    /// A work item names the changes to roll back, so requiring a change on the
+    /// same invocation made the flag unreachable: the caller had to already know
+    /// the answer the flag exists to compute.
+    #[test]
+    fn work_item_rollback_parses_without_a_change_argument() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["kin", "rollback", "--feature", "some-work-id"])
+                .expect("naming a work item must be a complete rollback invocation");
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    change_id: None,
+                    feature: Some(ref work_id),
+                } if work_id == "some-work-id"
+            ));
+
+            let cli = Cli::try_parse_from(["kin", "rollback", "abc123"])
+                .expect("naming a change stays a complete rollback invocation");
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    change_id: Some(ref change),
+                    feature: None,
+                } if change == "abc123"
+            ));
         });
     }
 
