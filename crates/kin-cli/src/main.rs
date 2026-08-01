@@ -352,7 +352,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Rename an entity through graph relations and repository source-CAS truth
+    /// Bounded graph-native rename; unsupported cases fail closed
     Rename {
         /// Entity name or symbol under the cursor
         symbol: String,

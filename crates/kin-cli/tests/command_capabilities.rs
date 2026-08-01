@@ -280,4 +280,5 @@ fn top_level_help_marks_open_git_replacement_surfaces() {
     assert!(stdout.contains("Show coherent repository-v6 workspace status"));
     assert!(stdout.contains("Create an exact semantic and artifact commit"));
     assert!(stdout.contains("Show exact repository-v6 artifact and semantic changes"));
+    assert!(stdout.contains("Bounded graph-native rename; unsupported cases fail closed"));
 }
