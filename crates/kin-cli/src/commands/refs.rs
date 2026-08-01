@@ -271,7 +271,6 @@ pub fn build_bulk_refs_response(
     }
 
     let relation_kinds = parse_bulk_relation_kind(&request.kind)?;
-    let allowed: std::collections::HashSet<RelationKind> = relation_kinds.iter().copied().collect();
     let mut results = Vec::with_capacity(request.entity_ids.len());
     let mut with_references = 0usize;
 
@@ -308,26 +307,21 @@ pub fn build_bulk_refs_response(
             continue;
         };
 
-        let mut reference_count = 0usize;
-        let mut matched_kinds: Vec<RelationKind> = Vec::new();
-        for rel in graph.get_all_relations_for_entity(&entity_id)? {
-            let Some(src_entity_id) = rel.src.as_entity() else {
-                continue;
-            };
-            if rel.dst != GraphNodeId::Entity(entity_id) {
-                continue;
-            }
-            if !allowed.contains(&rel.kind) {
-                continue;
-            }
-            if src_entity_id == entity_id {
-                continue;
-            }
-            reference_count += 1;
-            if !matched_kinds.contains(&rel.kind) {
-                matched_kinds.push(rel.kind);
-            }
-        }
+        // Bulk mode reports the same unit as the ordinary `kin refs` surface:
+        // distinct referencing entities, not raw relation edges. One caller
+        // may carry Calls, Imports, and References edges to the same target,
+        // and ingestion may retain duplicate observations of an edge. Counting
+        // those edges here made the compact answer disagree with the rows the
+        // human-readable command could actually enumerate. Keep one grouping
+        // authority for both paths so the count cannot drift again.
+        let references = collect_graph_references(graph, &entity_id, &relation_kinds)?;
+        let reference_count = references.len();
+        let mut matched_kinds: Vec<RelationKind> = references
+            .iter()
+            .flat_map(|entry| entry.relation_kinds.iter().copied())
+            .collect();
+        matched_kinds.sort_by_key(relation_kind_rank);
+        matched_kinds.dedup();
 
         let has_references = reference_count > 0;
         if has_references {
@@ -526,7 +520,10 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_refs_response, parse_relation_kinds, refs_not_found_guidance, RefsRequest};
+    use super::{
+        build_bulk_refs_response, build_refs_response, parse_relation_kinds,
+        refs_not_found_guidance, BulkRefsRequest, RefsRequest,
+    };
     use kin_model::RelationKind;
 
     /// `kin refs` must answer only from graph-owned relation edges. A reference
@@ -688,7 +685,7 @@ mod tests {
     /// replaces collapsed them into a single row wearing the first caller's
     /// name, under a count line that then miscounted the referencing entities.
     #[test]
-    fn refs_lists_every_referencing_entity_not_one_per_file() {
+    fn refs_and_bulk_count_referencing_entities_not_relation_edges() {
         use kin_db::InMemoryGraph;
         use kin_model::relation::{Relation, RelationOrigin};
         use kin_model::{
@@ -750,6 +747,23 @@ mod tests {
                 })
                 .unwrap();
         }
+        // The same caller can carry multiple graph-owned observations of the
+        // target. They enrich its row; they do not create more callers.
+        for kind in [RelationKind::References, RelationKind::Calls] {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(caller_a.id),
+                    dst: GraphNodeId::Entity(target.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
 
         let response = build_refs_response(
             &layout,
@@ -769,6 +783,32 @@ mod tests {
         assert!(
             joined.contains("caller_a") && joined.contains("caller_b"),
             "both same-file callers must be listed: {joined}"
+        );
+
+        let compact = build_bulk_refs_response(
+            &graph,
+            &BulkRefsRequest {
+                entity_ids: vec![target.id.to_string()],
+                kind: "Any".to_string(),
+                compact: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(compact.results[0]["reference_count"], 2);
+
+        let verbose = build_bulk_refs_response(
+            &graph,
+            &BulkRefsRequest {
+                entity_ids: vec![target.id.to_string()],
+                kind: "Any".to_string(),
+                compact: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(verbose.results[0]["reference_count"], 2);
+        assert_eq!(
+            verbose.results[0]["matched_kinds"],
+            serde_json::json!(["Calls", "References"])
         );
     }
 }
