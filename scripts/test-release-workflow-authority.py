@@ -2480,7 +2480,7 @@ def assert_install_proof_status_contract(
         'path.join(process.cwd(), ".agents", "mcp_config.json")',
         "spawn(entry.command, entry.args",
         "cwd: entry.cwd",
-        "env: { ...process.env, ...(entry.env ?? {}) }",
+        "env: { ...proofEnv, ...(entry.env ?? {}) }",
     ):
         require(graph_active, policy, "installed daemon startup and health capture")
 
@@ -6452,145 +6452,7 @@ def main() -> None:
     assert_install_proof_windows_admission_contract(windows_admission, windows_contract)
     windows_contract_source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     assert_windows_contract_stage_check_is_reachable(windows_contract_source)
-    windows_public_surfaces = {
-        README: readme,
-        QUICKSTART_DOC: QUICKSTART_DOC.read_text(encoding="utf-8"),
-        WINDOWS_WSL2_DOC: WINDOWS_WSL2_DOC.read_text(encoding="utf-8"),
-        UPDATE_TRUST: update_trust,
-        NPM_CANONICAL_README: NPM_CANONICAL_README.read_text(encoding="utf-8"),
-        LLMS_DOC: LLMS_DOC.read_text(encoding="utf-8"),
-    }
-    compatibility_mcp_readme = NPM_MCP_README.read_text(encoding="utf-8")
-    assert_windows_public_support_contract(
-        windows_contract_source,
-        install_ps1,
-        windows_public_surfaces,
-        compatibility_mcp_readme,
-    )
-    public_notice = windows_public_support_notice(windows_contract_source)
 
-    drifted_readme_surfaces = dict(windows_public_surfaces)
-    drifted_readme_surfaces[README] = readme.replace(
-        public_notice,
-        "Native Windows supports the graph and daemon without vectors.",
-        1,
-    )
-    expect_assertion(
-        "the README restores a larger native-Windows capability claim",
-        "must repeat the Windows support notice",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1,
-            drifted_readme_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    expect_assertion(
-        "the public notice drifts away from the executable refusal contract",
-        "no longer states the executable refusal contract",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source.replace(
-                "repository admission is currently unavailable",
-                "repository admission is available",
-                1,
-            ),
-            install_ps1,
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    expect_assertion(
-        "the PowerShell installer maps native ARM64 to a nonexistent archive",
-        "must never resolve native ARM64",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1.replace(
-                '"ARM64" { throw "No native Windows ARM64 archive is published.',
-                '"ARM64" { return "aarch64" # No native Windows ARM64 archive is published.',
-                1,
-            ),
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    expect_assertion(
-        "the native installer auto-configures an unusable repository setup",
-        "must not configure repository/MCP workflows",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1 + "\n& $KinExe setup\n",
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    for label, original, expected in (
-        (
-            "the native installer comments out its executable support notice binding",
-            '$NativeWindowsSupportNotice = "',
-            "must repeat the Windows support notice",
-        ),
-        (
-            "the native installer comments out its visible support warning",
-            'Write-Host "  ! $NativeWindowsSupportNotice"',
-            "truthful native-Windows installer",
-        ),
-    ):
-        expect_assertion(
-            label,
-            expected,
-            lambda original=original: assert_windows_public_support_contract(
-                windows_contract_source,
-                install_ps1.replace(original, f"# {original}", 1),
-                windows_public_surfaces,
-                compatibility_mcp_readme,
-            ),
-        )
-    expect_assertion(
-        "a PowerShell block comment disables the visible native-Windows warning",
-        "truthful native-Windows installer",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1.replace(
-                'Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow',
-                '<#\nWrite-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow\n#>',
-                1,
-            ),
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    blocked_quickstart_surfaces = dict(windows_public_surfaces)
-    blocked_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
-        QUICKSTART_DOC
-    ].replace(public_notice, f"<!-- {public_notice} -->", 1)
-    expect_assertion(
-        "the quickstart hides the native-Windows support boundary",
-        "must repeat the Windows support notice",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1,
-            blocked_quickstart_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    drifted_quickstart_surfaces = dict(windows_public_surfaces)
-    drifted_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
-        QUICKSTART_DOC
-    ].replace(
-        "Native Windows always skips repository setup while admission is unsupported",
-        "Both installers launch repository setup unless KIN_NO_SETUP=1",
-        1,
-    )
-    expect_assertion(
-        "the quickstart claims native Windows launches repository setup",
-        "quickstart platform-specific setup contract",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1,
-            drifted_quickstart_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
     expect_assertion(
         "the contract script counts stages where one can never appear",
         "reachable Windows stage-leak check",

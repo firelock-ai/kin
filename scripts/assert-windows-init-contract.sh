@@ -41,6 +41,8 @@ scratch="$(cd "$scratch" && pwd)"
 # runner process behind if that ever changes.
 trap 'taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true' EXIT
 
+NON_EMPTY_REFUSAL="requires an empty directory"
+
 failures=0
 
 fail() {

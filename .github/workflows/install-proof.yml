@@ -482,24 +482,11 @@ jobs:
           fi
           echo "Installed Windows release admitted exact Git and native-empty repositories without stage residue and refused the non-empty native boundary."
 
-<<<<<<< HEAD
-      # What Windows still proves without a repository. This is the whole
-      # remaining first-run surface on the platform: the CLI's own build
-      # provenance bound to the release tag's public source, the platform
-      # capability posture, and the setup writers for the shell hook, the
-      # install ledger, and every agent-client MCP config a repo-free install
-      # can write, which is four of the six. `kin bench-meta` reports the CLI
-      # build alone, so the daemon's build provenance is not bound here. Codex
-      # and Antigravity are excluded by the product rather than by this proof,
-      # because their entries bind an exact repository; both exclusions are
-      # asserted below.
-=======
       # Preserve a pre-repository Windows checkpoint in addition to the full
       # repo/daemon/MCP proof below. It binds CLI provenance and proves that
       # setup remains useful before a repository exists. Codex is deliberately
       # absent at this checkpoint because its entry binds an exact repository;
       # the first-run step below proves all five clients after admission.
->>>>>>> d8e84ea5 (Prove native Windows repository workflows)
       - name: Windows repo-free provenance and setup proof
         if: runner.os == 'Windows'
         shell: bash
@@ -1347,7 +1334,6 @@ jobs:
           if (status.schema !== "kin.status.v3") {
             throw new Error(`kin-status.json: unsupported schema ${status.schema ?? "missing"}`);
           }
-<<<<<<< HEAD
           const validateEmbeddingCoverage = (coverage, label) => {
             if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
               throw new Error(`${label}: embedding_coverage is missing or malformed`);
@@ -1377,15 +1363,11 @@ jobs:
               throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
             }
           };
-          validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
-          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
-=======
-          if (semanticCoverage.supported !== !isWindows) {
-            throw new Error(
-              `${runnerOs} semantic vector support is ${semanticCoverage.supported}, expected ${!isWindows}`
-            );
->>>>>>> d8e84ea5 (Prove native Windows repository workflows)
+          if (!isWindows) {
+            validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
+            if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
+              throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+            }
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
@@ -1583,8 +1565,6 @@ jobs:
             const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
             if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
               throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
-            }
-          }
             }
           }
           NODE
