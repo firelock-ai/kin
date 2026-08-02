@@ -562,7 +562,7 @@ fn open_retained_config_directory(path: &Path) -> Result<File> {
     open_config_directory(
         path,
         FILE_LIST_DIRECTORY | FILE_ADD_FILE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
     )
 }
 
