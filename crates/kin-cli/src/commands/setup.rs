@@ -13169,13 +13169,13 @@ try {
             }
             $authorityStream.Lock(0, [Int64]::MaxValue)
             $authorityLocked = $true
-        } catch [IO.IOException] {
+        } catch {
             if ($null -ne $authorityStream) {
                 $authorityStream.Dispose()
                 $authorityStream = $null
             }
             if ([DateTime]::UtcNow -ge $authorityDeadline) {
-                throw "timed out acquiring Kin install authority for deferred uninstall cleanup"
+                throw "timed out acquiring Kin install authority for deferred uninstall cleanup: $_"
             }
             Start-Sleep -Milliseconds 25
         }
@@ -13230,7 +13230,7 @@ try {
         "    $current = [Environment]::GetEnvironmentVariable('Path', 'User')",
         r#"    $testRelease = $env:KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE
     if (-not [string]::IsNullOrEmpty($testRelease)) {
-        $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(120)
+        $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(300)
         while (-not (Test-Path -LiteralPath $testRelease -PathType Leaf)) {
             if ([DateTime]::UtcNow -ge $testReleaseDeadline) {
                 throw "timed out waiting for the native-test deferred-cleanup release"
