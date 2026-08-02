@@ -13151,7 +13151,6 @@ $retired = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_RETIRED)
 $incompleteMarker = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_INCOMPLETE_MARKER)
 $expectedIdentity = $env:KIN_UNINSTALL_EXPECTED_IDENTITY
 $parentHandle = [KinUninstallIdentity]::LockParent($pidToWait, $expectedParentCreation)
-$authorityStream = [IO.File]::Open($authority, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
 $readyBytes = [Text.Encoding]::UTF8.GetBytes($env:KIN_UNINSTALL_READY_NONCE)
 $readyStream = [IO.File]::Open($readyPublishing, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
 try {
@@ -13165,9 +13164,16 @@ try {
     $authorityDeadline = [DateTime]::UtcNow.AddMinutes(5)
     while (-not $authorityLocked) {
         try {
+            if ($null -eq $authorityStream) {
+                $authorityStream = [IO.File]::Open($authority, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+            }
             $authorityStream.Lock(0, [Int64]::MaxValue)
             $authorityLocked = $true
         } catch [IO.IOException] {
+            if ($null -ne $authorityStream) {
+                $authorityStream.Dispose()
+                $authorityStream = $null
+            }
             if ([DateTime]::UtcNow -ge $authorityDeadline) {
                 throw "timed out acquiring Kin install authority for deferred uninstall cleanup"
             }
@@ -14842,6 +14848,11 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "successful deferred uninstall",
             Duration::from_secs(120),
             || {
+                if success.helper_log.is_file() {
+                    let log_content = fs::read_to_string(&success.helper_log).unwrap_or_default();
+                    eprintln!("deferred uninstall helper logged error:\n{log_content}");
+                    return false;
+                }
                 !success.incomplete_marker.exists()
                     && !success.retired.exists()
                     && !success.helper_ready.exists()
