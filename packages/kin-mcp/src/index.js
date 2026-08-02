@@ -56,10 +56,17 @@ export function resolveReleaseAsset(platform = process.platform, arch = process.
       daemonBinaryName: DAEMON_BINARY_NAME
     };
   }
+  if (platform === 'win32' && arch === 'x64') {
+    return {
+      assetName: 'kin-windows-x86_64',
+      archiveName: 'kin-windows-x86_64.zip',
+      binaryName: `${PRIMARY_BINARY_NAME}.exe`,
+      daemonBinaryName: `${DAEMON_BINARY_NAME}.exe`
+    };
+  }
 
   throw new Error(
-    `kin-mcp does not have a published Kin binary for ${platform}/${arch} yet. ` +
-      'On Windows, use WSL2 for this alpha.'
+    `kin-mcp does not have a published Kin binary for ${platform}/${arch} yet.`
   );
 }
 
@@ -122,7 +129,7 @@ export async function ensureKinBinary({
     cacheRoot
   });
 
-  const daemonPath = path.join(path.dirname(binaryPath), DAEMON_BINARY_NAME);
+  const daemonPath = resolveDaemonBinaryPath(binaryPath);
   if (
     (await isRunnable(binaryPath, platform)) &&
     (await isRunnable(daemonPath, platform))
@@ -215,7 +222,8 @@ export async function runKinMcp(argv = [], options = {}) {
 }
 
 export function resolveDaemonBinaryPath(kinBinaryPath) {
-  return path.join(path.dirname(kinBinaryPath), DAEMON_BINARY_NAME);
+  const suffix = path.extname(kinBinaryPath).toLowerCase() === '.exe' ? '.exe' : '';
+  return path.join(path.dirname(kinBinaryPath), `${DAEMON_BINARY_NAME}${suffix}`);
 }
 
 export function childEnv(env, kinBinaryPath, platform = process.platform) {
@@ -240,13 +248,14 @@ function guidedProvisioningFailure(error) {
     'Fixes:',
     '  - Install Kin directly and run `kin setup` to configure your agent, then point',
     '    this wrapper at it with KIN_MCP_KIN_BINARY=/path/to/kin.',
-    '  - Or retry on a supported target (macOS/Linux). On Windows use WSL2 for this alpha.',
+    '  - Or retry on a supported target (macOS, Linux, or Windows x64).',
+    '    Native Windows is vector-free; use WSL2 when you need vectors or projection.',
     '  - Or override the release source with KIN_MCP_RELEASE_BASE_URL if you mirror releases.'
   ].join('\n');
 }
 
-function isTruthyEnv(value) {
-  return ['1', 'true', 'TRUE', 'yes', 'YES'].includes(String(value || ''));
+export function isTruthyEnv(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }
 
 function renderHelp() {
@@ -311,8 +320,54 @@ async function installKinBinary({ binaryPath, env, platform, arch, version }) {
     binaryName,
     daemonBinaryName,
     binaryPath,
-    platform
+    platform,
+    env
   });
+}
+
+function mergeEnvironment(base, overrides) {
+  const merged = { ...base };
+  for (const [name, value] of Object.entries(overrides || {})) {
+    for (const inherited of Object.keys(merged)) {
+      if (inherited.toLowerCase() === name.toLowerCase()) {
+        delete merged[inherited];
+      }
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
+function environmentValue(env, name) {
+  const key = Object.keys(env).find(candidate => candidate.toLowerCase() === name.toLowerCase());
+  return key === undefined ? undefined : env[key];
+}
+
+function windowsSystemTarPath(env) {
+  const systemRoot = environmentValue(env, 'SystemRoot');
+  if (!systemRoot) {
+    throw new Error('native Windows ZIP extraction requires SystemRoot');
+  }
+  return path.win32.join(systemRoot, 'System32', 'tar.exe');
+}
+
+function archiveExtraction(platform, env, archiveName) {
+  if (platform === 'win32') {
+    if (process.platform === 'win32') {
+      return {
+        executable: windowsSystemTarPath(env),
+        args: ['-xf', archiveName, '-C', '.']
+      };
+    }
+    // Cross-target tests on Unix exercise genuine ZIP bytes with the host's
+    // deterministic system unzip. Production never installs Windows assets
+    // on a Unix host.
+    return {
+      executable: '/usr/bin/unzip',
+      args: ['-q', archiveName, '-d', '.']
+    };
+  }
+  return { executable: 'tar', args: ['-xf', archiveName, '-C', '.'] };
 }
 
 async function installFromArchive({
@@ -322,7 +377,8 @@ async function installFromArchive({
   binaryName,
   daemonBinaryName,
   binaryPath,
-  platform
+  platform,
+  env
 }) {
   const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-install-'));
   const archivePath = path.join(tmpRoot, archiveName);
@@ -332,7 +388,15 @@ async function installFromArchive({
 
   try {
     await fsp.writeFile(archivePath, archiveBytes);
-    await execFile('tar', ['-xzf', archivePath, '-C', tmpRoot]);
+    const toolEnv = mergeEnvironment(process.env, env);
+    const extraction = archiveExtraction(platform, toolEnv, archiveName);
+    // Windows authority is the absolute System32 bsdtar, never a Git/MSYS or
+    // user-provided `tar` found through PATH. Relative operands also avoid the
+    // GNU remote-host interpretation of `C:\\...` paths.
+    await execFile(extraction.executable, extraction.args, {
+      cwd: tmpRoot,
+      env: toolEnv
+    });
 
     const kinStaged = await stageBinary({
       tmpRoot,
@@ -378,7 +442,9 @@ async function stageBinary({
   required,
   missingHint
 }) {
-  const extracted = path.join(tmpRoot, assetName, sourceName);
+  const extracted = platform === 'win32'
+    ? path.join(tmpRoot, sourceName)
+    : path.join(tmpRoot, assetName, sourceName);
   try {
     await fsp.access(extracted, fs.constants.R_OK);
   } catch {

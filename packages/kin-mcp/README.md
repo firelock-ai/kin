@@ -61,10 +61,12 @@ For a pinned version:
 ## Requirements
 
 - Node.js 20+
-- macOS or Linux
+- macOS, Linux, or native Windows x64
 - A Kin-initialized repository (`kin init`)
 
-Windows users should run Kin through WSL2 during the alpha.
+The native Windows archive is vector-free and does not include transparent
+filesystem projection. Use WSL2 when you need vectors or projection; the core
+graph, lexical, daemon, and MCP workflow runs natively on Windows x64.
 
 ## Cache
 
@@ -72,6 +74,7 @@ The wrapper caches the downloaded `kin` and `kin-daemon` binaries under:
 
 - macOS: `~/Library/Caches/kin-mcp`
 - Linux: `~/.cache/kin-mcp`
+- Windows: `%LOCALAPPDATA%\kin-mcp\Cache`
 
 Set `KIN_MCP_CACHE_DIR` to override the cache location.
 

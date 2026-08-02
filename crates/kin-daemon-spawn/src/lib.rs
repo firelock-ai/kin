@@ -33,6 +33,8 @@
 //! here keeps this crate cheap enough that neither caller has a reason to
 //! reimplement it.
 
+use fs2::FileExt;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -60,6 +62,234 @@ pub const PORT_FILE_NAME: &str = "daemon.port";
 
 /// File the daemon writes its PID into as part of endpoint publication.
 pub const PID_FILE_NAME: &str = "daemon.pid";
+
+/// Shared install-mutation lease for spawn paths that cannot depend on
+/// `kin-cli` (most importantly MCP daemon revival). Full uninstall takes the
+/// same `<KIN_HOME>/update.lock` exclusively before stopping processes and
+/// retiring the executable root. Holding this lease until readiness makes a
+/// managed spawn land wholly before that sweep or fail after retirement.
+pub struct ManagedInstallSpawnFence {
+    _file: File,
+    #[cfg(windows)]
+    _root: File,
+}
+
+impl ManagedInstallSpawnFence {
+    /// Take spawn admission only when `binary` is the real `bin/kin-daemon`
+    /// beneath `configured_root`. Development and explicitly external daemon
+    /// binaries return `Ok(None)` and are not attributed to the managed install.
+    pub fn acquire(binary: &Path, configured_root: &Path) -> std::io::Result<Option<Self>> {
+        let Some(bin_dir) = binary.parent() else {
+            return Ok(None);
+        };
+        if bin_dir.file_name().and_then(|name| name.to_str()) != Some("bin") {
+            return Ok(None);
+        }
+        let Some(candidate_root) = bin_dir.parent() else {
+            return Ok(None);
+        };
+        let candidate_root = candidate_root.canonicalize()?;
+        let candidate_name = candidate_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if candidate_name.starts_with(".kin-uninstall-retired-")
+            || candidate_name.starts_with(".kin-uninstall-delete-")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to spawn a managed daemon from retired uninstall state: {}",
+                    binary.display()
+                ),
+            ));
+        }
+        let configured_root = match configured_root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if candidate_root != configured_root {
+            return Ok(None);
+        }
+
+        let root_before = fs::symlink_metadata(&configured_root)?;
+        if root_before.file_type().is_symlink() || !root_before.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed install root is not a real non-symlink directory",
+            ));
+        }
+        let binary_before = fs::symlink_metadata(binary)?;
+        if binary_before.file_type().is_symlink() || !binary_before.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed daemon binary is not a real non-symlink file",
+            ));
+        }
+        let resolved_binary = binary.canonicalize()?;
+        let expected_binary = configured_root
+            .join("bin")
+            .join(binary.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "managed daemon binary has no file name",
+                )
+            })?);
+        if resolved_binary != expected_binary.canonicalize()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed daemon binary changed before spawn admission",
+            ));
+        }
+
+        let lock_path = configured_root.join("update.lock");
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed install update lock is not a real non-symlink file",
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let file = options.open(&lock_path)?;
+        FileExt::lock_shared(&file)?;
+        #[cfg(windows)]
+        let root_guard = open_windows_root_guard(&configured_root)?;
+
+        if configured_root.canonicalize()? != candidate_root
+            || binary.canonicalize()? != resolved_binary
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed install changed after spawn admission",
+            ));
+        }
+        let root_after = fs::symlink_metadata(&configured_root)?;
+        if !same_file_object(&root_before, &root_after) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed install root identity changed after spawn admission",
+            ));
+        }
+        let lock_path_metadata = fs::symlink_metadata(&lock_path)?;
+        if lock_path_metadata.file_type().is_symlink()
+            || !same_file_object(&file.metadata()?, &lock_path_metadata)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "managed install update lock binding changed after spawn admission",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let current_lock = open_windows_regular_nofollow(&lock_path)?;
+            if windows_file_identity(&file)?.0 != windows_file_identity(&current_lock)?.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed install update lock object changed after spawn admission",
+                ));
+            }
+        }
+        Ok(Some(Self {
+            _file: file,
+            #[cfg(windows)]
+            _root: root_guard,
+        }))
+    }
+}
+
+#[cfg(unix)]
+fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_object(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> std::io::Result<((u32, u64), u32)> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        (
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ),
+        info.dwFileAttributes,
+    ))
+}
+
+#[cfg(windows)]
+fn open_windows_root_guard(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let (_, attributes) = windows_file_identity(&file)?;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed install root is not a real non-reparse directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_windows_regular_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let (_, attributes) = windows_file_identity(&file)?;
+    if attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed install update lock is not a real non-reparse file",
+        ));
+    }
+    Ok(file)
+}
 
 #[cfg(unix)]
 const TEST_RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
@@ -2718,6 +2948,66 @@ pub async fn register_started_daemon(kin_root: &Path, daemon_url: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These are intentionally cross-platform. The permanent native-Windows
+    // authority leg selects this name prefix so Windows proves the same
+    // shared/exclusive lease and retired-root contract as Unix.
+    #[test]
+    fn managed_spawn_fence_blocks_exclusive_uninstall_authority_until_release() {
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".kin");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let daemon = root.join("bin/kin-daemon");
+        fs::write(&daemon, b"managed daemon fixture").unwrap();
+
+        let fence = ManagedInstallSpawnFence::acquire(&daemon, &root)
+            .unwrap()
+            .expect("managed binary must acquire install admission");
+        let lock_path = root.join("update.lock");
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            FileExt::lock_exclusive(&file).unwrap();
+            acquired_tx.send(()).unwrap();
+            file
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "exclusive uninstall lease passed a live managed spawn"
+        );
+        drop(fence);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exclusive uninstall lease did not proceed after readiness release");
+        drop(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn managed_spawn_fence_rejects_binary_resolved_inside_retired_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".kin");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/kin-daemon"), b"managed daemon fixture").unwrap();
+        let retired = tmp
+            .path()
+            .join(".kin-uninstall-retired-00000000-0000-4000-8000-000000000001");
+        fs::rename(&root, &retired).unwrap();
+
+        let error = ManagedInstallSpawnFence::acquire(&retired.join("bin/kin-daemon"), &root)
+            .err()
+            .expect("retired managed executable must never regain spawn admission");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("retired uninstall state"));
+    }
 
     // ── Process-group containment ─────────────────────────────────────────
     //

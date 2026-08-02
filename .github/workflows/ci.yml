@@ -114,7 +114,7 @@ jobs:
     #
     # This job stays on every event on purpose, and the authority test enforces
     # that it carries no job-level `if:`. It is the merge group's only proof of
-    # the Windows admission refusals, so taking it off the queue to reclaim its
+    # the native Windows admission contract, so taking it off the queue to reclaim its
     # runner minutes would trade a reviewable pre-landing signal for a required
     # context that first fails on main.
     runs-on: windows-latest
@@ -133,6 +133,20 @@ jobs:
       - name: Test installer warning and checksum contract (Windows PowerShell 5.1)
         shell: powershell
         run: ./scripts/test-install-checksum.ps1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Test both public npm surfaces on native Windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test --prefix ./packages/kin
+          npm run lint --prefix ./packages/kin
+          npm test --prefix ./packages/kin-mcp
+          npm run lint --prefix ./packages/kin-mcp
+          node --check ./scripts/prove-windows-npm-first-run.mjs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
@@ -289,6 +303,46 @@ jobs:
           run_required_filter "kin-cli Windows modules" "windows" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
+          run_required_exact "MCP Windows sibling daemon discovery" \
+            "daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-mcp --no-default-features --lib
+          # Full uninstall owns native Windows process handles, directory
+          # identity, and deferred self-deletion. Compiling these paths on a
+          # non-Windows host cannot prove their runtime contract, so keep both
+          # the focused unit surface and the real daemon lifecycle in the
+          # permanent Windows authority leg.
+          run_required_filter "full managed uninstall safety" \
+            "commands::setup::tests::full_uninstall" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native full managed uninstall lifecycle" \
+            "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native managed-daemon ownership scan" \
+            "commands::daemon::tests::native_managed_daemon_scan_canonicalizes_and_rejects_traversal" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native install authority contention and crash recovery" \
+            "commands::update::tests::native_install_authority_contends_across_aliases_and_recovers_after_crash" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_exact "native managed-daemon spawn admission" \
+            "commands::update::tests::managed_daemon_spawn_lease_blocks_uninstall_authority_until_readiness" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "managed-install spawn fence" \
+            "managed_spawn_fence" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon-spawn --lib
+          run_required_filter "daemon shutdown identity" "shutdown" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --lib
+          run_required_target "daemon status and stop lifecycle" \
+            "daemon_status_and_stop_lifecycle" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test daemon_stop
           run_required_filter "bounded CLI test subprocesses" \
             "commands::test_subprocess::tests" \
             --locked --target x86_64-pc-windows-msvc \
@@ -322,17 +376,18 @@ jobs:
             -p kin-cli --no-default-features --test repository_merge_resolution
 
       # The two steps below are the pull-request half of the Windows admission
-      # contract. The installer leg asserts the same refusals against the
+      # contract. The installer leg asserts the same behavior against the
       # release binary, but it runs only on the landing push, so on its own it
       # can report an admission change no earlier than a required check
       # failing on a release commit. The feature set matches the installer
       # leg's so both legs drive the same build of the command.
-      - name: Build the Windows CLI the admission assertions drive
+      - name: Build the Windows binaries the admission and npm assertions drive
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --bin kin
+            -p kin-cli -p kin-daemon --no-default-features \
+            --bin kin --bin kin-daemon
 
       - name: Assert the Windows admission contract
         shell: bash
@@ -341,6 +396,15 @@ jobs:
           bash ./scripts/assert-windows-init-contract.sh \
             "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/debug/kin.exe" \
             "$RUNNER_TEMP/kin-windows-admission"
+
+      - name: Prove both npm surfaces from built Windows binaries
+        shell: bash
+        env:
+          KIN_NPM_PROOF_KIN_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin.exe
+          KIN_NPM_PROOF_DAEMON_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin-daemon.exe
+        run: |
+          set -euo pipefail
+          node ./scripts/prove-windows-npm-first-run.mjs
 
   windows-installer:
     name: Windows installer + vector-free release build
@@ -990,7 +1054,7 @@ jobs:
       # It is the authority when the two runners disagree, and it covers the
       # package's doctests in the same pass instead of needing a second step.
       - name: Test featureless kin-cli
-        run: cargo test -p kin-cli --no-default-features --locked
+        run: cargo test -p kin-cli --no-default-features --lib --tests --locked
 
       # kin-daemon owns feature-dependent status sampling and response tests of
       # its own. A featureless package check compiles those routes but does not
@@ -998,7 +1062,7 @@ jobs:
       # answer. Run the complete daemon package under the same release feature
       # set; doctests need no companion step because the crate disables them.
       - name: Test featureless kin-daemon
-        run: cargo test -p kin-daemon --no-default-features --locked
+        run: cargo test -p kin-daemon --no-default-features --lib --tests --locked
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 

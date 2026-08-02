@@ -18,7 +18,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
@@ -881,6 +881,47 @@ struct DaemonAuthState {
     auth_token: Option<String>,
 }
 
+#[derive(Clone)]
+struct DaemonShutdownControl(Option<tokio::sync::watch::Sender<bool>>);
+
+async fn request_daemon_shutdown(
+    Extension(control): Extension<DaemonShutdownControl>,
+    Json(expected): Json<kin_cli::daemon_client::ProcessIdentity>,
+) -> Response {
+    let current = match kin_cli::daemon_client::current_process_identity() {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("current process identity unavailable: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    if current != expected {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "daemon process incarnation changed"})),
+        )
+            .into_response();
+    }
+    let Some(shutdown) = control.0 else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "cooperative shutdown is unavailable"})),
+        )
+            .into_response();
+    };
+    match shutdown.send(true) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("shutdown channel closed: {error}")})),
+        )
+            .into_response(),
+    }
+}
+
 fn is_public_route(path: &str) -> bool {
     let path = path.strip_prefix("/v2").unwrap_or(path);
     matches!(path, "/health" | "/ready" | "/readiness" | "/spine/health")
@@ -1064,6 +1105,7 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
 fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/health", get(health))
+        .route("/shutdown", post(request_daemon_shutdown))
         .route("/readiness", get(readiness))
         .route("/ready", get(readiness))
         .route("/session", post(start_session).get(list_sessions))
@@ -1408,6 +1450,14 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 }
 
 fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Router {
+    router_with_auth_and_shutdown(state, auth_token, None)
+}
+
+fn router_with_auth_and_shutdown(
+    state: Arc<DaemonState>,
+    auth_token: Option<String>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) -> Router {
     let routes = api_routes();
     let activity_state = Arc::clone(&state);
 
@@ -1504,6 +1554,7 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v2", routes)
+        .layer(Extension(DaemonShutdownControl(shutdown)))
         .layer(middleware::from_fn_with_state(
             DaemonAuthState { auth_token },
             daemon_auth,
@@ -10118,10 +10169,11 @@ pub fn bind_api_listener(
 pub async fn serve_bound_with_shutdown(
     state: Arc<DaemonState>,
     listener: tokio::net::TcpListener,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let auth_token = resolve_serve_auth_token(&state.layout);
-    let app = router_with_auth(state, auth_token);
+    let app = router_with_auth_and_shutdown(state, auth_token, shutdown_tx);
     let port = listener
         .local_addr()
         .map(|addr| addr.port())
@@ -10147,7 +10199,7 @@ pub async fn serve_with_shutdown(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let (listener, _bound_port) = bind_api_listener(&state, port)?;
-    serve_bound_with_shutdown(state, listener, shutdown_rx).await
+    serve_bound_with_shutdown(state, listener, None, shutdown_rx).await
 }
 
 fn resolve_bind_host(bind_host: Option<String>) -> String {
@@ -11698,6 +11750,7 @@ mod tests {
     /// mutation, so native history that introduces artifacts cannot be admitted
     /// by any pull today. Editing an artifact the destination already holds is
     /// what a native transfer can actually carry, so it is what this proves.
+    #[cfg(unix)]
     fn advance_peer_artifact(
         storage: &FsPath,
         repository_id: &RepositoryId,
@@ -12056,6 +12109,7 @@ mod tests {
     /// repository, because a transfer only exists between replicas of the same
     /// repository identity: the ref advertisement refuses anything else. This is
     /// the local half of what a native clone will establish.
+    #[cfg(unix)]
     struct WorkspaceFollowFixture {
         state: Arc<DaemonState>,
         working: PathBuf,
@@ -15130,6 +15184,7 @@ mod tests {
     /// Install one entity into the daemon query graph alone, the way the
     /// asynchronous LSP enrichment worker and parser reconciliation both do:
     /// derived semantics that have not crossed the repository compare-and-swap.
+    #[cfg(unix)]
     fn install_unpublished_derived_entity(state: &DaemonState, name: &str) -> kin_model::EntityId {
         let entity = kin_model::Entity {
             id: kin_model::EntityId::new(),
@@ -23346,6 +23401,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_route_is_bound_to_the_expected_process_incarnation() {
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let mut stale = serde_json::to_value(&identity).unwrap();
+        stale["birth_token"] = serde_json::Value::String("reused-pid-successor".to_string());
+
+        let (rejected_tx, rejected_rx) = tokio::sync::watch::channel(false);
+        let rejected_app = router_with_auth_and_shutdown(
+            test_state(),
+            Some("shutdown-token".to_string()),
+            Some(rejected_tx),
+        );
+        let rejected = rejected_app
+            .oneshot(
+                Request::post("/shutdown")
+                    .header("authorization", "Bearer shutdown-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(stale.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(
+            !*rejected_rx.borrow(),
+            "mismatched identity requested shutdown"
+        );
+
+        let (accepted_tx, accepted_rx) = tokio::sync::watch::channel(false);
+        let accepted_app = router_with_auth_and_shutdown(
+            test_state(),
+            Some("shutdown-token".to_string()),
+            Some(accepted_tx),
+        );
+        let accepted = accepted_app
+            .oneshot(
+                Request::post("/shutdown")
+                    .header("authorization", "Bearer shutdown-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&identity).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert!(
+            *accepted_rx.borrow(),
+            "matching identity did not request shutdown"
+        );
+    }
+
+    #[tokio::test]
     async fn spine_edges_snapshot_is_authenticated_and_read_only() {
         let state = test_state();
         let app = router_with_auth(state, Some("secret-token".to_string()));
@@ -24166,7 +24272,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(serve_bound_with_shutdown(state, listener, shutdown_rx));
+        let server = tokio::spawn(serve_bound_with_shutdown(
+            state,
+            listener,
+            None,
+            shutdown_rx,
+        ));
         let base = format!("http://{addr}");
 
         let http = reqwest::Client::new();

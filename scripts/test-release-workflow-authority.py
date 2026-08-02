@@ -36,6 +36,11 @@ MCP_TOOLS_DOC = ROOT / "docs" / "mcp-tools.md"
 LLMS_DOC = ROOT / "llms.txt"
 NPM_CANONICAL_README = ROOT / "packages" / "kin" / "README.md"
 NPM_MCP_README = ROOT / "packages" / "kin-mcp" / "README.md"
+WINDOWS_NPM_PROOF = ROOT / "scripts" / "prove-windows-npm-first-run.mjs"
+CANONICAL_NPM_PROVISION = ROOT / "packages" / "kin" / "lib" / "provision.mjs"
+CANONICAL_NPM_PROVISION_TEST = ROOT / "packages" / "kin" / "test" / "provision.test.mjs"
+COMPAT_NPM_PROVISION = ROOT / "packages" / "kin-mcp" / "src" / "index.js"
+COMPAT_NPM_PROVISION_TEST = ROOT / "packages" / "kin-mcp" / "test" / "index.test.js"
 INSTALLER_CALLBACK = WORKFLOWS / "publish-release-installers.yml"
 UPDATE_TRUST = ROOT / "docs" / "security" / "signing-and-update-trust.md"
 PREPARE_RELEASE = ROOT / "scripts" / "prepare-release.mjs"
@@ -2020,7 +2025,7 @@ def assert_node_validator_rejects_missing_proof(step: str, label: str) -> None:
 
 
 def windows_init_contract_strings() -> dict[str, str]:
-    """Return the shipped Windows admission contract's own refusal strings.
+    """Return wording shared by both Windows admission proofs.
 
     The install proof installs a public release anonymously and has no
     checkout, so it cannot run the contract script and retypes these instead.
@@ -2030,12 +2035,7 @@ def windows_init_contract_strings() -> dict[str, str]:
 
     source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     strings: dict[str, str] = {}
-    for name in (
-        "CONFIG_REFUSAL",
-        "SOURCE_PROOF_STAGE",
-        "DURABLE_FLUSH_GAP",
-        "NON_EMPTY_REFUSAL",
-    ):
+    for name in ("NON_EMPTY_REFUSAL",):
         bindings = re.findall(rf'(?m)^{name}="([^"]+)"$', source)
         if len(bindings) != 1:
             raise AssertionError(
@@ -2176,13 +2176,13 @@ def assert_windows_public_support_contract(
 
 
 def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> None:
-    """Keep the shipped contract's published-nothing check able to fail at all.
+    """Keep the shipped contract's stage-residue check able to fail at all.
 
     Both admission paths stage into the PARENT of the directory they admit:
     `crates/kin-core/src/git_init.rs` derives the stage from the source's
     parent and `crates/kin-core/src/init.rs` from the working directory's. A
     stage count taken inside the admitted directory therefore reports zero for
-    every input and passes whether or not the refusal cleaned up after itself.
+    every input and passes whether or not admission cleaned up after itself.
     This script is a required Windows check on every pull request, so a form
     that cannot fail is worse here than no check at all: it reads as proof.
     """
@@ -2191,7 +2191,7 @@ def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> No
     for policy in (
         'parent="$(dirname "$dir")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
-        'if [ "$staged" != "$expected_residue" ]; then',
+        'if [ "$staged" != "0" ]; then',
     ):
         require(active, policy, "reachable Windows stage-leak check")
 
@@ -2276,46 +2276,86 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
         )
 
 
-def assert_install_proof_repo_steps_are_unix_only(install_proof: str) -> None:
-    """Keep every repository-dependent install-proof step off Windows.
+def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
+    """Require native Windows released bytes to prove repo, daemon, and MCP.
 
-    `kin init` refuses every admission boundary on Windows and the contract
-    script asserts that refusal by name on every pull request, so a step
-    needing an admitted repository has no passing outcome available to it
-    there. Without these guards the release gate demands the admission the
-    shipped product refuses, and the Windows leg cannot go green on either
-    answer.
+    This is deliberately a positive execution proof. Merely rejecting one
+    spelling of ``runner.os != 'Windows'`` lets an equivalent Linux-only
+    expression, a job-level guard, a matrix exclusion, or a fixed non-Windows
+    runner silently remove the Windows leg while the policy test stays green.
+    The three release-critical steps are therefore unconditional inside one
+    canonical matrix job whose runner is the matrix OS and whose include list
+    contains an unexcluded ``windows-latest`` row.
     """
+
+    jobs = workflow_job_blocks(install_proof)
+    install_job = jobs.get("install-proof")
+    if install_job is None:
+        raise AssertionError("native Windows release proof lost the install-proof job")
+
+    job_fields = job_top_level_mapping_fields(install_job)
+    if any(key == "if" for key, _ in job_fields):
+        raise AssertionError(
+            "native Windows release proof lost repository coverage: install-proof "
+            "must not carry a job-level condition"
+        )
+    runs_on = [value.strip() for key, value in job_fields if key == "runs-on"]
+    if runs_on != ["${{ matrix.os }}"]:
+        raise AssertionError(
+            "native Windows release proof must run on the reviewed OS matrix; "
+            f"found runs-on={runs_on}"
+        )
+
+    strategy = dynamic_job_context_source(install_job)
+    strategy_lines = active_lines(strategy)
+    if any(
+        line == "exclude:" or line.startswith("exclude:")
+        for line in strategy_lines
+    ):
+        raise AssertionError(
+            "native Windows release proof matrix must not exclude a reviewed OS row"
+        )
+    if strategy_lines.count("- os: windows-latest") != 1:
+        raise AssertionError(
+            "native Windows release proof matrix must contain exactly one "
+            "windows-latest row"
+        )
 
     for step in (
         "First-run repository, daemon, and setup proof",
         "Graph query and MCP tool-call proof",
         "Validate installed capability proof",
     ):
-        if "if: runner.os != 'Windows'" not in "\n".join(
-            active_lines(install_proof_step(install_proof, step))
-        ):
+        step_source = textwrap.dedent(
+            install_proof_step(install_proof, step)
+        ).strip()
+        top_level_fields: list[str] = []
+        for line in classifier_active_job_source(step_source).splitlines()[1:]:
+            indent = len(line) - len(line.lstrip())
+            if indent != 2:
+                continue
+            match = re.fullmatch(r"  (?P<key>[A-Za-z0-9_-]+):(?:[ \t].*)?", line)
+            if match is None:
+                raise AssertionError(
+                    "install-proof step fields must use canonical unquoted `key:` "
+                    f"syntax: {line.strip()}"
+                )
+            top_level_fields.append(match.group("key"))
+        if "if" in top_level_fields:
             raise AssertionError(
-                f"install proof requires a Kin repository on Windows: {step} lost "
-                "its runner.os != 'Windows' guard"
+                f"native Windows release proof lost repository coverage: {step} "
+                "must run unconditionally for every reviewed matrix row"
             )
 
 
 def assert_install_proof_windows_admission_contract(
     windows_admission: str, contract: dict[str, str]
 ) -> None:
-    """Require the install proof to assert the refusal Windows actually ships.
-
-    A release proof that asserted an admission the product refuses can never go
-    green, and one that asserted a refusal the product no longer produces would
-    go green on the wrong behavior. Both failure modes are closed by requiring
-    each boundary to name its own cause in the contract's own words, and by
-    requiring every refusal to have published nothing.
-    """
+    """Require released Windows bytes to assert the native admission contract."""
 
     active = "\n".join(active_lines(windows_admission))
-    for name, refusal in contract.items():
-        binding = f'{name}="{refusal}"'
+    for name, wording in contract.items():
+        binding = f'{name}="{wording}"'
         if binding not in active:
             raise AssertionError(
                 "install proof must assert the shipped Windows admission contract "
@@ -2323,38 +2363,28 @@ def assert_install_proof_windows_admission_contract(
                 f"expected {binding}"
             )
     for policy in (
-        'require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2',
-        'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
-        'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
-        'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2',
-        'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
-        'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
-        'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
+        'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
+        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
+        'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
+        'fail "$1 failed" "$3"',
         'fail "$1 unexpectedly succeeded" "$3"',
+        'if [ ! -d "$2/.kin" ]; then',
         'if [ -e "$2/.kin" ]; then',
         'parent="$(dirname "$2")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
-        'if [ "$staged" != "$4" ]; then',
+        'if [ "$staged" != "0" ]; then',
     ):
         require(active, policy, "shipped Windows admission contract proof")
 
 
 def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
-    """Keep proving every Windows surface that survives without a repository.
+    """Keep the pre-repository Windows setup/provenance checkpoint falsifiable.
 
-    Windows-gating the repository steps is a reduction in release coverage, so
-    what remains has to stay genuinely falsifiable rather than becoming a leg
-    that installs a binary and declares victory. The installed CLI still proves
-    its own build provenance against the release tag's own public source, the
-    platform capability posture is still pinned by name including the repair
-    negative control, and setup still writes and validates the shell hook, the
-    install ledger, and every agent-client MCP config a repo-free install can
-    write. `kin bench-meta` reports the CLI build alone, so the daemon's build
-    provenance is among what this leg no longer binds. Codex and Antigravity
-    are the exceptions, excluded by the product because their entries bind an
-    exact repository, and both absences are asserted rather than unmentioned.
+    The later first-run steps prove the admitted repo, daemon, all five client
+    writers, and MCP. This earlier checkpoint separately proves the CLI's
+    public provenance, unsupported capability posture, and the four client
+    writers that do not require an exact repository binding.
     """
 
     active = "\n".join(active_lines(repo_free))
@@ -2450,7 +2480,7 @@ def assert_install_proof_status_contract(
         'path.join(process.cwd(), ".agents", "mcp_config.json")',
         "spawn(entry.command, entry.args",
         "cwd: entry.cwd",
-        "env: { ...process.env, ...(entry.env ?? {}) }",
+        "env: { ...proofEnv, ...(entry.env ?? {}) }",
     ):
         require(graph_active, policy, "installed daemon startup and health capture")
 
@@ -2577,6 +2607,164 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
         blocks[job] = jobs[match.start() : end].rstrip()
     return blocks
+
+
+def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
+    """Require both public npm surfaces to pass a real native Windows first run.
+
+    Unit tests on Linux can prove package policy, but not Windows executable
+    names or sibling-daemon discovery. Keep the canonical package, compatibility
+    wrapper, built binary pair, and PATH-free runtime exercise in one required
+    Windows job so none can be inferred from the others.
+    """
+
+    active_job_lines = active_lines(ci_job)
+    active_job = "\n".join(active_job_lines)
+    for command in (
+        "npm test --prefix ./packages/kin",
+        "npm run lint --prefix ./packages/kin",
+        "npm test --prefix ./packages/kin-mcp",
+        "npm run lint --prefix ./packages/kin-mcp",
+    ):
+        if command not in active_job_lines:
+            raise AssertionError(
+                "native Windows npm first-run CI proof is missing exact command: "
+                f"{command}"
+            )
+    for policy in (
+        "actions/setup-node@v7",
+        "node-version: 20",
+        "Test both public npm surfaces on native Windows",
+        "node --check ./scripts/prove-windows-npm-first-run.mjs",
+        "MCP Windows sibling daemon discovery",
+        "daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path",
+        "-p kin-mcp --no-default-features --lib",
+        "Build the Windows binaries the admission and npm assertions drive",
+        "-p kin-cli -p kin-daemon --no-default-features",
+        "--bin kin --bin kin-daemon",
+        "Prove both npm surfaces from built Windows binaries",
+        "KIN_NPM_PROOF_KIN_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin.exe",
+        "KIN_NPM_PROOF_DAEMON_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin-daemon.exe",
+        "node ./scripts/prove-windows-npm-first-run.mjs",
+    ):
+        require(active_job, policy, "native Windows npm first-run CI proof")
+
+    npm_tests = active_job.index("npm test --prefix ./packages/kin")
+    binary_build = active_job.index(
+        "Build the Windows binaries the admission and npm assertions drive"
+    )
+    runtime_proof = active_job.index(
+        "Prove both npm surfaces from built Windows binaries"
+    )
+    if not npm_tests < binary_build < runtime_proof:
+        raise AssertionError(
+            "native Windows npm proof must run package tests before building the "
+            "exact binaries its first-run integration drives"
+        )
+
+    active_proof = "\n".join(active_lines(proof_source))
+    for policy in (
+        "if (process.platform !== 'win32' && !hostOverride) {",
+        "requireBuiltBinary('KIN_NPM_PROOF_KIN_BIN', expectedKinName)",
+        "requireBuiltBinary('KIN_NPM_PROOF_DAEMON_BIN', expectedDaemonName)",
+        "await copyExecutable(builtKin, managedKin)",
+        "await copyExecutable(builtDaemon, managedDaemon)",
+        "writeLauncherStamp(targetKinVersion(), { KIN_HOME: kinHome })",
+        "setEnv(env, 'KIN_NO_PROVISION', '1')",
+        "deleteEnv(env, 'KIN_DAEMON_BIN')",
+        "assertPathExcludes(env, path.dirname(managedKin), '@kinlab/kin')",
+        "assert.ok(path.isAbsolute(managedKin), '@kinlab/kin managed binary must be absolute')",
+        "[canonicalKinLauncher, 'status', '--json']",
+        "[canonicalKinLauncher, 'search', 'greet', '--json']",
+        "launcher: canonicalMcpLauncher",
+        "setEnv(env, 'KIN_MCP_AUTO_INIT', '1')",
+        "launcher: compatibilityMcpLauncher",
+        "name: 'semantic_search'",
+        "assert.match(rendered, /greet/i",
+        "assert.match(rendered, /main\\.rs/i",
+        "['daemon', 'stop', '--all', '--json']",
+    ):
+        require(active_proof, policy, "native Windows npm first-run harness")
+
+    canonical_start = proof_source.index("async function proveCanonical(")
+    compatibility_start = proof_source.index(
+        "async function proveCompatibility(", canonical_start
+    )
+    canonical = "\n".join(
+        active_lines(proof_source[canonical_start:compatibility_start])
+    )
+    if re.search(r"setEnv\(env, ['\"]KIN_DAEMON_BIN['\"]", canonical):
+        raise AssertionError(
+            "canonical Windows npm proof must not inject KIN_DAEMON_BIN; the "
+            "absolute managed kin.exe must discover its sibling daemon"
+        )
+    for policy in (
+        "const hostilePath = [managedBinDir, readEnv(process.env, 'PATH') || '']",
+        "setEnv(env, 'PATH', pathWithoutDirectory(hostilePath, managedBinDir))",
+    ):
+        require(active_proof, policy, "non-vacuous PATH-free Windows npm proof")
+
+
+def assert_windows_npm_archive_authority(
+    canonical_source: str,
+    canonical_test: str,
+    compatibility_source: str,
+    compatibility_test: str,
+) -> None:
+    """Pin real-ZIP extraction to Windows system authority in both packages."""
+
+    for label, source, end_marker in (
+        (
+            "canonical npm provisioner",
+            canonical_source,
+            "/**\n * Download, verify, and install the pinned Kin release.",
+        ),
+        (
+            "compatibility npm provisioner",
+            compatibility_source,
+            "async function installFromArchive(",
+        ),
+    ):
+        start = source.index("function archiveExtraction(")
+        end = source.index(end_marker, start)
+        extraction = "\n".join(active_lines(source[start:end]))
+        require(
+            "\n".join(active_lines(source)),
+            "path.win32.join(systemRoot, 'System32', 'tar.exe')",
+            f"{label} absolute System32 extraction authority",
+        )
+        for policy in (
+            "if (platform === 'win32') {",
+            "if (process.platform === 'win32') {",
+            "executable: windowsSystemTarPath(env)",
+            "executable: '/usr/bin/unzip'",
+        ):
+            require(extraction, policy, f"{label} Windows ZIP extraction authority")
+
+    for label, test_source, test_name in (
+        (
+            "canonical npm provisioner",
+            canonical_test,
+            "provision uses deterministic Windows ZIP extraction under a hostile PATH",
+        ),
+        (
+            "compatibility npm provisioner",
+            compatibility_test,
+            "ensureKinBinary installs the flat native Windows zip and .exe pair",
+        ),
+    ):
+        active_test = "\n".join(active_lines(test_source))
+        for policy in (
+            test_name,
+            "environmentWithHostileTar",
+            "process.platform === 'win32' ? 'tar.exe' : 'tar'",
+            "env.PATH = [hostileBin, originalPath]",
+            "windowsSystemTarPath()",
+            "'/usr/bin/zip'",
+            "subarray(0, 4).toString('hex')",
+            "'504b0304'",
+        ):
+            require(active_test, policy, f"{label} genuine Windows ZIP regression")
 
 
 def job_top_level_mapping_fields(job: str) -> list[tuple[str, str]]:
@@ -6254,157 +6442,17 @@ def main() -> None:
         ),
     )
 
-    # The Windows leg asserts the admission the shipped product refuses, and
-    # everything the platform still proves without a repository.
+    # Native Windows release bytes must admit both supported repository
+    # boundaries, leave no transaction residue, and retain the non-empty
+    # boundary refusal.
     windows_contract = windows_init_contract_strings()
     windows_admission = install_proof_step(
         install_proof, "Windows admission contract proof"
     )
     assert_install_proof_windows_admission_contract(windows_admission, windows_contract)
-    # The published-nothing half of the contract, in both files that state it.
-    # It counted stages inside the directory it admits, which is never where a
-    # stage is created, so it passed on every input in both.
     windows_contract_source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
     assert_windows_contract_stage_check_is_reachable(windows_contract_source)
-    windows_public_surfaces = {
-        README: readme,
-        QUICKSTART_DOC: QUICKSTART_DOC.read_text(encoding="utf-8"),
-        WINDOWS_WSL2_DOC: WINDOWS_WSL2_DOC.read_text(encoding="utf-8"),
-        UPDATE_TRUST: update_trust,
-        NPM_CANONICAL_README: NPM_CANONICAL_README.read_text(encoding="utf-8"),
-        LLMS_DOC: LLMS_DOC.read_text(encoding="utf-8"),
-    }
-    compatibility_mcp_readme = NPM_MCP_README.read_text(encoding="utf-8")
-    assert_windows_public_support_contract(
-        windows_contract_source,
-        install_ps1,
-        windows_public_surfaces,
-        compatibility_mcp_readme,
-    )
-    public_notice = windows_public_support_notice(windows_contract_source)
 
-    drifted_readme_surfaces = dict(windows_public_surfaces)
-    drifted_readme_surfaces[README] = readme.replace(
-        public_notice,
-        "Native Windows supports the graph and daemon without vectors.",
-        1,
-    )
-    expect_assertion(
-        "the README restores a larger native-Windows capability claim",
-        "must repeat the Windows support notice",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1,
-            drifted_readme_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    expect_assertion(
-        "the public notice drifts away from the executable refusal contract",
-        "no longer states the executable refusal contract",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source.replace(
-                "repository admission is currently unavailable",
-                "repository admission is available",
-                1,
-            ),
-            install_ps1,
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    expect_assertion(
-        "the PowerShell installer maps native ARM64 to a nonexistent archive",
-        "must never resolve native ARM64",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1.replace(
-                '"ARM64" { throw "No native Windows ARM64 archive is published.',
-                '"ARM64" { return "aarch64" # No native Windows ARM64 archive is published.',
-                1,
-            ),
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    expect_assertion(
-        "the native installer auto-configures an unusable repository setup",
-        "must not configure repository/MCP workflows",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1 + "\n& $KinExe setup\n",
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    for label, original, expected in (
-        (
-            "the native installer comments out its executable support notice binding",
-            '$NativeWindowsSupportNotice = "',
-            "must repeat the Windows support notice",
-        ),
-        (
-            "the native installer comments out its visible support warning",
-            'Write-Host "  ! $NativeWindowsSupportNotice"',
-            "truthful native-Windows installer",
-        ),
-    ):
-        expect_assertion(
-            label,
-            expected,
-            lambda original=original: assert_windows_public_support_contract(
-                windows_contract_source,
-                install_ps1.replace(original, f"# {original}", 1),
-                windows_public_surfaces,
-                compatibility_mcp_readme,
-            ),
-        )
-    expect_assertion(
-        "a PowerShell block comment disables the visible native-Windows warning",
-        "truthful native-Windows installer",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1.replace(
-                'Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow',
-                '<#\nWrite-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow\n#>',
-                1,
-            ),
-            windows_public_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    blocked_quickstart_surfaces = dict(windows_public_surfaces)
-    blocked_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
-        QUICKSTART_DOC
-    ].replace(public_notice, f"<!-- {public_notice} -->", 1)
-    expect_assertion(
-        "the quickstart hides the native-Windows support boundary",
-        "must repeat the Windows support notice",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1,
-            blocked_quickstart_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
-    drifted_quickstart_surfaces = dict(windows_public_surfaces)
-    drifted_quickstart_surfaces[QUICKSTART_DOC] = windows_public_surfaces[
-        QUICKSTART_DOC
-    ].replace(
-        "Native Windows always skips repository setup while admission is unsupported",
-        "Both installers launch repository setup unless KIN_NO_SETUP=1",
-        1,
-    )
-    expect_assertion(
-        "the quickstart claims native Windows launches repository setup",
-        "quickstart platform-specific setup contract",
-        lambda: assert_windows_public_support_contract(
-            windows_contract_source,
-            install_ps1,
-            drifted_quickstart_surfaces,
-            compatibility_mcp_readme,
-        ),
-    )
     expect_assertion(
         "the contract script counts stages where one can never appear",
         "reachable Windows stage-leak check",
@@ -6429,19 +6477,7 @@ def main() -> None:
         ),
     )
     expect_assertion(
-        "the install proof's Windows refusal wording drifts from the contract script",
-        "drifted from",
-        lambda: assert_install_proof_windows_admission_contract(
-            windows_admission.replace(
-                windows_contract["DURABLE_FLUSH_GAP"],
-                "for durable metadata sync",
-                1,
-            ),
-            windows_contract,
-        ),
-    )
-    expect_assertion(
-        "the contract script's refusal wording drifts from the install proof",
+        "the contract script's non-empty refusal wording drifts from the install proof",
         "drifted from",
         lambda: assert_install_proof_windows_admission_contract(
             windows_admission,
@@ -6450,28 +6486,28 @@ def main() -> None:
     )
     for label, active_line in (
         (
-            "a Windows refusal may publish a repository anyway",
+            "the non-empty Windows refusal may publish a repository anyway",
             'if [ -e "$2/.kin" ]; then',
         ),
         (
-            "a Windows refusal may leave its unpublished stage behind",
+            "a Windows admission may leave its unpublished stage behind",
             "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
         ),
         (
-            "the non-empty boundary stops having to leave nothing behind",
-            'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
+            "exact Git stops having to succeed",
+            'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
         ),
         (
-            "a successful Windows admission stops failing the leg",
-            'fail "$1 unexpectedly succeeded" "$3"',
+            "native-empty bootstrap stops having to succeed",
+            'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
         ),
         (
-            "the exact-Git refusal stops having to name its own cause",
-            'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
+            "the non-empty boundary stops being refused",
+            'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
         ),
         (
-            "the non-empty native boundary stops being asserted",
-            'require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL"',
+            "the non-empty boundary stops naming its safety reason",
+            'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
         ),
     ):
         expect_assertion(
@@ -6484,20 +6520,67 @@ def main() -> None:
             ),
         )
 
-    assert_install_proof_repo_steps_are_unix_only(install_proof)
+    assert_install_proof_repo_steps_cover_windows(install_proof)
     for repo_step in (
         "First-run repository, daemon, and setup proof",
         "Graph query and MCP tool-call proof",
         "Validate installed capability proof",
     ):
         expect_assertion(
-            f"the install proof demands a Kin repository on Windows in {repo_step}",
-            "runner.os != 'Windows' guard",
+            f"the native Windows release proof loses {repo_step}",
+            "lost repository coverage",
             lambda mutated=install_proof.replace(
-                f"      - name: {repo_step}\n        if: runner.os != 'Windows'\n",
                 f"      - name: {repo_step}\n",
+                f"      - name: {repo_step}\n        if: runner.os != 'Windows'\n",
                 1,
-            ): assert_install_proof_repo_steps_are_unix_only(mutated),
+            ): assert_install_proof_repo_steps_cover_windows(mutated),
+        )
+        expect_assertion(
+            f"an alternate Linux-only expression removes {repo_step} from Windows",
+            "lost repository coverage",
+            lambda mutated=install_proof.replace(
+                f"      - name: {repo_step}\n",
+                f"      - name: {repo_step}\n        if: runner.os == 'Linux'\n",
+                1,
+            ): assert_install_proof_repo_steps_cover_windows(mutated),
+        )
+
+    for label, original, mutation, expected in (
+        (
+            "a job-level condition removes the Windows install proof",
+            "    name: ${{ matrix.os }}\n",
+            "    name: ${{ matrix.os }}\n    if: runner.os != 'Windows'\n",
+            "job-level condition",
+        ),
+        (
+            "the install proof stops using its OS matrix runner",
+            "    runs-on: ${{ matrix.os }}",
+            "    runs-on: ubuntu-latest",
+            "reviewed OS matrix",
+        ),
+        (
+            "the Windows matrix row disappears",
+            "          - os: windows-latest\n            setup-shell: powershell\n",
+            "",
+            "windows-latest row",
+        ),
+        (
+            "a matrix exclusion removes Windows after retaining its include row",
+            "        include:\n",
+            "        exclude:\n          - os: windows-latest\n        include:\n",
+            "must not exclude",
+        ),
+    ):
+        if original not in install_proof:
+            raise AssertionError(
+                f"Windows install-proof falsification lost fixture for {label}: {original}"
+            )
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=install_proof.replace(original, mutation, 1): (
+                assert_install_proof_repo_steps_cover_windows(mutated)
+            ),
         )
 
     repo_free = install_proof_step(
@@ -7035,36 +7118,183 @@ def main() -> None:
     # release commit, and letting the two legs carry their own copies restores
     # the drift that made the copies disagree.
     #
-    # Both boundaries now reach the graph authority store, one transaction past
-    # the config writer, so the config-writer refusal is pinned as a REFUTATION
-    # and the store's missing durable-flush capability is pinned by name.
-    # Requiring the absence of the one and the presence of the other is what
-    # keeps a regression to the old fail-closed arm from reading as a pass, and
-    # what forces the change that finally moves this boundary to say so here.
+    # Exact Git and native-empty admission are supported. The contract pins
+    # both successes, zero transaction residue, and the retained non-empty
+    # boundary refusal.
     windows_admission = (ROOT / "scripts" / "assert-windows-init-contract.sh").read_text(
         encoding="utf-8"
     )
     for policy in (
         '"$kin_bin" init',
-        'CONFIG_REFUSAL="cannot publish repository config"',
-        'SOURCE_PROOF_STAGE="prove mutable Git workspace"',
-        'DURABLE_FLUSH_GAP="for durable metadata flush"',
         'NON_EMPTY_REFUSAL="requires an empty directory"',
-        'refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE"',
-        'refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL"',
-        'refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL"',
-        'require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP"',
-        'require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP"',
-        'require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2',
-        'require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2',
-        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0',
+        'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
+        'require_non_empty_refused',
+        'if [ ! -d "$dir/.kin" ]; then',
         'fail "$label unexpectedly succeeded" "$log"',
         'if [ -e "$dir/.kin" ]; then',
+        'if [ "$staged" != "0" ]; then',
         "'.kin.init-*'",
     ):
         require(windows_admission, policy, "Windows admission contract assertions")
 
     ci_jobs = workflow_job_blocks(ci_workflow)
+    windows_npm_proof = WINDOWS_NPM_PROOF.read_text(encoding="utf-8")
+    assert_windows_npm_first_run_proof(
+        ci_jobs["windows-authority-tests"], windows_npm_proof
+    )
+    canonical_npm_provision = CANONICAL_NPM_PROVISION.read_text(encoding="utf-8")
+    canonical_npm_provision_test = CANONICAL_NPM_PROVISION_TEST.read_text(
+        encoding="utf-8"
+    )
+    compat_npm_provision = COMPAT_NPM_PROVISION.read_text(encoding="utf-8")
+    compat_npm_provision_test = COMPAT_NPM_PROVISION_TEST.read_text(
+        encoding="utf-8"
+    )
+    assert_windows_npm_archive_authority(
+        canonical_npm_provision,
+        canonical_npm_provision_test,
+        compat_npm_provision,
+        compat_npm_provision_test,
+    )
+    for label, canonical_source, canonical_test, compat_source, compat_test, expected in (
+        (
+            "canonical npm Windows extraction falls back to PATH tar",
+            canonical_npm_provision.replace(
+                "path.win32.join(systemRoot, 'System32', 'tar.exe')", "'tar'", 1
+            ),
+            canonical_npm_provision_test,
+            compat_npm_provision,
+            compat_npm_provision_test,
+            "absolute System32 extraction authority",
+        ),
+        (
+            "compatibility npm Windows extraction falls back to PATH tar",
+            canonical_npm_provision,
+            canonical_npm_provision_test,
+            compat_npm_provision.replace(
+                "path.win32.join(systemRoot, 'System32', 'tar.exe')", "'tar'", 1
+            ),
+            compat_npm_provision_test,
+            "absolute System32 extraction authority",
+        ),
+        (
+            "canonical npm Windows fixture stops proving real ZIP bytes",
+            canonical_npm_provision,
+            canonical_npm_provision_test.replace("'504b0304'", "'00000000'", 1),
+            compat_npm_provision,
+            compat_npm_provision_test,
+            "genuine Windows ZIP regression",
+        ),
+        (
+            "compatibility npm Windows fixture stops proving real ZIP bytes",
+            canonical_npm_provision,
+            canonical_npm_provision_test,
+            compat_npm_provision,
+            compat_npm_provision_test.replace("'504b0304'", "'00000000'", 1),
+            "genuine Windows ZIP regression",
+        ),
+        (
+            "canonical npm ZIP proof loses its hostile PATH",
+            canonical_npm_provision,
+            canonical_npm_provision_test.replace(
+                "env.PATH = [hostileBin, originalPath]",
+                "env.PATH = originalPath",
+                1,
+            ),
+            compat_npm_provision,
+            compat_npm_provision_test,
+            "genuine Windows ZIP regression",
+        ),
+        (
+            "compatibility npm ZIP proof loses its hostile PATH",
+            canonical_npm_provision,
+            canonical_npm_provision_test,
+            compat_npm_provision,
+            compat_npm_provision_test.replace(
+                "env.PATH = [hostileBin, originalPath]",
+                "env.PATH = originalPath",
+                1,
+            ),
+            "genuine Windows ZIP regression",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda canonical_source=canonical_source,
+            canonical_test=canonical_test,
+            compat_source=compat_source,
+            compat_test=compat_test: assert_windows_npm_archive_authority(
+                canonical_source,
+                canonical_test,
+                compat_source,
+                compat_test,
+            ),
+        )
+    for label, mutated_job, mutated_proof, expected in (
+        (
+            "canonical npm tests disappear from native Windows",
+            ci_jobs["windows-authority-tests"].replace(
+                "          npm test --prefix ./packages/kin\n", "", 1
+            ),
+            windows_npm_proof,
+            "native Windows npm first-run CI proof",
+        ),
+        (
+            "MCP sibling daemon discovery is compiled but never executed on Windows",
+            ci_jobs["windows-authority-tests"].replace(
+                "          run_required_exact \"MCP Windows sibling daemon discovery\" \\\n"
+                "            \"daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path\" \\\n"
+                "            --locked --target x86_64-pc-windows-msvc \\\n"
+                "            -p kin-mcp --no-default-features --lib\n",
+                "",
+                1,
+            ),
+            windows_npm_proof,
+            "native Windows npm first-run CI proof",
+        ),
+        (
+            "canonical runtime regains a KIN_DAEMON_BIN rescue",
+            ci_jobs["windows-authority-tests"],
+            windows_npm_proof.replace(
+                "  deleteEnv(env, 'KIN_DAEMON_BIN');\n"
+                "  assert.equal(readEnv(env, 'KIN_DAEMON_BIN'), undefined);\n"
+                "  assertPathExcludes(env, path.dirname(managedKin), '@kinlab/kin');\n",
+                "  setEnv(env, 'KIN_DAEMON_BIN', managedDaemon);\n"
+                "  assertPathExcludes(env, path.dirname(managedKin), '@kinlab/kin');\n",
+                1,
+            ),
+            "must not inject KIN_DAEMON_BIN",
+        ),
+        (
+            "canonical runtime stops proving daemon-backed status",
+            ci_jobs["windows-authority-tests"],
+            windows_npm_proof.replace(
+                "[canonicalKinLauncher, 'status', '--json']",
+                "[canonicalKinLauncher, '--version']",
+                1,
+            ),
+            "native Windows npm first-run harness",
+        ),
+        (
+            "compatibility wrapper is inferred from the canonical MCP entrypoint",
+            ci_jobs["windows-authority-tests"],
+            windows_npm_proof.replace(
+                "launcher: compatibilityMcpLauncher",
+                "launcher: canonicalMcpLauncher",
+                1,
+            ),
+            "native Windows npm first-run harness",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated_job=mutated_job, mutated_proof=mutated_proof: (
+                assert_windows_npm_first_run_proof(mutated_job, mutated_proof)
+            ),
+        )
     for job_id in ("windows-authority-tests", "windows-installer"):
         for policy in (
             "- name: Assert the Windows admission contract",
@@ -7103,6 +7333,16 @@ def main() -> None:
         "target/x86_64-pc-windows-msvc/debug/kin.exe",
         "pull-request Windows admission proof",
     )
+    for policy in (
+        "- name: Test both public npm surfaces on native Windows",
+        "npm test --prefix ./packages/kin-mcp",
+        "npm run lint --prefix ./packages/kin-mcp",
+    ):
+        require(
+            ci_jobs["windows-authority-tests"],
+            policy,
+            "native Windows npm MCP provisioning proof",
+        )
     require(
         ci_jobs["windows-installer"],
         "target/x86_64-pc-windows-msvc/release/kin.exe",
@@ -7111,7 +7351,7 @@ def main() -> None:
     if re.search(r"(?m)^    if:", ci_jobs["windows-authority-tests"]) is not None:
         raise AssertionError(
             "the Windows authority job must stay on every event, so admission "
-            "refusals are asserted before a release commit can carry them"
+            "behavior is asserted before a release commit can carry it"
         )
 
     # The Linux release artifacts are the only musl compilation Kin performs,

@@ -12273,21 +12273,1261 @@ pub fn ledger_status(json: bool) -> Result<()> {
 /// Ledger-verified: an artifact modified since install is left in place (unless
 /// `--force`) so a user's own edits are never clobbered. `--dry-run` reports
 /// what would be removed without touching disk.
-pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
+#[derive(Debug, Clone, serde::Serialize)]
+struct FullUninstallAction {
+    kind: String,
+    path: PathBuf,
+    action: String,
+    detail: String,
+}
+
+impl FullUninstallAction {
+    fn new(kind: &str, path: impl Into<PathBuf>, action: &str, detail: impl Into<String>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            path: path.into(),
+            action: action.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedInstallRoot {
+    requested: PathBuf,
+    path: PathBuf,
+    exists: bool,
+    identity: Option<InstallRootIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallRootIdentity {
+    volume_or_device: u64,
+    file_index_or_inode: u64,
+}
+
+#[cfg(unix)]
+fn install_root_identity(path: &Path) -> Result<InstallRootIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect install root identity {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "install root is not a real non-symlink directory: {}",
+            path.display()
+        );
+    }
+    Ok(InstallRootIdentity {
+        volume_or_device: metadata.dev(),
+        file_index_or_inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn install_root_identity(path: &Path) -> Result<InstallRootIdentity> {
+    use std::mem::zeroed;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("failed to open install root identity {}", path.display()))?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("failed to inspect install root handle {}", path.display()));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        anyhow::bail!(
+            "install root is not a real non-reparse directory: {}",
+            path.display()
+        );
+    }
+    Ok(InstallRootIdentity {
+        volume_or_device: u64::from(info.dwVolumeSerialNumber),
+        file_index_or_inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_root_identity(path: &Path) -> Result<InstallRootIdentity> {
+    let _ = path;
+    anyhow::bail!("full uninstall root identity is unsupported on this platform")
+}
+
+fn normalize_install_root(path: &Path) -> Result<(PathBuf, bool)> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "full uninstall requires an absolute KIN_HOME, got {}",
+            path.display()
+        );
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing full uninstall through symlink install root {}",
+                    path.display()
+                );
+            }
+            if !metadata.is_dir() {
+                anyhow::bail!(
+                    "refusing full uninstall because KIN_HOME is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok((
+                path.canonicalize().with_context(|| {
+                    format!("failed to resolve Kin install root {}", path.display())
+                })?,
+                true,
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().context("KIN_HOME has no parent directory")?;
+            let name = path
+                .file_name()
+                .context("KIN_HOME has no final path component")?;
+            let parent = parent.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve parent of absent Kin install root {}",
+                    path.display()
+                )
+            })?;
+            Ok((parent.join(name), false))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect Kin install root {}", path.display())),
+    }
+}
+
+fn valid_launcher_version_stamp(root: &Path) -> bool {
+    let Ok(bin) = fs::symlink_metadata(root.join("bin")) else {
+        return false;
+    };
+    if bin.file_type().is_symlink() || !bin.is_dir() {
+        return false;
+    }
+    let path = root.join("bin/.kinlab-kin-version");
+    let Ok(Some(observed)) = read_config_file_nofollow(&path, false) else {
+        return false;
+    };
+    let Ok(version) = std::str::from_utf8(&observed.bytes) else {
+        return false;
+    };
+    semver::Version::parse(version.trim().trim_start_matches('v')).is_ok()
+}
+
+fn valid_setup_ledger_marker(root: &Path) -> bool {
+    let Ok(config) = fs::symlink_metadata(root.join("config")) else {
+        return false;
+    };
+    if config.file_type().is_symlink() || !config.is_dir() {
+        return false;
+    }
+    let path = root.join("config/setup-ledger.json");
+    crate::commands::setup_ledger::SetupLedger::load(&path)
+        .map(|ledger| !ledger.entries.is_empty())
+        .unwrap_or(false)
+}
+
+fn incomplete_full_uninstall_artifacts(root: &Path) -> Result<Vec<PathBuf>> {
+    let parent = root.parent().context("Kin install root has no parent")?;
+    let mut artifacts = Vec::new();
+    for entry in fs::read_dir(parent).with_context(|| {
+        format!(
+            "failed to inspect {} for incomplete Kin uninstall state",
+            parent.display()
+        )
+    })? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let token = name
+            .strip_prefix(".kin-uninstall-retired-")
+            .or_else(|| name.strip_prefix(".kin-uninstall-delete-"))
+            .or_else(|| name.strip_prefix(".kin-uninstall-incomplete-"));
+        let Some(token) = token else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(token).is_ok_and(|id| {
+            id.get_version() == Some(uuid::Version::Random) && id.hyphenated().to_string() == token
+        }) {
+            artifacts.push(entry.path());
+        }
+    }
+    Ok(artifacts)
+}
+
+fn validate_full_uninstall_root_at(
+    requested: &Path,
+    user_home: &Path,
+    current_exe: Option<&Path>,
+) -> Result<ValidatedInstallRoot> {
+    let (root, exists) = normalize_install_root(requested)?;
+    let canonical_home = user_home
+        .canonicalize()
+        .with_context(|| format!("failed to resolve user home {}", user_home.display()))?;
+
+    // Removing the home directory or one of its ancestors is never a valid Kin
+    // uninstall, regardless of a hostile or accidental KIN_HOME override.
+    if canonical_home.starts_with(&root) {
+        anyhow::bail!(
+            "refusing full uninstall because KIN_HOME {} is the user home or one of its ancestors",
+            root.display()
+        );
+    }
+
+    let default_root = canonical_home.join(".kin");
+
+    // A custom KIN_HOME has no enforceable ownership boundary: arbitrary user
+    // data can be placed below an otherwise Kin-looking `lib/`, `state/`, or
+    // `packages/` directory and is indistinguishable from runtime data. Never
+    // authorize recursive deletion there. The ledger-scoped uninstall remains
+    // available, followed by explicit operator review of the custom root.
+    if root != default_root {
+        anyhow::bail!(
+            "refusing recursive full uninstall for custom KIN_HOME {}; run `kin setup uninstall` for ledger-owned artifacts, then review and remove that custom directory explicitly",
+            root.display()
+        );
+    }
+
+    let incomplete = incomplete_full_uninstall_artifacts(&root)?;
+    if !incomplete.is_empty() {
+        anyhow::bail!(
+            "full uninstall is incomplete: retired managed state remains: {}; refusing to report fully_removed",
+            incomplete
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if !exists {
+        return Ok(ValidatedInstallRoot {
+            requested: requested.to_path_buf(),
+            path: root,
+            exists: false,
+            identity: None,
+        });
+    }
+    let root_identity = install_root_identity(&root)?;
+
+    let active_binary_is_managed = current_exe
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|path| {
+            path.parent()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent == root)
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| matches!(name, "kin" | "kin.exe"))
+        });
+    // A path with a Kin-looking name is not ownership. Accept only an
+    // authenticated running Kin executable inside this root, the launcher's
+    // validated semantic-version stamp, or a valid non-empty setup ledger read
+    // through the no-follow/private-file authority path.
+    let has_strong_managed_proof = active_binary_is_managed
+        || valid_launcher_version_stamp(&root)
+        || valid_setup_ledger_marker(&root);
+    if !has_strong_managed_proof {
+        anyhow::bail!(
+            "refusing to recursively remove KIN_HOME {}; no strong managed-install ownership proof was found",
+            root.display()
+        );
+    }
+
+    if install_root_identity(&root)? != root_identity {
+        anyhow::bail!(
+            "KIN_HOME {} changed while managed-install ownership was being validated",
+            root.display()
+        );
+    }
+
+    Ok(ValidatedInstallRoot {
+        requested: requested.to_path_buf(),
+        identity: Some(root_identity),
+        path: root,
+        exists: true,
+    })
+}
+
+fn validate_full_uninstall_root() -> Result<ValidatedInstallRoot> {
+    let requested = kin_dir()?;
+    let home = home_dir()?;
+    let current_exe = env::current_exe().ok();
+    validate_full_uninstall_root_at(&requested, &home, current_exe.as_deref())
+}
+
+fn legacy_shell_path_targets(home: &Path) -> Vec<(String, PathBuf)> {
+    let mut targets = std::collections::BTreeSet::new();
+    targets.insert(("zsh".to_string(), home.join(".zshrc")));
+    targets.insert(("bash".to_string(), home.join(".bashrc")));
+    targets.insert(("fish".to_string(), home.join(".config/fish/config.fish")));
+    targets.insert((
+        "powershell".to_string(),
+        home.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1"),
+    ));
+    targets.insert((
+        "powershell".to_string(),
+        home.join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
+    ));
+    if let Some(profile) = env::var_os("PROFILE").filter(|value| !value.is_empty()) {
+        targets.insert(("powershell".to_string(), PathBuf::from(profile)));
+    }
+    targets.into_iter().collect()
+}
+
+fn cleanup_legacy_shell_path_blocks(
+    home: &Path,
+    install_root: &Path,
+    dry_run: bool,
+) -> Result<Vec<FullUninstallAction>> {
+    let bin_dir = install_root.join("bin");
+    let mut actions = Vec::new();
+    for (shell, path) in legacy_shell_path_targets(home) {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect shell config {}", path.display()))
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing legacy PATH cleanup through symlink shell config {}",
+                    path.display()
+                )
+            }
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(_) => {}
+        }
+
+        let block = rc_path_block(&shell, &bin_dir);
+        let lock = if dry_run {
+            None
+        } else {
+            Some(ConfigLock::acquire(&path)?)
+        };
+        let original = match &lock {
+            Some(lock) => lock.original_bytes(&path)?,
+            None => read_config_file_nofollow(&path, false)?.map(|observed| observed.bytes),
+        };
+        let Some(original) = original else {
+            continue;
+        };
+        let content = std::str::from_utf8(&original)
+            .with_context(|| format!("shell config {} is not UTF-8", path.display()))?;
+        let occurrences = content.matches(&block).count();
+        if occurrences == 0 {
+            continue;
+        }
+        if !dry_run {
+            let stripped = content.replace(&block, "");
+            lock.as_ref()
+                .context("legacy shell cleanup lost its config lock")?
+                .write_guarded(&path, stripped.as_bytes(), Some(&original))?;
+        }
+        actions.push(FullUninstallAction::new(
+            "legacy_shell_path",
+            path.clone(),
+            if dry_run { "would_remove" } else { "removed" },
+            format!(
+                "{} {} exact legacy Kin PATH block{}",
+                if dry_run { "would remove" } else { "removed" },
+                occurrences,
+                if occurrences == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    Ok(actions)
+}
+
+fn ledger_blocks_full_uninstall(
+    outcomes: &[crate::commands::setup_ledger::RemovalOutcome],
+) -> usize {
+    use crate::commands::setup_ledger::RemovalAction;
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.action,
+                RemovalAction::SkippedModified | RemovalAction::Failed
+            )
+        })
+        .count()
+}
+
+#[cfg(not(windows))]
+fn remove_full_install_root_with_hooks<F, R>(
+    root: &ValidatedInstallRoot,
+    dry_run: bool,
+    install_lock: Option<&crate::commands::update::InstallRootLock>,
+    before_retire: F,
+    after_retire: R,
+) -> Result<FullUninstallAction>
+where
+    F: FnOnce() -> Result<()>,
+    R: FnOnce(&Path) -> Result<()>,
+{
+    if !root.exists {
+        if !dry_run && fs::symlink_metadata(&root.path).is_ok() {
+            anyhow::bail!(
+                "Kin install root {} appeared after absent-root validation; re-run uninstall so it can be validated and locked",
+                root.path.display()
+            );
+        }
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "already_absent",
+            "managed Kin install root is already absent",
+        ));
+    }
+    if dry_run {
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "would_remove",
+            "would recursively remove the validated managed Kin install root",
+        ));
+    }
+    let expected = root
+        .identity
+        .context("validated install root lost its identity before removal")?;
+    let lock = install_lock.context("full uninstall lost install-mutation authority")?;
+    if lock.root() != root.path {
+        anyhow::bail!(
+            "install authority {} does not match validated root {}",
+            lock.root().display(),
+            root.path.display()
+        );
+    }
+    if install_root_identity(&root.path)? != expected {
+        anyhow::bail!(
+            "Kin install root identity changed after validation; refusing removal of {}",
+            root.path.display()
+        );
+    }
+    before_retire()?;
+    let retired = lock.retire_for_uninstall()?;
+    if install_root_identity(retired.path())? != expected {
+        anyhow::bail!(
+            "atomically retired Kin install root has the wrong identity; preserving {}",
+            retired.path().display()
+        );
+    }
+    after_retire(retired.path()).with_context(|| {
+        format!(
+            "post-retirement uninstall fence failed; preserving {}",
+            retired.path().display()
+        )
+    })?;
+    retired
+        .remove()
+        .context("failed to remove the descriptor-pinned atomically retired Kin install root")?;
+    if fs::symlink_metadata(&root.path).is_ok() {
+        anyhow::bail!(
+            "the original Kin install root was removed, but {} was recreated concurrently and was retained",
+            root.path.display()
+        );
+    }
+    Ok(FullUninstallAction::new(
+        "install_root",
+        &root.path,
+        "removed",
+        "removed the complete managed Kin install root",
+    ))
+}
+
+#[cfg(windows)]
+fn cleanup_windows_user_path(root: &Path, requested_root: &Path) -> Result<()> {
+    let script = r#"$ErrorActionPreference = 'Stop'
+$bins = @(
+    [IO.Path]::GetFullPath([IO.Path]::Combine($env:KIN_UNINSTALL_ROOT, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath([IO.Path]::Combine($env:KIN_UNINSTALL_PATH_ROOT, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+) | Select-Object -Unique
+$current = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($null -ne $current) {
+    $kept = @($current -split ';' | Where-Object {
+        if ([string]::IsNullOrWhiteSpace($_)) { return $true }
+        $candidate = $_.Trim().Trim('"')
+        try { $candidate = [IO.Path]::GetFullPath($candidate) } catch {}
+        $bins -notcontains $candidate.TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    })
+    [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+}
+"#;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .env("KIN_UNINSTALL_ROOT", root)
+        .env("KIN_UNINSTALL_PATH_ROOT", requested_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("failed to run exact Windows user-PATH cleanup")?;
+    if !status.success() {
+        anyhow::bail!(
+            "Windows user-PATH cleanup failed with status {}; full uninstall is not complete",
+            status
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn move_windows_install_root(from: &Path, to: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let encode = |path: &Path| -> Result<Vec<u16>> {
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            anyhow::bail!(
+                "Windows uninstall path contains an interior NUL: {}",
+                path.display()
+            );
+        }
+        encoded.push(0);
+        Ok(encoded)
+    };
+    let from_wide = encode(from)?;
+    let to_wide = encode(to)?;
+    if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to atomically retire Kin install root {} to {}",
+                from.display(),
+                to.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_windows_process_creation_time() -> Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error())
+            .context("failed to capture the uninstalling Windows process incarnation");
+    }
+    Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_uninstall_helper_ready(
+    child: &mut std::process::Child,
+    ready_path: &Path,
+    ready_nonce: &str,
+    log_path: &Path,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match fs::read_to_string(ready_path) {
+            Ok(observed) if observed == ready_nonce => return Ok(()),
+            Ok(observed) => anyhow::bail!(
+                "deferred Windows uninstall helper published an invalid ready handshake: {observed:?}"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read deferred Windows uninstall helper handshake {}",
+                        ready_path.display()
+                    )
+                })
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect deferred Windows uninstall helper startup")?
+        {
+            let detail = fs::read_to_string(log_path)
+                .unwrap_or_else(|_| "helper did not publish a diagnostic log".to_string());
+            anyhow::bail!(
+                "deferred Windows uninstall helper exited before its incarnation-safe handoff ({status}): {detail}"
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for deferred Windows uninstall helper to pin the parent process incarnation"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+fn retire_windows_install_root(
+    root: &ValidatedInstallRoot,
+    retired: &Path,
+    expected: InstallRootIdentity,
+) -> Result<()> {
+    match fs::symlink_metadata(retired) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect Windows uninstall retirement path {}",
+                    retired.display()
+                )
+            })
+        }
+        Ok(_) => anyhow::bail!(
+            "refusing to replace existing Windows uninstall retirement path {}",
+            retired.display()
+        ),
+    }
+    if install_root_identity(&root.path)? != expected {
+        anyhow::bail!(
+            "Kin install root identity changed before atomic retirement; refusing removal of {}",
+            root.path.display()
+        );
+    }
+    move_windows_install_root(&root.path, retired)?;
+    if install_root_identity(retired)? != expected {
+        anyhow::bail!(
+            "atomically retired Kin install root has the wrong identity; preserving {}",
+            retired.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+const WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE: &str =
+    "KIN_INTERNAL_TEST_UNINSTALL_PARENT_CREATED_100NS";
+#[cfg(all(test, windows))]
+const WINDOWS_UNINSTALL_HELPER_RELEASE: &str = "KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE";
+
+#[cfg(windows)]
+fn remove_full_install_root(
+    root: &ValidatedInstallRoot,
+    dry_run: bool,
+    install_lock: Option<&crate::commands::update::InstallRootLock>,
+) -> Result<FullUninstallAction> {
+    if !root.exists {
+        if !dry_run {
+            cleanup_windows_user_path(&root.path, &root.requested)?;
+            if fs::symlink_metadata(&root.path).is_ok() {
+                anyhow::bail!(
+                    "Kin install root {} appeared after absent-root validation; re-run uninstall so it can be validated and locked",
+                    root.path.display()
+                );
+            }
+        }
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            if dry_run {
+                "would_clean_path"
+            } else {
+                "already_absent"
+            },
+            if dry_run {
+                "install root is absent; would remove the exact installer-owned user-PATH segment"
+            } else {
+                "managed Kin install root is absent and the exact installer-owned user-PATH segment was removed; the inert current-user install-authority sidecar remains for race-safe future installs"
+            },
+        ));
+    }
+    if dry_run {
+        return Ok(FullUninstallAction::new(
+            "install_root",
+            &root.path,
+            "would_schedule",
+            "would remove the exact Kin user-PATH segment and schedule the validated install root for deletion after this process exits; the inert current-user install-authority sidecar would remain for race-safe future installs",
+        ));
+    }
+
+    let expected = root
+        .identity
+        .context("validated install root lost its identity before Windows removal")?;
+    if install_root_identity(&root.path)? != expected {
+        anyhow::bail!(
+            "Kin install root identity changed after validation; refusing removal of {}",
+            root.path.display()
+        );
+    }
+    let lock = install_lock.context("full uninstall lost install-mutation authority")?;
+    if lock.root() != root.path {
+        anyhow::bail!(
+            "install authority {} does not match validated root {}",
+            lock.root().display(),
+            root.path.display()
+        );
+    }
+
+    // Windows does not permit a running executable to unlink itself. A
+    // no-profile PowerShell helper opens this process, validates its creation
+    // time, and publishes a ready handshake while that incarnation is still
+    // alive. It then waits on the pinned process handle before deleting the
+    // image. Atomically retire the validated root while install authority is
+    // still held, then let the helper delete only that private sibling. A
+    // replacement install at the public pathname is therefore never followed.
+    let token = uuid::Uuid::new_v4();
+    let script_path = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
+    let log_path = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
+    let ready_path = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
+    let ready_publishing_path =
+        env::temp_dir().join(format!("kin-uninstall-{token}.ready.publishing"));
+    let ready_nonce = uuid::Uuid::new_v4().to_string();
+    let parent_creation_time = current_windows_process_creation_time()?;
+    let install_authority_path =
+        crate::commands::update::windows_install_authority_path(&root.path)?;
+    #[cfg(test)]
+    let parent_creation_time = match env::var_os(WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE) {
+        Some(override_value) => override_value
+            .to_string_lossy()
+            .parse::<u64>()
+            .context("invalid Windows uninstall parent-creation test override")?,
+        None => parent_creation_time,
+    };
+    let retired_path = root
+        .path
+        .parent()
+        .context("Kin install root has no parent")?
+        .join(format!(".kin-uninstall-retired-{token}"));
+    let incomplete_marker = root
+        .path
+        .parent()
+        .context("Kin install root has no parent")?
+        .join(format!(".kin-uninstall-incomplete-{token}"));
+    let script = r#"$ErrorActionPreference = 'Stop'
+$log = $env:KIN_UNINSTALL_LOG
+$ready = $env:KIN_UNINSTALL_READY
+$readyPublishing = $env:KIN_UNINSTALL_READY_PUBLISHING
+$authority = $env:KIN_UNINSTALL_AUTHORITY
+$parentHandle = $null
+$authorityStream = $null
+$authorityLocked = $false
+try {
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class KinUninstallIdentity {
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        public uint Attributes; public FILETIME Creation; public FILETIME Access;
+        public FILETIME Write; public uint Volume; public uint SizeHigh;
+        public uint SizeLow; public uint Links; public uint IndexHigh;
+        public uint IndexLow;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILE_DISPOSITION_INFO {
+        [MarshalAs(UnmanagedType.Bool)] public bool DeleteFile;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
+        IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle,
+        out BY_HANDLE_FILE_INFORMATION info);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetFileInformationByHandle(SafeFileHandle handle,
+        int informationClass, ref FILE_DISPOSITION_INFO information, uint size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetProcessTimes(SafeWaitHandle handle, out FILETIME creation,
+        out FILETIME exit, out FILETIME kernel, out FILETIME user);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint WaitForSingleObject(SafeWaitHandle handle, uint milliseconds);
+    static string ReadHandle(SafeFileHandle handle) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(handle, out info))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        if ((info.Attributes & 0x400) != 0 || (info.Attributes & 0x10) == 0)
+            throw new InvalidOperationException("retired root is not a real non-reparse directory");
+        ulong index = ((ulong)info.IndexHigh << 32) | info.IndexLow;
+        return ((ulong)info.Volume).ToString() + ":" + index.ToString();
+    }
+    public static string Read(string path) {
+        const uint FILE_SHARE_READ=1, FILE_SHARE_WRITE=2, FILE_SHARE_DELETE=4;
+        const uint OPEN_EXISTING=3, BACKUP_SEMANTICS=0x02000000, OPEN_REPARSE=0x00200000;
+        using (var handle = CreateFileW(path, 0,
+            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, IntPtr.Zero,
+            OPEN_EXISTING, BACKUP_SEMANTICS|OPEN_REPARSE, IntPtr.Zero)) {
+            if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return ReadHandle(handle);
+        }
+    }
+    public static SafeFileHandle Lock(string path, string expected) {
+        const uint FILE_READ_ATTRIBUTES=0x80, DELETE=0x00010000;
+        const uint FILE_SHARE_READ=1, FILE_SHARE_WRITE=2;
+        const uint OPEN_EXISTING=3, BACKUP_SEMANTICS=0x02000000, OPEN_REPARSE=0x00200000;
+        var handle = CreateFileW(path, FILE_READ_ATTRIBUTES|DELETE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
+            BACKUP_SEMANTICS|OPEN_REPARSE, IntPtr.Zero);
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            if (ReadHandle(handle) != expected)
+                throw new InvalidOperationException("retired root identity changed while acquiring deletion lock");
+            return handle;
+        } catch { handle.Dispose(); throw; }
+    }
+    public static string ReadLocked(SafeFileHandle handle) { return ReadHandle(handle); }
+    public static SafeWaitHandle LockParent(uint processId, ulong expectedCreation) {
+        const uint SYNCHRONIZE=0x00100000, QUERY_LIMITED_INFORMATION=0x1000;
+        var raw = OpenProcess(SYNCHRONIZE|QUERY_LIMITED_INFORMATION, false, processId);
+        if (raw == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var handle = new SafeWaitHandle(raw, true);
+        try {
+            FILETIME creation, exit, kernel, user;
+            if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            ulong observed = ((ulong)creation.High << 32) | creation.Low;
+            if (observed != expectedCreation)
+                throw new InvalidOperationException("uninstall parent process incarnation changed before helper handoff");
+            return handle;
+        } catch { handle.Dispose(); throw; }
+    }
+    public static void WaitForParentExit(SafeWaitHandle handle) {
+        const uint WAIT_OBJECT_0=0, WAIT_TIMEOUT=258;
+        uint result = WaitForSingleObject(handle, 300000);
+        if (result == WAIT_TIMEOUT)
+            throw new TimeoutException("timed out waiting for uninstall parent process incarnation");
+        if (result != WAIT_OBJECT_0)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public static void DeleteLocked(SafeFileHandle handle, string expected) {
+        if (ReadHandle(handle) != expected)
+            throw new InvalidOperationException("retired root identity changed before handle-bound deletion");
+        const int FileDispositionInfo = 4;
+        var disposition = new FILE_DISPOSITION_INFO { DeleteFile = true };
+        if (!SetFileInformationByHandle(handle, FileDispositionInfo, ref disposition,
+            (uint)Marshal.SizeOf(typeof(FILE_DISPOSITION_INFO))))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+}
+'@
+$installRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_ROOT)
+$requestedInstallRoot = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_PATH_ROOT)
+$bins = @(
+    [IO.Path]::GetFullPath([IO.Path]::Combine($installRoot, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+    [IO.Path]::GetFullPath([IO.Path]::Combine($requestedInstallRoot, 'bin')).TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+) | Select-Object -Unique
+$pidToWait = [int]$env:KIN_UNINSTALL_PID
+$expectedParentCreation = [UInt64]$env:KIN_UNINSTALL_PARENT_CREATED_100NS
+$retired = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_RETIRED)
+$incompleteMarker = [IO.Path]::GetFullPath($env:KIN_UNINSTALL_INCOMPLETE_MARKER)
+$expectedIdentity = $env:KIN_UNINSTALL_EXPECTED_IDENTITY
+$parentHandle = [KinUninstallIdentity]::LockParent($pidToWait, $expectedParentCreation)
+$readyBytes = [Text.Encoding]::UTF8.GetBytes($env:KIN_UNINSTALL_READY_NONCE)
+$readyStream = [IO.File]::Open($readyPublishing, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+try {
+    $readyStream.Write($readyBytes, 0, $readyBytes.Length)
+    $readyStream.Flush($true)
+} finally {
+    $readyStream.Dispose()
+}
+[IO.File]::Move($readyPublishing, $ready)
+[KinUninstallIdentity]::WaitForParentExit($parentHandle)
+    $authorityDeadline = [DateTime]::UtcNow.AddMinutes(5)
+    while (-not $authorityLocked) {
+        try {
+            if ($null -eq $authorityStream) {
+                $authorityStream = [IO.File]::Open($authority, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+            }
+            $authorityStream.Lock(0, [Int64]::MaxValue)
+            $authorityLocked = $true
+        } catch {
+            if ($null -ne $authorityStream) {
+                $authorityStream.Dispose()
+                $authorityStream = $null
+            }
+            if ([DateTime]::UtcNow -ge $authorityDeadline) {
+                throw "timed out acquiring Kin install authority for deferred uninstall cleanup: $_"
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($null -ne $current) {
+        $kept = @($current -split ';' | Where-Object {
+            if ([string]::IsNullOrWhiteSpace($_)) { return $true }
+            $candidate = $_.Trim().Trim('"')
+            try { $candidate = [IO.Path]::GetFullPath($candidate) } catch {}
+            $bins -notcontains $candidate.TrimEnd([char[]]@([char]47, [char]92)).ToLowerInvariant()
+        })
+        [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+    }
+    if (-not (Test-Path -LiteralPath $retired)) {
+        throw "retired Kin root disappeared before identity-bound cleanup; retaining incomplete marker $incompleteMarker"
+    }
+    if ([KinUninstallIdentity]::Read($retired) -ne $expectedIdentity) {
+        throw "retired Kin root identity changed; preserving $retired"
+    }
+    $deleteRoot = [IO.Path]::Combine([IO.Path]::GetDirectoryName($retired), ('.kin-uninstall-delete-' + [Guid]::NewGuid().ToString()))
+    [IO.Directory]::Move($retired, $deleteRoot)
+    if ([KinUninstallIdentity]::Read($deleteRoot) -ne $expectedIdentity) {
+        throw "retired Kin root changed during private deletion rename; preserving $deleteRoot"
+    }
+    $guard = [KinUninstallIdentity]::Lock($deleteRoot, $expectedIdentity)
+    try {
+        Get-ChildItem -LiteralPath $deleteRoot -Force | Remove-Item -Recurse -Force
+        if ([KinUninstallIdentity]::ReadLocked($guard) -ne $expectedIdentity) {
+            throw "retired Kin root identity changed while descriptor-locked; preserving $deleteRoot"
+        }
+        # Delete disposition targets this verified open directory handle. No
+        # pathname replacement can redirect final removal to another tree.
+        [KinUninstallIdentity]::DeleteLocked($guard, $expectedIdentity)
+    } finally {
+        $guard.Dispose()
+    }
+    Remove-Item -LiteralPath $incompleteMarker -Force
+    Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+} catch {
+    $_ | Out-File -LiteralPath $log -Encoding utf8
+} finally {
+    if ($null -ne $authorityStream) { $authorityStream.Dispose() }
+    if ($null -ne $parentHandle) { $parentHandle.Dispose() }
+    [IO.File]::Delete($readyPublishing)
+    Remove-Item -LiteralPath $ready -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}
+"#;
+    #[cfg(test)]
+    let script = script.replace(
+        "    $current = [Environment]::GetEnvironmentVariable('Path', 'User')",
+        r#"    $testRelease = $env:KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE
+    if (-not [string]::IsNullOrEmpty($testRelease)) {
+        $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(300)
+        while (-not (Test-Path -LiteralPath $testRelease -PathType Leaf)) {
+            if ([DateTime]::UtcNow -ge $testReleaseDeadline) {
+                throw "timed out waiting for the native-test deferred-cleanup release"
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')"#,
+    );
+    fs::write(&script_path, script).with_context(|| {
+        format!(
+            "failed to write deferred Windows uninstall helper {}",
+            script_path.display()
+        )
+    })?;
+    let marker_result = (|| -> Result<()> {
+        let mut marker = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&incomplete_marker)
+            .with_context(|| {
+                format!(
+                    "failed to create durable uninstall marker {}",
+                    incomplete_marker.display()
+                )
+            })?;
+        marker.write_all(b"kin-uninstall-incomplete-v1\n")?;
+        marker.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = marker_result {
+        let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
+        let _ = fs::remove_file(&incomplete_marker);
+        return Err(error);
+    }
+    if let Err(error) = retire_windows_install_root(root, &retired_path, expected) {
+        let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
+        let _ = fs::remove_file(&incomplete_marker);
+        return Err(error);
+    }
+    if let Err(error) = crate::commands::daemon::verify_install_owned_processes_absent(&root.path)
+        .and_then(|_| crate::commands::daemon::verify_install_owned_processes_absent(&retired_path))
+    {
+        let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
+        return Err(error).context(format!(
+            "post-retirement process fence failed; preserving {}",
+            retired_path.display()
+        ));
+    }
+    let child = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .env("KIN_UNINSTALL_ROOT", &root.path)
+        .env("KIN_UNINSTALL_PATH_ROOT", &root.requested)
+        .env("KIN_UNINSTALL_PID", std::process::id().to_string())
+        .env(
+            "KIN_UNINSTALL_PARENT_CREATED_100NS",
+            parent_creation_time.to_string(),
+        )
+        .env("KIN_UNINSTALL_LOG", &log_path)
+        .env("KIN_UNINSTALL_READY", &ready_path)
+        .env("KIN_UNINSTALL_READY_PUBLISHING", &ready_publishing_path)
+        .env("KIN_UNINSTALL_READY_NONCE", &ready_nonce)
+        .env("KIN_UNINSTALL_AUTHORITY", &install_authority_path)
+        .env("KIN_UNINSTALL_RETIRED", &retired_path)
+        .env("KIN_UNINSTALL_INCOMPLETE_MARKER", &incomplete_marker)
+        .env(
+            "KIN_UNINSTALL_EXPECTED_IDENTITY",
+            format!(
+                "{}:{}",
+                expected.volume_or_device, expected.file_index_or_inode
+            ),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(spawn_error) => {
+            let rollback = move_windows_install_root(&retired_path, &root.path);
+            let _ = fs::remove_file(&script_path);
+            let _ = fs::remove_file(&ready_path);
+            let _ = fs::remove_file(&ready_publishing_path);
+            match rollback {
+                Ok(()) => {
+                    let _ = fs::remove_file(&incomplete_marker);
+                    return Err(spawn_error).with_context(|| {
+                    format!(
+                        "failed to launch deferred Windows uninstall helper {}; atomically restored {}",
+                        script_path.display(),
+                        root.path.display()
+                    )
+                    });
+                }
+                Err(rollback_error) => anyhow::bail!(
+                    "failed to launch deferred Windows uninstall helper {}: {}; the validated install root is preserved at {}, but restoring its public path also failed: {:#}",
+                    script_path.display(),
+                    spawn_error,
+                    retired_path.display(),
+                    rollback_error
+                ),
+            }
+        }
+    };
+    if let Err(handoff_error) =
+        wait_for_windows_uninstall_helper_ready(&mut child, &ready_path, &ready_nonce, &log_path)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        let rollback = move_windows_install_root(&retired_path, &root.path);
+        let _ = fs::remove_file(&script_path);
+        let _ = fs::remove_file(&ready_path);
+        let _ = fs::remove_file(&ready_publishing_path);
+        let _ = fs::remove_file(&log_path);
+        match rollback {
+            Ok(()) => {
+                let _ = fs::remove_file(&incomplete_marker);
+                return Err(handoff_error).context(format!(
+                    "deferred Windows uninstall helper did not complete its incarnation-safe handoff; atomically restored {}",
+                    root.path.display()
+                ));
+            }
+            Err(rollback_error) => anyhow::bail!(
+                "deferred Windows uninstall helper did not complete its incarnation-safe handoff: {handoff_error:#}; the validated install root is preserved at {}, but restoring its public path also failed: {rollback_error:#}",
+                retired_path.display()
+            ),
+        }
+    }
+    drop(child);
+    Ok(FullUninstallAction::new(
+        "install_root",
+        &root.path,
+        "scheduled",
+        format!(
+            "scheduled current-user PATH cleanup and complete install-root deletion after process exit; the inert current-user install-authority sidecar remains for race-safe future installs; failures are recorded at {}",
+            log_path.display()
+        ),
+    ))
+}
+
+pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Result<()> {
     use crate::commands::setup_ledger::{ledger_path, run_uninstall, RemovalAction};
+
+    let install_root = if all {
+        Some(validate_full_uninstall_root()?)
+    } else {
+        None
+    };
+    let install_lock = match install_root.as_ref() {
+        Some(root) if root.exists && !dry_run => Some(
+            crate::commands::update::InstallRootLock::acquire_existing_waiting(&root.path)
+                .context("full uninstall could not acquire exclusive install-mutation authority")?,
+        ),
+        _ => None,
+    };
+    let daemon_fence = match install_root.as_ref() {
+        Some(root) if root.exists && !dry_run => Some(
+            crate::commands::daemon::stop_all_for_uninstall(&root.path)
+                .await
+                .context("full uninstall refused because not every Kin daemon could be stopped")?,
+        ),
+        Some(_) if !dry_run => {
+            crate::commands::daemon::stop_all_quiet()
+                .await
+                .context("full uninstall refused because not every Kin daemon could be stopped")?;
+            crate::commands::daemon::verify_install_owned_processes_absent(
+                &install_root
+                    .as_ref()
+                    .context("full uninstall root disappeared")?
+                    .path,
+            )?;
+            None
+        }
+        _ => None,
+    };
 
     let path = ledger_path()?;
     let outcomes = run_uninstall(&path, dry_run, force)?;
+    let blocked = ledger_blocks_full_uninstall(&outcomes);
+    let mut full_actions = Vec::new();
+    if let Some(root) = &install_root {
+        if blocked == 0 {
+            full_actions.extend(cleanup_legacy_shell_path_blocks(
+                &home_dir()?,
+                &root.path,
+                dry_run,
+            )?);
+            if root.requested != root.path {
+                full_actions.extend(cleanup_legacy_shell_path_blocks(
+                    &home_dir()?,
+                    &root.requested,
+                    dry_run,
+                )?);
+            }
+            if let Some(fence) = daemon_fence.as_ref() {
+                fence.verify_quiescent(&root.path).context(
+                    "full uninstall refused because a managed daemon restarted before root retirement",
+                )?;
+            }
+            #[cfg(not(windows))]
+            let install_root_action = remove_full_install_root_with_hooks(
+                root,
+                dry_run,
+                install_lock.as_ref(),
+                || Ok(()),
+                |retired| {
+                    if let Some(fence) = daemon_fence.as_ref() {
+                        // Retirement is the executable admission fence: after
+                        // this rename no new supervisor or worker can be
+                        // spawned from the managed public path. Scan both the
+                        // historical argv path and the retired executable path
+                        // before descriptor-bound deletion.
+                        fence.verify_quiescent(&root.path)?;
+                        fence.verify_quiescent(retired)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            #[cfg(windows)]
+            let install_root_action =
+                remove_full_install_root(root, dry_run, install_lock.as_ref())?;
+            full_actions.push(install_root_action);
+        } else {
+            full_actions.push(FullUninstallAction::new(
+                "install_root",
+                &root.path,
+                "blocked",
+                format!(
+                    "retained the install root because {blocked} ledger entr{} still require{} reconciliation",
+                    if blocked == 1 { "y" } else { "ies" },
+                    if blocked == 1 { "s" } else { "" }
+                ),
+            ));
+        }
+    }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+        if all {
+            let fully_removed = !dry_run
+                && full_actions.iter().any(|action| {
+                    action.kind == "install_root"
+                        && matches!(action.action.as_str(), "removed" | "already_absent")
+                });
+            let payload = serde_json::json!({
+                "schema": "kin.setup-uninstall.v2",
+                "scope": "all",
+                "dry_run": dry_run,
+                "ledger": outcomes,
+                "full_install": full_actions,
+                "fully_removed": fully_removed,
+                "retained_coordination_metadata": if cfg!(windows) {
+                    serde_json::json!([{
+                        "kind": "windows_install_authority",
+                        "reason": "persistent current-user-only sidecar prevents split install authority across crashes, aliases, and concurrent future installs"
+                    }])
+                } else {
+                    serde_json::json!([])
+                },
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&outcomes)?);
+        }
+        if blocked > 0 && all && !dry_run {
+            anyhow::bail!(
+                "full uninstall retained KIN_HOME because {blocked} ledger entries were modified or failed removal; review them and re-run with --force only if those Kin-owned slices should be removed"
+            );
+        }
         return Ok(());
     }
 
     if outcomes.is_empty() {
-        println!("No install ledger found — nothing recorded to uninstall.");
-        println!("(The ledger is written by `kin setup`; run it first if you expected entries.)");
-        return Ok(());
+        if all {
+            println!("No install ledger found — continuing with full managed-install cleanup.");
+        } else {
+            println!("No install ledger found — nothing recorded to uninstall.");
+            println!(
+                "(The ledger is written by `kin setup`; run it first if you expected entries.)"
+            );
+            return Ok(());
+        }
     }
 
     if dry_run {
@@ -12326,6 +13566,16 @@ pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
         println!("Removed {removed}, skipped {skipped} (modified since install), {failed} failed.");
         if skipped > 0 {
             println!("Re-run with --force to remove entries modified since install.");
+        }
+    }
+    if all {
+        for action in &full_actions {
+            println!("  {}", action.detail);
+        }
+        if blocked > 0 && !dry_run {
+            anyhow::bail!(
+                "full uninstall retained KIN_HOME because {blocked} ledger entries were modified or failed removal; review them and re-run with --force only if those Kin-owned slices should be removed"
+            );
         }
     }
     Ok(())
@@ -13006,6 +14256,938 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
         home.apply("KIN_HOME", Some(&preferred));
         assert_eq!(kin_dir().unwrap(), preferred);
+    }
+
+    #[test]
+    fn full_uninstall_root_rejects_home_and_unrecognized_custom_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let home_error = validate_full_uninstall_root_at(&home, &home, None).unwrap_err();
+        assert!(
+            home_error.to_string().contains("user home"),
+            "unexpected refusal: {home_error:#}"
+        );
+
+        let broad = tmp.path().join("tools");
+        fs::create_dir_all(broad.join("bin")).unwrap();
+        fs::write(broad.join("bin/kin"), b"binary").unwrap();
+        fs::write(broad.join("other-product-data"), b"keep").unwrap();
+        let broad_error =
+            validate_full_uninstall_root_at(&broad, &home, Some(&broad.join("bin/kin")))
+                .unwrap_err();
+        assert!(
+            broad_error.to_string().contains("custom KIN_HOME"),
+            "unexpected refusal: {broad_error:#}"
+        );
+
+        let misleading_name = tmp.path().join("working");
+        fs::create_dir_all(misleading_name.join("bin")).unwrap();
+        fs::write(misleading_name.join("bin/kin"), b"binary").unwrap();
+        fs::write(misleading_name.join("user-notes.txt"), b"keep").unwrap();
+        let misleading_error = validate_full_uninstall_root_at(
+            &misleading_name,
+            &home,
+            Some(&misleading_name.join("bin/kin")),
+        )
+        .unwrap_err();
+        assert!(
+            misleading_error.to_string().contains("custom KIN_HOME"),
+            "a directory name containing 'kin' must not bypass ownership checks: {misleading_error:#}"
+        );
+
+        let managed = tmp.path().join("kin-home");
+        fs::create_dir_all(managed.join("bin")).unwrap();
+        fs::write(managed.join("bin/kin"), b"binary").unwrap();
+        fs::create_dir_all(managed.join("lib")).unwrap();
+        fs::write(managed.join("lib/unrelated-user-notes.txt"), b"keep").unwrap();
+        let managed_error =
+            validate_full_uninstall_root_at(&managed, &home, Some(&managed.join("bin/kin")))
+                .unwrap_err();
+        assert!(managed_error.to_string().contains("custom KIN_HOME"));
+        assert_eq!(
+            fs::read(managed.join("lib/unrelated-user-notes.txt")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn full_uninstall_absent_root_never_hides_a_retired_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let retired = home.join(format!(".kin-uninstall-retired-{}", uuid::Uuid::new_v4()));
+        let deleting = home.join(format!(".kin-uninstall-delete-{}", uuid::Uuid::new_v4()));
+        let incomplete = home.join(format!(
+            ".kin-uninstall-incomplete-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(retired.join("bin")).unwrap();
+        fs::write(retired.join("bin/kin"), b"still here").unwrap();
+        fs::create_dir_all(deleting.join("bin")).unwrap();
+        fs::write(deleting.join("bin/kin"), b"also here").unwrap();
+        fs::write(&incomplete, b"journal").unwrap();
+
+        let error = validate_full_uninstall_root_at(&home.join(".kin"), &home, None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("retired managed state"), "{message}");
+        assert!(
+            message.contains("refusing to report fully_removed"),
+            "{message}"
+        );
+        assert_eq!(fs::read(retired.join("bin/kin")).unwrap(), b"still here");
+        assert_eq!(fs::read(deleting.join("bin/kin")).unwrap(), b"also here");
+        assert_eq!(fs::read(&incomplete).unwrap(), b"journal");
+
+        fs::create_dir_all(home.join(".kin/bin")).unwrap();
+        fs::write(home.join(".kin/bin/kin"), b"new install").unwrap();
+        let recreated = validate_full_uninstall_root_at(
+            &home.join(".kin"),
+            &home,
+            Some(&home.join(".kin/bin/kin")),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{recreated:#}").contains("retired managed state"),
+            "a recreated public install must not hide prior residual state: {recreated:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    const WINDOWS_FULL_UNINSTALL_CHILD_MODE: &str = "KIN_INTERNAL_TEST_FULL_UNINSTALL_CHILD_MODE";
+    #[cfg(windows)]
+    const WINDOWS_FULL_UNINSTALL_CHILD_ROOT: &str = "KIN_INTERNAL_TEST_FULL_UNINSTALL_CHILD_ROOT";
+    #[cfg(windows)]
+    const WINDOWS_FULL_UNINSTALL_CHILD_RESULT: &str =
+        "KIN_INTERNAL_TEST_FULL_UNINSTALL_CHILD_RESULT";
+
+    #[cfg(windows)]
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    struct WindowsFullUninstallChildResult {
+        retired: PathBuf,
+        incomplete_marker: PathBuf,
+        helper_script: PathBuf,
+        helper_ready: PathBuf,
+        helper_ready_publishing: PathBuf,
+        helper_log: PathBuf,
+        parked_original: Option<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    fn only_windows_uninstall_artifact(parent: &Path, prefix: &str) -> Result<PathBuf> {
+        let matches = fs::read_dir(parent)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            matches.len() == 1,
+            "expected one {prefix} artifact below {}, found {matches:?}",
+            parent.display()
+        );
+        Ok(matches.into_iter().next().expect("length checked above"))
+    }
+
+    #[cfg(windows)]
+    fn windows_user_path() -> Result<Option<String>> {
+        let snapshot_dir = tempfile::tempdir()?;
+        let snapshot = snapshot_dir.path().join("user-path.bin");
+        let script = r#"$ErrorActionPreference = 'Stop'
+$value = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($null -eq $value) {
+    [IO.File]::WriteAllBytes($env:KIN_TEST_PATH_SNAPSHOT, [byte[]]@(0))
+} else {
+    $body = [Text.Encoding]::UTF8.GetBytes($value)
+    $payload = New-Object byte[] ($body.Length + 1)
+    $payload[0] = 1
+    [Array]::Copy($body, 0, $payload, 1, $body.Length)
+    [IO.File]::WriteAllBytes($env:KIN_TEST_PATH_SNAPSHOT, $payload)
+}
+"#;
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .env("KIN_TEST_PATH_SNAPSHOT", &snapshot)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("failed to snapshot the Windows User PATH for native uninstall proof")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to snapshot the Windows User PATH: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&snapshot)?;
+        match bytes.split_first() {
+            Some((&0, [])) => Ok(None),
+            Some((&1, body)) => Ok(Some(String::from_utf8(body.to_vec())?)),
+            _ => anyhow::bail!("Windows User PATH snapshot had an invalid encoding marker"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn set_windows_user_path(value: Option<&str>) -> Result<()> {
+        let script = r#"$ErrorActionPreference = 'Stop'
+$value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } else { $null }
+[Environment]::SetEnvironmentVariable('Path', $value, 'User')
+"#;
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]);
+        match value {
+            Some(value) => {
+                command
+                    .env("KIN_TEST_PATH_PRESENT", "1")
+                    .env("KIN_TEST_PATH_VALUE", value);
+            }
+            None => {
+                command.env("KIN_TEST_PATH_PRESENT", "0");
+            }
+        }
+        let output = command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("failed to set the Windows User PATH for native uninstall proof")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to set the Windows User PATH: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    struct WindowsUserPathRestore {
+        original: Option<String>,
+        armed: bool,
+    }
+
+    #[cfg(windows)]
+    impl WindowsUserPathRestore {
+        fn capture() -> Result<Self> {
+            Ok(Self {
+                original: windows_user_path()?,
+                armed: true,
+            })
+        }
+
+        fn restore(&mut self) -> Result<()> {
+            set_windows_user_path(self.original.as_deref())?;
+            self.armed = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsUserPathRestore {
+        fn drop(&mut self) {
+            if self.armed {
+                if let Err(error) = set_windows_user_path(self.original.as_deref()) {
+                    eprintln!(
+                        "failed to restore the Windows User PATH after uninstall test: {error:#}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_full_uninstall_child(mode: &str) -> Result<()> {
+        let root = PathBuf::from(
+            env::var_os(WINDOWS_FULL_UNINSTALL_CHILD_ROOT)
+                .context("native uninstall child root was not provided")?,
+        );
+        let result_path = PathBuf::from(
+            env::var_os(WINDOWS_FULL_UNINSTALL_CHILD_RESULT)
+                .context("native uninstall child result path was not provided")?,
+        );
+        let home = root
+            .parent()
+            .context("native uninstall child root has no home parent")?;
+        let validated = validate_full_uninstall_root_at(&root, home, None)?;
+        let lock = crate::commands::update::InstallRootLock::acquire_existing_waiting(&root)?;
+        if mode == "parent-incarnation-mismatch" {
+            let _parent_creation_override =
+                EnvVarGuard::set(WINDOWS_UNINSTALL_PARENT_CREATION_OVERRIDE, "0");
+            let error = remove_full_install_root(&validated, false, Some(&lock))
+                .expect_err("a mismatched parent incarnation must fail the helper handoff");
+            let message = format!("{error:#}");
+            anyhow::ensure!(
+                message.contains("incarnation-safe handoff")
+                    && message.contains("atomically restored"),
+                "parent-incarnation mismatch produced an unexpected error: {message}"
+            );
+            anyhow::ensure!(
+                install_root_identity(&root)?
+                    == validated
+                        .identity
+                        .context("mismatch fixture lost validated identity")?,
+                "failed parent handoff did not restore the original root incarnation"
+            );
+            anyhow::ensure!(
+                !fs::read_dir(home)?
+                    .filter_map(std::result::Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".kin-uninstall-"))),
+                "failed parent handoff left an uninstall retirement artifact"
+            );
+            fs::write(&result_path, message)?;
+            return Ok(());
+        }
+        let outcome = remove_full_install_root(&validated, false, Some(&lock))?;
+        anyhow::ensure!(
+            outcome.action == "scheduled",
+            "native Windows uninstall did not schedule deferred deletion: {outcome:?}"
+        );
+
+        // The helper waits for this exact test process, so every artifact is
+        // stable and observable until this child writes its result and exits.
+        let retired = only_windows_uninstall_artifact(home, ".kin-uninstall-retired-")?;
+        let incomplete_marker =
+            only_windows_uninstall_artifact(home, ".kin-uninstall-incomplete-")?;
+        let token = incomplete_marker
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix(".kin-uninstall-incomplete-"))
+            .context("native uninstall marker did not carry its helper token")?;
+        let helper_script = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
+        let helper_ready = env::temp_dir().join(format!("kin-uninstall-{token}.ready"));
+        let helper_ready_publishing =
+            env::temp_dir().join(format!("kin-uninstall-{token}.ready.publishing"));
+        let helper_log = env::temp_dir().join(format!("kin-uninstall-{token}.log"));
+        anyhow::ensure!(
+            retired.is_dir(),
+            "validated root was not atomically retired"
+        );
+        anyhow::ensure!(
+            incomplete_marker.is_file(),
+            "deferred uninstall did not publish its durable incomplete marker"
+        );
+        anyhow::ensure!(
+            helper_script.is_file(),
+            "deferred uninstall helper script was not published"
+        );
+        anyhow::ensure!(
+            fs::read_to_string(&helper_ready)
+                .is_ok_and(|nonce| uuid::Uuid::parse_str(&nonce).is_ok()),
+            "deferred uninstall helper did not publish a valid incarnation-safe ready handshake"
+        );
+
+        let parked_original = if mode == "identity-mismatch" {
+            let parked = home.join("parked-original-install-root");
+            move_windows_install_root(&retired, &parked)?;
+            fs::create_dir_all(&retired)?;
+            fs::write(
+                retired.join("replacement.txt"),
+                b"replacement at retired pathname must survive",
+            )?;
+            Some(parked)
+        } else {
+            anyhow::ensure!(
+                mode == "success",
+                "unknown native uninstall child mode {mode}"
+            );
+            None
+        };
+
+        // Recreate the public pathname before the helper is allowed to run.
+        // A correct deferred delete remains bound to the retired incarnation.
+        fs::create_dir_all(&root)?;
+        fs::write(
+            root.join("replacement.txt"),
+            b"public path replacement must survive",
+        )?;
+
+        let result = WindowsFullUninstallChildResult {
+            retired,
+            incomplete_marker,
+            helper_script,
+            helper_ready,
+            helper_ready_publishing,
+            helper_log,
+            parked_original,
+        };
+        fs::write(&result_path, serde_json::to_vec(&result)?)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_condition(
+        label: &str,
+        timeout: Duration,
+        mut condition: impl FnMut() -> bool,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        anyhow::bail!("timed out waiting for {label}")
+    }
+
+    #[cfg(windows)]
+    fn run_windows_full_uninstall_child(
+        mode: &str,
+        root: &Path,
+        result_path: &Path,
+        helper_release: Option<&Path>,
+    ) -> Result<WindowsFullUninstallChildResult> {
+        let test_name =
+            "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup";
+        let mut command = Command::new(env::current_exe()?);
+        command
+            .args([test_name, "--exact", "--nocapture"])
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_MODE, mode)
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_ROOT, root)
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_RESULT, result_path)
+            .stdin(std::process::Stdio::null());
+        match helper_release {
+            Some(path) => {
+                command.env(WINDOWS_UNINSTALL_HELPER_RELEASE, path);
+            }
+            None => {
+                command.env_remove(WINDOWS_UNINSTALL_HELPER_RELEASE);
+            }
+        }
+        let output = command
+            .output()
+            .context("failed to launch the native Windows uninstall test child")?;
+        if !output.status.success() {
+            // If the child failed after launching the production helper, let
+            // that helper finish before the caller restores the real User
+            // PATH. The isolated home makes this marker lookup exact; no
+            // unrelated uninstall helper is observed or waited on.
+            let home = root
+                .parent()
+                .context("native uninstall child root has no home parent")?;
+            if let Ok(marker) = only_windows_uninstall_artifact(home, ".kin-uninstall-incomplete-")
+            {
+                if let Some(token) = marker
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .and_then(|name| name.strip_prefix(".kin-uninstall-incomplete-"))
+                {
+                    let helper_script = env::temp_dir().join(format!("kin-uninstall-{token}.ps1"));
+                    wait_for_windows_condition(
+                        "failed child uninstall helper to exit before PATH restoration",
+                        Duration::from_secs(45),
+                        || !helper_script.exists(),
+                    )?;
+                }
+            }
+            anyhow::bail!(
+                "native Windows uninstall child failed ({mode}):\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(serde_json::from_slice(&fs::read(result_path)?)?)
+    }
+
+    #[cfg(windows)]
+    fn run_windows_parent_incarnation_mismatch_child(
+        root: &Path,
+        result_path: &Path,
+    ) -> Result<String> {
+        let test_name =
+            "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup";
+        let output = Command::new(env::current_exe()?)
+            .args([test_name, "--exact", "--nocapture"])
+            .env(
+                WINDOWS_FULL_UNINSTALL_CHILD_MODE,
+                "parent-incarnation-mismatch",
+            )
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_ROOT, root)
+            .env(WINDOWS_FULL_UNINSTALL_CHILD_RESULT, result_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .context("failed to launch the parent-incarnation mismatch test child")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "parent-incarnation mismatch child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(fs::read_to_string(result_path)?)
+    }
+
+    #[cfg(windows)]
+    fn windows_path_fixture(root: &Path) -> (String, String) {
+        let parent = root.parent().expect("fixture root has a parent");
+        let keep_before = parent.join("keep-before");
+        let keep_similar = parent.join(".kin-neighbor").join("bin");
+        let keep_after = parent.join("keep-after");
+        (
+            format!(
+                "{};\"{}\";{};{}",
+                keep_before.display(),
+                root.join("bin").display(),
+                keep_similar.display(),
+                keep_after.display()
+            ),
+            format!(
+                "{};{};{}",
+                keep_before.display(),
+                keep_similar.display(),
+                keep_after.display()
+            ),
+        )
+    }
+
+    #[cfg(windows)]
+    fn prepare_windows_managed_root(root: &Path) -> Result<InstallRootIdentity> {
+        fs::create_dir_all(root.join("bin"))?;
+        fs::write(root.join("bin/.kinlab-kin-version"), b"0.4.6\n")?;
+        fs::write(root.join("bin/original.txt"), b"exact original incarnation")?;
+        install_root_identity(root)
+    }
+
+    #[cfg(windows)]
+    fn exercise_windows_full_uninstall_runtime() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+
+        // First drive the synchronous absent-root cleanup itself. The exact
+        // root and requested-root entries disappear while a lookalike remains.
+        let direct_root = fixture.path().join("direct").join(".kin");
+        let requested_root = fixture.path().join("direct-requested").join(".kin");
+        let keep_before = fixture.path().join("direct-keep-before");
+        let keep_similar = fixture
+            .path()
+            .join("direct")
+            .join(".kin-neighbor")
+            .join("bin");
+        let keep_after = fixture.path().join("direct-keep-after");
+        let direct_seed = format!(
+            "{};{};{};{};{}",
+            keep_before.display(),
+            direct_root.join("bin").display(),
+            keep_similar.display(),
+            requested_root.join("bin").display(),
+            keep_after.display()
+        );
+        let direct_expected = format!(
+            "{};{};{}",
+            keep_before.display(),
+            keep_similar.display(),
+            keep_after.display()
+        );
+        set_windows_user_path(Some(&direct_seed))?;
+        cleanup_windows_user_path(&direct_root, &requested_root)?;
+        anyhow::ensure!(
+            windows_user_path()?.as_deref() == Some(direct_expected.as_str()),
+            "synchronous Windows User PATH cleanup was not exact"
+        );
+
+        // Present the helper with the current PID but the wrong creation
+        // identity. It must reject the reusable PID immediately, exit without
+        // publishing readiness, and let the parent atomically restore the
+        // original root rather than waiting on that process number.
+        let handoff_home = fixture.path().join("handoff-mismatch").join("home");
+        let handoff_root = handoff_home.join(".kin");
+        fs::create_dir_all(&handoff_home)?;
+        let handoff_identity = prepare_windows_managed_root(&handoff_root)?;
+        let handoff_result_path = fixture.path().join("handoff-mismatch-result.txt");
+        let handoff_error =
+            run_windows_parent_incarnation_mismatch_child(&handoff_root, &handoff_result_path)?;
+        anyhow::ensure!(
+            handoff_error.contains("parent process incarnation changed"),
+            "helper did not explain its parent-incarnation refusal: {handoff_error}"
+        );
+        anyhow::ensure!(
+            install_root_identity(&handoff_root)? == handoff_identity,
+            "parent-incarnation refusal did not preserve the original install root"
+        );
+
+        let success_home = fixture.path().join("success").join("home");
+        let success_root = success_home.join(".kin");
+        fs::create_dir_all(&success_home)?;
+        let original_identity = prepare_windows_managed_root(&success_root)?;
+        let (success_seed, success_expected_path) = windows_path_fixture(&success_root);
+        set_windows_user_path(Some(&success_seed))?;
+        let success_result_path = fixture.path().join("success-result.json");
+        let success_helper_release = fixture.path().join("success-helper-release");
+        let success = run_windows_full_uninstall_child(
+            "success",
+            &success_root,
+            &success_result_path,
+            Some(&success_helper_release),
+        )?;
+        let reinstall_error = crate::commands::update::InstallRootLock::acquire(&success_root)
+            .err()
+            .context("a reinstall must not enter while deferred uninstall cleanup is pending")?;
+        let reinstall_message = format!("{reinstall_error:#}");
+        anyhow::ensure!(
+            reinstall_message.contains("install mutation is already active")
+                || reinstall_message.contains("prior Windows Kin uninstall")
+                || reinstall_message.contains("install authority"),
+            "pending uninstall rejected reinstall for an unexpected reason: {reinstall_message}"
+        );
+        fs::write(&success_helper_release, b"continue\n")?;
+        wait_for_windows_condition(
+            "successful deferred uninstall",
+            Duration::from_secs(120),
+            || {
+                if success.helper_log.is_file() {
+                    let log_content = fs::read_to_string(&success.helper_log).unwrap_or_default();
+                    eprintln!("deferred uninstall helper logged error:\n{log_content}");
+                    return false;
+                }
+                !success.incomplete_marker.exists()
+                    && !success.retired.exists()
+                    && !success.helper_ready.exists()
+                    && !success.helper_ready_publishing.exists()
+            },
+        )?;
+        let post_cleanup_lock = crate::commands::update::InstallRootLock::acquire(&success_root)
+            .context("reinstall authority did not recover after deferred uninstall cleanup")?;
+        drop(post_cleanup_lock);
+        anyhow::ensure!(
+            !success.helper_log.exists(),
+            "successful deferred uninstall unexpectedly left {}",
+            success.helper_log.display()
+        );
+        anyhow::ensure!(
+            fs::read(success_root.join("replacement.txt"))?
+                == b"public path replacement must survive",
+            "deferred delete followed the public install pathname replacement"
+        );
+        anyhow::ensure!(
+            install_root_identity(&success_root)? != original_identity,
+            "the public replacement retained the deleted root's identity"
+        );
+        anyhow::ensure!(
+            !fs::read_dir(&success_home)?
+                .filter_map(std::result::Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".kin-uninstall-delete-"))
+                }),
+            "successful deferred uninstall left its private delete incarnation"
+        );
+        anyhow::ensure!(
+            windows_user_path()?.as_deref() == Some(success_expected_path.as_str()),
+            "deferred helper did not remove only the exact Kin User PATH entry"
+        );
+
+        let failure_home = fixture.path().join("failure").join("home");
+        let failure_root = failure_home.join(".kin");
+        fs::create_dir_all(&failure_home)?;
+        let failure_identity = prepare_windows_managed_root(&failure_root)?;
+        let (failure_seed, failure_expected_path) = windows_path_fixture(&failure_root);
+        set_windows_user_path(Some(&failure_seed))?;
+        let failure_result_path = fixture.path().join("failure-result.json");
+        let failure = run_windows_full_uninstall_child(
+            "identity-mismatch",
+            &failure_root,
+            &failure_result_path,
+            None,
+        )?;
+        wait_for_windows_condition(
+            "failed deferred uninstall journal",
+            Duration::from_secs(120),
+            || failure.helper_log.is_file(),
+        )?;
+        anyhow::ensure!(
+            !failure.helper_ready.exists(),
+            "failed deferred uninstall retained its helper ready handshake"
+        );
+        anyhow::ensure!(
+            !failure.helper_ready_publishing.exists(),
+            "failed deferred uninstall retained its partial helper ready handshake"
+        );
+        anyhow::ensure!(
+            failure.incomplete_marker.is_file(),
+            "failed deferred uninstall cleared its durable incomplete marker"
+        );
+        anyhow::ensure!(
+            fs::read(failure.retired.join("replacement.txt"))?
+                == b"replacement at retired pathname must survive",
+            "identity-mismatched retired-path replacement was deleted"
+        );
+        anyhow::ensure!(
+            fs::read(failure_root.join("replacement.txt"))?
+                == b"public path replacement must survive",
+            "failed deferred delete followed the public install pathname replacement"
+        );
+        let parked_original = failure
+            .parked_original
+            .as_deref()
+            .context("identity-mismatch fixture did not park the original root")?;
+        anyhow::ensure!(
+            install_root_identity(parked_original)? == failure_identity,
+            "failed helper did not preserve the exact original root incarnation"
+        );
+        let failure_log = fs::read_to_string(&failure.helper_log)?;
+        anyhow::ensure!(
+            failure_log.contains("identity changed"),
+            "failed helper log did not explain its identity refusal: {failure_log}"
+        );
+        anyhow::ensure!(
+            windows_user_path()?.as_deref() == Some(failure_expected_path.as_str()),
+            "failed deferred helper did not apply exact User PATH cleanup before journaling"
+        );
+        fs::remove_file(&failure.helper_log)?;
+        Ok(())
+    }
+
+    /// This test must run on a native Windows host. Its child process executes
+    /// the production MoveFileEx retirement and then exits so the production
+    /// PowerShell helper can perform identity-bound deferred deletion.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup() -> Result<()> {
+        if let Some(mode) = env::var_os(WINDOWS_FULL_UNINSTALL_CHILD_MODE) {
+            return windows_full_uninstall_child(&mode.to_string_lossy());
+        }
+
+        let mut path_restore = WindowsUserPathRestore::capture()?;
+        let exercise = exercise_windows_full_uninstall_runtime();
+        let restore = path_restore.restore();
+        match (exercise, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(restore_error)) => Err(restore_error),
+            (Err(error), Err(restore_error)) => anyhow::bail!(
+                "native uninstall proof failed: {error:#}; restoring the original Windows User PATH also failed: {restore_error:#}"
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_uninstall_rejects_symlink_binary_as_custom_root_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("tools");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/notes.txt"), b"unrelated user library data").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/true", root.join("bin/kin")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        let error = validate_full_uninstall_root_at(&root, &home, None).unwrap_err();
+        assert!(
+            error.to_string().contains("custom KIN_HOME"),
+            "unexpected refusal: {error:#}"
+        );
+        assert_eq!(
+            fs::read(root.join("lib/notes.txt")).unwrap(),
+            b"unrelated user library data"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn full_uninstall_legacy_path_cleanup_is_exact_and_dry_run_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let install_root = home.join(".kin");
+        fs::create_dir_all(&home).unwrap();
+        let _profile = EnvVarGuard::unset("PROFILE");
+
+        let zsh = home.join(".zshrc");
+        let bash = home.join(".bashrc");
+        let block = rc_path_block("zsh", &install_root.join("bin"));
+        fs::write(&zsh, format!("export KEEP=1\n{block}alias k='kin'\n")).unwrap();
+        fs::write(&bash, format!("# user heading\n{block}{block}")).unwrap();
+        let before_zsh = fs::read(&zsh).unwrap();
+        let before_bash = fs::read(&bash).unwrap();
+
+        let dry = cleanup_legacy_shell_path_blocks(&home, &install_root, true).unwrap();
+        assert_eq!(dry.len(), 2);
+        assert_eq!(fs::read(&zsh).unwrap(), before_zsh);
+        assert_eq!(fs::read(&bash).unwrap(), before_bash);
+        let dry_entries = fs::read_dir(&home).unwrap().count();
+        assert_eq!(
+            dry_entries, 2,
+            "dry-run must not create persistent config-lock sidecars"
+        );
+
+        let removed = cleanup_legacy_shell_path_blocks(&home, &install_root, false).unwrap();
+        assert_eq!(removed.len(), 2);
+        let zsh_after = fs::read_to_string(&zsh).unwrap();
+        let bash_after = fs::read_to_string(&bash).unwrap();
+        assert_eq!(zsh_after, "export KEEP=1\nalias k='kin'\n");
+        assert_eq!(bash_after, "# user heading\n");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn full_uninstall_removes_only_the_validated_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".kin");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/kin"), b"binary").unwrap();
+        let keep = home.join("keep.txt");
+        fs::write(&keep, b"user data").unwrap();
+
+        let validated =
+            validate_full_uninstall_root_at(&root, &home, Some(&root.join("bin/kin"))).unwrap();
+        let lock =
+            crate::commands::update::InstallRootLock::acquire_existing_waiting(&root).unwrap();
+        let outcome = remove_full_install_root_with_hooks(
+            &validated,
+            false,
+            Some(&lock),
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(outcome.action, "removed");
+        assert!(!root.exists());
+        assert_eq!(fs::read(&keep).unwrap(), b"user data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_uninstall_never_deletes_an_ordinary_directory_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".kin");
+        let parked = home.join("validated-root-moved-away");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/kin"), b"binary").unwrap();
+
+        let validated =
+            validate_full_uninstall_root_at(&root, &home, Some(&root.join("bin/kin"))).unwrap();
+        let lock =
+            crate::commands::update::InstallRootLock::acquire_existing_waiting(&root).unwrap();
+        let error = remove_full_install_root_with_hooks(
+            &validated,
+            false,
+            Some(&lock),
+            || {
+                fs::rename(&root, &parked).unwrap();
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("unrelated.txt"), b"must survive").unwrap();
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("binding")
+                || error.to_string().contains("changed")
+                || error.to_string().contains("missing"),
+            "unexpected refusal: {error:#}"
+        );
+        assert_eq!(
+            fs::read(root.join("unrelated.txt")).unwrap(),
+            b"must survive"
+        );
+        assert!(parked.exists(), "the validated original must be preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_uninstall_retired_path_replacement_is_never_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".kin");
+        let parked = home.join("retired-original-moved-away");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/kin"), b"binary").unwrap();
+
+        let validated =
+            validate_full_uninstall_root_at(&root, &home, Some(&root.join("bin/kin"))).unwrap();
+        let lock =
+            crate::commands::update::InstallRootLock::acquire_existing_waiting(&root).unwrap();
+        let error = remove_full_install_root_with_hooks(
+            &validated,
+            false,
+            Some(&lock),
+            || Ok(()),
+            |retired| {
+                fs::rename(retired, &parked).unwrap();
+                fs::create_dir_all(retired).unwrap();
+                fs::write(retired.join("unrelated.txt"), b"must survive").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("binding changed"),
+            "unexpected refusal: {error:#}"
+        );
+        let replacement = fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("unrelated.txt").is_file())
+            .expect("retired-path replacement must be preserved");
+        assert_eq!(
+            fs::read(replacement.join("unrelated.txt")).unwrap(),
+            b"must survive"
+        );
+        assert!(
+            parked.exists(),
+            "the descriptor-pinned original remains parked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_uninstall_retires_public_executable_before_final_fence() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = home.join(".kin");
+        let daemon = root.join("bin/kin-daemon");
+        fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+        fs::write(&daemon, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&daemon).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&daemon, permissions).unwrap();
+        fs::write(root.join("bin/kin"), b"binary").unwrap();
+
+        let validated =
+            validate_full_uninstall_root_at(&root, &home, Some(&root.join("bin/kin"))).unwrap();
+        let lock =
+            crate::commands::update::InstallRootLock::acquire_existing_waiting(&root).unwrap();
+        let outcome = remove_full_install_root_with_hooks(
+            &validated,
+            false,
+            Some(&lock),
+            || Ok(()),
+            |retired| {
+                assert!(!root.exists(), "public executable root was not retired");
+                assert!(retired.join("bin/kin-daemon").is_file());
+                let error = Command::new(&daemon).status().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.action, "removed");
     }
 
     #[test]

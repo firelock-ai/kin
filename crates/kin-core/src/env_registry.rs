@@ -145,6 +145,13 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- install / setup root -------------------------------------------------
     EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the managed Kin install used by the launcher, setup, and shell hooks" },
     EnvVarSpec { name: "KIN_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "compatibility alias for the managed Kin install root; KIN_HOME wins when both are set" },
+    EnvVarSpec { name: "KIN_VERSION", kind: Kind::Str, default: "latest", sensitivity: Sensitivity::Operational, summary: "release version selected by the shell and PowerShell installers" },
+    EnvVarSpec { name: "KIN_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the shell and PowerShell installers" },
+    EnvVarSpec { name: "KIN_NO_SETUP", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "skip the installer's post-install setup wizard when set truthy" },
+    EnvVarSpec { name: "KIN_REGISTRY_REPAIR", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the POSIX installer to repair safe registry ownership modes" },
+    EnvVarSpec { name: "KIN_MANAGED_BIN", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "explicit native Kin binary used by the @kinlab/kin launcher instead of provisioning" },
+    EnvVarSpec { name: "KIN_NO_PROVISION", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "forbid network provisioning by the @kinlab/kin launcher" },
+    EnvVarSpec { name: "KIN_LAUNCHER_ADOPT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "force the @kinlab/kin launcher to provision its pinned release, including an intentional downgrade" },
     // ---- correctness / retrieval-affecting ------------------------------------
     EnvVarSpec { name: "KIN_SEMLOC_RERANK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "enable semantic-locate reranking of daemon locate results" },
     EnvVarSpec { name: "KIN_SEARCH_MODE", kind: Kind::OneOf(&["precise"]), default: "", sensitivity: Sensitivity::Correctness, summary: "search strictness; 'precise' rejects broad show-body searches" },
@@ -271,6 +278,9 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "MCP tool exposure profile" },
     EnvVarSpec { name: "KIN_MCP_REPO", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "bind `kin mcp start` to this repository instead of the launch directory" },
     EnvVarSpec { name: "KIN_MCP_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "cache directory override for the npm MCP wrapper's managed Kin binary" },
+    EnvVarSpec { name: "KIN_MCP_KIN_BINARY", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "explicit native Kin binary used by the @kinlab/kin-mcp wrapper" },
+    EnvVarSpec { name: "KIN_MCP_RELEASE_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the @kinlab/kin-mcp wrapper" },
+    EnvVarSpec { name: "KIN_MCP_AUTO_INIT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup" },
 
     // ---- diagnostics / benchmarking ------------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_DEBUG", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit locate pipeline debug output" },
@@ -763,6 +773,17 @@ fn doc_group(name: &str) -> &'static str {
     // Order matters: first match wins, most specific first.
     const GROUPS: &[(&str, &str)] = &[
         ("KIN_ENV_VALIDATION", "Validation control"),
+        ("KIN_HOME", "Install & launch"),
+        ("KIN_DIR", "Install & launch"),
+        ("KIN_VERSION", "Install & launch"),
+        ("KIN_BASE_URL", "Install & launch"),
+        ("KIN_NO_SETUP", "Install & launch"),
+        ("KIN_REGISTRY_REPAIR", "Install & launch"),
+        ("KIN_MANAGED_BIN", "Install & launch"),
+        ("KIN_NO_PROVISION", "Install & launch"),
+        ("KIN_LAUNCHER_", "Install & launch"),
+        ("KIN_MCP_", "Install & launch"),
+        ("KIN_BINARY_PATH", "Install & launch"),
         ("KIN_LOCATE_", "Locate pipeline tuning"),
         ("KIN_RANK_", "Ranking weights"),
         ("KIN_SEMLOC_", "Semantic-locate tuning"),
@@ -799,6 +820,7 @@ pub fn render_reference_markdown() -> String {
     // Deterministic: by group order, then name.
     const GROUP_ORDER: &[&str] = &[
         "Validation control",
+        "Install & launch",
         "General",
         "Daemon",
         "Supervisor",
@@ -1162,6 +1184,42 @@ mod tests {
                 report.unknown.is_empty(),
                 "{name} must be recognized, not reported unknown: {:?}",
                 report.unknown
+            );
+        }
+    }
+
+    #[test]
+    fn installer_and_wrapper_variables_are_registered_not_unknown() {
+        // These variables are consumed before the native process starts, but
+        // shell and Node launchers intentionally inherit them into `kin`.
+        // Calling them "unrecognized ... no effect" there is false and made a
+        // normal KIN_MCP_AUTO_INIT first run look misconfigured.
+        for (name, value) in [
+            ("KIN_VERSION", "0.4.6"),
+            ("KIN_BASE_URL", "file:///tmp/kin-releases"),
+            ("KIN_NO_SETUP", "1"),
+            ("KIN_REGISTRY_REPAIR", "1"),
+            ("KIN_MANAGED_BIN", "/tmp/kin"),
+            ("KIN_NO_PROVISION", "1"),
+            ("KIN_LAUNCHER_ADOPT", "1"),
+            ("KIN_MCP_KIN_BINARY", "/tmp/kin"),
+            (
+                "KIN_MCP_RELEASE_BASE_URL",
+                "https://github.example/releases",
+            ),
+            ("KIN_MCP_AUTO_INIT", "1"),
+        ] {
+            assert!(spec(name).is_some(), "{name} must be registered");
+            let report = audit_env([(name.to_string(), value.to_string())], false);
+            assert!(
+                report.unknown.is_empty(),
+                "{name} must be recognized, not reported unknown: {:?}",
+                report.unknown
+            );
+            assert!(
+                report.invalid.is_empty(),
+                "{name} test value must validate: {:?}",
+                report.invalid
             );
         }
     }

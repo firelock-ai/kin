@@ -589,14 +589,34 @@ impl DaemonCallSeam for RealDaemonSeam {
 /// revival path finds the same binary without a `kin-daemon` crate dep
 /// (which would be circular: `kin-daemon` already depends on `kin-mcp`).
 fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
-    if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
+    let explicit = std::env::var_os("KIN_DAEMON_BIN");
+    let executable = std::env::current_exe().ok();
+    let search_path = std::env::var_os("PATH");
+    find_mcp_daemon_binary_from(
+        explicit.as_deref(),
+        executable.as_deref(),
+        search_path.as_deref(),
+    )
+}
+
+#[cfg(windows)]
+const MCP_DAEMON_BINARY_FILE_NAME: &str = "kin-daemon.exe";
+#[cfg(not(windows))]
+const MCP_DAEMON_BINARY_FILE_NAME: &str = "kin-daemon";
+
+fn find_mcp_daemon_binary_from(
+    explicit: Option<&std::ffi::OsStr>,
+    executable: Option<&std::path::Path>,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    if let Some(explicit) = explicit {
         let path = std::path::PathBuf::from(explicit);
         if path.exists() {
             return Some(path);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("kin-daemon");
+    if let Some(exe) = executable {
+        let sibling = exe.with_file_name(MCP_DAEMON_BINARY_FILE_NAME);
         if sibling.exists() {
             return Some(sibling);
         }
@@ -607,7 +627,7 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
             .is_some_and(|name| name == "deps")
         {
             if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
-                let target_sibling = target_dir.join("kin-daemon");
+                let target_sibling = target_dir.join(MCP_DAEMON_BINARY_FILE_NAME);
                 if target_sibling.exists() {
                     return Some(target_sibling);
                 }
@@ -615,14 +635,23 @@ fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
         }
     }
     // Walk PATH manually (avoids `which` crate dep).
-    let path_var = std::env::var_os("PATH")?;
+    let path_var = search_path?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("kin-daemon");
+        let candidate = dir.join(MCP_DAEMON_BINARY_FILE_NAME);
         if candidate.exists() {
             return Some(candidate);
         }
     }
     None
+}
+
+fn configured_managed_install_root() -> Option<std::path::PathBuf> {
+    for key in ["KIN_HOME", "KIN_DIR"] {
+        if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            return Some(std::path::PathBuf::from(value));
+        }
+    }
+    kin_core::layout::global_home_kin_dir()
 }
 
 /// Spawn a fresh daemon and wait for it to pass `/health`.
@@ -664,6 +693,11 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
         "MCP revival: kin-daemon binary not found (not in PATH or next to kin binary)".to_string()
     })?;
+    let _install_spawn_fence = configured_managed_install_root()
+        .map(|root| kin_daemon_spawn::ManagedInstallSpawnFence::acquire(&daemon_bin, &root))
+        .transpose()
+        .map_err(|error| format!("MCP revival: managed install spawn admission failed: {error}"))?
+        .flatten();
 
     // A port record with no PID owner beside it belongs to a daemon that is
     // already gone. Left in place, the port we are about to read back would be
@@ -1376,6 +1410,22 @@ pub async fn forward_check_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_daemon_discovery_finds_platform_sibling_without_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory
+            .path()
+            .join(if cfg!(windows) { "kin.exe" } else { "kin" });
+        let daemon = directory.path().join(MCP_DAEMON_BINARY_FILE_NAME);
+        std::fs::write(&executable, b"kin fixture").unwrap();
+        std::fs::write(&daemon, b"daemon fixture").unwrap();
+
+        assert_eq!(
+            find_mcp_daemon_binary_from(None, Some(&executable), None),
+            Some(daemon)
+        );
+    }
 
     // ── Revival state machine ──────────────────────────────────────────────
     //

@@ -1027,9 +1027,11 @@ pub async fn run_with_authority(
 
     // Spawn the API server on the pre-bound listener.
     let api_state = Arc::clone(&state);
+    let api_cancel_tx = cancel_tx.clone();
     let api_cancel = cancel_rx.clone();
     let api_handle = tokio::spawn(async move {
-        api::serve_bound_with_shutdown(api_state, api_listener, api_cancel).await
+        api::serve_bound_with_shutdown(api_state, api_listener, Some(api_cancel_tx), api_cancel)
+            .await
     });
 
     // Register this repo-scoped graph daemon with the lightweight central

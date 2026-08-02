@@ -22,7 +22,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -35,6 +35,7 @@ use crate::state::DaemonState;
 
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
+const SUPERVISOR_OWNER_FILE: &str = "supervisor.owner";
 const SUPERVISOR_TOKEN_FILE: &str = "supervisor.token";
 const SUPERVISOR_LIFECYCLE_FILE: &str = "supervisor.lifecycle";
 const SUPERVISOR_SINGLETON_FILE: &str = "supervisor.lock";
@@ -276,11 +277,27 @@ fn write_supervisor_endpoint_files(
     let _lifecycle = acquire_supervisor_lifecycle_guard(dir)?;
     let pid_tmp = dir.join(format!("{SUPERVISOR_PID_FILE}.tmp"));
     let port_tmp = dir.join(format!("{SUPERVISOR_PORT_FILE}.tmp"));
+    let owner_tmp = dir.join(format!("{SUPERVISOR_OWNER_FILE}.tmp"));
     let pid_path = dir.join(SUPERVISOR_PID_FILE);
     let port_path = dir.join(SUPERVISOR_PORT_FILE);
+    let owner_path = dir.join(SUPERVISOR_OWNER_FILE);
     let result = (|| {
+        let owner = kin_cli::daemon_client::EndpointOwnerRecord::current().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "cannot publish supervisor endpoint without process-incarnation identity",
+            )
+        })?;
         std::fs::write(&pid_tmp, std::process::id().to_string())?;
         std::fs::write(&port_tmp, port.to_string())?;
+        std::fs::write(
+            &owner_tmp,
+            serde_json::to_vec(&owner).map_err(std::io::Error::other)?,
+        )?;
+        // Ownership is visible before the bare PID. Readers either observe a
+        // complete attributed endpoint or an incomplete publication they must
+        // preserve; they never observe a new PID with no incarnation record.
+        std::fs::rename(&owner_tmp, &owner_path)?;
         std::fs::rename(&pid_tmp, &pid_path)?;
         std::fs::rename(&port_tmp, &port_path)?;
         Ok(())
@@ -288,9 +305,11 @@ fn write_supervisor_endpoint_files(
     if result.is_err() {
         let _ = std::fs::remove_file(pid_tmp);
         let _ = std::fs::remove_file(port_tmp);
+        let _ = std::fs::remove_file(owner_tmp);
         if recorded_supervisor_pid(dir) == Some(std::process::id()) {
             let _ = std::fs::remove_file(pid_path);
             let _ = std::fs::remove_file(port_path);
+            let _ = std::fs::remove_file(owner_path);
         }
     }
     result
@@ -303,6 +322,7 @@ fn remove_supervisor_endpoint_files_if_current_process(dir: &Path, port: u16) {
     };
     let pid_path = dir.join(SUPERVISOR_PID_FILE);
     let port_path = dir.join(SUPERVISOR_PORT_FILE);
+    let owner_path = dir.join(SUPERVISOR_OWNER_FILE);
     let belongs_to_current = std::fs::read_to_string(&pid_path)
         .ok()
         .and_then(|content| content.trim().parse::<u32>().ok())
@@ -314,6 +334,23 @@ fn remove_supervisor_endpoint_files_if_current_process(dir: &Path, port: u16) {
     if !(belongs_to_current && same_port) {
         return;
     }
+    let owner_belongs_to_current = std::fs::read_to_string(&owner_path)
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<kin_cli::daemon_client::EndpointOwnerRecord>(&raw).ok()
+        })
+        .is_some_and(|owner| {
+            owner.identity().pid() == std::process::id()
+                && matches!(
+                    kin_cli::daemon_client::process_identity_is_current(owner.identity()),
+                    Ok(true)
+                )
+        });
+    if !owner_belongs_to_current {
+        warn!("preserving supervisor endpoint because its owner sidecar is missing or changed");
+        return;
+    }
+    let _ = std::fs::remove_file(owner_path);
     let _ = std::fs::remove_file(pid_path);
     let _ = std::fs::remove_file(port_path);
 }
@@ -896,6 +933,47 @@ struct SupervisorAuthState {
     auth_token: Option<String>,
 }
 
+#[derive(Clone)]
+struct SupervisorShutdownControl(Option<tokio::sync::watch::Sender<bool>>);
+
+async fn request_supervisor_shutdown(
+    Extension(control): Extension<SupervisorShutdownControl>,
+    Json(expected): Json<kin_cli::daemon_client::ProcessIdentity>,
+) -> Response {
+    let current = match kin_cli::daemon_client::current_process_identity() {
+        Ok(current) => current,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("current process identity unavailable: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    if current != expected {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "supervisor process incarnation changed"})),
+        )
+            .into_response();
+    }
+    let Some(shutdown) = control.0 else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "cooperative shutdown is unavailable"})),
+        )
+            .into_response();
+    };
+    match shutdown.send(true) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("shutdown channel closed: {error}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// Bearer-token guard for the supervisor control plane. No-ops when no token is
 /// enforced and on public liveness routes; otherwise requires a matching
 /// `Authorization: Bearer <token>`. Mirrors `api::daemon_auth`.
@@ -998,9 +1076,18 @@ pub fn router(state: Arc<SupervisorState>) -> Router {
 }
 
 fn router_with_auth(state: Arc<SupervisorState>, auth_token: Option<String>) -> Router {
+    router_with_auth_and_shutdown(state, auth_token, None)
+}
+
+fn router_with_auth_and_shutdown(
+    state: Arc<SupervisorState>,
+    auth_token: Option<String>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) -> Router {
     let app = Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
+        .route("/shutdown", post(request_supervisor_shutdown))
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/route", get(route_repo))
         .route("/daemons", get(list_repos))
@@ -1008,6 +1095,7 @@ fn router_with_auth(state: Arc<SupervisorState>, auth_token: Option<String>) -> 
         .route("/daemons/{repo_id}/heartbeat", post(heartbeat_daemon))
         .route("/daemons/{repo_id}", delete(deregister_daemon))
         .with_state(state)
+        .layer(Extension(SupervisorShutdownControl(shutdown)))
         .layer(middleware::from_fn_with_state(
             SupervisorAuthState { auth_token },
             supervisor_auth,
@@ -1292,15 +1380,18 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     }
 
     info!(port = bound_port, "kin supervisor listening");
-    let result = axum::serve(listener, router_with_auth(state, auth_token))
-        .with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
+    let result = axum::serve(
+        listener,
+        router_with_auth_and_shutdown(state, auth_token, Some(shutdown_tx.clone())),
+    )
+    .with_graceful_shutdown(async move {
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
             }
-        })
-        .await;
+        }
+    })
+    .await;
     remove_supervisor_endpoint_files_if_current_process(&state_dir, bound_port);
     result
 }
@@ -3277,6 +3368,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_is_bound_to_the_expected_process_incarnation() {
+        let identity = kin_cli::daemon_client::current_process_identity().unwrap();
+        let mut stale = serde_json::to_value(&identity).unwrap();
+        stale["birth_token"] = serde_json::Value::String("reused-pid-successor".to_string());
+
+        let (rejected_tx, rejected_rx) = tokio::sync::watch::channel(false);
+        let rejected_app = router_with_auth_and_shutdown(
+            Arc::new(SupervisorState::new()),
+            Some("shutdown-token".to_string()),
+            Some(rejected_tx),
+        );
+        let rejected = rejected_app
+            .oneshot(
+                Request::post("/shutdown")
+                    .header("authorization", "Bearer shutdown-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(stale.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(
+            !*rejected_rx.borrow(),
+            "mismatched identity requested shutdown"
+        );
+
+        let (accepted_tx, accepted_rx) = tokio::sync::watch::channel(false);
+        let accepted_app = router_with_auth_and_shutdown(
+            Arc::new(SupervisorState::new()),
+            Some("shutdown-token".to_string()),
+            Some(accepted_tx),
+        );
+        let accepted = accepted_app
+            .oneshot(
+                Request::post("/shutdown")
+                    .header("authorization", "Bearer shutdown-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&identity).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert!(
+            *accepted_rx.borrow(),
+            "matching identity did not request shutdown"
+        );
     }
 
     #[tokio::test]

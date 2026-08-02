@@ -1804,6 +1804,9 @@ enum SetupAction {
     },
     /// Remove exactly what `kin setup` recorded (ledger-verified)
     Uninstall {
+        /// Remove the complete managed install after ledger cleanup (Windows retains an inert authority sidecar)
+        #[arg(long, default_value_t = false)]
+        all: bool,
         /// Show what would be removed without changing anything
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -3210,10 +3213,11 @@ fn main() -> Result<()> {
                     }
                     Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
                     Some(SetupAction::Uninstall {
+                        all,
                         dry_run,
                         force,
                         json,
-                    }) => commands::setup::uninstall(dry_run, force, json),
+                    }) => commands::setup::uninstall(all, dry_run, force, json).await,
                     // `kin setup --check` is shorthand for the first-run health
                     // check without running the wizard.
                     None if check => commands::setup::doctor(false, false).await,
@@ -3686,6 +3690,34 @@ mod tests {
             .expect("spawn cli validation thread")
             .join()
             .expect("cli definition validation must succeed");
+    }
+
+    #[test]
+    fn setup_uninstall_all_is_explicit_and_composable_with_safety_flags() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin",
+                "setup",
+                "uninstall",
+                "--all",
+                "--dry-run",
+                "--force",
+                "--json",
+            ])
+            .expect("the explicit full-uninstall surface must parse");
+            assert!(matches!(
+                cli.command,
+                Command::Setup {
+                    action: Some(SetupAction::Uninstall {
+                        all: true,
+                        dry_run: true,
+                        force: true,
+                        json: true,
+                    }),
+                    ..
+                }
+            ));
+        });
     }
 
     #[test]

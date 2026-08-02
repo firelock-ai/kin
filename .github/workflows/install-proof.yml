@@ -365,54 +365,16 @@ jobs:
           }, null, 2)}\n`);
           NODE
 
-      # WINDOWS COVERAGE REDUCTION, stated here so that no later reader mistakes
-      # this leg for the one it replaces.
-      #
-      # Until 2026-07-20 the Windows leg proved the same first-run surface the
-      # Unix legs still prove: a repository admitted by `kin init`, a daemon
-      # serving it, a graph query, an MCP tool call, and a validated capability
-      # report. Run 29749887140, against the promoted v0.3.6 release, is the
-      # last run in which all of that passed on windows-latest.
-      #
-      # It cannot pass now. `kin init` refuses every admission boundary on
-      # Windows, because the graph store flushes a directory the way Unix does,
-      # by reopening it and syncing, and Windows refuses that open. The refusal
-      # is not an accident: scripts/assert-windows-init-contract.sh asserts it
-      # by name on every pull request as the contract this product ships. A
-      # release gate demanding success while a required check demands refusal
-      # cannot go green on either answer, which is why this leg had no passing
-      # outcome available to it at all.
-      #
-      # So the two steps below assert the contract the product ships, in the
-      # contract's own words, and the three repository-dependent steps after
-      # them became Unix-only. Windows still proves the installer, both
-      # binaries' version, the CLI's own build provenance, every admission
-      # refusal, and the whole repo-free setup surface. It no longer proves a
-      # repository, a running daemon, a graph query, an MCP tool call, or the
-      # daemon's build provenance, which reaches `kin status` from a running
-      # daemon and so needs a repository. That is a real loss of release
-      # coverage on one platform, taken deliberately and meant to be temporary.
-      #
-      # This step is also the tripwire that ends the reduction. When the Windows
-      # transaction-layer port lands and admission succeeds again,
-      # `require_refused` fails with "unexpectedly succeeded", and whoever reads
-      # that failure should delete these two steps, drop the three
-      # `runner.os != 'Windows'` guards below, and flip the contract script back
-      # to asserting a successful admission.
+      # Native Windows release bytes must admit both supported repository
+      # boundaries without leaving unpublished transaction stages. This
+      # anonymous release job cannot read the checked-in contract script, so it
+      # repeats the observable behavior; the authority test keeps it aligned
+      # with scripts/assert-windows-init-contract.sh.
       - name: Windows admission contract proof
         if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          # The shipped Windows admission contract, in the exact words
-          # scripts/assert-windows-init-contract.sh pins on every pull request.
-          # This runner is anonymous and has no checkout, so the strings are
-          # retyped; scripts/test-release-workflow-authority.py requires them to
-          # equal that script's own variables, so wording drifting in either
-          # file fails a required check instead of quietly passing here.
-          CONFIG_REFUSAL="cannot publish repository config"
-          SOURCE_PROOF_STAGE="prove mutable Git workspace"
-          DURABLE_FLUSH_GAP="for durable metadata flush"
           NON_EMPTY_REFUSAL="requires an empty directory"
 
           scratch="kin-windows-admission"
@@ -439,11 +401,6 @@ jobs:
               fail "$1 did not report: $2" "$3"
             fi
           }
-          refute_text() {
-            if [ "$(occurrences "$2" "$3")" -ne 0 ]; then
-              fail "$1 stopped at a gate this platform no longer has: $2" "$3"
-            fi
-          }
           # Deliberately not `find`: on a Windows runner that name also belongs
           # to System32\find.exe, whose arguments mean something else entirely,
           # and a PATH order resolving to it would report zero for every input
@@ -459,53 +416,33 @@ jobs:
             done
             echo "$matches"
           }
-          require_refused() {
-            if (cd "$2" && kin init) > "$3" 2>&1; then
-              fail "$1 unexpectedly succeeded" "$3"
-            fi
-            # A refusal publishes nothing. Both boundaries stage into a
-            # `.kin.init-<uuid>` and only move it into place at the end, so a
-            # `.kin` of any shape means a refusal published authority anyway,
-            # and a surviving stage means it did not clean up after itself.
-            if [ -e "$2/.kin" ]; then
-              fail "$1 left a half-created repository at $2/.kin" "$3"
-            fi
-            # WINDOWS CLEANUP GAP, asserted rather than assumed.
-            #
-            # The stage is a sibling of the admitted directory, not a child of
-            # it: crates/kin-core/src/git_init.rs derives it from the source's
-            # parent and crates/kin-core/src/init.rs from the working
-            # directory's, so a count taken inside the admitted directory can
-            # never see one and would report zero on every input. Each boundary
-            # therefore owns a private parent holding nothing but the directory
-            # under test, which keeps a survivor attributable to the boundary
-            # that left it.
-            #
-            # Counted where they actually appear, the two boundaries that reach
-            # the graph store DO leave their unpublished stage and its `.owner`
-            # marker behind, which is two entries each. This is post-refusal
-            # residue measured before any reaper could run: each boundary owns a
-            # freshly created parent and sees one `kin init`, and
-            # recover_orphaned_repository_stages runs against that parent before
-            # the stage exists, so it finds nothing to reap on any platform.
-            # What moves the count is refusal-time cleanup, or the
-            # transaction-layer port fixing cleanup_owned_staging_root on the
-            # failing path, where removal is best-effort against the same open
-            # handles that refuse the admission. Proving the off-unix reaper arm
-            # instead needs a second init against a parent already holding
-            # residue, which is a different fixture from this one. That is a
-            # real defect and it was invisible for as long as the count looked
-            # in the wrong place. It is asserted by exact count in both
-            # directions, so whatever finally drives it to zero trips this and
-            # has to come here and say so, exactly as a restored admission trips
-            # `require_refused` above.
+          require_no_stage_residue() {
             local parent
             parent="$(dirname "$2")"
             local staged
             staged="$(count_matching "$parent" '.kin.init-*')"
-            if [ "$staged" != "$4" ]; then
-              fail "$1 left $staged stage entries in $parent, expected $4" "$3"
+            if [ "$staged" != "0" ]; then
+              fail "$1 left $staged unpublished stage entries in $parent" "$3"
             fi
+          }
+          require_admitted() {
+            if ! (cd "$2" && kin init) > "$3" 2>&1; then
+              fail "$1 failed" "$3"
+            fi
+            if [ ! -d "$2/.kin" ]; then
+              fail "$1 returned success without publishing $2/.kin" "$3"
+            fi
+            require_no_stage_residue "$1" "$2" "$3"
+          }
+          require_refused() {
+            if (cd "$2" && kin init) > "$3" 2>&1; then
+              fail "$1 unexpectedly succeeded" "$3"
+            fi
+            if [ -e "$2/.kin" ]; then
+              fail "$1 published authority at $2/.kin" "$3"
+            fi
+            require_no_stage_residue "$1" "$2" "$3"
+            require_text "$1" "$NON_EMPTY_REFUSAL" "$3"
           }
 
           git_boundary="$scratch/exact-git/repo"
@@ -524,17 +461,12 @@ jobs:
             # before it reaches the boundary under test.
             git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
           )
-          require_refused "Windows exact-Git admission" "$git_boundary" "$git_log" 2
-          refute_text "Windows exact-Git admission" "$SOURCE_PROOF_STAGE" "$git_log"
-          refute_text "Windows exact-Git admission" "$CONFIG_REFUSAL" "$git_log"
-          require_text "Windows exact-Git admission" "$DURABLE_FLUSH_GAP" "$git_log"
+          require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"
 
           native_boundary="$scratch/native-unborn/repo"
           native_log="$scratch/kin-init-native-unborn.txt"
           mkdir -p "$native_boundary"
-          require_refused "Windows native-unborn bootstrap" "$native_boundary" "$native_log" 2
-          refute_text "Windows native-unborn bootstrap" "$CONFIG_REFUSAL" "$native_log"
-          require_text "Windows native-unborn bootstrap" "$DURABLE_FLUSH_GAP" "$native_log"
+          require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"
 
           # A capability Windows now has must not become permission to derive
           # authority from whatever happens to be lying in the directory.
@@ -542,25 +474,19 @@ jobs:
           populated_log="$scratch/kin-init-native-populated.txt"
           mkdir -p "$populated_boundary"
           printf 'untracked\n' > "$populated_boundary/stray.txt"
-          require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log" 0
-          require_text "Windows non-empty native boundary" "$NON_EMPTY_REFUSAL" "$populated_log"
+          require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"
 
           if [ "$failures" -ne 0 ]; then
-            echo "::error::the installed Windows release did not refuse admission as the shipped contract asserts ($failures check(s) failed)"
+            echo "::error::the installed Windows release violated its admission contract ($failures check(s) failed)"
             exit 1
           fi
-          echo "Installed Windows release refused every admission boundary at the cause it names, published no authority, and left exactly the unreaped stage residue this platform is known to leave."
+          echo "Installed Windows release admitted exact Git and native-empty repositories without stage residue and refused the non-empty native boundary."
 
-      # What Windows still proves without a repository. This is the whole
-      # remaining first-run surface on the platform: the CLI's own build
-      # provenance bound to the release tag's public source, the platform
-      # capability posture, and the setup writers for the shell hook, the
-      # install ledger, and every agent-client MCP config a repo-free install
-      # can write, which is four of the six. `kin bench-meta` reports the CLI
-      # build alone, so the daemon's build provenance is not bound here. Codex
-      # and Antigravity are excluded by the product rather than by this proof,
-      # because their entries bind an exact repository; both exclusions are
-      # asserted below.
+      # Preserve a pre-repository Windows checkpoint in addition to the full
+      # repo/daemon/MCP proof below. It binds CLI provenance and proves that
+      # setup remains useful before a repository exists. Codex is deliberately
+      # absent at this checkpoint because its entry binds an exact repository;
+      # the first-run step below proves all five clients after admission.
       - name: Windows repo-free provenance and setup proof
         if: runner.os == 'Windows'
         shell: bash
@@ -754,7 +680,6 @@ jobs:
           NODE
 
       - name: First-run repository, daemon, and setup proof
-        if: runner.os != 'Windows'
         shell: bash
         env:
           PROOF_SHELL: ${{ matrix.setup-shell }}
@@ -897,7 +822,6 @@ jobs:
             kin doctor --json > kin-claude-fallback-doctor.json
 
       - name: Graph query and MCP tool-call proof
-        if: runner.os != 'Windows'
         shell: bash
         working-directory: kin-install-proof
         run: |
@@ -945,13 +869,74 @@ jobs:
           kin setup status --json | tee kin-health.json
           kin doctor --json | tee kin-doctor.json
 
-          # Drive the installed MCP stdio server through initialize, tools/list,
-          # and a real graph-backed semantic_search call. Node owns the timeout
-          # so this behaves the same on Linux, macOS, and Windows.
+          # Drive the absolute installed MCP stdio server through initialize,
+          # tools/list, a real graph-backed semantic_search call, daemon loss,
+          # and a second call that must revive the daemon. Remove the install
+          # directory from the child's PATH and clear KIN_DAEMON_BIN: sibling
+          # discovery must work on its own, including kin-daemon.exe on Windows.
+          # Node owns the timeout so this behaves the same on every runner.
           node <<'NODE'
           const fs = require("fs");
           const path = require("path");
-          const { spawn } = require("child_process");
+          const { execFileSync, spawn, spawnSync } = require("child_process");
+
+          const resolver = process.platform === "win32"
+            ? ["where.exe", ["kin"]]
+            : ["sh", ["-c", "command -v kin"]];
+          const resolved = execFileSync(resolver[0], resolver[1], { encoding: "utf8" })
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .find(Boolean);
+          if (!resolved) throw new Error("could not resolve the installed Kin binary");
+          const kinBinary = fs.realpathSync(resolved);
+          const installDir = path.dirname(kinBinary);
+          const normalizePath = (value) => {
+            let normalized;
+            try {
+              normalized = fs.realpathSync(value);
+            } catch {
+              normalized = path.resolve(value);
+            }
+            return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+          };
+          const proofEnv = { ...process.env };
+          delete proofEnv.KIN_DAEMON_BIN;
+          const pathKey = Object.keys(proofEnv).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+          proofEnv[pathKey] = (proofEnv[pathKey] ?? "")
+            .split(path.delimiter)
+            .filter((entry) => entry && normalizePath(entry) !== normalizePath(installDir))
+            .join(path.delimiter);
+          if ((proofEnv[pathKey] ?? "")
+            .split(path.delimiter)
+            .some((entry) => entry && normalizePath(entry) === normalizePath(installDir))) {
+            throw new Error("PATH-free MCP proof still contains the Kin install directory");
+          }
+
+          const stopDaemons = (phase) => {
+            const stopped = spawnSync(
+              kinBinary,
+              ["daemon", "stop", "--all", "--json"],
+              {
+                cwd: process.cwd(),
+                env: proofEnv,
+                encoding: "utf8",
+                timeout: 60_000,
+              },
+            );
+            fs.appendFileSync(
+              "kin-mcp-daemon-stop.txt",
+              `${phase}: status=${stopped.status}\n${stopped.stdout ?? ""}${stopped.stderr ?? ""}\n`,
+            );
+            if (stopped.error || stopped.status !== 0) {
+              throw new Error(
+                `${phase}: failed to stop installed daemons: ${stopped.error ?? stopped.stderr}`,
+              );
+            }
+          };
+
+          // Setup/status already started the installed daemon. Stop it so MCP
+          // startup itself must find the sibling binary without a PATH rescue.
+          stopDaemons("before MCP startup");
 
           const requests = [
             { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
@@ -979,11 +964,13 @@ jobs:
           }
           const child = spawn(entry.command, entry.args, {
             cwd: entry.cwd,
-            env: { ...process.env, ...(entry.env ?? {}) },
+            env: { ...proofEnv, ...(entry.env ?? {}) },
             stdio: ["pipe", "pipe", "pipe"],
           });
           let stdout = "";
           let stderr = "";
+          let lineBuffer = "";
+          let revivalRequested = false;
           let settled = false;
           const finish = (error) => {
             if (settled) return;
@@ -992,6 +979,7 @@ jobs:
             fs.writeFileSync("kin-mcp-out.jsonl", stdout);
             fs.writeFileSync("kin-mcp-err.txt", stderr);
             if (error) {
+              if (!child.killed) child.kill("SIGKILL");
               console.error(error);
               console.error(stderr);
               process.exit(1);
@@ -999,9 +987,49 @@ jobs:
           };
           const timer = setTimeout(() => {
             child.kill("SIGKILL");
-            finish(new Error("installed MCP server did not exit within 60 seconds"));
-          }, 60_000);
-          child.stdout.on("data", (chunk) => { stdout += chunk; });
+            finish(new Error("installed MCP startup/revival proof did not exit within 120 seconds"));
+          }, 120_000);
+          const validateSearch = (message, label) => {
+            if (!message?.result || message.error || message.result.isError === true) {
+              throw new Error(`${label} failed: ${JSON.stringify(message ?? null)}`);
+            }
+            const rendered = JSON.stringify(message.result);
+            if (!rendered.includes("hello") || !rendered.includes("probe.py")) {
+              throw new Error(`${label} did not return the seeded hello entity`);
+            }
+          };
+          child.stdout.on("data", (chunk) => {
+            const text = chunk.toString();
+            stdout += text;
+            lineBuffer += text;
+            const lines = lineBuffer.split(/\r?\n/);
+            lineBuffer = lines.pop() ?? "";
+            try {
+              for (const line of lines) {
+                if (!line.trim().startsWith("{")) continue;
+                const message = JSON.parse(line);
+                if (message.id === 3 && !revivalRequested) {
+                  validateSearch(message, "initial MCP semantic_search");
+                  stopDaemons("between MCP calls");
+                  revivalRequested = true;
+                  child.stdin.write(`${JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 4,
+                    method: "tools/call",
+                    params: {
+                      name: "semantic_search",
+                      arguments: { query: "hello", compact: true, limit: 5 },
+                    },
+                  })}\n`);
+                } else if (message.id === 4) {
+                  validateSearch(message, "revived MCP semantic_search");
+                  child.stdin.end();
+                }
+              }
+            } catch (error) {
+              finish(error);
+            }
+          });
           child.stderr.on("data", (chunk) => { stderr += chunk; });
           child.on("error", finish);
           child.on("close", (code) => {
@@ -1019,19 +1047,15 @@ jobs:
               if (!JSON.stringify(byId.get(2)?.result ?? {}).includes("semantic_search")) {
                 throw new Error("MCP tools/list omitted semantic_search");
               }
-              const call = byId.get(3);
-              if (!call?.result || call.error || call.result.isError === true) {
-                throw new Error(`MCP semantic_search failed: ${JSON.stringify(call ?? null)}`);
-              }
-              if (!JSON.stringify(call.result).includes("hello") || !JSON.stringify(call.result).includes("probe.py")) {
-                throw new Error("MCP semantic_search did not return the seeded hello entity");
-              }
+              validateSearch(byId.get(3), "initial MCP semantic_search");
+              if (!revivalRequested) throw new Error("MCP daemon revival was not exercised");
+              validateSearch(byId.get(4), "revived MCP semantic_search");
               finish();
             } catch (error) {
               finish(error);
             }
           });
-          child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
+          child.stdin.write(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
           NODE
 
       - name: Graph-backed VFS projection proof
@@ -1244,7 +1268,6 @@ jobs:
           kin locate hello --json --explain --max-files 5 | tee kin-semantic-locate.json
 
       - name: Validate installed capability proof
-        if: runner.os != 'Windows'
         shell: bash
         working-directory: kin-install-proof
         run: |
@@ -1254,6 +1277,7 @@ jobs:
           const os = require("os");
           const path = require("path");
           const runnerOs = process.env.RUNNER_OS;
+          const isWindows = runnerOs === "Windows";
           const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
           const installedKin = fs.readFileSync("../installed-kin-command.txt", "utf8").trim();
@@ -1339,9 +1363,11 @@ jobs:
               throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
             }
           };
-          validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
-          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+          if (!isWindows) {
+            validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
+            if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
+              throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+            }
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
@@ -1400,8 +1426,8 @@ jobs:
             ["repo_init", "healthy"],
             ["shell_path", "healthy"],
             ["setup_ledger", "healthy"],
-            ["registry_authority", "healthy"],
-            ["vfs_projection", "healthy"],
+            ["registry_authority", isWindows ? "unsupported" : "healthy"],
+            ["vfs_projection", isWindows ? "unsupported" : "healthy"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
             ["mcp_client_codex", "healthy"],
@@ -1430,7 +1456,7 @@ jobs:
                   check.status === "healthy" ||
                   check.status === "unsupported"
               );
-            if (report.healthy !== true && !onlyPendingEmbeddingsBlocks) {
+            if (report.healthy !== true && (isWindows || !onlyPendingEmbeddingsBlocks)) {
               throw new Error(
                 `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
               );
@@ -1442,8 +1468,13 @@ jobs:
               }
             }
             const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-            if (!["healthy", "stale"].includes(semanticReadiness)) {
-              throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected healthy or stale`);
+            const allowedSemanticReadiness = isWindows
+              ? ["unsupported"]
+              : ["healthy", "stale"];
+            if (!allowedSemanticReadiness.includes(semanticReadiness)) {
+              throw new Error(
+                `${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected ${allowedSemanticReadiness.join(" or ")}`
+              );
             }
             const hardFailures = report.checks.filter((check) =>
               check.status === "missing" || check.status === "misconfigured"
@@ -1495,44 +1526,46 @@ jobs:
           if (legacy.userPolicy !== "preserve" || legacy.mcpServers.kin.env.USER_POLICY !== "preserve") {
             throw new Error("Antigravity legacy repair did not preserve unrelated user policy");
           }
-          const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
-          if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
-            throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
-          }
-          const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
-          if (embeddedStatus.schema !== "kin.status.v3") {
-            throw new Error(`kin-embedded-status.json: unsupported schema ${embeddedStatus.schema ?? "missing"}`);
-          }
-          validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
-          const embeddedCoverage = embeddedStatus.embedding_coverage;
-          if (
-            embeddedCoverage.state !== "observed" ||
-            embeddedCoverage.source !== "live_query_graph" ||
-            embeddedCoverage.total === 0 ||
-            embeddedCoverage.indexed !== embeddedCoverage.total ||
-            embeddedCoverage.pending !== 0
-          ) {
-            throw new Error(`Unix status did not prove complete observed embedding coverage: ${JSON.stringify(embeddedCoverage)}`);
-          }
-          for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
-            const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-            const checks = validateHealthReport(report, reportPath);
-            const readiness = checks.get("semantic_query_readiness")?.status;
-            if (report.healthy !== true || readiness !== "healthy") {
-              throw new Error(
-                `${reportPath}: overall healthy=${report.healthy}; ` +
-                `semantic_query_readiness=${readiness ?? "missing"}; ` +
-                `non-healthy checks: ${nonHealthyChecks(report)}`
-              );
+          if (!isWindows) {
+            const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
+            if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
+              throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
             }
-          }
-          const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));
-          if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
-            throw new Error("semantic kin search did not return the seeded hello entity");
-          }
-          const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
-          if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
-            throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
+            const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
+            if (embeddedStatus.schema !== "kin.status.v3") {
+              throw new Error(`kin-embedded-status.json: unsupported schema ${embeddedStatus.schema ?? "missing"}`);
+            }
+            validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
+            const embeddedCoverage = embeddedStatus.embedding_coverage;
+            if (
+              embeddedCoverage.state !== "observed" ||
+              embeddedCoverage.source !== "live_query_graph" ||
+              embeddedCoverage.total === 0 ||
+              embeddedCoverage.indexed !== embeddedCoverage.total ||
+              embeddedCoverage.pending !== 0
+            ) {
+              throw new Error(`Unix status did not prove complete observed embedding coverage: ${JSON.stringify(embeddedCoverage)}`);
+            }
+            for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
+              const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+              const checks = validateHealthReport(report, reportPath);
+              const readiness = checks.get("semantic_query_readiness")?.status;
+              if (report.healthy !== true || readiness !== "healthy") {
+                throw new Error(
+                  `${reportPath}: overall healthy=${report.healthy}; ` +
+                  `semantic_query_readiness=${readiness ?? "missing"}; ` +
+                  `non-healthy checks: ${nonHealthyChecks(report)}`
+                );
+              }
+            }
+            const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));
+            if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
+              throw new Error("semantic kin search did not return the seeded hello entity");
+            }
+            const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
+            if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
+              throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
+            }
           }
           NODE
 
