@@ -88,7 +88,7 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 use windows_sys::Win32::Storage::FileSystem::{
-    MoveFileExW, ReplaceFileW, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS,
+    MoveFileExW, ReplaceFileW, FILE_ADD_FILE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
     MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
@@ -115,7 +115,7 @@ struct ConfigAuthority {
     /// transaction runs, in the same way the crate's `_process_guard` locals
     /// are held rather than read. The identity it was opened with is captured
     /// once below, because a handle's identity cannot change while it is open.
-    _retained_directory: File,
+    _retained_directory: Option<File>,
     directory_identity: ConfigFileIdentity,
     display_directory: PathBuf,
     display_config: PathBuf,
@@ -150,7 +150,7 @@ pub(super) fn save_config_atomically_scoped_with_hook(
     kind: ConfigAuthorityKind,
     mut hook: impl FnMut(ConfigSaveHookPoint) -> Result<()>,
 ) -> Result<()> {
-    let authority = ConfigAuthority::open(path, kind)?;
+    let mut authority = ConfigAuthority::open(path, kind)?;
     let (handle, temp) = authority.create_temp()?;
     let mut handle = Some(handle);
     let hook: &mut dyn FnMut(ConfigSaveHookPoint) -> Result<()> = &mut hook;
@@ -187,6 +187,8 @@ pub(super) fn save_config_atomically_scoped_with_hook(
             "config temp file",
         )?;
         hook(ConfigSaveHookPoint::BeforePublication)?;
+        authority.release_retained_directory();
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         match authority.expected_config {
             Some(expected) => {
@@ -217,7 +219,7 @@ impl ConfigAuthority {
         let expected_config =
             inspect_config_file(directory_path, config_name, path, "repository config")?;
         let authority = Self {
-            _retained_directory: directory,
+            _retained_directory: Some(directory),
             directory_identity,
             display_directory: directory_path.to_path_buf(),
             display_config: path.to_path_buf(),
@@ -227,6 +229,10 @@ impl ConfigAuthority {
         authority.revalidate_visible_directory()?;
         authority.revalidate_expected_config()?;
         Ok(authority)
+    }
+
+    fn release_retained_directory(&mut self) {
+        self._retained_directory.take();
     }
 
     fn create_temp(&self) -> Result<(File, ConfigTemp)> {
@@ -239,8 +245,8 @@ impl ConfigAuthority {
             let file = match OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .share_mode(0)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&display_path)
             {
                 Ok(file) => file,
@@ -577,7 +583,7 @@ fn open_config_directory_nofollow(path: &Path) -> Result<File> {
     open_config_directory(
         path,
         FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     )
 }
 
@@ -637,9 +643,12 @@ fn inspect_config_file(
     label: &str,
 ) -> Result<Option<ConfigFileIdentity>> {
     let target = directory.join(name);
+    if !target.exists() {
+        return Ok(None);
+    }
     let file = match OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&target)
     {
@@ -681,13 +690,22 @@ fn move_file_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
 }
 
 fn move_file(source: &Path, destination: &Path, flags: u32) -> std::io::Result<()> {
-    let source = wide(source);
-    let destination = wide(destination);
-    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error());
+    let source_wide = wide(source);
+    let destination_wide = wide(destination);
+    let mut attempts = 0;
+    loop {
+        let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
+        if moved != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(5) && attempts < 50 {
+            attempts += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        return Err(error);
     }
-    Ok(())
 }
 
 /// `RENAME_EXCHANGE`'s purpose, by the call Windows provides for it.

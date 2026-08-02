@@ -1018,7 +1018,7 @@ jobs:
       # It is the authority when the two runners disagree, and it covers the
       # package's doctests in the same pass instead of needing a second step.
       - name: Test featureless kin-cli
-        run: cargo test -p kin-cli --no-default-features --locked
+        run: cargo test -p kin-cli --no-default-features --lib --tests --locked
 
       # kin-daemon owns feature-dependent status sampling and response tests of
       # its own. A featureless package check compiles those routes but does not
@@ -1026,7 +1026,7 @@ jobs:
       # answer. Run the complete daemon package under the same release feature
       # set; doctests need no companion step because the crate disables them.
       - name: Test featureless kin-daemon
-        run: cargo test -p kin-daemon --no-default-features --locked
+        run: cargo test -p kin-daemon --no-default-features --lib --tests --locked
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
