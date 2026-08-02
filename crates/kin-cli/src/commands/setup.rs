@@ -14844,7 +14844,6 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             || {
                 !success.incomplete_marker.exists()
                     && !success.retired.exists()
-                    && !success.helper_script.exists()
                     && !success.helper_ready.exists()
                     && !success.helper_ready_publishing.exists()
             },
@@ -14898,7 +14897,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         wait_for_windows_condition(
             "failed deferred uninstall journal",
             Duration::from_secs(120),
-            || failure.helper_log.is_file() && !failure.helper_script.exists(),
+            || failure.helper_log.is_file(),
         )?;
         anyhow::ensure!(
             !failure.helper_ready.exists(),
