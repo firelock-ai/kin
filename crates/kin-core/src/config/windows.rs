@@ -669,7 +669,14 @@ fn inspect_config_file(
 }
 
 fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str()
+    let path_str = path.to_string_lossy();
+    let clean = if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        Path::new(stripped)
+    } else {
+        path
+    };
+    clean
+        .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
