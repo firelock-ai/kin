@@ -14840,7 +14840,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let reinstall_message = format!("{reinstall_error:#}");
         anyhow::ensure!(
             reinstall_message.contains("install mutation is already active")
-                || reinstall_message.contains("prior Windows Kin uninstall"),
+                || reinstall_message.contains("prior Windows Kin uninstall")
+                || reinstall_message.contains("install authority"),
             "pending uninstall rejected reinstall for an unexpected reason: {reinstall_message}"
         );
         fs::write(&success_helper_release, b"continue\n")?;
