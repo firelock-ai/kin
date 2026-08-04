@@ -19,8 +19,8 @@
 
 use anyhow::{Context, Result};
 use kin_cli::commands::purge_ignored::{
-    summary_lines, PurgeIgnoredReport, PurgeIgnoredRequest, PurgeIgnoredResponse,
-    PURGE_IGNORED_SCHEMA, REPORTED_PATH_SAMPLE,
+    summary_lines, PublishedTransition, PurgeIgnoredReport, PurgeIgnoredRequest,
+    PurgeIgnoredResponse, PURGE_IGNORED_SCHEMA, REPORTED_PATH_SAMPLE,
 };
 use kin_db::EntityStore;
 use kin_model::{RepoPath, TransactionDelta, TreeDelta};
@@ -88,6 +88,7 @@ pub(crate) fn execute(
         sample_paths,
         applied: false,
         authority_generation: None,
+        published: None,
     };
 
     if !request.confirm || purge_set.is_empty() {
@@ -146,20 +147,55 @@ pub(crate) fn execute(
         previous.clone(),
         desired_tree,
     );
+
+    // Raise the graph-authority writer guard before touching the live graph.
+    // The handler's coordination gate excludes other writers, but the seqlock
+    // readers (mcp graph status, xref reads) take no gate at all: they sample
+    // the authority epoch, read, and revalidate. Without this guard the epoch
+    // never moves and `active_writers` stays zero, so a reader spanning a purge
+    // of up to 1.28M artifacts revalidates a torn view as stable. Dropping the
+    // guard also invalidates cross-repo spine edges pointing at purged
+    // artifacts, which would otherwise still be served as complete.
+    let graph_mutation = state.begin_graph_authority_mutation();
     let generation = crate::loop_runner::publish_exact_workspace_tree(state, &admitted)?;
     state.graph.apply_transaction_delta(&TransactionDelta {
         entity_deltas: Vec::new(),
         relation_deltas: Vec::new(),
-        tree_deltas: deltas,
+        tree_deltas: deltas.clone(),
         ..TransactionDelta::default()
     })?;
+    drop(graph_mutation);
+    // VFS paging cursors, the /vfs/version endpoint, and the version half of the
+    // xref read check all key on this. Skipping it after the single largest tree
+    // transition the system can make would leave every projection reader
+    // believing nothing changed.
+    state.bump_version();
 
     report.applied = true;
     report.authority_generation = generation;
+    report.published = Some(published_composition(&deltas));
     let lines = summary_lines(&report);
     Ok(PurgeIgnoredResponse {
         lines,
         mutated: true,
         report: Some(report),
     })
+}
+
+/// Count what the published transition actually did.
+///
+/// The purge plans from a complete working-directory walk, exactly as the watch
+/// loop does, so the transition also carries any addition or modification made
+/// since the last tick. Reporting the planned purge set alone would name a
+/// number the transition did not do.
+fn published_composition(deltas: &[TreeDelta]) -> PublishedTransition {
+    let mut published = PublishedTransition::default();
+    for delta in deltas {
+        match delta {
+            TreeDelta::Removed { .. } => published.removed += 1,
+            TreeDelta::Added { .. } => published.added += 1,
+            _ => published.modified += 1,
+        }
+    }
+    published
 }

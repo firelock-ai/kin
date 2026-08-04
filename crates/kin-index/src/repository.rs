@@ -168,11 +168,15 @@ impl CompleteRepositoryScan {
 /// from source already under graph truth. Admitting them costs content-address
 /// storage and retrieval quality while adding no semantic truth.
 ///
-/// Ambiguous names are deliberately absent. `build`, `out`, `bin`, and `vendor`
-/// routinely hold hand-written source or vendored dependency source, so they
-/// stay admitted and a repository that wants them excluded says so in its
-/// `.kinignore`. The rule for adding an entry here is that the name must be
-/// unambiguously derived output across the ecosystems that use it.
+/// Ambiguous names are deliberately absent. `build`, `out`, `bin`, `vendor`,
+/// and `coverage` routinely hold hand-written source or vendored dependency
+/// source, so they stay admitted and a repository that wants them excluded says
+/// so in its `.kinignore`. The rule for adding an entry here is that the name
+/// must be unambiguously derived output across the ecosystems that use it.
+///
+/// A `!` rule re-admits anything here, and re-admission is scoped: it cancels
+/// only the rules matching at or above its own boundary, so `!target` does not
+/// also re-admit `target/node_modules`.
 pub const DEFAULT_IGNORED_NAMES: &[&str] = &[
     // Rust, Maven, and sbt build output. This is the name that dominates
     // derived-byte volume in a polyglot workspace.
@@ -205,6 +209,22 @@ pub const DEFAULT_IGNORED_NAMES: &[&str] = &[
     // Finder metadata.
     ".DS_Store",
 ];
+
+/// Roots already warned about a missing `.kinignore` in this process.
+static WARNED_ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Whether this process should emit the missing-`.kinignore` warning for `root`.
+///
+/// Returns true exactly once per root. A poisoned lock warns rather than
+/// swallowing the condition, because an unheard warning is the failure here.
+fn warn_once_for_root(root: &Path) -> bool {
+    let warned = WARNED_ROOTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    match warned.lock() {
+        Ok(mut warned) => warned.insert(root.to_path_buf()),
+        Err(_) => true,
+    }
+}
 
 /// Literal, repo-scoped admission rules: [`DEFAULT_IGNORED_NAMES`] plus the
 /// contents of `.kinignore`.
@@ -263,12 +283,18 @@ impl RepositoryIgnore {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let rules = Self::default();
-                if let Some(warning) = rules.missing_configuration_warning() {
-                    tracing::warn!(
-                        repository = %root.display(),
-                        defaults = DEFAULT_IGNORED_NAMES.len(),
-                        "{warning}"
-                    );
+                // Latched per root. `load` runs once per watch-loop event batch
+                // against a ~100ms poll, so an unlatched warning would repeat
+                // several hundred characters per second on every repository in
+                // the fleet and bury the warnings that need reading.
+                if warn_once_for_root(root) {
+                    if let Some(warning) = rules.missing_configuration_warning() {
+                        tracing::warn!(
+                            repository = %root.display(),
+                            defaults = DEFAULT_IGNORED_NAMES.len(),
+                            "{warning}"
+                        );
+                    }
                 }
                 return Ok(rules);
             }
@@ -355,34 +381,80 @@ impl RepositoryIgnore {
         ))
     }
 
-    fn matches_rules(names: &BTreeSet<Vec<u8>>, prefixes: &[RepoPath], path: &RepoPath) -> bool {
-        let bytes = path.as_bytes();
-        if bytes
-            .split(|byte| *byte == b'/')
-            .any(|component| names.contains(component))
-        {
-            return true;
+    /// Whether any rule matches at or below byte offset `floor` in `bytes`.
+    ///
+    /// `floor` is the end of a re-admitted ancestor. Passing `0` tests the whole
+    /// path, which is the ordinary unqualified match.
+    fn rules_match_below(
+        names: &BTreeSet<Vec<u8>>,
+        prefixes: &[RepoPath],
+        bytes: &[u8],
+        floor: usize,
+    ) -> bool {
+        let mut start = 0;
+        for component in bytes.split(|byte| *byte == b'/') {
+            if start >= floor && names.contains(component) {
+                return true;
+            }
+            start += component.len() + 1;
         }
         prefixes.iter().any(|prefix| {
-            bytes == prefix.as_bytes()
-                || bytes
-                    .strip_prefix(prefix.as_bytes())
-                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+            let prefix = prefix.as_bytes();
+            prefix.len() > floor
+                && (bytes == prefix
+                    || bytes
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with(b"/")))
         })
     }
 
-    pub fn matches(&self, path: &RepoPath) -> bool {
-        if Self::matches_rules(&self.readmitted_names, &self.readmitted_prefixes, path) {
-            return false;
+    /// End offset of the deepest re-admitted ancestor-or-self of `bytes`.
+    fn readmit_floor(&self, bytes: &[u8]) -> Option<usize> {
+        let mut floor = None;
+        let mut start = 0;
+        for component in bytes.split(|byte| *byte == b'/') {
+            if self.readmitted_names.contains(component) {
+                floor = Some(start + component.len());
+            }
+            start += component.len() + 1;
         }
-        Self::matches_rules(&self.names, &self.prefixes, path)
+        for prefix in &self.readmitted_prefixes {
+            let prefix = prefix.as_bytes();
+            if bytes == prefix
+                || bytes
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+            {
+                floor = Some(floor.map_or(prefix.len(), |floor: usize| floor.max(prefix.len())));
+            }
+        }
+        floor
     }
 
-    /// Whether any re-admission rule names a path strictly beneath `directory`.
+    /// Whether ignore rules exclude `path`.
     ///
-    /// An excluded directory is pruned before its children are read, so a
-    /// re-admitted descendant is only reachable when the walk descends anyway.
+    /// A re-admission cancels only the rules matching at or above its own
+    /// boundary. Rules that match strictly deeper still apply, so `!target`
+    /// restores a `target` tree without dragging `target/node_modules` back in
+    /// with it. Without that scoping the escape hatch would reintroduce exactly
+    /// the unbounded derived output it exists to let an operator recover from.
+    pub fn matches(&self, path: &RepoPath) -> bool {
+        let bytes = path.as_bytes();
+        let floor = self.readmit_floor(bytes).unwrap_or(0);
+        Self::rules_match_below(&self.names, &self.prefixes, bytes, floor)
+    }
+
+    /// Whether the walk must descend into an otherwise-excluded `directory`
+    /// because a re-admission could name something beneath it.
+    ///
+    /// A bare-name rule such as `!keep.rs` names no directory, so its depth
+    /// cannot be known without looking. Descending is the conservative answer:
+    /// it costs directory reads, and the file branch still applies
+    /// `ignored && !tracked`, so a re-admission never admits its siblings.
     fn readmits_below(&self, directory: &RepoPath) -> bool {
+        if !self.readmitted_names.is_empty() {
+            return true;
+        }
         let prefix = directory.as_bytes();
         self.readmitted_prefixes.iter().any(|readmitted| {
             readmitted
@@ -1220,6 +1292,61 @@ mod tests {
         let none = RepositoryIgnore::load(root).unwrap();
         let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
         assert!(scan.entry(&path("target/keep.rs")).is_none());
+    }
+
+    /// A bare-name re-admission has no directory to descend from, so the walker
+    /// must descend anyway or the documented escape hatch is a silent no-op.
+    #[test]
+    fn bare_name_readmission_reaches_inside_a_pruned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/keep.rs"), b"pub fn keep() {}").unwrap();
+        fs::write(root.join("dist/bundle.js"), b"derived").unwrap();
+        fs::write(root.join(".kinignore"), b"!keep.rs\n").unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        assert!(!ignore.matches(&path("dist/keep.rs")));
+        let scan = scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        assert!(
+            scan.entry(&path("dist/keep.rs")).is_some(),
+            "the predicate admitted the path but the walker never reached it"
+        );
+        // Descending must not admit the siblings it walked past.
+        assert!(scan.entry(&path("dist/bundle.js")).is_none());
+
+        // Falsification: without the rule the same fixture keeps the file out.
+        fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
+        let none = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        assert!(scan.entry(&path("dist/keep.rs")).is_none());
+    }
+
+    /// Re-admission must cancel only the rule it overrides. If it blanket-won,
+    /// rescuing one tree would drag every nested default back in, which is the
+    /// volume problem this whole change exists to fix.
+    #[test]
+    fn readmission_does_not_defeat_defaults_nested_below_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".kinignore"), b"!target\n").unwrap();
+        let ignore = RepositoryIgnore::load(root).unwrap();
+
+        assert!(!ignore.matches(&path("target/keep.rs")));
+        assert!(!ignore.matches(&path("target/deep/keep.rs")));
+        assert!(
+            ignore.matches(&path("target/node_modules/pkg/index.js")),
+            "a nested default was defeated by an ancestor re-admission"
+        );
+        assert!(ignore.matches(&path("target/sub/.DS_Store")));
+        assert!(ignore.matches(&path("target/a/dist/bundle.js")));
+
+        // A prefix re-admission scopes the same way.
+        fs::write(root.join(".kinignore"), b"!target/keep\n").unwrap();
+        let prefixed = RepositoryIgnore::load(root).unwrap();
+        assert!(!prefixed.matches(&path("target/keep/src/lib.rs")));
+        assert!(prefixed.matches(&path("target/keep/node_modules/pkg/index.js")));
+        assert!(prefixed.matches(&path("target/other.o")));
     }
 
     /// The trap behind FIR-1854: a default exclude alone retires nothing,

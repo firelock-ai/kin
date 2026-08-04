@@ -277,7 +277,12 @@ fn sorted_map(map: &HashMap<String, usize>) -> Vec<(&String, &usize)> {
 }
 
 /// Collect every admitted repository file. Parser support, hidden names, and
-/// generated/vendor directory names do not affect membership.
+/// vendor directory names do not affect membership.
+///
+/// This deliberately loads the repository's real admission rules rather than
+/// [`crate::RepositoryIgnore::admit_everything`]. Coverage answers "how much of
+/// what Kin tracks is enriched", so counting build output Kin never admits would
+/// inflate the denominator with files that can never gain coverage.
 fn collect_all_files(root: &Path) -> crate::Result<Vec<std::path::PathBuf>> {
     let ignore = crate::RepositoryIgnore::load(root)?;
     let scan = crate::scan_repository(root, &ignore, std::iter::empty())?;
@@ -400,26 +405,39 @@ mod tests {
 
         fs::write(root.join("visible.rs"), "fn f() {}").unwrap();
 
-        // Dot-directories, dependency trees, and generated outputs are exact
-        // repository members even when their content gets only shallow/opaque
-        // semantic enrichment.
+        // A dot-directory and a vendored tree are exact repository members even
+        // when their content gets only shallow/opaque semantic enrichment.
         let hidden = root.join(".hidden");
         fs::create_dir(&hidden).unwrap();
         fs::write(hidden.join("secret.rs"), "fn s() {}").unwrap();
 
-        // node_modules
+        let vendored = root.join("vendor");
+        fs::create_dir(&vendored).unwrap();
+        fs::write(vendored.join("dep.js"), "module.exports = {}").unwrap();
+
+        // Build output is not a member, so coverage never counts it. Including
+        // it would inflate the denominator with files that cannot be enriched.
         let nm = root.join("node_modules");
         fs::create_dir(&nm).unwrap();
         fs::write(nm.join("dep.js"), "module.exports = {}").unwrap();
 
-        // target
         let target = root.join("target");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("built.rs"), "fn b() {}").unwrap();
 
         let report = compute_coverage_report(root).unwrap();
-        assert_eq!(report.total_files, 4);
-        assert_eq!(report.entity_source_count, 4);
+        assert_eq!(report.total_files, 3);
+        assert_eq!(report.entity_source_count, 3);
+
+        // Falsification: the fixture really does carry the two derived files, so
+        // an empty rule set must count all five.
+        let everything = crate::scan_repository(
+            root,
+            &crate::RepositoryIgnore::admit_everything(),
+            [].iter(),
+        )
+        .unwrap();
+        assert_eq!(everything.len(), 5);
     }
 
     #[test]

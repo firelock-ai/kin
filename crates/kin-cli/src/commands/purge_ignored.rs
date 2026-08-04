@@ -41,6 +41,20 @@ pub struct PurgeIgnoredRequest {
     pub actor: AuthorId,
 }
 
+/// What the published transition actually did.
+///
+/// A confirmed purge plans from a complete working-directory walk, the same
+/// shape the watch loop admits, so it can also carry an addition or
+/// modification made since the last tick. Reporting only the planned purge set
+/// would name a number the transition did not do.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedTransition {
+    pub removed: usize,
+    pub added: usize,
+    pub modified: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PurgeIgnoredReport {
@@ -63,6 +77,9 @@ pub struct PurgeIgnoredReport {
     /// Present only when this purge published a transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_generation: Option<u64>,
+    /// What the published transition did. `None` for a dry run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<PublishedTransition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +119,22 @@ pub fn summary_lines(report: &PurgeIgnoredReport) -> Vec<String> {
     }
     if report.purge_count == 0 {
         lines.push("Nothing to purge.".to_string());
+    } else if let Some(published) = report.published {
+        // Report what the transition did, not what was planned. A confirmed
+        // purge admits a complete working-directory observation, so it can
+        // carry an edit made since the last watch-loop tick, and claiming the
+        // planned count would describe a transition that did not happen.
+        lines.push(format!(
+            "Published: {} removed, {} added, {} modified.",
+            published.removed, published.added, published.modified
+        ));
+        if published.removed != report.purge_count {
+            lines.push(format!(
+                "Note: {} paths were reported as covered; the observation also carried \
+                 concurrent working-directory changes.",
+                report.purge_count
+            ));
+        }
     } else if report.applied {
         lines.push(format!("Untracked {} paths.", report.purge_count));
     } else {
@@ -147,6 +180,11 @@ mod tests {
             sample_truncated: purge_count > 1,
             applied,
             authority_generation: applied.then_some(7),
+            published: applied.then_some(PublishedTransition {
+                removed: purge_count,
+                added: 0,
+                modified: 0,
+            }),
         }
     }
 
@@ -164,11 +202,44 @@ mod tests {
     }
 
     #[test]
-    fn applied_summary_reports_the_change_instead_of_a_dry_run() {
+    fn applied_summary_reports_the_published_transition_not_the_planned_set() {
         let lines = summary_lines(&report(40, true, true));
         let text = lines.join("\n");
-        assert!(text.contains("Untracked 40 paths."), "{text}");
+        assert!(
+            text.contains("Published: 40 removed, 0 added, 0 modified."),
+            "{text}"
+        );
         assert!(!text.contains("Dry run"), "{text}");
+    }
+
+    /// A confirmed purge admits a complete observation, so it can carry an edit
+    /// made since the last watch-loop tick. The summary must describe what the
+    /// transition did rather than repeating the planned count.
+    #[test]
+    fn a_transition_wider_than_the_purge_set_is_reported_as_such() {
+        let mut wider = report(40, true, true);
+        wider.published = Some(PublishedTransition {
+            removed: 40,
+            added: 2,
+            modified: 1,
+        });
+        let text = summary_lines(&wider).join("\n");
+        assert!(
+            text.contains("Published: 40 removed, 2 added, 1 modified."),
+            "{text}"
+        );
+        assert!(!text.contains("Untracked 40 paths."), "{text}");
+
+        // A removal count that disagrees with the reported set is called out.
+        let mut fewer = report(40, true, true);
+        fewer.published = Some(PublishedTransition {
+            removed: 38,
+            added: 0,
+            modified: 0,
+        });
+        let text = summary_lines(&fewer).join("\n");
+        assert!(text.contains("Published: 38 removed"), "{text}");
+        assert!(text.contains("40 paths were reported as covered"), "{text}");
     }
 
     #[test]
