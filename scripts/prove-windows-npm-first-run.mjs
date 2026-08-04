@@ -35,6 +35,7 @@ import {
   resolveCachedBinaryPath,
   resolveDaemonBinaryPath,
 } from '../packages/kin-mcp/src/index.js';
+import { emptyGlobalGitConfig } from '../packages/kin-mcp/test/smoke-first-run.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.dirname(path.dirname(scriptPath));
@@ -172,7 +173,7 @@ function hermeticEnv({ root, managedBinDir }) {
   setEnv(env, 'APPDATA', appData);
   setEnv(env, 'XDG_CONFIG_HOME', xdgConfig);
   setEnv(env, 'XDG_CACHE_HOME', xdgCache);
-  setEnv(env, 'GIT_CONFIG_GLOBAL', process.platform === 'win32' ? 'NUL' : os.devNull);
+  setEnv(env, 'GIT_CONFIG_GLOBAL', emptyGlobalGitConfig());
   setEnv(env, 'GIT_CONFIG_NOSYSTEM', '1');
   setEnv(env, 'GIT_ATTR_NOSYSTEM', '1');
   setEnv(env, 'GIT_TERMINAL_PROMPT', '0');

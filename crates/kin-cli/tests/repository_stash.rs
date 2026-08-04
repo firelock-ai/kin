@@ -26,16 +26,11 @@ use common::Command;
 /// authority. Sealing is defined over graph-owned changes, so the workspace has
 /// to be dirty in authority before a seal has anything to do.
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(windows)]
-const NULL_GIT_CONFIG: &str = "NUL";
-#[cfg(not(windows))]
-const NULL_GIT_CONFIG: &str = "/dev/null";
-
 fn require_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .current_dir(path)
         .output()
         .expect("run git");
@@ -56,7 +51,7 @@ fn run_kin(
         .kin_command()
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .current_dir(repo)
         .output()

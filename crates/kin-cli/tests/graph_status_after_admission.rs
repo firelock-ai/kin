@@ -27,11 +27,6 @@ mod common;
 
 use common::Command;
 
-#[cfg(windows)]
-const NULL_GIT_CONFIG: &str = "NUL";
-#[cfg(not(windows))]
-const NULL_GIT_CONFIG: &str = "/dev/null";
-
 struct IsolatedDaemon {
     child: Option<common::RuntimeOwnedChild>,
 }
@@ -105,7 +100,7 @@ fn run_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .current_dir(path)
         .output()
         .expect("run git");

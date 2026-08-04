@@ -16,7 +16,7 @@
 // binaries and spawns a real daemon, so it runs on demand / in release CI.
 
 import cp from 'node:child_process';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, mkdtempSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -93,6 +93,36 @@ export function absoluteHostPath({
     .join(delimiter);
 }
 
+let windowsEmptyGlobalGitConfig = null;
+
+/**
+ * Path to bind to `GIT_CONFIG_GLOBAL` so Git resolves the global configuration
+ * scope to no configuration at all.
+ *
+ * Off Windows this is `os.devNull` — `/dev/null`, which Git opens and reads as
+ * an empty file. On Windows `os.devNull` is the reserved `NUL` device rather
+ * than a file, and Git refuses it with
+ * `fatal: unable to access 'NUL': Invalid argument`, failing every Git command
+ * the boundary was meant to isolate. Git accepts any readable file, so Windows
+ * gets one real empty file instead, created once per process and reused after
+ * that so it outlives any single child.
+ *
+ * `platform` is a parameter rather than a read of `process.platform` so tests
+ * can exercise the Windows branch — and therefore really create and check the
+ * file — on any host.
+ */
+export function emptyGlobalGitConfig(platform = process.platform) {
+  if (platform !== 'win32') {
+    return os.devNull;
+  }
+  if (windowsEmptyGlobalGitConfig === null) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'kin-empty-global-gitconfig-'));
+    windowsEmptyGlobalGitConfig = path.join(directory, 'gitconfig');
+    writeFileSync(windowsEmptyGlobalGitConfig, '');
+  }
+  return windowsEmptyGlobalGitConfig;
+}
+
 export function hermeticSmokeEnv({
   sourceEnv = process.env,
   hostPath,
@@ -108,7 +138,7 @@ export function hermeticSmokeEnv({
   }
 
   Object.assign(env, {
-    GIT_CONFIG_GLOBAL: platform === 'win32' ? 'NUL' : os.devNull,
+    GIT_CONFIG_GLOBAL: emptyGlobalGitConfig(platform),
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_ATTR_NOSYSTEM: '1',
     GIT_TERMINAL_PROMPT: '0',

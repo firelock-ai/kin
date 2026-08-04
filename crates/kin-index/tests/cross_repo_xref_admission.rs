@@ -307,10 +307,7 @@ where
         .args(args)
         .current_dir(repo)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .env("HOME", repo)
         .output()
         .unwrap()

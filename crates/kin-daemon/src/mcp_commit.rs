@@ -1520,10 +1520,7 @@ mod tests {
         let output = kin_git::test_support::fixture_git_in(repo)
             .args(args)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
             .output()
             .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
         assert!(
