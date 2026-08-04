@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-04
+
+### Changed
+
+- Bind the deferred-uninstall wait to the child and wait for its helper to complete (#604)
+- Free the release mint from advisory flakes and stop blind release retries (#605)
+- Read the host-binding fixtures as scripts rather than exec targets (#606)
+- Serve entity source projections from held repository authority (#608)
+- Settle status embedding coverage over a transient unobservable window (#609)
+- Declare the Windows install-proof leg experimental and pin that posture (#612)
+
 ## [0.4.9] - 2026-08-04
 
 ### Changed
