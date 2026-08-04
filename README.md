@@ -2,6 +2,8 @@
   <img src="docs/assets/kin-banner.png" alt="Kin - Semantic Repository Substrate" width="100%" />
 </p>
 
+<div align="center">
+
 <h3>Software that remembers itself.</h3>
 
 <p><em>Exact context, not more.</em></p>
