@@ -176,8 +176,20 @@ pub struct RegisteredRepoDaemon {
 /// /daemons`. The caller supplies a supervisor URL it already resolved (e.g. via
 /// [`ensure_supervisor_running`] or [`supervisor_recorded_endpoint`]); this does
 /// not itself start a supervisor.
+/// Bound on the supervisor topology fetch.
+///
+/// `kin daemon stop --all` awaits this before it stops anything, so an
+/// unbounded fetch is an unbounded stop: a supervisor that accepts the
+/// connection and never answers holds the whole command open with no identity
+/// yet signalled and no verdict to print. The supervisor only reads its own
+/// in-memory registry, so a healthy one answers immediately and this ceiling is
+/// never approached.
+const SUPERVISOR_TOPOLOGY_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn fetch_registered_daemons(supervisor_url: &str) -> Result<Vec<RegisteredRepoDaemon>> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(SUPERVISOR_TOPOLOGY_TIMEOUT)
+        .build()?;
     let mut request = client.get(format!("{}/daemons", supervisor_url.trim_end_matches('/')));
     if let Some(token) = supervisor_auth_token() {
         request = request.bearer_auth(token);

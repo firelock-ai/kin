@@ -577,16 +577,6 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Record a shutdown request from a caller that is not a signal handler.
-///
-/// The cooperative `/shutdown` endpoint is the caller that matters: accepting a
-/// request commits this process to exiting, so the force-exit backstop has to
-/// start counting down at the moment of acceptance rather than at the moment
-/// some later task manages to get scheduled.
-pub fn note_shutdown_requested() {
-    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Arm the runtime-independent shutdown flag from signal delivery itself.
 ///
 /// Registered through `signal_hook_registry`, which chains handlers, so tokio's
@@ -594,25 +584,47 @@ pub fn note_shutdown_requested() {
 /// This handler exists only so the force-exit backstop is armed by the kernel
 /// delivering the signal rather than by the runtime's willingness to poll a
 /// future.
+///
+/// A real signal is deliberately the ONLY writer of [`SHUTDOWN_REQUESTED`]. The
+/// flag is process-global and never cleared, and the watchdog it arms ends the
+/// process with `exit(0)`, so a non-signal writer would let one caller latch the
+/// flag and a later, unrelated watchdog inherit it. In a test binary that
+/// truncates the run and still reports success. Keeping signal delivery as the
+/// sole writer makes the latch mean what it says.
+///
+/// Registration also replaces SIGTERM's default disposition, because
+/// signal-hook-registry skips a `SIG_DFL` previous handler rather than chaining
+/// to it. From this call until tokio registers its own listener, a SIGTERM sets
+/// only this flag and death comes from the watchdog at grace rather than
+/// instantly. Every step between the two is a `tokio::spawn` with no top-level
+/// await, so the window is sub-millisecond and stays inside the documented
+/// bound, but it is a real window and the watchdog must be spawned right after
+/// this call rather than later.
 #[cfg(unix)]
 pub fn install_shutdown_signal_handler() {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: the handler body performs a single relaxed atomic store and
-        // calls nothing that is not async-signal-safe.
-        let registered = unsafe {
-            signal_hook_registry::register(signal, || {
-                SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            })
-        };
-        if let Err(error) = registered {
-            warn!(
-                signal,
-                error = %error,
-                "failed to arm the runtime-independent shutdown flag; \
-                 force-exit escalation falls back to in-runtime arming"
-            );
+    // `SigId` has no `Drop`, so every call appends another action to the signal
+    // slot permanently. Production installs once; the guard keeps the `pub` API
+    // from leaking that footgun to any other caller.
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            // SAFETY: the handler body performs a single relaxed atomic store
+            // and calls nothing that is not async-signal-safe.
+            let registered = unsafe {
+                signal_hook_registry::register(signal, || {
+                    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                })
+            };
+            if let Err(error) = registered {
+                warn!(
+                    signal,
+                    error = %error,
+                    "failed to arm the runtime-independent shutdown flag; \
+                     force-exit escalation falls back to in-runtime arming"
+                );
+            }
         }
-    }
+    });
 }
 
 #[cfg(not(unix))]
@@ -2506,9 +2518,8 @@ async fn select_with_signals(
 mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
-        note_shutdown_requested, parse_duration_secs, parse_owner_watch_pid,
-        should_enable_lsp_enrichment, should_flush_now, shutdown_requested, shutdown_signalled,
-        watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
+        parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
+        shutdown_signalled, watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
         DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3046,21 +3057,6 @@ mod tests {
             !is_shutdown.load(Ordering::Relaxed),
             "is_shutdown was never set — the backstop must not depend on it"
         );
-    }
-
-    #[test]
-    fn cooperative_shutdown_acceptance_arms_the_backstop() {
-        // macOS stop has no signal behind it: the CLI POSTs /shutdown and the
-        // endpoint accepting the request is the whole commitment to exit. That
-        // acceptance has to arm the same runtime-independent flag, or a daemon
-        // whose runtime wedges right after accepting absorbs the stop request
-        // and keeps running.
-        // Deliberately no "not yet armed" precondition: the flag is
-        // process-global and terminal by design, so asserting its initial value
-        // would make this test depend on which other test ran first.
-        note_shutdown_requested();
-        assert!(shutdown_requested());
-        assert!(shutdown_signalled(false, false, shutdown_requested()));
     }
 
     #[test]

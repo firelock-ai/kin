@@ -912,16 +912,13 @@ async fn request_daemon_shutdown(
         )
             .into_response();
     };
+    // `shutdown` is a clone of the daemon's cancel channel, which is the exact
+    // watch value the escalation watchdog polls, so accepting a cooperative
+    // request already starts the force-exit countdown. Nothing further is
+    // needed here, and nothing here is runtime-independent: reaching this line
+    // at all requires a schedulable runtime.
     match shutdown.send(true) {
-        Ok(()) => {
-            // Accepting the request commits this process to exiting, so the
-            // force-exit backstop starts counting down here. On macOS this is
-            // the whole stop path — there is no signal behind it — and leaving
-            // the countdown to a task the runtime may never schedule is what
-            // let a saturated daemon absorb a stop request and keep running.
-            crate::daemon::note_shutdown_requested();
-            (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response()
-        }
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("shutdown channel closed: {error}")})),
