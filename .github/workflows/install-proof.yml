@@ -680,6 +680,10 @@ jobs:
           NODE
 
       - name: Provide a tomllib-capable Python for the Codex TOML proof
+        # Unix runners already carry a tomllib-capable system python3, proven
+        # by prior green runs of this step there, so scope the pinned
+        # interpreter to the one platform where python3 has never executed.
+        if: runner.os == 'Windows'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
@@ -979,8 +983,12 @@ jobs:
           if (!entry || typeof entry.command !== "string" || !Array.isArray(entry.args) || typeof entry.cwd !== "string") {
             throw new Error(`${configPath}: captured MCP launch entry is missing`);
           }
+          // kin records the canonicalized repository root, which on Windows
+          // carries the `\\?\` verbatim prefix that CreateProcessW rejects as
+          // a working directory, so strip it before handing the path to spawn.
+          const stripVerbatim = (p) => (typeof p === "string" && p.startsWith("\\\\?\\") ? p.slice(4) : p);
           const child = spawn(entry.command, entry.args, {
-            cwd: entry.cwd,
+            cwd: stripVerbatim(entry.cwd),
             env: { ...proofEnv, ...(entry.env ?? {}) },
             stdio: ["pipe", "pipe", "pipe"],
           });
@@ -1525,14 +1533,20 @@ jobs:
             { path: path.join(home, ".gemini", "antigravity-ide", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
             { path: path.join(repoRoot, ".agents", "mcp_config.json"), args: repositoryArgs, cwd: repoRoot },
           ];
+          // kin records canonicalized repository paths, which on Windows carry
+          // the `\\?\` verbatim prefix; the expectations above are built from
+          // Node's non-verbatim realpath, so compare repository arguments and
+          // cwds in stripped form.
+          const stripVerbatim = (p) => (typeof p === "string" && p.startsWith("\\\\?\\") ? p.slice(4) : p);
           for (const expected of mcpConfigs) {
             const entry = JSON.parse(fs.readFileSync(expected.path, "utf8"))?.mcpServers?.kin;
+            const entryArgs = Array.isArray(entry?.args) ? entry.args.map(stripVerbatim) : entry?.args;
             if (
               !entry ||
               entry.command !== installedKin ||
-              JSON.stringify(entry.args) !== JSON.stringify(expected.args) ||
+              JSON.stringify(entryArgs) !== JSON.stringify(expected.args) ||
               entry.env?.KIN_MCP_TOOL_PROFILE !== "agent-default" ||
-              (expected.cwd !== undefined && entry.cwd !== expected.cwd)
+              (expected.cwd !== undefined && stripVerbatim(entry.cwd) !== expected.cwd)
             ) {
               throw new Error(`${expected.path}: Kin MCP entry is missing or malformed`);
             }
