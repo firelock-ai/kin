@@ -2479,7 +2479,8 @@ def assert_install_proof_status_contract(
         "kin doctor --json | tee kin-doctor.json",
         'path.join(process.cwd(), ".agents", "mcp_config.json")',
         "spawn(entry.command, entry.args",
-        "cwd: entry.cwd",
+        'const stripVerbatim = (p) => (typeof p === "string" && p.startsWith("\\\\\\\\?\\\\") ? p.slice(4) : p);',
+        "cwd: stripVerbatim(entry.cwd),",
         "env: { ...proofEnv, ...(entry.env ?? {}) }",
     ):
         require(graph_active, policy, "installed daemon startup and health capture")
