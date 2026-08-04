@@ -79,6 +79,12 @@ enum Command {
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Seconds to keep re-reading while embedding coverage is only
+        /// momentarily unobservable, such as an embedding pass or a graph
+        /// mutation batch spanning the sample. Never waits on a coverage that
+        /// was observed, nor on an absence a re-read cannot clear. 0 reads once
+        #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+        wait_quiesce: u64,
     },
     /// Create an exact semantic and artifact commit
     Commit {
@@ -2180,7 +2186,9 @@ fn main() -> Result<()> {
             match cli.command {
                 Command::Capabilities { json } => commands::capabilities::run(json),
                 Command::Init { path, json } => commands::init::run(path, json).await,
-                Command::Status { json } => commands::status::run(json).await,
+                Command::Status { json, wait_quiesce } => {
+                    commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
+                }
                 Command::Resources { action } => match action {
                     ResourcesAction::Inspect { json, profile } => {
                         commands::resources::run(json, profile).await
