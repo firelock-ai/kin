@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -879,11 +879,21 @@ fn sync_directory_tree(root: &Path) -> Result<()> {
         }
         index += 1;
     }
+    #[cfg(unix)]
     for directory in directories.into_iter().rev() {
-        File::open(&directory)
+        std::fs::File::open(&directory)
             .and_then(|file| file.sync_all())
             .map_err(|error| io(&directory, error))?;
     }
+    // Windows refuses `File::open` on a directory outright, so reaching the
+    // flush above there turns a healthy staged tree into an access denial
+    // rather than making it more durable. The file payloads are still flushed
+    // individually before the staged tree is moved into place; only the
+    // stronger parent-directory power-loss guarantee is Unix-specific. This is
+    // the same boundary `kin-daemon`'s `sync_directory_metadata` and
+    // `kin-core`'s `sync_parent_directory` already draw.
+    #[cfg(not(unix))]
+    let _ = directories;
     Ok(())
 }
 

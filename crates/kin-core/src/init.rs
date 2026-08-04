@@ -341,6 +341,13 @@ impl SealedContentSource for PreparedRepositoryInit {
 impl Drop for PreparedRepositoryInit {
     fn drop(&mut self) {
         if self.cleanup_armed {
+            // Released before the stage is removed, not alongside it. Fields
+            // drop only after this body returns, so leaving the authority in
+            // place here would mean removing a directory its backend still
+            // holds open. Unix allows that and Windows does not, which would
+            // leave the stage behind on the platform where a failed init most
+            // needs to clean up after itself.
+            drop(self.authority.take());
             if let Some(lease) = self.stage_lease.take() {
                 cleanup_staging_layout(lease, &self.layout, &self.manifest);
             }
@@ -732,6 +739,22 @@ fn stage_owner_name(stage_id: uuid::Uuid) -> String {
 const OWN_STAGE_OWNER_LOCK_ATTEMPTS: u32 = 100;
 const OWN_STAGE_OWNER_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// Whether a lock attempt was refused because someone else holds the lock.
+///
+/// The two platforms do not report contention as the same `ErrorKind`. Unix
+/// `flock` fails with `EWOULDBLOCK`, which std maps to `WouldBlock`, while
+/// Windows `LockFileEx` fails with `ERROR_LOCK_VIOLATION`, which std leaves
+/// uncategorized because only the socket-level `WSAEWOULDBLOCK` maps to
+/// `WouldBlock` there. Testing the kind alone therefore recognizes contention
+/// on Unix and nothing on Windows, which silently turns the bounded retry in
+/// `lock_own_stage_owner` into a single attempt. Comparing against the lock
+/// crate's own contention error is what keeps this true on both.
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
 /// Take the exclusive lock on an owner file this call just created with
 /// `create_new`, tolerating a concurrent recovery scan.
 ///
@@ -748,7 +771,7 @@ fn lock_own_stage_owner(owner_file: &File) -> std::io::Result<()> {
         Err(error) => error,
     };
     for _ in 1..OWN_STAGE_OWNER_LOCK_ATTEMPTS {
-        if last.kind() != std::io::ErrorKind::WouldBlock {
+        if !is_lock_contention(&last) {
             return Err(last);
         }
         std::thread::sleep(OWN_STAGE_OWNER_LOCK_RETRY);
@@ -1043,8 +1066,12 @@ fn publish_repository_layout_impl(
         ));
     }
 
-    sync_layout_recursively(prepared.layout.root())?;
+    // Closed before the flush rather than after it. The staged authority
+    // retains directory handles inside the stage, and flushing a file needs a
+    // writable handle on Windows, so the backend is released first and the
+    // flush below runs against a stage this call is the only holder of.
     drop(prepared.authority.take());
+    sync_layout_recursively(prepared.layout.root())?;
     verify_repository_layout(
         &prepared.layout,
         &prepared.metadata_seal,
@@ -1498,11 +1525,41 @@ fn validate_bootstrap_transaction(
     Ok(())
 }
 
+/// Read one staged metadata file, saying which read this was.
+///
+/// The config writer reports its own refusals against the same path this reads,
+/// so an unlabelled failure here is indistinguishable from a failure to publish
+/// and sends the reader to the wrong component. Sealing happens after
+/// publication, so naming the step is the difference between "the writer could
+/// not publish" and "the writer published something this cannot read".
+fn read_to_seal(path: &Path, label: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        KinError::Other(format!(
+            "read published {label} at {} to seal staged repository metadata: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Read one staged metadata file again, to check it against its seal.
+///
+/// Sealing and verifying read the same name at different points in the
+/// transaction, so they need to be told apart for the same reason the seal
+/// needs to be told apart from the writer. A verification that cannot be read
+/// means something took the file away after preparation, which is a different
+/// failure from never having been able to read it.
+fn read_to_verify_seal(path: &Path, label: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        KinError::Other(format!(
+            "reread {label} at {} to check it against its seal: {error}",
+            path.display()
+        ))
+    })
+}
+
 fn capture_metadata_seal(layout: &KinLayout) -> Result<RepositoryMetadataSeal> {
-    let config_bytes = std::fs::read(layout.config_path())
-        .map_err(|error| KinError::io(layout.config_path(), error))?;
-    let manifest_bytes = std::fs::read(layout.manifest_path())
-        .map_err(|error| KinError::io(layout.manifest_path(), error))?;
+    let config_bytes = read_to_seal(&layout.config_path(), "repository config")?;
+    let manifest_bytes = read_to_seal(&layout.manifest_path(), "repository manifest")?;
     Ok(RepositoryMetadataSeal {
         config_hash: Hash256::from_bytes(Sha256::digest(&config_bytes).into()),
         manifest_hash: Hash256::from_bytes(Sha256::digest(&manifest_bytes).into()),
@@ -1532,7 +1589,7 @@ fn verify_sealed_metadata_file(
     expected_bytes: &[u8],
     expected_hash: Hash256,
 ) -> Result<()> {
-    let observed = std::fs::read(path).map_err(|error| KinError::io(path, error))?;
+    let observed = read_to_verify_seal(path, label)?;
     let observed_hash = Hash256::from_bytes(Sha256::digest(&observed).into());
     if observed_hash != expected_hash || observed != expected_bytes {
         return Err(KinError::Other(format!(
@@ -1644,6 +1701,31 @@ fn validate_publish_destination(layout: &KinLayout, final_kin_dir: &Path) -> Res
     Ok(())
 }
 
+/// Open one staged file for the flush below.
+///
+/// Unix `fsync` accepts a read-only descriptor, so opening read-only is both
+/// sufficient and the weaker request. Windows has no equivalent: `sync_all` is
+/// `FlushFileBuffers`, which Microsoft documents as requiring `GENERIC_WRITE`
+/// on the handle, and which refuses a read-only one with
+/// `ERROR_ACCESS_DENIED`. Publication has to ask for write access there.
+///
+/// The difference is named here because of how it presents when it is missed.
+/// `sync_layout_recursively` walks each directory's children in sorted order,
+/// and a staged layout's first three entries are the empty directories
+/// `adapters`, `backups`, and `bench`, so `config.toml` is the first regular
+/// file the walk reaches. A read-only flush therefore reports an access denial
+/// against the staged repository config, which reads as the config writer
+/// refusing to publish rather than as publication failing to flush.
+#[cfg(not(windows))]
+fn open_to_flush(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn open_to_flush(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
 fn sync_layout_recursively(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| KinError::io(path, error))?;
     let file_type = metadata.file_type();
@@ -1654,7 +1736,7 @@ fn sync_layout_recursively(path: &Path) -> Result<()> {
         )));
     }
     if file_type.is_file() {
-        let file = std::fs::File::open(path).map_err(|error| KinError::io(path, error))?;
+        let file = open_to_flush(path).map_err(|error| KinError::io(path, error))?;
         return file.sync_all().map_err(|error| KinError::io(path, error));
     }
     if !file_type.is_dir() {
@@ -2222,9 +2304,8 @@ mod tests {
             .open(&owner_path)
             .unwrap();
         scanner.try_lock_exclusive().unwrap();
-        assert_eq!(
-            owner_file.try_lock_exclusive().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock,
+        assert!(
+            is_lock_contention(&owner_file.try_lock_exclusive().unwrap_err()),
             "the scan must really be holding the lock"
         );
 
@@ -2255,10 +2336,9 @@ mod tests {
             .unwrap();
         holder.try_lock_exclusive().unwrap();
 
-        assert_eq!(
-            lock_own_stage_owner(&owner_file).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert!(is_lock_contention(
+            &lock_own_stage_owner(&owner_file).unwrap_err()
+        ));
     }
 
     fn prepare_unborn(
@@ -2286,6 +2366,163 @@ mod tests {
         .unwrap();
         assert!(prepared.bootstrap.is_none());
         (prepared, transaction)
+    }
+
+    /// A canonical stage, built the way admission builds one.
+    ///
+    /// Admission canonicalizes before it stages, and the config writer only
+    /// owns a `.kin.init-<uuid-v4>` directory, so both are required here for
+    /// the save below to be the same call admission makes.
+    fn canonical_stage(parent: &tempfile::TempDir) -> PathBuf {
+        let root = parent.path().canonicalize().expect("canonicalize parent");
+        let stage = root.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        create_private_staging_root(&stage).expect("create stage");
+        stage
+    }
+
+    fn publish_staged_config(stage: &Path) {
+        KinConfig::default()
+            .save_initialization_stage(stage)
+            .expect("publish staged repository config");
+        let published =
+            std::fs::read(stage.join("config.toml")).expect("read back the published config");
+        assert!(
+            !published.is_empty(),
+            "a published config must hold the bytes it was given"
+        );
+    }
+
+    /// Building the stage must not break publishing into it.
+    ///
+    /// `kin init` assembles a stage in steps and then saves the repository
+    /// config into it. The config writer's own cases already prove it publishes
+    /// into a bare stage, so when admission refuses at that save, the cause has
+    /// to be something the stage gained on the way rather than the writer. Each
+    /// case below adds one construction step and then publishes through the
+    /// same entry admission uses, so the first one to refuse names the step
+    /// that caused it instead of leaving a whole transaction under suspicion.
+    #[test]
+    fn a_bare_stage_publishes_its_config() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        publish_staged_config(&stage);
+    }
+
+    #[test]
+    fn a_stage_holding_its_authority_backend_publishes_its_config() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        let layout = KinLayout::new(stage.clone());
+        // Held across the save, exactly as admission holds it.
+        let _backend = create_staged_repository_authority_backend(&layout.kindb_dir())
+            .expect("create staged authority backend");
+        publish_staged_config(&stage);
+    }
+
+    #[test]
+    fn a_stage_with_its_projection_control_directory_publishes_its_config() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        crate::tree::initialize_projection_control_directory(&stage)
+            .expect("initialize projection control directory");
+        publish_staged_config(&stage);
+    }
+
+    /// The platform fact `open_to_flush` exists for.
+    ///
+    /// Windows refuses `FlushFileBuffers` on a handle without write access,
+    /// while the identical Unix `fsync` on a read-only descriptor is legal.
+    /// That asymmetry is the whole reason publication opens staged files for
+    /// write, so it is asserted rather than left as a claim in a comment: if
+    /// Windows ever stops refusing, this fails and the extra access being
+    /// requested can be given back. Pairing the refusal with the same flush
+    /// succeeding through `open_to_flush` is what keeps a refusal arriving for
+    /// some unrelated reason from passing as this one.
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_handle_cannot_flush_on_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged.toml");
+        std::fs::write(&path, b"mode = \"native\"\n").unwrap();
+
+        let refused = File::open(&path)
+            .expect("a read-only handle opens")
+            .sync_all()
+            .expect_err("a read-only handle must not be able to flush on Windows");
+        let access_denied = i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED)
+            .expect("a documented WIN32_ERROR fits an i32");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(access_denied),
+            "the refusal must be the documented access denial, not something else: {refused}"
+        );
+
+        open_to_flush(&path)
+            .expect("a writable handle opens")
+            .sync_all()
+            .expect("the same file must flush through a writable handle");
+    }
+
+    /// Publication flushes a staged layout, so every file in one must flush.
+    ///
+    /// This is the call `kin init` refused at on native Windows. The walk sorts
+    /// each directory's children, and a staged layout opens with the empty
+    /// directories `adapters`, `backups`, and `bench`, so `config.toml` is the
+    /// first regular file it reaches and was the name every access denial
+    /// carried. Building the layout the way preparation builds it is what makes
+    /// this case reach the same file in the same order.
+    #[test]
+    fn a_staged_layout_flushes_every_file_it_holds() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        let layout = KinLayout::new(stage.clone());
+        for directory in layout.all_dirs() {
+            std::fs::create_dir_all(&directory).expect("create a staged layout directory");
+        }
+        std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
+            .expect("write the staged layout version");
+        KinConfig::default()
+            .save_initialization_stage(&stage)
+            .expect("publish the staged repository config");
+
+        sync_layout_recursively(&stage).expect("a staged layout must flush before publication");
+    }
+
+    /// Orphan recovery stays disabled where it cannot prove what it reaps.
+    ///
+    /// The reaping cases are gated to Unix because this returns zero without
+    /// scanning anywhere else. Asserting that here is what keeps the gate a
+    /// stated platform boundary rather than a silent hole: if recovery is ever
+    /// implemented off Unix, this fails and sends the reader to the cases that
+    /// should then be ungated.
+    #[cfg(not(unix))]
+    #[test]
+    fn orphan_recovery_is_disabled_off_unix() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let repository = parent.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let final_kin = repository.canonicalize().unwrap().join(".kin");
+        let staging_root = parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        let mut prepared = prepare_repository_layout_at(
+            &staging_root,
+            &final_kin,
+            KinConfig::default(),
+            KinManifest::new(),
+        )
+        .unwrap();
+        prepared.cleanup_armed = false;
+        drop(prepared);
+
+        assert_eq!(
+            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            0,
+            "recovery must reap nothing where it cannot prove ownership"
+        );
+        assert!(
+            staging_root.is_dir(),
+            "an unreaped stage must be left exactly where it was"
+        );
     }
 
     #[test]
@@ -2623,6 +2860,15 @@ mod tests {
         assert!(!owner_path.exists());
     }
 
+    /// Reaping is Unix-only, so the case that asserts a reap is too.
+    ///
+    /// `recover_orphaned_repository_stages` returns zero without scanning
+    /// anything off Unix, by the design stated on it: recovery stays disabled
+    /// where the platform cannot expose a stable file identity and
+    /// current-user ownership. `orphan_recovery_is_disabled_off_unix` below is
+    /// what holds that boundary honest, so this stays where the behaviour it
+    /// names actually exists rather than being weakened to pass everywhere.
+    #[cfg(unix)]
     #[test]
     fn orphan_recovery_reaps_only_an_unlocked_exactly_owned_stage() {
         let directory = tempfile::tempdir().unwrap();
@@ -2714,6 +2960,8 @@ mod tests {
         assert!(hard_link.is_file());
     }
 
+    /// Also asserts a reap, so it is bound to the platform that reaps.
+    #[cfg(unix)]
     #[test]
     fn orphan_recovery_is_bound_to_the_exact_destination() {
         let directory = tempfile::tempdir().unwrap();
@@ -3178,7 +3426,16 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
+    /// The replacement this detects cannot be staged on Windows at all.
+    ///
+    /// The case works by renaming the authority root out from under a live
+    /// backend. On Windows that rename is refused with a sharing violation,
+    /// because the backend retains directory handles that withhold DELETE
+    /// sharing, so the scenario cannot be constructed and the test fails in
+    /// its own setup rather than in the behaviour it checks. Windows excludes
+    /// the replacement where Unix detects it, which is the stronger of the two
+    /// and is why this is gated rather than weakened.
+    #[cfg(unix)]
     #[test]
     fn staged_authority_backend_rejects_a_replaced_root() {
         let directory = tempfile::tempdir().unwrap();

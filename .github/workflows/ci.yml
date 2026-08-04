@@ -316,6 +316,19 @@ jobs:
             "commands::setup::tests::full_uninstall" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
+          # Admission itself, in process. `kin init` is the transaction the
+          # contract script drives end to end, but that script runs two steps
+          # later and reports one line naming a path that two different
+          # components can report. These cases stage, publish, seal, and
+          # promote a repository through the same code the binary does, so a
+          # refusal names a test and a line instead of a path. Until this
+          # existed, `init.rs` had no native Windows coverage at all, which is
+          # why a refusal in it could only be seen by a thirty-minute job that
+          # then could not say which call refused.
+          run_required_filter "kin-core repository initialization" \
+            "init::tests" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-core --lib
           run_required_exact "native full managed uninstall lifecycle" \
             "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup" \
             --locked --target x86_64-pc-windows-msvc \
