@@ -35,6 +35,13 @@
       "reason": "The install proof frozen at this tag fails on every leg for two pre-existing defects the tag cannot receive fixes for. On the Unix legs, a daemon spawned by the long-lived MCP server is never reaped, and the liveness probe accepts the zombie as alive because kill with signal zero succeeds against a corpse, so a stop that was delivered and honoured is reported as a timeout at the proof's mid-MCP stop step. On the Windows leg, setup resolves the home through a lookup that requires the full profile and AppData tree to exist, so the proof's bare runner-temp home collapses to none before setup can run. Both the proof workflow and the binary resolve from the tag, the repairs landed on main only after it, and automatic release recovery exhausted all three attempts with the same signatures.",
       "superseded_by": "v0.4.9",
       "failed_release_run_id": "30894704670"
+    },
+    {
+      "tag": "v0.4.9",
+      "sha": "0a95bec85595b22e4ee60c6ac9a261250de7fa5a",
+      "reason": "The public install proof frozen at this tag fails on three of its five legs, and the tag can receive none of the repairs. The macos-15-intel and ubuntu-24.04-arm legs fail the installed-capability proof: the tagged binary reports embedding coverage as unobserved with reason graph_mutation_in_flight, so the proof reads a transient window in which the graph is still being mutated as a failure to prove complete coverage rather than waiting for it to settle. The failure is a race and not a fixed property of the platform, which is why the same two legs pass on some attempts and a third Unix leg failed on the first attempt. The windows-latest leg fails separately at the graph and MCP tool-call proof, where the daemon port file the step reads never appears. Both the proof workflow and the binary resolve from the tag, and the repairs landed on main only after it, so no later change to main can reach the failing steps. All three attempts of the cited run failed and automatic release recovery exhausted its bounded retries. The only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, so the tag never became the finalized Latest release and nothing downstream of the proof ever ran.",
+      "superseded_by": "v0.5.0",
+      "failed_release_run_id": "30947137583"
     }
   ]
 }
