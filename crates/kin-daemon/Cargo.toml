@@ -67,6 +67,10 @@ sysinfo = "0.39"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Chains a shutdown handler alongside tokio's own SIGTERM/SIGINT registration
+# (tokio registers through this same crate) so arming the force-exit backstop
+# never depends on the async runtime being schedulable.
+signal-hook-registry = "1.4"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [

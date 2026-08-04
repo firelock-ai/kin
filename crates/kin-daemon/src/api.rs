@@ -913,7 +913,15 @@ async fn request_daemon_shutdown(
             .into_response();
     };
     match shutdown.send(true) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response(),
+        Ok(()) => {
+            // Accepting the request commits this process to exiting, so the
+            // force-exit backstop starts counting down here. On macOS this is
+            // the whole stop path — there is no signal behind it — and leaving
+            // the countdown to a task the runtime may never schedule is what
+            // let a saturated daemon absorb a stop request and keep running.
+            crate::daemon::note_shutdown_requested();
+            (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response()
+        }
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("shutdown channel closed: {error}")})),

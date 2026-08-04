@@ -14,6 +14,11 @@
 //! pidfd, native Windows uses a process handle, and macOS uses an authenticated
 //! cooperative endpoint whose request names the expected birth identity. The
 //! wait is a ceiling, not a fixed delay.
+//!
+//! `--all` bounds the sweep, not just each step in it. Stopping identities in
+//! sequence under a per-identity ceiling left the command's real bound
+//! proportional to how many daemons happened to be running, so `stop --all`
+//! could outlive its caller's patience and be killed before reporting anything.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -81,6 +86,29 @@ fn stop_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30);
     Duration::from_secs(secs)
+}
+
+/// How long the whole `--all` sweep may take, as opposed to how long any one
+/// identity may take.
+///
+/// `--all` stops identities in sequence, so giving each the full per-identity
+/// ceiling made the command's real bound `identities × ceiling` with nothing
+/// bounding the product. An ordinary install is one worker plus the supervisor,
+/// which is already 60s of worst case — enough for a caller that allows 60s to
+/// kill the command before it can report anything, turning a stop that failed
+/// into a stop with no verdict at all. The sweep now shares one budget.
+fn stop_all_budget() -> Duration {
+    stop_timeout()
+}
+
+/// Budget left for the next identity in a sweep.
+///
+/// Reaching zero does not skip an identity: the stop request is still delivered,
+/// and only the wait for the process to disappear is what the exhausted budget
+/// gives up. The identity is then reported `timeout`, which is the honest
+/// outcome — the request went out and this command did not stay to watch.
+fn remaining_budget(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 /// Outcome of a graceful stop request against one recorded pid.
@@ -916,7 +944,10 @@ async fn stop_all(json: bool, quiet: bool) -> Result<()> {
 }
 
 async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) -> Result<()> {
-    let wait = stop_timeout();
+    // One budget for the whole sweep. Each identity below waits only for what
+    // is left of it, so this command's bound is the budget rather than the
+    // budget multiplied by however many daemons happen to be running.
+    let deadline = Instant::now() + stop_all_budget();
     let mut reports: Vec<StopReport> = Vec::new();
 
     // A live supervisor is the only authoritative registry of every repo
@@ -967,7 +998,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     // the registry snapshot and supervisor exit.
     if uninstall_root.is_some() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_supervisor_identity(identity, wait);
+            let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
             reports.push(StopReport {
                 kind: "supervisor",
                 label: "supervisor".to_string(),
@@ -984,7 +1015,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
             daemon.display_name.clone()
         };
         let kin_root = Path::new(&daemon.repo_root).join(".kin");
-        let outcome = stop_worker_at(&kin_root, daemon.pid, wait, uninstall_root)?;
+        let outcome = stop_worker_at(&kin_root, daemon.pid, remaining_budget(deadline), uninstall_root)?;
         if outcome.is_success() {
             remove_stale_daemon_files(&kin_root);
         }
@@ -1006,7 +1037,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
                 let already = reports.iter().any(|r| r.pid == pid);
                 if !already && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
-                    let outcome = stop_worker_at(&kin_root, pid, wait, uninstall_root)?;
+                    let outcome = stop_worker_at(&kin_root, pid, remaining_budget(deadline), uninstall_root)?;
                     if outcome.is_success() {
                         remove_stale_daemon_files(&kin_root);
                     }
@@ -1025,7 +1056,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     // workers first, supervisor last. Full uninstall already stopped it above.
     if uninstall_root.is_none() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_supervisor_identity(identity, wait);
+            let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
             if outcome.is_success() {
                 remove_stale_supervisor_files();
             }
@@ -1039,7 +1070,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     }
 
     if let Some(install_root) = uninstall_root {
-        stop_install_owned_daemons(install_root, wait, &mut reports)?;
+        stop_install_owned_daemons(install_root, remaining_budget(deadline), &mut reports)?;
     }
 
     if reports.is_empty() {

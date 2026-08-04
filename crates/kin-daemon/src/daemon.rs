@@ -564,20 +564,124 @@ fn parse_owner_watch_pid(raw: Option<&str>, self_pid: u32) -> Option<i32> {
     Some(pid)
 }
 
+/// Shutdown requested through a path that no scheduler can starve.
+///
+/// Written from a real OS signal handler, so every write must stay
+/// async-signal-safe: one relaxed atomic store, no allocation, no locking, no
+/// logging.
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has shutdown been requested through a runtime-independent path?
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a shutdown request from a caller that is not a signal handler.
+///
+/// The cooperative `/shutdown` endpoint is the caller that matters: accepting a
+/// request commits this process to exiting, so the force-exit backstop has to
+/// start counting down at the moment of acceptance rather than at the moment
+/// some later task manages to get scheduled.
+pub fn note_shutdown_requested() {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Arm the runtime-independent shutdown flag from signal delivery itself.
+///
+/// Registered through `signal_hook_registry`, which chains handlers, so tokio's
+/// own SIGTERM/SIGINT registration keeps driving the graceful path unchanged.
+/// This handler exists only so the force-exit backstop is armed by the kernel
+/// delivering the signal rather than by the runtime's willingness to poll a
+/// future.
+#[cfg(unix)]
+pub fn install_shutdown_signal_handler() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler body performs a single relaxed atomic store and
+        // calls nothing that is not async-signal-safe.
+        let registered = unsafe {
+            signal_hook_registry::register(signal, || {
+                SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        if let Err(error) = registered {
+            warn!(
+                signal,
+                error = %error,
+                "failed to arm the runtime-independent shutdown flag; \
+                 force-exit escalation falls back to in-runtime arming"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn install_shutdown_signal_handler() {}
+
 /// Has shutdown been signalled by any path?
 ///
-/// `is_shutdown` is the state flag set by the propagation task; `cancel` is the
-/// watch-channel flag that every shutdown trigger (SIGTERM/SIGINT, idle timeout,
-/// owner death, any task exiting) sets synchronously at the moment it fires.
+/// Three independent sources, because the force-exit backstop must not depend
+/// on the runtime it exists to rescue:
+/// - `os_requested`: set by the SIGTERM/SIGINT handler itself, or by the
+///   cooperative `/shutdown` endpoint at the moment it accepts the request.
+/// - `cancel`: the watch-channel flag every in-runtime shutdown trigger sets.
+/// - `is_shutdown`: the state flag the propagation task writes.
 ///
-/// The escalation watchdog arms on EITHER. Keying it on `is_shutdown` alone made
-/// the force-exit backstop depend on a tokio task running: the only writer of
-/// `is_shutdown` is the propagation task, so a wedged or saturated async runtime
-/// silently disarmed the very backstop that exists for the wedged case. `cancel`
-/// is set synchronously by the signal handler itself, so the backstop is now
-/// armed by the signal rather than by the scheduler's willingness to run a task.
-fn shutdown_signalled(is_shutdown: bool, cancel: bool) -> bool {
-    is_shutdown || cancel
+/// Only `os_requested` survives a saturated runtime. Both other flags are
+/// written from inside it: the SIGTERM arm of `select_with_signals` sets
+/// `cancel`, but that arm is a future the runtime has to poll, and the
+/// propagation task that writes `is_shutdown` is a task the runtime has to
+/// schedule. A reconciliation batch occupying every worker thread with
+/// synchronous work therefore disarmed the backstop that exists for precisely
+/// that case, and the daemon outlived its documented grace with no bound at
+/// all — a stop request that never terminated anything.
+fn shutdown_signalled(is_shutdown: bool, cancel: bool, os_requested: bool) -> bool {
+    is_shutdown || cancel || os_requested
+}
+
+/// Spawn the shutdown-escalation watchdog: a plain OS thread — deliberately
+/// NOT a tokio task — so it stays runnable even while the async runtime is
+/// tearing down or saturated. Once shutdown is signalled it grants a bounded
+/// grace period for the drain plus final flush to finish, then force-exits.
+///
+/// This is the hard backstop against two zombies. A blocking embedding batch
+/// mid GPU-compute cannot observe the cancel signal, so runtime teardown can
+/// otherwise block forever and leave a headless, SIGTERM-immune CPU zombie that
+/// still races kvec writes. A reconciliation batch that occupies every runtime
+/// worker with synchronous work is the same failure from the other direction:
+/// nothing inside the runtime runs, so nothing inside the runtime can arm this.
+///
+/// `is_shutdown` is taken as a probe rather than a flag so the production call
+/// site keeps reading `DaemonState` while a test can model the runtime whose
+/// propagation task never runs at all.
+pub fn spawn_shutdown_escalation_watchdog<F>(
+    is_shutdown: F,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    grace: Duration,
+) where
+    F: Fn() -> bool + Send + 'static,
+{
+    if let Err(error) = std::thread::Builder::new()
+        .name("kin-shutdown-watchdog".to_string())
+        .spawn(move || {
+            while !shutdown_signalled(is_shutdown(), *cancel.borrow(), shutdown_requested()) {
+                std::thread::sleep(SHUTDOWN_WATCH_POLL);
+            }
+            std::thread::sleep(grace);
+            // Still alive after the grace period → the graceful path is wedged
+            // (a blocking embed batch the runtime drop is waiting on, or a
+            // reconciliation batch holding every worker thread). Force the whole
+            // process down so a stop request always results in actual
+            // termination — no zombie, and no unbounded stop.
+            eprintln!(
+                "kin-daemon: graceful shutdown exceeded {}s grace — forcing process exit to prevent a CPU zombie",
+                grace.as_secs()
+            );
+            std::process::exit(0);
+        })
+    {
+        warn!(error = %error, "failed to spawn shutdown-escalation watchdog");
+    }
 }
 
 /// Is the process with this PID still alive?
@@ -990,6 +1094,7 @@ pub async fn run_with_authority(
                         .is_shutdown
                         .load(std::sync::atomic::Ordering::Relaxed),
                     *watch_cancel_rx.borrow(),
+                    shutdown_requested(),
                 ) {
                     return;
                 }
@@ -1102,51 +1207,21 @@ pub async fn run_with_authority(
         }
     });
 
-    // Shutdown-escalation watchdog. A plain OS thread — deliberately
-    // NOT a tokio task — so it stays runnable even while the async runtime is
-    // tearing down. Once graceful shutdown is signalled it grants a bounded
-    // grace period for the drain + final flush to finish, then force-exits.
-    // This is the hard backstop against the embed-worker zombie: a blocking
-    // embedding batch mid GPU-compute cannot observe the cancel signal, so
-    // runtime teardown can otherwise block forever and leave a headless,
-    // SIGTERM-immune CPU zombie that still races kvec writes.
-    //
-    // Armed by `shutdown_signalled`, i.e. the cancel watch-channel OR
-    // `is_shutdown`. Watching `is_shutdown` alone was a latent hole: its only
-    // writer is the propagation task above, so the backstop against a wedged
-    // runtime was itself gated on that runtime scheduling a task. The cancel
-    // flag is set synchronously by whichever path triggers shutdown
-    // (SIGTERM/SIGINT, idle timeout, owner death, any task exiting), so the
-    // grace period now starts when the signal lands. Neither flag is ever set
-    // during normal operation, so this still cannot fire on a healthy daemon.
+    // Arm the runtime-independent shutdown flag before the reconciliation loop
+    // can start occupying worker threads. Neither this flag nor the watchdog
+    // below is ever set during normal operation, so neither can fire on a
+    // healthy daemon.
+    install_shutdown_signal_handler();
     let escalation_state = Arc::clone(&state);
-    let escalation_cancel = cancel_rx.clone();
-    let escalation_grace = shutdown_escalation_grace();
-    if let Err(error) = std::thread::Builder::new()
-        .name("kin-shutdown-watchdog".to_string())
-        .spawn(move || {
-            while !shutdown_signalled(
-                escalation_state
-                    .is_shutdown
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                *escalation_cancel.borrow(),
-            ) {
-                std::thread::sleep(SHUTDOWN_WATCH_POLL);
-            }
-            std::thread::sleep(escalation_grace);
-            // Still alive after the grace period → the graceful path is wedged
-            // (almost certainly a blocking embed batch the runtime drop is
-            // waiting on). Force the whole process down so SIGTERM always
-            // results in actual termination — no zombie.
-            eprintln!(
-                "kin-daemon: graceful shutdown exceeded {}s grace — forcing process exit to prevent a CPU zombie",
-                escalation_grace.as_secs()
-            );
-            std::process::exit(0);
-        })
-    {
-        warn!(error = %error, "failed to spawn shutdown-escalation watchdog");
-    }
+    spawn_shutdown_escalation_watchdog(
+        move || {
+            escalation_state
+                .is_shutdown
+                .load(std::sync::atomic::Ordering::Relaxed)
+        },
+        cancel_rx.clone(),
+        shutdown_escalation_grace(),
+    );
 
     // Spawn projection rebuild in background — VFS needs it but locate doesn't.
     // The reconcile loop and API server can start immediately.
@@ -2431,8 +2506,9 @@ async fn select_with_signals(
 mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
-        parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
-        shutdown_signalled, watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
+        note_shutdown_requested, parse_duration_secs, parse_owner_watch_pid, shutdown_requested,
+        should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
+        watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
         DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2901,41 +2977,44 @@ mod tests {
     #[test]
     fn escalation_backstop_arms_on_the_signal_not_on_a_scheduled_task() {
         // A healthy daemon never arms the force-exit backstop.
-        assert!(!shutdown_signalled(false, false));
+        assert!(!shutdown_signalled(false, false, false));
 
-        // The regression this closes: the cancel watch-channel is set
-        // synchronously by whichever path triggers shutdown, while `is_shutdown`
-        // is written only by a tokio task. Keying the backstop on `is_shutdown`
-        // alone meant a wedged or saturated runtime — precisely the case the
-        // backstop exists for — silently disarmed it, because the propagation
-        // task never ran. Cancel alone must arm it.
-        assert!(shutdown_signalled(false, true));
+        // Each source arms it on its own.
+        assert!(shutdown_signalled(false, true, false));
+        assert!(shutdown_signalled(true, false, false));
 
-        // The propagation-task path still arms it, including when the cancel
-        // receiver has already been observed and reset by another consumer.
-        assert!(shutdown_signalled(true, false));
-        assert!(shutdown_signalled(true, true));
+        // The one that matters: both in-runtime flags unset, because a
+        // saturated runtime polls neither the SIGTERM future that sets `cancel`
+        // nor the propagation task that writes `is_shutdown`. The OS handler
+        // must arm the backstop by itself, or a stop request against a busy
+        // daemon has no bound at all.
+        assert!(shutdown_signalled(false, false, true));
     }
 
     #[test]
-    fn escalation_arm_loop_fires_when_only_the_cancel_channel_is_set() {
-        // Faithful model of the escalation watchdog's arm loop running on the
-        // real primitives: an AtomicBool standing in for `state.is_shutdown` and
-        // the daemon's actual cancel watch-channel. `is_shutdown` is
-        // deliberately never written — that is precisely what a wedged or
-        // saturated runtime looks like, since the propagation task is its only
-        // writer and it never gets scheduled. The force-exit backstop must still
-        // arm, because SIGTERM sets the cancel flag synchronously.
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    fn escalation_arm_loop_fires_when_only_the_os_handler_ran() {
+        // The escalation watchdog's arm loop on the real primitives: an
+        // AtomicBool standing in for `state.is_shutdown`, the daemon's actual
+        // cancel watch-channel, and a flag standing in for the process-global
+        // one the signal handler writes.
+        //
+        // Neither in-runtime flag is ever written here, which is exactly what a
+        // saturated runtime looks like: the SIGTERM future that would set
+        // `cancel` is never polled, and the propagation task that would write
+        // `is_shutdown` is never scheduled. Only the OS handler ran.
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let is_shutdown = Arc::new(AtomicBool::new(false));
+        let os_requested = Arc::new(AtomicBool::new(false));
         let armed = Arc::new(AtomicBool::new(false));
 
         let loop_is_shutdown = Arc::clone(&is_shutdown);
+        let loop_os_requested = Arc::clone(&os_requested);
         let loop_armed = Arc::clone(&armed);
         std::thread::spawn(move || {
             while !shutdown_signalled(
                 loop_is_shutdown.load(Ordering::Relaxed),
                 *cancel_rx.borrow(),
+                loop_os_requested.load(Ordering::Relaxed),
             ) {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -2946,9 +3025,9 @@ mod tests {
         // sits disarmed rather than counting down to a force-exit.
         assert!(!armed.load(Ordering::Relaxed));
 
-        // Exactly what the SIGTERM arm of `select_with_signals` does — and only
-        // that. No tokio task runs in this test at all.
-        cancel_tx.send(true).expect("cancel receiver alive");
+        // Exactly what the signal handler does, and only that: one relaxed
+        // store. No tokio task runs in this test at all.
+        os_requested.store(true, Ordering::Relaxed);
 
         // Bounded wait rather than join(): a regression here must fail the test,
         // not hang CI until the job timeout.
@@ -2959,13 +3038,29 @@ mod tests {
 
         assert!(
             armed.load(Ordering::Relaxed),
-            "cancel alone must arm the force-exit backstop; keying it on \
-             is_shutdown made the wedged-runtime backstop depend on the runtime"
+            "the OS handler alone must arm the force-exit backstop; keying it \
+             only on flags written from inside the runtime made the \
+             saturated-runtime backstop depend on that runtime"
         );
         assert!(
             !is_shutdown.load(Ordering::Relaxed),
             "is_shutdown was never set — the backstop must not depend on it"
         );
+    }
+
+    #[test]
+    fn cooperative_shutdown_acceptance_arms_the_backstop() {
+        // macOS stop has no signal behind it: the CLI POSTs /shutdown and the
+        // endpoint accepting the request is the whole commitment to exit. That
+        // acceptance has to arm the same runtime-independent flag, or a daemon
+        // whose runtime wedges right after accepting absorbs the stop request
+        // and keeps running.
+        // Deliberately no "not yet armed" precondition: the flag is
+        // process-global and terminal by design, so asserting its initial value
+        // would make this test depend on which other test ran first.
+        note_shutdown_requested();
+        assert!(shutdown_requested());
+        assert!(shutdown_signalled(false, false, shutdown_requested()));
     }
 
     #[test]
