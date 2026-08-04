@@ -2318,6 +2318,66 @@ mod tests {
         (prepared, transaction)
     }
 
+    /// A canonical stage, built the way admission builds one.
+    ///
+    /// Admission canonicalizes before it stages, and the config writer only
+    /// owns a `.kin.init-<uuid-v4>` directory, so both are required here for
+    /// the save below to be the same call admission makes.
+    fn canonical_stage(parent: &tempfile::TempDir) -> PathBuf {
+        let root = parent.path().canonicalize().expect("canonicalize parent");
+        let stage = root.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        create_private_staging_root(&stage).expect("create stage");
+        stage
+    }
+
+    fn publish_staged_config(stage: &Path) {
+        KinConfig::default()
+            .save_initialization_stage(stage)
+            .expect("publish staged repository config");
+        let published =
+            std::fs::read(stage.join("config.toml")).expect("read back the published config");
+        assert!(
+            !published.is_empty(),
+            "a published config must hold the bytes it was given"
+        );
+    }
+
+    /// Building the stage must not break publishing into it.
+    ///
+    /// `kin init` assembles a stage in steps and then saves the repository
+    /// config into it. The config writer's own cases already prove it publishes
+    /// into a bare stage, so when admission refuses at that save, the cause has
+    /// to be something the stage gained on the way rather than the writer. Each
+    /// case below adds one construction step and then publishes through the
+    /// same entry admission uses, so the first one to refuse names the step
+    /// that caused it instead of leaving a whole transaction under suspicion.
+    #[test]
+    fn a_bare_stage_publishes_its_config() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        publish_staged_config(&stage);
+    }
+
+    #[test]
+    fn a_stage_holding_its_authority_backend_publishes_its_config() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        let layout = KinLayout::new(stage.clone());
+        // Held across the save, exactly as admission holds it.
+        let _backend = create_staged_repository_authority_backend(&layout.kindb_dir())
+            .expect("create staged authority backend");
+        publish_staged_config(&stage);
+    }
+
+    #[test]
+    fn a_stage_with_its_projection_control_directory_publishes_its_config() {
+        let parent = tempfile::tempdir().unwrap();
+        let stage = canonical_stage(&parent);
+        crate::tree::initialize_projection_control_directory(&stage)
+            .expect("initialize projection control directory");
+        publish_staged_config(&stage);
+    }
+
     #[test]
     fn init_creates_unborn_repository_authority() {
         let directory = tempfile::tempdir().unwrap();
