@@ -30,6 +30,22 @@ use std::time::{Duration, Instant};
 /// during an ordinary suite run.
 const SATURATED_WORKER_ROOT: &str = "KIN_TEST_SATURATED_SHUTDOWN_ROOT";
 
+/// Same, for the healthy-runtime worker that proves the graceful path still
+/// wins the race on a daemon that is not starved.
+const GRACEFUL_WORKER_ROOT: &str = "KIN_TEST_GRACEFUL_SHUTDOWN_ROOT";
+
+/// Grace the graceful worker is given: long enough that a force-exit could
+/// never be mistaken for the graceful path finishing. The whole point of that
+/// test is to distinguish the two, so this must stay far above
+/// [`GRACEFUL_EXIT_BUDGET`].
+const GRACEFUL_WORKER_GRACE_SECS: u64 = 30;
+
+/// How long the parent waits for the healthy worker to exit after SIGTERM.
+/// Must stay well below [`GRACEFUL_WORKER_GRACE_SECS`]: exceeding it means the
+/// tokio signal path never observed the signal and only the backstop could
+/// still end the process.
+const GRACEFUL_EXIT_BUDGET: Duration = Duration::from_secs(8);
+
 /// Grace the worker grants before force-exiting, fed through the same
 /// `KIN_DAEMON_SHUTDOWN_GRACE_SECS` knob production reads. Short so the test is
 /// quick; the shipped default is 25s.
@@ -136,6 +152,117 @@ fn stop_terminates_a_daemon_whose_runtime_is_saturated() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The backstop must not become the ordinary way daemons stop.
+///
+/// Chaining a handler onto SIGTERM is only safe if tokio's own registration
+/// still fires: tokio registers through the same `signal-hook-registry`, and
+/// handlers chain rather than replace. If that were ever untrue, the graceful
+/// path would go silent and every stop would degrade to a force-exit that skips
+/// the final flush, the derived-CAS barrier, and endpoint retirement. The
+/// saturated test above cannot catch that, because a force-exit also satisfies
+/// "the process exited".
+///
+/// This one distinguishes them by clock: the worker gets a 30s grace and is
+/// required to exit within 8s. Only the tokio signal path can do that, so a
+/// pass here means the graceful path observed the signal rather than the
+/// backstop rescuing a broken one.
+///
+/// Nothing about the daemon's own SIGKILL-based test helpers covers this: they
+/// reap daemons with `start_kill`, so no existing test sends SIGTERM at all.
+#[test]
+fn a_healthy_daemon_still_stops_through_the_graceful_path() {
+    let root = tempfile::tempdir().expect("scratch root for the graceful worker");
+    let ready = root.path().join("graceful.ready");
+
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args(["--exact", "graceful_daemon_shutdown_worker", "--nocapture"])
+        .env(GRACEFUL_WORKER_ROOT, root.path())
+        .env(
+            "KIN_DAEMON_SHUTDOWN_GRACE_SECS",
+            GRACEFUL_WORKER_GRACE_SECS.to_string(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut worker = WorkerGuard(command.spawn().expect("spawn graceful daemon worker"));
+
+    let deadline = Instant::now() + READY_BUDGET;
+    while !ready.is_file() {
+        assert!(
+            worker.0.try_wait().expect("poll worker").is_none(),
+            "worker exited before it was listening for a signal"
+        );
+        assert!(Instant::now() < deadline, "worker never reported readiness");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let pid = i32::try_from(worker.0.id()).expect("worker pid fits a pid_t");
+    // SAFETY: `pid` is this test's own direct child, which has not been reaped.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGTERM) },
+        0,
+        "deliver SIGTERM to the healthy worker"
+    );
+
+    let deadline = Instant::now() + GRACEFUL_EXIT_BUDGET;
+    loop {
+        if let Some(status) = worker.0.try_wait().expect("poll worker") {
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "the graceful path exits 0 of its own accord"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a healthy daemon did not stop through the graceful path within {}s, \
+             despite a {}s force-exit grace. Chaining the runtime-independent \
+             handler onto SIGTERM must not displace tokio's own registration, \
+             or every stop silently degrades to a force-exit that skips the \
+             final flush and endpoint retirement.",
+            GRACEFUL_EXIT_BUDGET.as_secs(),
+            GRACEFUL_WORKER_GRACE_SECS
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Exact worker entrypoint: the daemon's shutdown wiring on a healthy runtime.
+/// Inert unless [`GRACEFUL_WORKER_ROOT`] is set.
+#[test]
+fn graceful_daemon_shutdown_worker() {
+    let Some(root) = std::env::var_os(GRACEFUL_WORKER_ROOT) else {
+        return;
+    };
+    let ready = PathBuf::from(root).join("graceful.ready");
+
+    spawn_parent_death_watchdog();
+    spawn_wall_clock_cap();
+
+    kin_daemon::daemon::install_shutdown_signal_handler();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    kin_daemon::daemon::spawn_shutdown_escalation_watchdog(
+        || false,
+        cancel_rx,
+        kin_daemon::daemon::shutdown_escalation_grace(),
+    );
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the healthy runtime");
+    runtime.block_on(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("register the tokio SIGTERM listener");
+        // Published after registration, so a signal arriving immediately after
+        // is still latched by tokio and delivered to `recv`.
+        std::fs::write(&ready, b"listening").expect("publish readiness");
+        sigterm.recv().await;
+        let _ = cancel_tx.send(true);
+    });
 }
 
 /// Exact worker entrypoint: the daemon's shutdown wiring on a runtime with no
