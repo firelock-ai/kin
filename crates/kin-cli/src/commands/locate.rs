@@ -3806,27 +3806,31 @@ fn run_with_graph_capture_budgeted(
         );
     }
     result.degradations = degradations;
+    // ONE held authority for BOTH projections below.
+    //
+    // They run back to back over the same symbol set in the same request, and
+    // every locate entry point -- `POST /locate`, the fused `semantic_locate`
+    // arm, multi-query, `kin locate --snippets` -- funnels through here. An
+    // authority open is a full recovery and the committed state a body's
+    // artifact-identity binding needs is a whole-history replay, so a session
+    // per function pays both twice for one answer, and a session per read pays
+    // them once per definition symbol. That per-symbol shape is the FIR-1897
+    // defect itself, and holding it here is what keeps it off this path.
+    //
+    // Constructing the session performs no IO, so hoisting it above the
+    // `opts.enabled` guards inside both callees costs a disabled request
+    // nothing.
+    let held_authority =
+        kin_mcp::handlers::common::HeldSourceAuthority::new(graph, repository_authority);
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
-    attach_snippets(
-        &mut result,
-        graph,
-        &snippet_opts,
-        repository_authority,
-        source_scope,
-    )?;
+    attach_snippets(&mut result, &held_authority, &snippet_opts, source_scope)?;
     // Re-project the ranked symbols into the graph-native PRIMARY surface: a
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(
-        &mut result,
-        graph,
-        &snippet_opts,
-        repository_authority,
-        source_scope,
-    )?;
+    build_entity_view(&mut result, &held_authority, &snippet_opts, source_scope)?;
     Ok(result)
 }
 
@@ -15441,22 +15445,20 @@ fn collect_explain_for_file(
 /// scorer derives its predicted symbol set from `symbols[].name`, which is
 /// unchanged), so retrieval scoring and proof are unaffected. A no-op unless
 /// `opts.enabled`.
+///
+/// Takes the request's held authority rather than a binding, so it cannot open
+/// a second one: the caller's session is the only authority on this path, and
+/// the graph it reads entities from is the one that session is bound to.
 pub fn attach_snippets(
     result: &mut LocateResult,
-    graph: &kin_db::InMemoryGraph,
+    held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
     opts: &SnippetOptions,
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
     if !opts.enabled || !opts.bodies {
         return Ok(());
     }
-    // One held authority for the whole result set. Every symbol on every file
-    // resolves against the same repository state, so opening authority and
-    // replaying committed history per symbol repeats identical work once per
-    // snippet rather than once per request.
-    let held_authority =
-        kin_mcp::handlers::common::HeldSourceAuthority::new(graph, repository_authority);
+    let graph = held_authority.store();
     for file in result.files.iter_mut() {
         if file.symbols.is_empty() {
             continue;
@@ -15483,7 +15485,7 @@ pub fn attach_snippets(
             };
             if let Some(source) =
                 kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
-                    &held_authority,
+                    held_authority,
                     entity,
                     opts.max_lines,
                     opts.max_chars,
@@ -15524,20 +15526,22 @@ fn match_symbol_entity<'a>(
 /// ([`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]) every
 /// agent surface uses — never a working-tree read. `None` means the entity has
 /// no source coordinates; graph/tree/blob gaps are errors.
+///
+/// Reads through the request's held authority. The one-shot entry point builds a
+/// fresh session per call, which is correct for a single-entity surface and is
+/// the FIR-1897 defect here: this runs once per definition symbol on a page.
 fn bounded_entity_body_with_note(
-    graph: &kin_db::InMemoryGraph,
+    held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
     entity: &kin_model::Entity,
     max_lines: usize,
     max_chars: usize,
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<Option<String>> {
-    let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
-        graph,
+    let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
+        held_authority,
         entity,
         max_lines,
         max_chars,
-        repository_authority,
         source_scope,
     )?
     else {
@@ -15574,16 +15578,22 @@ fn bounded_entity_body_with_note(
 /// (and `total_ranked`); the daemon then caches it and windows a single page via
 /// [`apply_entity_page`]. No filesystem read. A no-op unless `opts.enabled`
 /// (the agent/JSON surface), so the human/in-process path is unchanged.
+///
+/// Takes the SAME held authority [`attach_snippets`] just used. Both walk the
+/// same symbol set in the same request, so a body here resolves against
+/// authority and committed state already derived; deriving them again per
+/// definition symbol is the FIR-1897 shape, and it reaches every locate entry
+/// point because they all funnel through [`run_with_graph_capture_budgeted`].
 pub fn build_entity_view(
     result: &mut LocateResult,
-    graph: &kin_db::InMemoryGraph,
+    held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
     opts: &SnippetOptions,
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
     }
+    let graph = held_authority.store();
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -15613,11 +15623,10 @@ pub fn build_entity_view(
             // still projected.
             let body = if opts.bodies && sym.definition {
                 bounded_entity_body_with_note(
-                    graph,
+                    held_authority,
                     entity,
                     opts.max_lines,
                     opts.max_chars,
-                    repository_authority,
                     source_scope,
                 )?
                 .or_else(|| sym.snippet.clone())
@@ -17036,9 +17045,8 @@ mod tests {
         };
         build_entity_view(
             &mut result,
-            &graph,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
             &SnippetOptions::default(),
-            None,
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
         )
         .unwrap();

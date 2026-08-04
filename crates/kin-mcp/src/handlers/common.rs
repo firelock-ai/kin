@@ -26,7 +26,9 @@ use super::repository_authority::{ActiveRepositoryAuthority, WorkspaceReadSample
 use crate::error::{McpError, Result};
 use kin_core::LocalRepositoryAuthorityBinding;
 
-pub use super::repository_authority::REPOSITORY_AUTHORITY_OPEN_COUNT;
+pub use super::repository_authority::{
+    repository_authority_opens_on_this_thread, REPOSITORY_AUTHORITY_OPEN_COUNT,
+};
 use kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
 
 // ── Parameter extraction helpers ──
@@ -1010,6 +1012,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<String, ReferenceRow> = HashMap::new();
 
+    // One held authority for the whole reference set. This projects a body per
+    // REFERENCING entity, so it is the same multi-entity shape the retrieval
+    // surfaces have: deriving authority and committed state per row pays a full
+    // authority recovery and a whole-history replay once per caller found.
+    let held = HeldSourceAuthority::new(store, repository_authority);
+
     for rel in store
         .get_all_relations_for_entity(entity_id)
         .map_err(McpError::graph)?
@@ -1029,12 +1037,8 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
-        let snippet = read_bounded_entity_snippet(
-            store,
-            &entity,
-            repository_authority,
-            EntitySourceScope::WorkspaceHead,
-        )?;
+        let snippet =
+            read_bounded_entity_snippet_held(&held, &entity, EntitySourceScope::WorkspaceHead)?;
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
             entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
