@@ -32,10 +32,10 @@ use std::ffi::OsStr;
 /// opened it. Tying the file to the process instead removes that failure mode
 /// from the call sites rather than asking each of them to re-derive it.
 ///
-/// The file lives in a fresh temporary directory rather than at a predictable
-/// path. Callers are authority boundaries: a path another process can
-/// pre-create is a path it can pre-fill with a hostile global configuration,
-/// which is the exact authority the boundary exists to remove.
+/// The file is a freshly created temporary rather than a predictable path.
+/// Callers are authority boundaries: a path another process can pre-create is a
+/// path it can pre-fill with a hostile global configuration, which is the exact
+/// authority the boundary exists to remove.
 ///
 /// Creating that file is the only fallible step, and it fails loudly. Silently
 /// leaving `GIT_CONFIG_GLOBAL` unbound would hand the child the ambient global
@@ -53,15 +53,20 @@ pub fn empty_global_git_config() -> &'static OsStr {
     static EMPTY_GLOBAL_GIT_CONFIG: OnceLock<PathBuf> = OnceLock::new();
     EMPTY_GLOBAL_GIT_CONFIG
         .get_or_init(|| {
-            // Kept past the command that first asked for it: every later Git
-            // launch in this process reuses the same file.
-            let directory = tempfile::Builder::new()
+            // `tempfile` creates the file already empty, so the config needs no
+            // write of its own — there is no content to put in it.
+            //
+            // `keep` persists it past the command that first asked for it:
+            // every later Git launch in this process reuses the same file.
+            let (file, path) = tempfile::Builder::new()
                 .prefix("kin-empty-global-gitconfig-")
-                .tempdir()
-                .expect("create empty global Git config directory")
-                .keep();
-            let path = directory.join("gitconfig");
-            std::fs::write(&path, b"").expect("write empty global Git config");
+                .tempfile()
+                .expect("create empty global Git config")
+                .keep()
+                .expect("persist empty global Git config");
+            // Closed before any child is spawned: Windows will not hand Git a
+            // second handle to a file this process still holds open.
+            drop(file);
             path
         })
         .as_os_str()
