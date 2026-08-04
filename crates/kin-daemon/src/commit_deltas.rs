@@ -1706,7 +1706,9 @@ mod tests {
         graph.create_change(&genesis).unwrap();
 
         let source = layout.working_dir();
-        let files: &[(&str, &[u8])] = &[
+        // Parser support, vendoring, opaque bytes, and generated-but-committed
+        // artifacts never decide membership.
+        let expected: &[(&str, &[u8])] = &[
             ("Dockerfile", b"FROM scratch"),
             ("compose.yaml", b"services: {}"),
             ("Cargo.lock", b"version = 4"),
@@ -1717,10 +1719,14 @@ mod tests {
             ("assets/logo.bin", b"\x00\xff\x10"),
             ("vendor/lib/source.c", b"int vendored(void) { return 1; }"),
             ("generated/schema.pb", b"\x01\x02generated"),
+        ];
+        // Build output a compiler reproduces is excluded by the built-in
+        // defaults, so it never reaches repository truth.
+        let derived: &[(&str, &[u8])] = &[
             ("node_modules/pkg/index.js", b"export default 1"),
             ("target/debug/build.log", b"built"),
         ];
-        for (relative, bytes) in files {
+        for (relative, bytes) in expected.iter().chain(derived) {
             let path = source.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
@@ -1736,10 +1742,16 @@ mod tests {
                 _ => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
-        for (relative, _) in files {
+        for (relative, _) in expected {
             assert!(
                 admitted.contains(*relative),
                 "missing exact member {relative}"
+            );
+        }
+        for (relative, _) in derived {
+            assert!(
+                !admitted.contains(*relative),
+                "derived output admitted: {relative}"
             );
         }
     }
