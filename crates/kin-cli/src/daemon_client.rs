@@ -1923,6 +1923,90 @@ impl ProcessLiveness {
     }
 }
 
+/// Whether a Linux `/proc/<pid>/stat` line describes a zombie.
+///
+/// Split out from the probe below, and compiled under `test` on every platform,
+/// so this is not code that only ever builds on one target. Reading the wrong
+/// field is the failure mode that matters: it would answer "not a corpse"
+/// forever, which is exactly the bug being fixed, and it would do so silently.
+#[cfg(any(target_os = "linux", test))]
+fn linux_stat_line_is_zombie(stat: &str) -> bool {
+    // Field 3 is the state character. `comm` (field 2) is parenthesized and may
+    // itself contain spaces and `)`, and it is the only field that can, so the
+    // state is the first whitespace-separated field after `comm`'s FINAL
+    // closing delimiter.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
+}
+
+/// Has this PID already terminated, with only an unreaped process-table entry
+/// left behind?
+///
+/// `kill(pid, 0)` succeeds against a zombie, so a liveness probe built on the
+/// signal check alone reports a daemon that has already exited as still
+/// running — for as long as whichever process started it stays alive without
+/// waiting on it. That is the ordinary shape of an agent session: the MCP
+/// server starts a repo daemon, keeps running, and never reaps it, so `kin
+/// daemon stop` could watch the corpse for any length of time and never see it
+/// go away.
+///
+/// Reporting a zombie dead is affirmative rather than a guess, and it is
+/// strictly safer than the alternative: the process has terminated, it cannot
+/// execute, it holds no port, and its PID cannot be reused until it is reaped,
+/// so no successor can inherit a decision made here.
+///
+/// Callers must have established same-credential access first (this is only
+/// reached after `kill(pid, 0)` succeeded). Anything short of affirmative
+/// evidence of a corpse answers `false` and leaves the caller's conservative
+/// path intact.
+#[cfg(unix)]
+fn process_is_unreaped_corpse(pid: libc::pid_t) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        linux_stat_line_is_zombie(&stat)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut _,
+                expected as i32,
+            )
+        };
+        // `proc_pidinfo` reports failure as a zero return with `errno` set, so
+        // only zero is a result whose `errno` is this call's. A short non-zero
+        // return is undocumented and would leave `errno` holding whatever an
+        // earlier, unrelated call left there — and reading a stale `ESRCH` out
+        // of it would declare a LIVE daemon stopped, which is the one direction
+        // this must never fail in.
+        if written != 0 {
+            return false;
+        }
+        // Permission to inspect is already established by the caller's
+        // successful `kill(pid, 0)`, so `ESRCH` here is the kernel reporting
+        // that the process is gone rather than that this caller may not look.
+        // `EPERM` and every other failure stay indeterminate.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // No affirmative corpse probe on this platform. Never guess: an
+        // unrecognised Unix keeps the conservative "signalable means alive"
+        // answer it had before.
+        let _ = pid;
+        false
+    }
+}
+
 /// Classify whether a process with the given PID exists.
 pub fn process_liveness(pid: u32) -> ProcessLiveness {
     #[cfg(unix)]
@@ -1931,7 +2015,13 @@ pub fn process_liveness(pid: u32) -> ProcessLiveness {
             return ProcessLiveness::Dead;
         };
         if unsafe { libc::kill(pid, 0) } == 0 {
-            return ProcessLiveness::Alive;
+            // Signalable is not the same as running: an exited child whose
+            // parent has not waited on it still answers `kill(pid, 0)`.
+            return if process_is_unreaped_corpse(pid) {
+                ProcessLiveness::Dead
+            } else {
+                ProcessLiveness::Alive
+            };
         }
         return match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::ESRCH) => ProcessLiveness::Dead,
@@ -9175,6 +9265,154 @@ mod tests {
             "the current process must be observable as alive"
         );
         assert_eq!(process_liveness(std::process::id()), ProcessLiveness::Alive);
+    }
+
+    /// A child that has exited but has not been waited on is a corpse, not a
+    /// running daemon.
+    ///
+    /// This is the exact topology of an agent session: a long-lived MCP server
+    /// starts a repo daemon and never reaps it, so `kill(pid, 0)` keeps
+    /// answering for the daemon after it exits. Judging that "alive" is what
+    /// made `kin daemon stop --all` report `timeout` for a daemon that had
+    /// already stopped, no matter how long it waited.
+    ///
+    /// Deliberately never calls `wait()` before the assertion — reaping is the
+    /// thing whose absence is under test.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminated_child_that_was_never_reaped_is_not_alive() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a child that exits immediately");
+        let pid = child.id();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut liveness = process_liveness(pid);
+        while liveness != ProcessLiveness::Dead && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            liveness = process_liveness(pid);
+        }
+
+        // Reap before asserting so a failure cannot leak the corpse into the
+        // rest of the test binary, but assert on what was observed while it
+        // was still unreaped.
+        let reaped = child.wait();
+        assert_eq!(
+            liveness,
+            ProcessLiveness::Dead,
+            "an exited child nobody waited on must read as dead, not as a live daemon"
+        );
+        reaped.expect("reap the child");
+    }
+
+    /// The Linux state field is read from the right place.
+    ///
+    /// Runs on every platform: the `/proc` read is Linux-only, but a parser
+    /// that picks the wrong field would report every corpse as still running,
+    /// which is indistinguishable from having no fix at all.
+    #[test]
+    fn linux_stat_state_is_read_after_the_command_name() {
+        assert!(linux_stat_line_is_zombie(
+            "4242 (kin-daemon) Z 4240 4242 0 0 -1 4194560 0 0"
+        ));
+        assert!(!linux_stat_line_is_zombie(
+            "4242 (kin-daemon) S 4240 4242 0 0 -1 4194560 0 0"
+        ));
+        assert!(!linux_stat_line_is_zombie(
+            "4242 (kin-daemon) R 4240 4242 0 0 -1 4194560 0 0"
+        ));
+        // `comm` may contain spaces and its own parentheses, which is why the
+        // FINAL `)` is the delimiter. A naive first-`)` split reads "weird" as
+        // the state and answers "not a zombie" for a real corpse.
+        assert!(linux_stat_line_is_zombie(
+            "4242 (weird ) name) Z 4240 4242 0 0 -1 4194560 0 0"
+        ));
+        assert!(!linux_stat_line_is_zombie(
+            "4242 (weird ) name) S 4240 4242 0 0 -1 4194560 0 0"
+        ));
+        // A truncated or unparseable line is never affirmative evidence.
+        assert!(!linux_stat_line_is_zombie("4242 (kin-daemon)"));
+        assert!(!linux_stat_line_is_zombie(""));
+    }
+
+    /// The corpse probe must not be a blanket "dead": a child that is genuinely
+    /// running has to keep reading alive, or the fix above would turn every
+    /// stop into a false success.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_still_alive() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .spawn()
+            .expect("spawn a long-running child");
+        let pid = child.id();
+
+        std::thread::sleep(Duration::from_millis(250));
+        let liveness = process_liveness(pid);
+        let identity = process_identity(pid);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            liveness,
+            ProcessLiveness::Alive,
+            "a running child must not be mistaken for a corpse"
+        );
+        assert!(
+            matches!(identity, Ok(Some(_))),
+            "a running child must still have a readable birth identity, got {identity:?}"
+        );
+    }
+
+    /// The stop path decides purely on `process_identity_is_current(..) ==
+    /// Ok(false)`. An unreaped corpse must reach that verdict, otherwise the
+    /// wait loop runs its whole budget and reports `timeout` for a process that
+    /// is already gone.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreaped_corpse_is_not_the_current_incarnation() {
+        // Hold the child open on stdin so its identity can be recorded while it
+        // is unambiguously live. A fabricated identity would compare unequal
+        // for a live process too, which would make this test pass without the
+        // fix — the recorded incarnation has to be the real one.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read _; exit 0")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a child that waits for stdin");
+        let pid = child.id();
+
+        let identity = process_identity(pid)
+            .expect("read the live child's birth identity")
+            .expect("a running child has an identity");
+        assert!(
+            matches!(process_identity_is_current(&identity), Ok(true)),
+            "control: the recorded identity must be current while the child runs"
+        );
+
+        // Closing stdin ends the child. Nothing waits on it, so it stays in the
+        // process table as a corpse — which is the state under test.
+        drop(child.stdin.take());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut verdict = process_identity_is_current(&identity);
+        while !matches!(verdict, Ok(false)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            verdict = process_identity_is_current(&identity);
+        }
+
+        let reaped = child.wait();
+        assert!(
+            matches!(verdict, Ok(false)),
+            "an exited, unreaped child must compare as a finished incarnation so the \
+             stop wait can conclude; got {verdict:?}"
+        );
+        reaped.expect("reap the child");
     }
 
     #[test]
