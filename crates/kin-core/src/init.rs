@@ -739,6 +739,22 @@ fn stage_owner_name(stage_id: uuid::Uuid) -> String {
 const OWN_STAGE_OWNER_LOCK_ATTEMPTS: u32 = 100;
 const OWN_STAGE_OWNER_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// Whether a lock attempt was refused because someone else holds the lock.
+///
+/// The two platforms do not report contention as the same `ErrorKind`. Unix
+/// `flock` fails with `EWOULDBLOCK`, which std maps to `WouldBlock`, while
+/// Windows `LockFileEx` fails with `ERROR_LOCK_VIOLATION`, which std leaves
+/// uncategorized because only the socket-level `WSAEWOULDBLOCK` maps to
+/// `WouldBlock` there. Testing the kind alone therefore recognizes contention
+/// on Unix and nothing on Windows, which silently turns the bounded retry in
+/// `lock_own_stage_owner` into a single attempt. Comparing against the lock
+/// crate's own contention error is what keeps this true on both.
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
 /// Take the exclusive lock on an owner file this call just created with
 /// `create_new`, tolerating a concurrent recovery scan.
 ///
@@ -749,22 +765,6 @@ const OWN_STAGE_OWNER_LOCK_RETRY: std::time::Duration = std::time::Duration::fro
 /// outright on that. Contention on a file nobody else can name is transient by
 /// construction, so it is retried; anything else, and contention that outlasts
 /// the bound, still fails closed.
-/// Whether a lock attempt was refused because someone else holds the lock.
-///
-/// The two platforms do not report contention as the same `ErrorKind`. Unix
-/// `flock` fails with `EWOULDBLOCK`, which std maps to `WouldBlock`, while
-/// Windows `LockFileEx` fails with `ERROR_LOCK_VIOLATION`, which std leaves
-/// uncategorized because only the socket-level `WSAEWOULDBLOCK` maps to
-/// `WouldBlock` there. Testing the kind alone therefore recognizes contention
-/// on Unix and nothing on Windows, which silently turns the bounded retry below
-/// into a single attempt. Comparing against the lock crate's own contention
-/// error is what keeps this true on both.
-fn is_lock_contention(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || (error.raw_os_error().is_some()
-            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
-}
-
 fn lock_own_stage_owner(owner_file: &File) -> std::io::Result<()> {
     let mut last = match owner_file.try_lock_exclusive() {
         Ok(()) => return Ok(()),
