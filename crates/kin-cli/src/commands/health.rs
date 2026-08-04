@@ -2475,6 +2475,19 @@ mod tests {
         let config = dir.path().join("mcp_config.json");
         write_global_antigravity_binding(&config, &canonical);
 
+        // On Windows the canonicalized form carries the `\\?\` verbatim
+        // prefix and PathBuf::join resolves `..` against verbatim bases, so a
+        // dot-dot detour collapses back into `canonical` before the premise
+        // is ever checked. Derive the equivalent-but-unequal path from the
+        // plain form there, which is also the shape discovery produces.
+        #[cfg(windows)]
+        let discovered = std::path::PathBuf::from(
+            canonical
+                .to_str()
+                .and_then(|s| s.strip_prefix(r"\\?\"))
+                .expect("canonicalized temp paths carry the verbatim prefix on Windows"),
+        );
+        #[cfg(not(windows))]
         let discovered = canonical.join("..").join(canonical.file_name().unwrap());
         assert_ne!(discovered, canonical);
 
