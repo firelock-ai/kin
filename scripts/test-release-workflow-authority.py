@@ -4826,6 +4826,7 @@ def execute_recovery_escalation(
                 "EXHAUSTED": "true" if len(attempt_signatures) >= 3 else "false",
                 "UNKNOWN": classifier_outputs.get("unknown", ""),
                 "REPEATED": classifier_outputs.get("repeated", ""),
+                "DISTINCT": classifier_outputs.get("distinct", ""),
             }
         )
         completed = subprocess.run(
@@ -4863,6 +4864,11 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         )
     for needle in (
         "Classification: **repeated failure signature**",
+        # The strongest claim the alert can make, and it is only earned when
+        # every attempt really did produce one signature. Pinning the sentence
+        # itself is what keeps the all-attempts count from being deleted as
+        # redundant to the last-two stop rule it does not duplicate.
+        "Every observed attempt failed in the same job and step set",
         "another immediate rerun is unlikely to help",
         "recut only after confirming a source-bound defect",
         "preserve this tag for a same-release rerun if the cause is external",
@@ -4877,6 +4883,35 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     if "a rerun cannot reach a different outcome" in body:
         raise AssertionError(
             f"step identity was overstated as root-cause proof: {body}"
+        )
+
+    # The only shape that can reach the exhausted alert with a repeat verdict.
+    # The controller stops at two identical attempts, so a run that spent all
+    # three necessarily failed differently first, and the verdict text has to
+    # describe the equality the classifier actually established rather than
+    # claiming every attempt matched. Claiming it would contradict the
+    # per-attempt list three lines below it and send an operator past attempt 1,
+    # which is the evidence that the cause is not purely deterministic.
+    _, tail_repeat_body = execute_recovery_escalation(
+        release_recovery,
+        [("publish", "Push image"), compile_failure, compile_failure],
+    )
+    for needle in (
+        "Classification: **repeated failure signature**",
+        "The two most recent attempts failed in the same job and step set",
+        "Earlier attempts failed differently",
+        "- attempt 1: publish / Push image",
+        "- attempt 3: build-artifacts (x86_64-unknown-linux-musl) / Build release binaries",
+    ):
+        if needle not in tail_repeat_body:
+            raise AssertionError(
+                "a repeat established only across the last two attempts was not "
+                f"reported as one: {needle!r}: {tail_repeat_body}"
+            )
+    if "Every observed attempt failed in the same job and step set" in tail_repeat_body:
+        raise AssertionError(
+            "the alert claimed every attempt failed identically while its own "
+            f"per-attempt list shows attempt 1 differing: {tail_repeat_body}"
         )
 
     # The stop that spends one confirmation instead of the whole budget. The
@@ -5392,6 +5427,30 @@ def assert_mint_trigger_survives_advisory_flakes(release_tag: str) -> None:
                 f"reviewed default-branch push it evaluates: {clause}"
             )
 
+    # A widened trigger must not widen what the mint may release. The event's
+    # own head sha is the only stale-capable input into the candidate: a rerun
+    # of an older CI run carries the sha main held then, so resolving from it
+    # selects the version of that moment rather than the version main carries
+    # now, which is a class the scheduled arm structurally cannot reach. Both
+    # automatic arms therefore read one freshly fetched protected main, and the
+    # trigger stays a decision about when to look.
+    resolve = workflow_step_source(
+        "release-tag",
+        release_tag,
+        "      - name: Resolve exact coherent release commit\n",
+    )
+    if "workflow_run.head_sha" in resolve:
+        raise AssertionError(
+            "the release mint must not resolve its release candidate from the "
+            "triggering CI run's head sha, because a rerun of an older run "
+            "carries a stale one and the trigger decides only when to look"
+        )
+    if 'sha="$(git rev-parse refs/remotes/origin/main)"' not in resolve:
+        raise AssertionError(
+            "the release mint's automatic path must resolve its candidate from "
+            "the freshly fetched protected main it just verified"
+        )
+
 
 def assert_recovery_stops_on_repeated_signature(release_recovery: str) -> None:
     """A deterministic failure must cost one confirmation, not the whole budget.
@@ -5423,6 +5482,26 @@ def assert_recovery_stops_on_repeated_signature(release_recovery: str) -> None:
             f"a differing second failure was reported as deterministic: {outputs}"
         )
 
+    # The stop rule is last-two equality, not all-attempts equality, and the two
+    # are only distinguishable on this shape. A failure that reproduces after a
+    # differing first attempt still has to stop, because the budget it would
+    # spend buys another identical failure. The all-attempts count is reported
+    # beside it rather than deciding it, so the alert can say which of the two
+    # it observed instead of asserting the stronger one either way.
+    outputs = execute_recovery_classifier(
+        source, [notarize, compile_failure, compile_failure]
+    )
+    if outputs.get("repeated") != "true":
+        raise AssertionError(
+            "a failure that reproduced after a differing first attempt was not "
+            f"read as a repeat: {outputs}"
+        )
+    if outputs.get("distinct") != "2":
+        raise AssertionError(
+            "the all-attempts signature count did not observe the differing "
+            f"first attempt: {outputs}"
+        )
+
     # One attempt cannot repeat anything. Stopping here would retire a release
     # on its first failure and defeat the controller's entire purpose.
     outputs = execute_recovery_classifier(source, [compile_failure])
@@ -5444,11 +5523,14 @@ def assert_recovery_stops_on_repeated_signature(release_recovery: str) -> None:
             f"the retries: {outputs}"
         )
 
-    # The shape that produced the wrong answer in production: when one matrix
-    # leg fails, its siblings are cancelled, and a cancelled job still carries
-    # the step that actually failed. Filtering on the job's own conclusion
-    # first drops exactly that evidence and reads a repeat as two unreadable
-    # attempts, which retries a deterministic failure to the end of the budget.
+    # A shape GitHub can produce, hardened against rather than observed here:
+    # when one matrix leg fails its siblings can be cancelled, and a cancelled
+    # job still carries the step that actually failed. Filtering on the job's
+    # own conclusion first drops exactly that evidence and reads a repeat as two
+    # unreadable attempts, which retries a deterministic failure to the end of
+    # the budget. The runs this classifier was built from carried no cancelled
+    # job at all, so a step-primary read is defence and not the repair: what
+    # cost three attempts there was classifying only once the budget was gone.
     cancelled = ("build-artifacts (aarch64-unknown-linux-musl)", "Build release binaries", "cancelled")
     outputs = execute_recovery_classifier(source, [cancelled, cancelled])
     if outputs.get("repeated") != "true":

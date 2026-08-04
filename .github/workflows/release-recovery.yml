@@ -287,11 +287,15 @@ jobs:
           #
           # Failing STEPS are the primary evidence and the job's own conclusion
           # is deliberately not a filter on them. A job whose leg is cancelled
-          # when a sibling fails still reports its own failed step, and reading
-          # the job conclusion first would drop exactly that step and report a
-          # repeat as two different failures. The job-level fallback exists only
-          # for a job that failed while recording no failing step at all, such
-          # as a runner startup failure, which would otherwise be unreadable.
+          # when a sibling fails can still carry its own failed step, and
+          # reading the job conclusion first would drop exactly that step and
+          # report a repeat as two different failures. That shape did not appear
+          # in the runs this classifier was built from, so treating steps as
+          # primary is hardening rather than the repair; it can only ever find
+          # more evidence than a job-primary read, never less. The job-level
+          # fallback exists only for a job that failed while recording no
+          # failing step at all, such as a runner startup failure, which would
+          # otherwise be unreadable.
           signatures="${RUNNER_TEMP:-/tmp}/release-recovery-signatures"
           : > "$signatures"
           unknown=0
@@ -330,6 +334,13 @@ jobs:
           done
           latest="$(tail -1 "$signatures")"
           previous="$(tail -2 "$signatures" | head -1)"
+          # How many distinct signatures the whole run produced. This is
+          # reported, never acted on: the stop decision is last-two equality,
+          # because that is the earliest point at which a repeat is established.
+          # The two only ever differ on a run that already spent its budget, and
+          # they are kept apart so the alert can state which one it observed
+          # instead of asserting the stronger claim on both.
+          distinct="$(sort -u "$signatures" | wc -l | tr -d '[:space:]')"
           repeated=false
           if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] &&
              [ "$latest" = "$previous" ]; then
@@ -338,8 +349,9 @@ jobs:
           {
             echo "unknown=$unknown"
             echo "repeated=$repeated"
+            echo "distinct=$distinct"
           } >> "$GITHUB_OUTPUT"
-          echo "attempts=$ATTEMPTS unknown=$unknown repeated=$repeated"
+          echo "attempts=$ATTEMPTS unknown=$unknown repeated=$repeated distinct=$distinct"
           echo "latest failing steps: $latest"
 
       - name: Re-run failed jobs
@@ -379,6 +391,7 @@ jobs:
           EXHAUSTED: ${{ steps.resolve.outputs.exhausted }}
           UNKNOWN: ${{ steps.classify.outputs.unknown }}
           REPEATED: ${{ steps.classify.outputs.repeated }}
+          DISTINCT: ${{ steps.classify.outputs.distinct }}
         run: |
           set -euo pipefail
           # Advice given before classification is wrong in the direction that
@@ -412,7 +425,19 @@ jobs:
             advice="At least one attempt could not be read or carried no concrete failed step, so neither a deterministic nor a transient cause is established. Inspect the unrecorded attempts before choosing a same-release rerun or a source-fixed recut."
           elif [ "${REPEATED:-false}" = true ]; then
             verdict="repeated failure signature"
-            advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
+            # The stop rule is last-two equality, so a run that reached the end
+            # of its budget is one whose earlier attempts differed: an identical
+            # pair would have stopped it at two. Saying "every attempt" there
+            # would contradict the per-attempt list printed below and send an
+            # operator straight past the differing attempt, which is the
+            # evidence that the cause is not purely deterministic. The stronger
+            # sentence is therefore earned only by an all-attempts count of one,
+            # and an absent or unreadable count takes the narrower claim.
+            if [ "${DISTINCT:-0}" = 1 ]; then
+              advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
+            else
+              advice="The two most recent attempts failed in the same job and step set, so another immediate rerun is unlikely to help. Earlier attempts failed differently, which is evidence in its own right that the cause is not purely deterministic, so read the whole per-attempt list below before choosing a remedy. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
+            fi
           else
             verdict="varying failure signatures"
             advice="The observed failing job and step sets differed, which is consistent with the transient shape this controller exists for. Diagnose and rerun the same release rather than cutting a newer version unless the logs identify a source-bound defect."

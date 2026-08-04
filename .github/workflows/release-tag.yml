@@ -138,7 +138,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RAW_TAG: ${{ github.event.client_payload.tag }}
           RAW_SHA: ${{ github.event.client_payload.sha }}
-          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           git fetch origin \
@@ -153,10 +152,16 @@ jobs:
               tag="$RAW_TAG"
               sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
               ;;
-            workflow_run)
-              sha="$WORKFLOW_SHA"
-              ;;
-            schedule)
+            workflow_run|schedule)
+              # Both automatic arms read the same freshly fetched protected
+              # main. A trigger decides only when to look, never which commit to
+              # release, so the event's own head sha is deliberately not an
+              # input here: a rerun of an older CI run carries that run's sha,
+              # which resolves the version main carried then rather than the
+              # version it carries now. Reading main HEAD costs nothing, since
+              # the required-check gate re-derives everything from the resolved
+              # commit anyway, and it denies the event path a stale-candidate
+              # class the scheduled path structurally cannot reach.
               sha="$(git rev-parse refs/remotes/origin/main)"
               ;;
             *)
