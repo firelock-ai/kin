@@ -5462,6 +5462,17 @@ def assert_recovery_stops_on_repeated_signature(release_recovery: str) -> None:
     driven by the real jobs API shapes rather than by a stub's canned answer.
     """
 
+    classify_at = release_recovery.index(
+        "      - name: Classify the failure signature across attempts\n"
+    )
+    rerun_at = release_recovery.index("      - name: Re-run failed jobs\n")
+    if classify_at > rerun_at:
+        raise AssertionError(
+            "release recovery must classify the failure signature before it "
+            "requests any rerun, because a rerun issued ahead of the verdict "
+            "is exactly the blind retry this controller exists to prevent"
+        )
+
     source = recovery_step_script(
         release_recovery,
         "      - name: Classify the failure signature across attempts\n",
