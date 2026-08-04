@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::commands::auth::default_base_url_for_health;
 use crate::commands::setup::{
-    check_binary_in_path, configured_mcp_launcher, detect_shell, hook_filename, kin_dir, shell_rc,
-    shim_filename, CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
+    check_binary_in_path, configured_mcp_launcher, detect_shell, home_dir, hook_filename, kin_dir,
+    shell_rc, shim_filename, CANONICAL_NPM_MCP_COMMAND, CANONICAL_NPM_MCP_PACKAGE,
 };
 use crate::daemon_client::{InstalledStartupProtocol, SupervisorStartupSentinel};
 
@@ -877,10 +877,13 @@ struct McpClient {
 }
 
 pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, PathBuf)> {
-    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
-    let home = match home {
-        Some(h) => h,
-        None => return Vec::new(),
+    // Shares `setup::home_dir` deliberately. An unresolvable home here is not an
+    // error any caller sees — it is an empty client list, so setup would report
+    // success having configured nothing. Resolving the home by a stricter rule
+    // than the rest of setup uses is how that silence gets triggered.
+    let home = match home_dir() {
+        Ok(home) => home,
+        Err(_) => return Vec::new(),
     };
     let mut paths = vec![
         (
@@ -1328,7 +1331,7 @@ fn check_setup_ledger() -> HealthCheck {
 }
 
 fn check_editor() -> HealthCheck {
-    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    let home = home_dir().ok();
     let extensions_glob = home.as_ref().map(|h| h.join(".vscode").join("extensions"));
 
     let detected = extensions_glob
