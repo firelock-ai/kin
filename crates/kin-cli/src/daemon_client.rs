@@ -1504,6 +1504,18 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn purge_ignored(
+        &self,
+        request: &crate::commands::purge_ignored::PurgeIgnoredRequest,
+    ) -> Result<crate::commands::purge_ignored::PurgeIgnoredResponse> {
+        self.post_idempotent_json(
+            "/commands/purge-ignored",
+            request,
+            "send daemon-owned tracked-path purge request",
+        )
+        .await
+    }
+
     pub async fn rollback(
         &self,
         request: &crate::commands::rollback::RollbackRequest,

@@ -51,6 +51,7 @@ pub mod overview;
 pub mod pipeline;
 pub mod prepared_state;
 pub mod publish;
+pub mod purge_ignored;
 pub mod reconcile;
 pub mod ref_lookup;
 pub mod refs;

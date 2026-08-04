@@ -853,6 +853,16 @@ enum Command {
         #[arg(last = true)]
         task: Vec<String>,
     },
+    /// Retire tracked paths that ignore rules now cover. Reports without changing anything
+    /// unless --confirm is given.
+    PurgeIgnored {
+        /// Publish the removal instead of only reporting it
+        #[arg(long)]
+        confirm: bool,
+        /// Accept a purge that removes more than 75% of a non-trivial tree
+        #[arg(long)]
+        confirm_mass_deletion: bool,
+    },
     /// Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
@@ -3040,6 +3050,13 @@ fn main() -> Result<()> {
                     commands::capabilities::require_ready("open")?;
                     commands::session_run::open(editor, restrict_discovery, restrict_filesystem)
                         .await
+                }
+                Command::PurgeIgnored {
+                    confirm,
+                    confirm_mass_deletion,
+                } => {
+                    commands::capabilities::require_ready("purge-ignored")?;
+                    commands::purge_ignored::run(confirm, confirm_mass_deletion).await
                 }
                 Command::Reconcile {
                     session,

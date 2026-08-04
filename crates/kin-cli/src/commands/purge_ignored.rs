@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Wire types and CLI transport for retiring tracked paths that ignore rules
+//! now cover.
+//!
+//! Ignore rules never hide tracked paths, so a repository that admitted derived
+//! output before a rule existed keeps carrying it in graph truth forever. That
+//! retention is deliberate: an ignore rule must never turn into a silent
+//! deletion. Retiring the backlog is therefore an operator action with its own
+//! surface, and this is that surface.
+//!
+//! The default is a dry run. It names how many tracked paths the current rules
+//! cover, how many would remain, and a bounded sample of the paths themselves.
+//! Nothing moves until `--confirm`.
+
+use anyhow::{anyhow, Context, Result};
+use kin_model::{AuthorId, OperationId, RepositoryId};
+use serde::{Deserialize, Serialize};
+
+pub const PURGE_IGNORED_SCHEMA: &str = "kin.purge-ignored.v1";
+
+/// How many purged paths the report carries back.
+///
+/// A purge can cover millions of paths. The count is the decision input; the
+/// sample only lets an operator confirm the rules match what they expected.
+pub const REPORTED_PATH_SAMPLE: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurgeIgnoredRequest {
+    /// Publish the removal. Without it the daemon only reports what it would do.
+    pub confirm: bool,
+    /// Confirm a purge that removes more than 75% of a non-trivial tree.
+    ///
+    /// A repository whose graph is mostly build output legitimately trips the
+    /// mass-deletion guard, and that is exactly the case this command exists to
+    /// fix, so the operator can accept it without disabling the guard globally.
+    pub confirm_mass_deletion: bool,
+    pub operation_id: OperationId,
+    pub actor: AuthorId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PurgeIgnoredReport {
+    pub schema: String,
+    pub repository_id: RepositoryId,
+    /// Whether the repository states its own rules in `.kinignore`.
+    pub kinignore_present: bool,
+    /// Tracked paths before this purge.
+    pub tracked_total: usize,
+    /// Tracked paths the current ignore rules cover.
+    pub purge_count: usize,
+    /// Tracked paths that remain.
+    pub retained_total: usize,
+    /// Up to [`REPORTED_PATH_SAMPLE`] of the covered paths, in path order.
+    pub sample_paths: Vec<String>,
+    /// True when `sample_paths` is shorter than `purge_count`.
+    pub sample_truncated: bool,
+    /// False for a dry run.
+    pub applied: bool,
+    /// Present only when this purge published a transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeIgnoredResponse {
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub mutated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<PurgeIgnoredReport>,
+}
+
+/// Render the operator-facing summary for one purge report.
+///
+/// Kept separate from transport so the wording is asserted directly rather than
+/// through a daemon round trip.
+pub fn summary_lines(report: &PurgeIgnoredReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !report.kinignore_present {
+        lines.push(
+            "This repository has no .kinignore; the built-in defaults decided this set."
+                .to_string(),
+        );
+    }
+    lines.push(format!(
+        "{} of {} tracked paths are covered by ignore rules; {} would remain.",
+        report.purge_count, report.tracked_total, report.retained_total
+    ));
+    for path in &report.sample_paths {
+        lines.push(format!("  {path}"));
+    }
+    if report.sample_truncated {
+        lines.push(format!(
+            "  ... {} more",
+            report.purge_count.saturating_sub(report.sample_paths.len())
+        ));
+    }
+    if report.purge_count == 0 {
+        lines.push("Nothing to purge.".to_string());
+    } else if report.applied {
+        lines.push(format!("Untracked {} paths.", report.purge_count));
+    } else {
+        lines.push("Dry run; nothing changed. Re-run with --confirm to untrack these.".to_string());
+    }
+    lines
+}
+
+pub async fn run(confirm: bool, confirm_mass_deletion: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolve current directory")?;
+    let layout = crate::commands::require_repository_layout_at(&cwd)?;
+    let base_url = crate::daemon_client::resolve_daemon_url(&layout)
+        .await?
+        .ok_or_else(|| anyhow!("Kin daemon is required to retire tracked paths"))?;
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, &layout)?;
+    let response = client
+        .purge_ignored(&PurgeIgnoredRequest {
+            confirm,
+            confirm_mass_deletion,
+            operation_id: OperationId::new(),
+            actor: AuthorId::new(kin_core::whoami()),
+        })
+        .await?;
+    for line in &response.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(purge_count: usize, applied: bool, kinignore_present: bool) -> PurgeIgnoredReport {
+        PurgeIgnoredReport {
+            schema: PURGE_IGNORED_SCHEMA.to_string(),
+            repository_id: RepositoryId::new("purge-summary").unwrap(),
+            kinignore_present,
+            tracked_total: 100,
+            purge_count,
+            retained_total: 100 - purge_count,
+            sample_paths: vec!["target/debug/app.o".to_string()],
+            sample_truncated: purge_count > 1,
+            applied,
+            authority_generation: applied.then_some(7),
+        }
+    }
+
+    #[test]
+    fn dry_run_summary_names_counts_and_refuses_to_claim_a_change() {
+        let lines = summary_lines(&report(40, false, true));
+        let text = lines.join("\n");
+        assert!(text.contains("40 of 100 tracked paths"), "{text}");
+        assert!(text.contains("60 would remain"), "{text}");
+        assert!(text.contains("target/debug/app.o"), "{text}");
+        assert!(text.contains("... 39 more"), "{text}");
+        assert!(text.contains("Dry run; nothing changed"), "{text}");
+        assert!(!text.contains("Untracked"), "{text}");
+        assert!(!text.contains("no .kinignore"), "{text}");
+    }
+
+    #[test]
+    fn applied_summary_reports_the_change_instead_of_a_dry_run() {
+        let lines = summary_lines(&report(40, true, true));
+        let text = lines.join("\n");
+        assert!(text.contains("Untracked 40 paths."), "{text}");
+        assert!(!text.contains("Dry run"), "{text}");
+    }
+
+    #[test]
+    fn an_unconfigured_repository_is_told_the_defaults_decided_the_set() {
+        let text = summary_lines(&report(40, false, false)).join("\n");
+        assert!(text.contains("no .kinignore"), "{text}");
+        assert!(
+            text.contains("built-in defaults decided this set"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_purge_says_so_rather_than_offering_confirm() {
+        let mut empty = report(0, false, true);
+        empty.sample_paths.clear();
+        empty.sample_truncated = false;
+        let text = summary_lines(&empty).join("\n");
+        assert!(text.contains("Nothing to purge."), "{text}");
+        assert!(!text.contains("--confirm"), "{text}");
+    }
+}

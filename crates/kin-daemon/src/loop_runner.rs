@@ -345,10 +345,12 @@ fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<b
     Ok(false)
 }
 
-fn publish_exact_workspace_tree(
+/// Returns the authority generation this admission published, or `None` when
+/// the desired tree already matched authority and nothing moved.
+pub(crate) fn publish_exact_workspace_tree(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let Some(admission) = crate::repository_commit::publish_workspace_tree(
@@ -359,7 +361,7 @@ fn publish_exact_workspace_tree(
         kin_model::AuthorId::new(kin_core::whoami()),
     )?
     else {
-        return Ok(());
+        return Ok(None);
     };
     state.record_repository_authority_commit(admission.receipt.generation)?;
     info!(
@@ -369,7 +371,7 @@ fn publish_exact_workspace_tree(
         file_deltas = admission.file_count,
         "admitted exact workspace tree into repository authority"
     );
-    Ok(())
+    Ok(Some(admission.receipt.generation))
 }
 
 fn invalid_tree_transition(error: impl std::fmt::Display) -> DaemonError {
@@ -395,7 +397,7 @@ fn mass_deletion_refused(removed: u64, total_graph_files: u64) -> DaemonError {
 }
 
 /// Read the repository roots the next observation will be planned against.
-fn current_authority_roots(state: &DaemonState) -> Result<kin_model::RootBundle> {
+pub(crate) fn current_authority_roots(state: &DaemonState) -> Result<kin_model::RootBundle> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
@@ -530,7 +532,7 @@ fn exact_tree_admission(
             previous.clone(),
             desired_tree,
         );
-        publish_exact_workspace_tree(state, &admitted)?;
+        let _ = publish_exact_workspace_tree(state, &admitted)?;
         state.graph.apply_transaction_delta(&TransactionDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
@@ -2350,7 +2352,11 @@ mod tests {
 /// threshold to the shared `graph_collapse_is_wipe` predicate so the fs-sync
 /// guard and the shutdown guard stay consistent (>75% gone, baseline ≥ 16). An
 /// explicit operator override (`allow_override`) always permits the deletions.
-fn should_block_mass_deletion(removed: u64, total_graph_files: u64, allow_override: bool) -> bool {
+pub(crate) fn should_block_mass_deletion(
+    removed: u64,
+    total_graph_files: u64,
+    allow_override: bool,
+) -> bool {
     if allow_override {
         return false;
     }
