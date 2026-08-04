@@ -994,10 +994,65 @@ struct SetupPlan {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn home_dir() -> Result<PathBuf> {
-    directories::BaseDirs::new()
-        .map(|d| d.home_dir().to_path_buf())
-        .context("could not determine home directory")
+/// The home directory every setup artifact is written relative to.
+///
+/// `directories::BaseDirs::new()` resolves a Windows home only when
+/// `FOLDERID_Profile`, `FOLDERID_RoamingAppData` **and** `FOLDERID_LocalAppData`
+/// all resolve — each of them existence-verified, because the crate passes
+/// `dwFlags = 0` — and it never reads `USERPROFILE`. A profile root carrying no
+/// `AppData` subtree therefore collapses the whole constructor to `None`, and
+/// setup aborts with "could not determine home directory" before writing
+/// anything. That is not hypothetical: it is exactly how the public install
+/// proof's isolated-home leg fails on `windows-latest`, where the isolated
+/// profile is a bare directory.
+///
+/// So on Windows the profile root the environment explicitly names wins, then
+/// the profile-only known-folder lookup, and the AppData-requiring constructor
+/// is only the last resort. Preferring the explicit name is also what keeps an
+/// isolated home *isolated*: a lookup that answers from the machine's own known
+/// folders would quietly resolve the real profile instead of the override, so a
+/// caller that believed it had redirected the home would be writing to the
+/// user's real one.
+///
+/// Unix is deliberately untouched and stays on `BaseDirs`, which already reads
+/// `HOME` first and falls back to the passwd database.
+pub(crate) fn home_dir() -> Result<PathBuf> {
+    resolve_home_dir(
+        cfg!(windows),
+        |key| env::var_os(key),
+        || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+        || directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+    )
+    .context("could not determine home directory")
+}
+
+/// The platform-conditional policy behind [`home_dir`], with the platform, the
+/// environment, and both OS lookups taken as arguments.
+///
+/// The Windows arm is a runtime branch rather than a `#[cfg]` block on purpose:
+/// gated behind `cfg`, it would be compiled — and therefore tested — only on
+/// the one platform this fleet has no host for, which is how the defect above
+/// survived to a release proof. As written it is compiled and exercised on
+/// every host, and it reads nothing ambient, so a test states the whole
+/// environment it is asserting against.
+///
+/// `known_profile_root` is the profile-only lookup (`FOLDERID_Profile` on
+/// Windows); `base_dirs_home` is the stricter `BaseDirs` constructor.
+fn resolve_home_dir(
+    windows: bool,
+    var_os: impl Fn(&str) -> Option<OsString>,
+    known_profile_root: impl FnOnce() -> Option<PathBuf>,
+    base_dirs_home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if windows {
+        // An empty value is not a home; every Windows tool that reads this
+        // name treats it the same as unset.
+        if let Some(profile) = var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(profile));
+        }
+        return known_profile_root().or_else(base_dirs_home);
+    }
+    base_dirs_home()
 }
 
 pub(crate) fn kin_dir() -> Result<PathBuf> {
@@ -3114,7 +3169,7 @@ fn current_mcp_repair_targets_excluding_with_topology(
 
     let mut targets = Vec::new();
     let mut paths = crate::commands::health::mcp_client_config_paths();
-    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+    if let Ok(home) = home_dir() {
         paths.push((
             "antigravity",
             "Google Antigravity legacy",
@@ -13760,6 +13815,138 @@ mod tests {
             .get_envs()
             .find(|(candidate, _)| *candidate == OsStr::new(key))
             .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    /// The install proof's isolated Windows home, verbatim: `USERPROFILE` names
+    /// a directory that exists but carries no `AppData` subtree, so the
+    /// AppData-requiring `BaseDirs` constructor collapses to `None`. That
+    /// `None` used to be the entire answer, and `kin setup` aborted with "could
+    /// not determine home directory" before writing a single artifact.
+    #[test]
+    fn windows_home_resolves_an_isolated_profile_with_no_app_data_subtree() {
+        let isolated = PathBuf::from(r"D:\a\_temp\kin-proof-claude-fallback-home");
+
+        let resolved = resolve_home_dir(
+            true,
+            |key| (key == "USERPROFILE").then(|| isolated.as_os_str().to_os_string()),
+            // Whichever known-folder lookup the bare profile defeats, the
+            // resolution must not depend on it.
+            || None,
+            || None,
+        );
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(isolated.as_path()),
+            "a Windows profile root with no AppData subtree must still resolve"
+        );
+    }
+
+    /// The explicitly named profile beats whatever the machine's own known
+    /// folders report. Losing that ordering does not fail loudly: setup would
+    /// succeed against the real profile while the caller believed it had
+    /// redirected the home, which both writes where it must not and turns the
+    /// isolated leg of the install proof into a test of nothing.
+    #[test]
+    fn windows_home_prefers_the_named_profile_over_the_machine_profile() {
+        let isolated = PathBuf::from(r"D:\a\_temp\kin-proof-claude-fallback-home");
+        let machine = PathBuf::from(r"C:\Users\runneradmin");
+
+        let resolved = resolve_home_dir(
+            true,
+            |key| (key == "USERPROFILE").then(|| isolated.as_os_str().to_os_string()),
+            || Some(machine.clone()),
+            || Some(machine.clone()),
+        );
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(isolated.as_path()),
+            "an explicit USERPROFILE must outrank the machine's known folders"
+        );
+    }
+
+    /// Without a usable `USERPROFILE`, Windows falls through the profile-only
+    /// lookup and only then to the stricter constructor — and still reports
+    /// `None` when nothing resolves, so a genuinely homeless environment keeps
+    /// failing loudly instead of inventing a path.
+    #[test]
+    fn windows_home_falls_through_profile_root_then_base_dirs() {
+        let profile = PathBuf::from(r"C:\Users\runneradmin");
+        let base_dirs = PathBuf::from(r"C:\Users\stricter");
+
+        for unusable in [None, Some(OsString::new())] {
+            let resolved = resolve_home_dir(
+                true,
+                |_| unusable.clone(),
+                || Some(profile.clone()),
+                || Some(base_dirs.clone()),
+            );
+            assert_eq!(
+                resolved.as_deref(),
+                Some(profile.as_path()),
+                "an unset or empty USERPROFILE must fall through to the profile lookup"
+            );
+        }
+
+        assert_eq!(
+            resolve_home_dir(true, |_| None, || None, || Some(base_dirs.clone())).as_deref(),
+            Some(base_dirs.as_path()),
+            "the stricter constructor is still the last resort, not a removed step"
+        );
+        assert_eq!(
+            resolve_home_dir(true, |_| None, || None, || None),
+            None,
+            "no resolvable home must stay an error rather than a guess"
+        );
+    }
+
+    /// Unix keeps exactly the resolution it had — the `BaseDirs` answer
+    /// verbatim, including its `None`. `USERPROFILE` is a Windows name and must
+    /// not become a Unix input, and the profile-only lookup must not run there.
+    #[test]
+    fn unix_home_resolution_is_untouched_by_the_windows_arm() {
+        let base_dirs = PathBuf::from("/Users/runner");
+        let stray = PathBuf::from("/tmp/kin-proof-claude-fallback-home");
+
+        assert_eq!(
+            resolve_home_dir(
+                false,
+                |_| Some(stray.as_os_str().to_os_string()),
+                || Some(stray.clone()),
+                || Some(base_dirs.clone()),
+            )
+            .as_deref(),
+            Some(base_dirs.as_path()),
+            "Unix must ignore both Windows sources"
+        );
+        assert_eq!(
+            resolve_home_dir(
+                false,
+                |_| Some(stray.as_os_str().to_os_string()),
+                || Some(stray.clone()),
+                || None,
+            ),
+            None,
+            "Unix must keep failing exactly where BaseDirs fails"
+        );
+    }
+
+    /// The wiring, not just the policy: on this platform `home_dir` is still
+    /// the `BaseDirs` expression it was before the Windows arm existed.
+    ///
+    /// Both sides read the real environment, so the read is taken inside the
+    /// mutation domain — otherwise a neighbouring test's scoped `HOME` could
+    /// land between the two calls and fail this on a lie.
+    #[cfg(unix)]
+    #[test]
+    fn unix_home_dir_still_resolves_exactly_what_base_dirs_reports() {
+        let _domain = EnvVarGuard::new();
+
+        assert_eq!(
+            home_dir().ok(),
+            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+        );
     }
 
     #[test]
