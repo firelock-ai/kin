@@ -15047,20 +15047,89 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         Ok(())
     }
 
+    /// What a Windows deferred-uninstall poll observed.
+    ///
+    /// `Failed` reports state that can never become `Satisfied`. Polling past it
+    /// only spends the remaining timeout and reprints the same terminal reason.
+    #[cfg(windows)]
+    enum WindowsWaitState {
+        Satisfied,
+        Pending,
+        Failed(String),
+    }
+
     #[cfg(windows)]
     fn wait_for_windows_condition(
         label: &str,
         timeout: Duration,
-        mut condition: impl FnMut() -> bool,
+        mut condition: impl FnMut() -> WindowsWaitState,
     ) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            if condition() {
-                return Ok(());
+        loop {
+            match condition() {
+                WindowsWaitState::Satisfied => return Ok(()),
+                WindowsWaitState::Failed(detail) => {
+                    anyhow::bail!("{label} failed before its deadline: {detail}")
+                }
+                WindowsWaitState::Pending => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for {label}");
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        anyhow::bail!("timed out waiting for {label}")
+    }
+
+    /// Run a test child that launches the production detached uninstall helper.
+    ///
+    /// The helper outlives the child by design. `Command::output` captures
+    /// through pipes, and `CreateProcess` hands every inheritable handle a
+    /// process holds to the process it spawns, so the child's pipe ends reach
+    /// the helper even though the helper's own stdio is the null device.
+    /// Reading those pipes to end-of-file therefore waits for the helper, not
+    /// for the child, while the helper waits for state this process publishes
+    /// only after the child has been reaped. Capturing into files instead keeps
+    /// the wait bound to the child's own lifetime.
+    #[cfg(windows)]
+    fn run_uninstall_test_child(
+        command: &mut Command,
+        capture_root: &Path,
+        tag: &str,
+    ) -> Result<std::process::Output> {
+        let stdout_path = capture_root.join(format!("{tag}-child-stdout.log"));
+        let stderr_path = capture_root.join(format!("{tag}-child-stderr.log"));
+        let stdout = fs::File::create(&stdout_path).with_context(|| {
+            format!(
+                "failed to create uninstall child stdout capture {}",
+                stdout_path.display()
+            )
+        })?;
+        let stderr = fs::File::create(&stderr_path).with_context(|| {
+            format!(
+                "failed to create uninstall child stderr capture {}",
+                stderr_path.display()
+            )
+        })?;
+        let status = command
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .status()
+            .context("failed to run the native Windows uninstall test child")?;
+        Ok(std::process::Output {
+            status,
+            stdout: fs::read(&stdout_path).with_context(|| {
+                format!(
+                    "failed to read uninstall child stdout capture {}",
+                    stdout_path.display()
+                )
+            })?,
+            stderr: fs::read(&stderr_path).with_context(|| {
+                format!(
+                    "failed to read uninstall child stderr capture {}",
+                    stderr_path.display()
+                )
+            })?,
+        })
     }
 
     #[cfg(windows)]
@@ -15087,9 +15156,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                 command.env_remove(WINDOWS_UNINSTALL_HELPER_RELEASE);
             }
         }
-        let output = command
-            .output()
-            .context("failed to launch the native Windows uninstall test child")?;
+        let capture_root = result_path
+            .parent()
+            .context("native uninstall child result path has no parent")?;
+        let output = run_uninstall_test_child(&mut command, capture_root, mode)?;
         if !output.status.success() {
             // If the child failed after launching the production helper, let
             // that helper finish before the caller restores the real User
@@ -15109,7 +15179,13 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                     wait_for_windows_condition(
                         "failed child uninstall helper to exit before PATH restoration",
                         Duration::from_secs(45),
-                        || !helper_script.exists(),
+                        || {
+                            if helper_script.exists() {
+                                WindowsWaitState::Pending
+                            } else {
+                                WindowsWaitState::Satisfied
+                            }
+                        },
                     )?;
                 }
             }
@@ -15129,7 +15205,8 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     ) -> Result<String> {
         let test_name =
             "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup";
-        let output = Command::new(env::current_exe()?)
+        let mut command = Command::new(env::current_exe()?);
+        command
             .args([test_name, "--exact", "--nocapture"])
             .env(
                 WINDOWS_FULL_UNINSTALL_CHILD_MODE,
@@ -15137,9 +15214,12 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             )
             .env(WINDOWS_FULL_UNINSTALL_CHILD_ROOT, root)
             .env(WINDOWS_FULL_UNINSTALL_CHILD_RESULT, result_path)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .context("failed to launch the parent-incarnation mismatch test child")?;
+            .stdin(std::process::Stdio::null());
+        let capture_root = result_path
+            .parent()
+            .context("parent-incarnation mismatch result path has no parent")?;
+        let output =
+            run_uninstall_test_child(&mut command, capture_root, "parent-incarnation-mismatch")?;
         anyhow::ensure!(
             output.status.success(),
             "parent-incarnation mismatch child failed:\nstdout:\n{}\nstderr:\n{}",
@@ -15265,15 +15345,34 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "successful deferred uninstall",
             Duration::from_secs(120),
             || {
+                // A journalled helper error is terminal: the helper writes its
+                // log on the way out, so no later poll can clear it. An empty
+                // log is the same journal still being written, so keep polling
+                // rather than reporting a terminal error with no text in it.
                 if success.helper_log.is_file() {
                     let log_content = fs::read_to_string(&success.helper_log).unwrap_or_default();
-                    eprintln!("deferred uninstall helper logged error:\n{log_content}");
-                    return false;
+                    if log_content.trim().is_empty() {
+                        return WindowsWaitState::Pending;
+                    }
+                    return WindowsWaitState::Failed(format!(
+                        "the deferred uninstall helper journalled a terminal error to {}:\n{}",
+                        success.helper_log.display(),
+                        log_content.trim_end()
+                    ));
                 }
-                !success.incomplete_marker.exists()
+                // The helper removes its own script last, so its absence is what
+                // proves the teardown ran to completion rather than catching the
+                // helper part-way through it.
+                if !success.incomplete_marker.exists()
                     && !success.retired.exists()
                     && !success.helper_ready.exists()
                     && !success.helper_ready_publishing.exists()
+                    && !success.helper_script.exists()
+                {
+                    WindowsWaitState::Satisfied
+                } else {
+                    WindowsWaitState::Pending
+                }
             },
         )?;
         let post_cleanup_lock = crate::commands::update::InstallRootLock::acquire(&success_root)
@@ -15325,7 +15424,18 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         wait_for_windows_condition(
             "failed deferred uninstall journal",
             Duration::from_secs(120),
-            || failure.helper_log.is_file(),
+            || {
+                // The helper journals its refusal inside `catch` and only then
+                // clears the handshake artifacts in `finally`, removing its own
+                // script last. Waiting for the journal alone would observe the
+                // helper mid-teardown; waiting for the script to disappear
+                // proves the whole teardown ran.
+                if failure.helper_log.is_file() && !failure.helper_script.exists() {
+                    WindowsWaitState::Satisfied
+                } else {
+                    WindowsWaitState::Pending
+                }
+            },
         )?;
         anyhow::ensure!(
             !failure.helper_ready.exists(),
