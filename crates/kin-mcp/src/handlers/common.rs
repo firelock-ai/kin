@@ -3,10 +3,11 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use kin_model::change::TreeEntry;
 use kin_model::entity::{Entity, EntityKind, SourceSpan};
-use kin_model::graph::{EntityFilter, GraphStore};
+use kin_model::graph::{ChangeStore, EntityFilter, GraphStore};
 use kin_model::ids::{
     EntityId, Hash256, IntentId, LanguageId, RepoPath, SemanticChangeId, SessionId,
 };
@@ -21,8 +22,13 @@ thread_local! {
     pub static LAST_READ_SOURCE: std::cell::Cell<&'static str> = std::cell::Cell::new("unknown");
 }
 
+use super::repository_authority::{ActiveRepositoryAuthority, WorkspaceReadSample};
 use crate::error::{McpError, Result};
 use kin_core::LocalRepositoryAuthorityBinding;
+
+pub use super::repository_authority::{
+    repository_authority_opens_on_this_thread, REPOSITORY_AUTHORITY_OPEN_COUNT,
+};
 use kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
 
 // ── Parameter extraction helpers ──
@@ -449,12 +455,24 @@ pub fn trace_body<G: GraphStore>(
     entity: &Entity,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<String> {
-    Ok(read_entity_source_excerpt_detailed(
-        store,
+    trace_body_held(
+        &HeldSourceAuthority::new(store, repository_authority),
+        entity,
+    )
+}
+
+/// A trace step's body, served from authority this request already holds. A
+/// trace walks a chain and reads a body per step, so the per-read variant costs
+/// one authority recovery and one whole-history replay per step.
+pub fn trace_body_held<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+) -> Result<String> {
+    Ok(read_entity_source_excerpt_detailed_held(
+        held,
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
-        repository_authority,
         EntitySourceScope::WorkspaceHead,
     )?
     .map(|source| source.body)
@@ -827,13 +845,29 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     input_literal: i64,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<Option<Vec<TraceEvaluationStep>>> {
+    evaluate_trace_chain_held(
+        &HeldSourceAuthority::new(store, repository_authority),
+        chain,
+        input_literal,
+    )
+}
+
+/// Evaluate a trace chain from authority this request already holds.
+///
+/// The walk reads at least two bodies per step plus one per constant, so this is
+/// the variant a request must use; the per-read one multiplies a full authority
+/// recovery by the chain length.
+pub fn evaluate_trace_chain_held<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    chain: &[Entity],
+    input_literal: i64,
+) -> Result<Option<Vec<TraceEvaluationStep>>> {
+    let store = held.store();
     let mut constant_values = HashMap::new();
     for step in chain {
-        let body = trace_body(store, step, repository_authority)?;
+        let body = trace_body_held(held, step)?;
         for constant in trace_constants_for_step(store, step, &body)? {
-            if let Some(value) =
-                parse_trace_constant_value(&trace_body(store, &constant, repository_authority)?)
-            {
+            if let Some(value) = parse_trace_constant_value(&trace_body_held(held, &constant)?) {
                 constant_values
                     .entry(constant.name.clone())
                     .or_insert(value);
@@ -845,7 +879,7 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     let mut evaluation = Vec::new();
 
     for step in chain.iter().rev() {
-        let body = trace_body(store, step, repository_authority)?;
+        let body = trace_body_held(held, step)?;
         let Some((value, detail)) =
             evaluate_trace_step_body(&body, input_literal, &function_values, &constant_values)
         else {
@@ -978,6 +1012,12 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<String, ReferenceRow> = HashMap::new();
 
+    // One held authority for the whole reference set. This projects a body per
+    // REFERENCING entity, so it is the same multi-entity shape the retrieval
+    // surfaces have: deriving authority and committed state per row pays a full
+    // authority recovery and a whole-history replay once per caller found.
+    let held = HeldSourceAuthority::new(store, repository_authority);
+
     for rel in store
         .get_all_relations_for_entity(entity_id)
         .map_err(McpError::graph)?
@@ -997,12 +1037,8 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
-        let snippet = read_bounded_entity_snippet(
-            store,
-            &entity,
-            repository_authority,
-            EntitySourceScope::WorkspaceHead,
-        )?;
+        let snippet =
+            read_bounded_entity_snippet_held(&held, &entity, EntitySourceScope::WorkspaceHead)?;
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
             entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
@@ -1301,6 +1337,20 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
     )))
 }
 
+/// The text a retained authority failure must replay verbatim.
+///
+/// A session opens authority once and reports that same failure to every read
+/// that needed it, so the failure has to survive as text. `McpError::Context`
+/// prints a `context error: ` prefix, so retaining the Display string and
+/// re-wrapping it would nest that prefix once per replay and drift the message
+/// away from the one a single read reports.
+fn retained_gap_message(error: McpError) -> String {
+    match error {
+        McpError::Context(message) => message,
+        other => other.to_string(),
+    }
+}
+
 /// Which graph-owned repository state a source projection resolves against.
 ///
 /// `EntitySourceScope::WorkspaceHead` reads the workspace's exact graph-owned
@@ -1340,12 +1390,11 @@ pub enum EntitySourceScope {
 /// Callers use this to enforce artifact-identity binding where history can
 /// support it, so a replay that cannot answer must not turn into a read failure.
 fn committed_introducing_change<G: GraphStore>(
-    store: &G,
+    held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     change_id: &SemanticChangeId,
 ) -> Option<SemanticChangeId> {
-    store
-        .resolve_graph_at(change_id)
+    held.graph_at(change_id)
         .ok()?
         .entity_revisions
         .get(&entity.id)?
@@ -1409,10 +1458,180 @@ pub fn span_source_coherence(
     }
 }
 
+/// One request's held repository authority and the committed states its source
+/// reads derive from.
+///
+/// A source read needs three things a store cannot answer on its own: an open
+/// repository authority (for the workspace tree and the source blobs), the
+/// committed graph state at the change being read, and the tree at the change
+/// that introduced an entity. Each is expensive and each is a pure function of
+/// the store plus a change id, so deriving them once per REQUEST and deriving
+/// them once per RESULT are the same answer at very different cost. Before this
+/// type existed the projection derived all three per entity, which is what made
+/// a 40-candidate `semantic_locate` perform 40 authority opens and 40 whole-
+/// history replays and put a real repository out of service.
+///
+/// The reuse is sound because it is scoped, not cached. The session borrows ONE
+/// store snapshot for its whole life, so a memoized replay is byte-identical to
+/// the replay it replaces -- `resolve_graph_at` is deterministic in (store,
+/// change). Nothing survives the request: a later request opens authority again
+/// and sees whatever the store holds then. There is deliberately no process-wide
+/// cache here, because that is the shape that can serve authority the store has
+/// already moved past.
+///
+/// Reusing one sample is also strictly MORE coherent than re-sampling per
+/// entity. [`WorkspaceReadSample`] exists because pairing a tree from one
+/// generation with provenance from another is a real defect; sampling once per
+/// entity reintroduced exactly that hazard across a result set, where page 1 of
+/// a response could describe a generation page 40 no longer read from.
+///
+/// Everything is derived lazily. An entity with no span or no file origin needs
+/// no authority at all, and must keep returning "no source" rather than an
+/// authority error, so constructing a session neither opens authority nor
+/// replays anything.
+///
+/// [`WorkspaceReadSample`]: super::repository_authority::WorkspaceReadSample
+pub struct HeldSourceAuthority<'store, G: GraphStore> {
+    store: &'store G,
+    binding: Option<LocalRepositoryAuthorityBinding>,
+    /// One open attempt for the session. The error is retained as its message so
+    /// every entity that needs authority reports the same gap this session hit,
+    /// instead of re-attempting a recovery that already failed.
+    authority: std::sync::OnceLock<std::result::Result<ActiveRepositoryAuthority, String>>,
+    head_sample: std::sync::OnceLock<std::result::Result<Arc<WorkspaceReadSample>, String>>,
+    graph_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::graph::ResolvedGraphState>>>,
+    tree_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::ResolvedTree>>>,
+    /// Replays this session actually performed, as opposed to served from its
+    /// memo. The bound a query path has to hold is on this number, not on
+    /// elapsed time, so it is observable.
+    replays: AtomicU64,
+}
+
+impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
+    /// Hold authority for one request against one store snapshot.
+    ///
+    /// `repository_authority` is the startup-pinned binding, not an open: this
+    /// constructor performs no IO. A `None` binding is an ordinary state (a
+    /// daemon serving hosted snapshot authority), and only a read that actually
+    /// needs local authority turns it into a gap.
+    pub fn new(
+        store: &'store G,
+        repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    ) -> Self {
+        Self {
+            store,
+            binding: repository_authority.cloned(),
+            authority: std::sync::OnceLock::new(),
+            head_sample: std::sync::OnceLock::new(),
+            graph_at: Mutex::new(HashMap::new()),
+            tree_at: Mutex::new(HashMap::new()),
+            replays: AtomicU64::new(0),
+        }
+    }
+
+    /// Whole-history replays this session performed. A query path that derives
+    /// committed state per request holds this at a small constant; one that
+    /// derives it per result does not.
+    pub fn replays_performed(&self) -> u64 {
+        self.replays.load(Ordering::SeqCst)
+    }
+
+    /// The store this session is bound to, for graph reads that ride alongside
+    /// the source projection in the same walk.
+    pub fn store(&self) -> &'store G {
+        self.store
+    }
+
+    fn authority(&self) -> Result<&ActiveRepositoryAuthority> {
+        match self.authority.get_or_init(|| {
+            let binding = self.binding.as_ref().ok_or_else(|| {
+                "graph authority gap: this MCP runtime has no startup-pinned local repository \
+                 authority binding"
+                    .to_string()
+            })?;
+            ActiveRepositoryAuthority::open(binding).map_err(retained_gap_message)
+        }) {
+            Ok(authority) => Ok(authority),
+            Err(message) => Err(record_graph_source_gap(McpError::Context(message.clone()))),
+        }
+    }
+
+    /// The one instant of workspace authority this request reads at.
+    fn workspace_sample(&self) -> Result<&WorkspaceReadSample> {
+        match self.head_sample.get_or_init(|| {
+            self.authority()
+                .and_then(|authority| authority.workspace_sample())
+                .map(Arc::new)
+                .map_err(retained_gap_message)
+        }) {
+            Ok(sample) => Ok(sample.as_ref()),
+            Err(message) => Err(record_graph_source_gap(McpError::Context(message.clone()))),
+        }
+    }
+
+    /// The committed graph state at `change`, replayed at most once per session.
+    ///
+    /// The store's own error is returned unwrapped so each call site keeps the
+    /// message it already reports for a failed replay.
+    fn graph_at(
+        &self,
+        change: &SemanticChangeId,
+    ) -> std::result::Result<Arc<kin_model::graph::ResolvedGraphState>, <G as ChangeStore>::Error>
+    {
+        if let Some(state) = self.memo_hit(&self.graph_at, change) {
+            return Ok(state);
+        }
+        // The replay runs with no lock held: it is the expensive step, and a
+        // session shared across threads must not serialize on it. Losing the
+        // race costs one redundant replay and cannot produce a different answer,
+        // because the store is fixed for the session's life.
+        let resolved = Arc::new(self.store.resolve_graph_at(change)?);
+        self.replays.fetch_add(1, Ordering::SeqCst);
+        Ok(self.memo_fill(&self.graph_at, *change, resolved))
+    }
+
+    /// The repository tree at `change`, replayed at most once per session.
+    fn tree_at(
+        &self,
+        change: &SemanticChangeId,
+    ) -> std::result::Result<Arc<kin_model::ResolvedTree>, <G as ChangeStore>::Error> {
+        if let Some(tree) = self.memo_hit(&self.tree_at, change) {
+            return Ok(tree);
+        }
+        let resolved = Arc::new(self.store.resolve_tree_at(change)?);
+        self.replays.fetch_add(1, Ordering::SeqCst);
+        Ok(self.memo_fill(&self.tree_at, *change, resolved))
+    }
+
+    fn memo_hit<T>(
+        &self,
+        memo: &Mutex<HashMap<SemanticChangeId, Arc<T>>>,
+        change: &SemanticChangeId,
+    ) -> Option<Arc<T>> {
+        memo.lock()
+            .expect("held source authority memo is never poisoned")
+            .get(change)
+            .map(Arc::clone)
+    }
+
+    fn memo_fill<T>(
+        &self,
+        memo: &Mutex<HashMap<SemanticChangeId, Arc<T>>>,
+        change: SemanticChangeId,
+        resolved: Arc<T>,
+    ) -> Arc<T> {
+        Arc::clone(
+            memo.lock()
+                .expect("held source authority memo is never poisoned")
+                .entry(change)
+                .or_insert(resolved),
+        )
+    }
+}
+
 fn resolve_entity_source_authority<G: GraphStore>(
-    store: &G,
+    held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
     scope: EntitySourceScope,
 ) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
@@ -1430,14 +1649,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
         )));
     }
 
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
-        repository_authority.ok_or_else(|| {
-            graph_source_gap(
-                "this MCP runtime has no startup-pinned local repository authority binding",
-            )
-        })?,
-    )
-    .map_err(record_graph_source_gap)?;
+    let authority = held.authority()?;
 
     let path = RepoPath::from_utf8(recorded_origin.0.clone()).map_err(|error| {
         graph_source_gap(format!(
@@ -1469,9 +1681,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // to all describe one instant. Reading the tree from one snapshot and
             // the change id from another let a response pair generation N's bytes
             // with generation N+1's provenance, with nothing serializing the two.
-            let sample = authority
-                .workspace_sample()
-                .map_err(record_graph_source_gap)?;
+            let sample = held.workspace_sample()?;
             let workspace = &sample.workspace;
             let artifact = workspace
                 .tree
@@ -1514,9 +1724,9 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // prior binding to contradict, and rejecting it was exactly the false
             // gap that closed body reads on fresh clones.
             if let Some(introduced_by) =
-                committed_introducing_change(store, entity, &source_change_id)
+                committed_introducing_change(held, entity, &source_change_id)
             {
-                let introduced_tree = store.resolve_tree_at(&introduced_by).map_err(|error| {
+                let introduced_tree = held.tree_at(&introduced_by).map_err(|error| {
                     graph_source_gap(format!(
                         "cannot resolve entity {} introduction tree at {introduced_by}: {error}",
                         entity.id
@@ -1555,7 +1765,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
         // the tree at the same change, so this replaces a separate tree
         // resolution rather than adding to it.
         EntitySourceScope::At(source_change_id) => {
-            let committed = store.resolve_graph_at(&source_change_id).map_err(|error| {
+            let committed = held.graph_at(&source_change_id).map_err(|error| {
                 graph_source_gap(format!(
                     "cannot resolve committed repository state at {source_change_id}: {error}"
                 ))
@@ -1591,15 +1801,12 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // Bind the entity revision to the artifact identity that occupied its
             // path when that revision was introduced. A later path reuse must not
             // make an old entity read bytes from a different artifact.
-            let introduced_tree =
-                store
-                    .resolve_tree_at(&revision.introduced_by)
-                    .map_err(|error| {
-                        graph_source_gap(format!(
-                            "cannot resolve entity {} introduction tree at {}: {error}",
-                            entity.id, revision.introduced_by
-                        ))
-                    })?;
+            let introduced_tree = held.tree_at(&revision.introduced_by).map_err(|error| {
+                graph_source_gap(format!(
+                    "cannot resolve entity {} introduction tree at {}: {error}",
+                    entity.id, revision.introduced_by
+                ))
+            })?;
             let introduced_artifact = introduced_tree.artifact_at_path(&path).ok_or_else(|| {
                 graph_source_gap(format!(
                     "entity {} revision {} was introduced without an artifact at '{}'",
@@ -1695,6 +1902,13 @@ fn resolve_entity_source_authority<G: GraphStore>(
     )))
 }
 
+/// One-shot body projection: holds authority for the duration of this ONE read.
+///
+/// Correct for a single-entity surface (`get_entity_source`, `get_entity_body`).
+/// A surface that projects many entities for one request must instead build one
+/// [`HeldSourceAuthority`] and call
+/// [`read_entity_source_excerpt_detailed_held`], or it pays a full authority
+/// recovery and a whole-history replay per result.
 pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     store: &G,
     entity: &Entity,
@@ -1703,8 +1917,24 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
     scope: EntitySourceScope,
 ) -> Result<Option<ExactEntitySource>> {
-    let Some((mut source, bytes, span)) =
-        resolve_entity_source_authority(store, entity, repository_authority, scope)?
+    read_entity_source_excerpt_detailed_held(
+        &HeldSourceAuthority::new(store, repository_authority),
+        entity,
+        max_lines,
+        max_chars,
+        scope,
+    )
+}
+
+/// Body projection served from authority this request already holds.
+pub fn read_entity_source_excerpt_detailed_held<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    max_lines: usize,
+    max_chars: usize,
+    scope: EntitySourceScope,
+) -> Result<Option<ExactEntitySource>> {
+    let Some((mut source, bytes, span)) = resolve_entity_source_authority(held, entity, scope)?
     else {
         return Ok(None);
     };
@@ -1778,12 +2008,29 @@ pub fn read_bounded_entity_snippet<G: GraphStore>(
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
     scope: EntitySourceScope,
 ) -> Result<Option<String>> {
-    Ok(read_entity_source_excerpt_detailed(
-        store,
+    read_bounded_entity_snippet_held(
+        &HeldSourceAuthority::new(store, repository_authority),
+        entity,
+        scope,
+    )
+}
+
+/// Bounded snippet served from authority this request already holds.
+///
+/// This is the variant every retrieval surface must use. A retrieval result set
+/// projects one snippet per hit, so opening authority and replaying history per
+/// hit multiplies process-startup work by the page size -- the defect that made
+/// `semantic_locate` unusable on a real repository.
+pub fn read_bounded_entity_snippet_held<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    scope: EntitySourceScope,
+) -> Result<Option<String>> {
+    Ok(read_entity_source_excerpt_detailed_held(
+        held,
         entity,
         RETRIEVAL_SNIPPET_MAX_LINES,
         RETRIEVAL_SNIPPET_MAX_CHARS,
-        repository_authority,
         scope,
     )?
     .map(|source| source.body))
@@ -2114,14 +2361,28 @@ pub fn focal_context_json<G: GraphStore>(
     compact: bool,
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<serde_json::Value> {
+    focal_context_json_held(
+        &HeldSourceAuthority::new(store, repository_authority),
+        entity,
+        compact,
+    )
+}
+
+/// The focal entity's context projection, served from authority this request
+/// already holds. A context pack projects the focal entity and then every
+/// dependency it carries, so all of those reads belong to one session.
+pub fn focal_context_json_held<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    compact: bool,
+) -> Result<serde_json::Value> {
     let start_line = entity_presentation_start_line(entity);
     let end_line = entity_presentation_end_line(entity);
-    let source_excerpt = read_entity_source_excerpt_detailed(
-        store,
+    let source_excerpt = read_entity_source_excerpt_detailed_held(
+        held,
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
-        repository_authority,
         EntitySourceScope::WorkspaceHead,
     )?;
     let source = LAST_READ_SOURCE.with(|f| f.get());

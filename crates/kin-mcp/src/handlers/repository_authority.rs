@@ -89,8 +89,46 @@ pub(crate) struct WorkspaceReadSample {
     pub base_change_id: SemanticChangeId,
 }
 
+/// How many times this process has opened repository authority.
+///
+/// An open is a full authority recovery -- decode the persisted snapshot, then
+/// re-verify every persisted body against its content address -- so its cost is
+/// a property of the store, not of the request. That makes the open COUNT, not
+/// the wall clock, the honest thing for a test to bound: a query path that opens
+/// once per request stays O(1) here no matter how large the store gets, and one
+/// that opens per candidate does not. Public because the surfaces that must hold
+/// that bound (`semantic_locate`, `kin locate --snippets`) live in other crates.
+pub static REPOSITORY_AUTHORITY_OPEN_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static REPOSITORY_AUTHORITY_OPENS_ON_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Repository-authority opens performed so far ON THE CALLING THREAD.
+///
+/// [`REPOSITORY_AUTHORITY_OPEN_COUNT`] is the honest process total, but a delta
+/// taken across a section of one test is not that test's own number: test
+/// binaries run in parallel, and any sibling test that projects a body lands in
+/// the same counter. A bound asserted on the process total is therefore sound
+/// only while no concurrent test opens authority, which is a property of the
+/// whole binary that nothing enforces and every new test can silently break.
+///
+/// This count is immune to that, because another thread's opens are not in it.
+/// The one thing a caller must ensure is that the request it is measuring runs
+/// on the thread doing the measuring -- an off-thread open is invisible here, so
+/// a measured section that hands its work to a worker reads zero. That failure
+/// mode is loud rather than silent for the assertion these tests make (`== 1`
+/// fails on a zero), which is why it is the right way round.
+pub fn repository_authority_opens_on_this_thread() -> u64 {
+    REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(std::cell::Cell::get)
+}
+
 impl ActiveRepositoryAuthority {
     pub(crate) fn open(binding: &LocalRepositoryAuthorityBinding) -> Result<Self> {
+        REPOSITORY_AUTHORITY_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| opens.set(opens.get() + 1));
         let manager = binding.open_manager().map_err(|error| {
             McpError::Context(format!(
                 "graph authority gap: cannot open retained repository authority: {error}"

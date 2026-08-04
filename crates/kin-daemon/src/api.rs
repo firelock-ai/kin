@@ -6008,6 +6008,14 @@ fn build_semantic_locate_result(
     } else {
         None
     };
+    // Hold authority ONCE for this request. Opening it is a full authority
+    // recovery and the committed state a snippet's artifact-identity binding
+    // needs is a whole-history replay, and neither varies across the hits on a
+    // page: the daemon holds the loaded graph precisely so a query serves from
+    // it. Deriving both per hit is what made a 40-candidate page perform 40
+    // recoveries and 40 replays, and took a real repository out of service.
+    let held_authority =
+        kin_mcp::handlers::common::HeldSourceAuthority::new(graph, repository_authority.as_ref());
 
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
     let granularity_token = format!("sem:{}", if file_granularity { "file" } else { "entity" });
@@ -6171,10 +6179,9 @@ fn build_semantic_locate_result(
         // read and no silent graph-gap downgrade.
         let snippet = if include_snippet {
             if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
-                match kin_mcp::handlers::common::read_bounded_entity_snippet(
-                    graph,
+                match kin_mcp::handlers::common::read_bounded_entity_snippet_held(
+                    &held_authority,
                     entity,
-                    repository_authority.as_ref(),
                     source_scope,
                 ) {
                     Ok(snippet) => snippet,
@@ -24815,6 +24822,133 @@ mod tests {
             suppressed_hits[0].get("snippet").is_none(),
             "include_snippet:false must suppress the snippet: {}",
             suppressed_hits[0]
+        );
+    }
+
+    /// Install a page of committed, body-bearing definitions in distinct files.
+    ///
+    /// Distinct files AND distinct commits on purpose: each
+    /// `install_repository_file` is its own change, so the entities are
+    /// introduced by different changes. That is the shape a real retrieval page
+    /// has, and it is the one where a per-result authority open multiplies.
+    fn install_locate_page(state: &Arc<DaemonState>, page: usize) {
+        for index in 0..page {
+            let path = format!("src/config{index}.py");
+            let source =
+                format!("def parse_config{index}(path):\n    return {{\"which\": {index}}}\n");
+            install_repository_file(state, &path, source.as_bytes());
+            install_working_copy_file(state, &path, source.as_bytes(), false);
+            let mut entity = test_entity(&format!("parse_config{index}"), &path);
+            entity.span = Some(SourceSpan {
+                file: kin_model::FilePathId::new(&path),
+                start_byte: 0,
+                end_byte: source.len(),
+                start_line: 0,
+                start_col: 0,
+                end_line: 1,
+                end_col: 24,
+            });
+            // The fused ranker reads this preview to decide an entity is a
+            // definition rather than a bare reference, and only definitions get
+            // bodies. Without it this fixture would exercise the reference path,
+            // which projects nothing and would make the bound below vacuous.
+            entity.metadata.extra.insert(
+                "embedding_body_preview".to_string(),
+                json!(source.lines().next().unwrap()),
+            );
+            state.graph.upsert_entity(&entity).unwrap();
+        }
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bodies projected on a `semantic_locate` page, by whichever key the arm
+    /// used. Both are the same graph-owned projection; the count is what matters.
+    fn bodies_projected(payload: &serde_json::Value) -> usize {
+        payload["entities"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .filter(|hit| {
+                        hit.get("snippet").and_then(|v| v.as_str()).is_some()
+                            || hit.get("body").and_then(|v| v.as_str()).is_some()
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The FUSED `semantic_locate` page opens repository authority ONCE.
+    ///
+    /// This is the call-site regression test for FIR-1897 on the arm `POST
+    /// /locate` always uses, that `pipeline: "fused"` selects, that multi-query
+    /// forces, and that `KIN_PROFILE=accuracy-v1` selects. It runs the real MCP
+    /// dispatch route, so what it bounds is the shipped path rather than a
+    /// primitive: fused locate funnels into `run_with_graph_capture_budgeted`,
+    /// which projects bodies TWICE over the same symbol set -- once in
+    /// `attach_snippets` and again in `build_entity_view`. Holding one session
+    /// across both is the whole fix; reverting either to the one-shot entry point
+    /// compiles, changes no output, and must fail HERE.
+    ///
+    /// The assertion is on COUNTS, never on elapsed time. An authority open is a
+    /// full recovery that re-verifies every persisted body against its content
+    /// address, so it costs whatever the store is worth and a timing assertion on
+    /// a four-file fixture would pass just as readily with the defect present.
+    /// The count is the query path's own property and the one that must stay flat
+    /// as the store grows.
+    ///
+    /// It counts opens ON THIS THREAD rather than process-wide: this binary runs
+    /// tests in parallel and several siblings project bodies, so a delta on the
+    /// global counter is not this test's own number.
+    #[tokio::test]
+    async fn semantic_locate_fused_page_opens_repository_authority_once() {
+        const PAGE: usize = 4;
+        // Take scheduling out of the result. Every locate phase gate is a
+        // wall-clock decision resolved from the environment, and a host stalled
+        // long enough to exhaust one makes the pipeline skip discovery and
+        // return `Ok` with no files -- which reads at the assertions below
+        // exactly like the regression they exist to catch. `0` is the unbounded
+        // sentinel for these knobs, so this asserts the open COUNT rather than
+        // how much CPU a loaded CI runner happened to grant the query.
+        let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", "0")
+            .with("KIN_LOCATE_PHASE_MULTIHOP_SECS", "0")
+            .with("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SCORING_SECS", "0");
+        let state = test_state();
+        install_locate_page(&state, PAGE);
+        let app = router(state);
+
+        let before = kin_mcp::handlers::common::repository_authority_opens_on_this_thread();
+        let fused = call_semantic_locate(
+            app,
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": true
+            }),
+        )
+        .await;
+        let opens = kin_mcp::handlers::common::repository_authority_opens_on_this_thread() - before;
+
+        // Non-vacuity first. A page that projected fewer than two bodies cannot
+        // tell "one open per request" apart from "one open per body", so the
+        // bound below would pass without meaning anything.
+        let projected = bodies_projected(&fused);
+        assert!(
+            projected >= 2,
+            "the fixture must project at least two bodies for the bound to mean anything; \
+             projected {projected}: {fused}"
+        );
+        assert_eq!(
+            opens, 1,
+            "a fused locate page projected {projected} bodies and must have opened repository \
+             authority exactly once; opening per projected body is FIR-1897, and it reaches this \
+             arm through both `attach_snippets` and `build_entity_view`"
         );
     }
 

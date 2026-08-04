@@ -5317,6 +5317,218 @@ mod tests {
         assert!(error.to_string().contains("does not describe these bytes"));
     }
 
+    /// A page of retrieval hits derives repository authority ONCE, not once per
+    /// hit.
+    ///
+    /// This is the bound FIR-1897 was filed on. `semantic_locate` fans a client
+    /// `limit: 5` out to 40 daemon candidates, and the body projection re-opened
+    /// the persisted authority and replayed the whole committed history for each
+    /// one, so on a 23,683-blob store a single query ran past 44 minutes with no
+    /// vector frame anywhere in the profile.
+    ///
+    /// The assertion is on COUNTS, not on elapsed time. An authority open is a
+    /// full recovery and a replay walks all of history, so both cost whatever the
+    /// store is worth; only their number is the query path's own property, and it
+    /// is the one that has to stay flat as the store grows. A timing assertion on
+    /// a tiny fixture would pass just as readily with the defect present.
+    ///
+    /// The second arm is the falsification. The one-shot entry point holds
+    /// authority for exactly one read, which is the shape the whole projection
+    /// had before this fix, and it must visibly regress the open count on the
+    /// same fixture. Without it this test could be passing because the fixture is
+    /// cheap rather than because the query path changed. Only the OPEN count is
+    /// observable on that arm: it builds its session internally, so its replay
+    /// count is unreachable from here and is deliberately not claimed.
+    #[test]
+    fn a_retrieval_page_derives_repository_authority_once() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        // A page of distinct entities in distinct files, all committed by one
+        // change, which is the ordinary shape of a retrieval result set.
+        const PAGE: usize = 6;
+        let mut store = EmptyStore::default();
+        let mut page = Vec::with_capacity(PAGE);
+        for index in 0..PAGE {
+            let content = format!("export function hit{index}() {{ return {index}; }}\n");
+            let hash = blob_store.write(content.as_bytes()).unwrap();
+            let file_id = FilePathId::new(format!("src/hit{index}.ts"));
+            store.file_hashes.insert(file_id.clone(), hash);
+            let entity = whole_file_entity(&file_id, &content, Some(hash));
+            store.entities_by_id.insert(entity.id, entity.clone());
+            page.push(entity);
+        }
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+
+        // Opens on THIS thread, not process-wide. The global counter is the
+        // honest process total, but a delta taken across a section of one test
+        // is not that test's own number in a parallel binary. This assertion
+        // used to be sound only because every kin-mcp test that can open
+        // authority happens to hold `ENV_MUTEX`, which is a property of the
+        // whole binary that nothing enforces; the lock below is still needed for
+        // `KIN_SOURCE_ROOT`, but the count no longer depends on it.
+        let opens = common::repository_authority_opens_on_this_thread;
+
+        // Held arm: one session serves the whole page.
+        let held = HeldSourceAuthority::new(&store, Some(&authority));
+        let before_held = opens();
+        for (index, entity) in page.iter().enumerate() {
+            let snippet =
+                read_bounded_entity_snippet_held(&held, entity, EntitySourceScope::WorkspaceHead)
+                    .expect("every fixture entity has coherent graph-owned source")
+                    .expect("every fixture entity has source coordinates");
+            assert!(
+                snippet.contains(&format!("hit{index}")),
+                "hit {index} must serve its own body, not another entity's: {snippet}"
+            );
+        }
+        let held_opens = opens() - before_held;
+        assert_eq!(
+            held_opens, 1,
+            "a {PAGE}-hit page must open repository authority once; opening per hit is what \
+             multiplied a full authority recovery by the page size"
+        );
+        // The invariant, stated exactly. Every hit resolves against the SAME base
+        // change, so the committed state is ONE replay however long the page is.
+        // The introducing TREE is keyed by `introduced_by`, which varies per
+        // entity, so it is one replay per DISTINCT introducing change -- not one
+        // per hit, and not a constant. This fixture commits all six entities in
+        // one change, so D = 1 and the total is 2; that 2 is a property of the
+        // fixture, and only the formula below is the property of the fix.
+        let distinct_introducing_changes = 1;
+        assert_eq!(
+            held.replays_performed(),
+            1 + distinct_introducing_changes,
+            "the page must replay committed state once and the introducing tree once per \
+             distinct introducing change, not either of them once per hit"
+        );
+
+        // Falsification: the pre-fix shape, one session per read, on this exact
+        // fixture. If the counts above were an artifact of the fixture rather
+        // than of the fix, these would match them.
+        let before_one_shot = opens();
+        for entity in &page {
+            read_bounded_entity_snippet(
+                &store,
+                entity,
+                Some(&authority),
+                EntitySourceScope::WorkspaceHead,
+            )
+            .expect("the one-shot projection reads the same fixture")
+            .expect("every fixture entity has source coordinates");
+        }
+        assert_eq!(
+            opens() - before_one_shot,
+            PAGE as u64,
+            "the one-shot projection must still open once per read; if it does not, this test \
+             cannot tell a held session apart from the defect it was written to catch"
+        );
+    }
+
+    /// `find_references` derives repository authority ONCE, not once per caller.
+    ///
+    /// `collect_graph_reference_rows` projects a bounded body per REFERENCING
+    /// entity, so it has the same multi-entity shape as a retrieval page and had
+    /// the same defect: a full authority recovery and a whole-history replay per
+    /// caller found. It was missed when FIR-1897 was first scoped because the
+    /// surface reads relations rather than running retrieval, and the ticket was
+    /// written about `semantic_locate`.
+    ///
+    /// Same counting discipline as the page test above, and the same second arm
+    /// so a cheap fixture cannot be mistaken for a fixed one.
+    #[test]
+    fn find_references_derives_repository_authority_once() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        // One target plus several callers, each in its own file, which is what a
+        // real `find_references` answer looks like.
+        const CALLERS: usize = 5;
+        let mut store = EmptyStore::default();
+        let install = |store: &mut EmptyStore, name: &str| -> Entity {
+            let content = format!("export function {name}() {{ return \"{name}\"; }}\n");
+            let hash = blob_store.write(content.as_bytes()).unwrap();
+            let file_id = FilePathId::new(format!("src/{name}.ts"));
+            store.file_hashes.insert(file_id.clone(), hash);
+            let entity = whole_file_entity(&file_id, &content, Some(hash));
+            store.insert_test_entity(entity.clone());
+            entity
+        };
+        let target = install(&mut store, "target");
+        let callers: Vec<Entity> = (0..CALLERS)
+            .map(|index| install(&mut store, &format!("caller{index}")))
+            .collect();
+        for caller in &callers {
+            store.insert_test_calls_relation(caller, &target);
+        }
+        install_empty_store_exact_tree(&mut store, dir.path());
+        let authority = test_repository_authority(dir.path());
+
+        let opens = common::repository_authority_opens_on_this_thread;
+
+        let before_held = opens();
+        let rows = collect_graph_reference_rows(
+            &store,
+            &target.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .expect("every fixture caller has coherent graph-owned source");
+        let held_opens = opens() - before_held;
+
+        // Non-vacuity: the bound means nothing unless bodies were actually
+        // projected for more than one caller.
+        assert_eq!(
+            rows.len(),
+            CALLERS,
+            "every caller must be reported: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.snippet.is_some()).count(),
+            CALLERS,
+            "every reported caller must carry its graph-owned body: {rows:?}"
+        );
+        assert_eq!(
+            held_opens, 1,
+            "a {CALLERS}-caller reference set must open repository authority once; opening per \
+             caller is the FIR-1897 shape on the `find_references` surface"
+        );
+
+        // Falsification: the pre-fix shape, one session per row, same fixture.
+        let before_one_shot = opens();
+        for caller in &callers {
+            read_bounded_entity_snippet(
+                &store,
+                caller,
+                Some(&authority),
+                EntitySourceScope::WorkspaceHead,
+            )
+            .expect("the one-shot projection reads the same fixture")
+            .expect("every fixture caller has source coordinates");
+        }
+        assert_eq!(
+            opens() - before_one_shot,
+            CALLERS as u64,
+            "the one-shot projection must still open once per read; if it does not, this test \
+             cannot tell a held session apart from the defect it was written to catch"
+        );
+    }
+
     /// True when committed history records no active revision for `entity`, which
     /// is the condition that skips the artifact-identity binding.
     fn committed_introducing_change_is_absent(store: &EmptyStore, entity: &Entity) -> bool {
