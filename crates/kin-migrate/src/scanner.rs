@@ -12,10 +12,6 @@ use tracing::info;
 use crate::error::{MigrateError, Result};
 use crate::MigrationProcessHost;
 
-#[cfg(windows)]
-const NULL_GIT_CONFIG: &str = "NUL";
-#[cfg(not(windows))]
-const NULL_GIT_CONFIG: &str = "/dev/null";
 const MIGRATION_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MIGRATION_GIT_CAPTURE_LIMIT: u64 = 1024 * 1024;
 
@@ -181,7 +177,7 @@ fn isolate_git_process(command: &mut Command, host_path: &OsStr) {
         .env("PATH", host_path)
         .env("KIN_VFS_DISABLE", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
 }
@@ -274,10 +270,43 @@ mod tests {
         }
         assert_eq!(
             envs.get("GIT_CONFIG_GLOBAL"),
-            Some(&Some(NULL_GIT_CONFIG.to_string()))
+            Some(&Some(
+                kin_git::empty_global_git_config()
+                    .to_string_lossy()
+                    .into_owned()
+            ))
         );
         assert_eq!(envs.get("KIN_VFS_DISABLE"), Some(&Some("1".to_string())));
         assert!(envs.get("PATH").is_some_and(Option::is_some));
+    }
+
+    /// `kin migrate` shells out to Git through this boundary, so the global
+    /// config it binds has to be a path Git can actually open. Binding the
+    /// reserved Windows device name `NUL` made Git fail with
+    /// `fatal: unable to access 'NUL': Invalid argument` on a real Windows
+    /// host, which failed the scan rather than isolating it.
+    #[test]
+    fn product_git_boundary_binds_an_openable_empty_global_config() {
+        let mut command = Command::new("git");
+        let resolution_cwd = std::env::current_dir().unwrap();
+        let host_path =
+            absolute_host_search_path(kin_core::shims::unshimmed_path(), &resolution_cwd).unwrap();
+        isolate_git_process(&mut command, &host_path);
+
+        let bound = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("GIT_CONFIG_GLOBAL"))
+            .and_then(|(_, value)| value)
+            .expect("the migration Git boundary bound a global config");
+        assert_eq!(
+            bound,
+            kin_git::empty_global_git_config(),
+            "the migration Git boundary stopped routing through the shared helper"
+        );
+        assert!(
+            Path::new(bound).is_absolute(),
+            "bound global Git config {bound:?} is a bare name, not an absolute path"
+        );
     }
 
     #[cfg(unix)]

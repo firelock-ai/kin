@@ -152,10 +152,7 @@ mod tests {
             .args(args)
             .current_dir(repository)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", crate::empty_global_git_config())
             .output()
             .unwrap();
         assert!(

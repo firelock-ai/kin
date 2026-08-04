@@ -93,6 +93,36 @@ export function absoluteHostPath({
     .join(delimiter);
 }
 
+/**
+ * Path to bind to `GIT_CONFIG_GLOBAL` so Git resolves the global configuration
+ * scope to no configuration at all.
+ *
+ * Off Windows this is `os.devNull` - `/dev/null`, which reads as empty and
+ * refuses a `--global` write.
+ *
+ * On Windows `os.devNull` is the reserved `NUL` device rather than a file, and
+ * Git refuses it outright with
+ * `fatal: unable to access 'NUL': Invalid argument`. The binding there is
+ * instead a path inside a directory that is deliberately never created, which
+ * reproduces both halves of `/dev/null`: reads resolve to nothing, and a
+ * `--global` write fails loudly because Git cannot take a lockfile beneath a
+ * missing parent.
+ *
+ * A real empty file would satisfy only the first half. It is writable, so a
+ * stray `--global` write persists and every later Git launch reads it - a
+ * silent poisoning on Windows where Unix fails loudly. Both behaviors were
+ * falsified against Git 2.55.0 on a native Windows 11 ARM64 host.
+ *
+ * `platform` is a parameter rather than a read of `process.platform` so tests
+ * can exercise the Windows branch on any host.
+ */
+export function emptyGlobalGitConfig(platform = process.platform) {
+  if (platform !== 'win32') {
+    return os.devNull;
+  }
+  return path.join(os.tmpdir(), 'kin-absent-global-gitconfig', 'gitconfig');
+}
+
 export function hermeticSmokeEnv({
   sourceEnv = process.env,
   hostPath,
@@ -108,7 +138,7 @@ export function hermeticSmokeEnv({
   }
 
   Object.assign(env, {
-    GIT_CONFIG_GLOBAL: platform === 'win32' ? 'NUL' : os.devNull,
+    GIT_CONFIG_GLOBAL: emptyGlobalGitConfig(platform),
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_ATTR_NOSYSTEM: '1',
     GIT_TERMINAL_PROMPT: '0',

@@ -24,6 +24,7 @@ fn kin_process_group_guardian_worker() {
 pub mod admission_history;
 pub mod authority;
 pub mod error;
+pub mod global_config;
 pub mod lossless;
 pub mod preflight;
 pub mod repository_export;
@@ -40,6 +41,7 @@ pub use error::{
     GitCheckoutFilterFact, GitError, LocalGitHookExecutability, LocalGitHookFact, LocalGitHookKind,
     RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result, UnsealedContentGap,
 };
+pub use global_config::empty_global_git_config;
 pub use lossless::{
     capture_lossless_git_repository, rehydrate_lossless_git_repository,
     sync_git_repository_for_authority_handoff, GitObjectFormat, GitRehydrationResult,

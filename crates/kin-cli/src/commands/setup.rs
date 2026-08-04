@@ -2507,19 +2507,8 @@ fn finalize_setup_git_authority_process_with_ambient(
         .env("GIT_ALLOW_PROTOCOL", "file")
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0");
-    #[cfg(unix)]
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    #[cfg(windows)]
-    command.env("GIT_CONFIG_GLOBAL", "NUL");
-    #[cfg(not(any(unix, windows)))]
-    command.env(
-        "GIT_CONFIG_GLOBAL",
-        command
-            .get_current_dir()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".kin-empty-global-gitconfig"),
-    );
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config());
 }
 
 fn is_setup_git_authority_env(key: &std::ffi::OsStr) -> bool {
@@ -13826,6 +13815,34 @@ mod tests {
         assert_eq!(
             configured_command_env(&command, "GIT_OPTIONAL_LOCKS"),
             Some(Some(OsString::from("0")))
+        );
+    }
+
+    /// `kin setup` shells out to Git through this boundary, so the global
+    /// config it binds has to be a path Git can actually open. Binding the
+    /// reserved Windows device name `NUL` made Git fail with
+    /// `fatal: unable to access 'NUL': Invalid argument` on a real Windows
+    /// host, which failed setup rather than isolating it.
+    #[test]
+    fn setup_git_boundary_binds_an_openable_empty_global_config() {
+        let mut command = Command::new("git");
+        finalize_setup_git_authority_process_with_ambient(
+            &mut command,
+            OsStr::new("trusted-host-path"),
+            std::iter::empty(),
+        );
+
+        let bound = configured_command_env(&command, "GIT_CONFIG_GLOBAL")
+            .flatten()
+            .expect("the setup Git boundary bound a global config");
+        assert_eq!(
+            bound,
+            kin_git::empty_global_git_config(),
+            "the setup Git boundary stopped routing through the shared helper"
+        );
+        assert!(
+            Path::new(&bound).is_absolute(),
+            "bound global Git config {bound:?} is a bare name, not an absolute path"
         );
     }
 
