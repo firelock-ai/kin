@@ -1015,7 +1015,12 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
             daemon.display_name.clone()
         };
         let kin_root = Path::new(&daemon.repo_root).join(".kin");
-        let outcome = stop_worker_at(&kin_root, daemon.pid, remaining_budget(deadline), uninstall_root)?;
+        let outcome = stop_worker_at(
+            &kin_root,
+            daemon.pid,
+            remaining_budget(deadline),
+            uninstall_root,
+        )?;
         if outcome.is_success() {
             remove_stale_daemon_files(&kin_root);
         }
@@ -1037,7 +1042,8 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
                 let already = reports.iter().any(|r| r.pid == pid);
                 if !already && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
-                    let outcome = stop_worker_at(&kin_root, pid, remaining_budget(deadline), uninstall_root)?;
+                    let outcome =
+                        stop_worker_at(&kin_root, pid, remaining_budget(deadline), uninstall_root)?;
                     if outcome.is_success() {
                         remove_stale_daemon_files(&kin_root);
                     }

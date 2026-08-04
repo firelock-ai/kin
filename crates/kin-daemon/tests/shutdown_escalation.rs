@@ -71,11 +71,7 @@ fn stop_terminates_a_daemon_whose_runtime_is_saturated() {
 
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
     command
-        .args([
-            "--exact",
-            "saturated_daemon_shutdown_worker",
-            "--nocapture",
-        ])
+        .args(["--exact", "saturated_daemon_shutdown_worker", "--nocapture"])
         .env(SATURATED_WORKER_ROOT, root.path())
         .env(
             "KIN_DAEMON_SHUTDOWN_GRACE_SECS",

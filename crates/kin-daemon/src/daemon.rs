@@ -2506,8 +2506,8 @@ async fn select_with_signals(
 mod tests {
     use super::{
         drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
-        note_shutdown_requested, parse_duration_secs, parse_owner_watch_pid, shutdown_requested,
-        should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
+        note_shutdown_requested, parse_duration_secs, parse_owner_watch_pid,
+        should_enable_lsp_enrichment, should_flush_now, shutdown_requested, shutdown_signalled,
         watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
         DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
