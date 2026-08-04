@@ -679,6 +679,11 @@ jobs:
           }
           NODE
 
+      - name: Provide a tomllib-capable Python for the Codex TOML proof
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
       - name: First-run repository, daemon, and setup proof
         shell: bash
         env:
@@ -755,7 +760,7 @@ jobs:
           # current repository cwd retained as user-owned state.
           antigravity_legacy="$HOME/.gemini/antigravity-ide/mcp_config.json"
           mkdir -p "$(dirname "$antigravity_legacy")"
-          ANTIGRAVITY_LEGACY="$antigravity_legacy" REPO_ROOT="$(pwd -P)" node <<'NODE'
+          ANTIGRAVITY_LEGACY="$antigravity_legacy" node <<'NODE'
           const fs = require("fs");
           const path = require("path");
           const config = {
@@ -764,7 +769,10 @@ jobs:
               kin: {
                 command: "/stale/kin",
                 args: ["mcp", "start"],
-                cwd: process.env.REPO_ROOT,
+                // The validator compares this retained cwd against Node's own
+                // native realpath, so seed it in that exact form rather than
+                // the MSYS forward-slash form bash's pwd produces on Windows.
+                cwd: fs.realpathSync(process.cwd()),
                 env: { USER_POLICY: "preserve" },
               },
             },
@@ -1290,7 +1298,7 @@ jobs:
           const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
           const expectedLock = fs.readFileSync("../expected-lock-sha.txt", "utf8").trim();
           const installedKin = fs.readFileSync("../installed-kin-command.txt", "utf8").trim();
-          const expectedInstalledKin = path.join(os.homedir(), ".kin", "bin", "kin");
+          const expectedInstalledKin = path.join(os.homedir(), ".kin", "bin", isWindows ? "kin.exe" : "kin");
           if (installedKin !== expectedInstalledKin) {
             throw new Error(`installed Kin command proof ${installedKin || "missing"} does not equal ${expectedInstalledKin}`);
           }
