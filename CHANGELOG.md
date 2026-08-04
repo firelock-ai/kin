@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-08-04
+
+### Changed
+
+- Record v0.4.6 as an abandoned release lane (#592)
+- Detect the operator's shell before PowerShell's environment markers (#593)
+
 ## [0.4.7] - 2026-08-04
 
 ### Changed
