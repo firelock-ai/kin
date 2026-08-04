@@ -1288,16 +1288,58 @@ const IDX_GEMINI: usize = 3;
 const IDX_WINDSURF: usize = 4;
 const IDX_ANTIGRAVITY: usize = 5;
 
+/// The Claude Code CLI filename, by platform.
+fn claude_cli_filename() -> &'static str {
+    if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    }
+}
+
+/// Whether Claude Code itself has left evidence of an install in `home`.
+///
+/// Every other client gets a filesystem fallback beside its PATH probe, so a
+/// client installed outside the current `PATH` is still configured. Claude Code
+/// had only the PATH probe, which is why it alone was skipped when its CLI
+/// lives somewhere the invoking shell does not export — the native installer
+/// drops it in `~/.local/bin`, which login shells add but non-login and CI
+/// shells frequently do not.
+///
+/// The bare `~/.claude` directory never counts: `kin setup` creates it to
+/// write the discovery reminder, so trusting it would let a previous setup
+/// run manufacture its own evidence of an install that never happened.
+/// `~/.claude.json` is accepted even though `configure_claude_code` can
+/// create it, because non-interactive runs only configure clients this
+/// detection already admitted; the remaining self-evidence path is an
+/// operator explicitly selecting an undetected client in the advanced
+/// picker, which is a deliberate override rather than manufactured
+/// detection, and an uninstall excises Kin's key but leaves the file.
+fn claude_code_install_evidence(home: &Path) -> bool {
+    home.join(".claude.json").exists()
+        || home.join(".claude").join("settings.json").exists()
+        || home.join(".claude").join("config.json").exists()
+        || home
+            .join(".local")
+            .join("bin")
+            .join(claude_cli_filename())
+            .exists()
+}
+
 /// Detect installed AI assistants eligible for MCP auto-configuration.
 ///
 /// Detection heuristics per client:
-/// - Claude Code: `claude` binary on PATH
+/// - Claude Code: `claude` binary on PATH, or Claude Code's own state/config
+///   files, or the native installer's `~/.local/bin/claude`
 /// - Cursor: `cursor` binary on PATH, or `/Applications/Cursor.app`
 /// - Codex CLI: `codex` binary on PATH
 /// - Gemini CLI: `gemini` binary on PATH, or `~/.gemini` directory
 /// - Windsurf: `windsurf` binary on PATH, or `/Applications/Windsurf.app`
 fn detect_ai_assistants() -> Vec<AiAssistant> {
-    let claude_detected = check_binary_in_path("claude").is_some();
+    let claude_detected = check_binary_in_path("claude").is_some()
+        || home_dir()
+            .map(|home| claude_code_install_evidence(&home))
+            .unwrap_or(false);
     let cursor_detected = check_binary_in_path("cursor").is_some()
         || PathBuf::from("/Applications/Cursor.app").exists();
     let codex_detected = check_binary_in_path("codex").is_some();
@@ -1788,6 +1830,100 @@ fn inject_discovery_reminder(path: &PathBuf) -> Result<()> {
     fs::write(path, &content).with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(())
+}
+
+/// One agent instruction file setup can append the Kin-first discovery reminder
+/// to, paired with the client whose MCP registration makes that directive true.
+struct DiscoveryReminderTarget {
+    /// Assistant index whose MCP registration the directive depends on.
+    client: usize,
+    /// Human label used in setup output.
+    label: &'static str,
+    /// Stable ledger target id for the appended block.
+    ledger_target: &'static str,
+    path: PathBuf,
+}
+
+/// The instruction files setup can write, in output order.
+fn discovery_reminder_targets(home: &Path) -> Vec<DiscoveryReminderTarget> {
+    vec![
+        DiscoveryReminderTarget {
+            client: IDX_CLAUDE_CODE,
+            label: "Claude Code",
+            ledger_target: "claude-md",
+            path: home.join(".claude").join("CLAUDE.md"),
+        },
+        DiscoveryReminderTarget {
+            client: IDX_CODEX,
+            label: "Codex CLI",
+            ledger_target: "codex-agents",
+            path: home.join(".codex").join("AGENTS.md"),
+        },
+    ]
+}
+
+/// Whether Kin's discovery reminder is already appended to an instruction file.
+fn discovery_reminder_present(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.contains(KIN_DISCOVERY_REMINDER))
+        .unwrap_or(false)
+}
+
+/// Append the Kin-first discovery reminder to each instruction file whose client
+/// this run registered, and report what was written as `(ledger target, path)`.
+///
+/// The reminder is a standing behavioral directive: it tells the agent to reach
+/// for Kin's semantic MCP tools before grep or raw file reads, in every
+/// repository, for every session. That instruction is only true for a client
+/// whose MCP server is actually registered, so each file is gated on its own
+/// client appearing in `registered_clients`. Writing it for an unregistered
+/// client aims the agent at tools that are not wired, and every call it makes
+/// fails.
+///
+/// `home` is taken by argument rather than resolved here so this is exercisable
+/// without mutating the process environment that the rest of the suite reads.
+fn apply_discovery_reminders(
+    home: &Path,
+    registered_clients: &[usize],
+) -> Vec<(&'static str, PathBuf)> {
+    let mut written = Vec::new();
+    for target in discovery_reminder_targets(home) {
+        let DiscoveryReminderTarget {
+            client,
+            label,
+            ledger_target,
+            path,
+        } = target;
+        if !registered_clients.contains(&client) {
+            if discovery_reminder_present(&path) {
+                println!(
+                    "  {} {label} reminder is present at {} but Kin's MCP server is not \
+                     registered for it — `kin setup uninstall` removes it when a setup run \
+                     recorded it; an unrecorded reminder stays until removed by hand",
+                    style("!").yellow(),
+                    path.display()
+                );
+            } else {
+                println!(
+                    "  {} {label} reminder skipped — Kin's MCP server was not registered for it",
+                    style("→").cyan()
+                );
+            }
+            continue;
+        }
+        match inject_discovery_reminder(&path) {
+            Ok(()) => {
+                println!(
+                    "  {} {label} discovery reminder ensured ({})",
+                    style("✓").green(),
+                    path.display()
+                );
+                written.push((ledger_target, path));
+            }
+            Err(e) => println!("  {} {label} reminder failed: {e}", style("!").yellow()),
+        }
+    }
+    written
 }
 
 /// Check if a given MCP config file already has the "kin" server entry.
@@ -11555,6 +11691,10 @@ async fn apply_plan(
 
     // AI client MCP configuration.
     let mut configured_assistants: Vec<(String, Option<PathBuf>)> = Vec::new();
+    // Assistant indices whose MCP server this run actually registered. Gates the
+    // discovery reminders below so a directive is never written for a client
+    // Kin did not wire up.
+    let mut registered_clients: Vec<usize> = Vec::new();
     if plan.configure_mcp {
         println!("AI client MCP configuration:");
         for idx in &plan.mcp_assistant_indices {
@@ -11588,6 +11728,7 @@ async fn apply_plan(
                         a.name,
                         path.display()
                     );
+                    registered_clients.push(*idx);
                     configured_assistants.push((a.name.to_string(), Some(path)));
                 }
                 Some(Err(e)) => {
@@ -11613,22 +11754,18 @@ async fn apply_plan(
     }
 
     // Agent discovery reminders.
+    //
+    // The reminder is a standing behavioral directive: it tells the agent to
+    // reach for Kin's semantic MCP tools before grep or raw file reads, in every
+    // repository, for every session. That instruction is only true for a client
+    // whose MCP server is actually registered, so each instruction file is gated
+    // on its own client's registration succeeding this run. Writing it for an
+    // unregistered client aims the agent at tools that are not wired, and every
+    // call it makes fails.
+    let mut written_reminders: Vec<(&'static str, PathBuf)> = Vec::new();
     if plan.inject_discovery_reminders {
         println!("Agent discovery reminders:");
-        let home = home_dir()?;
-        for (label, path) in [
-            ("Claude Code", home.join(".claude").join("CLAUDE.md")),
-            ("Codex CLI", home.join(".codex").join("AGENTS.md")),
-        ] {
-            match inject_discovery_reminder(&path) {
-                Ok(()) => println!(
-                    "  {} {label} discovery reminder ensured ({})",
-                    style("✓").green(),
-                    path.display()
-                ),
-                Err(e) => println!("  {} {label} reminder failed: {e}", style("!").yellow()),
-            }
-        }
+        written_reminders = apply_discovery_reminders(&home_dir()?, &registered_clients);
         println!();
     }
 
@@ -11645,7 +11782,7 @@ async fn apply_plan(
 
     // Record what we wrote into the install ledger so `kin doctor` can verify it
     // and `kin setup uninstall` can remove exactly it.
-    record_setup_ledger(plan, shell_name);
+    record_setup_ledger(plan, shell_name, &written_reminders);
 
     Ok(configured_assistants)
 }
@@ -11677,7 +11814,18 @@ fn read_kin_mcp_entry(path: &Path) -> Option<serde_json::Value> {
 /// original install timestamps across idempotent re-runs. Ledger failures are
 /// non-fatal: setup already succeeded, so a ledger write error is a warning, not
 /// a setup failure.
-fn record_setup_ledger(plan: &SetupPlan, shell_name: &str) {
+///
+/// `written_reminders` carries the instruction files this run actually appended
+/// to, as `(ledger target, path)`. Only those are recorded, so the ledger never
+/// claims an artifact the registration gate declined to write. Entries recorded
+/// by an earlier run survive regardless: [`SetupLedger::record`] upserts and
+/// never prunes, so `kin setup uninstall` can still remove a reminder appended
+/// before that gate existed.
+fn record_setup_ledger(
+    plan: &SetupPlan,
+    shell_name: &str,
+    written_reminders: &[(&'static str, PathBuf)],
+) {
     use crate::commands::setup_ledger::{ArtifactKind, LedgerEntry, SetupLedger};
 
     let Ok(ledger_path) = crate::commands::setup_ledger::ledger_path() else {
@@ -11743,22 +11891,14 @@ fn record_setup_ledger(plan: &SetupPlan, shell_name: &str) {
         }
 
         if plan.inject_discovery_reminders {
-            if let Ok(home) = home_dir() {
-                for (target, path) in [
-                    ("claude-md", home.join(".claude").join("CLAUDE.md")),
-                    ("codex-agents", home.join(".codex").join("AGENTS.md")),
-                ] {
-                    let present = fs::read_to_string(&path)
-                        .map(|c| c.contains(KIN_DISCOVERY_REMINDER))
-                        .unwrap_or(false);
-                    if present {
-                        ledger.record(LedgerEntry::appended(
-                            ArtifactKind::DiscoveryReminder,
-                            target,
-                            path,
-                            KIN_DISCOVERY_REMINDER,
-                        ));
-                    }
+            for (target, path) in written_reminders {
+                if discovery_reminder_present(path) {
+                    ledger.record(LedgerEntry::appended(
+                        ArtifactKind::DiscoveryReminder,
+                        *target,
+                        path.clone(),
+                        KIN_DISCOVERY_REMINDER,
+                    ));
                 }
             }
         }
@@ -13612,6 +13752,7 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::setup_ledger::ArtifactKind;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
 
@@ -15578,6 +15719,180 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         fs::write(&primary, b"{}\n").unwrap();
         assert_eq!(configure_claude_code().unwrap(), primary);
         assert!(read_kin_mcp_entry(&primary).is_some());
+    }
+
+    /// A temp home plus the ledger path a test drives directly.
+    fn reminder_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        (dir, home)
+    }
+
+    /// FIR-1878: the Kin-first directive is a standing instruction to prefer
+    /// Kin's MCP tools over grep and raw file reads, in every repository, for
+    /// every session. Writing it for a client whose MCP server setup never
+    /// registered points that agent at tools which are not wired.
+    ///
+    /// Models the reported first-install shape: Cursor registers, Claude Code
+    /// does not, and the run still reaches the reminder step. Against the
+    /// pre-fix code — an unconditional loop over both instruction files — this
+    /// fails on the `.claude/CLAUDE.md` assertion.
+    #[test]
+    fn discovery_reminder_is_withheld_from_a_client_kin_did_not_register() {
+        let (_dir, home) = reminder_fixture();
+
+        let written = apply_discovery_reminders(&home, &[IDX_CURSOR]);
+
+        assert!(
+            written.is_empty(),
+            "nothing may be reported as written, so the ledger cannot claim it either"
+        );
+        assert!(
+            !home.join(".claude").join("CLAUDE.md").exists(),
+            "a directive to prefer Kin's MCP tools must not be written for a client \
+             whose MCP server was never registered"
+        );
+        assert!(
+            !home.join(".codex").join("AGENTS.md").exists(),
+            "the same gate must hold for Codex"
+        );
+    }
+
+    /// The other half of the gate: once a client is registered the directive is
+    /// true for it, so it is written and reported for the ledger to track.
+    #[test]
+    fn discovery_reminder_follows_a_successful_registration() {
+        let (_dir, home) = reminder_fixture();
+
+        let written = apply_discovery_reminders(&home, &[IDX_CLAUDE_CODE]);
+
+        assert_eq!(
+            written,
+            vec![("claude-md", home.join(".claude").join("CLAUDE.md"))],
+            "only the registered client's reminder is written and reported"
+        );
+        assert!(discovery_reminder_present(
+            &home.join(".claude").join("CLAUDE.md")
+        ));
+        assert!(
+            !home.join(".codex").join("AGENTS.md").exists(),
+            "an unregistered sibling stays untouched in the same run"
+        );
+    }
+
+    /// Each instruction file is gated on its own client, not on any client
+    /// having been registered.
+    #[test]
+    fn each_instruction_file_is_gated_on_its_own_client() {
+        let (_dir, home) = reminder_fixture();
+
+        let written = apply_discovery_reminders(&home, &[IDX_CODEX]);
+
+        assert_eq!(
+            written
+                .iter()
+                .map(|(target, _)| *target)
+                .collect::<Vec<_>>(),
+            vec!["codex-agents"]
+        );
+        assert!(discovery_reminder_present(
+            &home.join(".codex").join("AGENTS.md")
+        ));
+        assert!(!discovery_reminder_present(
+            &home.join(".claude").join("CLAUDE.md")
+        ));
+    }
+
+    /// Re-running setup must not append the block twice.
+    #[test]
+    fn discovery_reminder_injection_is_idempotent() {
+        let (_dir, home) = reminder_fixture();
+        let claude_md = home.join(".claude").join("CLAUDE.md");
+
+        apply_discovery_reminders(&home, &[IDX_CLAUDE_CODE]);
+        let once = fs::read_to_string(&claude_md).unwrap();
+        apply_discovery_reminders(&home, &[IDX_CLAUDE_CODE]);
+
+        assert_eq!(fs::read_to_string(&claude_md).unwrap(), once);
+    }
+
+    /// A reminder appended by a Kin that predates the gate stays removable:
+    /// uninstall excises exactly the recorded block and leaves the user's own
+    /// text alone.
+    #[test]
+    fn uninstall_excises_a_reminder_left_by_an_earlier_run() {
+        use crate::commands::setup_ledger::{uninstall_entry, LedgerEntry};
+
+        let (_dir, home) = reminder_fixture();
+        let claude_md = home.join(".claude").join("CLAUDE.md");
+        apply_discovery_reminders(&home, &[IDX_CLAUDE_CODE]);
+        let user_text = "# My own instructions\n\nKeep this.\n";
+        let with_user = format!("{user_text}{}", fs::read_to_string(&claude_md).unwrap());
+        fs::write(&claude_md, &with_user).unwrap();
+
+        let entry = LedgerEntry::appended(
+            ArtifactKind::DiscoveryReminder,
+            "claude-md",
+            claude_md.clone(),
+            KIN_DISCOVERY_REMINDER,
+        );
+        uninstall_entry(&entry, false, false);
+
+        let after = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            !after.contains(KIN_DISCOVERY_REMINDER),
+            "uninstall must remove the reminder block"
+        );
+        assert!(
+            after.contains("Keep this."),
+            "the user's own text must survive"
+        );
+    }
+
+    /// Claude Code was the only client detected by PATH alone. Its own state
+    /// file is install evidence, so a CLI outside the invoking shell's PATH —
+    /// the native installer's `~/.local/bin` in a non-login shell — is still
+    /// configured rather than silently skipped.
+    #[test]
+    fn claude_code_state_file_counts_as_install_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        assert!(!claude_code_install_evidence(&home));
+
+        fs::write(home.join(".claude.json"), b"{}\n").unwrap();
+        assert!(claude_code_install_evidence(&home));
+    }
+
+    #[test]
+    fn claude_code_native_install_path_counts_as_install_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bin = home.join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        assert!(!claude_code_install_evidence(&home));
+
+        fs::write(bin.join(claude_cli_filename()), b"#!/bin/sh\n").unwrap();
+        assert!(claude_code_install_evidence(&home));
+    }
+
+    /// Detection must not be satisfiable by Kin's own output. `kin setup`
+    /// creates `~/.claude/CLAUDE.md` itself, so counting the directory would let
+    /// one run manufacture evidence of an install that never happened — and the
+    /// next run would register a client the user does not have.
+    #[test]
+    fn kin_written_claude_directory_is_not_install_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("CLAUDE.md"), KIN_DISCOVERY_REMINDER).unwrap();
+
+        assert!(
+            !claude_code_install_evidence(&home),
+            "Kin's own discovery reminder must never read as a Claude Code install"
+        );
     }
 
     #[cfg(unix)]
