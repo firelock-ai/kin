@@ -24904,6 +24904,20 @@ mod tests {
     #[tokio::test]
     async fn semantic_locate_fused_page_opens_repository_authority_once() {
         const PAGE: usize = 4;
+        // Take scheduling out of the result. Every locate phase gate is a
+        // wall-clock decision resolved from the environment, and a host stalled
+        // long enough to exhaust one makes the pipeline skip discovery and
+        // return `Ok` with no files -- which reads at the assertions below
+        // exactly like the regression they exist to catch. `0` is the unbounded
+        // sentinel for these knobs, so this asserts the open COUNT rather than
+        // how much CPU a loaded CI runner happened to grant the query.
+        let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", "0")
+            .with("KIN_LOCATE_PHASE_MULTIHOP_SECS", "0")
+            .with("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SCORING_SECS", "0");
         let state = test_state();
         install_locate_page(&state, PAGE);
         let app = router(state);
