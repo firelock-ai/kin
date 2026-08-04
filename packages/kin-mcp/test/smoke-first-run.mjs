@@ -16,7 +16,7 @@
 // binaries and spawns a real daemon, so it runs on demand / in release CI.
 
 import cp from 'node:child_process';
-import { constants as fsConstants, mkdtempSync, writeFileSync } from 'node:fs';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -93,34 +93,34 @@ export function absoluteHostPath({
     .join(delimiter);
 }
 
-let windowsEmptyGlobalGitConfig = null;
-
 /**
  * Path to bind to `GIT_CONFIG_GLOBAL` so Git resolves the global configuration
  * scope to no configuration at all.
  *
- * Off Windows this is `os.devNull` — `/dev/null`, which Git opens and reads as
- * an empty file. On Windows `os.devNull` is the reserved `NUL` device rather
- * than a file, and Git refuses it with
- * `fatal: unable to access 'NUL': Invalid argument`, failing every Git command
- * the boundary was meant to isolate. Git accepts any readable file, so Windows
- * gets one real empty file instead, created once per process and reused after
- * that so it outlives any single child.
+ * Off Windows this is `os.devNull` - `/dev/null`, which reads as empty and
+ * refuses a `--global` write.
+ *
+ * On Windows `os.devNull` is the reserved `NUL` device rather than a file, and
+ * Git refuses it outright with
+ * `fatal: unable to access 'NUL': Invalid argument`. The binding there is
+ * instead a path inside a directory that is deliberately never created, which
+ * reproduces both halves of `/dev/null`: reads resolve to nothing, and a
+ * `--global` write fails loudly because Git cannot take a lockfile beneath a
+ * missing parent.
+ *
+ * A real empty file would satisfy only the first half. It is writable, so a
+ * stray `--global` write persists and every later Git launch reads it - a
+ * silent poisoning on Windows where Unix fails loudly. Both behaviors were
+ * falsified against Git 2.55.0 on a native Windows 11 ARM64 host.
  *
  * `platform` is a parameter rather than a read of `process.platform` so tests
- * can exercise the Windows branch — and therefore really create and check the
- * file — on any host.
+ * can exercise the Windows branch on any host.
  */
 export function emptyGlobalGitConfig(platform = process.platform) {
   if (platform !== 'win32') {
     return os.devNull;
   }
-  if (windowsEmptyGlobalGitConfig === null) {
-    const directory = mkdtempSync(path.join(os.tmpdir(), 'kin-empty-global-gitconfig-'));
-    windowsEmptyGlobalGitConfig = path.join(directory, 'gitconfig');
-    writeFileSync(windowsEmptyGlobalGitConfig, '');
-  }
-  return windowsEmptyGlobalGitConfig;
+  return path.join(os.tmpdir(), 'kin-absent-global-gitconfig', 'gitconfig');
 }
 
 export function hermeticSmokeEnv({

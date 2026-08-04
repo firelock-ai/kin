@@ -747,12 +747,14 @@ mod git_process_boundary_tests {
             .find(|(key, _)| *key == OsStr::new("GIT_CONFIG_GLOBAL"))
             .and_then(|(_, value)| value)
             .expect("the eject Git boundary bound a global config");
-        let contents = fs::read(bound).unwrap_or_else(|error| {
-            panic!("bound global Git config {bound:?} is not readable: {error}")
-        });
+        assert_eq!(
+            bound,
+            kin_git::empty_global_git_config(),
+            "the eject Git boundary stopped routing through the shared helper"
+        );
         assert!(
-            contents.is_empty(),
-            "bound global Git config {bound:?} carries configuration"
+            Path::new(bound).is_absolute(),
+            "bound global Git config {bound:?} is a bare name, not an absolute path"
         );
     }
 

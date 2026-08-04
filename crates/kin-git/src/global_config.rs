@@ -6,8 +6,8 @@
 //! Every Kin surface that shells out to Git binds `GIT_CONFIG_GLOBAL` so the
 //! ambient global configuration scope cannot steer the child. This module owns
 //! the single answer to "what path means no global configuration", because the
-//! answer is not the same on every target and getting it wrong disables Git
-//! entirely rather than degrading isolation.
+//! answer is not the same on every target and getting it wrong either disables
+//! Git entirely or turns a loud failure into a silent one.
 
 use std::ffi::OsStr;
 
@@ -15,31 +15,39 @@ use std::ffi::OsStr;
 /// scope to no configuration at all.
 ///
 /// `GIT_CONFIG_GLOBAL` *replaces* the global scope rather than adding to it, so
-/// an empty file is exactly what silences `$HOME/.gitconfig` and its XDG
-/// sibling.
+/// binding a path Git reads as empty is what silences `$HOME/.gitconfig` and its
+/// XDG sibling.
 ///
-/// Unix names `/dev/null`, which Git opens and reads as that empty file. No
-/// other target has an equivalent path, and Windows in particular does not:
-/// `NUL` is a reserved device name rather than a file, and Git refuses it with
-/// `fatal: unable to access 'NUL': Invalid argument`. A boundary that bound
-/// `NUL` therefore failed every Git command it was meant to isolate. Git
-/// accepts any readable file, so the remaining targets share one real empty
-/// file, created once per process.
+/// Unix names `/dev/null`. It reads as empty, and a `--global` write to it fails
+/// loudly (`error: could not lock config file /dev/null`) rather than being
+/// swallowed.
 ///
-/// The returned lifetime is deliberately `'static`. Callers mutate a
-/// [`std::process::Command`] and return before that command is spawned, so a
-/// file owned by the calling function would already be unlinked by the time Git
-/// opened it. Tying the file to the process instead removes that failure mode
-/// from the call sites rather than asking each of them to re-derive it.
+/// No other target has that path, and Windows in particular does not. `NUL` is a
+/// reserved device name rather than a file; Git refuses it outright with
+/// `fatal: unable to access 'NUL': Invalid argument`, so a boundary that bound
+/// it failed the very Git commands it existed to isolate.
 ///
-/// The file is a freshly created temporary rather than a predictable path.
-/// Callers are authority boundaries: a path another process can pre-create is a
-/// path it can pre-fill with a hostile global configuration, which is the exact
-/// authority the boundary exists to remove.
+/// Off Unix the binding is instead **a path inside a directory that does not
+/// exist**, which reproduces both halves of `/dev/null`'s behavior:
 ///
-/// Creating that file is the only fallible step, and it fails loudly. Silently
-/// leaving `GIT_CONFIG_GLOBAL` unbound would hand the child the ambient global
-/// scope from inside the function whose whole purpose is to take it away.
+/// - Reads are clean. Git tolerates an absent global config and resolves the
+///   scope to nothing, so the ambient global scope is fully suppressed.
+/// - Writes fail loudly. Git cannot create its lockfile beneath a missing
+///   parent, so `git config --global ...` errors instead of silently persisting.
+///
+/// That second half is the reason this is not simply a real empty file. A shared
+/// empty file is *writable*: a stray `--global` write succeeds, persists, and is
+/// then read by every later Git launch in the process, silently poisoning on
+/// Windows the exact isolation this function provides, where Unix would have
+/// failed loudly. Both behaviors were falsified against Git 2.55.0 on a native
+/// Windows 11 ARM64 host, including a control proving the probe could see an
+/// ambient `[user] name` when `GIT_CONFIG_GLOBAL` was unset.
+///
+/// Nothing is created, so this performs no filesystem operation, leaks no
+/// temporary directory, and cannot fail. The path is deterministic; on Windows
+/// `%TEMP%` is per-user, so pre-creating it requires already being that user,
+/// who could edit `$HOME/.gitconfig` directly and gains nothing. Every caller
+/// also binds `GIT_CONFIG_NOSYSTEM=1`.
 #[cfg(unix)]
 pub fn empty_global_git_config() -> &'static OsStr {
     OsStr::new("/dev/null")
@@ -53,21 +61,11 @@ pub fn empty_global_git_config() -> &'static OsStr {
     static EMPTY_GLOBAL_GIT_CONFIG: OnceLock<PathBuf> = OnceLock::new();
     EMPTY_GLOBAL_GIT_CONFIG
         .get_or_init(|| {
-            // `tempfile` creates the file already empty, so the config needs no
-            // write of its own — there is no content to put in it.
-            //
-            // `keep` persists it past the command that first asked for it:
-            // every later Git launch in this process reuses the same file.
-            let (file, path) = tempfile::Builder::new()
-                .prefix("kin-empty-global-gitconfig-")
-                .tempfile()
-                .expect("create empty global Git config")
-                .keep()
-                .expect("persist empty global Git config");
-            // Closed before any child is spawned: Windows will not hand Git a
-            // second handle to a file this process still holds open.
-            drop(file);
-            path
+            // The intermediate directory is deliberately never created: its
+            // absence is what makes a `--global` write fail instead of persist.
+            std::env::temp_dir()
+                .join("kin-absent-global-gitconfig")
+                .join("gitconfig")
         })
         .as_os_str()
 }
@@ -75,53 +73,64 @@ pub fn empty_global_git_config() -> &'static OsStr {
 #[cfg(test)]
 mod tests {
     use super::empty_global_git_config;
+    use std::path::Path;
 
-    /// The property Git actually needs, asserted on every target: the bound
-    /// path opens and yields no configuration. `NUL` fails this on Windows,
-    /// where it is a device rather than a file, and fails it on every other
-    /// target, where nothing of that name exists at all.
+    /// Asserted on every target, and the reason it is worth asserting: `NUL` is
+    /// a bare reserved device name, so it is not absolute anywhere. This single
+    /// property fails against the defect on Unix and Windows alike.
     #[test]
-    fn bound_path_opens_and_reads_as_empty() {
-        let path = empty_global_git_config();
-        let contents = std::fs::read(path).unwrap_or_else(|error| {
-            panic!("global Git config {path:?} is not a readable path: {error}")
-        });
+    fn bound_path_is_absolute() {
+        let path = Path::new(empty_global_git_config());
         assert!(
-            contents.is_empty(),
-            "global Git config {path:?} carries {} bytes of configuration",
-            contents.len()
+            path.is_absolute(),
+            "global Git config {path:?} is not an absolute path, so it is a bare \
+             name Git resolves against its own working directory"
         );
     }
 
-    /// The path outlives any one command, so repeated boundary applications in
-    /// a process bind the same file rather than racing to recreate it.
+    /// The binding outlives any one command, so repeated boundary applications
+    /// in a process agree rather than racing to derive different paths.
     #[test]
     fn bound_path_is_stable_within_the_process() {
         assert_eq!(empty_global_git_config(), empty_global_git_config());
     }
 
+    /// Unix keeps the device Git already reads as an empty config and refuses
+    /// to lock for writing.
     #[cfg(unix)]
     #[test]
     fn unix_binds_the_null_device() {
         assert_eq!(
             empty_global_git_config(),
             std::ffi::OsStr::new("/dev/null"),
-            "Unix lost the path Git already reads as an empty config"
+            "Unix lost the path Git reads as empty and refuses to lock"
         );
+        let contents = std::fs::read("/dev/null").expect("read /dev/null");
+        assert!(contents.is_empty(), "/dev/null did not read as empty");
     }
 
-    /// Off Unix there is no device Git will open, so the bound path has to be a
-    /// real, empty, regular file.
+    /// Off Unix the guarantee is structural: the config path is absent, and so
+    /// is its parent. The absent parent is what makes `git config --global`
+    /// fail to take a lockfile instead of silently persisting.
     #[cfg(not(unix))]
     #[test]
-    fn non_unix_binds_an_empty_regular_file() {
-        let path = empty_global_git_config();
-        let metadata = std::fs::metadata(path)
-            .unwrap_or_else(|error| panic!("global Git config {path:?} is not a path: {error}"));
+    fn non_unix_binds_an_absent_path_under_an_absent_parent() {
+        let path = Path::new(empty_global_git_config());
         assert!(
-            metadata.is_file(),
-            "global Git config {path:?} is not a regular file"
+            !path.exists(),
+            "global Git config {path:?} exists, so Git would read it"
         );
-        assert_eq!(metadata.len(), 0, "global Git config {path:?} is not empty");
+        let parent = path.parent().expect("bound path has a parent directory");
+        assert!(
+            !parent.exists(),
+            "parent {parent:?} exists, so a --global write could create the \
+             config there and silently poison every later Git launch"
+        );
+        assert!(
+            parent
+                .parent()
+                .is_some_and(|grandparent| grandparent == std::env::temp_dir()),
+            "bound path {path:?} is not anchored in the per-user temp directory"
+        );
     }
 }

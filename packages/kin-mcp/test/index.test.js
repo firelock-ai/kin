@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import cp from 'node:child_process';
 import crypto from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -37,22 +37,27 @@ import {
   runGit
 } from './smoke-first-run.mjs';
 
-test('the empty global Git config is a path Git will open on every platform', () => {
+test('the empty global Git config resolves to no configuration on every platform', () => {
   // Off Windows, `/dev/null` is the path Git already reads as an empty config.
   assert.equal(emptyGlobalGitConfig('linux'), os.devNull);
   assert.equal(emptyGlobalGitConfig('darwin'), os.devNull);
 
   // On Windows `os.devNull` is the reserved `NUL` device rather than a file,
-  // and Git refuses it outright, so that branch has to materialize a real one.
+  // and Git refuses it outright, so that branch names a path under an absent
+  // parent: reads resolve to nothing and a `--global` write fails loudly.
   const windows = emptyGlobalGitConfig('win32');
   assert.notEqual(windows, 'NUL');
-  const stats = statSync(windows);
-  assert.equal(stats.isFile(), true, `${windows} is not a regular file`);
-  assert.equal(stats.size, 0, `${windows} is not empty`);
-  assert.equal(readFileSync(windows, 'utf8'), '');
+  assert.equal(path.isAbsolute(windows), true, `${windows} is not absolute`);
+  // Nothing is created: the absent parent is what makes a `--global` write fail
+  // loudly instead of persisting into a file every later Git launch would read.
+  assert.equal(existsSync(windows), false, `${windows} should not exist`);
+  assert.equal(
+    existsSync(path.dirname(windows)),
+    false,
+    `${path.dirname(windows)} should not exist`
+  );
 
-  // The file outlives any single child, so repeated calls reuse it rather than
-  // racing to recreate a path a spawned Git may already have open.
+  // Deterministic, so repeated boundary applications agree.
   assert.equal(emptyGlobalGitConfig('win32'), windows);
 });
 
@@ -217,13 +222,11 @@ test('first-run smoke scrubs mixed-case Windows authority names', () => {
   assert.equal(env.PATH, 'C:\\Git\\cmd;C:\\Windows\\System32');
   // `NUL` is a reserved Windows device, not a file: Git refuses it with
   // `fatal: unable to access 'NUL': Invalid argument` and every isolated Git
-  // command fails. Assert the property Git actually needs — a readable, empty,
-  // regular file — rather than pinning a spelling. Simulating win32 makes the
-  // Windows branch really create that file, so this runs on any host.
-  const globalConfig = statSync(env.GIT_CONFIG_GLOBAL);
-  assert.equal(globalConfig.isFile(), true, `${env.GIT_CONFIG_GLOBAL} is not a regular file`);
-  assert.equal(globalConfig.size, 0, `${env.GIT_CONFIG_GLOBAL} is not empty`);
-  assert.equal(readFileSync(env.GIT_CONFIG_GLOBAL, 'utf8'), '');
+  // command fails. Assert the property Git actually needs rather than pinning a
+  // spelling: an absolute path that resolves to no configuration.
+  assert.notEqual(env.GIT_CONFIG_GLOBAL, 'NUL');
+  assert.equal(path.isAbsolute(env.GIT_CONFIG_GLOBAL), true);
+  assert.equal(env.GIT_CONFIG_GLOBAL, emptyGlobalGitConfig('win32'));
   assert.equal(env.KIN_VFS_DISABLE, '1');
   const inheritedNames = Object.keys(env).map(name => name.toLowerCase());
   for (const name of [
