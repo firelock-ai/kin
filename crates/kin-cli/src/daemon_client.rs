@@ -1982,7 +1982,13 @@ fn process_is_unreaped_corpse(pid: libc::pid_t) -> bool {
                 expected as i32,
             )
         };
-        if written == expected as i32 {
+        // `proc_pidinfo` reports failure as a zero return with `errno` set, so
+        // only zero is a result whose `errno` is this call's. A short non-zero
+        // return is undocumented and would leave `errno` holding whatever an
+        // earlier, unrelated call left there — and reading a stale `ESRCH` out
+        // of it would declare a LIVE daemon stopped, which is the one direction
+        // this must never fail in.
+        if written != 0 {
             return false;
         }
         // Permission to inspect is already established by the caller's
