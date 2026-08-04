@@ -1,10 +1,6 @@
-<div align="center">
-
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-dark.svg">
-<source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg">
-<img src="https://raw.githubusercontent.com/firelock-ai/kin/main/brand/kin-lockup-light.svg" alt="Kin" width="300">
-</picture>
+<p align="center">
+  <img src="docs/assets/kin-banner.png" alt="Kin - Semantic Repository Substrate" width="100%" />
+</p>
 
 <h3>Software that remembers itself.</h3>
 
