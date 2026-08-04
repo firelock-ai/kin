@@ -7328,6 +7328,19 @@ def main() -> None:
         "config::windows::capability_exclusion_tests",
         "native retained-capability exclusion proof",
     )
+    # `kin init` is what the admission script drives, and it lives two steps
+    # later behind a build. When it refuses, the script reports one line naming
+    # a path that both the config writer and the metadata seal report against,
+    # so the end-to-end leg cannot say which component refused. Running
+    # admission in process here names a test instead. This is required rather
+    # than merely present because `init.rs` carried no native Windows coverage
+    # at all until it was added, which is how a refusal in it stayed unlocated
+    # across repeated attempts.
+    require(
+        ci_jobs["windows-authority-tests"],
+        "init::tests",
+        "native repository initialization proof",
+    )
     require(
         ci_jobs["windows-authority-tests"],
         "target/x86_64-pc-windows-msvc/debug/kin.exe",
