@@ -2502,9 +2502,14 @@ mod tests {
     /// returns a `\\?\` verbatim path, `env::current_dir` never does, and
     /// repository discovery walks up from the working directory without
     /// changing its form.
+    ///
+    /// The name must keep its `windows_` prefix. CI's native Windows leg
+    /// selects kin-cli tests by the substring filter `windows`, so a
+    /// Windows-only regression test named without it compiles on that leg and
+    /// never runs, which is worse than having no test at all.
     #[cfg(windows)]
     #[test]
-    fn antigravity_global_binding_accepts_a_verbatim_root_from_a_plain_working_directory() {
+    fn windows_antigravity_global_binding_accepts_a_verbatim_root_from_a_plain_working_directory() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".kin")).unwrap();
