@@ -15355,10 +15355,14 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                         log_content.trim_end()
                     ));
                 }
+                // The helper removes its own script last, so its absence is what
+                // proves the teardown ran to completion rather than catching the
+                // helper part-way through it.
                 if !success.incomplete_marker.exists()
                     && !success.retired.exists()
                     && !success.helper_ready.exists()
                     && !success.helper_ready_publishing.exists()
+                    && !success.helper_script.exists()
                 {
                     WindowsWaitState::Satisfied
                 } else {
@@ -15416,7 +15420,12 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "failed deferred uninstall journal",
             Duration::from_secs(120),
             || {
-                if failure.helper_log.is_file() {
+                // The helper journals its refusal inside `catch` and only then
+                // clears the handshake artifacts in `finally`, removing its own
+                // script last. Waiting for the journal alone would observe the
+                // helper mid-teardown; waiting for the script to disappear
+                // proves the whole teardown ran.
+                if failure.helper_log.is_file() && !failure.helper_script.exists() {
                     WindowsWaitState::Satisfied
                 } else {
                     WindowsWaitState::Pending
