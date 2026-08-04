@@ -13441,6 +13441,7 @@ try {
     let script = script.replace(
         "    $current = [Environment]::GetEnvironmentVariable('Path', 'User')",
         r#"    $testRelease = $env:KIN_INTERNAL_TEST_UNINSTALL_HELPER_RELEASE
+    if (-not [string]::IsNullOrEmpty($testRelease)) { throw "injected terminal helper error for abort proof" }
     if (-not [string]::IsNullOrEmpty($testRelease)) {
         $testReleaseDeadline = [DateTime]::UtcNow.AddSeconds(300)
         while (-not (Test-Path -LiteralPath $testRelease -PathType Leaf)) {
