@@ -912,6 +912,11 @@ async fn request_daemon_shutdown(
         )
             .into_response();
     };
+    // `shutdown` is a clone of the daemon's cancel channel, which is the exact
+    // watch value the escalation watchdog polls, so accepting a cooperative
+    // request already starts the force-exit countdown. Nothing further is
+    // needed here, and nothing here is runtime-independent: reaching this line
+    // at all requires a schedulable runtime.
     match shutdown.send(true) {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({"stopping": true}))).into_response(),
         Err(error) => (

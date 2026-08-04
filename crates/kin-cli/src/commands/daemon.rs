@@ -14,6 +14,11 @@
 //! pidfd, native Windows uses a process handle, and macOS uses an authenticated
 //! cooperative endpoint whose request names the expected birth identity. The
 //! wait is a ceiling, not a fixed delay.
+//!
+//! `--all` bounds the sweep, not just each step in it. Stopping identities in
+//! sequence under a per-identity ceiling left the command's real bound
+//! proportional to how many daemons happened to be running, so `stop --all`
+//! could outlive its caller's patience and be killed before reporting anything.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -81,6 +86,49 @@ fn stop_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30);
     Duration::from_secs(secs)
+}
+
+/// Worst case for one daemon that rides its force-exit escalation all the way:
+/// `DEFAULT_SHUTDOWN_ESCALATION_GRACE` (25s) plus one `SHUTDOWN_WATCH_POLL`
+/// (250ms) for the watchdog to notice. Any sweep budget has to clear this for
+/// the FIRST identity alone, or a single wedged daemon consumes the whole sweep.
+const DAEMON_FORCE_EXIT_WORST_CASE: Duration = Duration::from_millis(25_250);
+
+/// Reserved for the supervisor, which is stopped last.
+const SUPERVISOR_STOP_RESERVE: Duration = Duration::from_secs(10);
+
+/// How long the whole `--all` sweep may take, as opposed to how long any one
+/// identity may take.
+///
+/// `--all` stops identities in sequence, so giving each the full per-identity
+/// ceiling made the command's real bound `identities × ceiling` with nothing
+/// bounding the product. An ordinary install is one worker plus the supervisor,
+/// which is already 60s of worst case against a caller that commonly allows 60s,
+/// so the command was killed before it could report anything, turning a stop
+/// that failed into a stop with no verdict at all.
+///
+/// Sizing it is not free choice. `stop_timeout()`'s 30s was picked as a
+/// PER-IDENTITY margin over the daemon's ~25.25s hard bound, so reusing it as
+/// the whole-sweep budget leaves that 5s of margin to cover every identity after
+/// the first. One worker riding the full escalation would hand the supervisor
+/// 4.75s, and a supervisor reported `timeout` fails the command just as loudly
+/// as a hang. The budget is therefore derived from the daemon's bound rather
+/// than borrowed from a per-identity constant, and still leaves headroom under
+/// the 60s callers typically allow.
+fn stop_all_budget() -> Duration {
+    DAEMON_FORCE_EXIT_WORST_CASE
+        .saturating_add(SUPERVISOR_STOP_RESERVE)
+        .max(stop_timeout())
+}
+
+/// Budget left before `deadline`.
+///
+/// Reaching zero does not skip an identity: the stop request is still delivered,
+/// and only the wait for the process to disappear is what the exhausted budget
+/// gives up. The identity is then reported `timeout`, which is the honest
+/// outcome, since the request went out and this command did not stay to watch.
+fn remaining_budget(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 /// Outcome of a graceful stop request against one recorded pid.
@@ -916,7 +964,17 @@ async fn stop_all(json: bool, quiet: bool) -> Result<()> {
 }
 
 async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) -> Result<()> {
-    let wait = stop_timeout();
+    // One budget for the whole sweep. Each identity below waits only for what
+    // is left of it, so this command's bound is the budget rather than the
+    // budget multiplied by however many daemons happen to be running.
+    //
+    // Workers stop against an earlier deadline so the supervisor, which stops
+    // last, cannot be starved by them. Without that reserve a single worker
+    // riding its force-exit escalation leaves the supervisor a few seconds, and
+    // a supervisor reported `timeout` fails the command exactly as loudly as
+    // the hang this change exists to remove.
+    let deadline = Instant::now() + stop_all_budget();
+    let worker_deadline = deadline - SUPERVISOR_STOP_RESERVE;
     let mut reports: Vec<StopReport> = Vec::new();
 
     // A live supervisor is the only authoritative registry of every repo
@@ -967,7 +1025,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     // the registry snapshot and supervisor exit.
     if uninstall_root.is_some() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_supervisor_identity(identity, wait);
+            let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
             reports.push(StopReport {
                 kind: "supervisor",
                 label: "supervisor".to_string(),
@@ -984,7 +1042,12 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
             daemon.display_name.clone()
         };
         let kin_root = Path::new(&daemon.repo_root).join(".kin");
-        let outcome = stop_worker_at(&kin_root, daemon.pid, wait, uninstall_root)?;
+        let outcome = stop_worker_at(
+            &kin_root,
+            daemon.pid,
+            remaining_budget(worker_deadline),
+            uninstall_root,
+        )?;
         if outcome.is_success() {
             remove_stale_daemon_files(&kin_root);
         }
@@ -1006,7 +1069,12 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
                 let already = reports.iter().any(|r| r.pid == pid);
                 if !already && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
-                    let outcome = stop_worker_at(&kin_root, pid, wait, uninstall_root)?;
+                    let outcome = stop_worker_at(
+                        &kin_root,
+                        pid,
+                        remaining_budget(worker_deadline),
+                        uninstall_root,
+                    )?;
                     if outcome.is_success() {
                         remove_stale_daemon_files(&kin_root);
                     }
@@ -1025,7 +1093,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     // workers first, supervisor last. Full uninstall already stopped it above.
     if uninstall_root.is_none() {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
-            let outcome = stop_supervisor_identity(identity, wait);
+            let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
             if outcome.is_success() {
                 remove_stale_supervisor_files();
             }
@@ -1039,7 +1107,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     }
 
     if let Some(install_root) = uninstall_root {
-        stop_install_owned_daemons(install_root, wait, &mut reports)?;
+        stop_install_owned_daemons(install_root, deadline, &mut reports)?;
     }
 
     if reports.is_empty() {
@@ -1217,9 +1285,14 @@ fn legacy_managed_identity(
 
 fn stop_install_owned_daemons(
     install_root: &Path,
-    wait: Duration,
+    deadline: Instant,
     reports: &mut Vec<StopReport>,
 ) -> Result<()> {
+    // Takes the sweep DEADLINE, not a remaining-budget snapshot. A snapshot is
+    // re-spent by every process on every pass, so the real bound here would be
+    // passes x processes x budget rather than the budget the caller meant.
+    // Recomputing against the deadline keeps the whole sweep inside one bound.
+    //
     // A second pass catches a worker spawned while the supervisor was exiting;
     // the retained startup authority means no successor supervisor can appear.
     for _ in 0..3 {
@@ -1244,7 +1317,12 @@ fn stop_install_owned_daemons(
             match process.kind {
                 ManagedDaemonKind::Worker { repo_root } => {
                     let kin_root = repo_root.join(".kin");
-                    let outcome = stop_worker_at(&kin_root, process.pid, wait, Some(install_root))?;
+                    let outcome = stop_worker_at(
+                        &kin_root,
+                        process.pid,
+                        remaining_budget(deadline),
+                        Some(install_root),
+                    )?;
                     if outcome.is_success() {
                         remove_stale_daemon_files(&kin_root);
                     }
@@ -1256,7 +1334,11 @@ fn stop_install_owned_daemons(
                     });
                 }
                 ManagedDaemonKind::Supervisor => {
-                    let outcome = stop_supervisor_pid(process.pid, wait, Some(install_root))?;
+                    let outcome = stop_supervisor_pid(
+                        process.pid,
+                        remaining_budget(deadline),
+                        Some(install_root),
+                    )?;
                     reports.push(StopReport {
                         kind: "supervisor",
                         label: "supervisor".to_string(),
@@ -1500,6 +1582,38 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_budget_cannot_be_consumed_by_one_wedged_daemon() {
+        // The failure this closes: `--all` stops identities in sequence and the
+        // supervisor goes last. A worker that rides its force-exit escalation
+        // spends ~25.25s, and when the whole-sweep budget was the 30s
+        // per-identity constant that left the supervisor 4.75s. A supervisor
+        // reported `timeout` fails the command exactly as loudly as the hang
+        // this change exists to remove, so the sweep has to clear one full
+        // escalation AND still fund the tail.
+        let budget = stop_all_budget();
+        assert!(
+            budget >= DAEMON_FORCE_EXIT_WORST_CASE + SUPERVISOR_STOP_RESERVE,
+            "sweep budget {budget:?} must fund one full force-exit escalation \
+             plus the supervisor reserve"
+        );
+
+        // What the sweep actually hands the supervisor after a worst-case
+        // worker, computed the way `stop_all_inner` computes it.
+        let sweep_start = Instant::now();
+        let worker_deadline = (sweep_start + budget) - SUPERVISOR_STOP_RESERVE;
+        let after_wedged_worker = sweep_start + DAEMON_FORCE_EXIT_WORST_CASE;
+        assert!(
+            worker_deadline >= after_wedged_worker,
+            "a single wedged worker must not exhaust the workers' share"
+        );
+        let supervisor_share = (sweep_start + budget) - after_wedged_worker;
+        assert!(
+            supervisor_share >= SUPERVISOR_STOP_RESERVE,
+            "supervisor was left {supervisor_share:?}, less than its reserve"
+        );
+    }
+
+    #[test]
     fn stop_outcome_success_semantics() {
         assert!(StopOutcome::Stopped.is_success());
         assert!(StopOutcome::NotRunning.is_success());
@@ -1607,7 +1721,11 @@ mod tests {
                     "daemon scan authorized an outside process through lexical traversal"
                 );
                 let mut reports = Vec::new();
-                stop_install_owned_daemons(&install_root, Duration::from_secs(5), &mut reports)?;
+                stop_install_owned_daemons(
+                    &install_root,
+                    Instant::now() + Duration::from_secs(5),
+                    &mut reports,
+                )?;
                 anyhow::ensure!(
                     reports.iter().any(|report| {
                         report.pid == managed_child.0.id() && report.outcome.is_success()

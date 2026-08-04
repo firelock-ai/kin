@@ -1358,6 +1358,24 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     // via KIN_SUPERVISOR_REAP_DISABLE.
     spawn_rogue_daemon_reaper(Arc::clone(&state), shutdown_rx.clone());
 
+    // The supervisor is stopped LAST in a `kin daemon stop --all` sweep, and
+    // until now it was the one identity in that sweep with no hard bound on how
+    // long stopping it could take. Its only shutdown paths are the tokio task
+    // below and axum's graceful shutdown, which waits for in-flight connections
+    // to finish; a request against a wedged repo daemon therefore holds the
+    // supervisor open with nothing to end it. The CLI then reports a timeout
+    // for a supervisor that was never going to exit, and a stop that worked on
+    // every worker still fails.
+    //
+    // Same backstop the repo daemon uses: arming is runtime-independent, and
+    // the watchdog is a plain OS thread that force-exits at grace.
+    crate::daemon::install_shutdown_signal_handler();
+    crate::daemon::spawn_shutdown_escalation_watchdog(
+        || false,
+        shutdown_rx.clone(),
+        crate::daemon::shutdown_escalation_grace(),
+    );
+
     #[cfg(unix)]
     {
         let signal_shutdown = shutdown_tx.clone();
