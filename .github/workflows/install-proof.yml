@@ -1270,7 +1270,33 @@ jobs:
             *) echo "unsupported Unix install-proof shell: $PROOF_SHELL" >&2; exit 1 ;;
           esac
           kin embed --max-seconds 300 --json | tee kin-embed.json
-          kin status --json | tee kin-embedded-status.json
+          # Coverage can be momentarily unobservable rather than incomplete: a
+          # graph mutation batch spanning the sample leaves the daemon unable to
+          # pair counters with a stable authority epoch, and status then reports
+          # unobserved/graph_mutation_in_flight. That is a window, not a
+          # shortfall, and one sample can land inside it. Settle over exactly
+          # that window instead of asserting on a single read.
+          #
+          # This workflow also runs on schedule and on release:published from
+          # the default branch against whatever release is currently latest, so
+          # the installed binary can predate the flag. Probe for it rather than
+          # inferring support from a version, and record which read was taken so
+          # a failure names the read that produced it. `case` on a captured
+          # string, not `grep -q` in a pipeline: SIGPIPE under `pipefail` would
+          # invert the test.
+          settle_probe="$(kin status --help 2>&1 || true)"
+          case "$settle_probe" in
+            *--wait-quiesce*)
+              printf 'bounded settle (kin status --wait-quiesce 60)\n' \
+                | tee kin-status-settle-mode.txt
+              kin status --json --wait-quiesce 60 | tee kin-embedded-status.json
+              ;;
+            *)
+              printf 'single sample (installed kin has no --wait-quiesce)\n' \
+                | tee kin-status-settle-mode.txt >&2
+              kin status --json | tee kin-embedded-status.json
+              ;;
+          esac
           kin setup status --json | tee kin-embedded-health.json
           kin doctor --json | tee kin-embedded-doctor.json
           kin search hello --semantic --json | tee kin-semantic-search.json
@@ -1546,8 +1572,22 @@ jobs:
             }
             validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
             const embeddedCoverage = embeddedStatus.embedding_coverage;
+            const settleMode = fs.existsSync("kin-status-settle-mode.txt")
+              ? fs.readFileSync("kin-status-settle-mode.txt", "utf8").trim()
+              : "unrecorded";
+            // Two distinct failures, kept apart so the log says which one
+            // happened. Unobserved means the report could not measure coverage
+            // even after the settle above; the counts below mean it measured
+            // and came up short. Only the first is a race, and the state field
+            // is what separates them, so a genuinely incomplete store still
+            // fails here exactly as it did before the settle existed.
+            if (embeddedCoverage.state !== "observed") {
+              throw new Error(
+                `Unix status could not observe embedding coverage after a ${settleMode} read: ` +
+                `${JSON.stringify(embeddedCoverage)}`
+              );
+            }
             if (
-              embeddedCoverage.state !== "observed" ||
               embeddedCoverage.source !== "live_query_graph" ||
               embeddedCoverage.total === 0 ||
               embeddedCoverage.indexed !== embeddedCoverage.total ||

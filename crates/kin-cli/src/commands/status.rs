@@ -23,6 +23,15 @@
 //! vector index holds, so coverage is reported as its own object naming the
 //! live view it was sampled from. When no such view is available the object
 //! says so; it never reports the zero that an unindexed graph would produce.
+//!
+//! Some of those absences are a window rather than a condition: an embedding
+//! pass holds the work lock, or a mutation batch spans the sample, and the next
+//! read observes coverage with nothing else having changed. Naming them is what
+//! lets a caller tell "not measurable right now" from "measured and
+//! incomplete", and `--wait-quiesce` lets it act on that instead of only
+//! reading it, by bounding a re-read of exactly those states. Completeness is
+//! never what the settle inspects, so an observed shortfall is published on the
+//! first read and cannot be waited into looking whole.
 
 use std::path::PathBuf;
 
@@ -56,6 +65,15 @@ pub const STATUS_SCHEMA: &str = "kin.status.v3";
 /// tight enough to protect against a stuck handler would also abandon a
 /// legitimate read on a large store.
 const LIVE_STATUS_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// First and longest gap between re-reads inside a `--wait-quiesce` settle.
+///
+/// The settle sleeps between attempts rather than retrying immediately. What it
+/// waits for is another task finishing: a spin would take the same round trip
+/// over and over and compete for the runtime with the work whose completion is
+/// the only thing that can change the answer.
+const QUIESCE_BACKOFF_FLOOR: std::time::Duration = std::time::Duration::from_millis(50);
+const QUIESCE_BACKOFF_CEILING: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn deserialize_status_schema<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -250,6 +268,36 @@ pub enum EmbeddingCoverageUnobserved {
     /// from every state above, all of which are answers about a graph that was
     /// reachable.
     SamplingFailed,
+}
+
+impl EmbeddingCoverageUnobserved {
+    /// Whether re-reading alone can turn this absence into an observation.
+    ///
+    /// Two of these states end on their own with nobody intervening: an
+    /// embedding pass releases the work lock, and a mutation batch closes its
+    /// authority epoch. A read that arrives afterwards measures the same graph
+    /// the earlier one could not pair a stable epoch with, so waiting is
+    /// waiting for a window to shut.
+    ///
+    /// Every other absence needs a different actor to change something first. A
+    /// daemon has to be started, a vector index has to be attached, a build has
+    /// to ship a backend, a poisoned lock needs a restart because no later pass
+    /// can ever take it. Spending a settle budget on those would report the same
+    /// absence later and call the delay progress.
+    ///
+    /// Exhaustive on purpose: a new absence has to state which side it is on
+    /// rather than inheriting a wildcard that would silently make it waitable.
+    pub fn settles_on_its_own(self) -> bool {
+        match self {
+            Self::SamplingContended | Self::GraphMutationInFlight => true,
+            Self::NoRunningDaemon
+            | Self::DaemonStatusUnavailable
+            | Self::NoVectorIndexAttached
+            | Self::VectorSupportDisabled
+            | Self::EmbeddingWorkLockPoisoned
+            | Self::SamplingFailed => false,
+        }
+    }
 }
 
 /// Embedding coverage of the live view that answers semantic queries.
@@ -835,15 +883,70 @@ async fn live_status_from_running_daemon(
     }
 }
 
-pub async fn run(json: bool) -> Result<()> {
-    let layout = crate::commands::require_repository_layout()?;
-    let report = match live_status_from_running_daemon(&layout).await {
-        Ok(report) => report,
+/// One complete status reading: the live daemon's when it answers, and this
+/// process's own authority read naming why it did not otherwise.
+async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReport> {
+    match live_status_from_running_daemon(layout).await {
+        Ok(report) => Ok(report),
         Err(reason) => {
-            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-            inspect(&layout, &binding, EmbeddingCoverage::unobserved(reason))?
+            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+            inspect(layout, &binding, EmbeddingCoverage::unobserved(reason))
         }
-    };
+    }
+}
+
+/// Re-read until embedding coverage stops being momentarily unobservable, or
+/// until `budget` is spent.
+///
+/// This waits on one thing only: an absence the state machine documents as
+/// self-clearing. Three consequences, and they are the whole contract.
+///
+/// An observed coverage returns from the first read whatever it counts. A
+/// half-embedded repository is not retried, not held back, and cannot be waited
+/// into looking complete, because completeness is never what this inspects.
+///
+/// An absence that needs another actor to move returns immediately too, so a
+/// missing daemon or a poisoned embedding lock is reported at once instead of
+/// after a budget spent proving it will not change.
+///
+/// When the budget runs out the last real reading is returned unchanged. The
+/// caller publishes what was actually seen, with its reason intact, rather than
+/// a timeout standing in for an observation.
+///
+/// A zero budget reads exactly once, which is what every caller that did not
+/// ask to wait gets.
+async fn settle_embedding_coverage<Read, Reading>(
+    budget: std::time::Duration,
+    mut read: Read,
+) -> Result<StatusReport>
+where
+    Read: FnMut() -> Reading,
+    Reading: std::future::Future<Output = Result<StatusReport>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut backoff = QUIESCE_BACKOFF_FLOOR;
+    loop {
+        let report = read().await?;
+        let EmbeddingCoverage::Unobserved { reason } = report.embedding_coverage else {
+            return Ok(report);
+        };
+        if !reason.settles_on_its_own() {
+            return Ok(report);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(report);
+        }
+        // Never overshoot the budget the caller stated, including on the last
+        // nap before the deadline.
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = backoff.saturating_mul(2).min(QUIESCE_BACKOFF_CEILING);
+    }
+}
+
+pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    let report = settle_embedding_coverage(wait_quiesce, || read_status_once(&layout)).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1447,6 +1550,285 @@ mod tests {
             error.to_string().contains("embedding_coverage is invalid"),
             "{error}"
         );
+    }
+
+    /// One real report to drive the settle with, so it is exercised against the
+    /// shape production hands it rather than a hand-built stand-in.
+    fn settle_base_report() -> StatusReport {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        inspect(&init.layout, &binding, unobserved_fixture()).unwrap()
+    }
+
+    fn carrying(base: &StatusReport, coverage: EmbeddingCoverage) -> StatusReport {
+        let mut report = base.clone();
+        report.embedding_coverage = coverage;
+        report
+    }
+
+    /// Slack allowed above a settle budget on a loaded machine. Wide on
+    /// purpose: these bounds exist to catch a settle that never stops, not to
+    /// measure scheduler latency, and a tight bound here would fail on load
+    /// rather than on a defect.
+    const SETTLE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Budget handed to a case that must not wait at all. Generous enough that
+    /// spending any of it is unambiguous, short enough that a settle which
+    /// wrongly waits fails the suite quickly instead of hanging it.
+    const IMMEDIATE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Drive the settle with a scripted sequence of readings, returning the
+    /// final report, how many readings were consumed, and how much of the
+    /// budget was spent. The last entry repeats once the script runs out, which
+    /// is how a never-clearing condition is expressed.
+    async fn drive_settle(
+        budget: std::time::Duration,
+        script: Vec<StatusReport>,
+    ) -> (StatusReport, usize, std::time::Duration) {
+        let reads = std::cell::Cell::new(0usize);
+        let started = tokio::time::Instant::now();
+        let report = settle_embedding_coverage(budget, || {
+            let attempt = reads.get();
+            reads.set(attempt + 1);
+            let reading = script[attempt.min(script.len() - 1)].clone();
+            async move { Ok(reading) }
+        })
+        .await
+        .unwrap();
+        (report, reads.get(), tokio::time::Instant::now() - started)
+    }
+
+    /// The FIR-1877 race itself: the daemon could not pair a stable authority
+    /// epoch with a sample, and the coverage it was hiding is observable a
+    /// moment later. A single-sample caller failed here.
+    #[tokio::test]
+    async fn a_mutation_in_flight_settles_into_the_observation_it_was_hiding() {
+        let base = settle_base_report();
+        let stalled = carrying(
+            &base,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::GraphMutationInFlight),
+        );
+        let settled = carrying(
+            &base,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 57,
+                pending: 0,
+                total: 57,
+            },
+        );
+
+        let (report, reads, elapsed) = drive_settle(
+            std::time::Duration::from_secs(30),
+            vec![stalled.clone(), stalled, settled.clone()],
+        )
+        .await;
+
+        assert_eq!(
+            report, settled,
+            "the settle must publish the reading it waited for"
+        );
+        assert_eq!(reads, 3, "the settle must re-read until the window shut");
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the settle must return when coverage is observable, not at its deadline: {elapsed:?}"
+        );
+    }
+
+    /// A held embedding lock is the sibling transient state and settles the
+    /// same way.
+    #[tokio::test]
+    async fn a_contended_sample_settles_the_same_way() {
+        let base = settle_base_report();
+        let contended = carrying(
+            &base,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::SamplingContended),
+        );
+        let settled = carrying(
+            &base,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 4,
+                pending: 0,
+                total: 4,
+            },
+        );
+
+        let (report, reads, _) = drive_settle(
+            std::time::Duration::from_secs(30),
+            vec![contended, settled.clone()],
+        )
+        .await;
+
+        assert_eq!(report, settled);
+        assert_eq!(reads, 2);
+    }
+
+    /// A window that never shuts must expire truthfully. The caller receives
+    /// the last real reading, still unobserved and still naming its reason, so
+    /// its own assertion fails on what was actually seen.
+    #[tokio::test]
+    async fn a_window_that_never_shuts_expires_reporting_the_last_state_seen() {
+        let base = settle_base_report();
+        let budget = std::time::Duration::from_millis(250);
+        let stalled = carrying(
+            &base,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::GraphMutationInFlight),
+        );
+
+        let (report, reads, elapsed) = drive_settle(budget, vec![stalled.clone()]).await;
+
+        assert_eq!(
+            report, stalled,
+            "an expired settle must publish the reading it last took, not a synthesized one"
+        );
+        assert!(
+            elapsed >= budget,
+            "the settle must spend the budget it was given: {elapsed:?} < {budget:?}"
+        );
+        assert!(
+            elapsed < budget + SETTLE_SLACK,
+            "the settle must stop at its deadline rather than wait on: {elapsed:?}"
+        );
+        assert!(
+            reads > 1,
+            "an expired settle must have actually re-read, not slept once: {reads}"
+        );
+        // A spin would take far more readings than a backoff floored at 50ms
+        // can fit into the budget.
+        assert!(
+            reads <= 1 + (budget.as_millis() / QUIESCE_BACKOFF_FLOOR.as_millis()) as usize,
+            "the settle must back off between readings rather than spin: {reads}"
+        );
+    }
+
+    /// The falsification that matters most. A store whose coverage is genuinely
+    /// incomplete is observed, not unobservable, so the settle returns it
+    /// untouched on the first reading. Nothing here can wait a shortfall into
+    /// looking whole, and a caller asserting indexed == total still fails.
+    #[tokio::test]
+    async fn genuine_incompleteness_is_returned_at_once_and_never_masked() {
+        let base = settle_base_report();
+        let incomplete = carrying(
+            &base,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 11,
+                pending: 46,
+                total: 57,
+            },
+        );
+
+        let (report, reads, elapsed) =
+            drive_settle(IMMEDIATE_BUDGET, vec![incomplete.clone()]).await;
+
+        assert_eq!(
+            report, incomplete,
+            "an observed shortfall must pass through unchanged"
+        );
+        assert_eq!(reads, 1, "an observed coverage must never be re-read");
+        assert!(
+            elapsed < IMMEDIATE_BUDGET,
+            "an observed coverage must not consume the settle budget: {elapsed:?}"
+        );
+        let EmbeddingCoverage::Observed { indexed, total, .. } = report.embedding_coverage else {
+            panic!("coverage must remain observed");
+        };
+        assert_ne!(
+            indexed, total,
+            "the shortfall a proof asserts on must survive the settle"
+        );
+    }
+
+    /// An empty store reads as observed zero, not as unobservable, so a
+    /// never-embedded repository fails a completeness assertion immediately
+    /// instead of being waited on.
+    #[tokio::test]
+    async fn an_unembedded_store_is_not_waited_on() {
+        let base = settle_base_report();
+        let empty = carrying(
+            &base,
+            EmbeddingCoverage::Observed {
+                source: EmbeddingCoverageSource::LiveQueryGraph,
+                indexed: 0,
+                pending: 0,
+                total: 0,
+            },
+        );
+
+        let (report, reads, elapsed) = drive_settle(IMMEDIATE_BUDGET, vec![empty.clone()]).await;
+
+        assert_eq!(report, empty);
+        assert_eq!(reads, 1);
+        assert!(elapsed < IMMEDIATE_BUDGET, "{elapsed:?}");
+    }
+
+    /// An absence a re-read cannot clear must not consume the budget. Waiting
+    /// on a poisoned embedding lock would delay the report and end at the same
+    /// answer, having told the operator to keep waiting for a pass that can
+    /// never run.
+    #[tokio::test]
+    async fn an_absence_that_needs_another_actor_returns_immediately() {
+        let base = settle_base_report();
+        for reason in [
+            EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned,
+            EmbeddingCoverageUnobserved::NoRunningDaemon,
+            EmbeddingCoverageUnobserved::NoVectorIndexAttached,
+            EmbeddingCoverageUnobserved::VectorSupportDisabled,
+            EmbeddingCoverageUnobserved::DaemonStatusUnavailable,
+            EmbeddingCoverageUnobserved::SamplingFailed,
+        ] {
+            let stuck = carrying(&base, EmbeddingCoverage::unobserved(reason));
+            let (report, reads, elapsed) =
+                drive_settle(IMMEDIATE_BUDGET, vec![stuck.clone()]).await;
+
+            assert_eq!(report, stuck, "{reason:?} must be published as read");
+            assert_eq!(reads, 1, "{reason:?} must not be re-read");
+            assert!(
+                elapsed < IMMEDIATE_BUDGET,
+                "{reason:?} must not consume the settle budget: {elapsed:?}"
+            );
+        }
+    }
+
+    /// The default every caller that did not ask to wait receives: exactly the
+    /// single sample the command took before this flag existed.
+    #[tokio::test]
+    async fn a_zero_budget_reads_exactly_once_even_on_a_transient_absence() {
+        let base = settle_base_report();
+        let stalled = carrying(
+            &base,
+            EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::GraphMutationInFlight),
+        );
+
+        let (report, reads, elapsed) =
+            drive_settle(std::time::Duration::ZERO, vec![stalled.clone()]).await;
+
+        assert_eq!(report, stalled);
+        assert_eq!(reads, 1);
+        assert!(elapsed < IMMEDIATE_BUDGET, "{elapsed:?}");
+    }
+
+    /// The classification is the whole safety argument, so assert it directly
+    /// rather than only through the loop that consults it.
+    #[test]
+    fn only_the_documented_transient_absences_are_waited_on() {
+        assert!(EmbeddingCoverageUnobserved::SamplingContended.settles_on_its_own());
+        assert!(EmbeddingCoverageUnobserved::GraphMutationInFlight.settles_on_its_own());
+        for permanent in [
+            EmbeddingCoverageUnobserved::NoRunningDaemon,
+            EmbeddingCoverageUnobserved::DaemonStatusUnavailable,
+            EmbeddingCoverageUnobserved::NoVectorIndexAttached,
+            EmbeddingCoverageUnobserved::VectorSupportDisabled,
+            EmbeddingCoverageUnobserved::EmbeddingWorkLockPoisoned,
+            EmbeddingCoverageUnobserved::SamplingFailed,
+        ] {
+            assert!(
+                !permanent.settles_on_its_own(),
+                "{permanent:?} does not clear by re-reading and must not be waited on"
+            );
+        }
     }
 
     #[test]
