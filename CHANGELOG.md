@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-08-04
+
+### Changed
+
+- Add safe full managed uninstall (#582)
+- Bound daemon shutdown against a saturated runtime (#588)
+- Exclude derived build output from ingest and add a confirmed tracked-set purge (#587)
+- Stop the entrypoint deleting a workspace it cannot rebuild (#589)
+- Replace README hero with the new brand banner (#590)
+- Publish a staged repository on native Windows (#585)
+
+
 ## [0.4.6] - 2026-08-01
 
 ### Changed
