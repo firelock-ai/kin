@@ -127,13 +127,39 @@ fn authority_order_worker() {
             "{key} did not retain its final safe binding"
         );
     }
-    #[cfg(windows)]
-    assert_eq!(std::env::var("GIT_CONFIG_GLOBAL").as_deref(), Ok("NUL"));
     #[cfg(unix)]
     assert_eq!(
         std::env::var("GIT_CONFIG_GLOBAL").as_deref(),
-        Ok("/dev/null")
+        Ok("/dev/null"),
+        "the final scrub did not empty the global Git config scope"
     );
+    // Windows has no path that behaves like `/dev/null` here: `NUL` is a
+    // reserved device name that Git rejects outright, so the scrub must hand
+    // Git a real, readable, empty file instead.
+    #[cfg(not(unix))]
+    {
+        let global = PathBuf::from(
+            std::env::var_os("GIT_CONFIG_GLOBAL")
+                .expect("the final scrub bound a global Git config"),
+        );
+        let metadata = std::fs::metadata(&global).unwrap_or_else(|error| {
+            panic!(
+                "global Git config {} is not a readable path: {error}",
+                global.display()
+            )
+        });
+        assert!(
+            metadata.is_file(),
+            "global Git config {} is not a regular file",
+            global.display()
+        );
+        assert_eq!(
+            metadata.len(),
+            0,
+            "global Git config {} is not empty",
+            global.display()
+        );
+    }
 
     let expected_git_date =
         std::env::var(EXPECTED_GIT_DATE_ENV).expect("expected fixture Git date");
