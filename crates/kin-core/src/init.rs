@@ -1514,6 +1514,22 @@ fn read_to_seal(path: &Path, label: &str) -> Result<Vec<u8>> {
     })
 }
 
+/// Read one staged metadata file again, to check it against its seal.
+///
+/// Sealing and verifying read the same name at different points in the
+/// transaction, so they need to be told apart for the same reason the seal
+/// needs to be told apart from the writer. A verification that cannot be read
+/// means something took the file away after preparation, which is a different
+/// failure from never having been able to read it.
+fn read_to_verify_seal(path: &Path, label: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        KinError::Other(format!(
+            "reread {label} at {} to check it against its seal: {error}",
+            path.display()
+        ))
+    })
+}
+
 fn capture_metadata_seal(layout: &KinLayout) -> Result<RepositoryMetadataSeal> {
     let config_bytes = read_to_seal(&layout.config_path(), "repository config")?;
     let manifest_bytes = read_to_seal(&layout.manifest_path(), "repository manifest")?;
@@ -1546,7 +1562,7 @@ fn verify_sealed_metadata_file(
     expected_bytes: &[u8],
     expected_hash: Hash256,
 ) -> Result<()> {
-    let observed = std::fs::read(path).map_err(|error| KinError::io(path, error))?;
+    let observed = read_to_verify_seal(path, label)?;
     let observed_hash = Hash256::from_bytes(Sha256::digest(&observed).into());
     if observed_hash != expected_hash || observed != expected_bytes {
         return Err(KinError::Other(format!(
