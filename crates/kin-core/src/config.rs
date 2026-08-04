@@ -2289,6 +2289,53 @@ mod capability_owned_config_replacement_tests {
         assert!(residual_writer_entries(&config).is_empty());
     }
 
+    /// The path shape admission actually hands the writer.
+    ///
+    /// `kin init` canonicalizes the stage root before it saves anything, and a
+    /// canonical path on Windows carries the `\\?\` verbatim prefix. Every
+    /// other case in this module passes a temporary path that was never
+    /// canonicalized, so none of them exercises the shape the binary uses, and
+    /// all of them pass on a platform where `kin init` fails at this exact
+    /// file. That gap is why this case exists.
+    ///
+    /// Publication and the read-back are asserted as separate steps because
+    /// they are separate calls that fail for different reasons. Admission
+    /// reads this file again immediately afterwards to seal repository
+    /// metadata, and that read reports the same path as the writer would, so a
+    /// test that collapsed them could not say which one refused.
+    #[test]
+    fn a_canonical_stage_path_publishes_the_way_admission_calls_it() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let stage = directory
+            .path()
+            .join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&stage).expect("create stage");
+        let config = std::fs::canonicalize(&stage)
+            .expect("canonicalize stage")
+            .join("config.toml");
+
+        if let Err(error) = save_config_atomically_scoped(
+            &config,
+            b"mode = \"native\"\n",
+            ConfigAuthorityKind::InitializationStage,
+        ) {
+            panic!("publishing through a canonical stage path refused: {error}");
+        }
+
+        match std::fs::read(&config) {
+            Ok(published) => assert_eq!(published, b"mode = \"native\"\n"),
+            Err(error) => panic!(
+                "the published config could not be read back, which is the call that seals \
+                 repository metadata: {error}"
+            ),
+        }
+        assert!(
+            residual_writer_entries(&config).is_empty(),
+            "publication left writer-owned intermediates behind: {:?}",
+            residual_writer_entries(&config)
+        );
+    }
+
     #[test]
     fn a_stage_directory_that_is_not_a_canonical_uuid_v4_is_refused() {
         let directory = tempfile::tempdir().expect("tempdir");

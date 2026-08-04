@@ -1498,11 +1498,25 @@ fn validate_bootstrap_transaction(
     Ok(())
 }
 
+/// Read one staged metadata file, saying which read this was.
+///
+/// The config writer reports its own refusals against the same path this reads,
+/// so an unlabelled failure here is indistinguishable from a failure to publish
+/// and sends the reader to the wrong component. Sealing happens after
+/// publication, so naming the step is the difference between "the writer could
+/// not publish" and "the writer published something this cannot read".
+fn read_to_seal(path: &Path, label: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        KinError::Other(format!(
+            "read published {label} at {} to seal staged repository metadata: {error}",
+            path.display()
+        ))
+    })
+}
+
 fn capture_metadata_seal(layout: &KinLayout) -> Result<RepositoryMetadataSeal> {
-    let config_bytes = std::fs::read(layout.config_path())
-        .map_err(|error| KinError::io(layout.config_path(), error))?;
-    let manifest_bytes = std::fs::read(layout.manifest_path())
-        .map_err(|error| KinError::io(layout.manifest_path(), error))?;
+    let config_bytes = read_to_seal(&layout.config_path(), "repository config")?;
+    let manifest_bytes = read_to_seal(&layout.manifest_path(), "repository manifest")?;
     Ok(RepositoryMetadataSeal {
         config_hash: Hash256::from_bytes(Sha256::digest(&config_bytes).into()),
         manifest_hash: Hash256::from_bytes(Sha256::digest(&manifest_bytes).into()),
