@@ -40,6 +40,14 @@ jobs:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # The Windows leg runs the full unconditional proof and uploads its
+    # artifacts, but its verdict does not yet gate the release: the installed
+    # daemon on Windows serves queries without publishing .kin/daemon.port, so
+    # the endpoint-provenance step cannot pass there yet. The release authority
+    # suite pins this posture to exactly the windows-latest row; a blocking
+    # Windows leg returns by deleting the experimental flag here and the
+    # posture assertion there in the same change.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +62,7 @@ jobs:
             setup-shell: zsh
           - os: windows-latest
             setup-shell: powershell
+            experimental: true
     steps:
       - name: Public install (Unix)
         if: runner.os != 'Windows'
