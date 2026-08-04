@@ -1747,6 +1747,60 @@ mod tests {
         );
     }
 
+    /// A host that merely ships PowerShell exports `PSModulePath` into every
+    /// process, including the bash one the operator is actually using. The
+    /// installed bash integration is the one to judge; reading the PowerShell
+    /// marker first reported a working bash install as misconfigured and
+    /// pointed the operator at a `.ps1` profile their shell never loads.
+    #[test]
+    #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn shell_path_judges_the_named_shell_when_powershell_is_merely_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        let hook_dir = kin_home.join("shell");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&hook_dir).unwrap();
+
+        let hook = hook_dir.join(hook_filename("bash"));
+        std::fs::write(&hook, "# kin-vfs test hook\n").unwrap();
+        std::fs::write(
+            home.join(".bashrc"),
+            format!(
+                "source \"{}\"\nexport PATH=\"{}:$PATH\"\n",
+                hook.display(),
+                kin_home.join("bin").display()
+            ),
+        )
+        .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvVarGuard::unset("KIN_DIR");
+        let _shell = EnvVarGuard::set("SHELL", "/bin/bash");
+        let _ps_module_path =
+            EnvVarGuard::set("PSModulePath", "/opt/microsoft/powershell/7/Modules");
+        let _ps_version_table = EnvVarGuard::unset("PSVersionTable");
+        let _profile = EnvVarGuard::unset("PROFILE");
+        let _path = EnvVarGuard::set("PATH", "/usr/bin");
+
+        let check = check_shell_path();
+        assert_eq!(check.id, "shell_path");
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "installed bash integration should be healthy while pwsh is merely present; \
+             got {:?}: {}",
+            check.status,
+            check.detail
+        );
+        assert!(
+            check.detail.starts_with("bash "),
+            "detail should describe the bash integration: {}",
+            check.detail
+        );
+    }
+
     fn check_with(id: &str, status: HealthStatus) -> HealthCheck {
         HealthCheck::new(id, id, status, "")
     }
