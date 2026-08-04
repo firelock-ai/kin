@@ -544,7 +544,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/install-proof.yml",
         "install-proof",
-    ): "c5cd6bbfa99f45c84084d22aafe5e0bb038c2ee006404a58d72e19a0db69b46e",
+    ): "91bbe7dd412df4ade467a53be2618eb8199bc746b682ae5f27552649009446b4",
     (
         ".github/workflows/release.yml",
         "build",
@@ -2273,6 +2273,68 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
         raise AssertionError(
             "only the committed Git bootstrap may run between entering the "
             f"worktree kin init admits and admitting it; found {prelude}"
+        )
+
+
+def assert_install_proof_windows_experimental_posture(install_proof: str) -> None:
+    """Pin the declared experimental scope of the install-proof matrix.
+
+    The Windows leg still executes its full unconditional proof, but its
+    verdict is tolerated while the installed daemon does not publish an
+    endpoint file there. Tolerance is admitted only as the exact job-level
+    matrix guard — enforced as the single active ``continue-on-error``
+    mention in the entire job, so a step-level tolerance (which would spare
+    every leg, not one) cannot hide below the job header — and the
+    ``experimental: true`` flag only on the ``windows-latest`` row. Anything
+    looser — an unconditional ``continue-on-error``, a tolerated step, an
+    experimental Unix row, or a value other than ``true`` — silently removes
+    a reviewed OS from the release gate, so each is rejected here by name.
+    """
+
+    jobs = workflow_job_blocks(install_proof)
+    install_job = jobs.get("install-proof")
+    if install_job is None:
+        raise AssertionError(
+            "windows experimental posture lost the install-proof job"
+        )
+    job_fields = job_top_level_mapping_fields(install_job)
+    tolerance = [
+        value.strip() for key, value in job_fields if key == "continue-on-error"
+    ]
+    if tolerance != ["${{ matrix.experimental == true }}"]:
+        raise AssertionError(
+            "install-proof continue-on-error must be exactly the matrix "
+            f"experimental guard; found {tolerance}"
+        )
+    tolerance_mentions = [
+        line for line in active_lines(install_job) if "continue-on-error" in line
+    ]
+    if tolerance_mentions != [
+        "continue-on-error: ${{ matrix.experimental == true }}"
+    ]:
+        raise AssertionError(
+            "install-proof admits exactly one continue-on-error, the "
+            "job-level matrix experimental guard; a step-level tolerance "
+            f"would spare every leg; found {tolerance_mentions}"
+        )
+    strategy_lines = active_lines(dynamic_job_context_source(install_job))
+    current_row: str | None = None
+    experimental_rows: list[str] = []
+    for line in strategy_lines:
+        if line.startswith("- os:"):
+            current_row = line.removeprefix("- os:").strip()
+        elif line == "experimental: true" and current_row is not None:
+            experimental_rows.append(current_row)
+        elif line.startswith("experimental"):
+            raise AssertionError(
+                "install-proof matrix rows admit only a literal "
+                f"`experimental: true`; found `{line}` under "
+                f"{current_row or 'no row'}"
+            )
+    if experimental_rows != ["windows-latest"]:
+        raise AssertionError(
+            "install-proof experimental rows must be exactly "
+            f"['windows-latest']; found {experimental_rows}"
         )
 
 
@@ -6985,6 +7047,67 @@ def main() -> None:
             expected,
             lambda mutated=install_proof.replace(original, mutation, 1): (
                 assert_install_proof_repo_steps_cover_windows(mutated)
+            ),
+        )
+
+    assert_install_proof_windows_experimental_posture(install_proof)
+    for label, original, mutation, expected in (
+        (
+            "the experimental flag spreads to a Unix matrix row",
+            "          - os: ubuntu-latest\n            setup-shell: bash\n",
+            "          - os: ubuntu-latest\n            setup-shell: bash\n"
+            "            experimental: true\n",
+            "exactly ['windows-latest']",
+        ),
+        (
+            "the install proof tolerates every leg unconditionally",
+            "    continue-on-error: ${{ matrix.experimental == true }}\n",
+            "    continue-on-error: true\n",
+            "matrix experimental guard",
+        ),
+        (
+            "the tolerance guard survives while the Windows flag disappears",
+            "            experimental: true\n",
+            "",
+            "exactly ['windows-latest']",
+        ),
+        (
+            "an experimental value other than a literal true appears",
+            "            experimental: true\n",
+            "            experimental: yes\n",
+            "literal `experimental: true`",
+        ),
+        (
+            "the tolerance guard disappears while the flag stays",
+            "    continue-on-error: ${{ matrix.experimental == true }}\n",
+            "",
+            "matrix experimental guard",
+        ),
+        (
+            "a step-level tolerance spares every leg below the job header",
+            "      - name: Public install (Unix)\n",
+            "      - name: Public install (Unix)\n"
+            "        continue-on-error: true\n",
+            "exactly one continue-on-error",
+        ),
+        (
+            "a quoted-key tolerance hides on a step",
+            "      - name: Public install (Unix)\n",
+            "      - name: Public install (Unix)\n"
+            "        \"continue-on-error\": true\n",
+            "exactly one continue-on-error",
+        ),
+    ):
+        if original not in install_proof:
+            raise AssertionError(
+                "windows experimental posture falsification lost fixture for "
+                f"{label}: {original!r}"
+            )
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=install_proof.replace(original, mutation, 1): (
+                assert_install_proof_windows_experimental_posture(mutated)
             ),
         )
 
