@@ -1278,10 +1278,15 @@ fn claude_cli_filename() -> &'static str {
 /// drops it in `~/.local/bin`, which login shells add but non-login and CI
 /// shells frequently do not.
 ///
-/// Only artifacts Claude Code writes for itself count. The `~/.claude`
-/// directory does not: `kin setup` creates it to write the discovery reminder,
-/// so trusting it would let a previous setup run manufacture its own evidence
-/// of an install that never happened.
+/// The bare `~/.claude` directory never counts: `kin setup` creates it to
+/// write the discovery reminder, so trusting it would let a previous setup
+/// run manufacture its own evidence of an install that never happened.
+/// `~/.claude.json` is accepted even though `configure_claude_code` can
+/// create it, because non-interactive runs only configure clients this
+/// detection already admitted; the remaining self-evidence path is an
+/// operator explicitly selecting an undetected client in the advanced
+/// picker, which is a deliberate override rather than manufactured
+/// detection, and an uninstall excises Kin's key but leaves the file.
 fn claude_code_install_evidence(home: &Path) -> bool {
     home.join(".claude.json").exists()
         || home.join(".claude").join("settings.json").exists()
@@ -1865,7 +1870,8 @@ fn apply_discovery_reminders(
             if discovery_reminder_present(&path) {
                 println!(
                     "  {} {label} reminder is present at {} but Kin's MCP server is not \
-                     registered for it — `kin setup uninstall` removes the reminder",
+                     registered for it — `kin setup uninstall` removes it when a setup run \
+                     recorded it; an unrecorded reminder stays until removed by hand",
                     style("!").yellow(),
                     path.display()
                 );
@@ -15710,17 +15716,20 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     fn each_instruction_file_is_gated_on_its_own_client() {
         let (_dir, home) = reminder_fixture();
 
-        let written = apply_discovery_reminders(&home, &[IDX_CLAUDE_CODE, IDX_CODEX]);
+        let written = apply_discovery_reminders(&home, &[IDX_CODEX]);
 
         assert_eq!(
             written
                 .iter()
                 .map(|(target, _)| *target)
                 .collect::<Vec<_>>(),
-            vec!["claude-md", "codex-agents"]
+            vec!["codex-agents"]
         );
         assert!(discovery_reminder_present(
             &home.join(".codex").join("AGENTS.md")
+        ));
+        assert!(!discovery_reminder_present(
+            &home.join(".claude").join("CLAUDE.md")
         ));
     }
 
