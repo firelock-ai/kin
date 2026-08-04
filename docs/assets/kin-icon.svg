@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Gradient for Top-Right Diagonal Arm (Cyan to Ultraviolet Purple) -->
+    <linearGradient id="grad-top-arm" x1="141" y1="254" x2="361" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3AEAF5" />
+      <stop offset="100%" stop-color="#8015FF" />
+    </linearGradient>
+
+    <!-- Gradient for Bottom-Right Diagonal Arm (Cyan to Ultraviolet Purple) -->
+    <linearGradient id="grad-bottom-arm" x1="141" y1="254" x2="365" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3AEAF5" />
+      <stop offset="100%" stop-color="#7F11FF" />
+    </linearGradient>
+
+    <!-- 3D Translucent Glass Highlight Overlay -->
+    <linearGradient id="glass-overlay" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.35" />
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.2" />
+    </linearGradient>
+  </defs>
+
+  <!-- Solid Dark Matte Background -->
+  <rect width="512" height="512" rx="96" fill="#0A0E17" />
+
+  <!-- Main K Graph Network Group -->
+  <g>
+    <!-- 1. Straight Solid Capsule Edges -->
+    <!-- Vertical Left Cyan Stem -->
+    <line x1="141" y1="128" x2="141" y2="380" 
+          stroke="#35EFF8" 
+          stroke-width="32" 
+          stroke-linecap="round" />
+
+    <!-- Top-Right Diagonal Arm (Cyan -> Purple) -->
+    <line x1="141" y1="254" x2="361" y2="128" 
+          stroke="url(#grad-top-arm)" 
+          stroke-width="32" 
+          stroke-linecap="round" />
+
+    <!-- Bottom-Right Diagonal Arm (Cyan -> Purple) -->
+    <line x1="141" y1="254" x2="365" y2="380" 
+          stroke="url(#grad-bottom-arm)" 
+          stroke-width="32" 
+          stroke-linecap="round" />
+
+    <!-- 2. Glassmorphic Highlight Overlay Lines -->
+    <line x1="141" y1="128" x2="141" y2="380" 
+          stroke="url(#glass-overlay)" 
+          stroke-width="12" 
+          stroke-linecap="round" />
+    <line x1="141" y1="254" x2="361" y2="128" 
+          stroke="url(#glass-overlay)" 
+          stroke-width="12" 
+          stroke-linecap="round" />
+    <line x1="141" y1="254" x2="365" y2="380" 
+          stroke="url(#glass-overlay)" 
+          stroke-width="12" 
+          stroke-linecap="round" />
+
+    <!-- 3. Integrated Solid Graph Node Vertices -->
+    <!-- Top-Left Stem Node -->
+    <circle cx="141" cy="128" r="30" fill="#35EFF8" />
+    <!-- Center Junction Node -->
+    <circle cx="141" cy="254" r="30" fill="#3AEAF5" />
+    <!-- Bottom-Left Stem Node -->
+    <circle cx="141" cy="380" r="30" fill="#32EFF7" />
+    <!-- Upper-Right Tip Node -->
+    <circle cx="361" cy="128" r="30" fill="#8015FF" />
+    <!-- Lower-Right Tip Node -->
+    <circle cx="365" cy="380" r="30" fill="#7F11FF" />
+
+    <!-- Node Inner Gloss Highlights -->
+    <circle cx="141" cy="128" r="14" fill="#FFFFFF" fill-opacity="0.35" />
+    <circle cx="141" cy="254" r="14" fill="#FFFFFF" fill-opacity="0.3" />
+    <circle cx="361" cy="128" r="14" fill="#FFFFFF" fill-opacity="0.3" />
+  </g>
+</svg>

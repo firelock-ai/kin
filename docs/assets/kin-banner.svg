@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1376 768" width="100%" height="100%">
+  <defs>
+    <!-- Gradient for Top Diagonal Arm -->
+    <linearGradient id="grad-top-arm" x1="230" y1="384" x2="490" y2="190" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3AEAF5" />
+      <stop offset="100%" stop-color="#8015FF" />
+    </linearGradient>
+
+    <!-- Gradient for Bottom Diagonal Arm -->
+    <linearGradient id="grad-bottom-arm" x1="230" y1="384" x2="495" y2="578" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3AEAF5" />
+      <stop offset="100%" stop-color="#7F11FF" />
+    </linearGradient>
+
+    <!-- Glass Overlay Gradient for 3D Translucency -->
+    <linearGradient id="glass-overlay" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.35" />
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.2" />
+    </linearGradient>
+  </defs>
+
+  <!-- Solid Dark Matte Background -->
+  <rect width="1376" height="768" rx="48" fill="#0A0E17" />
+
+  <!-- 1. Left K Graph Icon Mark -->
+  <g>
+    <!-- Straight Vertical Stem -->
+    <line x1="230" y1="190" x2="230" y2="578" 
+          stroke="#35EFF8" 
+          stroke-width="48" 
+          stroke-linecap="round" />
+
+    <!-- Top Diagonal Arm -->
+    <line x1="230" y1="384" x2="490" y2="190" 
+          stroke="url(#grad-top-arm)" 
+          stroke-width="48" 
+          stroke-linecap="round" />
+
+    <!-- Bottom Diagonal Arm -->
+    <line x1="230" y1="384" x2="495" y2="578" 
+          stroke="url(#grad-bottom-arm)" 
+          stroke-width="48" 
+          stroke-linecap="round" />
+
+    <!-- Glass Highlights -->
+    <line x1="230" y1="190" x2="230" y2="578" 
+          stroke="url(#glass-overlay)" 
+          stroke-width="18" 
+          stroke-linecap="round" />
+    <line x1="230" y1="384" x2="490" y2="190" 
+          stroke="url(#glass-overlay)" 
+          stroke-width="18" 
+          stroke-linecap="round" />
+    <line x1="230" y1="384" x2="495" y2="578" 
+          stroke="url(#glass-overlay)" 
+          stroke-width="18" 
+          stroke-linecap="round" />
+
+    <!-- Node Vertices -->
+    <circle cx="230" cy="190" r="44" fill="#35EFF8" />
+    <circle cx="230" cy="384" r="44" fill="#3AEAF5" />
+    <circle cx="230" cy="578" r="44" fill="#32EFF7" />
+    <circle cx="490" cy="190" r="44" fill="#8015FF" />
+    <circle cx="495" cy="578" r="44" fill="#7F11FF" />
+
+    <circle cx="230" cy="190" r="22" fill="#FFFFFF" fill-opacity="0.35" />
+    <circle cx="230" cy="384" r="22" fill="#FFFFFF" fill-opacity="0.3" />
+    <circle cx="490" cy="190" r="22" fill="#FFFFFF" fill-opacity="0.3" />
+  </g>
+
+  <!-- 2. KIN Wordmark & Tagline -->
+  <g fill="#FFFFFF">
+    <!-- Letter K -->
+    <path d="M 600 250 L 654 250 L 654 360 L 755 250 L 825 250 L 702 376 L 832 519 L 762 519 L 654 394 L 654 519 L 600 519 Z" />
+    <!-- Letter I -->
+    <path d="M 875 250 L 929 250 L 929 519 L 875 519 Z" />
+    <!-- Letter N -->
+    <path d="M 975 250 L 1029 250 L 1112 422 L 1112 250 L 1166 250 L 1166 519 L 1112 519 L 1029 347 L 1029 519 L 975 519 Z" />
+  </g>
+
+  <!-- Subtitle Tagline -->
+  <text x="602" y="575" 
+        fill="#94A3B8" 
+        font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', 'Segoe UI', sans-serif" 
+        font-weight="700" 
+        font-size="28" 
+        letter-spacing="9.8">SEMANTIC REPOSITORY SUBSTRATE</text>
+</svg>
