@@ -830,7 +830,30 @@ mod git_process_boundary_tests {
         let host_path = absolute_eject_host_search_path("bin", &resolution_cwd).unwrap();
         let git = which::which_in("git", Some(&host_path), &resolution_cwd).unwrap();
         assert!(git.is_absolute(), "host Git binding remained relative");
-        let output = Command::new(git).current_dir(&child_cwd).output().unwrap();
+        // `sh` reads the binding as a script operand instead of `exec` taking
+        // it as a program. That is the command line `exec` was already
+        // building: the fixture carries a `#!/bin/sh` line, so the kernel ran
+        // `/bin/sh <binding>` in the child's directory and passed the path
+        // exactly as given. A binding that stayed relative therefore still
+        // reaches the hostile copy below and still fails, because `sh`
+        // resolves a relative operand against its own working directory just
+        // as `exec` resolves a relative program path.
+        //
+        // What the spelling drops is a false failure. `exec` refuses with
+        // `ETXTBSY` while any process holds the target inode open for
+        // writing, and a sibling test thread's in-flight spawn
+        // transiently owns a duplicate of the descriptor the `write` above
+        // opened. Nothing here can close that window. The kernel counts
+        // writers per inode, so materializing under a temporary name and
+        // renaming into place carries the same count across; and the offending
+        // descriptor lives in a child process this test never names. Ceasing
+        // to be an `exec` target is what removes the exposure.
+        let output = Command::new("/bin/sh")
+            .arg(&git)
+            .current_dir(&child_cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"trusted");
     }
 
