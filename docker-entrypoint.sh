@@ -21,7 +21,7 @@ if ! mkdir -p "${WORKSPACE_DIR}/.kin" 2>/dev/null || [ ! -w "${WORKSPACE_DIR}/.k
     exit 1
 fi
 
-KIN_DIR="${WORKSPACE_DIR}/.kin"
+KIN_DIR="$(cd "${WORKSPACE_DIR}/.kin" && pwd -P)"
 
 # Paths every layout version creates. HEAD, objects/ and kindb/graph.kndb were
 # git-shaped artifacts of the pre-authority layout and are NOT produced by a
