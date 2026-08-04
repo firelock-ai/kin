@@ -2282,11 +2282,13 @@ def assert_install_proof_windows_experimental_posture(install_proof: str) -> Non
     The Windows leg still executes its full unconditional proof, but its
     verdict is tolerated while the installed daemon does not publish an
     endpoint file there. Tolerance is admitted only as the exact job-level
-    matrix guard, and the ``experimental: true`` flag only on the
-    ``windows-latest`` row. Anything looser — an unconditional
-    ``continue-on-error``, an experimental Unix row, or a value other than
-    ``true`` — silently removes a reviewed OS from the release gate, so each
-    is rejected here by name.
+    matrix guard — enforced as the single active ``continue-on-error``
+    mention in the entire job, so a step-level tolerance (which would spare
+    every leg, not one) cannot hide below the job header — and the
+    ``experimental: true`` flag only on the ``windows-latest`` row. Anything
+    looser — an unconditional ``continue-on-error``, a tolerated step, an
+    experimental Unix row, or a value other than ``true`` — silently removes
+    a reviewed OS from the release gate, so each is rejected here by name.
     """
 
     jobs = workflow_job_blocks(install_proof)
@@ -2303,6 +2305,17 @@ def assert_install_proof_windows_experimental_posture(install_proof: str) -> Non
         raise AssertionError(
             "install-proof continue-on-error must be exactly the matrix "
             f"experimental guard; found {tolerance}"
+        )
+    tolerance_mentions = [
+        line for line in active_lines(install_job) if "continue-on-error" in line
+    ]
+    if tolerance_mentions != [
+        "continue-on-error: ${{ matrix.experimental == true }}"
+    ]:
+        raise AssertionError(
+            "install-proof admits exactly one continue-on-error, the "
+            "job-level matrix experimental guard; a step-level tolerance "
+            f"would spare every leg; found {tolerance_mentions}"
         )
     strategy_lines = active_lines(dynamic_job_context_source(install_job))
     current_row: str | None = None
@@ -6665,6 +6678,20 @@ def main() -> None:
             "    continue-on-error: ${{ matrix.experimental == true }}\n",
             "",
             "matrix experimental guard",
+        ),
+        (
+            "a step-level tolerance spares every leg below the job header",
+            "      - name: Public install (Unix)\n",
+            "      - name: Public install (Unix)\n"
+            "        continue-on-error: true\n",
+            "exactly one continue-on-error",
+        ),
+        (
+            "a quoted-key tolerance hides on a step",
+            "      - name: Public install (Unix)\n",
+            "      - name: Public install (Unix)\n"
+            "        \"continue-on-error\": true\n",
+            "exactly one continue-on-error",
         ),
     ):
         if original not in install_proof:
