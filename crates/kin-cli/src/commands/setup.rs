@@ -15346,9 +15346,14 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             Duration::from_secs(120),
             || {
                 // A journalled helper error is terminal: the helper writes its
-                // log on the way out, so no later poll can clear it.
+                // log on the way out, so no later poll can clear it. An empty
+                // log is the same journal still being written, so keep polling
+                // rather than reporting a terminal error with no text in it.
                 if success.helper_log.is_file() {
                     let log_content = fs::read_to_string(&success.helper_log).unwrap_or_default();
+                    if log_content.trim().is_empty() {
+                        return WindowsWaitState::Pending;
+                    }
                     return WindowsWaitState::Failed(format!(
                         "the deferred uninstall helper journalled a terminal error to {}:\n{}",
                         success.helper_log.display(),
