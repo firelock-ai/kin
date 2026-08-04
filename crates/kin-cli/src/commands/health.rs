@@ -2533,6 +2533,26 @@ mod tests {
             "the drive-letter root a working directory yields must accept the verbatim root \
              setup recorded"
         );
+
+        // Without this, the assertion above could pass for the wrong reason.
+        // `evaluate_antigravity_binding_for` returns None both when the binding
+        // is correct and when it cannot resolve this installation's launcher at
+        // all, and this is the first test to reach that code on a Windows
+        // runner. A binding pointed elsewhere must still be rejected, so a
+        // launcher that failed to resolve fails the test instead of passing it.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other = other.canonicalize().unwrap();
+        write_global_antigravity_binding(&config, &other);
+        assert!(
+            evaluate_antigravity_binding_for(
+                &config,
+                false,
+                &canonical_health_repo(PathBuf::from(plain)),
+            )
+            .is_some(),
+            "a binding pointed at a different repository must still be misconfigured"
+        );
     }
 
     fn installed_kin(path: &str, protocol: InstalledStartupProtocol) -> InstalledKin {
