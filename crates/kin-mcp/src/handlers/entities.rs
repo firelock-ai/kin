@@ -486,10 +486,10 @@ pub fn assemble_entity_sources_response(
 /// `GraphSourceRecord` (debug-formatted kind, `to_string` language, raw
 /// file path) so the row shape is identical whichever path resolved it.
 fn resolve_entity_source_generic<G: GraphStore>(
-    store: &G,
+    held: &HeldSourceAuthority<'_, G>,
     id: &str,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> ResolvedEntitySource {
+    let store = held.store();
     let entity_id = match parse_entity_id(id) {
         Ok(entity_id) => entity_id,
         Err(_) => {
@@ -501,12 +501,11 @@ fn resolve_entity_source_generic<G: GraphStore>(
     };
     match store.get_entity(&entity_id) {
         Ok(Some(entity)) => {
-            match read_entity_source_excerpt_detailed(
-                store,
+            match read_entity_source_excerpt_detailed_held(
+                held,
                 &entity,
                 DEFAULT_SOURCE_MAX_LINES,
                 DEFAULT_SOURCE_MAX_BYTES,
-                repository_authority,
                 EntitySourceScope::WorkspaceHead,
             ) {
                 Ok(Some(source)) => ResolvedEntitySource::Found(EntitySourceRow {
@@ -557,9 +556,11 @@ pub fn handle_get_entity_sources<G: GraphStore>(
     repository_authority: Option<&LocalRepositoryAuthorityBinding>,
 ) -> Result<ToolCallResult> {
     let (entity_ids, opts) = parse_batch_source_args(args)?;
+    // A batch is one request: it holds authority once for every id it resolves.
+    let held = HeldSourceAuthority::new(store, repository_authority);
     let resolved = entity_ids
         .iter()
-        .map(|id| resolve_entity_source_generic(store, id, repository_authority))
+        .map(|id| resolve_entity_source_generic(&held, id))
         .collect();
     Ok(assemble_entity_sources_response(resolved, &opts))
 }
@@ -626,8 +627,13 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let focal_entry = pack.focal_entities.first();
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
+    // One held authority for the whole pack. A pack projects the focal entity
+    // and then a body per dependency it carries, so deriving authority per
+    // projection multiplies a full recovery by the pack's size.
+    let held = HeldSourceAuthority::new(store, repository_authority);
+
     let focal_json = if let (Some(_), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(store, entity, compact, repository_authority)?
+        focal_context_json_held(&held, entity, compact)?
     } else {
         serde_json::json!(null)
     };
@@ -650,12 +656,11 @@ pub fn handle_get_context_pack<G: GraphStore>(
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                let body = read_entity_source_excerpt_detailed(
-                    store,
+                let body = read_entity_source_excerpt_detailed_held(
+                    &held,
                     &e,
                     MCP_SOURCE_MAX_LINES,
                     MCP_SOURCE_MAX_CHARS,
-                    repository_authority,
                     EntitySourceScope::WorkspaceHead,
                 )?;
                 let source = LAST_READ_SOURCE.with(|f| f.get());
@@ -1602,6 +1607,10 @@ pub fn handle_explore_codebase<G: GraphStore>(
     use kin_context::{build_context_pack, estimate_tokens, ContextOptions};
     use kin_model::context::TokenBudget;
 
+    // One held authority for the whole exploration: the trace rendering below
+    // reads a body per chain step and per constant it finds.
+    let held = HeldSourceAuthority::new(store, repository_authority);
+
     let query = get_string_param(args, "query")?;
     let strategy = args
         .get("strategy")
@@ -1779,7 +1788,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
 
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let step_body = trace_body(store, step, repository_authority)?;
+                        let step_body = trace_body_held(&held, step)?;
                         let constants = trace_constants_for_step(store, step, &step_body)?;
 
                         if !push_with_budget(
@@ -1839,8 +1848,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
                                     output.push_str("  ... (truncated)\n");
                                     break;
                                 }
-                                let constant_body =
-                                    trace_body(store, constant, repository_authority)?;
+                                let constant_body = trace_body_held(&held, constant)?;
                                 if !push_indented_body(
                                     &mut output,
                                     &mut tokens_used,
@@ -1857,7 +1865,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
 
                 if let Some(input_literal) = trace_query.input_literal {
                     if let Some(evaluation) =
-                        evaluate_trace_chain(store, &chain, input_literal, repository_authority)?
+                        evaluate_trace_chain_held(&held, &chain, input_literal)?
                     {
                         if push_with_budget(
                             &mut output,

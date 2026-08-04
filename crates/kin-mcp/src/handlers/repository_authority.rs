@@ -89,8 +89,21 @@ pub(crate) struct WorkspaceReadSample {
     pub base_change_id: SemanticChangeId,
 }
 
+/// How many times this process has opened repository authority.
+///
+/// An open is a full authority recovery -- decode the persisted snapshot, then
+/// re-verify every persisted body against its content address -- so its cost is
+/// a property of the store, not of the request. That makes the open COUNT, not
+/// the wall clock, the honest thing for a test to bound: a query path that opens
+/// once per request stays O(1) here no matter how large the store gets, and one
+/// that opens per candidate does not. Public because the surfaces that must hold
+/// that bound (`semantic_locate`, `kin locate --snippets`) live in other crates.
+pub static REPOSITORY_AUTHORITY_OPEN_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl ActiveRepositoryAuthority {
     pub(crate) fn open(binding: &LocalRepositoryAuthorityBinding) -> Result<Self> {
+        REPOSITORY_AUTHORITY_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let manager = binding.open_manager().map_err(|error| {
             McpError::Context(format!(
                 "graph authority gap: cannot open retained repository authority: {error}"

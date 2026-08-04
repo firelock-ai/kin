@@ -15451,6 +15451,12 @@ pub fn attach_snippets(
     if !opts.enabled || !opts.bodies {
         return Ok(());
     }
+    // One held authority for the whole result set. Every symbol on every file
+    // resolves against the same repository state, so opening authority and
+    // replaying committed history per symbol repeats identical work once per
+    // snippet rather than once per request.
+    let held_authority =
+        kin_mcp::handlers::common::HeldSourceAuthority::new(graph, repository_authority);
     for file in result.files.iter_mut() {
         if file.symbols.is_empty() {
             continue;
@@ -15475,14 +15481,15 @@ pub fn attach_snippets(
             let Some(entity) = match_symbol_entity(&entities, sym) else {
                 continue;
             };
-            if let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
-                graph,
-                entity,
-                opts.max_lines,
-                opts.max_chars,
-                repository_authority,
-                source_scope,
-            )? {
+            if let Some(source) =
+                kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
+                    &held_authority,
+                    entity,
+                    opts.max_lines,
+                    opts.max_chars,
+                    source_scope,
+                )?
+            {
                 sym.snippet = Some(source.body);
                 filled += 1;
             }

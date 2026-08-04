@@ -6008,6 +6008,14 @@ fn build_semantic_locate_result(
     } else {
         None
     };
+    // Hold authority ONCE for this request. Opening it is a full authority
+    // recovery and the committed state a snippet's artifact-identity binding
+    // needs is a whole-history replay, and neither varies across the hits on a
+    // page: the daemon holds the loaded graph precisely so a query serves from
+    // it. Deriving both per hit is what made a 40-candidate page perform 40
+    // recoveries and 40 replays, and took a real repository out of service.
+    let held_authority =
+        kin_mcp::handlers::common::HeldSourceAuthority::new(graph, repository_authority.as_ref());
 
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
     let granularity_token = format!("sem:{}", if file_granularity { "file" } else { "entity" });
@@ -6171,10 +6179,9 @@ fn build_semantic_locate_result(
         // read and no silent graph-gap downgrade.
         let snippet = if include_snippet {
             if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
-                match kin_mcp::handlers::common::read_bounded_entity_snippet(
-                    graph,
+                match kin_mcp::handlers::common::read_bounded_entity_snippet_held(
+                    &held_authority,
                     entity,
-                    repository_authority.as_ref(),
                     source_scope,
                 ) {
                     Ok(snippet) => snippet,
