@@ -879,10 +879,21 @@ pub fn decode_git_external_object(
                     reason: format!("decode tree: {error}"),
                 }
             })?;
+            let raw_modes = raw_tree_entry_modes(record.object, body, hash_kind.len_in_bytes())?;
+            if raw_modes.len() != tree.entries.len() {
+                return Err(GitExternalAuthorityError::InvalidObject {
+                    object: record.object,
+                    reason: format!(
+                        "tree body walks to {} entries but decodes to {}",
+                        raw_modes.len(),
+                        tree.entries.len()
+                    ),
+                });
+            }
             let mut previous = None;
             let mut names = BTreeSet::new();
             for (position, entry) in tree.entries.iter().copied().enumerate() {
-                let mode = exact_tree_mode(record.object, entry.mode)?;
+                let mode = exact_tree_mode(record.object, entry.mode, raw_modes[position])?;
                 let name =
                     GitTreeEntryName::from_bytes(entry.filename.to_vec()).map_err(|error| {
                         GitExternalAuthorityError::InvalidObject {
@@ -1395,9 +1406,52 @@ fn ensure_lower_hex(
     Ok(())
 }
 
+/// The exact mode encodings of one tree body's entries, in body order.
+///
+/// A tree entry is `<mode> <name>\0<oid>`, so the encodings are recoverable
+/// from the body without reparsing the objects. They are read back here rather
+/// than re-encoded from the decoded mode, because a decoded mode cannot
+/// represent every spelling Git tolerates: `gix` collapses a zero-padded file
+/// mode onto its canonical value, and represents a zero-padded directory with
+/// the same value it gives the literal `140000` that Git rejects.
+fn raw_tree_entry_modes(
+    object: ExternalObjectId,
+    body: &[u8],
+    oid_len: usize,
+) -> std::result::Result<Vec<&[u8]>, GitExternalAuthorityError> {
+    let malformed = |reason: &str| GitExternalAuthorityError::InvalidObject {
+        object,
+        reason: format!("malformed tree body: {reason}"),
+    };
+    let mut modes = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let space = rest
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| malformed("tree entry has no mode terminator"))?;
+        let (mode, after_mode) = rest.split_at(space);
+        let nul = after_mode
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| malformed("tree entry has no name terminator"))?;
+        let entry_len = nul
+            .checked_add(1)
+            .and_then(|len| len.checked_add(oid_len))
+            .ok_or_else(|| malformed("tree entry length overflows"))?;
+        if after_mode.len() < entry_len {
+            return Err(malformed("tree entry is truncated"));
+        }
+        modes.push(mode);
+        rest = &after_mode[entry_len..];
+    }
+    Ok(modes)
+}
+
 fn exact_tree_mode(
     object: ExternalObjectId,
     mode: gix_object::tree::EntryMode,
+    raw_mode: &[u8],
 ) -> std::result::Result<GitTreeEntryMode, GitExternalAuthorityError> {
     let exact = match mode.value() {
         0o040000 => GitTreeEntryMode::Tree,
@@ -1412,8 +1466,19 @@ fn exact_tree_mode(
             })
         }
     };
-    let mut buffer = [0_u8; 6];
-    if mode.as_bytes(&mut buffer) != exact.canonical_mode() {
+    // Git's own parser tolerates leading zeros, so history written by pre-2010
+    // tooling and CVS/SVN imports carries `040000` where canonical Git writes
+    // `40000`. Such an encoding still names exactly one legal mode, and the
+    // admitted body is stored and replayed verbatim, so accepting it costs no
+    // fidelity: an object is bound to its raw bytes by the Git object ID that
+    // `ExternalObjectRecord::validate_raw` recomputes over them. Any other
+    // spelling stays refused, so a mode whose digits differ from the canonical
+    // ones can never be admitted as that mode.
+    let significant = raw_mode
+        .iter()
+        .position(|digit| *digit != b'0')
+        .map_or(raw_mode, |first| &raw_mode[first..]);
+    if significant != exact.canonical_mode() {
         return Err(GitExternalAuthorityError::InvalidObject {
             object,
             reason: "noncanonical tree-entry mode encoding".to_string(),
@@ -2024,17 +2089,102 @@ mod tests {
     }
 
     #[test]
+    fn zero_padded_tree_modes_are_admitted_without_rewriting_the_body() {
+        for format in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
+            let mut bodies = MemoryBodies::default();
+            let leaf = bodies.insert(format, ExternalObjectKind::Blob, b"legacy\n".to_vec());
+            let child = bodies.insert(
+                format,
+                ExternalObjectKind::Tree,
+                tree_body(&[(b"page.txt", b"100644", leaf.object.oid)]),
+            );
+            // Pre-2010 and CVS/SVN-imported history spells directories "040000"
+            // where canonical Git spells "40000", and pads file modes likewise.
+            // Git admits both and reports them only under `fsck --strict`.
+            let padded_body = tree_body(&[
+                (b"docs", b"040000", child.object.oid),
+                (b"setup.py", b"0100644", leaf.object.oid),
+            ]);
+            let padded = bodies.insert(format, ExternalObjectKind::Tree, padded_body.clone());
+
+            let decoded = decode_git_external_object(format, &padded, &padded_body).unwrap();
+            assert_eq!(
+                decoded.dependencies,
+                vec![
+                    GitObjectDependency {
+                        kind: GitObjectDependencyKind::TreeEntry {
+                            position: 0,
+                            mode: GitTreeEntryMode::Tree,
+                            name: GitTreeEntryName::from_bytes(b"docs".to_vec()).unwrap(),
+                        },
+                        target: ExternalObjectId::new(ExternalObjectKind::Tree, child.object.oid),
+                    },
+                    GitObjectDependency {
+                        kind: GitObjectDependencyKind::TreeEntry {
+                            position: 1,
+                            mode: GitTreeEntryMode::Blob,
+                            name: GitTreeEntryName::from_bytes(b"setup.py".to_vec()).unwrap(),
+                        },
+                        target: ExternalObjectId::new(ExternalObjectKind::Blob, leaf.object.oid),
+                    },
+                ]
+            );
+
+            // Admission binds the exact admitted bytes and nothing else: the
+            // canonically respelled tree is a different object, so a rewrite on
+            // the way in could never pass the record's own identity check.
+            assert_eq!(usize::try_from(padded.body_len).unwrap(), padded_body.len());
+            let canonical_body = tree_body(&[
+                (b"docs", b"40000", child.object.oid),
+                (b"setup.py", b"100644", leaf.object.oid),
+            ]);
+            assert_ne!(canonical_body, padded_body);
+            assert!(ExternalObjectRecord::from_raw(
+                ExternalObjectKind::Tree,
+                padded.object.oid,
+                &canonical_body,
+            )
+            .is_err());
+
+            // The whole authority admits, which is the path `kin init` takes.
+            let commit = bodies.insert(
+                format,
+                ExternalObjectKind::Commit,
+                commit_body(padded.object.oid, &[], b"legacy import"),
+            );
+            let authority = direct_authority(
+                format,
+                vec![leaf, child, padded, commit.clone()],
+                commit.object,
+                &bodies,
+            )
+            .unwrap();
+            let mut loader = bodies.clone();
+            authority.validate_with_body_loader(&mut loader).unwrap();
+        }
+    }
+
+    #[test]
     fn malformed_tree_modes_names_duplicates_and_order_fail_closed() {
         let format = GitObjectFormat::Sha1;
         let target = repeated_oid(format, 0x51);
         let cases = [
             tree_body(&[(b"file", b"100664", target)]),
-            tree_body(&[(b"dir", b"040000", target)]),
+            tree_body(&[(b"file", b"100645", target)]),
+            tree_body(&[(b"file", b"999999", target)]),
+            // gix parses this to the same value it uses for a padded "040000",
+            // so only the admitted bytes can tell the two apart.
+            tree_body(&[(b"dir", b"140000", target)]),
             tree_body(&[(b"", b"100644", target)]),
             tree_body(&[(b"a/b", b"100644", target)]),
             tree_body(&[(b".", b"100644", target)]),
             tree_body(&[(b".GIT", b"100644", target)]),
             tree_body(&[(b"vendor", b"160000", repeated_oid(GitObjectFormat::Sha1, 0))]),
+            [
+                tree_body(&[(b"file", b"100644", target)]),
+                b"100644 truncated".to_vec(),
+            ]
+            .concat(),
         ];
         for body in cases {
             let mut bodies = MemoryBodies::default();
@@ -2044,6 +2194,18 @@ mod tests {
                 "malformed tree body unexpectedly decoded: {body:?}"
             );
         }
+
+        // A literal `140000` decodes to the same mode value as a zero-padded
+        // directory, so its refusal has to come from the admitted bytes rather
+        // than from the decoded mode.
+        let literal_body = tree_body(&[(b"dir", b"140000", target)]);
+        let mut literal_bodies = MemoryBodies::default();
+        let literal = literal_bodies.insert(format, ExternalObjectKind::Tree, literal_body.clone());
+        assert!(matches!(
+            decode_git_external_object(format, &literal, &literal_body),
+            Err(GitExternalAuthorityError::InvalidObject { reason, .. })
+                if reason == "noncanonical tree-entry mode encoding"
+        ));
 
         let duplicate_body = tree_body(&[
             (b"same", b"100644", target),
