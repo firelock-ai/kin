@@ -1120,10 +1120,31 @@ fn restore_shim_from_sources(dest: &Path, sources: &[PathBuf]) -> Result<Option<
     Ok(None)
 }
 
+/// Whether the environment carries PowerShell's markers.
+///
+/// `PSModulePath` is machine-scoped: the Windows installer sets it for every
+/// process, PowerShell exports it to its children on every platform, and hosted
+/// CI images that merely ship `pwsh` export it into shells that are not
+/// PowerShell at all. It therefore proves PowerShell is present, not that this
+/// process is running under it.
+fn powershell_environment_markers() -> bool {
+    env::var_os("PSModulePath").is_some() || env::var_os("PSVersionTable").is_some()
+}
+
 pub(crate) fn detect_shell() -> &'static str {
-    if env::var("PSModulePath").is_ok() || env::var("PSVersionTable").is_ok() {
+    // On Windows PowerShell is the shell Kin configures and its markers are the
+    // reliable signal. `SHELL` there is set by whatever POSIX layer (Git Bash,
+    // MSYS) launched the process and does not name the shell a user configures
+    // Kin for, so it must not outrank them.
+    if cfg!(target_os = "windows") && powershell_environment_markers() {
         return "powershell";
     }
+
+    // Everywhere else `SHELL` names the user's own shell and outranks the
+    // PowerShell markers, which on Unix say only that PowerShell exists on the
+    // machine. Reading the markers first detected bash and zsh operators as
+    // PowerShell, wrote the hook to a profile their shell never loads, and then
+    // reported the shell integration they were actually using as misconfigured.
     if let Ok(shell) = env::var("SHELL") {
         if shell.ends_with("/zsh") || shell.ends_with("/zsh-5") {
             return "zsh";
@@ -1135,6 +1156,13 @@ pub(crate) fn detect_shell() -> &'static str {
             return "fish";
         }
     }
+
+    // No POSIX shell named itself. The markers are the remaining evidence, so
+    // `pwsh` on Unix is still detected whenever `SHELL` cannot answer.
+    if powershell_environment_markers() {
+        return "powershell";
+    }
+
     "zsh"
 }
 
@@ -14256,6 +14284,49 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
 
         home.apply("KIN_HOME", Some(&preferred));
         assert_eq!(kin_dir().unwrap(), preferred);
+    }
+
+    #[test]
+    #[serial]
+    fn detect_shell_prefers_the_named_shell_over_ambient_powershell_markers() {
+        let mut shell_env = EnvVarGuard::unset("SHELL")
+            .without("PSModulePath")
+            .without("PSVersionTable");
+
+        // A hosted image that merely ships pwsh exports PSModulePath into every
+        // process, including a bash one. The shell is still bash.
+        shell_env.apply("PSModulePath", Some("/opt/microsoft/powershell/7/Modules"));
+        shell_env.apply("SHELL", Some("/bin/bash"));
+        if cfg!(target_os = "windows") {
+            assert_eq!(detect_shell(), "powershell");
+        } else {
+            assert_eq!(detect_shell(), "bash");
+        }
+
+        shell_env.apply("SHELL", Some("/bin/zsh"));
+        if cfg!(target_os = "windows") {
+            assert_eq!(detect_shell(), "powershell");
+        } else {
+            assert_eq!(detect_shell(), "zsh");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn detect_shell_uses_powershell_markers_when_no_posix_shell_names_itself() {
+        let mut shell_env = EnvVarGuard::unset("SHELL")
+            .without("PSModulePath")
+            .without("PSVersionTable");
+
+        assert_eq!(detect_shell(), "zsh");
+
+        shell_env.apply("PSModulePath", Some("/opt/microsoft/powershell/7/Modules"));
+        assert_eq!(detect_shell(), "powershell");
+
+        // An unrecognized login shell is not an answer either, so the markers
+        // still decide.
+        shell_env.apply("SHELL", Some("/usr/bin/false"));
+        assert_eq!(detect_shell(), "powershell");
     }
 
     #[test]
