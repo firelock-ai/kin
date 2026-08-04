@@ -47,12 +47,24 @@ concurrency:
 jobs:
   mint-release-tag:
     name: Mint release tag
+    # Any completed CI run for a main push is an occasion to evaluate a mint,
+    # whatever that run concluded in aggregate. The aggregate conclusion is not
+    # a release verdict and is deliberately not consulted here: a ci.yml run
+    # carries jobs beyond the release-critical ones, so a single non-required
+    # red — an advisory Windows or coverage leg — turns the whole run red and
+    # would silence this trigger on most main pushes, leaving the schedule as
+    # the only automatic path. "Verify required checks are green" below is the
+    # authority. It binds each reviewed required context to its exact workflow
+    # id, path, push event, branch, and head sha, judges that context's own
+    # conclusion, and explicitly refuses to let a producing run's aggregate
+    # conclusion veto through it. This trigger therefore decides only when to
+    # look, never whether the commit is releasable, which is exactly the
+    # division the scheduled path already runs under.
     if: >-
       github.event_name != 'workflow_run' ||
       (
         github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.conclusion == 'success'
+        github.event.workflow_run.head_branch == 'main'
       )
     runs-on: ubuntu-latest
     # The automatic path waits for release-critical checks to settle, so the
@@ -126,7 +138,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RAW_TAG: ${{ github.event.client_payload.tag }}
           RAW_SHA: ${{ github.event.client_payload.sha }}
-          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           git fetch origin \
@@ -141,10 +152,16 @@ jobs:
               tag="$RAW_TAG"
               sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
               ;;
-            workflow_run)
-              sha="$WORKFLOW_SHA"
-              ;;
-            schedule)
+            workflow_run|schedule)
+              # Both automatic arms read the same freshly fetched protected
+              # main. A trigger decides only when to look, never which commit to
+              # release, so the event's own head sha is deliberately not an
+              # input here: a rerun of an older CI run carries that run's sha,
+              # which resolves the version main carried then rather than the
+              # version it carries now. Reading main HEAD costs nothing, since
+              # the required-check gate re-derives everything from the resolved
+              # commit anyway, and it denies the event path a stale-candidate
+              # class the scheduled path structurally cannot reach.
               sha="$(git rev-parse refs/remotes/origin/main)"
               ;;
             *)
