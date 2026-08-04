@@ -802,8 +802,17 @@ jobs:
           mkdir -p "$claude_fallback_home/.claude"
           mkdir -p "$claude_fallback_bin"
           printf '{}\n' > "$claude_fallback_home/.claude/config.json"
-          printf '#!/bin/sh\nexit 0\n' > "$claude_fallback_bin/claude"
-          chmod +x "$claude_fallback_bin/claude"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Detection resolves this shim through which-rs, which on Windows
+            # treats a file as executable only when it carries a PATHEXT
+            # extension. An extension-less `#!/bin/sh` script is therefore
+            # invisible to detection here, so use a real .exe as the other
+            # agent shims in this workflow already do.
+            cp "$(command -v kin)" "$claude_fallback_bin/claude.exe"
+          else
+            printf '#!/bin/sh\nexit 0\n' > "$claude_fallback_bin/claude"
+            chmod +x "$claude_fallback_bin/claude"
+          fi
           claude_fallback_path="$claude_fallback_bin:$primary_home/.kin/bin:/usr/bin:/bin"
           HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
           KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
