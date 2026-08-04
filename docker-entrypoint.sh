@@ -21,10 +21,45 @@ if ! mkdir -p "${WORKSPACE_DIR}/.kin" 2>/dev/null || [ ! -w "${WORKSPACE_DIR}/.k
     exit 1
 fi
 
+KIN_DIR="$(cd "${WORKSPACE_DIR}/.kin" && pwd -P)"
+
+# Paths every layout version creates. HEAD, objects/ and kindb/graph.kndb were
+# git-shaped artifacts of the pre-authority layout and are NOT produced by a
+# current `kin init`, so testing for them was unconditionally true and turned the
+# branch below into an unconditional wipe on every start. These four are present
+# in both the pre-authority and the current layout, so an existing repository of
+# either vintage is left alone and the daemon decides whether it can open it.
+layout_is_materialized() {
+    [ -f "${KIN_DIR}/manifest.json" ] \
+        && [ -f "${KIN_DIR}/config.toml" ] \
+        && [ -f "${KIN_DIR}/version" ] \
+        && [ -d "${KIN_DIR}/kindb" ]
+}
+
+# Refuse to delete a tree that has a filesystem mounted inside it. The registry
+# pod mounts its published-crates volume at .kin/packages, and `rm -rf` unlinks
+# the volume's contents before it fails EBUSY on the mount point itself, so the
+# destructive path loses data first and crashloops second.
+kin_dir_contains_mount() {
+    [ -r /proc/self/mountinfo ] || return 1
+    while read -r _ _ _ _ mount_point _; do
+        case "${mount_point}" in
+            "${KIN_DIR}" | "${KIN_DIR}"/*) return 0 ;;
+        esac
+    done < /proc/self/mountinfo
+    return 1
+}
+
 # Materialize a real Kin repo layout. Re-init only when the tree is missing or
 # incomplete so an existing repo on a persistent volume is never clobbered.
-if [ ! -f "${WORKSPACE_DIR}/.kin/manifest.json" ] || [ ! -f "${WORKSPACE_DIR}/.kin/config.toml" ] || [ ! -f "${WORKSPACE_DIR}/.kin/HEAD" ] || [ ! -d "${WORKSPACE_DIR}/.kin/objects" ] || [ ! -f "${WORKSPACE_DIR}/.kin/kindb/graph.kndb" ]; then
-    rm -rf "${WORKSPACE_DIR}/.kin"
+if ! layout_is_materialized; then
+    if kin_dir_contains_mount; then
+        echo "[entrypoint] FATAL: '${KIN_DIR}' is not a materialized Kin layout, but a filesystem is mounted inside it." >&2
+        echo "[entrypoint] Refusing to re-initialize, because that deletes the mounted volume's contents before it fails on the mount point." >&2
+        echo "[entrypoint] Prepare the repository before anything is mounted under .kin, or mount that volume outside the repository." >&2
+        exit 1
+    fi
+    rm -rf "${KIN_DIR}"
     kin init "${WORKSPACE_DIR}"
 fi
 
