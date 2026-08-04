@@ -4,13 +4,19 @@
 //! Exact repository membership discovery.
 //!
 //! Repository membership is independent of parser support. This scanner admits
-//! every regular file and symbolic link, including configuration, generated
-//! output, vendored trees, binaries, and files in unsupported languages. Only
-//! Kin/Git control metadata is inherently excluded.
+//! every regular file and symbolic link, including configuration, vendored
+//! trees, binaries, and files in unsupported languages. Kin/Git control
+//! metadata is inherently excluded, and the compiler/packager output named by
+//! [`DEFAULT_IGNORED_NAMES`] is excluded by default because the graph is the
+//! system of record for source truth, not for derived bytes that any build
+//! reproduces.
 //!
-//! Explicit `.kinignore` rules apply only to paths that are not already tracked.
-//! A tracked path remains observable after a rule begins matching it, so ignore
+//! Ignore rules apply only to paths that are not already tracked. A tracked
+//! path remains observable after a rule begins matching it, so ignore
 //! configuration can never silently turn graph-owned truth into a deletion.
+//! Retiring already-admitted derived output is therefore a deliberate operator
+//! action: [`tracked_paths_covered_by_ignore`] names exactly which tracked
+//! paths a purge would untrack.
 //!
 //! A caller receives [`CompleteRepositoryScan`] only after every representable
 //! directory entry, metadata lookup, file read, and symbolic-link read
@@ -156,23 +162,142 @@ impl CompleteRepositoryScan {
     }
 }
 
-/// Literal, repo-scoped admission rules loaded from `.kinignore`.
+/// Names excluded from repository membership before any `.kinignore` is read.
+///
+/// Every entry is compiler, packager, or tool output that a build reproduces
+/// from source already under graph truth. Admitting them costs content-address
+/// storage and retrieval quality while adding no semantic truth.
+///
+/// Ambiguous names are deliberately absent. `build`, `out`, `bin`, `vendor`,
+/// and `coverage` routinely hold hand-written source or vendored dependency
+/// source, so they stay admitted and a repository that wants them excluded says
+/// so in its `.kinignore`. The rule for adding an entry here is that the name
+/// must be unambiguously derived output across the ecosystems that use it.
+///
+/// A `!` rule re-admits anything here, and re-admission is scoped: it cancels
+/// only the rules matching at or above its own boundary, so `!target` does not
+/// also re-admit `target/node_modules`.
+pub const DEFAULT_IGNORED_NAMES: &[&str] = &[
+    // Rust, Maven, and sbt build output. This is the name that dominates
+    // derived-byte volume in a polyglot workspace.
+    "target",
+    // Package-manager dependency trees.
+    "node_modules",
+    // JavaScript and Python packaging output.
+    "dist",
+    // Python bytecode and environment/tool caches.
+    "__pycache__",
+    ".venv",
+    ".tox",
+    ".nox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".ipynb_checkpoints",
+    // JavaScript framework and bundler caches.
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".nyc_output",
+    // Build-tool and provider caches.
+    ".gradle",
+    ".terraform",
+    // Kin fleet lane-coordination state.
+    ".kin-coord",
+    // Finder metadata.
+    ".DS_Store",
+];
+
+/// Roots already warned about a missing `.kinignore` in this process.
+static WARNED_ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Whether this process should emit the missing-`.kinignore` warning for `root`.
+///
+/// Returns true exactly once per root. A poisoned lock warns rather than
+/// swallowing the condition, because an unheard warning is the failure here.
+fn warn_once_for_root(root: &Path) -> bool {
+    let warned = WARNED_ROOTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+    match warned.lock() {
+        Ok(mut warned) => warned.insert(root.to_path_buf()),
+        Err(_) => true,
+    }
+}
+
+/// Literal, repo-scoped admission rules: [`DEFAULT_IGNORED_NAMES`] plus the
+/// contents of `.kinignore`.
 ///
 /// A pattern without `/` matches a component at any depth. A pattern with `/`
 /// matches one repository path or its descendants. Glob interpretation is
 /// intentionally absent.
-#[derive(Debug, Clone, Default)]
+///
+/// A `!` prefix re-admits a path that another rule excludes, which is the only
+/// way to override a built-in default. Re-admission wins regardless of rule
+/// order, so `!target` restores an ordinary `target` directory and
+/// `!target/keep.rs` restores one path beneath an otherwise-excluded tree.
+#[derive(Debug, Clone)]
 pub struct RepositoryIgnore {
     names: BTreeSet<Vec<u8>>,
     prefixes: Vec<RepoPath>,
+    readmitted_names: BTreeSet<Vec<u8>>,
+    readmitted_prefixes: Vec<RepoPath>,
+    configured: bool,
+}
+
+impl Default for RepositoryIgnore {
+    /// The built-in defaults, as though a repository carried no `.kinignore`.
+    ///
+    /// An empty rule set is [`RepositoryIgnore::admit_everything`]. Defaulting
+    /// to no rules is what let derived output reach graph truth unbounded, so
+    /// the safe construction is the one callers get implicitly.
+    fn default() -> Self {
+        let mut rules = Self::admit_everything();
+        for name in DEFAULT_IGNORED_NAMES {
+            rules.names.insert(name.as_bytes().to_vec());
+        }
+        rules
+    }
 }
 
 impl RepositoryIgnore {
+    /// Rules that exclude nothing, not even build output.
+    ///
+    /// Reserved for callers that must observe a complete host tree, such as
+    /// import and projection fixtures. Runtime scan paths use
+    /// [`RepositoryIgnore::load`].
+    pub fn admit_everything() -> Self {
+        Self {
+            names: BTreeSet::new(),
+            prefixes: Vec::new(),
+            readmitted_names: BTreeSet::new(),
+            readmitted_prefixes: Vec::new(),
+            configured: false,
+        }
+    }
+
     pub fn load(root: &Path) -> Result<Self, IncompleteRepositoryScan> {
         let path = root.join(".kinignore");
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let rules = Self::default();
+                // Latched per root. `load` runs once per watch-loop event batch
+                // against a ~100ms poll, so an unlatched warning would repeat
+                // several hundred characters per second on every repository in
+                // the fleet and bury the warnings that need reading.
+                if warn_once_for_root(root) {
+                    if let Some(warning) = rules.missing_configuration_warning() {
+                        tracing::warn!(
+                            repository = %root.display(),
+                            defaults = DEFAULT_IGNORED_NAMES.len(),
+                            "{warning}"
+                        );
+                    }
+                }
+                return Ok(rules);
+            }
             Err(error) => {
                 return Err(IncompleteRepositoryScan::io(
                     path,
@@ -192,16 +317,26 @@ impl RepositoryIgnore {
         })?;
 
         let mut rules = Self::default();
+        rules.configured = true;
         for (line_index, raw) in content.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let pattern = line.trim_end_matches('/');
+            let (pattern, readmit) = match line.strip_prefix('!') {
+                Some(rest) => (rest.trim(), true),
+                None => (line, false),
+            };
+            let pattern = pattern.trim_end_matches('/');
             let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
             if pattern.is_empty() {
                 continue;
             }
+            let (names, prefixes) = if readmit {
+                (&mut rules.readmitted_names, &mut rules.readmitted_prefixes)
+            } else {
+                (&mut rules.names, &mut rules.prefixes)
+            };
             if pattern.contains('/') {
                 let prefix = RepoPath::from_utf8(pattern).map_err(|error| {
                     IncompleteRepositoryScan::io(
@@ -211,30 +346,183 @@ impl RepositoryIgnore {
                         RepositoryScanDiagnostics::default(),
                     )
                 })?;
-                rules.prefixes.push(prefix);
+                prefixes.push(prefix);
             } else {
-                rules.names.insert(pattern.as_bytes().to_vec());
+                names.insert(pattern.as_bytes().to_vec());
             }
         }
         rules.prefixes.sort();
         rules.prefixes.dedup();
+        rules.readmitted_prefixes.sort();
+        rules.readmitted_prefixes.dedup();
         Ok(rules)
     }
 
+    /// Whether this repository states its own admission rules in `.kinignore`.
+    pub const fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    /// Operator-facing warning for a repository with no `.kinignore`.
+    ///
+    /// Returned rather than only logged so callers can surface it on their own
+    /// channel and tests can assert its content.
+    pub fn missing_configuration_warning(&self) -> Option<String> {
+        if self.configured {
+            return None;
+        }
+        Some(format!(
+            "no .kinignore: admission is running on {} built-in default excludes \
+             ({}). Derived output outside those names will be ingested as \
+             repository truth. Write a .kinignore to state this repository's \
+             rules, and use `!name` to re-admit a default.",
+            DEFAULT_IGNORED_NAMES.len(),
+            DEFAULT_IGNORED_NAMES.join(", ")
+        ))
+    }
+
+    /// Whether any rule matches at or below byte offset `floor` in `bytes`.
+    ///
+    /// `floor` is the end of a re-admitted ancestor. Passing `0` tests the whole
+    /// path, which is the ordinary unqualified match.
+    fn rules_match_below(
+        names: &BTreeSet<Vec<u8>>,
+        prefixes: &[RepoPath],
+        bytes: &[u8],
+        floor: usize,
+    ) -> bool {
+        let mut start = 0;
+        for component in bytes.split(|byte| *byte == b'/') {
+            if start >= floor && names.contains(component) {
+                return true;
+            }
+            start += component.len() + 1;
+        }
+        prefixes.iter().any(|prefix| {
+            let prefix = prefix.as_bytes();
+            prefix.len() > floor
+                && (bytes == prefix
+                    || bytes
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with(b"/")))
+        })
+    }
+
+    /// End offset of the deepest re-admitted ancestor-or-self of `bytes`.
+    fn readmit_floor(&self, bytes: &[u8]) -> Option<usize> {
+        let mut floor = None;
+        let mut start = 0;
+        for component in bytes.split(|byte| *byte == b'/') {
+            if self.readmitted_names.contains(component) {
+                floor = Some(start + component.len());
+            }
+            start += component.len() + 1;
+        }
+        for prefix in &self.readmitted_prefixes {
+            let prefix = prefix.as_bytes();
+            if bytes == prefix
+                || bytes
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+            {
+                floor = Some(floor.map_or(prefix.len(), |floor: usize| floor.max(prefix.len())));
+            }
+        }
+        floor
+    }
+
+    /// Whether ignore rules exclude `path`.
+    ///
+    /// A re-admission cancels only the rules matching at or above its own
+    /// boundary. Rules that match strictly deeper still apply, so `!target`
+    /// restores a `target` tree without dragging `target/node_modules` back in
+    /// with it. Without that scoping the escape hatch would reintroduce exactly
+    /// the unbounded derived output it exists to let an operator recover from.
     pub fn matches(&self, path: &RepoPath) -> bool {
         let bytes = path.as_bytes();
-        if bytes
-            .split(|byte| *byte == b'/')
-            .any(|component| self.names.contains(component))
-        {
+        let floor = self.readmit_floor(bytes).unwrap_or(0);
+        Self::rules_match_below(&self.names, &self.prefixes, bytes, floor)
+    }
+
+    /// Whether the walk must descend into an otherwise-excluded `directory`
+    /// because a re-admission could name something beneath it.
+    ///
+    /// A bare-name rule such as `!keep.rs` names no directory, so its depth
+    /// cannot be known without looking. Descending is the conservative answer:
+    /// it costs directory reads, and the file branch still applies
+    /// `ignored && !tracked`, so a re-admission never admits its siblings.
+    fn readmits_below(&self, directory: &RepoPath) -> bool {
+        if !self.readmitted_names.is_empty() {
             return true;
         }
-        self.prefixes.iter().any(|prefix| {
-            bytes == prefix.as_bytes()
-                || bytes
-                    .strip_prefix(prefix.as_bytes())
-                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+        let prefix = directory.as_bytes();
+        self.readmitted_prefixes.iter().any(|readmitted| {
+            readmitted
+                .as_bytes()
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
         })
+    }
+}
+
+/// Tracked paths that current ignore rules would exclude if they arrived today.
+///
+/// Ignore rules never hide tracked paths, so a repository that admitted derived
+/// output before a rule existed keeps carrying it. This is the evidence a purge
+/// reports before it acts and the exact set it removes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IgnoredTrackedPaths {
+    paths: Vec<RepoPath>,
+    tracked_total: usize,
+}
+
+impl IgnoredTrackedPaths {
+    /// The tracked paths covered by ignore rules, in repository path order.
+    pub fn paths(&self) -> &[RepoPath] {
+        &self.paths
+    }
+
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// How many paths the repository tracks in total.
+    pub const fn tracked_total(&self) -> usize {
+        self.tracked_total
+    }
+
+    /// Tracked paths that would remain after a purge.
+    pub const fn retained_total(&self) -> usize {
+        self.tracked_total.saturating_sub(self.paths.len())
+    }
+}
+
+/// Name the tracked paths that `ignore` covers.
+///
+/// This reads graph-owned tracked identity, never the host filesystem: a purge
+/// decides what to untrack from repository truth, so an absent or stale working
+/// directory cannot change the answer.
+pub fn tracked_paths_covered_by_ignore<'a>(
+    ignore: &RepositoryIgnore,
+    tracked: impl IntoIterator<Item = &'a RepoPath>,
+) -> IgnoredTrackedPaths {
+    let mut tracked_total = 0;
+    let mut paths = Vec::new();
+    for path in tracked {
+        tracked_total += 1;
+        if ignore.matches(path) {
+            paths.push(path.clone());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    IgnoredTrackedPaths {
+        paths,
+        tracked_total,
     }
 }
 
@@ -447,7 +735,10 @@ impl Scanner<'_> {
             let ignored = self.ignore.matches(&repo_path);
 
             if file_type.is_dir() {
-                if ignored && !self.is_tracked_or_contains_tracked(&repo_path) {
+                if ignored
+                    && !self.is_tracked_or_contains_tracked(&repo_path)
+                    && !self.ignore.readmits_below(&repo_path)
+                {
                     self.diagnostics.ignored_untracked_entries += 1;
                     continue;
                 }
@@ -740,11 +1031,14 @@ mod tests {
         scan_repository(root, &ignore, std::iter::empty()).unwrap()
     }
 
+    /// Membership stays independent of parser support, hidden names, and
+    /// vendoring. Only control metadata and derived output are excluded, and
+    /// `build`/`out`/`vendor` stay admitted because those names are ambiguous.
     #[test]
     fn scan_admits_every_non_control_repository_surface() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let files: &[(&str, &[u8])] = &[
+        let admitted: &[(&str, &[u8])] = &[
             ("Dockerfile", b"FROM alpine"),
             ("compose.yaml", b"services: {}"),
             ("Cargo.lock", b"version = 4"),
@@ -754,18 +1048,20 @@ mod tests {
             ("notes/brain.brainfuck", b"+++[>+++<-]"),
             ("assets/logo.bin", b"\x00\xff\x10"),
             ("unrelated/receipt.pdf", b"%PDF-not-really"),
-            ("node_modules/pkg/index.js", b"export default 1"),
-            ("target/generated.rs", b"pub const GENERATED: bool = true;"),
             ("vendor/lib/source.c", b"int vendored(void) { return 1; }"),
-            ("dist/app.js", b"console.log('dist')"),
             ("build/report.txt", b"build output"),
             ("out/data", b"output"),
-            ("__pycache__/state.bin", b"cache"),
-            (".next/server/app.js", b"next"),
             (".env.example", b"NAME=value"),
             (".kinignore", b""),
         ];
-        for (relative, content) in files {
+        let excluded_by_default: &[(&str, &[u8])] = &[
+            ("node_modules/pkg/index.js", b"export default 1"),
+            ("target/generated.rs", b"pub const GENERATED: bool = true;"),
+            ("dist/app.js", b"console.log('dist')"),
+            ("__pycache__/state.bin", b"cache"),
+            (".next/server/app.js", b"next"),
+        ];
+        for (relative, content) in admitted.iter().chain(excluded_by_default) {
             let host = root.join(relative);
             fs::create_dir_all(host.parent().unwrap()).unwrap();
             fs::write(host, content).unwrap();
@@ -783,13 +1079,19 @@ mod tests {
 
         let scan = scan(root);
         let paths = scan.paths().cloned().collect::<BTreeSet<_>>();
-        for (relative, _) in files {
+        for (relative, _) in admitted {
             assert!(paths.contains(&path(relative)), "missing {relative}");
+        }
+        for (relative, _) in excluded_by_default {
+            assert!(
+                !paths.contains(&path(relative)),
+                "derived output admitted: {relative}"
+            );
         }
         assert!(paths.contains(&path(".kin-release/downstreams.json")));
         assert!(!paths.iter().any(is_repository_control_path));
-        assert_eq!(scan.len(), files.len() + 1);
-        assert_eq!(scan.diagnostics().admitted_entries, files.len() + 1);
+        assert_eq!(scan.len(), admitted.len() + 1);
+        assert_eq!(scan.diagnostics().admitted_entries, admitted.len() + 1);
     }
 
     #[cfg(unix)]
@@ -846,36 +1148,260 @@ mod tests {
         assert!(scan.entry(&non_utf8).is_some());
     }
 
+    /// Uses names absent from [`DEFAULT_IGNORED_NAMES`] on purpose. Asserting
+    /// this against `target` would pass on the built-in defaults alone and
+    /// prove nothing about `.kinignore` parsing.
     #[test]
     fn explicit_ignore_applies_only_before_tracking() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        fs::create_dir_all(root.join("target/nested")).unwrap();
-        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
-        fs::write(root.join("target/nested/new.bin"), b"new").unwrap();
-        fs::write(root.join("target/retained.bin"), b"retained").unwrap();
-        fs::write(root.join("node_modules/pkg/index.js"), b"generated").unwrap();
+        fs::create_dir_all(root.join("build/nested")).unwrap();
+        fs::create_dir_all(root.join("vendor/pkg")).unwrap();
+        fs::write(root.join("build/nested/new.bin"), b"new").unwrap();
+        fs::write(root.join("build/retained.bin"), b"retained").unwrap();
+        fs::write(root.join("vendor/pkg/index.js"), b"generated").unwrap();
         fs::write(root.join(".env"), b"SECRET=never-admit-untracked").unwrap();
-        fs::write(root.join(".kinignore"), b"target/\nnode_modules/\n.env\n").unwrap();
+        fs::write(root.join(".kinignore"), b"build/\nvendor/\n.env\n").unwrap();
         let ignore = RepositoryIgnore::load(root).unwrap();
+        assert!(ignore.is_configured());
 
         let initial = scan_repository(root, &ignore, std::iter::empty()).unwrap();
-        assert!(initial.entry(&path("target/nested/new.bin")).is_none());
-        assert!(initial.entry(&path("target/retained.bin")).is_none());
-        assert!(initial.entry(&path("node_modules/pkg/index.js")).is_none());
+        assert!(initial.entry(&path("build/nested/new.bin")).is_none());
+        assert!(initial.entry(&path("build/retained.bin")).is_none());
+        assert!(initial.entry(&path("vendor/pkg/index.js")).is_none());
         assert!(initial.entry(&path(".env")).is_none());
 
-        let retained = path("target/retained.bin");
-        fs::write(root.join("target/retained.bin"), b"updated tracked bytes").unwrap();
+        let retained = path("build/retained.bin");
+        fs::write(root.join("build/retained.bin"), b"updated tracked bytes").unwrap();
         let tracked = scan_repository(root, &ignore, [&retained]).unwrap();
         assert!(tracked.entry(&retained).is_some());
         assert_eq!(
             tracked.entry(&retained).unwrap().content_hash,
             sha256_bytes(b"updated tracked bytes")
         );
-        assert!(tracked.entry(&path("target/nested/new.bin")).is_none());
-        assert!(tracked.entry(&path("node_modules/pkg/index.js")).is_none());
+        assert!(tracked.entry(&path("build/nested/new.bin")).is_none());
+        assert!(tracked.entry(&path("vendor/pkg/index.js")).is_none());
         assert!(tracked.entry(&path(".env")).is_none());
+    }
+
+    #[test]
+    fn missing_kinignore_warns_and_still_applies_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("main.rs"), b"fn main() {}").unwrap();
+
+        let unconfigured = RepositoryIgnore::load(root).unwrap();
+        assert!(!unconfigured.is_configured());
+        let warning = unconfigured
+            .missing_configuration_warning()
+            .expect("absent .kinignore must warn");
+        assert!(warning.contains(".kinignore"), "{warning}");
+        assert!(warning.contains("target"), "{warning}");
+        assert!(warning.contains("built-in default excludes"), "{warning}");
+        assert!(unconfigured.matches(&path("target/debug/app")));
+
+        // Falsification: the same call against a repository that states its
+        // rules must go quiet, so the assertions above cannot pass vacuously.
+        fs::write(root.join(".kinignore"), b"# stated\n").unwrap();
+        let configured = RepositoryIgnore::load(root).unwrap();
+        assert!(configured.is_configured());
+        assert_eq!(configured.missing_configuration_warning(), None);
+        assert!(configured.matches(&path("target/debug/app")));
+    }
+
+    #[test]
+    fn default_excludes_reject_untracked_derived_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let derived = [
+            "target/debug/app.o",
+            "node_modules/pkg/index.js",
+            "dist/bundle.js",
+            "__pycache__/mod.pyc",
+            ".venv/bin/python",
+            ".pytest_cache/v/lastfailed",
+            ".next/server/page.js",
+            ".turbo/cache.log",
+            ".gradle/state.bin",
+            ".terraform/provider",
+            ".kin-coord/worktrees/lane/file",
+        ];
+        for relative in derived {
+            let host = root.join(relative);
+            fs::create_dir_all(host.parent().unwrap()).unwrap();
+            fs::write(host, b"derived").unwrap();
+        }
+        fs::write(root.join("lib.rs"), b"pub fn kept() {}").unwrap();
+
+        let scan = scan(root);
+        for relative in derived {
+            assert!(
+                scan.entry(&path(relative)).is_none(),
+                "derived output admitted: {relative}"
+            );
+        }
+        assert!(scan.entry(&path("lib.rs")).is_some());
+        assert_eq!(scan.len(), 1);
+        assert!(scan.diagnostics().ignored_untracked_entries > 0);
+
+        // Falsification: the fixture really does contain those trees, so an
+        // empty rule set must admit every one of them.
+        let everything = scan_repository(
+            root,
+            &RepositoryIgnore::admit_everything(),
+            std::iter::empty(),
+        )
+        .unwrap();
+        for relative in derived {
+            assert!(
+                everything.entry(&path(relative)).is_some(),
+                "fixture never created {relative}"
+            );
+        }
+        assert_eq!(everything.len(), derived.len() + 1);
+    }
+
+    #[test]
+    fn readmit_rule_overrides_a_built_in_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("target/deep")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("target/keep.rs"), b"pub fn keep() {}").unwrap();
+        fs::write(root.join("target/deep/drop.o"), b"object").unwrap();
+        fs::write(root.join("dist/app.js"), b"bundle").unwrap();
+
+        // A whole-name re-admission restores the tree.
+        fs::write(root.join(".kinignore"), b"!target\n").unwrap();
+        let whole = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &whole, std::iter::empty()).unwrap();
+        assert!(scan.entry(&path("target/keep.rs")).is_some());
+        assert!(scan.entry(&path("target/deep/drop.o")).is_some());
+        assert!(scan.entry(&path("dist/app.js")).is_none());
+
+        // A path re-admission descends into an otherwise-pruned directory and
+        // restores exactly one member.
+        fs::write(root.join(".kinignore"), b"!target/keep.rs\n").unwrap();
+        let single = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &single, std::iter::empty()).unwrap();
+        assert!(scan.entry(&path("target/keep.rs")).is_some());
+        assert!(scan.entry(&path("target/deep/drop.o")).is_none());
+
+        // Falsification: drop the re-admission and the same fixture loses it.
+        fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
+        let none = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        assert!(scan.entry(&path("target/keep.rs")).is_none());
+    }
+
+    /// A bare-name re-admission has no directory to descend from, so the walker
+    /// must descend anyway or the documented escape hatch is a silent no-op.
+    #[test]
+    fn bare_name_readmission_reaches_inside_a_pruned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/keep.rs"), b"pub fn keep() {}").unwrap();
+        fs::write(root.join("dist/bundle.js"), b"derived").unwrap();
+        fs::write(root.join(".kinignore"), b"!keep.rs\n").unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        assert!(!ignore.matches(&path("dist/keep.rs")));
+        let scan = scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        assert!(
+            scan.entry(&path("dist/keep.rs")).is_some(),
+            "the predicate admitted the path but the walker never reached it"
+        );
+        // Descending must not admit the siblings it walked past.
+        assert!(scan.entry(&path("dist/bundle.js")).is_none());
+
+        // Falsification: without the rule the same fixture keeps the file out.
+        fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
+        let none = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        assert!(scan.entry(&path("dist/keep.rs")).is_none());
+    }
+
+    /// Re-admission must cancel only the rule it overrides. If it blanket-won,
+    /// rescuing one tree would drag every nested default back in, which is the
+    /// volume problem this whole change exists to fix.
+    #[test]
+    fn readmission_does_not_defeat_defaults_nested_below_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".kinignore"), b"!target\n").unwrap();
+        let ignore = RepositoryIgnore::load(root).unwrap();
+
+        assert!(!ignore.matches(&path("target/keep.rs")));
+        assert!(!ignore.matches(&path("target/deep/keep.rs")));
+        assert!(
+            ignore.matches(&path("target/node_modules/pkg/index.js")),
+            "a nested default was defeated by an ancestor re-admission"
+        );
+        assert!(ignore.matches(&path("target/sub/.DS_Store")));
+        assert!(ignore.matches(&path("target/a/dist/bundle.js")));
+
+        // A prefix re-admission scopes the same way.
+        fs::write(root.join(".kinignore"), b"!target/keep\n").unwrap();
+        let prefixed = RepositoryIgnore::load(root).unwrap();
+        assert!(!prefixed.matches(&path("target/keep/src/lib.rs")));
+        assert!(prefixed.matches(&path("target/keep/node_modules/pkg/index.js")));
+        assert!(prefixed.matches(&path("target/other.o")));
+    }
+
+    /// The trap behind FIR-1854: a default exclude alone retires nothing,
+    /// because ignore rules never hide graph-owned identity.
+    #[test]
+    fn default_excludes_never_hide_already_tracked_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("target/debug/tracked.o"), b"admitted earlier").unwrap();
+        fs::write(root.join("target/debug/fresh.o"), b"arrived later").unwrap();
+
+        let tracked = path("target/debug/tracked.o");
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+
+        assert!(
+            scan.entry(&tracked).is_some(),
+            "a default exclude must not silently delete graph-owned truth"
+        );
+        assert!(scan.entry(&path("target/debug/fresh.o")).is_none());
+        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+    }
+
+    #[test]
+    fn tracked_paths_covered_by_ignore_names_the_purge_set() {
+        let ignore = RepositoryIgnore::default();
+        let tracked = [
+            path("src/main.rs"),
+            path("target/debug/app.o"),
+            path("target/debug/deps/lib.rlib"),
+            path("node_modules/pkg/index.js"),
+            path("vendor/lib/source.c"),
+        ];
+
+        let covered = tracked_paths_covered_by_ignore(&ignore, tracked.iter());
+        assert_eq!(
+            covered.paths(),
+            [
+                path("node_modules/pkg/index.js"),
+                path("target/debug/app.o"),
+                path("target/debug/deps/lib.rlib"),
+            ]
+        );
+        assert_eq!(covered.len(), 3);
+        assert_eq!(covered.tracked_total(), 5);
+        assert_eq!(covered.retained_total(), 2);
+        assert!(!covered.is_empty());
+
+        // Falsification: the same tracked set under empty rules purges nothing.
+        let none =
+            tracked_paths_covered_by_ignore(&RepositoryIgnore::admit_everything(), tracked.iter());
+        assert!(none.is_empty());
+        assert_eq!(none.tracked_total(), 5);
+        assert_eq!(none.retained_total(), 5);
     }
 
     #[cfg(unix)]

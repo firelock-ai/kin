@@ -1168,6 +1168,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/resolve", post(command_resolve))
         .route("/commands/drift", post(command_drift))
         .route("/commands/tag", post(command_tag))
+        .route("/commands/purge-ignored", post(command_purge_ignored))
         .route("/commands/rollback", post(command_rollback))
         .route("/commands/checkout", post(command_checkout))
         .route("/commands/stash", post(command_stash))
@@ -3379,6 +3380,46 @@ async fn command_tag(
 
     let _coordination = state.coordination_gate.lock().await;
     let response = crate::repository_tag::execute(&state, &request)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/purge-ignored — retire tracked paths that ignore rules cover.
+///
+/// Reports without mutating unless the request confirms. The coordination gate
+/// is held for both, so the watch loop cannot admit a competing observation
+/// between the tracked set this reports and the transition it publishes.
+async fn command_purge_ignored(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::purge_ignored::PurgeIgnoredRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local repository purge authority is unavailable for hosted snapshot authority"
+                .to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "purge publishes against HEAD authority; run it without ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    let _coordination = state.coordination_gate.lock().await;
+    let response = crate::repository_purge::execute(&state, &request)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
     Ok(Json(response))
 }
 
@@ -16900,6 +16941,142 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    async fn purge_ignored_through_api(
+        app: &axum::Router,
+        confirm: bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/purge-ignored")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "confirm": confirm,
+                            "confirm_mass_deletion": true,
+                            "operation_id": kin_model::OperationId::new(),
+                            "actor": AuthorId::new("purge-acceptance")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn tracked_paths(state: &DaemonState) -> std::collections::BTreeSet<String> {
+        state
+            .graph
+            .resolved_tree()
+            .artifacts_by_path()
+            .map(|artifact| artifact.path.to_string())
+            .collect()
+    }
+
+    /// A default exclude alone retires nothing, because ignore rules never hide
+    /// tracked identity. The purge is what retires the backlog, and the removal
+    /// has to be in authority rather than only in the live graph.
+    #[tokio::test]
+    async fn purge_ignored_untracks_admitted_derived_output_and_survives_restart() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let layout = state.layout.clone();
+
+        for (path, content) in [
+            ("src/lib.rs", &b"pub fn kept() {}"[..]),
+            ("target/debug/app.o", &b"derived"[..]),
+            ("target/debug/deps/lib.rlib", &b"derived"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+        let app = router(Arc::clone(&state));
+
+        // Precondition: the derived output really is tracked, so the assertions
+        // below cannot pass because it was never admitted.
+        assert!(tracked_paths(&state).contains("target/debug/app.o"));
+
+        let (_, dry) = purge_ignored_through_api(&app, false).await;
+        assert_eq!(dry["mutated"], json!(false));
+        assert_eq!(dry["report"]["purge_count"], json!(2));
+        assert_eq!(dry["report"]["tracked_total"], json!(3));
+        assert_eq!(dry["report"]["retained_total"], json!(1));
+        assert_eq!(dry["report"]["applied"], json!(false));
+        assert_eq!(dry["report"]["kinignore_present"], json!(false));
+        assert_eq!(
+            dry["report"]["sample_paths"],
+            json!(["target/debug/app.o", "target/debug/deps/lib.rlib"])
+        );
+        assert!(
+            tracked_paths(&state).contains("target/debug/app.o"),
+            "a dry run untracked a path"
+        );
+
+        let (_, applied) = purge_ignored_through_api(&app, true).await;
+        assert_eq!(applied["mutated"], json!(true));
+        assert_eq!(applied["report"]["applied"], json!(true));
+        assert_eq!(applied["report"]["purge_count"], json!(2));
+        assert!(applied["report"]["authority_generation"].is_number());
+
+        let live = tracked_paths(&state);
+        assert!(live.contains("src/lib.rs"));
+        assert!(!live.contains("target/debug/app.o"));
+        assert!(!live.contains("target/debug/deps/lib.rlib"));
+
+        // The files are still on disk. Only tracking was retired.
+        assert!(layout.working_dir().join("target/debug/app.o").exists());
+
+        // Restart: a fresh daemon rebuilds its graph from persisted authority,
+        // so this fails if the purge only moved the in-memory view.
+        drop(app);
+        drop(state);
+        let restarted = Arc::new(DaemonState::open(layout).unwrap());
+        let after_restart = tracked_paths(&restarted);
+        assert!(after_restart.contains("src/lib.rs"));
+        assert!(
+            !after_restart.contains("target/debug/app.o"),
+            "the purge did not survive a restart: {after_restart:?}"
+        );
+        assert!(!after_restart.contains("target/debug/deps/lib.rlib"));
+    }
+
+    /// A repository that states `!target` keeps its build output tracked, so the
+    /// purge set is driven by the repository's rules and not by a hardcoded list.
+    #[tokio::test]
+    async fn purge_ignored_honors_a_readmitted_default() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        install_working_copy_file(&state, ".kinignore", b"!target\n", false);
+        install_repository_file(&state, ".kinignore", b"!target\n");
+        install_working_copy_file(&state, "target/debug/app.o", b"derived", false);
+        install_repository_file(&state, "target/debug/app.o", b"derived");
+        let app = router(Arc::clone(&state));
+
+        let (_, dry) = purge_ignored_through_api(&app, false).await;
+        assert_eq!(dry["report"]["purge_count"], json!(0));
+        assert_eq!(dry["report"]["kinignore_present"], json!(true));
+        assert!(dry["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("Nothing to purge.")));
+
+        let (_, applied) = purge_ignored_through_api(&app, true).await;
+        assert_eq!(applied["mutated"], json!(false));
+        assert!(tracked_paths(&state).contains("target/debug/app.o"));
     }
 
     fn branch_change(state: &DaemonState) -> SemanticChangeId {
