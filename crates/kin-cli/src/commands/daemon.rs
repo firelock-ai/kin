@@ -1721,7 +1721,11 @@ mod tests {
                     "daemon scan authorized an outside process through lexical traversal"
                 );
                 let mut reports = Vec::new();
-                stop_install_owned_daemons(&install_root, Duration::from_secs(5), &mut reports)?;
+                stop_install_owned_daemons(
+                    &install_root,
+                    Instant::now() + Duration::from_secs(5),
+                    &mut reports,
+                )?;
                 anyhow::ensure!(
                     reports.iter().any(|report| {
                         report.pid == managed_child.0.id() && report.outcome.is_success()
