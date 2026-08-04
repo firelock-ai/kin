@@ -1668,6 +1668,61 @@ mod tests {
         assert!(message.contains("4242"), "{message}");
     }
 
+    /// The reported outcome for a daemon whose parent never reaps it.
+    ///
+    /// This is the shape the install proof hit on every Unix leg: the MCP
+    /// server starts a repo daemon and stays alive, so when the stop request is
+    /// delivered and honoured, the exited daemon lingers as an unreaped corpse.
+    /// `kill(pid, 0)` keeps answering for it, so the wait loop never concluded
+    /// and every identity was reported `timeout` — a stop that worked, reported
+    /// as a stop that failed.
+    ///
+    /// Asserts the outcome the user actually sees rather than the primitive
+    /// beneath it. The wait is deliberately generous: without a corpse-aware
+    /// liveness probe this returns `Timeout` after burning all of it, so the
+    /// test fails on the verdict rather than on being slow.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_daemon_whose_parent_never_reaps_it_reports_stopped() {
+        // `exec` so the signalled PID is the process that actually dies, rather
+        // than a shell that leaves an orphan behind.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .spawn()
+            .expect("spawn a stand-in daemon");
+        let identity = process_identity(child.id())
+            .expect("read the stand-in daemon's birth identity")
+            .expect("a running stand-in daemon has an identity");
+
+        let wait = Duration::from_secs(10);
+        #[cfg(target_os = "macos")]
+        let outcome = stop_identity_cooperatively(&identity, wait, |expected| {
+            // Model the cooperative `/shutdown` endpoint accepting the request:
+            // on macOS the daemon is asked over HTTP rather than signalled.
+            let killed = unsafe { libc::kill(expected.pid() as libc::pid_t, libc::SIGTERM) };
+            assert_eq!(
+                killed, 0,
+                "the stand-in daemon must accept the stop request"
+            );
+            Ok(true)
+        });
+        #[cfg(not(target_os = "macos"))]
+        let outcome = stop_identity_graceful(&identity, wait);
+
+        // Nothing waited on the child before the outcome above was decided,
+        // which is the condition under test. Reap afterwards so the corpse does
+        // not outlive the test.
+        let reaped = child.wait();
+        assert_eq!(
+            outcome,
+            StopOutcome::Stopped,
+            "a daemon that honoured the stop request must be reported stopped even when \
+             its parent has not reaped it"
+        );
+        reaped.expect("reap the stand-in daemon");
+    }
+
     #[cfg(windows)]
     #[test]
     fn native_managed_daemon_scan_canonicalizes_and_rejects_traversal() -> Result<()> {
