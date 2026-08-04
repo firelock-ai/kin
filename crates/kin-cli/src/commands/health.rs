@@ -935,8 +935,25 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
     paths
 }
 
+/// Repository root the health surface names when it checks an MCP binding.
+///
+/// `kin setup` records the *canonicalized* repository path in every config it
+/// writes. Repository discovery instead inherits the form of the process
+/// working directory, which on Windows carries no `\\?\` verbatim prefix and on
+/// Unix leaves symlinked ancestors unresolved. Comparing those two forms as
+/// strings rejects setup's own write as misconfigured, so both sides derive the
+/// repository the same way here rather than at each comparison site.
 fn current_health_repo() -> Option<PathBuf> {
-    crate::commands::managed_config_scope::discover_repo_root()
+    crate::commands::managed_config_scope::discover_repo_root().map(canonical_health_repo)
+}
+
+/// Normalize a discovered repository root to the form the config writers record.
+///
+/// A root that cannot be canonicalized is returned unchanged: discovery already
+/// succeeded, so dropping it here would silently retire a health check instead
+/// of reporting a binding it can no longer confirm.
+fn canonical_health_repo(root: PathBuf) -> PathBuf {
+    root.canonicalize().unwrap_or(root)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1133,6 +1150,14 @@ fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthS
     } else {
         current_health_repo()?
     };
+    evaluate_antigravity_binding_for(path, workspace, &repo_root)
+}
+
+fn evaluate_antigravity_binding_for(
+    path: &Path,
+    workspace: bool,
+    repo_root: &Path,
+) -> Option<(HealthStatus, String)> {
     let root: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let entry = root.get("mcpServers")?.get("kin")?;
     let expected_command = configured_mcp_launcher().ok()?;
@@ -2384,6 +2409,163 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         write_config(&other);
         assert!(evaluate_antigravity_binding(&config, true).is_some());
+    }
+
+    /// Write the global Antigravity binding exactly as `kin setup` does: with
+    /// the canonicalized repository root, through the canonical npm wrapper so
+    /// the assertion does not depend on this machine's installed launcher.
+    fn write_global_antigravity_binding(config: &Path, bound_repo: &Path) {
+        std::fs::write(
+            config,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": CANONICAL_NPM_MCP_COMMAND,
+                        "args": ["-y", CANONICAL_NPM_MCP_PACKAGE, "mcp", "start", "--repo", bound_repo.to_string_lossy()],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The two sides of an MCP binding check name the repository differently:
+    /// the writers canonicalize, discovery inherits the working directory's raw
+    /// form. Normalizing at the source is what lets the exact-string comparison
+    /// stay exact.
+    #[test]
+    fn health_repo_is_normalized_to_the_form_the_config_writers_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let canonical = repo.canonicalize().unwrap();
+
+        // Stands in for what discovery hands back in production: the same
+        // repository named through a path `canonicalize` would not produce.
+        let raw = canonical.join("..").join(canonical.file_name().unwrap());
+        assert_ne!(raw, canonical);
+
+        assert_eq!(canonical_health_repo(raw), canonical);
+        assert_eq!(
+            canonical_health_repo(canonical.clone()),
+            canonical,
+            "normalizing an already-canonical root must not disturb it"
+        );
+
+        // Discovery succeeded, so a root that cannot be canonicalized is still
+        // reported rather than dropped — a dropped root retires the check.
+        let vanished = dir.path().join("gone");
+        assert_eq!(canonical_health_repo(vanished.clone()), vanished);
+    }
+
+    /// Regression, FIR-1911: on Windows the first `kin setup` wrote the global
+    /// Antigravity binding with the canonicalized (`\\?\` verbatim) repository
+    /// root, then `kin setup status --json` reported it misconfigured, because
+    /// the global arm compared it against a non-canonicalized root by exact
+    /// string. Whichever equivalent form discovery yields, the binding setup
+    /// itself just wrote must read healthy.
+    #[test]
+    fn antigravity_global_binding_accepts_the_repository_setup_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let canonical = repo.canonicalize().unwrap();
+        let config = dir.path().join("mcp_config.json");
+        write_global_antigravity_binding(&config, &canonical);
+
+        // On Windows the canonicalized form carries the `\\?\` verbatim
+        // prefix and PathBuf::join resolves `..` against verbatim bases, so a
+        // dot-dot detour collapses back into `canonical` before the premise
+        // is ever checked. Derive the equivalent-but-unequal path from the
+        // plain form there, which is also the shape discovery produces.
+        #[cfg(windows)]
+        let discovered = std::path::PathBuf::from(
+            canonical
+                .to_str()
+                .and_then(|s| s.strip_prefix(r"\\?\"))
+                .expect("canonicalized temp paths carry the verbatim prefix on Windows"),
+        );
+        #[cfg(not(windows))]
+        let discovered = canonical.join("..").join(canonical.file_name().unwrap());
+        assert_ne!(discovered, canonical);
+
+        assert!(
+            evaluate_antigravity_binding_for(&config, false, &canonical_health_repo(discovered))
+                .is_none(),
+            "a binding written with the canonicalized repository root must be accepted when \
+             discovery names that same repository through an equivalent path"
+        );
+
+        // The check still has to reject a binding pointed at another
+        // repository, or normalizing would have made it vacuous.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other = other.canonicalize().unwrap();
+        write_global_antigravity_binding(&config, &other);
+        assert!(
+            evaluate_antigravity_binding_for(&config, false, &canonical_health_repo(canonical))
+                .is_some(),
+            "a binding pointed at a different repository must still be misconfigured"
+        );
+    }
+
+    /// The same defect in the exact path forms Windows produces: `canonicalize`
+    /// returns a `\\?\` verbatim path, `env::current_dir` never does, and
+    /// repository discovery walks up from the working directory without
+    /// changing its form.
+    ///
+    /// The name must keep its `windows_` prefix. CI's native Windows leg
+    /// selects kin-cli tests by the substring filter `windows`, so a
+    /// Windows-only regression test named without it compiles on that leg and
+    /// never runs, which is worse than having no test at all.
+    #[cfg(windows)]
+    #[test]
+    fn windows_antigravity_global_binding_accepts_a_verbatim_root_from_a_plain_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let canonical = repo.canonicalize().unwrap();
+        let verbatim = canonical.to_string_lossy().into_owned();
+        let plain = verbatim
+            .strip_prefix(r"\\?\")
+            .expect("canonicalize yields a verbatim path on Windows");
+        assert_ne!(plain, verbatim.as_str());
+
+        let config = dir.path().join("mcp_config.json");
+        write_global_antigravity_binding(&config, &canonical);
+
+        assert!(
+            evaluate_antigravity_binding_for(
+                &config,
+                false,
+                &canonical_health_repo(PathBuf::from(plain)),
+            )
+            .is_none(),
+            "the drive-letter root a working directory yields must accept the verbatim root \
+             setup recorded"
+        );
+
+        // Without this, the assertion above could pass for the wrong reason.
+        // `evaluate_antigravity_binding_for` returns None both when the binding
+        // is correct and when it cannot resolve this installation's launcher at
+        // all, and this is the first test to reach that code on a Windows
+        // runner. A binding pointed elsewhere must still be rejected, so a
+        // launcher that failed to resolve fails the test instead of passing it.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other = other.canonicalize().unwrap();
+        write_global_antigravity_binding(&config, &other);
+        assert!(
+            evaluate_antigravity_binding_for(
+                &config,
+                false,
+                &canonical_health_repo(PathBuf::from(plain)),
+            )
+            .is_some(),
+            "a binding pointed at a different repository must still be misconfigured"
+        );
     }
 
     fn installed_kin(path: &str, protocol: InstalledStartupProtocol) -> InstalledKin {
