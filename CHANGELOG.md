@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-08-04
+
+### Changed
+
+- Bind fixture Git's global config to a path Git will open (#597)
+- Bind the global Git config to a path that reads empty and refuses writes (#599)
+- Judge an unreaped daemon corpse dead instead of still running (#600)
+- Resolve the Windows home from the profile the environment names (#601)
+- Give the install proof's fallback agent shim an executable Windows form (#602)
+
 ## [0.4.8] - 2026-08-04
 
 ### Changed

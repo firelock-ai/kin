@@ -28,6 +28,13 @@
       "reason": "The public install proof frozen at this tag fails its health gate on three of its four Unix legs: the tagged binary reports shell_path=misconfigured, which is fatal under the proof's own tolerance rule, and the validation leaves orphaned kin-daemon processes behind at cleanup. The daemon-lifecycle repairs landed on main only after the tag, and the proof workflow and binary both resolve from the tag, so no later change to main can reach the failing steps. All three attempts of the cited run failed with the same signature on macos-latest, ubuntu-latest, and ubuntu-24.04-arm, and automatic release recovery exhausted its bounded retries. The GitHub Release object for this tag became the finalized Latest release although no Release run ever succeeded and no terminal completion marker exists, so the prior-stable predicate cannot be satisfied by this lane.",
       "superseded_by": "v0.4.8",
       "failed_release_run_id": "30762349762"
+    },
+    {
+      "tag": "v0.4.8",
+      "sha": "35ca3f7e546ee5e4d27645dd853488849115de9a",
+      "reason": "The install proof frozen at this tag fails on every leg for two pre-existing defects the tag cannot receive fixes for. On the Unix legs, a daemon spawned by the long-lived MCP server is never reaped, and the liveness probe accepts the zombie as alive because kill with signal zero succeeds against a corpse, so a stop that was delivered and honoured is reported as a timeout at the proof's mid-MCP stop step. On the Windows leg, setup resolves the home through a lookup that requires the full profile and AppData tree to exist, so the proof's bare runner-temp home collapses to none before setup can run. Both the proof workflow and the binary resolve from the tag, the repairs landed on main only after it, and automatic release recovery exhausted all three attempts with the same signatures.",
+      "superseded_by": "v0.4.9",
+      "failed_release_run_id": "30894704670"
     }
   ]
 }
