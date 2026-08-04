@@ -445,20 +445,49 @@ pub fn isolate_fixture_git(command: &mut Command) {
         .env("GIT_PAGER", "cat")
         .env("GIT_ALLOW_PROTOCOL", "file")
         .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_CONFIG_GLOBAL", empty_global_git_config())
         .env("PATH", host_path)
         .env("KIN_VFS_DISABLE", "1");
-    #[cfg(unix)]
-    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
-    #[cfg(windows)]
-    command.env("GIT_CONFIG_GLOBAL", "NUL");
-    #[cfg(not(any(unix, windows)))]
-    command.env(
-        "GIT_CONFIG_GLOBAL",
-        command
-            .get_current_dir()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".kin-test-global-gitconfig"),
-    );
+}
+
+/// Path a fixture binds to `GIT_CONFIG_GLOBAL` so the global scope resolves to
+/// no configuration at all.
+///
+/// `GIT_CONFIG_GLOBAL` replaces the global scope rather than adding to it, so
+/// an empty file is what silences `$HOME/.gitconfig` and its XDG sibling.
+///
+/// Unix names `/dev/null`, which Git opens and reads as that empty file. No
+/// other target has an equivalent path. Windows in particular does not:
+/// `NUL` is a reserved device name rather than a file, and Git refuses it with
+/// `fatal: unable to access 'NUL': Invalid argument`, so every fixture launch
+/// fails instead of being isolated. Git accepts any readable file, so the
+/// remaining targets share one real empty file, created once per test process.
+/// It deliberately lives in its own temporary directory rather than in the
+/// repository under test, where it would otherwise surface as untracked
+/// content in the fixtures this function exists to keep clean.
+#[cfg(unix)]
+fn empty_global_git_config() -> &'static OsStr {
+    OsStr::new("/dev/null")
+}
+
+#[cfg(not(unix))]
+fn empty_global_git_config() -> &'static OsStr {
+    static EMPTY_GLOBAL_GIT_CONFIG: std::sync::OnceLock<std::path::PathBuf> =
+        std::sync::OnceLock::new();
+    EMPTY_GLOBAL_GIT_CONFIG
+        .get_or_init(|| {
+            // Kept past the initializing command instead of being dropped with
+            // it: every later fixture launch in this process reuses the file.
+            let directory = tempfile::Builder::new()
+                .prefix("kin-git-global-config-")
+                .tempdir()
+                .expect("create empty global Git config directory")
+                .keep();
+            let path = directory.join("gitconfig");
+            std::fs::write(&path, b"").expect("write empty global Git config");
+            path
+        })
+        .as_os_str()
 }
 
 /// Environment-only equivalent of [`isolate_fixture_git`] for process-group
@@ -496,7 +525,7 @@ fn isolate_fixture_guardian_environment_with_path(
         .env("GIT_PAGER", "cat")
         .env("GIT_ALLOW_PROTOCOL", "file")
         .env("GIT_PROTOCOL_FROM_USER", "0")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", empty_global_git_config())
         .env("PATH", host_path)
         .env("KIN_VFS_DISABLE", "1");
 }
