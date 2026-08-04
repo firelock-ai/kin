@@ -1961,7 +1961,25 @@ mod tests {
             std::env::split_paths(&host_path).all(|entry| entry.is_absolute()),
             "fixture host PATH retained a child-cwd-relative entry"
         );
-        let output = Command::new("kin-fixture-helper")
+        // The search still runs for real, and still runs from the child's
+        // working directory, which is where a relative PATH entry would reach
+        // the hostile copy; what changes is that the helper it finds is read
+        // by `sh` as a script operand instead of being handed to `exec` as a
+        // program. `sh` resolves that operand against its own working
+        // directory exactly as `exec` resolves a relative program path, so a
+        // relative entry still fails this assertion. What the indirection
+        // drops is a false failure: `exec` refuses with `ETXTBSY` while any
+        // process holds the target inode open for writing, and a sibling test
+        // thread's in-flight spawn transiently owns a duplicate of the
+        // descriptor the `write` above opened. Nothing here can close that
+        // window. The kernel counts writers per inode, so materializing under
+        // a temporary name and renaming into place carries the same count
+        // across; and the offending descriptor lives in a child process this
+        // test never names. Ceasing to be an `exec` target is what removes the
+        // exposure.
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"exec /bin/sh "$(command -v kin-fixture-helper)""#)
             .current_dir(&child_root)
             .env("PATH", host_path)
             .output()
