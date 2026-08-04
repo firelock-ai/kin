@@ -178,3 +178,12 @@ jobs:
           if printf '%s\n' "$out_bad" | grep -qi "Permission denied"; then echo "::error::leaked a bare mkdir permission-denied death"; exit 1; fi
           echo "unwritable workspace: loud fatal + exit 1, no bare mkdir death"
           echo "::endgroup::"
+
+      # The smoke above boots with nothing mounted under .kin, so it models the
+      # kin-daemon pod and never the kin-registry pod, which mounts its
+      # published-crates disk at <repo>/.kin/packages. That gap is where a
+      # regression that emptied the disk on every start survived. This proves the
+      # entrypoint leaves a mounted volume alone and refuses rather than deleting
+      # through it, and that it still re-initializes when nothing is at risk.
+      - name: Entrypoint contract with a volume mounted inside .kin
+        run: bash scripts/test-entrypoint-workspace-mount.sh kin:ci
