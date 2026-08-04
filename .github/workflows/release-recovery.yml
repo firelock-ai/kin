@@ -255,10 +255,98 @@ jobs:
           echo "abandoned=true" >> "$GITHUB_OUTPUT"
           echo "::notice::${TAG} at ${SHA} is reconciled by abandonment: ${RECORD} retires it in favour of its recorded successor, so no retry is dispatched, no alert is filed, and this reconcile concludes success."
 
+      # A retry budget spent on a failure that cannot vary is the most
+      # expensive thing this controller can do: three identical ~45-minute
+      # Release attempts confirm what the second one already established, and
+      # every minute of it is release latency. Classification therefore has to
+      # happen BEFORE the next rerun is requested, not only after the budget is
+      # gone. The alert step below already reasoned about the signature, but it
+      # ran only once retries were exhausted, so it could describe a
+      # deterministic failure and never prevent one.
+      #
+      # This step never fails the job. An unreadable attempt must leave the
+      # controller exactly as it was — retrying, because a transient API error
+      # is not evidence that the release failure is deterministic — so every
+      # read is guarded and every unhappy path degrades to "unrecorded", which
+      # the repeat test refuses to count.
+      - name: Classify the failure signature across attempts
+        id: classify
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.record.outputs.abandoned != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          ATTEMPTS: ${{ steps.resolve.outputs.attempt }}
+        run: |
+          set -euo pipefail
+          # The signature is the whole set of failing job and step pairs for one
+          # attempt, sorted, so a matrix failure whose legs queue in a different
+          # order each time still compares equal.
+          #
+          # Failing STEPS are the primary evidence and the job's own conclusion
+          # is deliberately not a filter on them. A job whose leg is cancelled
+          # when a sibling fails still reports its own failed step, and reading
+          # the job conclusion first would drop exactly that step and report a
+          # repeat as two different failures. The job-level fallback exists only
+          # for a job that failed while recording no failing step at all, such
+          # as a runner startup failure, which would otherwise be unreadable.
+          signatures="${RUNNER_TEMP:-/tmp}/release-recovery-signatures"
+          : > "$signatures"
+          unknown=0
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            signature=""
+            # Pages are slurped and filtered in one pass. `--paginate` with an
+            # inline query applies the query per page, which would emit one line
+            # per page and break the one-line-per-attempt mapping below.
+            if attempt_jobs="$(gh api --paginate --slurp \
+              "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?per_page=100" \
+              2>/dev/null)"; then
+              signature="$(jq -r '
+                [ .[].jobs[] as $job
+                  | $job.steps[]?
+                  | select(.conclusion == "failure")
+                  | "\($job.name) / \(.name)"
+                ] | unique | join("; ")' <<< "$attempt_jobs" 2>/dev/null)" \
+                || signature=""
+              if [ -z "$signature" ]; then
+                signature="$(jq -r '
+                  [ .[].jobs[]
+                    | select(.conclusion == "failure" or .conclusion == "timed_out")
+                    | "\(.name) / <no failing step recorded>"
+                  ] | unique | join("; ")' <<< "$attempt_jobs" 2>/dev/null)" \
+                  || signature=""
+              fi
+            fi
+            if [ -z "$signature" ]; then
+              unknown=$((unknown + 1))
+              # Deliberately constant rather than attempt-numbered, so two
+              # unreadable attempts never compare equal to each other by
+              # accident of text. The unknown count is what rejects them.
+              signature="unrecorded"
+            fi
+            printf '%s\n' "$signature" >> "$signatures"
+          done
+          latest="$(tail -1 "$signatures")"
+          previous="$(tail -2 "$signatures" | head -1)"
+          repeated=false
+          if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] &&
+             [ "$latest" = "$previous" ]; then
+            repeated=true
+          fi
+          {
+            echo "unknown=$unknown"
+            echo "repeated=$repeated"
+          } >> "$GITHUB_OUTPUT"
+          echo "attempts=$ATTEMPTS unknown=$unknown repeated=$repeated"
+          echo "latest failing steps: $latest"
+
       - name: Re-run failed jobs
         if: >-
           steps.resolve.outputs.needed == 'true' &&
           steps.resolve.outputs.retry == 'true' &&
+          steps.classify.outputs.repeated != 'true' &&
           steps.record.outputs.abandoned != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -275,7 +363,10 @@ jobs:
       - name: Alert after automatic retries are exhausted
         if: >-
           steps.resolve.outputs.needed == 'true' &&
-          steps.resolve.outputs.exhausted == 'true' &&
+          (
+            steps.resolve.outputs.exhausted == 'true' ||
+            steps.classify.outputs.repeated == 'true'
+          ) &&
           steps.record.outputs.abandoned != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -285,6 +376,9 @@ jobs:
           RUN_ID: ${{ steps.resolve.outputs.run_id }}
           RUN_URL: ${{ steps.resolve.outputs.url }}
           ATTEMPTS: ${{ steps.resolve.outputs.attempt }}
+          EXHAUSTED: ${{ steps.resolve.outputs.exhausted }}
+          UNKNOWN: ${{ steps.classify.outputs.unknown }}
+          REPEATED: ${{ steps.classify.outputs.repeated }}
         run: |
           set -euo pipefail
           # Advice given before classification is wrong in the direction that
@@ -296,65 +390,40 @@ jobs:
           # diagnosis can establish that root cause.
           #
           # The signature is the whole set of failing job and step pairs per
-          # attempt. It is deliberately not called root-cause proof: step
-          # identity is cheap and needs no log download, but a persistent
-          # registry or notarization outage can repeat at the same step too.
-          # A repeated signature changes the immediate recommendation and tells
-          # the operator where to start; the logs still decide rerun versus recut.
+          # attempt, computed once by the classify step above and read here.
+          # It is deliberately not called root-cause proof: step identity is
+          # cheap and needs no log download, but a persistent registry or
+          # notarization outage can repeat at the same step too. A repeated
+          # signature changes the immediate recommendation and tells the
+          # operator where to start; the logs still decide rerun versus recut.
           #
-          # The set is sorted and joined rather than reduced to its first
-          # element. The jobs API returns jobs in job-id order, ids are minted
-          # at queue time, and parallel matrix legs queue in a different order
-          # on each attempt, so the first failing job of a matrix failure is a
-          # coin flip. Taking it would report three identical failures of the
-          # same step as three different ones and recommend another immediate
-          # rerun without surfacing the repeated shape.
-          #
-          # Pages are slurped and filtered in one pass. `--paginate` with an
-          # inline query applies the query per page, which would emit one line
-          # per page and break the one-line-per-attempt mapping below.
-          signatures="$(mktemp)"
-          unknown=0
-          for attempt in $(seq 1 "$ATTEMPTS"); do
-            if attempt_jobs="$(gh api --paginate --slurp \
-              "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?per_page=100" \
-              2>/dev/null)"; then
-              signature="$(jq -r '
-                [ .[].jobs[]
-                  | select(.conclusion == "failure")
-                  | { job: .name,
-                      step: ( .steps[]?
-                              | select(.conclusion == "failure")
-                              | .name ) }
-                  | "\(.job) / \(.step)"
-                ] | unique | join("; ")' <<< "$attempt_jobs" 2>/dev/null)" \
-                || signature=""
-            else
-              signature=""
-            fi
-            if [ -z "$signature" ]; then
-              unknown=$((unknown + 1))
-              # Deliberately constant rather than attempt-numbered. A numbered
-              # placeholder would make unreadable attempts differ from each
-              # other, so the distinct-signature count alone would reject them
-              # and the unknown count below would never be what decided it. The
-              # guard against classifying an unreadable run has to be the one
-              # doing the work, not a spare wheel behind an accident of text.
-              signature="unrecorded"
-            fi
-            printf '%s\n' "$signature" >> "$signatures"
-          done
-          distinct="$(sort -u "$signatures" | wc -l | tr -d ' ')"
-          failing_steps="$(head -1 "$signatures")"
-          if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] && [ "$distinct" -eq 1 ]; then
-            verdict="repeated failure signature"
-            advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
-          elif [ "$unknown" -ne 0 ]; then
+          # Classification has exactly one implementation, in the step that acts
+          # on it. Recomputing it here would let the reason this controller
+          # stopped retrying disagree with the reason it reports.
+          signatures="${RUNNER_TEMP:-/tmp}/release-recovery-signatures"
+          if [ ! -s "$signatures" ]; then
+            # Unreachable while classify guards this step, and harmless if that
+            # ever changes: an absent file is not evidence of anything.
+            printf 'unrecorded\n' > "$signatures"
+          fi
+          failing_steps="$(tail -1 "$signatures")"
+          if [ "${UNKNOWN:-1}" -ne 0 ]; then
             verdict="indeterminate"
             advice="At least one attempt could not be read or carried no concrete failed step, so neither a deterministic nor a transient cause is established. Inspect the unrecorded attempts before choosing a same-release rerun or a source-fixed recut."
+          elif [ "${REPEATED:-false}" = true ]; then
+            verdict="repeated failure signature"
+            advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
           else
             verdict="varying failure signatures"
             advice="The observed failing job and step sets differed, which is consistent with the transient shape this controller exists for. Diagnose and rerun the same release rather than cutting a newer version unless the logs identify a source-bound defect."
+          fi
+          # Say which of the two stop conditions actually ended the retries. A
+          # repeat stop deliberately leaves retry budget unspent, so reporting
+          # it as exhaustion would misdescribe both the state and the remedy.
+          if [ "${REPEATED:-false}" = true ] && [ "${EXHAUSTED:-true}" != true ]; then
+            opening="$(printf "The automatic release controller stopped retrying \`%s\` at \`%s\` after %s attempt(s): the failing-step signature repeated exactly, so the remaining retry budget would only have bought another identical failure." "$TAG" "$SHA" "$ATTEMPTS")"
+          else
+            opening="$(printf "The automatic release controller exhausted its retries for \`%s\` at \`%s\` after %s attempt(s)." "$TAG" "$SHA" "$ATTEMPTS")"
           fi
 
           # A mint that reported failure on a release it had already created
@@ -384,8 +453,7 @@ jobs:
           if [ -z "$existing" ]; then
             body="$(mktemp)"
             {
-              printf "The automatic release controller exhausted its retries for \`%s\` at \`%s\` after %s attempt(s).\n\n" \
-                "$TAG" "$SHA" "$ATTEMPTS"
+              printf '%s\n\n' "$opening"
               printf 'Release run: %s (id %s)\n\n' "$RUN_URL" "$RUN_ID"
               printf 'Classification: **%s**. %s\n\n' "$verdict" "$advice"
               printf 'Failing step per attempt:\n\n'
@@ -403,5 +471,9 @@ jobs:
               --body-file "$body" \
               >/dev/null
           fi
-          echo "::error::${TAG} exhausted its automatic retries after ${ATTEMPTS} attempt(s), ${verdict}, failing steps: ${failing_steps}: ${RUN_URL}"
+          if [ "${REPEATED:-false}" = true ] && [ "${EXHAUSTED:-true}" != true ]; then
+            echo "::error::${TAG} stopped retrying after ${ATTEMPTS} attempt(s), ${verdict}, repeated failing steps: ${failing_steps}: ${RUN_URL}"
+          else
+            echo "::error::${TAG} exhausted its automatic retries after ${ATTEMPTS} attempt(s), ${verdict}, failing steps: ${failing_steps}: ${RUN_URL}"
+          fi
           exit 1

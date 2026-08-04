@@ -4523,13 +4523,12 @@ def assert_required_context_action_pins(workflows: dict[Path, str]) -> None:
                 )
 
 
-def recovery_escalation_source(release_recovery: str) -> str:
-    """Extract the escalation step exactly as the recovery controller runs it."""
+def recovery_step_script(release_recovery: str, anchor: str) -> str:
+    """Extract a recovery step's script exactly as the controller runs it."""
 
-    anchor = "      - name: Alert after automatic retries are exhausted\n"
     if anchor not in release_recovery:
         raise AssertionError(
-            "release-recovery no longer carries the escalation step"
+            f"release-recovery no longer carries {anchor.strip()!r}"
         )
     start = release_recovery.index(anchor)
     remainder = release_recovery[start + 1 :]
@@ -4543,78 +4542,160 @@ def recovery_escalation_source(release_recovery: str) -> str:
     return textwrap.dedent(step[step.index(marker) + len(marker) :])
 
 
-def execute_recovery_escalation(
-    source: str,
-    attempt_signatures: list[tuple[str, str] | None],
-    *,
-    release: dict[str, object] | None = None,
-    release_error: str | None = None,
-) -> tuple[subprocess.CompletedProcess[str], str]:
-    """Run the escalation against scripted attempt jobs and release state.
+def recovery_escalation_source(release_recovery: str) -> str:
+    """Extract the escalation step exactly as the recovery controller runs it."""
 
-    The `gh` stub answers `-q` by running the real `jq`, so the workflow's own
-    query decides the signature. A stub that returned canned answers would
-    exercise the shell and leave the jq that does the classifying unproven.
+    return recovery_step_script(
+        release_recovery,
+        "      - name: Alert after automatic retries are exhausted\n",
+    )
+
+
+RECOVERY_CLASSIFIER_ANCHOR = (
+    "      - name: Classify the failure signature across attempts\n"
+)
+RECOVERY_FIXTURE_RUN_ID = "4242"
+
+
+def write_attempt_job_fixtures(
+    responses: Path,
+    attempt_signatures: list[object],
+) -> None:
+    """Write one jobs-API response per attempt in the shape GitHub returns.
+
+    A failure entry is `(job, step)`, or `(job, step, job_conclusion)` when the
+    job's own conclusion differs from its failing step's — the shape a matrix
+    leg takes when a sibling's failure cancels it mid-step. A `None` step is a
+    job that failed while recording no failing step at all.
     """
+
+    for index, signature in enumerate(attempt_signatures, start=1):
+        if signature is None:
+            continue
+        # A single failing job makes the jobs API's ordering irrelevant,
+        # which is the shape production never produces for a matrix
+        # failure. Every attempt therefore carries its failures in the
+        # order given, so a caller can vary it the way real queue-time job
+        # ids do.
+        failures = [signature] if isinstance(signature, tuple) else list(signature)
+        jobs: list[dict[str, object]] = [
+            {
+                "name": "Preflight",
+                "conclusion": "success",
+                "steps": [{"name": "Checkout", "conclusion": "success"}],
+            }
+        ]
+        for failure in failures:
+            job, step_name = failure[0], failure[1]
+            job_conclusion = failure[2] if len(failure) > 2 else "failure"
+            steps: list[dict[str, object]] = [
+                {"name": "Checkout", "conclusion": "success"}
+            ]
+            if step_name is not None:
+                steps.append({"name": step_name, "conclusion": "failure"})
+            jobs.append(
+                {
+                    "name": job,
+                    "conclusion": job_conclusion,
+                    "steps": steps,
+                }
+            )
+        payload = {"jobs": jobs}
+        target = (
+            f"repos_firelock-ai_kin_actions_runs_{RECOVERY_FIXTURE_RUN_ID}"
+            f"_attempts_{index}_jobs"
+        )
+        (responses / target).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def read_step_outputs(path: Path) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            outputs[key] = value
+    return outputs
+
+
+def run_recovery_classifier_in(
+    root: Path,
+    source: str,
+    attempt_signatures: list[object],
+) -> dict[str, str]:
+    """Run the classifier inside a prepared fixture root and return its outputs.
+
+    The root must already carry `responses/` and the `gh` stub in `bin/`. The
+    classifier's signature file lands in this same directory because the alert
+    step reads it from RUNNER_TEMP, which is how the two steps share one
+    classification inside a single job.
+
+    The classifier decides whether a retry is spent, so it must never fail the
+    reconcile job: a controller that dies here neither retries nor alerts, and
+    the release lane silently stops moving. That is asserted on every run
+    rather than in one dedicated case.
+    """
+
+    script = root / "classify.sh"
+    script.write_text(source, encoding="utf-8")
+    outputs_file = root / "classifier-output"
+    outputs_file.write_text("", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PATH"] = f"{root / 'bin'}{os.pathsep}{environment['PATH']}"
+    environment.update(
+        {
+            "FIXTURE": str(root),
+            "GH_TOKEN": "fixture",
+            "REPO": "firelock-ai/kin",
+            "RUN_ID": RECOVERY_FIXTURE_RUN_ID,
+            "ATTEMPTS": str(len(attempt_signatures)),
+            "RUNNER_TEMP": str(root),
+            "GITHUB_OUTPUT": str(outputs_file),
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "the recovery classifier must never fail the reconcile job, "
+            "because a controller that dies here neither retries nor alerts: "
+            f"{completed.stdout}{completed.stderr}"
+        )
+    return read_step_outputs(outputs_file)
+
+
+def execute_recovery_classifier(
+    source: str,
+    attempt_signatures: list[object],
+) -> dict[str, str]:
+    """Run the classifier against scripted attempt jobs and return its outputs."""
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        script = root / "escalate.sh"
-        script.write_text(source, encoding="utf-8")
         responses = root / "responses"
         responses.mkdir()
-        run_id = "4242"
-        for index, signature in enumerate(attempt_signatures, start=1):
-            if signature is None:
-                continue
-            # A single failing job makes the jobs API's ordering irrelevant,
-            # which is the shape production never produces for a matrix
-            # failure. Every attempt therefore carries its failures in the
-            # order given, so a caller can vary it the way real queue-time job
-            # ids do.
-            failures = [signature] if isinstance(signature, tuple) else list(signature)
-            jobs: list[dict[str, object]] = [
-                {
-                    "name": "Preflight",
-                    "conclusion": "success",
-                    "steps": [{"name": "Checkout", "conclusion": "success"}],
-                }
-            ]
-            for job, step_name in failures:
-                jobs.append(
-                    {
-                        "name": job,
-                        "conclusion": "failure",
-                        "steps": [
-                            {"name": "Checkout", "conclusion": "success"},
-                            {"name": step_name, "conclusion": "failure"},
-                        ],
-                    }
-                )
-            payload = {"jobs": jobs}
-            target = (
-                f"repos_firelock-ai_kin_actions_runs_{run_id}"
-                f"_attempts_{index}_jobs"
-            )
-            (responses / target).write_text(json.dumps(payload), encoding="utf-8")
-        release_response = responses / "repos_firelock-ai_kin_releases_tags_v9.9.9"
-        if release is not None and release_error is not None:
-            raise AssertionError("release fixture cannot be both readable and failed")
-        if release is not None:
-            release_response.write_text(
-                json.dumps(release),
-                encoding="utf-8",
-            )
-        if release_error is not None:
-            Path(f"{release_response}.error").write_text(
-                release_error,
-                encoding="utf-8",
-            )
+        write_attempt_job_fixtures(responses, attempt_signatures)
         binaries = root / "bin"
         binaries.mkdir()
-        (binaries / "gh").write_text(
-            textwrap.dedent(
-                """\
+        write_recovery_gh_stub(binaries)
+        return run_recovery_classifier_in(root, source, attempt_signatures)
+
+
+def write_recovery_gh_stub(binaries: Path) -> None:
+    """A `gh` that answers `-q` with the real `jq`.
+
+    A stub that returned canned answers would exercise the shell and leave the
+    jq that does the classifying unproven.
+    """
+
+    (binaries / "gh").write_text(
+        textwrap.dedent(
+            """\
                 #!/usr/bin/env bash
                 set -uo pipefail
                 case "$1" in
@@ -4671,10 +4752,60 @@ def execute_recovery_escalation(
                     ;;
                 esac
                 """
-            ),
-            encoding="utf-8",
+        ),
+        encoding="utf-8",
+    )
+    (binaries / "gh").chmod(0o755)
+
+
+def execute_recovery_escalation(
+    release_recovery: str,
+    attempt_signatures: list[object],
+    *,
+    release: dict[str, object] | None = None,
+    release_error: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the reconcile's classify and alert steps the way the job runs them.
+
+    The alert no longer computes the signature itself; it reports what the
+    classifier that spent or withheld the retry decided. Driving the two steps
+    in order, through one runner temp directory and the classifier's real step
+    outputs, is what keeps this a test of the controller rather than of a
+    hand-copied duplicate of its logic.
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        script = root / "escalate.sh"
+        script.write_text(
+            recovery_escalation_source(release_recovery), encoding="utf-8"
         )
-        (binaries / "gh").chmod(0o755)
+        responses = root / "responses"
+        responses.mkdir()
+        write_attempt_job_fixtures(responses, attempt_signatures)
+        binaries = root / "bin"
+        binaries.mkdir()
+        write_recovery_gh_stub(binaries)
+        # The real classifier, run first and into this same runner temp, so the
+        # alert reads the signature file and outputs the controller produced.
+        classifier_outputs = run_recovery_classifier_in(
+            root,
+            recovery_step_script(release_recovery, RECOVERY_CLASSIFIER_ANCHOR),
+            attempt_signatures,
+        )
+        release_response = responses / "repos_firelock-ai_kin_releases_tags_v9.9.9"
+        if release is not None and release_error is not None:
+            raise AssertionError("release fixture cannot be both readable and failed")
+        if release is not None:
+            release_response.write_text(
+                json.dumps(release),
+                encoding="utf-8",
+            )
+        if release_error is not None:
+            Path(f"{release_response}.error").write_text(
+                release_error,
+                encoding="utf-8",
+            )
         environment = dict(os.environ)
         environment["PATH"] = f"{binaries}{os.pathsep}{environment['PATH']}"
         environment.update(
@@ -4684,9 +4815,17 @@ def execute_recovery_escalation(
                 "REPO": "firelock-ai/kin",
                 "TAG": "v9.9.9",
                 "SHA": RELEASE_GATE_FIXTURE_SHA,
-                "RUN_ID": run_id,
-                "RUN_URL": f"https://example.invalid/runs/{run_id}",
+                "RUN_ID": RECOVERY_FIXTURE_RUN_ID,
+                "RUN_URL": (
+                    f"https://example.invalid/runs/{RECOVERY_FIXTURE_RUN_ID}"
+                ),
                 "ATTEMPTS": str(len(attempt_signatures)),
+                "RUNNER_TEMP": str(root),
+                # resolve declares exhaustion at the third attempt; the alert
+                # distinguishes that from a repeat stop that left budget unspent.
+                "EXHAUSTED": "true" if len(attempt_signatures) >= 3 else "false",
+                "UNKNOWN": classifier_outputs.get("unknown", ""),
+                "REPEATED": classifier_outputs.get("repeated", ""),
             }
         )
         completed = subprocess.run(
@@ -4711,11 +4850,10 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     preserve that distinction before it tells an operator to burn a version.
     """
 
-    source = recovery_escalation_source(release_recovery)
     compile_failure = ("build-artifacts (x86_64-unknown-linux-musl)", "Build release binaries")
 
     repeated, body = execute_recovery_escalation(
-        source,
+        release_recovery,
         [compile_failure, compile_failure, compile_failure],
     )
     if repeated.returncode == 0:
@@ -4741,8 +4879,36 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
             f"step identity was overstated as root-cause proof: {body}"
         )
 
+    # The stop that spends one confirmation instead of the whole budget. The
+    # alert still fires, and it must not describe unspent budget as exhausted:
+    # the remedy for a repeat differs from the remedy for a run that tried
+    # everything, and the tag is still eligible for a same-release rerun.
+    stopped, stopped_body = execute_recovery_escalation(
+        release_recovery,
+        [compile_failure, compile_failure],
+    )
+    if stopped.returncode == 0:
+        raise AssertionError(
+            "a confirmed repeat did not raise the release alarm: "
+            f"{stopped.stdout}{stopped.stderr}"
+        )
+    for needle in (
+        "Classification: **repeated failure signature**",
+        "stopped retrying",
+        "after 2 attempt(s)",
+    ):
+        if needle not in stopped_body:
+            raise AssertionError(
+                f"a repeat stop was not reported as one: {needle!r}: {stopped_body}"
+            )
+    if "exhausted its retries" in stopped_body:
+        raise AssertionError(
+            "a repeat stop that left retry budget unspent was reported as "
+            f"exhaustion: {stopped_body}"
+        )
+
     _, transient_body = execute_recovery_escalation(
-        source,
+        release_recovery,
         [
             ("build-artifacts (x86_64-apple-darwin)", "Notarize"),
             ("publish", "Push image"),
@@ -4763,7 +4929,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     # repeated. Claiming deterministic from an unreadable attempt would retire
     # a recoverable release on a transient API error.
     _, unreadable_body = execute_recovery_escalation(
-        source,
+        release_recovery,
         [compile_failure, None, compile_failure],
     )
     for needle in (
@@ -4799,7 +4965,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         "Build kin-cli + kin-daemon (native)",
     )
     _, matrix_body = execute_recovery_escalation(
-        source,
+        release_recovery,
         [[aarch64, x86_64], [x86_64, aarch64], [aarch64, x86_64]],
     )
     if "Classification: **repeated failure signature**" not in matrix_body:
@@ -4811,7 +4977,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     # Every attempt unreadable is the case that isolates the unknown count.
     # The signatures all match each other, so nothing but that count stands
     # between a total read failure and a verdict of "deterministic, recut it".
-    _, blind_body = execute_recovery_escalation(source, [None, None, None])
+    _, blind_body = execute_recovery_escalation(release_recovery, [None, None, None])
     if "Classification: **indeterminate**" not in blind_body:
         raise AssertionError(
             "a run whose attempts could not be read at all was classified "
@@ -4821,7 +4987,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     # A mint that reported failure on a release it had already created would
     # otherwise send this controller to repair a healthy release.
     _, existing_release_body = execute_recovery_escalation(
-        source,
+        release_recovery,
         [compile_failure, compile_failure, compile_failure],
         release={
             "draft": False,
@@ -4844,7 +5010,7 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
     # network failure is unknown state and must never be rewritten as "no
     # Release", which would send repair after an object that may exist.
     _, unreadable_release_body = execute_recovery_escalation(
-        source,
+        release_recovery,
         [compile_failure, compile_failure, compile_failure],
         release_error="gh: API rate limit exceeded (HTTP 403)\n",
     )
@@ -5174,6 +5340,145 @@ def assert_selector_arguments(
         )
 
 
+def assert_mint_trigger_survives_advisory_flakes(release_tag: str) -> None:
+    """The event-driven mint must evaluate on any completed main-push CI run.
+
+    ci.yml carries jobs beyond the release-critical ones, so its aggregate
+    conclusion goes red whenever a non-required advisory leg flakes, which is
+    most main pushes. Gating the workflow_run trigger on that aggregate made
+    the event path hostage to a flake and left the schedule as the only
+    automatic mint, which GitHub then failed to deliver for roughly four hours.
+    The mint's own "Verify required checks are green" step is the release
+    authority: it binds each reviewed required context to its exact producing
+    workflow and explicitly refuses to let that producer's aggregate conclusion
+    veto through it. A trigger that re-imposes the aggregate contradicts the
+    gate it precedes and can only ever subtract mint occasions.
+    """
+
+    block = workflow_job_blocks(release_tag).get("mint-release-tag")
+    if block is None:
+        raise AssertionError("release-tag no longer declares the mint job")
+    guard: list[str] = []
+    inside = False
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not inside:
+            if stripped.startswith("if:"):
+                inside = True
+                guard.append(stripped)
+            continue
+        if stripped.startswith("runs-on:"):
+            break
+        if stripped.startswith("#"):
+            continue
+        guard.append(stripped)
+    active = "\n".join(guard)
+    if not inside:
+        raise AssertionError("the release mint no longer guards its triggers")
+    if "github.event.workflow_run.conclusion" in active:
+        raise AssertionError(
+            "the release mint's workflow_run trigger must not consult the CI "
+            "run's aggregate conclusion: a single non-required advisory flake "
+            "reds that aggregate and would silence the event-driven mint, "
+            "leaving only the schedule GitHub is free not to deliver"
+        )
+    for clause in (
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.head_branch == 'main'",
+    ):
+        if clause not in active:
+            raise AssertionError(
+                "the release mint's workflow_run trigger must still pin the "
+                f"reviewed default-branch push it evaluates: {clause}"
+            )
+
+
+def assert_recovery_stops_on_repeated_signature(release_recovery: str) -> None:
+    """A deterministic failure must cost one confirmation, not the whole budget.
+
+    The controller exists for transient failures. A failure that reproduces
+    with an identical failing-step signature is not transient in any way a
+    rerun can fix, and each blind retry costs a full Release run. The classifier
+    therefore runs BEFORE the rerun is requested, and its verdict has to be
+    driven by the real jobs API shapes rather than by a stub's canned answer.
+    """
+
+    source = recovery_step_script(
+        release_recovery,
+        "      - name: Classify the failure signature across attempts\n",
+    )
+    compile_failure = ("build-artifacts (x86_64-unknown-linux-musl)", "Build release binaries")
+    notarize = ("build-artifacts (aarch64-apple-darwin)", "Notarize")
+
+    outputs = execute_recovery_classifier(source, [compile_failure, compile_failure])
+    if outputs.get("repeated") != "true":
+        raise AssertionError(
+            "a second identical failing-step signature did not stop the retry "
+            f"budget: {outputs}"
+        )
+
+    outputs = execute_recovery_classifier(source, [compile_failure, notarize])
+    if outputs.get("repeated") != "false":
+        raise AssertionError(
+            f"a differing second failure was reported as deterministic: {outputs}"
+        )
+
+    # One attempt cannot repeat anything. Stopping here would retire a release
+    # on its first failure and defeat the controller's entire purpose.
+    outputs = execute_recovery_classifier(source, [compile_failure])
+    if outputs.get("repeated") != "false":
+        raise AssertionError(
+            f"a single first failure was treated as a repeat: {outputs}"
+        )
+
+    # A transient API error is not evidence that the release failure repeats.
+    outputs = execute_recovery_classifier(source, [compile_failure, None])
+    if outputs.get("repeated") != "false" or outputs.get("unknown") == "0":
+        raise AssertionError(
+            f"an unreadable attempt was folded into a repeat verdict: {outputs}"
+        )
+    outputs = execute_recovery_classifier(source, [None, None])
+    if outputs.get("repeated") != "false":
+        raise AssertionError(
+            "two unreadable attempts compared equal to each other and stopped "
+            f"the retries: {outputs}"
+        )
+
+    # The shape that produced the wrong answer in production: when one matrix
+    # leg fails, its siblings are cancelled, and a cancelled job still carries
+    # the step that actually failed. Filtering on the job's own conclusion
+    # first drops exactly that evidence and reads a repeat as two unreadable
+    # attempts, which retries a deterministic failure to the end of the budget.
+    cancelled = ("build-artifacts (aarch64-unknown-linux-musl)", "Build release binaries", "cancelled")
+    outputs = execute_recovery_classifier(source, [cancelled, cancelled])
+    if outputs.get("repeated") != "true":
+        raise AssertionError(
+            "a failing step inside a cancelled matrix leg was not read as "
+            f"failure evidence: {outputs}"
+        )
+
+    # A job that failed while recording no failing step at all — a runner
+    # startup failure — is still a signature, not an unreadable attempt.
+    startup = ("publish", None, "failure")
+    outputs = execute_recovery_classifier(source, [startup, startup])
+    if outputs.get("repeated") != "true" or outputs.get("unknown") != "0":
+        raise AssertionError(
+            f"a job-level failure with no failing step was unreadable: {outputs}"
+        )
+
+    # The order matrix legs queue in must not decide the verdict.
+    aarch64 = ("Build (kin-linux-aarch64)", "Build kin-cli + kin-daemon (native)")
+    x86_64 = ("Build (kin-linux-x86_64)", "Build kin-cli + kin-daemon (native)")
+    outputs = execute_recovery_classifier(
+        source, [[aarch64, x86_64], [x86_64, aarch64]]
+    )
+    if outputs.get("repeated") != "true":
+        raise AssertionError(
+            "a matrix failure that repeated identically was classified by the "
+            f"order its legs happened to queue in: {outputs}"
+        )
+
+
 def assert_recovery_record_authority(release_recovery: str) -> None:
     """Recovery must decide abandonment through the rail's own selector.
 
@@ -5233,6 +5538,10 @@ def assert_recovery_abandonment_stand_down(release_recovery: str) -> None:
     condition = "steps.record.outputs.abandoned != 'true'"
     for marker, duty in (
         ("name: Re-run failed jobs", "bounded retry"),
+        (
+            "name: Classify the failure signature across attempts",
+            "failure-signature classification",
+        ),
         (
             "name: Alert after automatic retries are exhausted",
             "exhausted-retry alert",
@@ -5958,7 +6267,6 @@ def main() -> None:
         "checks: read",
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
-        "github.event.workflow_run.conclusion == 'success'",
         "repository_dispatch:",
         "types: [release_tag]",
         "github.event.action",
@@ -6281,6 +6589,9 @@ def main() -> None:
         '.head_repository.full_name == $repo',
         "rerun-failed-jobs",
         '[ "$attempt" -ge 3 ]',
+        "name: Classify the failure signature across attempts",
+        "steps.classify.outputs.repeated != 'true'",
+        "steps.classify.outputs.repeated == 'true'",
         "Release blocked after automatic retries",
         "scripts/abandoned-release-tags.json",
         "scripts/select-admissible-release-tag.py",
@@ -9388,6 +9699,10 @@ def main() -> None:
     assert_recovery_escalation_classifies(
         RELEASE_RECOVERY.read_text(encoding="utf-8")
     )
+    assert_recovery_stops_on_repeated_signature(
+        RELEASE_RECOVERY.read_text(encoding="utf-8")
+    )
+    assert_mint_trigger_survives_advisory_flakes(release_tag)
 
     with tempfile.TemporaryDirectory() as directory:
         fixture_directory = Path(directory)
