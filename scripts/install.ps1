@@ -13,9 +13,10 @@
 #   $env:KIN_NO_SETUP = "1"     CI compatibility; native repository setup is always skipped
 #   $env:KIN_BASE_URL = "..."   Install from a mirror (CI smoke tests / offline)
 #
-# Native Windows cannot currently admit a repository. The executable refusal
-# contract in scripts/assert-windows-init-contract.sh owns the exact public
-# support notice copied below; release authority fails if the copies drift.
+# Native Windows admits repositories; scripts/assert-windows-init-contract.sh
+# proves both admission boundaries on every pull request. The
+# $NativeWindowsSupportNotice binding below owns the exact public support
+# notice, and release authority fails if any shipped copy of it drifts.
 
 $ErrorActionPreference = "Stop"
 
@@ -439,8 +440,8 @@ if (Test-KinTruthy $env:KIN_NO_SETUP) {
     Write-Info "Skipping repository-free setup diagnostics (KIN_NO_SETUP=1)."
 } else {
     Write-Host ""
-    Write-Info "Not running repository setup: native Windows cannot admit a Kin repository."
-    Write-Info "Install inside WSL2 before configuring repository or MCP workflows."
+    Write-Info "Not running repository setup: MCP and review workflows are not yet covered on native Windows."
+    Write-Info "Run 'kin init' in a Git repository to publish graph authority; use WSL2 for MCP, review, and projection workflows."
 }
 
 # ── Cleanup ─────────────────────────────────────────────────────────────

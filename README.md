@@ -136,10 +136,7 @@ release; prefer the installer, the release archives, or npm until a version
 you can verify appears there.
 
 On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
-Native Windows support is early: repositories admit and graph and lexical
-queries answer natively, but transparent filesystem projection is not shipped
-there and its end-to-end install proof is still maturing, so WSL2 remains the
-recommended path for full Kin.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
 Read [Platform and maturity](#platform-and-maturity) below before choosing a
 Windows install path.
 
