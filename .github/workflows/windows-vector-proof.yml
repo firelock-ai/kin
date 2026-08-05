@@ -24,8 +24,17 @@ name: Windows vector proof
 # No inputs. `workflow_dispatch` already selects the ref to run against, so an
 # input feeding `actions/checkout`'s `ref:` would add an injection surface and
 # buy nothing.
+#
+# TEMPORARY, REMOVE BEFORE MERGE: `workflow_dispatch` is only dispatchable once
+# the file exists on the default branch, which makes it unrunnable on the very
+# branch that introduces it. The push trigger below is scoped to this one lane
+# branch purely so the proof can produce evidence pre-merge. It runs the same
+# job body the dispatch path will.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - chore/lane-nwvec-kin
 
 permissions:
   contents: read
