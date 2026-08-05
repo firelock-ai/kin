@@ -2691,6 +2691,9 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
 WINDOWS_DAEMON_SIBLING_BUILD = (
     "- name: Build the sibling Windows daemon the authority tests drive"
 )
+WINDOWS_DAEMON_COMPILE_STEP = (
+    "- name: Compile and run native Windows authority tests"
+)
 WINDOWS_DAEMON_LIFECYCLE_TEST = '"daemon_status_and_stop_lifecycle"'
 
 
@@ -2709,20 +2712,38 @@ def assert_windows_daemon_sibling_build(ci_job: str) -> None:
     than supplying its own input. Ordering is pinned as well as presence: this
     build sitting after the tests is how the leg failed for days while reporting
     a daemon missing from a directory the job did eventually populate.
+
+    Judged on active lines and scoped to the step's own block: the `--target`
+    that decides where the binary lands must appear inside the sibling build
+    step itself, and ordering compares step-name positions, so a comment
+    quoting the test name can neither satisfy a policy nor invert the order.
     """
 
-    for policy in (
-        WINDOWS_DAEMON_SIBLING_BUILD,
-        "-p kin-daemon --no-default-features --bin kin-daemon",
-    ):
-        require(ci_job, policy, "native Windows daemon lifecycle prerequisite")
-    if ci_job.index(WINDOWS_DAEMON_SIBLING_BUILD) > ci_job.index(
-        WINDOWS_DAEMON_LIFECYCLE_TEST
-    ):
+    active_job = "\n".join(active_lines(ci_job))
+    for step in (WINDOWS_DAEMON_SIBLING_BUILD, WINDOWS_DAEMON_COMPILE_STEP):
+        require(active_job, step, "native Windows daemon lifecycle prerequisite")
+    build_start = active_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
+    compile_start = active_job.index(WINDOWS_DAEMON_COMPILE_STEP)
+    if build_start > compile_start:
         raise AssertionError(
             "native Windows daemon lifecycle prerequisite must build the msvc "
             "kin-daemon binary before the lifecycle test reads it"
         )
+    sibling_build_block = active_job[build_start:compile_start]
+    for policy in (
+        "-p kin-daemon --no-default-features --bin kin-daemon",
+        "--target x86_64-pc-windows-msvc",
+    ):
+        require(
+            sibling_build_block,
+            policy,
+            "native Windows daemon lifecycle prerequisite",
+        )
+    require(
+        active_job[compile_start:],
+        WINDOWS_DAEMON_LIFECYCLE_TEST,
+        "native Windows daemon lifecycle prerequisite",
+    )
 
 
 def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
