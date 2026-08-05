@@ -3034,6 +3034,21 @@ mod tests {
         assert!(error.to_string().contains("retired uninstall state"));
     }
 
+    /// The four `fs::Metadata` fields the pre-fix Windows arm of
+    /// `same_file_object` compared, rendered for a CI log.
+    fn root_field_probe(root: &Path) -> String {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => format!(
+                "is_dir={} len={} modified={:?} created={:?}",
+                metadata.file_type().is_dir(),
+                metadata.len(),
+                metadata.modified().ok(),
+                metadata.created().ok()
+            ),
+            Err(error) => format!("unreadable: {error}"),
+        }
+    }
+
     fn managed_fixture(dir: &Path, precreate_lock: bool) -> (PathBuf, PathBuf) {
         let root = dir.join(".kin");
         fs::create_dir_all(root.join("bin")).unwrap();
@@ -3056,7 +3071,23 @@ mod tests {
         for precreate_lock in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let (daemon, root) = managed_fixture(tmp.path(), precreate_lock);
+            // The four fields the pre-fix Windows predicate compared, read on
+            // either side of admission. This host's answer is not the runner's:
+            // on a native Windows 11 host none of them move when the lock is
+            // created inside the root, while `windows-latest` refused the same
+            // admission twelve consecutive times. Emitted so the next refusal
+            // names the field that diverged instead of only the guard that
+            // fired. Captured output surfaces when this test fails, which is
+            // exactly the case it exists for.
+            eprintln!(
+                "FENCE_ROOT_FIELDS: precreate_lock={precreate_lock} at=snapshot {}",
+                root_field_probe(&root)
+            );
             let fence = ManagedInstallSpawnFence::acquire(&daemon, &root);
+            eprintln!(
+                "FENCE_ROOT_FIELDS: precreate_lock={precreate_lock} at=recheck {}",
+                root_field_probe(&root)
+            );
             let outcome = match &fence {
                 Ok(Some(_)) => "admitted".to_string(),
                 Ok(None) => "not treated as a managed install".to_string(),
