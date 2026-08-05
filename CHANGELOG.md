@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distinguish name-mode search matches from text-search fallbacks (#633)
 - Refuse semantic-only tool calls when the guard cannot answer (#632)
 - Enforce the native-Windows support notice across shipped surfaces (#634)
+- Syntax-check install.sh on every pull request (#635)
 
 
 ## [0.5.4] - 2026-08-05
