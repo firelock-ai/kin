@@ -35,8 +35,9 @@ binary hash. GitHub signs an artifact attestation over the final archives and
 aggregate manifest before the prerelease is created.
 
 The Windows archive is a release-blocking target. Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
-The archive is vector-free, checksum-protected, and GitHub-attested, but it is
-not OS-code-signed by this pipeline. Windows VFS projection is not shipped.
+The archive carries semantic vector search, and is checksum-protected and
+GitHub-attested, but it is not OS-code-signed by this pipeline. Windows VFS
+projection is not shipped.
 
 Every tag is first published as a non-latest prerelease. The anonymous install
 proof installs all five archives (Linux x86_64/aarch64, macOS x86_64/aarch64,

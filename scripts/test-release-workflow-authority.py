@@ -254,7 +254,7 @@ REQUIRED_RELEASE_CHECKS = (
     "DCO Sign-off",
     "cargo-deny",
     "gitleaks (full history)",
-    "Windows installer + vector-free release build",
+    "Windows installer + vector release build",
 )
 DOCS_ONLY_WORKFLOW_HEADER = textwrap.dedent(
     """\
@@ -450,7 +450,7 @@ CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
     "npm-launchers": "npm launcher tests",
     "windows-authority-tests": "Windows authority tests",
-    "windows-installer": "Windows installer + vector-free release build",
+    "windows-installer": "Windows installer + vector release build",
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
     "check": "Check & Test",
@@ -535,6 +535,13 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/secret-scan.yml": {
         "gitleaks": "gitleaks (full history)",
     },
+    # workflow_dispatch only, so it publishes no check run on a pull request or
+    # merge group and cannot satisfy or become a required context. Registered
+    # here because this census is the thing that would otherwise let a second
+    # required-context producer appear unreviewed.
+    ".github/workflows/windows-vector-proof.yml": {
+        "windows-vector-proof": "Windows semantic vector search proof",
+    },
 }
 EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
@@ -548,7 +555,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/release.yml",
         "build",
-    ): "4708a5968103aa4c624423fd5a67c5c183969919773e52c9cc204b2c9983c90b",
+    ): "ffde401b1343930965ae6a2a89ca3a81b2996af5821b332f65de7eba874e2be2",
     (
         ".github/workflows/release.yml",
         "verify_npm_published",
@@ -572,7 +579,7 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
     "gitleaks (full history)": {
         (".github/workflows/secret-scan.yml", "gitleaks"),
     },
-    "Windows installer + vector-free release build": {
+    "Windows installer + vector release build": {
         (".github/workflows/ci.yml", "windows-installer"),
     },
 }
@@ -597,7 +604,7 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
         ".github/workflows/secret-scan.yml",
         "push",
     ),
-    "Windows installer + vector-free release build": (
+    "Windows installer + vector release build": (
         245_803_170,
         ".github/workflows/ci.yml",
         "push",
@@ -1018,8 +1025,10 @@ def windows_node_validator_fixture() -> tuple[
                 "kin_source_known": True,
                 "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
                 "embeddings": {
-                    "vector_enabled": False,
-                    "embeddings_enabled": False,
+                    "vector_enabled": True,
+                    "embeddings_enabled": True,
+                    # Metal is the macOS-only compiled backend, not the marker
+                    # cargo feature, so it stays false on a correct Windows build.
                     "metal_enabled": False,
                 },
             },
@@ -1314,17 +1323,20 @@ def assert_windows_node_validator_behavior(step: str) -> None:
             "d" * 64,
         ),
         (
-            "vector feature enabled",
+            "vector feature disabled",
             "kin-windows-bench-meta.json",
             ("embeddings", "vector_enabled"),
-            True,
+            False,
         ),
         (
-            "embedding feature enabled",
+            "embedding feature disabled",
             "kin-windows-bench-meta.json",
             ("embeddings", "embeddings_enabled"),
-            True,
+            False,
         ),
+        # Metal stays a negative control in the same direction: it is the
+        # macOS-only compiled backend, so a Windows archive claiming it is
+        # still the defect this rejects.
         (
             "Metal feature enabled",
             "kin-windows-bench-meta.json",
@@ -2466,8 +2478,8 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         "meta.kin_dirty !== false",
         "meta.kin_source_known !== true",
         "meta.dependency_provenance !== expectedLock",
-        "meta.embeddings?.vector_enabled !== false",
-        "meta.embeddings?.embeddings_enabled !== false",
+        "meta.embeddings?.vector_enabled !== true",
+        "meta.embeddings?.embeddings_enabled !== true",
         "meta.embeddings?.metal_enabled !== false",
         'authority.checks[0]?.state !== "unsupported"',
         '["repo_init", "missing"]',
@@ -7190,9 +7202,9 @@ def main() -> None:
             'meta.dependency_provenance !== ""',
         ),
         (
-            "the Windows leg stops proving its vector-free feature contract",
-            "meta.embeddings?.vector_enabled !== false",
+            "the Windows leg stops proving its vector feature contract",
             "meta.embeddings?.vector_enabled !== true",
+            "meta.embeddings?.vector_enabled !== false",
         ),
         (
             "the Windows registry-authority repair negative control disappears",
@@ -8671,7 +8683,7 @@ def main() -> None:
     installer_end = ci_workflow.index("\n  changes:", installer_start)
     installer_job = ci_workflow[installer_start:installer_end]
     for policy in (
-        "name: Windows installer + vector-free release build",
+        "name: Windows installer + vector release build",
         "github.event_name != 'pull_request'",
         "needs.changes.outputs.docs_only != 'true'",
     ):
@@ -9243,7 +9255,7 @@ def main() -> None:
         "DCO Sign-off",
         "cargo-deny",
         "gitleaks (full history)",
-        "Windows installer + vector-free release build",
+        "Windows installer + vector release build",
         "missing required check: {name}",
         "required check not green: {name}",
         "ambiguous required check: {name}",
@@ -9844,7 +9856,7 @@ def main() -> None:
     ) -> None:
         check = required_check_fixture(
             check_runs,
-            "Windows installer + vector-free release build",
+            "Windows installer + vector release build",
         )
         check["head_sha"] = "2" * 40
 
@@ -9853,7 +9865,7 @@ def main() -> None:
         "required check is attached to the wrong head sha",
         (
             "required check has wrong head sha: "
-            "Windows installer + vector-free release build"
+            "Windows installer + vector release build"
         ),
         change_required_check_head,
     )

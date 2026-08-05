@@ -64,9 +64,8 @@ For a pinned version:
 - macOS, Linux, or native Windows x64
 - A Kin-initialized repository (`kin init`)
 
-The native Windows archive is vector-free and does not include transparent
-filesystem projection. Use WSL2 when you need vectors or projection; the core
-graph, lexical, daemon, and MCP workflow runs natively on Windows x64.
+The native Windows archive carries semantic vector search but does not include
+transparent filesystem projection. Use WSL2 when you need projection.
 
 ## Cache
 

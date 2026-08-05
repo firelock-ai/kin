@@ -24,7 +24,8 @@
 //!   budget when its model is already cached locally, and the embedding
 //!   seed floor actually rejects near-orthogonal noise.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set once by the daemon's serving entrypoint. The cross-encoder's
@@ -208,9 +209,57 @@ pub fn cosine_to_relevance(cosine: f32) -> f32 {
 /// dependency; a false negative merely means the reranker stays off by
 /// default until the model is fetched explicitly.
 pub fn cross_encoder_model_cached(model_id: &str) -> bool {
-    let base = std::env::var_os("HF_HOME").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/huggingface"))
-    });
+    let base = hf_cache_base(
+        cfg!(windows),
+        |key| std::env::var_os(key),
+        || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+        || directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+    );
+    cached_under_base(base.as_deref(), model_id)
+}
+
+/// The root `hf-hub` would resolve its cache under, given the platform and the
+/// environment.
+///
+/// `hf-hub` reads `HF_HOME` first and otherwise falls back to
+/// `dirs::home_dir()/.cache/huggingface` (`hf-hub-0.5.0/src/lib.rs:42-54`), so
+/// this mirrors that shape and defers the home itself to the one resolver the
+/// crate already has.
+///
+/// Taken as arguments rather than gated behind `cfg` for the reason
+/// [`crate::commands::setup::resolve_home_dir`] spells out: a `cfg`-gated
+/// Windows arm is compiled, and therefore tested, only on the platform this
+/// fleet has no host for. That is precisely how the `HOME`-only lookup this
+/// replaces survived — `HOME` is not a Windows name, so the probe answered
+/// "absent" on Windows even with the model fully downloaded, and the reranker
+/// silently stayed off instead of failing.
+///
+/// One divergence is deliberate and worth naming: on Windows `dirs::home_dir()`
+/// is `FOLDERID_Profile` (`dirs-6.0.0/src/win.rs:5`) while `resolve_home_dir`
+/// prefers a non-empty `USERPROFILE`. They agree unless `USERPROFILE` has been
+/// redirected away from the known-folder profile, and following the redirect is
+/// what keeps an isolated home isolated. When they do disagree the probe under-
+/// reports, which this function's contract already permits: a false negative
+/// only leaves the reranker off until the model is fetched explicitly.
+fn hf_cache_base(
+    windows: bool,
+    var_os: impl Fn(&str) -> Option<OsString>,
+    known_profile_root: impl FnOnce() -> Option<PathBuf>,
+    base_dirs_home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    // An empty value is not a path; treat it the same as unset rather than
+    // resolving the cache relative to the working directory.
+    if let Some(hf_home) = var_os("HF_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(hf_home));
+    }
+    crate::commands::setup::resolve_home_dir(windows, var_os, known_profile_root, base_dirs_home)
+        .map(|home| home.join(".cache").join("huggingface"))
+}
+
+/// Whether `model_id` has a resolved snapshot under an already-resolved cache
+/// root. Split from the root lookup so the layout and the home policy fail
+/// independently.
+fn cached_under_base(base: Option<&Path>, model_id: &str) -> bool {
     let Some(base) = base else {
         return false;
     };
@@ -344,5 +393,184 @@ mod tests {
             !accuracy.cross_encoder_default(false),
             "an unset default must never trigger a mid-query model download"
         );
+    }
+
+    /// Reads only the names it is given, so a test states the whole environment
+    /// it is asserting against and nothing ambient can leak in.
+    fn env_of(pairs: &[(&str, &Path)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let pairs: Vec<(String, OsString)> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.as_os_str().to_os_string()))
+            .collect();
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    fn stage_cached_model(home: &Path, model_id: &str) {
+        let dir = home
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
+            .join(format!("models--{}", model_id.replace('/', "--")))
+            .join("snapshots")
+            .join("0123456789abcdef");
+        std::fs::create_dir_all(&dir).unwrap();
+    }
+
+    const CE_MODEL: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+
+    /// Windows names the profile root `USERPROFILE` and does not set `HOME`, so
+    /// a `HOME`-only lookup reports every model absent no matter what is on
+    /// disk. This is the regression: it fails against the previous lookup and
+    /// passes against the shared resolver.
+    #[test]
+    fn probe_finds_a_cached_model_under_a_windows_shaped_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path();
+        stage_cached_model(profile, CE_MODEL);
+
+        let base = hf_cache_base(true, env_of(&[("USERPROFILE", profile)]), || None, || None);
+
+        assert_eq!(
+            base,
+            Some(profile.join(".cache").join("huggingface")),
+            "a Windows home must resolve from USERPROFILE"
+        );
+        assert!(
+            cached_under_base(base.as_deref(), CE_MODEL),
+            "a fully downloaded model under a Windows profile must read as cached"
+        );
+    }
+
+    /// The negative arm, so the positive above cannot pass by answering `true`
+    /// unconditionally.
+    #[test]
+    fn probe_reports_absent_when_no_model_is_cached() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path();
+
+        let base = hf_cache_base(true, env_of(&[("USERPROFILE", profile)]), || None, || None);
+
+        assert_eq!(base, Some(profile.join(".cache").join("huggingface")));
+        assert!(
+            !cached_under_base(base.as_deref(), CE_MODEL),
+            "an empty cache must report absent"
+        );
+    }
+
+    /// A profile root that exists but holds no `AppData` subtree collapses the
+    /// `BaseDirs` constructor to `None`. `USERPROFILE` must still win, which is
+    /// the same failure mode the setup resolver was hardened against.
+    #[test]
+    fn windows_probe_prefers_the_named_profile_over_both_lookups() {
+        let temp = tempfile::tempdir().unwrap();
+        let named = temp.path().join("named");
+        let known = temp.path().join("known-folder");
+        std::fs::create_dir_all(&named).unwrap();
+        stage_cached_model(&named, CE_MODEL);
+
+        let base = hf_cache_base(
+            true,
+            env_of(&[("USERPROFILE", &named)]),
+            || Some(known.clone()),
+            || Some(known.clone()),
+        );
+
+        assert_eq!(base, Some(named.join(".cache").join("huggingface")));
+        assert!(cached_under_base(base.as_deref(), CE_MODEL));
+    }
+
+    /// With `USERPROFILE` unset or empty the known-folder profile answers, so an
+    /// environment that names nothing still resolves.
+    #[test]
+    fn windows_probe_falls_back_to_the_known_folder_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let known = temp.path();
+        stage_cached_model(known, CE_MODEL);
+
+        for env in [env_of(&[]), env_of(&[("USERPROFILE", Path::new(""))])] {
+            let base = hf_cache_base(true, env, || Some(known.to_path_buf()), || None);
+            assert_eq!(base, Some(known.join(".cache").join("huggingface")));
+            assert!(cached_under_base(base.as_deref(), CE_MODEL));
+        }
+    }
+
+    /// Unix keeps resolving through `BaseDirs`, which reads `HOME` first and
+    /// otherwise falls back to the passwd database, and must never consult
+    /// `USERPROFILE`.
+    #[test]
+    fn unix_probe_resolves_through_base_dirs_and_ignores_userprofile() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let windows_only = temp.path().join("windows-only");
+        std::fs::create_dir_all(&home).unwrap();
+        stage_cached_model(&home, CE_MODEL);
+
+        let base = hf_cache_base(
+            false,
+            env_of(&[("USERPROFILE", &windows_only)]),
+            || Some(windows_only.clone()),
+            || Some(home.clone()),
+        );
+
+        assert_eq!(base, Some(home.join(".cache").join("huggingface")));
+        assert!(cached_under_base(base.as_deref(), CE_MODEL));
+    }
+
+    /// `HF_HOME` is the cache root itself, not a home, and outranks every home
+    /// lookup on both platforms. An empty value is not a path and must read as
+    /// unset rather than resolving relative to the working directory.
+    #[test]
+    fn hf_home_outranks_the_resolved_home_and_ignores_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let hf_home = temp.path().join("hf");
+        let profile = temp.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(
+            hf_home
+                .join("hub")
+                .join(format!("models--{}", CE_MODEL.replace('/', "--")))
+                .join("snapshots")
+                .join("0123456789abcdef"),
+        )
+        .unwrap();
+
+        for windows in [true, false] {
+            let base = hf_cache_base(
+                windows,
+                env_of(&[("HF_HOME", &hf_home), ("USERPROFILE", &profile)]),
+                || Some(profile.clone()),
+                || Some(profile.clone()),
+            );
+            assert_eq!(base, Some(hf_home.clone()), "HF_HOME is the cache root");
+            assert!(cached_under_base(base.as_deref(), CE_MODEL));
+
+            let empty = hf_cache_base(
+                windows,
+                env_of(&[("HF_HOME", Path::new("")), ("USERPROFILE", &profile)]),
+                || Some(profile.clone()),
+                || Some(profile.clone()),
+            );
+            assert_eq!(
+                empty,
+                Some(profile.join(".cache").join("huggingface")),
+                "an empty HF_HOME must read as unset"
+            );
+        }
+    }
+
+    /// No resolvable home at all is the one case that legitimately answers
+    /// `None`, and it must report absent rather than probing a relative path.
+    #[test]
+    fn probe_reports_absent_without_any_resolvable_home() {
+        for windows in [true, false] {
+            let base = hf_cache_base(windows, env_of(&[]), || None, || None);
+            assert_eq!(base, None);
+            assert!(!cached_under_base(base.as_deref(), CE_MODEL));
+        }
     }
 }
