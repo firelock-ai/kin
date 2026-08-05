@@ -210,17 +210,23 @@ jobs:
             `embedded_entities=${embed.embedded_entities} index=${embed.vector_index_path}`
           );
 
-          // `kin status` coverage is captured as DIAGNOSTIC here, not as a gate.
-          // On Windows the daemon does not stay resident between CLI
-          // invocations, and `kin status` deliberately never starts one, so any
-          // read of it races the daemon's lifetime and returns
-          // unobserved/no_running_daemon regardless of what was actually
-          // embedded. Both the CI runner and a native aarch64 Windows guest
-          // reproduced that with the read placed AFTER a query that does start a
-          // daemon, so it is the surface that is wrong, not the ordering.
+          // `kin status` coverage is captured as DIAGNOSTIC here, not as a gate,
+          // because reading it is a timing race rather than a measurement.
+          // `kin status` deliberately never starts a daemon, so it reports
+          // whatever is running when it happens to run: if the daemon from the
+          // preceding command has already exited, it correctly reports
+          // unobserved/no_running_daemon no matter how much was embedded. Three
+          // runs here hit exactly that, which is what moved the assertion off it.
           //
-          // Gating on it would be gating on a race. The embed command's own
-          // report above is the direct evidence and is what this asserts.
+          // It is NOT that Windows cannot observe coverage. An earlier version of
+          // this comment said so and was wrong: on a native Windows host with a
+          // live daemon, `kin status --json` returns
+          // {"state":"observed","source":"live_query_graph","indexed":6954,...}.
+          // The field works; only its availability at an arbitrary moment does not.
+          //
+          // So gate on the embed command's own report above, which is the direct
+          // output of the process that did the work and depends on nothing still
+          // being alive afterwards.
           const status = read("kin-status.json");
           console.log(`status embedding_coverage (diagnostic): ${JSON.stringify(status.embedding_coverage ?? null)}`);
 
