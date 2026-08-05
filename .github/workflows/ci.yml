@@ -167,6 +167,22 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # `daemon_status_and_stop_lifecycle` drives a real daemon, and the harness
+      # takes it from the `kin-daemon` beside the `kin` binary the test was
+      # built with. Every other `kin-daemon` invocation below compiles `--lib`,
+      # and the step that builds the binary runs after the tests, so nothing put
+      # a `kin-daemon.exe` in the msvc directory before the test read it. The
+      # harness covers a missing daemon by rebuilding one, which lands beside
+      # the test only when it carries the same `--target`, so a leg that omits
+      # this build depends on that rebuild rather than on its own inputs. The
+      # feature set matches the binary build below, so both produce one artifact.
+      - name: Build the sibling Windows daemon the authority tests drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --bin kin-daemon
+
       - name: Compile and run native Windows authority tests
         shell: bash
         run: |

@@ -3163,6 +3163,59 @@ fn daemon_compat(runtime: &IsolatedDaemonRuntime, path: &Path) -> Result<(), Str
     }
 }
 
+/// The `--target` a `kin-daemon` rebuild has to carry to land beside `kin`.
+///
+/// Cargo writes a build to `<target-dir>/<profile>/`, and moves it to
+/// `<target-dir>/<triple>/<profile>/` when it is given `--target`. The daemon
+/// this harness demands sits beside `CARGO_BIN_EXE_kin`, so a rebuild that
+/// drops the triple the test binary was built for writes a directory the
+/// compatibility check never reads: the rebuild succeeds and the check still
+/// reports the daemon missing, naming a path nothing ever wrote.
+///
+/// The triple is only in the path when cargo put it there, which is exactly
+/// when the rebuild needs it, so the layout answers the question directly.
+fn daemon_rebuild_target<'a>(kin_bin: &Path, triple: &'a str) -> Option<&'a str> {
+    let profile_parent = kin_bin.parent()?.parent()?;
+    (profile_parent.file_name()?.to_str() == Some(triple)).then_some(triple)
+}
+
+#[test]
+fn daemon_rebuild_follows_the_layout_its_own_binary_was_written_into() {
+    let triple = "x86_64-pc-windows-msvc";
+
+    assert_eq!(
+        daemon_rebuild_target(Path::new("/w/target/debug/kin"), triple),
+        None,
+        "a host build already writes the directory the check reads"
+    );
+    assert_eq!(
+        daemon_rebuild_target(
+            Path::new("/w/target/x86_64-pc-windows-msvc/debug/kin.exe"),
+            triple
+        ),
+        Some(triple),
+        "a cross build is only reachable by repeating its --target"
+    );
+    // A target directory relocated by CARGO_TARGET_DIR keeps the layout, so the
+    // triple component stays the whole signal and no path prefix is assumed.
+    assert_eq!(
+        daemon_rebuild_target(
+            Path::new("/lane/cargo-target/nwinfix/x86_64-pc-windows-msvc/debug/kin.exe"),
+            triple
+        ),
+        Some(triple),
+    );
+    assert_eq!(
+        daemon_rebuild_target(
+            Path::new("/w/target/aarch64-apple-darwin/debug/kin"),
+            triple
+        ),
+        None,
+        "a triple this binary was not built for must never be passed on"
+    );
+    assert_eq!(daemon_rebuild_target(Path::new("kin"), triple), None);
+}
+
 fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
     let daemon_bin = kin_bin.with_file_name(format!("kin-daemon{}", std::env::consts::EXE_SUFFIX));
@@ -3173,6 +3226,10 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
     BUILD_DAEMON.get_or_init(|| {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir.ancestors().nth(2).expect("kin workspace root");
+        let mut args = vec!["build", "-p", "kin-daemon", "--bin", "kin-daemon"];
+        if let Some(target) = daemon_rebuild_target(&kin_bin, env!("KIN_CLI_TARGET_TRIPLE")) {
+            args.extend_from_slice(&["--target", target]);
+        }
         // This shells out to cargo from inside a cargo-driven test run, so it
         // contends for the build-directory lock with whatever else is building
         // this checkout. Cargo waits on that lock forever and prints only to
@@ -3180,7 +3237,7 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         let mut build = Command::new(env!("CARGO"));
         scrub_inherited_kin_authority(build.inner_mut());
         let output = build
-            .args(["build", "-p", "kin-daemon", "--bin", "kin-daemon"])
+            .args(&args)
             .current_dir(workspace_root)
             .output_within(BUILD_TIMEOUT)
             .expect("run cargo build -p kin-daemon");

@@ -26,4 +26,12 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo::rustc-link-arg-bins=/STACK:16777216");
     }
+    // Cargo writes a `--target` build to `<target-dir>/<triple>/<profile>/` and
+    // a host build to `<target-dir>/<profile>/`, and tells the compiled code
+    // neither which of the two it is nor what triple it was built for. The test
+    // harness reuses the `kin-daemon` sitting beside its own `kin` binary and
+    // has to be able to rebuild one into that same directory, so it needs the
+    // triple to reproduce the layout it is reading from.
+    let target = std::env::var("TARGET").expect("cargo sets TARGET for build scripts");
+    println!("cargo::rustc-env=KIN_CLI_TARGET_TRIPLE={target}");
 }
