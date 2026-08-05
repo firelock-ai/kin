@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-05
+
+### Changed
+
+- Judge the managed root by object identity on Windows (#622)
+- Bump tokio from 1.52.4 to 1.53.1 (#413)
+- Bump base64 from 0.22.1 to 0.23.0 (#409)
+- Bump http-body from 1.0.1 to 1.1.0 (#411)
+- Bump anyhow from 1.0.103 to 1.0.104 (#412)
+
+
 ## [0.5.2] - 2026-08-05
 
 ### Changed
