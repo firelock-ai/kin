@@ -1116,6 +1116,86 @@ mod tests {
         );
     }
 
+    /// A launch profile is not a session change.
+    ///
+    /// `kin with --semantic-only` generates the launched assistant's permission
+    /// settings before it starts. Those files describe the launch, not the
+    /// work, so admitting them would commit an assistant's profile into
+    /// repository authority on every clean exit — from the one flag whose
+    /// purpose is to keep the graph the only surface the assistant touches.
+    ///
+    /// The profile therefore lives beside the projection under `.kin/runs/`,
+    /// and this asserts the scanner cannot reach it from either direction: the
+    /// profile files exist, an ordinary file written inside the projection is
+    /// observed, and no profile path appears in the delta.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_profile_beside_the_projection_is_not_a_session_change() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("member.txt"), b"admitted\n").unwrap();
+        let init = kin_core::init(repo.path()).unwrap();
+        let layout = init.layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let blobs = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
+
+        let session_dir = layout.runs_dir().join("session-launch-profile-probe");
+        let request = crate::commands::session_workspace::SessionWorkspaceRequest {
+            session_dir: session_dir.display().to_string(),
+            strategy: None,
+            scope: None,
+        };
+        crate::commands::session_workspace::materialize_session_workspace(
+            &layout, &binding, &request,
+        )
+        .unwrap();
+
+        // Written through the production writer, so this binds to where
+        // `kin with` actually puts a profile rather than to a fixture of it.
+        let adapter = crate::commands::assistant_adapter::adapter_for("claude").unwrap();
+        let profile =
+            crate::commands::session_run::LaunchProfile::write(&layout.runs_dir(), adapter, false)
+                .unwrap();
+        let settings = profile.dir().join("semantic-only-settings.json");
+        assert!(
+            settings.is_file(),
+            "the profile must actually be on disk for this assertion to mean anything"
+        );
+        assert!(
+            !profile.dir().starts_with(&session_dir),
+            "the profile is inside the projection at {}",
+            profile.dir().display()
+        );
+
+        // A real working-tree change, so the scanner is demonstrably observing
+        // this projection rather than returning an empty delta.
+        std::fs::write(session_dir.join("member.txt"), b"edited in session\n").unwrap();
+
+        let observation =
+            observe_session_workspace(&layout, &binding, &session_dir, &blobs, false).unwrap();
+        let observed = observation
+            .deltas()
+            .iter()
+            .filter_map(|delta| delta.new_state().or_else(|| delta.old_state()))
+            .filter_map(|entry| entry.path.as_utf8())
+            .collect::<Vec<_>>();
+
+        assert!(
+            observed.contains(&"member.txt"),
+            "the scanner observed nothing, so this proves nothing: {observed:?}"
+        );
+        let profile_leaf = profile
+            .dir()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        for path in &observed {
+            assert!(
+                !path.contains(profile_leaf) && !path.contains("semantic-only-settings.json"),
+                "a launch profile path reached repository authority: {path}"
+            );
+        }
+    }
+
     #[test]
     fn mass_deletion_requires_explicit_confirmation() {
         let source = (0..20)
