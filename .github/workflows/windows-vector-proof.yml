@@ -153,7 +153,6 @@ jobs:
           kin.exe embed --max-seconds 1800 --json | tee "$RUNNER_TEMP/kin-embed.json"
           echo "embed_wall_seconds=$(( $(date +%s) - embed_start ))" \
             | tee "$RUNNER_TEMP/kin-embed-timing.txt"
-          kin.exe status --json | tee "$RUNNER_TEMP/kin-status.json"
 
       - name: Query the embedded graph
         shell: bash
@@ -167,6 +166,12 @@ jobs:
             | tee "$RUNNER_TEMP/kin-semantic-search.json"
           kin.exe locate "how are settings loaded" --json --explain --max-files 5 \
             | tee "$RUNNER_TEMP/kin-locate.json"
+          # `kin status` deliberately does not auto-start the daemon, and the
+          # daemon `kin embed` used has exited by now. Read it AFTER the queries
+          # above, which do start one. Reading it earlier returns
+          # state=unobserved reason=no_running_daemon, which is a dead harness
+          # rather than a shortfall, and is exactly how the first run failed.
+          kin.exe status --json | tee "$RUNNER_TEMP/kin-status.json"
 
       - name: Assert the runtime proved semantic search
         shell: bash
@@ -184,6 +189,19 @@ jobs:
           if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0) {
             throw new Error(`embedding did not reach full coverage: ${JSON.stringify(embed)}`);
           }
+          // Assert on the embed command's OWN report, not only on the status
+          // read below. Zero pending is satisfied vacuously by a run that
+          // embedded nothing, so the count that proves inference ran has to be
+          // checked directly and at its source.
+          if (!(embed.embedded_entities > 0)) {
+            throw new Error(`embedding produced no entity vectors: ${JSON.stringify(embed)}`);
+          }
+          if (!embed.vector_index_path) {
+            throw new Error(`embedding wrote no vector index: ${JSON.stringify(embed)}`);
+          }
+          console.log(
+            `embedded_entities=${embed.embedded_entities} index=${embed.vector_index_path}`
+          );
 
           const status = read("kin-status.json");
           const coverage = status.embedding_coverage;

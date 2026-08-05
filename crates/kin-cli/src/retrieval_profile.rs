@@ -241,6 +241,13 @@ pub fn cross_encoder_model_cached(model_id: &str) -> bool {
 /// what keeps an isolated home isolated. When they do disagree the probe under-
 /// reports, which this function's contract already permits: a false negative
 /// only leaves the reranker off until the model is fetched explicitly.
+///
+/// That divergence is measured, not inferred. On a native Windows host with
+/// both `HOME` and `USERPROFILE` pointed at an isolated directory, `hf-hub`
+/// still wrote its 522 MB cache under the known-folder profile and left the
+/// isolated home empty. Preferring `USERPROFILE` is still the right side to err
+/// on: reporting a model cached that `hf-hub` would not find there is a false
+/// POSITIVE, and that costs a download in the middle of a query.
 fn hf_cache_base(
     windows: bool,
     var_os: impl Fn(&str) -> Option<OsString>,
