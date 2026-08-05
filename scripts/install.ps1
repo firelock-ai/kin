@@ -390,7 +390,7 @@ foreach ($bin in @("kin.exe", "kin-daemon.exe", "kin-vfs.exe")) {
 }
 
 # Move the projection shim if the archive bundled it. The native Windows release
-# is vector-free and ships no shim, so this is normally absent.
+# ships no projection client, so this is normally absent.
 $HaveShim = $false
 $shimSrc = Join-Path $TmpDir "kin_vfs_shim.dll"
 if (Test-Path $shimSrc) {

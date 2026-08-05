@@ -4,7 +4,7 @@
 
 // Offline first-run integration proof for Kin's two public npm surfaces.
 //
-// The Windows CI job builds the real vector-free kin.exe + kin-daemon.exe and
+// The Windows authority job builds the real kin.exe + kin-daemon.exe and
 // passes their absolute paths through KIN_NPM_PROOF_{KIN,DAEMON}_BIN. This
 // script copies those exact bytes into each package's real managed layout and
 // drives:

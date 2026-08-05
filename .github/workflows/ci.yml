@@ -392,8 +392,9 @@ jobs:
       # contract. The installer leg asserts the same behavior against the
       # release binary, but it runs only on the landing push, so on its own it
       # can report an admission change no earlier than a required check
-      # failing on a release commit. The feature set matches the installer
-      # leg's so both legs drive the same build of the command.
+      # failing on a release commit. This leg builds without default features
+      # and the installer leg builds with them, so the shared script asserts
+      # the same refusals against both feature sets of the command.
       - name: Build the Windows binaries the admission and npm assertions drive
         shell: bash
         run: |
@@ -532,7 +533,7 @@ jobs:
             -p kin-cli -p kin-daemon
           sccache --show-stats
 
-      - name: Verify Windows build provenance and disabled features
+      - name: Verify Windows build provenance and feature set
         shell: bash
         run: |
           set -euo pipefail
@@ -1086,9 +1087,9 @@ jobs:
       # Nothing else on these legs resolves kin-cli without its default
       # features, so a break that appears only with `vector` and `embeddings`
       # off compiles clean here and reaches main behind a green required
-      # context. The Windows job covers that configuration for the msvc target
-      # and runs three filtered subsets of the library, so the cases asserting
-      # the vector-free path execute in this step and nowhere else.
+      # context. The Windows authority job covers that configuration for the
+      # msvc target through filtered subsets of the library, so the cases
+      # asserting the featureless path execute in this step and nowhere else.
       # `RUSTFLAGS: -D warnings` is set at workflow level, so the unused-import
       # shape this class first took fails the step rather than warning.
       #

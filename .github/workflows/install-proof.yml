@@ -1426,11 +1426,11 @@ jobs:
               throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
             }
           };
+          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
+            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+          }
           if (!isWindows) {
             validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
-            if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-              throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
-            }
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
@@ -1519,7 +1519,7 @@ jobs:
                   check.status === "healthy" ||
                   check.status === "unsupported"
               );
-            if (report.healthy !== true && (isWindows || !onlyPendingEmbeddingsBlocks)) {
+            if (report.healthy !== true && !onlyPendingEmbeddingsBlocks) {
               throw new Error(
                 `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
               );
@@ -1531,9 +1531,7 @@ jobs:
               }
             }
             const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-            const allowedSemanticReadiness = isWindows
-              ? ["unsupported"]
-              : ["healthy", "stale"];
+            const allowedSemanticReadiness = ["healthy", "stale"];
             if (!allowedSemanticReadiness.includes(semanticReadiness)) {
               throw new Error(
                 `${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected ${allowedSemanticReadiness.join(" or ")}`
