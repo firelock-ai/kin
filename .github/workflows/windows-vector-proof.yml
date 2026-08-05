@@ -22,8 +22,10 @@
 # and display name, but it never reads `on:` triggers: adding `pull_request:`
 # here leaves the suite green (falsified directly, both ways). So keeping this
 # dispatch-only is a review responsibility, not a guarded invariant. Anyone
-# adding a trigger is adding a check run to every pull request, plus a ~522 MB
-# model fetch and a ~30 minute job, of which the release build is ~23 minutes.
+# adding a trigger is adding a check run to every pull request. Run 30969196206
+# measured 36 minutes end to end, of which the release build is 23 and the
+# post-job cargo cache save is 5. The ~522 MB model fetch is inside that, in the
+# embed step, and only because the hub cache missed on that run.
 #
 # Run it when the vector-carrying Windows surface changes, and paste the run URL
 # into the change that claims Windows semantic search works.
