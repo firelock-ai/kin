@@ -535,10 +535,14 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/secret-scan.yml": {
         "gitleaks": "gitleaks (full history)",
     },
-    # workflow_dispatch only, so it publishes no check run on a pull request or
-    # merge group and cannot satisfy or become a required context. Registered
-    # here because this census is the thing that would otherwise let a second
-    # required-context producer appear unreviewed.
+    # workflow_dispatch only, so as written it publishes no check run on a pull
+    # request or merge group. Registered here because this census is what would
+    # otherwise let a new job's NAME appear unreviewed.
+    #
+    # It does not follow that the dispatch-only property is protected: this
+    # census reads job names and never `on:` triggers, so adding
+    # `pull_request:` to that workflow leaves the suite green. Verified by
+    # injecting the trigger and re-running.
     ".github/workflows/windows-vector-proof.yml": {
         "windows-vector-proof": "Windows semantic vector search proof",
     },

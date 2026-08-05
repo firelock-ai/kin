@@ -13,9 +13,17 @@
 #   - It fetches a ~522 MB model. On every pull request that is a tax nobody
 #     asked for, and on the release-gating installer leg it would make the mint
 #     hostage to huggingface.co being reachable.
-#   - It produces no check run on a pull request or merge group, so it can never
-#     become a required context by accident. The workflow-job census in
-#     scripts/test-release-workflow-authority.py pins that.
+#   - As written it produces no check run on a pull request or merge group, so
+#     it is not a required-context producer.
+#
+# That last property is NOT enforced anywhere, and an earlier version of this
+# comment wrongly claimed it was. The workflow-job census in
+# scripts/test-release-workflow-authority.py pins this workflow's path, job id
+# and display name, but it never reads `on:` triggers: adding `pull_request:`
+# here leaves the suite green (falsified directly, both ways). So keeping this
+# dispatch-only is a review responsibility, not a guarded invariant. Anyone
+# adding a trigger is adding a check run to every pull request, plus a ~522 MB
+# model fetch and a ~45 minute Windows release build.
 #
 # Run it when the vector-carrying Windows surface changes, and paste the run URL
 # into the change that claims Windows semantic search works.
