@@ -3084,7 +3084,7 @@ mod tests {
     /// strongest statement available without instrumenting the function.
     #[cfg(windows)]
     #[test]
-    fn windows_root_identity_distinguishes_a_swapped_directory() {
+    fn managed_spawn_fence_windows_root_identity_distinguishes_a_swapped_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let admitted = tmp.path().join("admitted");
         let impostor = tmp.path().join("impostor");
