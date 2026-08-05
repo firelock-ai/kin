@@ -155,6 +155,13 @@ impl ManagedInstallSpawnFence {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        // Opened before the lock, because the root's post-admission identity has
+        // to be judged against a handle bound to the directory that was admitted.
+        // Windows identity lives in GetFileInformationByHandle, so a path-derived
+        // Metadata cannot carry it, and a handle opened after the lock would be
+        // bound to whatever the path resolves to by then.
+        #[cfg(windows)]
+        let root_guard = open_windows_root_guard(&configured_root)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -166,8 +173,6 @@ impl ManagedInstallSpawnFence {
         }
         let file = options.open(&lock_path)?;
         FileExt::lock_shared(&file)?;
-        #[cfg(windows)]
-        let root_guard = open_windows_root_guard(&configured_root)?;
 
         if configured_root.canonicalize()? != candidate_root
             || binary.canonicalize()? != resolved_binary
@@ -177,12 +182,32 @@ impl ManagedInstallSpawnFence {
                 "managed install changed after spawn admission",
             ));
         }
-        let root_after = fs::symlink_metadata(&configured_root)?;
-        if !same_file_object(&root_before, &root_after) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "managed install root identity changed after spawn admission",
-            ));
+        // Unix compares dev+ino, which is the object's identity and does not move
+        // when the directory's contents do. Windows has no path-derived identity,
+        // so it asks the same question the way the lock binding below does: the
+        // handle held since admission against a fresh open of the same path. The
+        // metadata heuristic cannot stand in here, because it answers "does this
+        // look unchanged" rather than "is this the same object", and creating the
+        // lock inside the root is a legitimate change to how the root looks.
+        #[cfg(unix)]
+        {
+            let root_after = fs::symlink_metadata(&configured_root)?;
+            if !same_file_object(&root_before, &root_after) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed install root identity changed after spawn admission",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let current_root = open_windows_root_guard(&configured_root)?;
+            if windows_file_identity(&root_guard)?.0 != windows_file_identity(&current_root)?.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed install root identity changed after spawn admission",
+                ));
+            }
         }
         let lock_path_metadata = fs::symlink_metadata(&lock_path)?;
         if lock_path_metadata.file_type().is_symlink()
@@ -3007,6 +3032,112 @@ mod tests {
             .expect("retired managed executable must never regain spawn admission");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("retired uninstall state"));
+    }
+
+    /// The four `fs::Metadata` fields the pre-fix Windows arm of
+    /// `same_file_object` compared, rendered for a CI log.
+    fn root_field_probe(root: &Path) -> String {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => format!(
+                "is_dir={} len={} modified={:?} created={:?}",
+                metadata.file_type().is_dir(),
+                metadata.len(),
+                metadata.modified().ok(),
+                metadata.created().ok()
+            ),
+            Err(error) => format!("unreadable: {error}"),
+        }
+    }
+
+    fn managed_fixture(dir: &Path, precreate_lock: bool) -> (PathBuf, PathBuf) {
+        let root = dir.join(".kin");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let daemon = root.join("bin/kin-daemon");
+        fs::write(&daemon, b"managed daemon fixture").unwrap();
+        if precreate_lock {
+            fs::write(root.join("update.lock"), b"").unwrap();
+        }
+        (daemon, root)
+    }
+
+    /// Admission must not depend on whether `update.lock` already exists.
+    ///
+    /// The two cases are the first spawn against a fresh install and every spawn
+    /// after it. They differ only in that the first one creates a directory entry
+    /// inside the root while admission is in flight, which is the install working
+    /// as intended and must not read as the root being swapped underneath it.
+    #[test]
+    fn managed_spawn_fence_admits_whether_or_not_the_lock_already_exists() {
+        for precreate_lock in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (daemon, root) = managed_fixture(tmp.path(), precreate_lock);
+            // The four fields the pre-fix Windows predicate compared, read on
+            // either side of admission. This host's answer is not the runner's:
+            // on a native Windows 11 host none of them move when the lock is
+            // created inside the root, while `windows-latest` refused the same
+            // admission twelve consecutive times. Emitted so the next refusal
+            // names the field that diverged instead of only the guard that
+            // fired. Captured output surfaces when this test fails, which is
+            // exactly the case it exists for.
+            eprintln!(
+                "FENCE_ROOT_FIELDS: precreate_lock={precreate_lock} at=snapshot {}",
+                root_field_probe(&root)
+            );
+            let fence = ManagedInstallSpawnFence::acquire(&daemon, &root);
+            eprintln!(
+                "FENCE_ROOT_FIELDS: precreate_lock={precreate_lock} at=recheck {}",
+                root_field_probe(&root)
+            );
+            let outcome = match &fence {
+                Ok(Some(_)) => "admitted".to_string(),
+                Ok(None) => "not treated as a managed install".to_string(),
+                Err(error) => format!("refused with {error}"),
+            };
+            assert!(
+                matches!(fence, Ok(Some(_))),
+                "managed binary must acquire install admission with \
+                 precreate_lock={precreate_lock}; got {outcome}"
+            );
+        }
+    }
+
+    /// The negative control for the Windows root check, at the predicate level.
+    ///
+    /// Both green arms above pass equally well against a guard that has stopped
+    /// guarding, so on their own they cannot tell "no longer trips falsely" from
+    /// "no longer trips at all". This pins that the comparison the guard performs
+    /// can still distinguish: a fresh open of the SAME directory agrees with the
+    /// held handle, and a DIFFERENT directory does not.
+    ///
+    /// The end-to-end arm this stands in for -- re-pointing the root path to
+    /// another directory between admission and re-check -- is not expressible
+    /// portably here, because that window lives inside `acquire`. This is the
+    /// strongest statement available without instrumenting the function.
+    #[cfg(windows)]
+    #[test]
+    fn managed_spawn_fence_windows_root_identity_distinguishes_a_swapped_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let admitted = tmp.path().join("admitted");
+        let impostor = tmp.path().join("impostor");
+        fs::create_dir_all(&admitted).unwrap();
+        fs::create_dir_all(&impostor).unwrap();
+
+        let held = open_windows_root_guard(&admitted).unwrap();
+        let fresh_same = open_windows_root_guard(&admitted).unwrap();
+        let fresh_other = open_windows_root_guard(&impostor).unwrap();
+
+        assert_eq!(
+            windows_file_identity(&held).unwrap().0,
+            windows_file_identity(&fresh_same).unwrap().0,
+            "a fresh open of the admitted root must agree with the held handle, \
+             or the guard would refuse every legitimate admission"
+        );
+        assert_ne!(
+            windows_file_identity(&held).unwrap().0,
+            windows_file_identity(&fresh_other).unwrap().0,
+            "a different directory must not compare equal to the admitted root, \
+             or the guard would admit a swapped install"
+        );
     }
 
     // ── Process-group containment ─────────────────────────────────────────
