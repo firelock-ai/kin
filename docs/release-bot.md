@@ -130,7 +130,7 @@ The single job refuses — before any tag is created — unless **all** hold:
    - `DCO Sign-off`
    - `cargo-deny`
    - `gitleaks (full history)`
-   - `Windows installer + vector-free release build`
+   - `Windows installer + vector release build`
 
    This reviewed list is the authority for release admission. The active `main`
    ruleset should carry the same contexts, but the mint does not read mutable

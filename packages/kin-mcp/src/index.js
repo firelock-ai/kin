@@ -249,7 +249,8 @@ function guidedProvisioningFailure(error) {
     '  - Install Kin directly and run `kin setup` to configure your agent, then point',
     '    this wrapper at it with KIN_MCP_KIN_BINARY=/path/to/kin.',
     '  - Or retry on a supported target (macOS, Linux, or Windows x64).',
-    '    Native Windows is vector-free; use WSL2 when you need vectors or projection.',
+    '    Native Windows carries semantic vector search but no filesystem projection;',
+    '    use WSL2 when you need projection.',
     '  - Or override the release source with KIN_MCP_RELEASE_BASE_URL if you mirror releases.'
   ].join('\n');
 }

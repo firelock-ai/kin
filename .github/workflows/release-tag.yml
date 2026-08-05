@@ -793,7 +793,7 @@ jobs:
             DCO Sign-off
             cargo-deny
             gitleaks (full history)
-            Windows installer + vector-free release build
+            Windows installer + vector release build
         run: |
           set -euo pipefail
           gh api "repos/$REPO/actions/runs/$CURRENT_RUN_ID" \
@@ -907,7 +907,7 @@ jobs:
                   "push",
                   release_branch,
               ),
-              "Windows installer + vector-free release build": (
+              "Windows installer + vector release build": (
                   245803170,
                   ".github/workflows/ci.yml",
                   "push",

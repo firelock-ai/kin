@@ -558,12 +558,15 @@ jobs:
           if (meta.dependency_provenance !== expectedLock) {
             throw new Error(`installed Windows Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} does not match release source ${expectedLock}`);
           }
+          // What a user actually installed, not what CI built. `metal_enabled`
+          // tracks the compiled backend rather than the marker cargo feature,
+          // so it stays false on Windows even with default features on.
           if (
-            meta.embeddings?.vector_enabled !== false ||
-            meta.embeddings?.embeddings_enabled !== false ||
+            meta.embeddings?.vector_enabled !== true ||
+            meta.embeddings?.embeddings_enabled !== true ||
             meta.embeddings?.metal_enabled !== false
           ) {
-            throw new Error("installed Windows CLI does not prove the vector-free feature contract");
+            throw new Error("installed Windows CLI does not prove the vector feature contract");
           }
 
           const authority = JSON.parse(fs.readFileSync("kin-windows-registry-authority.json", "utf8"));
@@ -1423,11 +1426,11 @@ jobs:
               throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
             }
           };
+          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
+            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+          }
           if (!isWindows) {
             validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
-            if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-              throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
-            }
           }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
@@ -1516,7 +1519,7 @@ jobs:
                   check.status === "healthy" ||
                   check.status === "unsupported"
               );
-            if (report.healthy !== true && (isWindows || !onlyPendingEmbeddingsBlocks)) {
+            if (report.healthy !== true && !onlyPendingEmbeddingsBlocks) {
               throw new Error(
                 `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
               );
@@ -1528,9 +1531,7 @@ jobs:
               }
             }
             const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-            const allowedSemanticReadiness = isWindows
-              ? ["unsupported"]
-              : ["healthy", "stale"];
+            const allowedSemanticReadiness = ["healthy", "stale"];
             if (!allowedSemanticReadiness.includes(semanticReadiness)) {
               throw new Error(
                 `${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected ${allowedSemanticReadiness.join(" or ")}`
@@ -1651,7 +1652,7 @@ jobs:
 
       - name: Preserve proof reports
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-proof-${{ matrix.os }}-${{ github.run_id }}
           if-no-files-found: warn

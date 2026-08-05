@@ -254,7 +254,7 @@ REQUIRED_RELEASE_CHECKS = (
     "DCO Sign-off",
     "cargo-deny",
     "gitleaks (full history)",
-    "Windows installer + vector-free release build",
+    "Windows installer + vector release build",
 )
 DOCS_ONLY_WORKFLOW_HEADER = textwrap.dedent(
     """\
@@ -450,7 +450,7 @@ CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
     "npm-launchers": "npm launcher tests",
     "windows-authority-tests": "Windows authority tests",
-    "windows-installer": "Windows installer + vector-free release build",
+    "windows-installer": "Windows installer + vector release build",
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
     "check": "Check & Test",
@@ -535,6 +535,17 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/secret-scan.yml": {
         "gitleaks": "gitleaks (full history)",
     },
+    # workflow_dispatch only, so as written it publishes no check run on a pull
+    # request or merge group. Registered here because this census is what would
+    # otherwise let a new job's NAME appear unreviewed.
+    #
+    # It does not follow that the dispatch-only property is protected: this
+    # census reads job names and never `on:` triggers, so adding
+    # `pull_request:` to that workflow leaves the suite green. Verified by
+    # injecting the trigger and re-running.
+    ".github/workflows/windows-vector-proof.yml": {
+        "windows-vector-proof": "Windows semantic vector search proof",
+    },
 }
 EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
@@ -548,7 +559,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/release.yml",
         "build",
-    ): "4708a5968103aa4c624423fd5a67c5c183969919773e52c9cc204b2c9983c90b",
+    ): "ffde401b1343930965ae6a2a89ca3a81b2996af5821b332f65de7eba874e2be2",
     (
         ".github/workflows/release.yml",
         "verify_npm_published",
@@ -572,7 +583,7 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
     "gitleaks (full history)": {
         (".github/workflows/secret-scan.yml", "gitleaks"),
     },
-    "Windows installer + vector-free release build": {
+    "Windows installer + vector release build": {
         (".github/workflows/ci.yml", "windows-installer"),
     },
 }
@@ -597,7 +608,7 @@ REQUIRED_RELEASE_CHECK_PROVENANCE = {
         ".github/workflows/secret-scan.yml",
         "push",
     ),
-    "Windows installer + vector-free release build": (
+    "Windows installer + vector release build": (
         245_803_170,
         ".github/workflows/ci.yml",
         "push",
@@ -1018,8 +1029,10 @@ def windows_node_validator_fixture() -> tuple[
                 "kin_source_known": True,
                 "dependency_provenance": VALIDATOR_FIXTURE_LOCK,
                 "embeddings": {
-                    "vector_enabled": False,
-                    "embeddings_enabled": False,
+                    "vector_enabled": True,
+                    "embeddings_enabled": True,
+                    # Metal is the macOS-only compiled backend, not the marker
+                    # cargo feature, so it stays false on a correct Windows build.
                     "metal_enabled": False,
                 },
             },
@@ -1314,17 +1327,20 @@ def assert_windows_node_validator_behavior(step: str) -> None:
             "d" * 64,
         ),
         (
-            "vector feature enabled",
+            "vector feature disabled",
             "kin-windows-bench-meta.json",
             ("embeddings", "vector_enabled"),
-            True,
+            False,
         ),
         (
-            "embedding feature enabled",
+            "embedding feature disabled",
             "kin-windows-bench-meta.json",
             ("embeddings", "embeddings_enabled"),
-            True,
+            False,
         ),
+        # Metal stays a negative control in the same direction: it is the
+        # macOS-only compiled backend, so a Windows archive claiming it is
+        # still the defect this rejects.
         (
             "Metal feature enabled",
             "kin-windows-bench-meta.json",
@@ -2466,8 +2482,8 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         "meta.kin_dirty !== false",
         "meta.kin_source_known !== true",
         "meta.dependency_provenance !== expectedLock",
-        "meta.embeddings?.vector_enabled !== false",
-        "meta.embeddings?.embeddings_enabled !== false",
+        "meta.embeddings?.vector_enabled !== true",
+        "meta.embeddings?.embeddings_enabled !== true",
         "meta.embeddings?.metal_enabled !== false",
         'authority.checks[0]?.state !== "unsupported"',
         '["repo_init", "missing"]',
@@ -2670,6 +2686,64 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs)
         blocks[job] = jobs[match.start() : end].rstrip()
     return blocks
+
+
+WINDOWS_DAEMON_SIBLING_BUILD = (
+    "- name: Build the sibling Windows daemon the authority tests drive"
+)
+WINDOWS_DAEMON_COMPILE_STEP = (
+    "- name: Compile and run native Windows authority tests"
+)
+WINDOWS_DAEMON_LIFECYCLE_TEST = '"daemon_status_and_stop_lifecycle"'
+
+
+def assert_windows_daemon_sibling_build(ci_job: str) -> None:
+    """Require the Windows leg to build the daemon its lifecycle test drives.
+
+    The lifecycle test runs a real daemon, and the harness takes it from the
+    `kin-daemon` beside the `kin` binary the test was built with. Every other
+    `kin-daemon` invocation in the leg compiles `--lib`, which produces no
+    binary, so without an explicit build nothing writes one for that target
+    before the test reads it.
+
+    The harness does cover a missing daemon by rebuilding one, but a rebuild
+    lands beside the test only when it repeats the same `--target`, so a leg
+    that leaves the build to the harness is asserting a harness behavior rather
+    than supplying its own input. Ordering is pinned as well as presence: this
+    build sitting after the tests is how the leg failed for days while reporting
+    a daemon missing from a directory the job did eventually populate.
+
+    Judged on active lines and scoped to the step's own block: the `--target`
+    that decides where the binary lands must appear inside the sibling build
+    step itself, and ordering compares step-name positions, so a comment
+    quoting the test name can neither satisfy a policy nor invert the order.
+    """
+
+    active_job = "\n".join(active_lines(ci_job))
+    for step in (WINDOWS_DAEMON_SIBLING_BUILD, WINDOWS_DAEMON_COMPILE_STEP):
+        require(active_job, step, "native Windows daemon lifecycle prerequisite")
+    build_start = active_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
+    compile_start = active_job.index(WINDOWS_DAEMON_COMPILE_STEP)
+    if build_start > compile_start:
+        raise AssertionError(
+            "native Windows daemon lifecycle prerequisite must build the msvc "
+            "kin-daemon binary before the lifecycle test reads it"
+        )
+    sibling_build_block = active_job[build_start:compile_start]
+    for policy in (
+        "-p kin-daemon --no-default-features --bin kin-daemon",
+        "--target x86_64-pc-windows-msvc",
+    ):
+        require(
+            sibling_build_block,
+            policy,
+            "native Windows daemon lifecycle prerequisite",
+        )
+    require(
+        active_job[compile_start:],
+        WINDOWS_DAEMON_LIFECYCLE_TEST,
+        "native Windows daemon lifecycle prerequisite",
+    )
 
 
 def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
@@ -7190,9 +7264,9 @@ def main() -> None:
             'meta.dependency_provenance !== ""',
         ),
         (
-            "the Windows leg stops proving its vector-free feature contract",
-            "meta.embeddings?.vector_enabled !== false",
+            "the Windows leg stops proving its vector feature contract",
             "meta.embeddings?.vector_enabled !== true",
+            "meta.embeddings?.vector_enabled !== false",
         ),
         (
             "the Windows registry-authority repair negative control disappears",
@@ -7671,6 +7745,32 @@ def main() -> None:
     assert_windows_npm_first_run_proof(
         ci_jobs["windows-authority-tests"], windows_npm_proof
     )
+    assert_windows_daemon_sibling_build(ci_jobs["windows-authority-tests"])
+    windows_job = ci_jobs["windows-authority-tests"]
+    sibling_build_start = windows_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
+    sibling_build_end = windows_job.index(
+        "      - name: Compile and run native Windows authority tests"
+    )
+    sibling_build_block = windows_job[sibling_build_start:sibling_build_end]
+    for label, mutated_job, expected in (
+        (
+            "the Windows leg stops building the daemon its lifecycle test drives",
+            windows_job.replace(sibling_build_block, "", 1),
+            "native Windows daemon lifecycle prerequisite",
+        ),
+        (
+            "the sibling daemon build drifts back after the tests that read it",
+            windows_job.replace(sibling_build_block, "", 1) + sibling_build_block,
+            "before the lifecycle test reads it",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated_job=mutated_job: assert_windows_daemon_sibling_build(
+                mutated_job
+            ),
+        )
     canonical_npm_provision = CANONICAL_NPM_PROVISION.read_text(encoding="utf-8")
     canonical_npm_provision_test = CANONICAL_NPM_PROVISION_TEST.read_text(
         encoding="utf-8"
@@ -8671,7 +8771,7 @@ def main() -> None:
     installer_end = ci_workflow.index("\n  changes:", installer_start)
     installer_job = ci_workflow[installer_start:installer_end]
     for policy in (
-        "name: Windows installer + vector-free release build",
+        "name: Windows installer + vector release build",
         "github.event_name != 'pull_request'",
         "needs.changes.outputs.docs_only != 'true'",
     ):
@@ -9243,7 +9343,7 @@ def main() -> None:
         "DCO Sign-off",
         "cargo-deny",
         "gitleaks (full history)",
-        "Windows installer + vector-free release build",
+        "Windows installer + vector release build",
         "missing required check: {name}",
         "required check not green: {name}",
         "ambiguous required check: {name}",
@@ -9844,7 +9944,7 @@ def main() -> None:
     ) -> None:
         check = required_check_fixture(
             check_runs,
-            "Windows installer + vector-free release build",
+            "Windows installer + vector release build",
         )
         check["head_sha"] = "2" * 40
 
@@ -9853,7 +9953,7 @@ def main() -> None:
         "required check is attached to the wrong head sha",
         (
             "required check has wrong head sha: "
-            "Windows installer + vector-free release build"
+            "Windows installer + vector release build"
         ),
         change_required_check_head,
     )

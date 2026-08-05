@@ -5433,6 +5433,210 @@ mod tests {
         );
     }
 
+    /// An entity the current workspace does not contain is history, not a gap.
+    ///
+    /// FIR-1935. The graph ingests whole reachable history, so it carries
+    /// entities for files a repository deleted or renamed -- on the first
+    /// repository this was tried against, `httpx/models.py`, deleted in 2020.
+    /// The body projection reported that absence as an authority gap, and every
+    /// surface projecting many entities turned one such candidate into a failed
+    /// request.
+    ///
+    /// Three entities, and the middle one is the fix:
+    /// - a live entity still projects its body, so the fix did not cost reads,
+    /// - an entity whose path the workspace tree does not carry is classified as
+    ///   history, which is what lets a page skip it,
+    /// - a path the tree DOES carry whose bytes the graph cannot produce is
+    ///   still a hard failure. Without that arm this test would pass just as
+    ///   readily against a blanket swallow, which is the fix a hurry would have
+    ///   written and which would have hidden every real projection break.
+    #[test]
+    fn an_entity_absent_at_the_current_generation_is_history_not_an_authority_gap() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        let mut store = EmptyStore::default();
+
+        // Live: in the workspace tree at the current generation.
+        let live_content = "export function live() { return 1; }\n";
+        let live_hash = blob_store.write(live_content.as_bytes()).unwrap();
+        let live_file = FilePathId::new("src/live.ts");
+        store.file_hashes.insert(live_file.clone(), live_hash);
+        let live = whole_file_entity(&live_file, live_content, Some(live_hash));
+        store.insert_test_entity(live.clone());
+
+        // Historical: the graph holds the entity AND its bytes, and the current
+        // workspace tree does not carry the path because history deleted it.
+        // Every coordinate the projection needs is present except the one thing
+        // that is legitimately gone, so nothing but the deletion can explain a
+        // failure here.
+        //
+        // It is admitted to the store AFTER the tree is installed, and that
+        // ordering is forced rather than cosmetic: admission refuses a
+        // transaction that "leaves entity ... on repository path ... absent from
+        // the staged tree", so this state cannot be minted inside one change at
+        // all. It arises the way it arose on `httpx` -- from history, across
+        // changes -- and the runtime condition the projection actually meets is
+        // an entity in hand whose path the CURRENT tree lacks. That is what this
+        // reproduces.
+        let deleted_content = "export function deleted() { return 2; }\n";
+        let deleted_hash = blob_store.write(deleted_content.as_bytes()).unwrap();
+        let deleted_file = FilePathId::new("src/deleted.ts");
+        let deleted = whole_file_entity(&deleted_file, deleted_content, Some(deleted_hash));
+
+        install_empty_store_exact_tree(&mut store, dir.path());
+
+        // Unservable: a path the workspace tree DOES carry, whose recorded span
+        // was derived from other bytes. The graph owes an answer here and cannot
+        // give a sound one, which is the genuine authority gap this fix must not
+        // swallow.
+        //
+        // This is the gap the fixture can actually express. Two others were
+        // tried first and are refused by admission itself, which is worth
+        // recording: a tree entry whose blob is absent from the CAS is rejected
+        // ("absent from immutable source CAS"), and a change leaving an entity
+        // on a path absent from its staged tree is rejected too. The store will
+        // not hold those shapes, so they cannot be reproduced here.
+        let mut unservable = live.clone();
+        unservable.id = EntityId::new();
+        unservable.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::Value::String(Hash256::from_bytes([42; 32]).to_string()),
+        );
+        store.insert_test_entity(deleted.clone());
+        let authority = test_repository_authority(dir.path());
+        let held = HeldSourceAuthority::new(&store, Some(&authority));
+
+        let snippet =
+            read_bounded_entity_snippet_held(&held, &live, EntitySourceScope::WorkspaceHead)
+                .expect("a live entity must still project its body")
+                .expect("the live entity has source coordinates");
+        assert!(
+            snippet.contains("return 1"),
+            "the live entity must serve its own body: {snippet}"
+        );
+
+        let error =
+            read_bounded_entity_snippet_held(&held, &deleted, EntitySourceScope::WorkspaceHead)
+                .expect_err("the current workspace holds no body for a deleted file");
+        assert!(
+            common::is_absent_at_generation(&error),
+            "a file history deleted must classify as history, not as an authority gap: {error}"
+        );
+        assert!(
+            error.to_string().contains("src/deleted.ts"),
+            "the message must name the path that is gone: {error}"
+        );
+
+        let error =
+            read_bounded_entity_snippet_held(&held, &unservable, EntitySourceScope::WorkspaceHead)
+                .expect_err("bytes the graph promised and cannot serve must fail the read");
+        assert!(
+            !common::is_absent_at_generation(&error),
+            "a path the tree carries whose blob is unreadable is a real gap and must stay fatal; \
+             classifying it as history is how this fix would become a blanket swallow: {error}"
+        );
+    }
+
+    /// One caller deleted by history does not cost the whole reference set.
+    ///
+    /// The page-level half of FIR-1935, on the multi-entity surface this crate
+    /// owns: `find_references` projects a body per referencing entity, so before
+    /// the fix a single historical caller propagated its error out of the loop
+    /// and the call returned nothing at all. The daemon's `semantic_locate` had
+    /// the identical shape and is what the ticket was filed on.
+    ///
+    /// The assertion that matters is that the LIVE callers come back. A test
+    /// that only asserted the call no longer errors would also pass if the fix
+    /// dropped every row.
+    #[test]
+    fn a_reference_set_survives_a_caller_whose_file_history_deleted() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+
+        const LIVE_CALLERS: usize = 3;
+        let mut store = EmptyStore::default();
+        let install = |store: &mut EmptyStore, name: &str| -> Entity {
+            let content = format!("export function {name}() {{ return \"{name}\"; }}\n");
+            let hash = blob_store.write(content.as_bytes()).unwrap();
+            let file_id = FilePathId::new(format!("src/{name}.ts"));
+            store.file_hashes.insert(file_id.clone(), hash);
+            let entity = whole_file_entity(&file_id, &content, Some(hash));
+            store.insert_test_entity(entity.clone());
+            entity
+        };
+        let target = install(&mut store, "target");
+        let live: Vec<Entity> = (0..LIVE_CALLERS)
+            .map(|index| install(&mut store, &format!("caller{index}")))
+            .collect();
+        for caller in &live {
+            store.insert_test_calls_relation(caller, &target);
+        }
+        install_empty_store_exact_tree(&mut store, dir.path());
+
+        // The deleted caller joins the graph AFTER the tree is installed: its
+        // path is absent from the current workspace, which admission forbids
+        // within a single change and which history produces across changes. Its
+        // bytes are written, so only the deletion can explain a failed read.
+        let deleted_content = "export function deleted_caller() { return 0; }\n";
+        let deleted_hash = blob_store.write(deleted_content.as_bytes()).unwrap();
+        let deleted_file = FilePathId::new("src/deleted_caller.ts");
+        let deleted = whole_file_entity(&deleted_file, deleted_content, Some(deleted_hash));
+        store.insert_test_entity(deleted.clone());
+        store.insert_test_calls_relation(&deleted, &target);
+
+        let authority = test_repository_authority(dir.path());
+
+        let rows = collect_graph_reference_rows(
+            &store,
+            &target.id,
+            &[RelationKind::Calls],
+            Some(&authority),
+        )
+        .expect("one caller deleted by history must not fail the whole reference set");
+
+        assert_eq!(
+            rows.len(),
+            LIVE_CALLERS,
+            "every live caller must be reported and the deleted one must not be: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| row.snippet.is_some()),
+            "every reported caller must still carry its graph-owned body: {rows:?}"
+        );
+        // Keyed on file_path, NOT on name: every fixture entity is named
+        // "alpha", so a name-based assertion here could not fail and would be
+        // no evidence at all.
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.file_path.as_deref() == Some("src/deleted_caller.ts")),
+            "a caller whose file the current workspace does not contain is not a caller today: \
+             {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.file_path.as_deref() == Some("src/caller0.ts")),
+            "the live callers must be the rows that came back: {rows:?}"
+        );
+    }
+
     /// `find_references` derives repository authority ONCE, not once per caller.
     ///
     /// `collect_graph_reference_rows` projects a bounded body per REFERENCING

@@ -15483,15 +15483,24 @@ pub fn attach_snippets(
             let Some(entity) = match_symbol_entity(&entities, sym) else {
                 continue;
             };
-            if let Some(source) =
-                kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
-                    held_authority,
-                    entity,
-                    opts.max_lines,
-                    opts.max_chars,
-                    source_scope,
-                )?
-            {
+            // A symbol whose file the current workspace does not contain comes
+            // from history and carries no body today; it is skipped rather than
+            // failing the whole page, which is what any repository with a
+            // deleted or renamed file did.
+            let source = match kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
+                held_authority,
+                entity,
+                opts.max_lines,
+                opts.max_chars,
+                source_scope,
+            ) {
+                Ok(source) => source,
+                Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(source) = source {
                 sym.snippet = Some(source.body);
                 filled += 1;
             }
@@ -15537,14 +15546,23 @@ fn bounded_entity_body_with_note(
     max_chars: usize,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<Option<String>> {
-    let Some(source) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
+    // No body exists for an entity the current workspace does not contain, and
+    // that is an ordinary answer on a store carrying history, not a read
+    // failure: the caller renders the hit without a body.
+    let source = match kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
         held_authority,
         entity,
         max_lines,
         max_chars,
         source_scope,
-    )?
-    else {
+    ) {
+        Ok(source) => source,
+        Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(source) = source else {
         return Ok(None);
     };
     let body = source.body;
