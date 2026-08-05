@@ -776,6 +776,14 @@ jobs:
       - name: Validate installer checksum fixtures
         run: python3 scripts/test-install-checksum.py
 
+      # Runs before the suites it polices: a gate whose assertion lost its call
+      # site still exits 0, so passing those suites proves nothing until this
+      # step confirms every check in them is still reachable and still runs on
+      # pull requests. scripts/test-release-workflow-authority.py asserts this
+      # step exists, so the pair cannot be half-removed.
+      - name: Validate that every release gate assertion still runs
+        run: python3 scripts/test-assertion-reachability.py
+
       - name: Validate mandatory Homebrew release outcome gate
         run: python3 scripts/test-homebrew-release-gate.py
 
