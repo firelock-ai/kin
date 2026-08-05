@@ -468,15 +468,24 @@ pub fn trace_body_held<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
 ) -> Result<String> {
-    Ok(read_entity_source_excerpt_detailed_held(
+    // A step whose file the current workspace does not contain has no body to
+    // show, which is the same outcome as an entity with no projectable span and
+    // takes the same signature fallback. The trace keeps walking; one historical
+    // step does not end the chain.
+    let source = match read_entity_source_excerpt_detailed_held(
         held,
         entity,
         MCP_SOURCE_MAX_LINES,
         MCP_SOURCE_MAX_CHARS,
         EntitySourceScope::WorkspaceHead,
-    )?
-    .map(|source| source.body)
-    .unwrap_or_else(|| entity.signature.clone()))
+    ) {
+        Ok(source) => source,
+        Err(error) if is_absent_at_generation(&error) => None,
+        Err(error) => return Err(error),
+    };
+    Ok(source
+        .map(|source| source.body)
+        .unwrap_or_else(|| entity.signature.clone()))
 }
 
 pub fn looks_like_constant_identifier(token: &str) -> bool {
@@ -1037,8 +1046,20 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
 
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
-        let snippet =
-            read_bounded_entity_snippet_held(&held, &entity, EntitySourceScope::WorkspaceHead)?;
+        // A referencing entity the current workspace does not contain is a
+        // reference from history, not a caller of this code today, so it is not
+        // reported as one. Failing the whole reference set over it -- the shape
+        // this had -- made `find_references` unusable on any repository that
+        // ever deleted a file.
+        let snippet = match read_bounded_entity_snippet_held(
+            &held,
+            &entity,
+            EntitySourceScope::WorkspaceHead,
+        ) {
+            Ok(snippet) => snippet,
+            Err(error) if is_absent_at_generation(&error) => continue,
+            Err(error) => return Err(error),
+        };
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
             entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
@@ -1335,6 +1356,41 @@ fn graph_source_gap(message: impl Into<String>) -> McpError {
         "graph authority gap: {}",
         message.into()
     )))
+}
+
+/// The entity's path does not exist at the workspace's current generation.
+///
+/// Deliberately NOT a [`graph_source_gap`]. Authority did not fail here and
+/// nothing is missing that the graph promised: the graph ingests whole history,
+/// so it carries entities for files a repository deleted or renamed, and the
+/// current workspace correctly does not contain them. Counting this as a graph
+/// miss would report every ordinary repository with a deletion in its history as
+/// a broken store, and typing it as a gap is what made one historical candidate
+/// fatal to a whole retrieval page.
+fn entity_absent_at_generation(
+    entity: &Entity,
+    path: &str,
+    generation: impl std::fmt::Display,
+    workspace_id: impl std::fmt::Display,
+) -> McpError {
+    LAST_READ_SOURCE.with(|f| f.set("absent-at-generation"));
+    McpError::WorkspaceAbsent(format!(
+        "entity {} ({}) records its source at '{path}', which the workspace does not contain at \
+         generation {generation}; the graph carries this entity from history, so it has no body \
+         in the current workspace (workspace {workspace_id})",
+        entity.id, entity.name
+    ))
+}
+
+/// True when `error` reports an entity absent from the current generation.
+///
+/// The predicate a multi-entity projection uses to skip one candidate while
+/// still failing loudly on every genuine authority gap: a tree that cannot be
+/// sampled, a blob the graph promised and cannot produce, a span that does not
+/// describe its bytes, or a path reused by a different artifact all remain
+/// fatal.
+pub fn is_absent_at_generation(error: &McpError) -> bool {
+    matches!(error, McpError::WorkspaceAbsent(_))
 }
 
 /// The text a retained authority failure must replay verbatim.
@@ -1683,16 +1739,22 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // with generation N+1's provenance, with nothing serializing the two.
             let sample = held.workspace_sample()?;
             let workspace = &sample.workspace;
+            // Absence from the current tree is graph truth answering, not
+            // authority failing: the store carries history, and a file deleted
+            // or renamed upstream is legitimately not here. Typed apart from a
+            // gap so a multi-entity projection can skip THIS candidate while a
+            // genuinely unservable path below still fails the read.
             let artifact = workspace
                 .tree
                 .artifact_at_path(&path)
                 .cloned()
                 .ok_or_else(|| {
-                    graph_source_gap(format!(
-                        "entity {} points at '{}' but that path is absent from workspace {} at \
-                         generation {}",
-                        entity.id, recorded_origin.0, workspace.workspace_id, workspace.generation
-                    ))
+                    entity_absent_at_generation(
+                        entity,
+                        &recorded_origin.0,
+                        workspace.generation,
+                        workspace.workspace_id,
+                    )
                 })?;
             let source_change_id = sample.base_change_id;
 

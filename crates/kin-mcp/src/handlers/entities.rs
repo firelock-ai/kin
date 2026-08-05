@@ -656,13 +656,24 @@ pub fn handle_get_context_pack<G: GraphStore>(
             });
             if !compact {
                 obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
-                let body = read_entity_source_excerpt_detailed_held(
+                // A dependency whose file the current workspace does not contain
+                // is still a dependency graph truth asserts, so it stays in the
+                // pack and says why it has no body. Dropping it would shrink a
+                // structural answer silently, and failing here would lose the
+                // whole pack over one entity that history explains.
+                let (body, absent_reason) = match read_entity_source_excerpt_detailed_held(
                     &held,
                     &e,
                     MCP_SOURCE_MAX_LINES,
                     MCP_SOURCE_MAX_CHARS,
                     EntitySourceScope::WorkspaceHead,
-                )?;
+                ) {
+                    Ok(body) => (body, None),
+                    Err(error) if is_absent_at_generation(&error) => {
+                        (None, Some(error.to_string()))
+                    }
+                    Err(error) => return Err(error),
+                };
                 let source = LAST_READ_SOURCE.with(|f| f.get());
                 obj["source"] = serde_json::json!(source);
                 // Same rule as the focal body: a dependency's `body` is the
@@ -678,7 +689,9 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     }
                     None => {
                         obj["body"] = serde_json::Value::Null;
-                        obj["body_unavailable"] = serde_json::json!(entity_body_gap_reason(&e));
+                        obj["body_unavailable"] = serde_json::json!(
+                            absent_reason.unwrap_or_else(|| entity_body_gap_reason(&e))
+                        );
                     }
                 }
             }

@@ -6185,6 +6185,16 @@ fn build_semantic_locate_result(
                     source_scope,
                 ) {
                     Ok(snippet) => snippet,
+                    // A candidate the current workspace does not contain is
+                    // history, not a failure. Whole-history ingest means every
+                    // repository that ever deleted or renamed a file carries
+                    // such entities, so failing the call here made retrieval
+                    // unusable on essentially every real repository. The
+                    // candidate is dropped from a current-workspace ranking and
+                    // the page fills from the ones below it.
+                    Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {
+                        continue;
+                    }
                     Err(error) => {
                         return kin_mcp::ToolCallResult::error(format!(
                             "semantic_locate could not read graph-owned source for entity {}: \
