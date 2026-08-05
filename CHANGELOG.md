@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-05
+
+### Fixed
+
+- Treat a path absent at the current generation as history, not an authority gap (#617)
+
+### Changed
+
+- Refresh README banner, lead, and demo copy (#613)
+- Embed the measured ripgrep impact capture in the README demo slot (#619)
+
 ## [0.5.0] - 2026-08-04
 
 ### Changed
