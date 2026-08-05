@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-08-05
+
+### Changed
+
+- Launch assistants through a per-CLI adapter registry with a semantic-only profile (#624)
+- Report which assertion failed in the release follow-up proofs (#626)
+- Correct the native Windows support notice to match shipped behavior (#628)
+
+
 ## [0.5.3] - 2026-08-05
 
 ### Changed
