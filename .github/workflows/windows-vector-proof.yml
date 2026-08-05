@@ -173,11 +173,21 @@ jobs:
             | tee "$RUNNER_TEMP/kin-semantic-search.json"
           kin.exe locate "how are settings loaded" --json --explain --max-files 5 \
             | tee "$RUNNER_TEMP/kin-locate.json"
-          # `kin status` deliberately does not auto-start the daemon, and the
-          # daemon `kin embed` used has exited by now. Read it AFTER the queries
-          # above, which do start one. Reading it earlier returns
-          # state=unobserved reason=no_running_daemon, which is a dead harness
-          # rather than a shortfall, and is exactly how the first run failed.
+          # `kin status` deliberately does not auto-start a daemon, so it reports
+          # whatever happens to be running at the instant it runs.
+          #
+          # An earlier version of this comment said to place the read after the
+          # queries above "which do start one", implying that ordering makes the
+          # read observe. It does not. Measured on a native Windows guest against
+          # a fully embedded store: a query does start a daemon, but that daemon
+          # is gone before the next process starts, so this read reports
+          # state=unobserved reason=no_running_daemon wherever it is placed, and
+          # returns that negative in under a second rather than hanging.
+          #
+          # Keeping it after the queries costs nothing, so it stays there, but do
+          # not read the placement as buying coverage. Nothing here depends on it:
+          # the read is captured as a diagnostic and every assertion below runs
+          # off `kin embed`'s own report instead.
           kin.exe status --json | tee "$RUNNER_TEMP/kin-status.json"
 
       - name: Assert the runtime proved semantic search
@@ -218,11 +228,16 @@ jobs:
           // unobserved/no_running_daemon no matter how much was embedded. Three
           // runs here hit exactly that, which is what moved the assertion off it.
           //
-          // It is NOT that Windows cannot observe coverage. An earlier version of
-          // this comment said so and was wrong: on a native Windows host with a
-          // live daemon, `kin status --json` returns
-          // {"state":"observed","source":"live_query_graph","indexed":6954,...}.
-          // The field works; only its availability at an arbitrary moment does not.
+          // Do not read that as "Windows cannot observe coverage" either. Both
+          // directions have been overstated in this comment before, so here is
+          // exactly what is and is not known. Every archived artifact from this
+          // job and from the guest reports unobserved/no_running_daemon. An
+          // earlier version of this comment cited a specific observed reading
+          // with an indexed count; that citation is withdrawn, because no
+          // artifact was ever archived behind it and a later run on the same
+          // store with the same binaries did not reproduce it. Whether this field
+          // can report observed on Windows at all is therefore open, and tracked
+          // by FIR-1943 rather than asserted here.
           //
           // So gate on the embed command's own report above, which is the direct
           // output of the process that did the work and depends on nothing still
