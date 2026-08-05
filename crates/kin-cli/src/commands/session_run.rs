@@ -61,6 +61,15 @@ impl SessionProjection {
             .strip_prefix("session-")
             .unwrap_or(self.name.as_str())
     }
+
+    /// Session-metadata scratch space beside the projection root.
+    ///
+    /// Files here live exactly as long as the session but are outside the
+    /// reconciled tree, so a launch profile can never enter the graph as a
+    /// working-tree change.
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.dir.join("launch-profile")
+    }
 }
 
 /// Materialize one disposable session projection through the daemon.
@@ -462,13 +471,11 @@ pub async fn open(
 }
 
 /// Assistants `kin with` knows how to launch.
+///
+/// Resolution lives in the adapter registry so the launcher and `kin setup`'s
+/// registration writers can never disagree about which assistants exist.
 pub fn assistant_program(assistant: &str) -> Result<&'static str> {
-    match assistant.trim().to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" => Ok("claude"),
-        "codex" => Ok("codex"),
-        "gemini" | "gemini-cli" => Ok("gemini"),
-        other => bail!("unknown assistant '{other}'; kin with supports: claude, codex, gemini"),
-    }
+    Ok(super::assistant_adapter::adapter_for(assistant)?.program())
 }
 
 /// `kin with <assistant> [-- <task...>]`.
@@ -478,6 +485,7 @@ pub async fn with(
     passive_guidance: bool,
     restrict_discovery: bool,
     restrict_filesystem: bool,
+    semantic_only: bool,
     task: Vec<String>,
 ) -> Result<()> {
     if restrict_discovery || restrict_filesystem {
@@ -500,7 +508,14 @@ pub async fn with(
         );
     }
 
-    let program = assistant_program(&assistant)?;
+    let adapter = super::assistant_adapter::adapter_for(&assistant)?;
+    let program = adapter.program();
+    // Probe support before materializing: an unsupported assistant must
+    // refuse without minting a projection it would then leak.
+    if semantic_only {
+        adapter.semantic_only(Path::new(""), cfg!(windows))?;
+    }
+
     let layout = discover_layout()?;
     let mut projection = materialize(layout, None, None).await?;
     let session_id = register_lease(
@@ -521,6 +536,22 @@ pub async fn with(
     eprintln!("Session: {session_id}");
 
     let mut command = std::process::Command::new(program);
+    if semantic_only {
+        let scratch = projection.scratch_dir();
+        let profile = adapter.semantic_only(&scratch, cfg!(windows))?;
+        std::fs::create_dir_all(&scratch)?;
+        for file in &profile.files {
+            let path = scratch.join(&file.relative_path);
+            std::fs::write(&path, &file.contents)?;
+            #[cfg(unix)]
+            if file.executable {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        command.args(&profile.extra_args);
+        eprintln!("{}", profile.disclosure);
+    }
     if !task.is_empty() {
         command.args(&task);
     }

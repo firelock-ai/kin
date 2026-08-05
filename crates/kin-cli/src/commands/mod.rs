@@ -3,6 +3,7 @@
 
 pub mod approvals;
 pub mod assistant;
+pub mod assistant_adapter;
 pub mod audit;
 pub mod auth;
 pub mod backup;

@@ -855,6 +855,11 @@ enum Command {
         /// In native mode, block both filesystem discovery and direct file reads
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
+        /// Deny the assistant's native discovery tools for this launch, leaving
+        /// Kin's semantic tools as the only discovery surface; the enforcement
+        /// tier is printed at launch and differs per assistant
+        #[arg(long)]
+        semantic_only: bool,
         /// Task prompt
         #[arg(last = true)]
         task: Vec<String>,
@@ -3079,6 +3084,7 @@ fn main() -> Result<()> {
                     passive_guidance,
                     restrict_discovery,
                     restrict_filesystem,
+                    semantic_only,
                     task,
                 } => {
                     commands::capabilities::require_ready("with")?;
@@ -3088,6 +3094,7 @@ fn main() -> Result<()> {
                         passive_guidance,
                         restrict_discovery,
                         restrict_filesystem,
+                        semantic_only,
                         task,
                     )
                     .await
