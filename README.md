@@ -1,42 +1,48 @@
 <p align="center">
-  <img src="docs/assets/kin-banner.png" alt="Kin - Semantic Repository Substrate" width="100%" />
+  <img src="docs/assets/kin-banner-2026.png" alt="Kin, the semantic system of record for AI-written software" width="100%" />
 </p>
+
+<!-- Demo GIF slot: embed the launch demo GIF here, directly under the banner,
+     once the final asset lands in docs/assets/. Do not link an asset that is
+     not in the tree. -->
 
 <div align="center">
 
-<h3>Software that remembers itself.</h3>
-
-<p><em>Exact context, not more.</em></p>
+<h3>The diff is not the change.</h3>
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Latest release](https://img.shields.io/badge/release-latest-6E56CF.svg)](https://github.com/firelock-ai/kin/releases/latest) [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 </div>
 
-Kin is the system of record for AI-written software. AI agents can write a
-change faster than a team can establish what it touches, whether it reverses
-an earlier fix, and how far its blast radius reaches. Git records files and
-line history. Kin records the software itself as a graph of entities,
-relations, changes, and provenance, then gives humans and agents one semantic
-authority to query and review.
+AI agents can write a change faster than a team can establish what it touches,
+whether it reverses an earlier fix, and how far its consequences reach. Git
+records files and line history. Kin records the software itself as a graph of
+entities, relations, changes, and provenance, then gives humans and agents one
+semantic authority to query and review. What a change touches shows up before
+it merges, and agents work from exact context instead of re-reading the
+repository.
 
-Kin is a public alpha. It is usable today as a local CLI, daemon, MCP server,
-review surface, and graph-backed filesystem projection. It is pre-1.0, so expect
-rough edges and breaking changes. See the [latest stable release](https://github.com/firelock-ai/kin/releases/latest)
+Kin is the semantic system of record for AI-written software. It is a public
+alpha, usable today as a local CLI, daemon, MCP server, review surface, and
+graph-backed filesystem projection. It is pre-1.0, so expect rough edges and
+breaking changes. See the [latest stable release](https://github.com/firelock-ai/kin/releases/latest)
 and the [current limitations](#platform-and-maturity) before adopting it in a
 critical workflow.
 
 ## See it on a real repository
 
-A one-line signature change in ripgrep looks harmless in the diff. Asking the
-graph before any build runs:
+A one-line signature change in ripgrep looks harmless in the diff. Asked
+before any compiler runs, on a graph that was already built, `kin impact`
+names the entities the edit affects, from the direct callers of the changed
+signature out through the wider blast radius.
 
-<div align="center">
-<img src="docs/assets/kin-impact-ripgrep.png" alt="A git diff adding a parameter to resolve_binary, then kin impact listing 13 impacted entities within 3 hops, grouped by hop distance" width="920">
-</div>
+<!-- Demo capture slot: embed the regenerated kin impact capture here once the
+     final asset lands in docs/assets/. Do not re-link the retired capture. -->
 
-The three direct callers stopped compiling the moment that parameter changed.
-`kin impact` named them from graph truth, with the two and three hop blast
-radius behind them, before any compiler ran.
+Kin surfaces what the change touches. Whether the change is correct stays with
+your compiler, tests, and review. The graph is built beforehand by `kin init`,
+and building it is the expensive part; after that, impact questions are
+answered from graph truth, not from re-reading the tree.
 
 ## The stack
 
@@ -112,16 +118,21 @@ names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,
 `kin-linux-x86_64`, and `kin-windows-x86_64`; use the Unix `.tar.gz` or Windows
 `.zip` suffix shown on the latest release page.
 
-Homebrew and npm entry points resolve the same public release channel:
+The npm entry point resolves the same public release channel:
 
 ```sh
-brew install firelock-ai/kin/kin
-# or
 npm install -g @kinlab/kin@latest
 ```
 
+A Homebrew tap exists but publishes on its own cadence and can lag the latest
+release; prefer the installer, the release archives, or npm until a version
+you can verify appears there.
+
 On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
-Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+Native Windows support is early: repositories admit and graph and lexical
+queries answer natively, but this build has no semantic vector search yet and
+its end-to-end install proof is still maturing, so WSL2 remains the
+recommended path for full Kin.
 Read [Platform and maturity](#platform-and-maturity) below before choosing a
 Windows install path.
 
@@ -169,7 +180,7 @@ add local vector similarity over them, and confirm coverage with
 
 ## Review an AI-written change
 
-**AI writes code. Kin proves the change.**
+**AI writes code. Kin proves what changed.**
 
 Run `kin init` on the branch you want to review so the relevant Git history is in
 the graph, then pass explicit commit SHAs to the report-only shadow gate:
@@ -179,15 +190,15 @@ kin review shadow "$(git rev-parse main)..$(git rev-parse HEAD)"
 ```
 
 The result is `PASS`, `NEEDS ATTENTION`, or `WOULD BLOCK`, with graph-derived
-blast radius, repair context, and audit evidence. The command does not block a
-merge or mutate graph state. It produces evidence for a human or CI policy to
-act on.
+blast radius, repair context, and recorded evidence. Authorship is declared,
+not verified. The command does not block a merge or mutate graph state. It
+produces evidence for a human or CI policy to act on.
 
 ## How Kin relates to Git
 
-Kin is designed to replace Git as the repository authority. During brownfield
-adoption, Git remains an explicit import/export interoperability boundary; it
-never answers Kin runtime queries or repairs missing graph truth.
+Beside Git today. Repository authority over time. During brownfield adoption,
+Git remains an explicit import/export interoperability boundary; it never
+answers Kin runtime queries or repairs missing graph truth.
 
 - `kin init` imports complete reachable Git history and exact parent edges.
   Kin deliberately has no partial-history or snapshot-only initialization mode.
@@ -200,20 +211,6 @@ never answers Kin runtime queries or repairs missing graph truth.
   no-replace destination publication is acknowledged. Capability-anchored
   publication is currently available on Unix hosts; other hosts refuse before
   creating the export.
-- `kin eject` first proves that the graph-owned workspace, source blobs, and
-  working projection agree exactly. It builds and verifies a complete ordinary
-  Git replacement, stops graph projection, revalidates authority, then swaps
-  authority in a durable order: the replacement `.git/` is installed first,
-  then the locked `.kin/` namespace is detached with a no-replace rename. The
-  replacement `.git/` comes from Kin authority; the previous repository-local
-  `.git` entry and the detached `.kin/` are retained in a private, recoverable
-  sibling archive.
-  Credential-free remote and branch-tracking settings sealed during import are
-  restored without copying ambient Git configuration.
-  Kin intentionally retains that archive until the operator has independently
-  backed up and removes it. Capability-anchored eject is currently available on
-  Unix hosts; Windows fails before namespace mutation until an equally durable
-  retained-handle transaction is available.
 
 This lets a team migrate an existing repository without giving up its editor,
 compiler, build system, or Git interoperability while Kin becomes authoritative.
@@ -227,16 +224,22 @@ boundaries:
 | --- | --- | --- |
 | macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Shipped and exercised on both architectures. It uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
 | Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. Current artifacts require glibc 2.39; Alpine/musl and older-glibc distributions are not supported projection hosts. The arm64 release proof runs on Ubuntu 24.04. |
-| Native Windows x86_64 | The release archive starts and exposes repository-free diagnostics, but `kin init` fails closed; no repository-backed workflow is supported. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+| Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but this build ships without semantic vector search and its end-to-end install proof is still maturing. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+
+First indexing reads the entire reachable Git history, so `kin init` on a
+large or long-lived repository takes minutes, not seconds, before embedding
+begins. After `init` returns, the daemon continues preparing in the
+background, and the first agent calls on a large repository can take
+noticeably longer to answer.
 
 Bounded arm64 testing found the core graph and lexical path usable at 512 MB,
 but full embedding downloads a roughly 522 MB model and currently needs 2 GB as
 the safe operating floor; 1 GB is an unsafe edge and 512 MB can terminate during
 embedding. These are observed alpha constraints, not universal sizing promises.
 
-A successful `kin --version` proves only that the core binary runs. It does not
-prove VFS compatibility or a live graph-backed projection. On a supported Unix
-host, use `kin setup status`, `kin-vfs status --workspace .`, and a real
+A successful `kin --version` establishes only that the core binary runs. It
+does not establish VFS compatibility or a live graph-backed projection. On a
+supported Unix host, use `kin setup status`, `kin-vfs status --workspace .`, and a real
 `kin-vfs exec --workspace . -- <command>` launch. The VFS launcher includes an
 interposition canary and reports when the operating system strips the shim.
 The [kin-vfs README](https://github.com/firelock-ai/kin-vfs#current-platform-and-package-boundaries)
@@ -246,8 +249,8 @@ Release assets are checksum-published and the release workflow runs anonymous
 installation, daemon/MCP, embedding, and real graph-backed VFS projection checks
 across its supported runner matrix. The workflow itself is public:
 [Install Proof](https://github.com/firelock-ai/kin/actions/workflows/install-proof.yml).
-A green release proves those exact artifacts and environments; it is not a claim
-that every distribution, tool, or repository shape is already covered.
+A green release establishes those exact artifacts and environments; it is not a
+claim that every distribution, tool, or repository shape is already covered.
 
 ## Proof posture
 
@@ -273,3 +276,5 @@ that measured scope as hypotheses until they have their own reproducible proof.
 ## License
 
 [Apache-2.0](LICENSE).
+
+<p align="center"><em>Software that remembers itself.</em></p>

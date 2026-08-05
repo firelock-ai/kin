@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320">
+  <defs>
+    <linearGradient id="kg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="50%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="320" fill="#0a0d12"/>
+  <g transform="translate(485, 158) scale(3.4)">
+    <line x1="0" y1="-18" x2="0" y2="18" stroke="url(#kg)" stroke-width="3.5" stroke-linecap="round"/>
+    <line x1="0" y1="0" x2="16" y2="-16" stroke="url(#kg)" stroke-width="3.5" stroke-linecap="round"/>
+    <line x1="0" y1="0" x2="16" y2="16" stroke="url(#kg)" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="0" cy="-18" r="3.5" fill="url(#kg)"/>
+    <circle cx="0" cy="18" r="3.5" fill="url(#kg)"/>
+    <circle cx="0" cy="0" r="4.5" fill="url(#kg)"/>
+    <circle cx="16" cy="-16" r="3.5" fill="url(#kg)"/>
+    <circle cx="16" cy="16" r="3.5" fill="url(#kg)"/>
+  </g>
+  <text x="581" y="212" fill="#ffffff" font-family="Inter ExtraBold" font-size="150" letter-spacing="-6">kin</text>
+  <text x="800" y="112" fill="#71717a" font-family="Inter Medium" font-size="22">&#8482;</text>
+</svg>
