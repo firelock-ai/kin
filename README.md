@@ -118,10 +118,15 @@ names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,
 `kin-linux-x86_64`, and `kin-windows-x86_64`; use the Unix `.tar.gz` or Windows
 `.zip` suffix shown on the latest release page.
 
-The curl installer above tracks the latest release directly. Homebrew and npm
-entry points exist but publish on their own cadence and can lag the latest
-release; prefer the installer or the release archives until a version you can
-verify appears on those channels.
+The npm entry point resolves the same public release channel:
+
+```sh
+npm install -g @kinlab/kin@latest
+```
+
+A Homebrew tap exists but publishes on its own cadence and can lag the latest
+release; prefer the installer, the release archives, or npm until a version
+you can verify appears there.
 
 On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
 Native Windows support is early: repositories admit and graph and lexical
