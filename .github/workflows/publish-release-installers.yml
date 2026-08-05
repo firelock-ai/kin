@@ -51,13 +51,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/heads/main ]
+          # Name the field and the observed value: a bare [ ] under `set -e`
+          # reports a real refusal as a bare exit code.
+          assert_field() {
+            [ "$2" = "$3" ] || {
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            }
+          }
+          assert_field "triggering ref" "$GITHUB_REF" refs/heads/main
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
-          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
+          assert_field "checked-out head" "$(git rev-parse HEAD)" "$GITHUB_SHA"
           ancestry="$(gh api \
             "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${current}" \
             --jq .status)"
-          [ "$ancestry" = ahead ] || [ "$ancestry" = identical ]
+          [ "$ancestry" = ahead ] || [ "$ancestry" = identical ] || {
+            echo "::error::callback sha ${GITHUB_SHA} compares '$ancestry' to live main ${current}, expected ahead or identical"
+            exit 1
+          }
 
           authority_paths=(
             .github/workflows/publish-release-installers.yml
@@ -84,20 +95,35 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "$KIN_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$KIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # A bare [ ] under `set -e` exits 1 printing nothing, so a genuine
+          # refusal reaches the log as an unexplained exit code. Assert through
+          # a helper that names the field and the value actually observed.
+          assert_field() {
+            [ "$2" = "$3" ] || {
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            }
+          }
+          assert_matches() {
+            [[ "$2" =~ $3 ]] || {
+              echo "::error::$1: '$2' does not match $3"
+              exit 1
+            }
+          }
+          assert_matches "source run id" "$SOURCE_RUN_ID" '^[0-9]+$'
+          assert_matches "release tag" "$KIN_TAG" '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          assert_matches "release sha" "$KIN_SHA" '^[0-9a-f]{40}$'
 
           run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
-          [ "$(jq -r '.id | tostring' <<< "$run")" = "$SOURCE_RUN_ID" ]
-          [ "$(jq -r .status <<< "$run")" = completed ]
-          [ "$(jq -r .conclusion <<< "$run")" = success ]
-          [ "$(jq -r .event <<< "$run")" = push ]
-          [ "$(jq -r .path <<< "$run")" = .github/workflows/release.yml ]
-          [ "$(jq -r .repository.full_name <<< "$run")" = "$GITHUB_REPOSITORY" ]
-          [ "$(jq -r .head_repository.full_name <<< "$run")" = "$GITHUB_REPOSITORY" ]
-          [ "$(jq -r .head_branch <<< "$run")" = "$KIN_TAG" ]
-          [ "$(jq -r .head_sha <<< "$run")" = "$KIN_SHA" ]
+          assert_field "source run id" "$(jq -r '.id | tostring' <<< "$run")" "$SOURCE_RUN_ID"
+          assert_field "source run status" "$(jq -r .status <<< "$run")" completed
+          assert_field "source run conclusion" "$(jq -r .conclusion <<< "$run")" success
+          assert_field "source run event" "$(jq -r .event <<< "$run")" push
+          assert_field "source run workflow" "$(jq -r .path <<< "$run")" .github/workflows/release.yml
+          assert_field "source run repository" "$(jq -r .repository.full_name <<< "$run")" "$GITHUB_REPOSITORY"
+          assert_field "source run head repository" "$(jq -r .head_repository.full_name <<< "$run")" "$GITHUB_REPOSITORY"
+          assert_field "source run head branch" "$(jq -r .head_branch <<< "$run")" "$KIN_TAG"
+          assert_field "source run head sha" "$(jq -r .head_sha <<< "$run")" "$KIN_SHA"
 
           ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${KIN_TAG}")"
           object_type="$(jq -r .object.type <<< "$ref")"
@@ -108,19 +134,25 @@ jobs:
             object_type="$(jq -r .object.type <<< "$tag_object")"
             peeled="$(jq -r .object.sha <<< "$tag_object")"
           done
-          [ "$object_type" = commit ]
-          [ "$peeled" = "$KIN_SHA" ]
+          assert_field "release tag object type" "$object_type" commit
+          assert_field "release tag target sha" "$peeled" "$KIN_SHA"
 
           release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${KIN_TAG}")"
-          [ "$(jq -r .draft <<< "$release")" = false ]
-          [ "$(jq -r .prerelease <<< "$release")" = false ]
-          [ -n "$(jq -r '.published_at // empty' <<< "$release")" ]
+          assert_field "release draft flag" "$(jq -r .draft <<< "$release")" false
+          assert_field "release prerelease flag" "$(jq -r .prerelease <<< "$release")" false
+          [ -n "$(jq -r '.published_at // empty' <<< "$release")" ] || {
+            echo "::error::release ${KIN_TAG} has no published_at timestamp"
+            exit 1
+          }
           release_id="$(jq -r '.id | tostring' <<< "$release")"
           latest_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.id | tostring')"
-          [ "$release_id" = "$latest_id" ]
+          assert_field "release id versus GitHub Latest" "$release_id" "$latest_id"
 
           status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${KIN_SHA}...main" --jq .status)"
-          [ "$status" = ahead ] || [ "$status" = identical ]
+          [ "$status" = ahead ] || [ "$status" = identical ] || {
+            echo "::error::released sha ${KIN_SHA} compares '$status' to main, expected ahead or identical"
+            exit 1
+          }
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
       - name: Checkout exact released installer sources
@@ -135,14 +167,22 @@ jobs:
         id: installers
         run: |
           set -euo pipefail
-          [ "$(git -C release-source rev-parse HEAD)" = "$KIN_SHA" ]
+          checked_out="$(git -C release-source rev-parse HEAD)"
+          [ "$checked_out" = "$KIN_SHA" ] || {
+            echo "::error::installer sources are at ${checked_out}, expected released sha ${KIN_SHA}"
+            exit 1
+          }
           sh -n release-source/scripts/install.sh
           # shellcheck disable=SC2016 # PowerShell variables must reach pwsh literally.
           pwsh -NoProfile -Command '$ErrorActionPreference="Stop"; $t=$null; $e=$null; [System.Management.Automation.Language.Parser]::ParseFile("release-source/scripts/install.ps1",[ref]$t,[ref]$e)|Out-Null; if($e.Count){exit 1}'
           install_sha256="$(sha256sum release-source/scripts/install.sh | awk '{print $1}')"
           install_ps1_sha256="$(sha256sum release-source/scripts/install.ps1 | awk '{print $1}')"
-          [[ "$install_sha256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$install_ps1_sha256" =~ ^[0-9a-f]{64}$ ]]
+          for pair in "install.sh:$install_sha256" "install.ps1:$install_ps1_sha256"; do
+            [[ "${pair#*:}" =~ ^[0-9a-f]{64}$ ]] || {
+              echo "::error::${pair%%:*} digest '${pair#*:}' is not 64 lowercase hex characters"
+              exit 1
+            }
+          done
           echo "install_sha256=$install_sha256" >> "$GITHUB_OUTPUT"
           echo "install_ps1_sha256=$install_ps1_sha256" >> "$GITHUB_OUTPUT"
 
@@ -233,6 +273,14 @@ jobs:
           KIN_HOMEBREW_VERIFY_MAX_WAIT_SECONDS: 900
         run: |
           set -euo pipefail
+          # Name the field and the observed value: a bare [ ] under `set -e`
+          # reports a real downstream refusal as a bare exit code.
+          assert_field() {
+            [ "$2" = "$3" ] || {
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            }
+          }
           expected_title="Update formula ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}"
           downstream_id=""
           for _ in $(seq 1 36); do
@@ -246,11 +294,16 @@ jobs:
               state="$(gh api "repos/firelock-ai/homebrew-kin/actions/runs/${downstream_id}")"
               status="$(jq -r .status <<< "$state")"
               if [ "$status" = completed ]; then
-                [ "$(jq -r .conclusion <<< "$state")" = success ]
-                [ "$(jq -r .event <<< "$state")" = repository_dispatch ]
-                [ "$(jq -r .path <<< "$state")" = .github/workflows/update-formula.yml ]
-                [ "$(jq -r .head_branch <<< "$state")" = main ]
-                [ "$(jq -r .repository.full_name <<< "$state")" = firelock-ai/homebrew-kin ]
+                assert_field "Homebrew run ${downstream_id} conclusion" \
+                  "$(jq -r .conclusion <<< "$state")" success
+                assert_field "Homebrew run ${downstream_id} event" \
+                  "$(jq -r .event <<< "$state")" repository_dispatch
+                assert_field "Homebrew run ${downstream_id} workflow" \
+                  "$(jq -r .path <<< "$state")" .github/workflows/update-formula.yml
+                assert_field "Homebrew run ${downstream_id} head branch" \
+                  "$(jq -r .head_branch <<< "$state")" main
+                assert_field "Homebrew run ${downstream_id} repository" \
+                  "$(jq -r .repository.full_name <<< "$state")" firelock-ai/homebrew-kin
                 break
               fi
             fi
@@ -279,6 +332,14 @@ jobs:
           DISPATCHED_AT: ${{ steps.installer-dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
+          # Name the field and the observed value: a bare [ ] under `set -e`
+          # reports a real downstream refusal as a bare exit code.
+          assert_field() {
+            [ "$2" = "$3" ] || {
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            }
+          }
           expected_title="Publish installers ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}"
           downstream_id=""
           for _ in $(seq 1 36); do
@@ -292,11 +353,16 @@ jobs:
               state="$(gh api "repos/firelock-ai/kin-infra/actions/runs/${downstream_id}")"
               status="$(jq -r .status <<< "$state")"
               if [ "$status" = completed ]; then
-                [ "$(jq -r .conclusion <<< "$state")" = success ]
-                [ "$(jq -r .event <<< "$state")" = repository_dispatch ]
-                [ "$(jq -r .path <<< "$state")" = .github/workflows/publish-install.yml ]
-                [ "$(jq -r .head_branch <<< "$state")" = main ]
-                [ "$(jq -r .repository.full_name <<< "$state")" = firelock-ai/kin-infra ]
+                assert_field "installer run ${downstream_id} conclusion" \
+                  "$(jq -r .conclusion <<< "$state")" success
+                assert_field "installer run ${downstream_id} event" \
+                  "$(jq -r .event <<< "$state")" repository_dispatch
+                assert_field "installer run ${downstream_id} workflow" \
+                  "$(jq -r .path <<< "$state")" .github/workflows/publish-install.yml
+                assert_field "installer run ${downstream_id} head branch" \
+                  "$(jq -r .head_branch <<< "$state")" main
+                assert_field "installer run ${downstream_id} repository" \
+                  "$(jq -r .repository.full_name <<< "$state")" firelock-ai/kin-infra
                 break
               fi
             fi
