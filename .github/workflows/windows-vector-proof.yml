@@ -25,16 +25,13 @@ name: Windows vector proof
 # input feeding `actions/checkout`'s `ref:` would add an injection surface and
 # buy nothing.
 #
-# TEMPORARY, REMOVE BEFORE MERGE: `workflow_dispatch` is only dispatchable once
-# the file exists on the default branch, which makes it unrunnable on the very
-# branch that introduces it. The push trigger below is scoped to this one lane
-# branch purely so the proof can produce evidence pre-merge. It runs the same
-# job body the dispatch path will.
+# Note for whoever next changes this file: `workflow_dispatch` only becomes
+# dispatchable once the workflow exists on the default branch, so it cannot be
+# run on the branch that introduces or renames it. Proving a change here
+# pre-merge needs a temporary `push:` trigger scoped to that branch, removed
+# before merge. That is how run 30969196206 was produced.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - chore/lane-nwvec-kin
 
 permissions:
   contents: read
