@@ -7,13 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-08-05
+
+### Changed
+
+- Ship native Windows semantic vector search (#616)
+- Correct the Windows proof's account of when status can observe (#621)
+- Bump actions/upload-artifact from 4 to 7 (#533)
+- Build the Windows daemon the authority tests drive before running them (#615)
+
+
 ## [0.5.1] - 2026-08-05
+
+### Fixed
+
+- Treat a path absent at the current generation as history, not an authority gap (#617)
 
 ### Changed
 
 - Refresh README banner, lead, and demo copy (#613)
 - Embed the measured ripgrep impact capture in the README demo slot (#619)
-
 
 ## [0.5.0] - 2026-08-04
 
