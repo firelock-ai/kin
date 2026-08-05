@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Native Windows semantic vector search, executed rather than compiled.
+#
+# Everything else that touches vectors on Windows is compile-time evidence: the
+# feature graph resolves, the binary reports its flags, the archive packages.
+# None of that shows that embedding inference has ever RUN on Windows, and until
+# this workflow existed nothing in the fleet had. That gap is the whole reason
+# the platform shipped vector-free, so it gets its own executed proof.
+#
+# `workflow_dispatch` only, deliberately:
+#   - It fetches a ~522 MB model. On every pull request that is a tax nobody
+#     asked for, and on the release-gating installer leg it would make the mint
+#     hostage to huggingface.co being reachable.
+#   - As written it produces no check run on a pull request or merge group, so
+#     it is not a required-context producer.
+#
+# That last property is NOT enforced anywhere, and an earlier version of this
+# comment wrongly claimed it was. The workflow-job census in
+# scripts/test-release-workflow-authority.py pins this workflow's path, job id
+# and display name, but it never reads `on:` triggers: adding `pull_request:`
+# here leaves the suite green (falsified directly, both ways). So keeping this
+# dispatch-only is a review responsibility, not a guarded invariant. Anyone
+# adding a trigger is adding a check run to every pull request. Run 30969196206
+# measured 36 minutes end to end, of which the release build is 23 and the
+# post-job cargo cache save is 5. The ~522 MB model fetch is inside that, in the
+# embed step, and only because the hub cache missed on that run.
+#
+# Run it when the vector-carrying Windows surface changes, and paste the run URL
+# into the change that claims Windows semantic search works.
+name: Windows vector proof
+
+# No inputs. `workflow_dispatch` already selects the ref to run against, so an
+# input feeding `actions/checkout`'s `ref:` would add an injection surface and
+# buy nothing.
+#
+# Note for whoever next changes this file: `workflow_dispatch` only becomes
+# dispatchable once the workflow exists on the default branch, so it cannot be
+# run on the branch that introduces or renames it. Proving a change here
+# pre-merge needs a temporary `push:` trigger scoped to that branch, removed
+# before merge. That is how run 30969196206 was produced.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows-vector-proof:
+    name: Windows semantic vector search proof
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Preserve tracked bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ${{ runner.temp }}/sccache
+          key: windows-vector-proof-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            windows-vector-proof-
+
+      # Keyed on the model id rather than the lock: the download is invariant
+      # across source changes, and a cold fetch is most of this job's wall clock.
+      - name: Cache the Hugging Face hub
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: windows-hf-hub-nomic-embed-text-v1.5
+
+      # Release profile, not debug. The embedding backend is pure-Rust matmul;
+      # an unoptimised build makes the timings meaningless and the run long
+      # enough to hit the job timeout.
+      - name: Build kin with vector features
+        shell: bash
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: ${{ runner.temp }}/sccache
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-pc-windows-msvc \
+            -p kin-cli -p kin-daemon
+          sccache --show-stats
+
+      - name: Prove the built binary carries vectors
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="target/x86_64-pc-windows-msvc/release"
+          "$bin_dir/kin.exe" bench-meta --json > "$RUNNER_TEMP/bench-meta.json"
+          node <<'NODE'
+          const fs = require("fs");
+          const meta = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/bench-meta.json`, "utf8"));
+          for (const feature of ["vector", "embeddings"]) {
+            if (!meta.feature_flags.includes(feature)) {
+              throw new Error(`Windows proof binary did not enable ${feature}`);
+            }
+          }
+          if (meta.feature_flags.includes("metal")) {
+            throw new Error("Windows proof binary reported the macOS-only metal backend");
+          }
+          console.log(`feature_flags: ${meta.feature_flags.join(",")}`);
+          NODE
+
+      # Admission takes exact Git import or an empty native directory and
+      # refuses a populated non-Git one, so the fixture is a real Git worktree.
+      - name: Seed a fixture repository and admit it
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release"
+          mkdir -p "$RUNNER_TEMP/vector-fixture"
+          cd "$RUNNER_TEMP/vector-fixture"
+          git init -q
+          git config user.email ci@firelock.ai
+          git config user.name ci
+          # Distinct topics with no shared vocabulary, so a semantic hit cannot
+          # be explained by a lexical match on the query term.
+          printf 'def parse_configuration_file(path):\n    """Read settings from disk."""\n    return {}\n' > settings.py
+          printf 'def compute_checksum(data):\n    """Hash a byte buffer."""\n    return 0\n' > hashing.py
+          printf 'def send_email_notification(to, body):\n    """Deliver a message to a recipient."""\n    return True\n' > mailer.py
+          git add -A
+          git commit -qm "fixture"
+          "$bin_dir/kin.exe" init 2>&1 | tee "$RUNNER_TEMP/kin-init.txt"
+
+      - name: Embed the fixture on native Windows
+        shell: bash
+        working-directory: ${{ runner.temp }}/vector-fixture
+        run: |
+          set -euo pipefail
+          bin_dir="$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release"
+          export PATH="$bin_dir:$PATH"
+          # First run pays the model download. Bound it so a network stall fails
+          # visibly instead of burning the whole job budget.
+          embed_start=$(date +%s)
+          kin.exe embed --max-seconds 1800 --json | tee "$RUNNER_TEMP/kin-embed.json"
+          echo "embed_wall_seconds=$(( $(date +%s) - embed_start ))" \
+            | tee "$RUNNER_TEMP/kin-embed-timing.txt"
+
+      - name: Query the embedded graph
+        shell: bash
+        working-directory: ${{ runner.temp }}/vector-fixture
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release:$PATH"
+          # "credentials" appears in none of the fixture files, so a ranked hit
+          # is the embedding arm answering, not a substring match.
+          kin.exe search credentials --semantic --json \
+            | tee "$RUNNER_TEMP/kin-semantic-search.json"
+          kin.exe locate "how are settings loaded" --json --explain --max-files 5 \
+            | tee "$RUNNER_TEMP/kin-locate.json"
+          # `kin status` deliberately does not auto-start the daemon, and the
+          # daemon `kin embed` used has exited by now. Read it AFTER the queries
+          # above, which do start one. Reading it earlier returns
+          # state=unobserved reason=no_running_daemon, which is a dead harness
+          # rather than a shortfall, and is exactly how the first run failed.
+          kin.exe status --json | tee "$RUNNER_TEMP/kin-status.json"
+
+      - name: Assert the runtime proved semantic search
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const temp = process.env.RUNNER_TEMP;
+          const read = (name) => JSON.parse(fs.readFileSync(`${temp}/${name}`, "utf8"));
+
+          const embed = read("kin-embed.json");
+          if (embed.time_limited === true) {
+            throw new Error(`embedding hit its time bound before completing: ${JSON.stringify(embed)}`);
+          }
+          if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0) {
+            throw new Error(`embedding did not reach full coverage: ${JSON.stringify(embed)}`);
+          }
+          // Assert on the embed command's OWN report, not only on the status
+          // read below. Zero pending is satisfied vacuously by a run that
+          // embedded nothing, so the count that proves inference ran has to be
+          // checked directly and at its source.
+          if (!(embed.embedded_entities > 0)) {
+            throw new Error(`embedding produced no entity vectors: ${JSON.stringify(embed)}`);
+          }
+          if (!embed.vector_index_path) {
+            throw new Error(`embedding wrote no vector index: ${JSON.stringify(embed)}`);
+          }
+          console.log(
+            `embedded_entities=${embed.embedded_entities} index=${embed.vector_index_path}`
+          );
+
+          // `kin status` coverage is captured as DIAGNOSTIC here, not as a gate,
+          // because reading it is a timing race rather than a measurement.
+          // `kin status` deliberately never starts a daemon, so it reports
+          // whatever is running when it happens to run: if the daemon from the
+          // preceding command has already exited, it correctly reports
+          // unobserved/no_running_daemon no matter how much was embedded. Three
+          // runs here hit exactly that, which is what moved the assertion off it.
+          //
+          // It is NOT that Windows cannot observe coverage. An earlier version of
+          // this comment said so and was wrong: on a native Windows host with a
+          // live daemon, `kin status --json` returns
+          // {"state":"observed","source":"live_query_graph","indexed":6954,...}.
+          // The field works; only its availability at an arbitrary moment does not.
+          //
+          // So gate on the embed command's own report above, which is the direct
+          // output of the process that did the work and depends on nothing still
+          // being alive afterwards.
+          const status = read("kin-status.json");
+          console.log(`status embedding_coverage (diagnostic): ${JSON.stringify(status.embedding_coverage ?? null)}`);
+
+          // `kin locate --json` is an object carrying `files[]` and, when the
+          // retrieval arms degrade, `degradations[]`. A vector-free build is
+          // exactly the case that records vector_index/feature_disabled here,
+          // so its ABSENCE is what proves the vector arm actually served.
+          const locate = read("kin-locate.json");
+          const disabled = (locate.degradations ?? []).filter(
+            (d) => d.component === "vector_index" && d.reason === "feature_disabled"
+          );
+          if (disabled.length > 0) {
+            throw new Error(`locate reported the vector index as feature_disabled: ${JSON.stringify(disabled)}`);
+          }
+          if (!Array.isArray(locate.files) || locate.files.length === 0) {
+            throw new Error(`locate returned no ranked files: ${JSON.stringify(locate).slice(0, 800)}`);
+          }
+
+          // `kin search --json` is a top-level array of entity records, each
+          // carrying `name` and `file`. Any other shape means the contract
+          // moved and this assertion stopped meaning what it says.
+          const search = read("kin-semantic-search.json");
+          if (!Array.isArray(search)) {
+            throw new Error(`kin search --json was not an array: ${JSON.stringify(search).slice(0, 400)}`);
+          }
+          if (search.length === 0) {
+            throw new Error("semantic search returned no ranked results");
+          }
+          if (!search.every((record) => typeof record.file === "string")) {
+            throw new Error(`kin search records lack a file field: ${JSON.stringify(search).slice(0, 400)}`);
+          }
+          console.log(
+            `semantic search returned ${search.length} ranked results; ` +
+            `locate returned ${locate.files.length} files`
+          );
+          NODE
+
+      - name: Upload proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-vector-proof
+          path: |
+            ${{ runner.temp }}/kin-*.json
+            ${{ runner.temp }}/kin-*.txt
+          if-no-files-found: warn

@@ -425,7 +425,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
             shim_name: kin_vfs_shim.dll
-            skip_vector: true
+            # kin-vfs only. This row used to carry `skip_vector: true`, which
+            # gated BOTH the vector feature set and the kin-vfs build, so
+            # shipping vectors on Windows by deleting that one key would also
+            # have started building an LD_PRELOAD libc interceptor for msvc.
+            # The two are unrelated and are now named separately.
+            skip_vfs: true
             cross: false
 
     steps:
@@ -554,17 +559,16 @@ jobs:
         if: ${{ !matrix.cross }}
         shell: bash
         run: |
-          FLAGS=""
-          if [ "$SKIP_VECTOR" = "true" ]; then
-            FLAGS="--no-default-features"
-          fi
           # The daemon is the runtime: `kin init` works without it but
           # `kin status`/`kin search`/the MCP server all require kin-daemon on
           # PATH, so a clean public install must ship it alongside `kin`.
-          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
+          #
+          # Every platform now builds the same default feature set. Windows was
+          # the only leg that stripped it, and dropping that split is what puts
+          # native vector search in the shipped Windows archive.
+          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
         env:
           TARGET: ${{ matrix.target }}
-          SKIP_VECTOR: ${{ matrix.skip_vector }}
 
       - name: Build kin-cli + kin-daemon (cross)
         if: ${{ matrix.cross }}
@@ -590,7 +594,7 @@ jobs:
           TARGET: ${{ matrix.target }}
 
       - name: Build kin-vfs (native)
-        if: ${{ !matrix.cross && !matrix.skip_vector }}
+        if: ${{ !matrix.cross && !matrix.skip_vfs }}
         working-directory: kin-vfs
         shell: bash
         run: |
@@ -617,7 +621,6 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          SKIP_VECTOR: ${{ matrix.skip_vector }}
         run: |
           set -euo pipefail
           case "$RUNNER_ARCH:$TARGET" in
@@ -639,7 +642,7 @@ jobs:
           "$kin_bin" bench-meta --json > "$provenance_dir/kin-build-meta.json"
           expected_sha="$(git rev-parse HEAD)"
 
-          EXPECTED_SHA="$expected_sha" SKIP_VECTOR="$SKIP_VECTOR" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
+          EXPECTED_SHA="$expected_sha" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
           const crypto = require("crypto");
           const fs = require("fs");
           const expected = process.env.EXPECTED_SHA;
@@ -674,12 +677,25 @@ jobs:
               `does not match tagged Cargo.lock ${tagLockSha}`
             );
           }
-          if (process.env.SKIP_VECTOR === "true") {
-            for (const feature of ["vector", "embeddings", "metal"]) {
-              if (meta.feature_flags.includes(feature)) {
-                throw new Error(`vector-free release unexpectedly enabled ${feature}`);
-              }
+          // Every published archive now carries semantic search. This used to
+          // run only for the one leg that stripped the features, which meant no
+          // leg ever asserted they were PRESENT; a silent feature regression on
+          // any platform would have shipped green. Assert it everywhere.
+          //
+          // `metal` reports the compiled backend rather than the marker cargo
+          // feature (bench_meta.rs `metal_active()` is
+          // `cfg!(target_os = "macos")`), so it is expected on macOS and is a
+          // defect anywhere else.
+          for (const feature of ["vector", "embeddings"]) {
+            if (!meta.feature_flags.includes(feature)) {
+              throw new Error(`release build for ${process.env.TARGET} did not enable ${feature}`);
             }
+          }
+          const expectMetal = process.env.TARGET.includes("apple-darwin");
+          if (meta.feature_flags.includes("metal") !== expectMetal) {
+            throw new Error(
+              `release build for ${process.env.TARGET} reported metal=${meta.feature_flags.includes("metal")}, expected ${expectMetal}`
+            );
           }
           NODE
 

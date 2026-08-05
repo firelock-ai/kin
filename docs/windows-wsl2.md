@@ -20,13 +20,14 @@ Two parts of Kin are built around Unix runtime mechanics:
   `.kin` repository is published. Without an admitted repository, graph,
   lexical, daemon/query, repository setup, MCP, and review flows have no
   supported native-Windows starting point.
-- **Semantic vector search** ships enabled on Linux/macOS. The repository-free
-  native Windows CLI artifact (`kin-windows-x86_64.zip`) is built vector-free
-  (`--no-default-features`).
+- **Semantic vector search** ships enabled on every published platform. The
+  native Windows CLI artifact (`kin-windows-x86_64.zip`) is built with the same
+  default feature set as Linux and macOS, so semantic search and embedding are
+  compiled in rather than stripped. Embedding runs on the portable CPU backend;
+  the Metal GPU backend is macOS-only and is not part of any Windows build.
 
-Running under WSL2 gives you the complete, vector-enabled Kin with working
-filesystem projection and the same behavior the project tests and benchmarks
-against.
+Running under WSL2 gives you the complete Kin with working filesystem
+projection and the same behavior the project tests and benchmarks against.
 
 ## Setup
 
@@ -76,10 +77,10 @@ irm https://get.kinlab.dev/install.ps1 | iex
 
 The installer prints the admission limitation before downloading, verifies the
 download's SHA-256 checksum, and installs the x86_64 CLI release shape. It does
-not run repository setup or claim a usable native repository. The archive is
-vector-free and does not provide transparent filesystem projection; native
-Windows health reports repository, daemon, semantic-query, and VFS readiness as
-missing or unsupported.
+not run repository setup or claim a usable native repository. The archive
+carries semantic vector search but does not provide transparent filesystem
+projection; native Windows health reports repository, daemon, semantic-query,
+and VFS readiness as missing or unsupported.
 
 No native Windows ARM64 archive is published. Use WSL2, or run x64 PowerShell
 under Windows x64 emulation to install the x86_64 archive for repository-free

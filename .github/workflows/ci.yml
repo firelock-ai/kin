@@ -392,8 +392,9 @@ jobs:
       # contract. The installer leg asserts the same behavior against the
       # release binary, but it runs only on the landing push, so on its own it
       # can report an admission change no earlier than a required check
-      # failing on a release commit. The feature set matches the installer
-      # leg's so both legs drive the same build of the command.
+      # failing on a release commit. This leg builds without default features
+      # and the installer leg builds with them, so the shared script asserts
+      # the same refusals against both feature sets of the command.
       - name: Build the Windows binaries the admission and npm assertions drive
         shell: bash
         run: |
@@ -420,7 +421,12 @@ jobs:
           node ./scripts/prove-windows-npm-first-run.mjs
 
   windows-installer:
-    name: Windows installer + vector-free release build
+    # Renamed from "Windows installer + vector-free release build" when native
+    # vector search shipped on Windows. The name is not decoration: release-tag.yml
+    # resolves this exact string out of REQUIRED_CHECKS to decide whether Windows
+    # evidence exists for a release sha, so a name still claiming "vector-free"
+    # would be the mint's own authority asserting the opposite of what it built.
+    name: Windows installer + vector release build
     needs: changes
     # Deliberately off the pull-request path. This leg cold-builds the whole
     # dependency graph in the release profile for x86_64-pc-windows-msvc and
@@ -471,24 +477,47 @@ jobs:
             ~/.cargo/git
             target
             ${{ runner.temp }}/sccache
-          key: windows-vectorless-cargo-${{ hashFiles('Cargo.lock') }}
+          # Cache key renamed with the feature set. The vectorless key indexed a
+          # dependency graph with no ndarray, tokenizers, hnsw or onig in it, so
+          # restoring from it would warm almost nothing and would report a hit
+          # while doing so.
+          key: windows-vector-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-vectorless-cargo-
+            windows-vector-cargo-
 
-      - name: Assert vector-free feature graph
+      # Windows ships native vector search, so this asserts the feature graph in
+      # both directions rather than only forbidding features. `vector` and
+      # `embeddings` must be reachable, or the leg would silently certify a
+      # degraded build; `metal` and `accelerate` must not be, because those are
+      # macOS-only backends whose activation lives in a
+      # `cfg(target_os = "macos")` dependency block and must never unify in here.
+      #
+      # `grep -c` rather than `grep -q`: under `pipefail` a `-q` match closes the
+      # pipe early and the SIGPIPE fails the step, which reads exactly like the
+      # feature being absent. Reading a file cannot invert the guard that way.
+      - name: Assert the Windows feature graph
         shell: bash
         run: |
           set -euo pipefail
           cargo tree --locked --target x86_64-pc-windows-msvc \
-            -p kin-daemon --no-default-features -e features -i kin-db \
+            -p kin-daemon -e features -i kin-db \
             | tee "$RUNNER_TEMP/kin-db-feature-tree.txt"
-          if grep -Eq 'kin-db feature "(vector|embeddings|metal|accelerate)"' \
-            "$RUNNER_TEMP/kin-db-feature-tree.txt"; then
-            echo "::error::Windows vector-free build still enables a heavy kin-db feature"
-            exit 1
-          fi
+          for required in vector embeddings; do
+            if [ "$(grep -Ec "kin-db feature \"${required}\"" \
+              "$RUNNER_TEMP/kin-db-feature-tree.txt")" -eq 0 ]; then
+              echo "::error::Windows release build is missing kin-db feature ${required}"
+              exit 1
+            fi
+          done
+          for forbidden in metal accelerate; do
+            if [ "$(grep -Ec "kin-db feature \"${forbidden}\"" \
+              "$RUNNER_TEMP/kin-db-feature-tree.txt")" -ne 0 ]; then
+              echo "::error::Windows build pulled the macOS-only kin-db feature ${forbidden}"
+              exit 1
+            fi
+          done
 
-      - name: Build Windows release binaries without vector features
+      - name: Build Windows release binaries with vector features
         shell: bash
         env:
           # Compile cache keyed per crate, so a Cargo.lock change warm-starts
@@ -501,10 +530,10 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc \
-            -p kin-cli -p kin-daemon --no-default-features
+            -p kin-cli -p kin-daemon
           sccache --show-stats
 
-      - name: Verify Windows build provenance and disabled features
+      - name: Verify Windows build provenance and feature set
         shell: bash
         run: |
           set -euo pipefail
@@ -544,10 +573,18 @@ jobs:
               `does not match tracked Git bytes ${expectedLock}`
             );
           }
-          for (const feature of ["vector", "embeddings", "metal"]) {
-            if (meta.feature_flags.includes(feature)) {
-              throw new Error(`Windows vector-free build unexpectedly enabled ${feature}`);
+          // The shipped binary must report the features it was built with, not
+          // merely resolve them in the dependency graph. `metal` tracks the
+          // compiled backend rather than the marker cargo feature
+          // (bench_meta.rs `metal_active()` is `cfg!(target_os = "macos")`), so
+          // a correct Windows build reports vector and embeddings and no metal.
+          for (const feature of ["vector", "embeddings"]) {
+            if (!meta.feature_flags.includes(feature)) {
+              throw new Error(`Windows release build did not enable ${feature}`);
             }
+          }
+          if (meta.feature_flags.includes("metal")) {
+            throw new Error("Windows release build reported the macOS-only metal backend");
           }
           NODE
 
@@ -1050,9 +1087,9 @@ jobs:
       # Nothing else on these legs resolves kin-cli without its default
       # features, so a break that appears only with `vector` and `embeddings`
       # off compiles clean here and reaches main behind a green required
-      # context. The Windows job covers that configuration for the msvc target
-      # and runs three filtered subsets of the library, so the cases asserting
-      # the vector-free path execute in this step and nowhere else.
+      # context. The Windows authority job covers that configuration for the
+      # msvc target through filtered subsets of the library, so the cases
+      # asserting the featureless path execute in this step and nowhere else.
       # `RUSTFLAGS: -D warnings` is set at workflow level, so the unused-import
       # shape this class first took fails the step rather than warning.
       #

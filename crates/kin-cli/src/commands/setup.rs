@@ -1038,7 +1038,12 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 ///
 /// `known_profile_root` is the profile-only lookup (`FOLDERID_Profile` on
 /// Windows); `base_dirs_home` is the stricter `BaseDirs` constructor.
-fn resolve_home_dir(
+///
+/// Visible to the crate because the Hugging Face cache probe in
+/// `crate::retrieval_profile` mirrors the same layout and must resolve the home
+/// the same way. A second resolver there is what produced the `HOME`-only
+/// lookup that never matched on Windows.
+pub(crate) fn resolve_home_dir(
     windows: bool,
     var_os: impl Fn(&str) -> Option<OsString>,
     known_profile_root: impl FnOnce() -> Option<PathBuf>,
