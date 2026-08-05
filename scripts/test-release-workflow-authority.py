@@ -2688,6 +2688,64 @@ def workflow_job_blocks(workflow: str) -> dict[str, str]:
     return blocks
 
 
+WINDOWS_DAEMON_SIBLING_BUILD = (
+    "- name: Build the sibling Windows daemon the authority tests drive"
+)
+WINDOWS_DAEMON_COMPILE_STEP = (
+    "- name: Compile and run native Windows authority tests"
+)
+WINDOWS_DAEMON_LIFECYCLE_TEST = '"daemon_status_and_stop_lifecycle"'
+
+
+def assert_windows_daemon_sibling_build(ci_job: str) -> None:
+    """Require the Windows leg to build the daemon its lifecycle test drives.
+
+    The lifecycle test runs a real daemon, and the harness takes it from the
+    `kin-daemon` beside the `kin` binary the test was built with. Every other
+    `kin-daemon` invocation in the leg compiles `--lib`, which produces no
+    binary, so without an explicit build nothing writes one for that target
+    before the test reads it.
+
+    The harness does cover a missing daemon by rebuilding one, but a rebuild
+    lands beside the test only when it repeats the same `--target`, so a leg
+    that leaves the build to the harness is asserting a harness behavior rather
+    than supplying its own input. Ordering is pinned as well as presence: this
+    build sitting after the tests is how the leg failed for days while reporting
+    a daemon missing from a directory the job did eventually populate.
+
+    Judged on active lines and scoped to the step's own block: the `--target`
+    that decides where the binary lands must appear inside the sibling build
+    step itself, and ordering compares step-name positions, so a comment
+    quoting the test name can neither satisfy a policy nor invert the order.
+    """
+
+    active_job = "\n".join(active_lines(ci_job))
+    for step in (WINDOWS_DAEMON_SIBLING_BUILD, WINDOWS_DAEMON_COMPILE_STEP):
+        require(active_job, step, "native Windows daemon lifecycle prerequisite")
+    build_start = active_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
+    compile_start = active_job.index(WINDOWS_DAEMON_COMPILE_STEP)
+    if build_start > compile_start:
+        raise AssertionError(
+            "native Windows daemon lifecycle prerequisite must build the msvc "
+            "kin-daemon binary before the lifecycle test reads it"
+        )
+    sibling_build_block = active_job[build_start:compile_start]
+    for policy in (
+        "-p kin-daemon --no-default-features --bin kin-daemon",
+        "--target x86_64-pc-windows-msvc",
+    ):
+        require(
+            sibling_build_block,
+            policy,
+            "native Windows daemon lifecycle prerequisite",
+        )
+    require(
+        active_job[compile_start:],
+        WINDOWS_DAEMON_LIFECYCLE_TEST,
+        "native Windows daemon lifecycle prerequisite",
+    )
+
+
 def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
     """Require both public npm surfaces to pass a real native Windows first run.
 
@@ -7687,6 +7745,32 @@ def main() -> None:
     assert_windows_npm_first_run_proof(
         ci_jobs["windows-authority-tests"], windows_npm_proof
     )
+    assert_windows_daemon_sibling_build(ci_jobs["windows-authority-tests"])
+    windows_job = ci_jobs["windows-authority-tests"]
+    sibling_build_start = windows_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
+    sibling_build_end = windows_job.index(
+        "      - name: Compile and run native Windows authority tests"
+    )
+    sibling_build_block = windows_job[sibling_build_start:sibling_build_end]
+    for label, mutated_job, expected in (
+        (
+            "the Windows leg stops building the daemon its lifecycle test drives",
+            windows_job.replace(sibling_build_block, "", 1),
+            "native Windows daemon lifecycle prerequisite",
+        ),
+        (
+            "the sibling daemon build drifts back after the tests that read it",
+            windows_job.replace(sibling_build_block, "", 1) + sibling_build_block,
+            "before the lifecycle test reads it",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated_job=mutated_job: assert_windows_daemon_sibling_build(
+                mutated_job
+            ),
+        )
     canonical_npm_provision = CANONICAL_NPM_PROVISION.read_text(encoding="utf-8")
     canonical_npm_provision_test = CANONICAL_NPM_PROVISION_TEST.read_text(
         encoding="utf-8"
