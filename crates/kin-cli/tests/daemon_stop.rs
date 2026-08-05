@@ -67,6 +67,24 @@ fn wait_until_dead(pid: u32, timeout: Duration) {
     }
 }
 
+/// Wait for a path to disappear, the file-side analogue of `wait_until_dead`.
+///
+/// Process death and pid-file removal are two different events. The exiting
+/// daemon unlinks its own pid file, so a parent that has only observed the
+/// process leave can still see the path for a short window, and on Windows an
+/// open handle keeps an unlinked name visible for longer than it does on Unix.
+/// Asserting the file is gone the instant the process is gone therefore fails
+/// intermittently while describing the failure as a product defect.
+///
+/// This still fails when the file genuinely never goes away: the caller asserts
+/// after the wait, so a real leak times out and reports exactly as before.
+fn wait_until_gone(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn daemon_status_and_stop_lifecycle() {
     let root = tempfile::tempdir().expect("temp root");
@@ -140,6 +158,7 @@ fn daemon_status_and_stop_lifecycle() {
         !is_process_alive(worker_pid),
         "worker daemon pid {worker_pid} still alive after `kin daemon stop`"
     );
+    wait_until_gone(&pid_path, Duration::from_secs(5));
     assert!(
         !pid_path.exists(),
         "daemon.pid must be cleared after a confirmed stop"
