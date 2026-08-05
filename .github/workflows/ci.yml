@@ -105,6 +105,18 @@ jobs:
           bash -n ./scripts/verify-npm-release.sh
           bash -n ./scripts/assert-windows-init-contract.sh
           bash -n ./scripts/verify-base-image-pins.sh
+          # install.sh is the public installer users pipe straight into a shell,
+          # and the one with no pull-request syntax check. Its only `sh -n` runs
+          # in publish-release-installers.yml, which triggers on `workflow_run`
+          # after Release completes, so it cannot fail until a tag exists and a
+          # tag cannot be un-cut. `#!/usr/bin/env sh` is why this is `sh -n` and
+          # not the `bash -n` used for the bash-only scripts above.
+          #
+          # install.ps1 needs no line here. scripts/test-install-checksum.ps1
+          # parses it on every pull request in windows-authority-tests, under
+          # both PowerShell 7 and Windows PowerShell 5.1, and that job is held
+          # unconditional by the release-authority test.
+          sh -n ./scripts/install.sh
 
   windows-authority-tests:
     name: Windows authority tests
