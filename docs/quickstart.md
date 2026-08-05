@@ -81,7 +81,7 @@ and `install.ps1` unless noted):
 - `KIN_DIR`: compatibility alias for `KIN_HOME`.
 - `KIN_NO_SETUP=1`: on macOS and Linux, skip the `kin setup` wizard after the
   binaries are installed (run `kin setup` yourself when ready).
-  Native Windows always skips repository setup while admission is unsupported;
+  Native Windows always skips repository setup because the install proof does not yet cover MCP or review workflows there.
   `KIN_NO_SETUP` is accepted there only for CI compatibility and selects the
   CI-oriented skip message.
 - `KIN_BASE_URL`: install from a mirror or local path instead of GitHub releases
