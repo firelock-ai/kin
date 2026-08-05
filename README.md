@@ -36,8 +36,15 @@ before any compiler runs, on a graph that was already built, `kin impact`
 names the entities the edit affects, from the direct callers of the changed
 signature out through the wider blast radius.
 
-<!-- Demo capture slot: embed the regenerated kin impact capture here once the
-     final asset lands in docs/assets/. Do not re-link the retired capture. -->
+<p align="center">
+  <img src="docs/assets/kin-impact-ripgrep.png" alt="kin impact on ripgrep listing 13 impacted entities within 3 hops of a one-line signature change" width="100%" />
+</p>
+
+Recorded against a prepared graph at ripgrep commit
+`e89fff89ac9af12e8d4ce9d5fd07beb408ca730f`. 13 impacted entities within 3 hops,
+including 3 direct callers of the changed signature. The graph was built
+beforehand. No compiler ran. Exact commands and raw traces:
+[kinlab.ai/proof](https://kinlab.ai/proof).
 
 Kin surfaces what the change touches. Whether the change is correct stays with
 your compiler, tests, and review. The graph is built beforehand by `kin init`,
