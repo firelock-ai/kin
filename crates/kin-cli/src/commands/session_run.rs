@@ -63,6 +63,122 @@ impl SessionProjection {
     }
 }
 
+/// Directory-name prefix for a launch profile under `.kin/runs/`.
+///
+/// Deliberately not `session-`: every reader of `.kin/runs/` selects
+/// projections by that prefix — `resolve_session_directory` when picking the
+/// latest session, `validate_session_leaf` when accepting a named one, and
+/// [`discard`] when removing one — so a profile directory can never be
+/// mistaken for a session to reconcile, resolve, or delete.
+const LAUNCH_PROFILE_PREFIX: &str = "launch-profile-";
+
+/// The generated launch profile for one `kin with --semantic-only` process.
+///
+/// The profile is a sibling of the session projection under `.kin/runs/`, and
+/// both halves of that placement carry weight:
+///
+/// * The reconcile scanner walks the projection directory and nothing else, so
+///   a profile file can never be observed as a working-tree change and admitted
+///   into repository authority. A launch profile describes the launch, not the
+///   work, and committing an assistant's permission settings on every clean
+///   exit would be the opposite of what the flag is for.
+/// * The launched process's working directory is the projection, so the profile
+///   is not an entry of the tree the subject agent is working in.
+///
+/// A profile lives for exactly one child process. Its directory is removed on
+/// every path out of [`with`], including the failure paths, which is why the
+/// guard is armed by [`LaunchProfile::write`] before the first byte is written.
+pub struct LaunchProfile {
+    dir: PathBuf,
+    extra_args: Vec<OsString>,
+    disclosure: String,
+}
+
+impl LaunchProfile {
+    /// Build and write one assistant's semantic-only profile.
+    ///
+    /// Called before the projection is materialized and before any daemon
+    /// lease is registered: every step here is fallible, and a failure between
+    /// `register_lease` and `close` would abandon both the projection directory
+    /// and a live daemon session.
+    pub fn write(
+        runs_dir: &Path,
+        adapter: &dyn super::assistant_adapter::AssistantAdapter,
+        windows: bool,
+    ) -> Result<Self> {
+        let dir = runs_dir.join(format!("{LAUNCH_PROFILE_PREFIX}{}", uuid::Uuid::new_v4()));
+        let profile = adapter.semantic_only(&dir, windows)?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create the launch profile directory {}", dir.display()))?;
+        let written = Self {
+            dir,
+            extra_args: profile.extra_args,
+            disclosure: profile.disclosure,
+        };
+        for file in &profile.files {
+            let path = written.dir.join(&file.relative_path);
+            std::fs::write(&path, &file.contents)
+                .with_context(|| format!("write the launch profile file {}", path.display()))?;
+        }
+        Ok(written)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Flags the launched CLI needs to load this profile.
+    pub fn extra_args(&self) -> &[OsString] {
+        &self.extra_args
+    }
+
+    /// The one line printed at launch describing what the profile holds.
+    pub fn disclosure(&self) -> &str {
+        &self.disclosure
+    }
+}
+
+impl Drop for LaunchProfile {
+    fn drop(&mut self) {
+        if let Err(error) = remove_launch_profile(&self.dir) {
+            eprintln!(
+                "Kin: failed to remove the launch profile {}: {error:#}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+/// Remove a launch profile directory.
+///
+/// Re-checked here for the same reason [`discard`] re-checks a session path: a
+/// removal reached from a `Drop` must not be walkable into an arbitrary tree by
+/// a caller that constructed the value with a different path.
+fn remove_launch_profile(profile_dir: &Path) -> Result<()> {
+    let name = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !name.starts_with(LAUNCH_PROFILE_PREFIX) || name.len() == LAUNCH_PROFILE_PREFIX.len() {
+        bail!(
+            "refusing to remove {}: not a launch profile",
+            profile_dir.display()
+        );
+    }
+    if profile_dir.is_symlink() {
+        bail!(
+            "refusing to remove {}: launch profile path is a symlink",
+            profile_dir.display()
+        );
+    }
+    match std::fs::remove_dir_all(profile_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove the launch profile {}", profile_dir.display())),
+    }
+}
+
 /// Materialize one disposable session projection through the daemon.
 ///
 /// The daemon owns repository authority, so it is the only process allowed to
@@ -462,13 +578,11 @@ pub async fn open(
 }
 
 /// Assistants `kin with` knows how to launch.
+///
+/// Resolution lives in the adapter registry so the launcher and `kin setup`'s
+/// registration writers can never disagree about which assistants exist.
 pub fn assistant_program(assistant: &str) -> Result<&'static str> {
-    match assistant.trim().to_ascii_lowercase().as_str() {
-        "claude" | "claude-code" => Ok("claude"),
-        "codex" => Ok("codex"),
-        "gemini" | "gemini-cli" => Ok("gemini"),
-        other => bail!("unknown assistant '{other}'; kin with supports: claude, codex, gemini"),
-    }
+    Ok(super::assistant_adapter::adapter_for(assistant)?.program())
 }
 
 /// `kin with <assistant> [-- <task...>]`.
@@ -478,6 +592,7 @@ pub async fn with(
     passive_guidance: bool,
     restrict_discovery: bool,
     restrict_filesystem: bool,
+    semantic_only: bool,
     task: Vec<String>,
 ) -> Result<()> {
     if restrict_discovery || restrict_filesystem {
@@ -500,8 +615,18 @@ pub async fn with(
         );
     }
 
-    let program = assistant_program(&assistant)?;
+    let adapter = super::assistant_adapter::adapter_for(&assistant)?;
+    let program = adapter.program();
+
     let layout = discover_layout()?;
+    // Write the profile before materializing. Every step of it is fallible —
+    // an unsupported assistant, a full disk, a read-only mount — and a failure
+    // after the projection exists would abandon the projection directory, and
+    // after `register_lease` a live daemon session with it.
+    let profile = semantic_only
+        .then(|| LaunchProfile::write(&layout.runs_dir(), adapter, cfg!(windows)))
+        .transpose()?;
+
     let mut projection = materialize(layout, None, None).await?;
     let session_id = register_lease(
         &mut projection,
@@ -521,11 +646,18 @@ pub async fn with(
     eprintln!("Session: {session_id}");
 
     let mut command = std::process::Command::new(program);
+    if let Some(profile) = &profile {
+        command.args(profile.extra_args());
+        eprintln!("{}", profile.disclosure());
+    }
     if !task.is_empty() {
         command.args(&task);
     }
     let exit = run_in_session(&projection, command)?;
     close(&projection, exit, SessionCloseout::Reconcile).await?;
+    // `std::process::exit` runs no destructors, so the profile is removed here
+    // rather than left to drop on the way out of a non-zero exit.
+    drop(profile);
     if exit.code != 0 {
         std::process::exit(exit.code);
     }

@@ -855,10 +855,21 @@ enum Command {
         /// In native mode, block both filesystem discovery and direct file reads
         #[arg(long, conflicts_with = "restrict_discovery")]
         restrict_filesystem: bool,
+        /// Deny the assistant's native discovery tools for this launch, leaving
+        /// Kin's semantic tools as the only discovery surface; the enforcement
+        /// tier is printed at launch and differs per assistant
+        #[arg(long)]
+        semantic_only: bool,
         /// Task prompt
         #[arg(last = true)]
         task: Vec<String>,
     },
+    /// Hidden PreToolUse adjudicator for a `kin with --semantic-only` session.
+    ///
+    /// Reads one hook payload on stdin and exits 0 to permit or 2 to refuse.
+    /// The launched assistant calls this, not an operator.
+    #[command(hide = true)]
+    SemanticOnlyGuard,
     /// Retire tracked paths that ignore rules now cover. Reports without changing anything
     /// unless --confirm is given.
     PurgeIgnored {
@@ -2131,6 +2142,14 @@ fn main() -> Result<()> {
     }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let cli = parse_cli_or_report_retired_command();
+    // The semantic-only guard runs once per tool call of a launched assistant
+    // and adjudicates a payload on stdin. It touches no repository, so it
+    // returns before the tracing subscriber, the environment audit, the pending
+    // MCP repair retry, and the tokio runtime: none of them would change its
+    // answer, and all of them would be charged to the subject's tool latency.
+    if matches!(cli.command, Command::SemanticOnlyGuard) {
+        return commands::assistant_adapter::run_semantic_only_guard();
+    }
     let command_name = current_command_name();
     let cwd = std::env::current_dir()?.display().to_string();
     let profile_out = cli
@@ -3079,6 +3098,7 @@ fn main() -> Result<()> {
                     passive_guidance,
                     restrict_discovery,
                     restrict_filesystem,
+                    semantic_only,
                     task,
                 } => {
                     commands::capabilities::require_ready("with")?;
@@ -3088,9 +3108,15 @@ fn main() -> Result<()> {
                         passive_guidance,
                         restrict_discovery,
                         restrict_filesystem,
+                        semantic_only,
                         task,
                     )
                     .await
+                }
+                // Adjudicated before the runtime starts; see the early return
+                // at the top of `main`.
+                Command::SemanticOnlyGuard => {
+                    commands::assistant_adapter::run_semantic_only_guard()
                 }
                 Command::Shell {
                     strategy,
