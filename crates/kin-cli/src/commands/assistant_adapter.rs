@@ -181,11 +181,53 @@ fn semantic_only_redirect() -> String {
     )
 }
 
+/// Collapse the path spellings that mean the same file.
+///
+/// `rm /opt/kin//kin` and `rm /opt/kin/./kin` name the same program as
+/// `rm /opt/kin/kin`, so a containment test run on the raw command string is
+/// evaded by typing a second slash. Folding both spellings first makes the test
+/// decide on the path rather than on how it was written.
+fn normalize_path_text(text: &str) -> String {
+    let mut normalized = text.to_string();
+    loop {
+        let collapsed = normalized.replace("//", "/").replace("/./", "/");
+        if collapsed == normalized {
+            return normalized;
+        }
+        normalized = collapsed;
+    }
+}
+
+/// Paths a semantic-only session may not name, given where its guard lives.
+///
+/// The parent directory is included because moving or removing the directory
+/// takes the guard with it, and `rm -r` and `mv` are both spellable with the
+/// allowed commands. Ancestors above the parent are not included: every
+/// absolute path contains `/`, so refusing further up refuses everything.
+fn guard_refused_paths(program: &Path) -> Vec<String> {
+    let mut refused = vec![normalize_path_text(&program.display().to_string())];
+    if let Some(parent) = program.parent() {
+        let parent = normalize_path_text(&parent.display().to_string());
+        if !parent.is_empty() && parent != "/" {
+            refused.push(parent);
+        }
+    }
+    refused
+}
+
 /// Decide whether a semantic-only session may run one Bash command.
 ///
 /// `Err` carries the line the assistant is shown, so a refusal teaches the
 /// replacement rather than only naming the rule.
-pub fn semantic_only_bash_verdict(command: &str) -> std::result::Result<(), String> {
+///
+/// `guard_paths` is a parameter rather than a [`guard_program`] call because
+/// this predicate is a pure function of the command string, which is what lets
+/// every vector in `BYPASS_VECTORS` be decided in a unit test with no process
+/// state. The caller resolves the paths once at the impure boundary.
+pub fn semantic_only_bash_verdict(
+    command: &str,
+    guard_paths: &[String],
+) -> std::result::Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
         return Err(format!(
@@ -220,6 +262,22 @@ pub fn semantic_only_bash_verdict(command: &str) -> std::result::Result<(), Stri
             semantic_only_redirect()
         ));
     }
+    // `rm`, `mv`, and `chmod` are allowed against the working tree and reach the
+    // guard binary just as easily. Removing or disabling it is caught by the
+    // hook's fail-closed suffix, but replacing it with a program that exits 0 is
+    // not: that guard answers, and it answers yes. Refusing to name the path is
+    // what covers the replacement, so the two halves are not alternatives.
+    let normalized = normalize_path_text(command);
+    if let Some(path) = guard_paths
+        .iter()
+        .find(|path| normalized.contains(path.as_str()))
+    {
+        return Err(format!(
+            "semantic-only session: refusing this Bash command because it names {path}, which is \
+             the guard enforcing this session; {}",
+            semantic_only_redirect()
+        ));
+    }
     Ok(())
 }
 
@@ -230,7 +288,10 @@ pub fn semantic_only_bash_verdict(command: &str) -> std::result::Result<(), Stri
 /// selected that this function was not written to allow all refuse. A guard
 /// that allowed what it did not understand would be an audit of the payloads
 /// that happen to be well formed.
-pub fn semantic_only_guard_verdict(payload: &[u8]) -> std::result::Result<(), String> {
+pub fn semantic_only_guard_verdict(
+    payload: &[u8],
+    guard_paths: &[String],
+) -> std::result::Result<(), String> {
     let refuse_unreadable = |detail: &str| {
         Err(format!(
             "semantic-only session: refusing this call because its hook payload {detail}; {}",
@@ -253,7 +314,7 @@ pub fn semantic_only_guard_verdict(payload: &[u8]) -> std::result::Result<(), St
         else {
             return refuse_unreadable("is a Bash call carrying no command string");
         };
-        return semantic_only_bash_verdict(command);
+        return semantic_only_bash_verdict(command, guard_paths);
     }
     if tool.starts_with(CLAUDE_ALLOWED_MCP_PREFIX) || CLAUDE_ALLOWED_BASH_FOLLOWUPS.contains(&tool)
     {
@@ -272,6 +333,20 @@ pub fn semantic_only_guard_verdict(payload: &[u8]) -> std::result::Result<(), St
 pub fn run_semantic_only_guard() -> Result<()> {
     use std::io::Read as _;
 
+    // A guard that cannot locate itself cannot tell whether a command is aimed
+    // at it, and returning the error would exit 1, which lets the tool run.
+    let guard_paths = match guard_program() {
+        Ok(program) => guard_refused_paths(&program),
+        Err(error) => {
+            eprintln!(
+                "semantic-only session: refusing this call because the guard could not resolve \
+                 its own path ({error}), so it cannot tell whether the call is aimed at it; {}",
+                semantic_only_redirect()
+            );
+            std::process::exit(2);
+        }
+    };
+
     let mut payload = Vec::new();
     // Returning the IO error would exit 1, and every hook exit code except 2 is
     // a non-blocking error that lets the tool run. A guard that cannot read its
@@ -289,7 +364,7 @@ pub fn run_semantic_only_guard() -> Result<()> {
         );
         std::process::exit(2);
     }
-    if let Err(refusal) = semantic_only_guard_verdict(&payload) {
+    if let Err(refusal) = semantic_only_guard_verdict(&payload, &guard_paths) {
         eprintln!("{refusal}");
         std::process::exit(2);
     }
@@ -305,6 +380,33 @@ pub fn run_semantic_only_guard() -> Result<()> {
 /// silently turn enforcement off.
 fn guard_program() -> Result<PathBuf> {
     std::env::current_exe().context("resolve the kin executable for the semantic-only guard")
+}
+
+/// Turn any guard failure into Claude Code's blocking exit code.
+///
+/// Exit 2 is the only hook status that blocks; every other non-zero status is
+/// reported as a non-blocking error and the tool then runs. So a guard that has
+/// been deleted, made non-executable, or is unavailable for a reason nobody
+/// enumerated hands the session its full toolset back while the launch banner
+/// still advertises the enforced tier — enforcement degrades and nothing says
+/// so. Re-raising every failure as 2 makes an unusable guard a refusal instead
+/// of an opening, and it covers the whole class rather than the routes someone
+/// thought to list.
+///
+/// It cannot cover a guard replaced by a working program that exits 0. That one
+/// answers, and it answers yes, which is why [`semantic_only_bash_verdict`] also
+/// refuses commands that name the guard's own path.
+///
+/// `||` and `exit` mean the same thing to `cmd.exe` as to a POSIX shell, so one
+/// spelling serves both arms.
+const HOOK_FAIL_CLOSED_SUFFIX: &str = " || exit 2";
+
+/// The shell string Claude Code runs for every guarded tool call.
+fn semantic_only_hook_command(program: &Path, windows: bool) -> String {
+    format!(
+        "{} semantic-only-guard{HOOK_FAIL_CLOSED_SUFFIX}",
+        shell_quote_program(program, windows)
+    )
 }
 
 /// Quote one program path for the shell Claude Code runs a hook command in.
@@ -347,10 +449,7 @@ impl AssistantAdapter for ClaudeAdapter {
         // what makes the profile non-disarmable: `Edit`, `Write`, and `rm` stay
         // available by design, so a hook script the session could delete or
         // rewrite would be enforcement the subject holds the off switch for.
-        let guard = format!(
-            "{} semantic-only-guard",
-            shell_quote_program(&guard_program()?, windows)
-        );
+        let guard = semantic_only_hook_command(&guard_program()?, windows);
         let settings = serde_json::json!({
             "permissions": { "deny": deny },
             "hooks": {
@@ -373,8 +472,9 @@ impl AssistantAdapter for ClaudeAdapter {
             tier: EnforcementTier::Enforced,
             disclosure: format!(
                 "semantic-only [enforced]: Grep/Glob/Read are refused; Bash is refused unless the \
-                 command is one of {}; MCP tools other than Kin's are refused. Kin's MCP tools, \
-                 Edit, and Write stay available.",
+                 command is one of {}, and is refused even then if it names Kin's own binary, \
+                 which the session may not disarm; MCP tools other than Kin's are refused. Kin's \
+                 MCP tools, Edit, and Write stay available.",
                 CLAUDE_ALLOWED_BASH.join(", ")
             ),
         })
@@ -444,6 +544,18 @@ pub fn adapter_for(assistant: &str) -> Result<&'static dyn AssistantAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a released `kin` sits, for the tests that ask what a session may
+    /// say about its own guard.
+    const GUARD_PROGRAM: &str = "/usr/local/bin/kin";
+
+    /// The guard paths a session launched from [`GUARD_PROGRAM`] refuses.
+    fn guard_paths() -> Vec<String> {
+        guard_refused_paths(Path::new(GUARD_PROGRAM))
+    }
+
+    /// No guard to protect, for the arms that decide on the command alone.
+    const NO_GUARD: &[String] = &[];
 
     /// Every way of reading a file that the adversarial review of the original
     /// blocklist enumerated, plus the blocklist's own entries.
@@ -547,7 +659,7 @@ mod tests {
     #[test]
     fn every_enumerated_file_read_bypass_is_refused() {
         for vector in BYPASS_VECTORS {
-            let refusal = semantic_only_bash_verdict(vector)
+            let refusal = semantic_only_bash_verdict(vector, NO_GUARD)
                 .expect_err(&format!("semantic-only admitted a file read: {vector}"));
             assert!(
                 refusal.contains("semantic-only session: refusing"),
@@ -559,7 +671,7 @@ mod tests {
         for reader in CLAUDE_DENIED_BASH_READERS {
             let command = format!("{reader} src/main.rs");
             assert!(
-                semantic_only_bash_verdict(&command).is_err(),
+                semantic_only_bash_verdict(&command, NO_GUARD).is_err(),
                 "semantic-only admitted {command}"
             );
         }
@@ -580,7 +692,7 @@ mod tests {
             "rm -f target/debug/stale",
             "chmod u+x scripts/run",
         ] {
-            semantic_only_bash_verdict(allowed).unwrap_or_else(|refusal| {
+            semantic_only_bash_verdict(allowed, NO_GUARD).unwrap_or_else(|refusal| {
                 panic!("semantic-only refused a permitted command {allowed}: {refusal}")
             });
         }
@@ -592,13 +704,13 @@ mod tests {
             "rm /sys/kernel/notes",
         ] {
             assert!(
-                semantic_only_bash_verdict(disclosure).is_err(),
+                semantic_only_bash_verdict(disclosure, NO_GUARD).is_err(),
                 "semantic-only admitted {disclosure}"
             );
         }
 
-        assert!(semantic_only_bash_verdict("").is_err());
-        assert!(semantic_only_bash_verdict("   ").is_err());
+        assert!(semantic_only_bash_verdict("", NO_GUARD).is_err());
+        assert!(semantic_only_bash_verdict("   ", NO_GUARD).is_err());
     }
 
     #[test]
@@ -612,34 +724,43 @@ mod tests {
             .unwrap()
         };
 
-        semantic_only_guard_verdict(&payload("Bash", "mkdir -p src/rendering")).unwrap();
-        assert!(semantic_only_guard_verdict(&payload("Bash", "sed -n p src/main.rs")).is_err());
+        semantic_only_guard_verdict(&payload("Bash", "mkdir -p src/rendering"), NO_GUARD).unwrap();
+        assert!(
+            semantic_only_guard_verdict(&payload("Bash", "sed -n p src/main.rs"), NO_GUARD)
+                .is_err()
+        );
 
         // The hook is also a backstop for the tools the deny rules name, so a
         // deny rule that failed to apply is still refused here.
         for denied in CLAUDE_DENIED_TOOLS {
             assert!(
-                semantic_only_guard_verdict(&payload(denied, "")).is_err(),
+                semantic_only_guard_verdict(&payload(denied, ""), NO_GUARD).is_err(),
                 "guard admitted {denied}"
             );
         }
 
         // Kin's MCP surface is what the session is pointed at; another
         // server's file reader is not.
-        semantic_only_guard_verdict(&payload("mcp__kin__semantic_locate", "")).unwrap();
-        semantic_only_guard_verdict(&payload("BashOutput", "")).unwrap();
-        assert!(semantic_only_guard_verdict(&payload("mcp__filesystem__read_file", "")).is_err());
-        assert!(semantic_only_guard_verdict(&payload("mcp__kinlab__read", "")).is_err());
-
-        // Anything unreadable is a refusal, not an admission.
-        assert!(semantic_only_guard_verdict(b"").is_err());
-        assert!(semantic_only_guard_verdict(b"not json").is_err());
-        assert!(semantic_only_guard_verdict(br#"{"tool_input":{"command":"pwd"}}"#).is_err());
-        assert!(semantic_only_guard_verdict(br#"{"tool_name":"Bash"}"#).is_err());
+        semantic_only_guard_verdict(&payload("mcp__kin__semantic_locate", ""), NO_GUARD).unwrap();
+        semantic_only_guard_verdict(&payload("BashOutput", ""), NO_GUARD).unwrap();
         assert!(
-            semantic_only_guard_verdict(br#"{"tool_name":"Bash","tool_input":{"command":7}}"#)
+            semantic_only_guard_verdict(&payload("mcp__filesystem__read_file", ""), NO_GUARD)
                 .is_err()
         );
+        assert!(semantic_only_guard_verdict(&payload("mcp__kinlab__read", ""), NO_GUARD).is_err());
+
+        // Anything unreadable is a refusal, not an admission.
+        assert!(semantic_only_guard_verdict(b"", NO_GUARD).is_err());
+        assert!(semantic_only_guard_verdict(b"not json", NO_GUARD).is_err());
+        assert!(
+            semantic_only_guard_verdict(br#"{"tool_input":{"command":"pwd"}}"#, NO_GUARD).is_err()
+        );
+        assert!(semantic_only_guard_verdict(br#"{"tool_name":"Bash"}"#, NO_GUARD).is_err());
+        assert!(semantic_only_guard_verdict(
+            br#"{"tool_name":"Bash","tool_input":{"command":7}}"#,
+            NO_GUARD
+        )
+        .is_err());
     }
 
     #[test]
@@ -685,7 +806,7 @@ mod tests {
         );
         let command = hook["hooks"][0]["command"].as_str().unwrap();
         assert!(
-            command.ends_with(" semantic-only-guard"),
+            command.contains(" semantic-only-guard"),
             "the hook must call the guard: {command}"
         );
         assert!(
@@ -729,7 +850,7 @@ mod tests {
                     disclosure.contains(allowed),
                     "{allowed} unnamed: {disclosure}"
                 );
-                semantic_only_bash_verdict(allowed).unwrap_or_else(|refusal| {
+                semantic_only_bash_verdict(allowed, NO_GUARD).unwrap_or_else(|refusal| {
                     panic!("the disclosure names {allowed} but the guard refuses it: {refusal}")
                 });
             }
@@ -743,6 +864,14 @@ mod tests {
             assert!(
                 !disclosure.contains("backstop"),
                 "the disclosure must not credit coverage to a backstop: {disclosure}"
+            );
+            // The guard-path refusal is part of the boundary, so the line
+            // describing the boundary has to name it. Listing `rm` as allowed
+            // without saying `rm <the guard>` is not understates the rule in the
+            // one direction an operator would be surprised by.
+            assert!(
+                disclosure.contains("names Kin's own binary"),
+                "the disclosure must name the guard-path refusal: {disclosure}"
             );
             assert!(disclosure.contains("MCP tools other than Kin's are refused"));
         }
@@ -784,6 +913,156 @@ mod tests {
             shell_quote_program(Path::new(r"C:\Program Files\kin.exe"), true),
             "\"C:\\Program Files\\kin.exe\""
         );
+    }
+
+    /// Enforcement must not be able to leave without the session noticing.
+    ///
+    /// Claude Code reports a `PreToolUse` hook it cannot execute as a
+    /// non-blocking error and then runs the tool, so a guard that is deleted or
+    /// made non-executable would drop the session back to the deny rules — which
+    /// `sed`, `awk`, `perl`, `python3`, `git show`, and a nested `claude -p` all
+    /// walk straight through — while the banner still says enforced. Verified
+    /// against Claude Code 2.1.222: with the bare command a dead guard let
+    /// `sed -n 1p secret.txt` run and print the file; with this suffix the same
+    /// call was blocked and recorded as a permission denial.
+    #[test]
+    fn the_hook_command_turns_an_unusable_guard_into_a_refusal() {
+        // Asserted against the literal exit code Claude Code treats as blocking,
+        // never against `HOOK_FAIL_CLOSED_SUFFIX`. Comparing the built command to
+        // the same constant that built it is a check that cannot fail: emptying
+        // the constant leaves `ends_with` trivially true and the test green while
+        // the profile ships with no fail-closed behavior at all.
+        for windows in [false, true] {
+            let command = semantic_only_hook_command(Path::new(GUARD_PROGRAM), windows);
+            assert!(
+                command.ends_with(" || exit 2"),
+                "a guard that cannot run must block, not warn: {command}"
+            );
+            assert!(
+                command.contains(" semantic-only-guard"),
+                "the hook must still call the guard: {command}"
+            );
+
+            let profile = ClaudeAdapter
+                .semantic_only(Path::new("/tmp/profile"), windows)
+                .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&profile.files[0].contents).unwrap();
+            let installed = parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                installed.ends_with(" || exit 2"),
+                "the written profile must carry the fail-closed suffix: {installed}"
+            );
+        }
+    }
+
+    /// Run the hook string the way Claude Code runs it and read the status.
+    ///
+    /// The assertion above is on the text; this one is on the behavior, which is
+    /// what the profile actually depends on. It runs only where a POSIX shell
+    /// exists, and it asks the same question as the text assertion rather than a
+    /// weaker one: a missing guard must exit 2, because 2 is the only status
+    /// Claude Code blocks on.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_guard_exits_with_the_blocking_status_in_a_real_shell() {
+        use std::process::{Command, Stdio};
+
+        let missing = Path::new("/nonexistent/kin directory/kin");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(semantic_only_hook_command(missing, false))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run the hook command");
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "an unrunnable guard must exit 2; every other status lets the tool run"
+        );
+
+        // The falsification: the bare command this replaced exits 127, which
+        // Claude Code reports as a non-blocking error and then runs the tool.
+        let bare = format!(
+            "{} semantic-only-guard",
+            shell_quote_program(missing, false)
+        );
+        let bare_status = Command::new("sh")
+            .arg("-c")
+            .arg(bare)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run the bare command");
+        assert_ne!(
+            bare_status.code(),
+            Some(2),
+            "the bare command must not already block, or this test proves nothing"
+        );
+    }
+
+    /// A subject may not disarm the guard adjudicating it.
+    ///
+    /// The fail-closed suffix covers a guard that is gone or unrunnable, but not
+    /// one replaced by a working program that exits 0 — that guard answers, and
+    /// it answers yes. Confirmed against Claude Code 2.1.222: an empty
+    /// executable at the guard path let `sed -n 1p secret.txt` print the file
+    /// with the suffix in place and no denial recorded. `mv`, `rm`, and `chmod`
+    /// are all allowed against the working tree and reach the binary just as
+    /// easily, so naming it has to be the refusal.
+    #[test]
+    fn a_session_cannot_reach_the_guard_that_enforces_it() {
+        let paths = guard_paths();
+        for reach in [
+            "rm /usr/local/bin/kin",
+            "rm -f /usr/local/bin/kin",
+            "mv /usr/local/bin/kin /tmp/parked",
+            "mv scratch/passthrough /usr/local/bin/kin",
+            "chmod 000 /usr/local/bin/kin",
+            "chmod -x /usr/local/bin/kin",
+            "rm -r /usr/local/bin",
+            "mv /usr/local/bin /tmp/parked",
+            // The same file, spelled to slip a containment test.
+            "rm /usr/local//bin/kin",
+            "rm /usr/local/./bin/kin",
+            "rm /usr/local/bin/./kin",
+        ] {
+            let refusal = semantic_only_bash_verdict(reach, &paths)
+                .expect_err(&format!("semantic-only admitted a disarm: {reach}"));
+            assert!(
+                refusal.contains("the guard enforcing this session"),
+                "{reach}: {refusal}"
+            );
+            // The falsification: without the guard paths every one of these is
+            // an ordinary allowed command, which is exactly the pre-fix state.
+            semantic_only_bash_verdict(reach, NO_GUARD).unwrap_or_else(|refusal| {
+                panic!("{reach} was refused for a reason other than the guard: {refusal}")
+            });
+        }
+
+        // The refusal is about the guard, not about the commands. Work on the
+        // tree that has nothing to do with it still runs.
+        for allowed in [
+            "rm -f target/debug/stale",
+            "mv src/old.rs src/new.rs",
+            "chmod u+x scripts/run",
+            "mkdir -p src/rendering",
+        ] {
+            semantic_only_bash_verdict(allowed, &paths).unwrap_or_else(|refusal| {
+                panic!("guard-path refusal caught an unrelated command {allowed}: {refusal}")
+            });
+        }
+
+        // A guard installed at the root would otherwise refuse every absolute
+        // path, which is a session that can do nothing rather than a guarded one.
+        assert!(!guard_refused_paths(Path::new("/kin")).contains(&"/".to_string()));
+        assert!(guard_refused_paths(Path::new("/kin")).contains(&"/kin".to_string()));
     }
 
     #[test]
