@@ -118,16 +118,16 @@ names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,
 `kin-linux-x86_64`, and `kin-windows-x86_64`; use the Unix `.tar.gz` or Windows
 `.zip` suffix shown on the latest release page.
 
-Homebrew and npm entry points resolve the same public release channel:
-
-```sh
-brew install firelock-ai/kin/kin
-# or
-npm install -g @kinlab/kin@latest
-```
+The curl installer above tracks the latest release directly. Homebrew and npm
+entry points exist but publish on their own cadence and can lag the latest
+release; prefer the installer or the release archives until a version you can
+verify appears on those channels.
 
 On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
-Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+Native Windows support is early: repositories admit and graph and lexical
+queries answer natively, but this build has no semantic vector search yet and
+its end-to-end install proof is still maturing, so WSL2 remains the
+recommended path for full Kin.
 Read [Platform and maturity](#platform-and-maturity) below before choosing a
 Windows install path.
 
@@ -219,7 +219,13 @@ boundaries:
 | --- | --- | --- |
 | macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Shipped and exercised on both architectures. It uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
 | Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. Current artifacts require glibc 2.39; Alpine/musl and older-glibc distributions are not supported projection hosts. The arm64 release proof runs on Ubuntu 24.04. |
-| Native Windows x86_64 | The release archive starts and exposes repository-free diagnostics, but `kin init` fails closed; no repository-backed workflow is supported. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+| Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but this build ships without semantic vector search and its end-to-end install proof is still maturing. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+
+First indexing reads the entire reachable Git history, so `kin init` on a
+large or long-lived repository takes minutes, not seconds, before embedding
+begins. After `init` returns, the daemon continues preparing in the
+background, and the first agent calls on a large repository can take
+noticeably longer to answer.
 
 Bounded arm64 testing found the core graph and lexical path usable at 512 MB,
 but full embedding downloads a roughly 522 MB model and currently needs 2 GB as
