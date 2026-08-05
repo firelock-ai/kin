@@ -16,10 +16,10 @@ npx -y @kinlab/kin --version
 npx -y @kinlab/kin setup --intent agent --no-interactive
 ```
 
-Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
 No native Windows ARM64 archive is published. An x64 Node process under Windows
-emulation can provision the x86_64 archive for diagnostics; use WSL2 for the
-repository workflow documented below.
+emulation can provision the x86_64 archive; use WSL2 for the repository workflow
+documented below.
 
 ## What it does
 

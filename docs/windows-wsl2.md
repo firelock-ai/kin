@@ -1,9 +1,9 @@
 # Windows: use WSL2
 
-Kin repository workflows are supported on **Linux and macOS**. Native Windows
-currently has no repository-admission path.
+Kin repository workflows are fully supported on **Linux and macOS**. Native
+Windows admits repositories, but does not yet carry the whole workflow.
 
-Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
 
 Use **WSL2 (Windows Subsystem for Linux 2)** running a Linux distribution for
 the supported Windows-hosted experience.
@@ -16,10 +16,11 @@ Two parts of Kin are built around Unix runtime mechanics:
   calls via `LD_PRELOAD` (Linux) / `DYLD_INSERT_LIBRARIES` (macOS). That
   interception model does not exist on native Windows, so the "any tool sees
   graph-backed files as normal files" experience is Linux/macOS only.
-- **Repository admission** currently fails closed on native Windows before a
-  `.kin` repository is published. Without an admitted repository, graph,
-  lexical, daemon/query, repository setup, MCP, and review flows have no
-  supported native-Windows starting point.
+- **MCP and review workflows** are not yet covered end to end on native Windows
+  by the public install proof, so WSL2 is the supported path for connecting
+  agents and running review. Repository admission itself is not the blocker:
+  `kin init` admits a Git repository on native Windows and publishes graph
+  authority, and graph, lexical, and daemon-backed queries answer from it.
 - **Semantic vector search** ships enabled on every published platform. The
   native Windows CLI artifact (`kin-windows-x86_64.zip`) is built with the same
   default feature set as Linux and macOS, so semantic search and embedding are
@@ -67,7 +68,7 @@ projection and the same behavior the project tests and benchmarks against.
    than under `/mnt/c`; cross-OS filesystem access through `/mnt/*` is
    noticeably slower and does not support the projection layer cleanly.
 
-## Native Windows binary (repository-free only)
+## Native Windows binary
 
 If you only need the core CLI and cannot use WSL2, install with PowerShell:
 
@@ -75,12 +76,19 @@ If you only need the core CLI and cannot use WSL2, install with PowerShell:
 irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
-The installer prints the admission limitation before downloading, verifies the
-download's SHA-256 checksum, and installs the x86_64 CLI release shape. It does
-not run repository setup or claim a usable native repository. The archive
-carries semantic vector search but does not provide transparent filesystem
-projection; native Windows health reports repository, daemon, semantic-query,
-and VFS readiness as missing or unsupported.
+The installer prints the current support boundary before downloading, verifies
+the download's SHA-256 checksum, and installs the x86_64 CLI release shape. The
+archive carries semantic vector search but does not provide transparent
+filesystem projection, so `kin setup status` reports VFS readiness as
+unsupported on native Windows. Health checks run outside a Kin repository
+report repository, daemon, and semantic-query readiness as missing because they
+are repo-scoped; run them from inside an admitted repository.
+
+Git for Windows sets `core.autocrlf=true` in its system config, which rewrites
+line endings on checkout. `kin init` admits only a worktree whose bytes match
+the committed tree, so it refuses a repository cloned that way with `tracked
+blob ... bytes differ from the committed tree`. Run `git config --global
+core.autocrlf false` and clone again.
 
 No native Windows ARM64 archive is published. Use WSL2, or run x64 PowerShell
 under Windows x64 emulation to install the x86_64 archive for repository-free

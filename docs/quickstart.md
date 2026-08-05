@@ -59,11 +59,16 @@ On native Windows, use PowerShell:
 irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
-Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories.
+Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
 The PowerShell installer prints that boundary before downloading anything. Native
 Windows ARM64 has no release archive; an x64 PowerShell process may use the x86_64
 archive under Windows emulation, but WSL2 is the recommended path. Follow the Linux
 flow inside WSL2; see [windows-wsl2.md](./windows-wsl2.md).
+
+Git for Windows sets `core.autocrlf=true` in its system config, which rewrites line
+endings on checkout. `kin init` admits only a worktree whose bytes match the committed
+tree, so it will refuse a repository cloned that way with `tracked blob ... bytes differ
+from the committed tree`. Run `git config --global core.autocrlf false` and clone again.
 
 ### Installer options
 
