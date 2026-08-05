@@ -203,18 +203,19 @@ jobs:
             `embedded_entities=${embed.embedded_entities} index=${embed.vector_index_path}`
           );
 
+          // `kin status` coverage is captured as DIAGNOSTIC here, not as a gate.
+          // On Windows the daemon does not stay resident between CLI
+          // invocations, and `kin status` deliberately never starts one, so any
+          // read of it races the daemon's lifetime and returns
+          // unobserved/no_running_daemon regardless of what was actually
+          // embedded. Both the CI runner and a native aarch64 Windows guest
+          // reproduced that with the read placed AFTER a query that does start a
+          // daemon, so it is the surface that is wrong, not the ordering.
+          //
+          // Gating on it would be gating on a race. The embed command's own
+          // report above is the direct evidence and is what this asserts.
           const status = read("kin-status.json");
-          const coverage = status.embedding_coverage;
-          if (!coverage || coverage.state !== "observed") {
-            throw new Error(`status could not observe embedding coverage: ${JSON.stringify(coverage ?? null)}`);
-          }
-          // The whole point of the run: inference actually produced vectors on
-          // Windows. A zero here is the vector-free outcome wearing a green
-          // check, which is exactly what this workflow exists to catch.
-          if (!(coverage.indexed > 0)) {
-            throw new Error(`Windows embedding produced no indexed vectors: ${JSON.stringify(coverage)}`);
-          }
-          console.log(`indexed=${coverage.indexed} source=${coverage.source}`);
+          console.log(`status embedding_coverage (diagnostic): ${JSON.stringify(status.embedding_coverage ?? null)}`);
 
           // `kin locate --json` is an object carrying `files[]` and, when the
           // retrieval arms degrade, `degradations[]`. A vector-free build is
