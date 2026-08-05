@@ -1,13 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#60a5fa"/><stop offset="100%" style="stop-color:#2563eb"/></linearGradient><linearGradient id="gAxis" gradientUnits="userSpaceOnUse" x1="-19" y1="-21" x2="23" y2="21"><stop offset="0%" style="stop-color:#60a5fa"/><stop offset="100%" style="stop-color:#2563eb"/></linearGradient></defs>
-  <rect width="32" height="32" rx="6" fill="#0f0f13"/>
-  <g transform="translate(15, 16) scale(0.42)">
-    <line x1="0" y1="0" x2="-14" y2="-16" stroke="url(#g)" stroke-width="5" stroke-linecap="round"/>
-    <line x1="0" y1="0" x2="-14" y2="16" stroke="url(#g)" stroke-width="5" stroke-linecap="round"/>
-    <line x1="0" y1="0" x2="18" y2="0" stroke="url(#gAxis)" stroke-width="5" stroke-linecap="round"/>
-    <circle cx="0" cy="0" r="6.5" fill="url(#g)"/>
-    <circle cx="-14" cy="-16" r="5" fill="url(#g)"/>
-    <circle cx="-14" cy="16" r="5" fill="url(#g)"/>
-    <circle cx="18" cy="0" r="5" fill="url(#g)"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="k-arm" x1="391" y1="52" x2="105" y2="338" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#AE5AFF"/><stop offset="1" stop-color="#6C48FA"/>
+    </linearGradient>
+    <linearGradient id="k-leg" x1="177" y1="309" x2="436" y2="460" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B55FD"/><stop offset="1" stop-color="#3B74FB"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="115" fill="#0F1117"/>
+  <g transform="translate(45.38,56.78) scale(0.77804)">
+  <path d="M 200.42 56.98 A 17.00 17.00 0 0 1 212.44 52.00 L 345.23 52.00 A 19.00 19.00 0 0 1 358.66 84.44 L 142.56 300.54 A 22.00 22.00 0 0 1 105.00 284.99 L 105.00 157.78 A 13.00 13.00 0 0 1 108.81 148.59 Z" fill="url(#k-arm)"/>
+  <path d="M 210.08 276.14 A 30.00 30.00 0 0 1 252.52 276.13 L 400.57 424.25 A 21.00 21.00 0 0 1 385.72 460.10 L 226.12 460.10 A 15.00 15.00 0 0 1 215.51 455.70 L 140.05 380.16 A 24.00 24.00 0 0 1 140.05 346.24 Z" fill="url(#k-leg)"/>
   </g>
 </svg>

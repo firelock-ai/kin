@@ -1,78 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <!-- Gradient for Top-Right Diagonal Arm (Cyan to Ultraviolet Purple) -->
-    <linearGradient id="grad-top-arm" x1="141" y1="254" x2="361" y2="128" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#3AEAF5" />
-      <stop offset="100%" stop-color="#8015FF" />
+    <linearGradient id="k-arm" x1="391" y1="52" x2="105" y2="338" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#AE5AFF"/><stop offset="1" stop-color="#6C48FA"/>
     </linearGradient>
-
-    <!-- Gradient for Bottom-Right Diagonal Arm (Cyan to Ultraviolet Purple) -->
-    <linearGradient id="grad-bottom-arm" x1="141" y1="254" x2="365" y2="380" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#3AEAF5" />
-      <stop offset="100%" stop-color="#7F11FF" />
-    </linearGradient>
-
-    <!-- 3D Translucent Glass Highlight Overlay -->
-    <linearGradient id="glass-overlay" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.35" />
-      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.08" />
-      <stop offset="100%" stop-color="#000000" stop-opacity="0.2" />
+    <linearGradient id="k-leg" x1="177" y1="309" x2="436" y2="460" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5B55FD"/><stop offset="1" stop-color="#3B74FB"/>
     </linearGradient>
   </defs>
-
-  <!-- Solid Dark Matte Background -->
-  <rect width="512" height="512" rx="96" fill="#0A0E17" />
-
-  <!-- Main K Graph Network Group -->
-  <g>
-    <!-- 1. Straight Solid Capsule Edges -->
-    <!-- Vertical Left Cyan Stem -->
-    <line x1="141" y1="128" x2="141" y2="380" 
-          stroke="#35EFF8" 
-          stroke-width="32" 
-          stroke-linecap="round" />
-
-    <!-- Top-Right Diagonal Arm (Cyan -> Purple) -->
-    <line x1="141" y1="254" x2="361" y2="128" 
-          stroke="url(#grad-top-arm)" 
-          stroke-width="32" 
-          stroke-linecap="round" />
-
-    <!-- Bottom-Right Diagonal Arm (Cyan -> Purple) -->
-    <line x1="141" y1="254" x2="365" y2="380" 
-          stroke="url(#grad-bottom-arm)" 
-          stroke-width="32" 
-          stroke-linecap="round" />
-
-    <!-- 2. Glassmorphic Highlight Overlay Lines -->
-    <line x1="141" y1="128" x2="141" y2="380" 
-          stroke="url(#glass-overlay)" 
-          stroke-width="12" 
-          stroke-linecap="round" />
-    <line x1="141" y1="254" x2="361" y2="128" 
-          stroke="url(#glass-overlay)" 
-          stroke-width="12" 
-          stroke-linecap="round" />
-    <line x1="141" y1="254" x2="365" y2="380" 
-          stroke="url(#glass-overlay)" 
-          stroke-width="12" 
-          stroke-linecap="round" />
-
-    <!-- 3. Integrated Solid Graph Node Vertices -->
-    <!-- Top-Left Stem Node -->
-    <circle cx="141" cy="128" r="30" fill="#35EFF8" />
-    <!-- Center Junction Node -->
-    <circle cx="141" cy="254" r="30" fill="#3AEAF5" />
-    <!-- Bottom-Left Stem Node -->
-    <circle cx="141" cy="380" r="30" fill="#32EFF7" />
-    <!-- Upper-Right Tip Node -->
-    <circle cx="361" cy="128" r="30" fill="#8015FF" />
-    <!-- Lower-Right Tip Node -->
-    <circle cx="365" cy="380" r="30" fill="#7F11FF" />
-
-    <!-- Node Inner Gloss Highlights -->
-    <circle cx="141" cy="128" r="14" fill="#FFFFFF" fill-opacity="0.35" />
-    <circle cx="141" cy="254" r="14" fill="#FFFFFF" fill-opacity="0.3" />
-    <circle cx="361" cy="128" r="14" fill="#FFFFFF" fill-opacity="0.3" />
-  </g>
+  <path d="M 200.42 56.98 A 17.00 17.00 0 0 1 212.44 52.00 L 345.23 52.00 A 19.00 19.00 0 0 1 358.66 84.44 L 142.56 300.54 A 22.00 22.00 0 0 1 105.00 284.99 L 105.00 157.78 A 13.00 13.00 0 0 1 108.81 148.59 Z" fill="url(#k-arm)"/>
+  <path d="M 210.08 276.14 A 30.00 30.00 0 0 1 252.52 276.13 L 400.57 424.25 A 21.00 21.00 0 0 1 385.72 460.10 L 226.12 460.10 A 15.00 15.00 0 0 1 215.51 455.70 L 140.05 380.16 A 24.00 24.00 0 0 1 140.05 346.24 Z" fill="url(#k-leg)"/>
 </svg>
