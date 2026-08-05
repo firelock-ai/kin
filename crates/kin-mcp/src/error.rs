@@ -18,6 +18,19 @@ pub enum McpError {
     #[error("context error: {0}")]
     Context(String),
 
+    /// An entity's recorded source path does not exist at the workspace's
+    /// current generation.
+    ///
+    /// This is graph truth answering completely, not authority failing: the
+    /// graph ingests whole history, so it carries entities for files that were
+    /// deleted or renamed at some point and are absent from the current
+    /// workspace. It is a property of ONE entity, so a surface projecting many
+    /// entities skips that candidate; a surface asked for exactly this entity
+    /// still reports it. Kept apart from [`McpError::Context`] so callers
+    /// classify it by type rather than by matching message text.
+    #[error("entity absent at workspace generation: {0}")]
+    WorkspaceAbsent(String),
+
     #[error("review error: {0}")]
     Review(String),
 
