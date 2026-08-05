@@ -48,7 +48,7 @@ function Test-KinTruthy([string]$Value) {
     return @("1", "true", "yes", "on") -contains $Value.Trim().ToLowerInvariant()
 }
 
-$NativeWindowsSupportNotice = "Native Windows x86_64 can install and run repository-free CLI diagnostics, but repository admission is currently unavailable: kin init fails closed, so graph, lexical, daemon, repository setup, MCP, and review workflows are unsupported. Use WSL2 for usable Kin repositories."
+$NativeWindowsSupportNotice = "Native Windows x86_64 support is early. Repository admission works: kin init imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience. If kin init reports that tracked bytes differ from the committed tree, Git for Windows checked the repository out with core.autocrlf=true from its system config; run 'git config --global core.autocrlf false' and clone again."
 
 function Resolve-KinWindowsArchiveArchitecture {
     param(

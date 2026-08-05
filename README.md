@@ -137,8 +137,8 @@ you can verify appears there.
 
 On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
 Native Windows support is early: repositories admit and graph and lexical
-queries answer natively, but this build has no semantic vector search yet and
-its end-to-end install proof is still maturing, so WSL2 remains the
+queries answer natively, but transparent filesystem projection is not shipped
+there and its end-to-end install proof is still maturing, so WSL2 remains the
 recommended path for full Kin.
 Read [Platform and maturity](#platform-and-maturity) below before choosing a
 Windows install path.
@@ -231,7 +231,7 @@ boundaries:
 | --- | --- | --- |
 | macOS, Apple Silicon and Intel | Native graph, vector, daemon, setup, MCP, and review surfaces ship in the release archive. | Shipped and exercised on both architectures. It uses `DYLD_INSERT_LIBRARIES`; SIP-protected or hardened programs may reject injection. |
 | Linux x86_64 and arm64 | `kin` and `kin-daemon` are static musl builds intended to run on glibc and musl distributions. | The public VFS executable and shim are GNU/glibc builds, not musl builds. Current artifacts require glibc 2.39; Alpine/musl and older-glibc distributions are not supported projection hosts. The arm64 release proof runs on Ubuntu 24.04. |
-| Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but this build ships without semantic vector search and its end-to-end install proof is still maturing. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
+| Native Windows x86_64 | Early support: repositories admit and graph and lexical queries answer natively, but MCP and review workflows are not yet covered end to end by the install proof. WSL2 remains the recommended path for full Kin. | Not shipped. Use WSL2 with a Linux distribution that meets the glibc boundary for projection. |
 
 First indexing reads the entire reachable Git history, so `kin init` on a
 large or long-lived repository takes minutes, not seconds, before embedding
