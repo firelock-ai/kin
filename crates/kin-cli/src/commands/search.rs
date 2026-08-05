@@ -120,6 +120,30 @@ fn evaluate_semantic_coverage(
     })
 }
 
+/// How a search row was found.
+///
+/// Name matching is conjunctive: the name index takes the exact name, then the
+/// intersection of every query token, then a substring containment, so a row it
+/// returns shares literal text with the query. The text fallback is disjunctive
+/// BM25 over content, so a query naming nothing still returns that index's
+/// highest-scoring documents — `zzz_this_symbol_does_not_exist` tokenizes into
+/// words that do occur, and twenty unrelated entities come back.
+///
+/// Both used to render and serialize identically, so a caller could not tell a
+/// hit from a guess. An agent acting on a typo, a stale name, or a symbol from
+/// another version received twenty confident rows and no way to reject them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMatchKind {
+    /// The query matched this entity's name.
+    Name,
+    /// No name matched the query, so lexical search over content answered
+    /// instead. The row shares content tokens with the query, not a name.
+    TextFallback,
+    /// Vector retrieval answered, ranked against the query's embedding.
+    Semantic,
+}
+
 #[derive(Serialize)]
 struct SearchJsonEntity {
     id: String,
@@ -129,8 +153,14 @@ struct SearchJsonEntity {
     line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     end_line: Option<u32>,
+    /// Present whenever the surface that produced this row measured one.
+    /// Comparable only against rows sharing a `match_kind`: a `text_fallback`
+    /// score is BM25, a `semantic` score is the ranker's.
     #[serde(skip_serializing_if = "Option::is_none")]
     score: Option<f32>,
+    /// Absent only when the row came from a daemon predating the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_kind: Option<SearchMatchKind>,
     signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
@@ -142,6 +172,10 @@ struct SearchJsonArtifact {
     file: String,
     artifact_kind: String,
     line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_kind: Option<SearchMatchKind>,
     preview: Option<String>,
 }
 
@@ -206,6 +240,11 @@ pub struct DaemonSearchEntityRecord {
     pub end_byte: Option<usize>,
     pub signature: Option<String>,
     pub score: Option<f32>,
+    /// `default` rather than required so a CLI paired with a daemon predating
+    /// the field reads `None` — unknown — instead of inheriting a provenance
+    /// nobody recorded. Absent must not read as "matched by name".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<SearchMatchKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -221,6 +260,8 @@ pub struct DaemonSearchArtifactRecord {
     pub line: u32,
     pub preview: Option<String>,
     pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<SearchMatchKind>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -444,14 +485,21 @@ pub fn collect_daemon_search_response(
         request.kind.as_deref(),
         request.language.as_deref(),
     )?;
+    // A name query that only the fallback answered is reported as a fallback at
+    // the response level too, so a reader that never looks at a single row still
+    // learns that nothing matched by name.
+    let text_fallback = !results.is_empty()
+        && results
+            .iter()
+            .all(|matched| matched.match_kind == SearchMatchKind::TextFallback);
     let records = results
         .iter()
-        .map(|record| record_to_daemon_record(record, None))
+        .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
     Ok(DaemonSearchResponse {
         query: request.query.clone(),
         semantic: false,
-        text_fallback: false,
+        text_fallback,
         total_matches: records.len(),
         records,
         semantic_coverage: None,
@@ -585,7 +633,11 @@ fn collect_daemon_semantic_search_response(
     let mut records = Vec::new();
     for result in &ranked {
         if let Some(record) = item_map.get(&result.id) {
-            records.push(record_to_daemon_record(record, Some(result.score)));
+            records.push(record_to_daemon_record(
+                record,
+                SearchMatchKind::Semantic,
+                Some(result.score),
+            ));
         }
     }
 
@@ -599,12 +651,19 @@ fn collect_daemon_semantic_search_response(
     })
 }
 
+/// One search row together with how it was found.
+struct MatchedRecord {
+    record: SearchRecord,
+    match_kind: SearchMatchKind,
+    score: Option<f32>,
+}
+
 fn collect_search_results(
     graph: &kin_db::InMemoryGraph,
     pattern: &str,
     kind: Option<&str>,
     language: Option<&str>,
-) -> Result<Vec<SearchRecord>> {
+) -> Result<Vec<MatchedRecord>> {
     let kinds = kind.and_then(parse_kinds);
     let languages = language.and_then(parse_language);
     // "test" is role-based, not kind-based (parsers never emit EntityKind::Test)
@@ -622,7 +681,14 @@ fn collect_search_results(
         if let Some(ref lang) = languages {
             all.retain(|entity| entity.language == *lang);
         }
-        return Ok(all.into_iter().map(SearchRecord::Entity).collect());
+        return Ok(all
+            .into_iter()
+            .map(|entity| MatchedRecord {
+                record: SearchRecord::Entity(entity),
+                match_kind: SearchMatchKind::Name,
+                score: None,
+            })
+            .collect());
     }
 
     let sub_patterns: Vec<&str> = pattern
@@ -643,15 +709,27 @@ fn collect_search_results(
         };
         for entity in graph.query_entities(&filter)? {
             if seen.insert(entity.id.to_string()) {
-                results.push(SearchRecord::Entity(entity));
+                results.push(MatchedRecord {
+                    record: SearchRecord::Entity(entity),
+                    match_kind: SearchMatchKind::Name,
+                    score: None,
+                });
             }
         }
     }
 
-    // Full-text search fallback for JSON path too
+    // Full-text search fallback for JSON path too.
+    //
+    // Everything below this line answered a question the caller did not ask: no
+    // name matched, so BM25 over content answers instead, and BM25 is
+    // disjunctive — a query whose tokens appear anywhere returns that index's
+    // best documents whether or not the symbol exists. These rows are marked so
+    // a caller can tell them from the name matches above, and they carry the
+    // BM25 score the loop used to discard, which is the only number a consumer
+    // can threshold on.
     if results.len() < 5 {
         let text_hits = graph.text_search(pattern, 20)?;
-        for (retrieval_key, _score) in text_hits {
+        for (retrieval_key, score) in text_hits {
             let Some(record) = resolve_retrieval_record(graph, retrieval_key) else {
                 continue;
             };
@@ -665,14 +743,18 @@ fn collect_search_results(
                 // entity already matched by name above does not add a second
                 // row, and multiple embedding records for one entity collapse.
                 if seen.insert(record.dedupe_key()) {
-                    results.push(record);
+                    results.push(MatchedRecord {
+                        record,
+                        match_kind: SearchMatchKind::TextFallback,
+                        score: Some(score),
+                    });
                 }
             }
         }
     }
 
     if pattern.trim().is_empty() {
-        results.sort_by_key(record_sort_key);
+        results.sort_by_key(|matched| record_sort_key(&matched.record));
     }
     Ok(results)
 }
@@ -775,6 +857,7 @@ fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
             line: entity.start_line.unwrap_or(1),
             end_line: entity.end_line,
             score: entity.score,
+            match_kind: entity.match_kind,
             signature: entity.signature.clone(),
             body: entity.body.clone(),
         }),
@@ -783,27 +866,37 @@ fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
             file: artifact.file.clone().unwrap_or_default(),
             artifact_kind: artifact.artifact_kind.clone(),
             line: artifact.line,
+            score: artifact.score,
+            match_kind: artifact.match_kind,
             preview: artifact.preview.clone(),
         }),
     }
 }
 
-fn record_to_daemon_record(record: &SearchRecord, score: Option<f32>) -> DaemonSearchRecord {
+fn record_to_daemon_record(
+    record: &SearchRecord,
+    match_kind: SearchMatchKind,
+    score: Option<f32>,
+) -> DaemonSearchRecord {
     match record {
         SearchRecord::Entity(entity) => {
-            DaemonSearchRecord::Entity(entity_to_daemon_record(entity, score))
+            DaemonSearchRecord::Entity(entity_to_daemon_record(entity, match_kind, score))
         }
         SearchRecord::Resolved {
             item: ResolvedRetrievalItem::Entity(entity),
             ..
-        } => DaemonSearchRecord::Entity(entity_to_daemon_record(entity, score)),
+        } => DaemonSearchRecord::Entity(entity_to_daemon_record(entity, match_kind, score)),
         SearchRecord::Resolved { item, .. } => {
-            DaemonSearchRecord::Artifact(resolved_item_to_daemon_record(item, score))
+            DaemonSearchRecord::Artifact(resolved_item_to_daemon_record(item, match_kind, score))
         }
     }
 }
 
-fn entity_to_daemon_record(entity: &Entity, score: Option<f32>) -> DaemonSearchEntityRecord {
+fn entity_to_daemon_record(
+    entity: &Entity,
+    match_kind: SearchMatchKind,
+    score: Option<f32>,
+) -> DaemonSearchEntityRecord {
     let span = entity.span.as_ref();
     DaemonSearchEntityRecord {
         id: entity.id.to_string(),
@@ -817,6 +910,7 @@ fn entity_to_daemon_record(entity: &Entity, score: Option<f32>) -> DaemonSearchE
         end_byte: span.map(|span| span.end_byte),
         signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
         score,
+        match_kind: Some(match_kind),
         body: None,
         body_omitted_line_count: 0,
     }
@@ -824,6 +918,7 @@ fn entity_to_daemon_record(entity: &Entity, score: Option<f32>) -> DaemonSearchE
 
 fn resolved_item_to_daemon_record(
     item: &ResolvedRetrievalItem,
+    match_kind: SearchMatchKind,
     score: Option<f32>,
 ) -> DaemonSearchArtifactRecord {
     let file = item.file_path().map(|f| f.0);
@@ -843,6 +938,7 @@ fn resolved_item_to_daemon_record(
                 .clone()
                 .filter(|summary| !summary.trim().is_empty()),
             score,
+            match_kind: Some(match_kind),
         },
         ResolvedRetrievalItem::ShallowFile(file_item) => DaemonSearchArtifactRecord {
             title: file_display_name(&file_item.file_id.0),
@@ -861,6 +957,7 @@ fn resolved_item_to_daemon_record(
                 ))
             },
             score,
+            match_kind: Some(match_kind),
         },
         ResolvedRetrievalItem::StructuredArtifact(artifact) => DaemonSearchArtifactRecord {
             title: file_display_name(&artifact.file_id.0),
@@ -870,6 +967,7 @@ fn resolved_item_to_daemon_record(
             line: 1,
             preview: artifact.text_preview.clone(),
             score,
+            match_kind: Some(match_kind),
         },
         ResolvedRetrievalItem::OpaqueArtifact(artifact) => DaemonSearchArtifactRecord {
             title: file_display_name(&artifact.file_id.0),
@@ -885,6 +983,7 @@ fn resolved_item_to_daemon_record(
             line: 1,
             preview: artifact.text_preview.clone(),
             score,
+            match_kind: Some(match_kind),
         },
     }
 }
@@ -1056,6 +1155,19 @@ fn retrieval_key_string(key: &RetrievalKey) -> String {
     serde_json::to_string(key).unwrap_or_else(|_| format!("{:?}", key))
 }
 
+/// Row suffix marking a lexical fallback in the plain listing.
+///
+/// The response-level banner only fires when nothing matched by name. A query
+/// with one or two name matches still triggers the fallback — it fills to five —
+/// and those extra rows would otherwise print exactly like the real ones, which
+/// is the same defect at smaller scale.
+fn fallback_marker(match_kind: Option<SearchMatchKind>) -> &'static str {
+    match match_kind {
+        Some(SearchMatchKind::TextFallback) => "  [text-search fallback, no name match]",
+        _ => "",
+    }
+}
+
 fn render_daemon_search_response(
     layout: &kin_core::KinLayout,
     response: &DaemonSearchResponse,
@@ -1074,6 +1186,15 @@ fn render_daemon_search_response(
     if response.semantic && response.text_fallback {
         println!(
             "No vector matches for '{}'; using graph text search fallback:",
+            response.query
+        );
+    } else if response.text_fallback {
+        // Without this line the twenty rows below read as twenty matches. None
+        // of them matched the query by name, and saying so is the difference
+        // between a result and a guess.
+        println!(
+            "No name matched '{}'; the rows below are graph text search \
+             fallbacks ranked by content, not name matches:",
             response.query
         );
     }
@@ -1150,7 +1271,7 @@ fn render_daemon_search_response(
                         );
                     } else {
                         println!(
-                            "  {} ({}, {}) - {}",
+                            "  {} ({}, {}) - {}{}",
                             entity.name,
                             entity.kind,
                             entity.language,
@@ -1158,7 +1279,8 @@ fn render_daemon_search_response(
                                 .file
                                 .as_deref()
                                 .map(|file| display_read_path(layout, file))
-                                .unwrap_or_else(|| "no file".to_string())
+                                .unwrap_or_else(|| "no file".to_string()),
+                            fallback_marker(entity.match_kind)
                         );
                     }
                 }
@@ -1177,14 +1299,15 @@ fn render_daemon_search_response(
                         );
                     } else {
                         println!(
-                            "  {} ({}) - {}",
+                            "  {} ({}) - {}{}",
                             artifact.title,
                             artifact.context,
                             artifact
                                 .file
                                 .as_deref()
                                 .map(|file| display_read_path(layout, file))
-                                .unwrap_or_else(|| "no file".to_string())
+                                .unwrap_or_else(|| "no file".to_string()),
+                            fallback_marker(artifact.match_kind)
                         );
                     }
                 }
@@ -1379,6 +1502,7 @@ mod tests {
     fn search_json_entity_carries_score_and_span() {
         use super::{
             daemon_record_to_json, DaemonSearchEntityRecord, DaemonSearchRecord, SearchJsonRecord,
+            SearchMatchKind,
         };
         let rec = DaemonSearchRecord::Entity(DaemonSearchEntityRecord {
             id: "e1".into(),
@@ -1392,6 +1516,7 @@ mod tests {
             end_byte: None,
             signature: Some("fn handler()".into()),
             score: Some(0.87),
+            match_kind: Some(SearchMatchKind::Semantic),
             body: None,
             body_omitted_line_count: 0,
         });
@@ -1403,6 +1528,235 @@ mod tests {
         assert_eq!(json["line"].as_u64(), Some(10));
         assert_eq!(json["end_line"].as_u64(), Some(20));
         assert!((json["score"].as_f64().unwrap() - 0.87).abs() < 1e-6);
+        assert_eq!(json["match_kind"].as_str(), Some("semantic"));
+    }
+
+    /// The collector must label a guess as a guess against a real graph.
+    ///
+    /// This runs the mechanism rather than the serializer: a live text index, a
+    /// name that exists, and a compound query that names nothing but shares
+    /// content tokens — which is exactly how a nonsense string returned twenty
+    /// rows. Asserting the fallback set is non-empty is deliberate: a fixture
+    /// whose text index never answers would make every claim below vacuously
+    /// true and the test unable to fail.
+    #[test]
+    fn the_collector_marks_rows_no_name_matched_as_fallbacks() {
+        use super::{
+            collect_daemon_search_response, DaemonSearchRecord, DaemonSearchRequest,
+            SearchMatchKind,
+        };
+        use kin_model::EntityStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let graph = kin_db::InMemoryGraph::with_text_index(dir.path().join("text-index"));
+
+        let mut described = dedupe_test_entity("provide_context_for_failure", "src/context.rs");
+        described.doc_summary = Some(
+            "attach additional context to a failing operation before it propagates".to_string(),
+        );
+        let mut other = dedupe_test_entity("ensure_nonbool", "tests/ui/ensure-nonbool.rs");
+        other.doc_summary =
+            Some("this does not exist as a bool anywhere in the context".to_string());
+        for entity in [&described, &other] {
+            graph.upsert_entity(entity).expect("upsert");
+        }
+        graph.flush_text_index().expect("flush text index");
+
+        let search = |query: &str| {
+            collect_daemon_search_response(
+                &graph,
+                &DaemonSearchRequest {
+                    query: query.to_string(),
+                    kind: None,
+                    language: None,
+                    limit: None,
+                    semantic: false,
+                    show_body: false,
+                    body_limit: None,
+                },
+            )
+            .expect("search")
+        };
+
+        let real = search("provide_context_for_failure");
+        let named: Vec<_> = real
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                DaemonSearchRecord::Entity(entity) => Some(entity),
+                DaemonSearchRecord::Artifact(_) => None,
+            })
+            .filter(|entity| entity.match_kind == Some(SearchMatchKind::Name))
+            .collect();
+        assert!(
+            named
+                .iter()
+                .any(|e| e.name == "provide_context_for_failure"),
+            "a symbol that exists must come back as a name match: {:?}",
+            real.records
+        );
+        assert!(
+            !real.text_fallback,
+            "a query a name answered is not a fallback"
+        );
+
+        let nonsense = search("zzz_context_does_not_exist_anywhere_9f3a");
+        // The fixture has to actually produce the defect, or the assertions
+        // below prove nothing about it.
+        assert!(
+            !nonsense.records.is_empty(),
+            "fixture inert: the text fallback returned nothing, so this test \
+             cannot observe the behavior it exists to pin"
+        );
+        for record in &nonsense.records {
+            let match_kind = match record {
+                DaemonSearchRecord::Entity(entity) => entity.match_kind,
+                DaemonSearchRecord::Artifact(artifact) => artifact.match_kind,
+            };
+            assert_eq!(
+                match_kind,
+                Some(SearchMatchKind::TextFallback),
+                "a row no name matched must not claim to be a name match: {record:?}"
+            );
+        }
+        assert!(
+            nonsense.text_fallback,
+            "a response only the fallback answered must say so"
+        );
+    }
+
+    /// The JSON a machine consumer reads must say which surface answered.
+    ///
+    /// Name mode used to emit `id, kind, name, file, line, end_line, signature`
+    /// and nothing else: no score, no provenance. A row the name index returned
+    /// and a row BM25 guessed at serialized to the same shape, so an agent
+    /// searching a typo, a renamed symbol, or a symbol from another version got
+    /// twenty confident-looking results and no field to reject them by.
+    #[test]
+    fn name_mode_json_separates_a_match_from_a_fallback() {
+        use super::{
+            daemon_record_to_json, DaemonSearchEntityRecord, DaemonSearchRecord, SearchJsonRecord,
+            SearchMatchKind,
+        };
+
+        let row = |match_kind, score| {
+            let record = DaemonSearchRecord::Entity(DaemonSearchEntityRecord {
+                id: "e1".into(),
+                name: "NotBool".into(),
+                kind: "Class".into(),
+                language: "rust".into(),
+                file: Some("tests/ui/ensure-nonbool.rs".into()),
+                start_line: Some(3),
+                end_line: Some(4),
+                start_byte: None,
+                end_byte: None,
+                signature: None,
+                score,
+                match_kind: Some(match_kind),
+                body: None,
+                body_omitted_line_count: 0,
+            });
+            let SearchJsonRecord::Entity(entity) = daemon_record_to_json(&record) else {
+                panic!("expected entity record");
+            };
+            serde_json::to_value(&entity).expect("serialize")
+        };
+
+        let matched = row(SearchMatchKind::Name, None);
+        let guessed = row(SearchMatchKind::TextFallback, Some(2.5));
+
+        // The acceptance: reading only the JSON, the two are distinguishable.
+        assert_ne!(
+            matched["match_kind"], guessed["match_kind"],
+            "a fallback must not serialize the same as a name match"
+        );
+        assert_eq!(matched["match_kind"].as_str(), Some("name"));
+        assert_eq!(guessed["match_kind"].as_str(), Some("text_fallback"));
+
+        // And the fallback carries the BM25 score the collector used to discard,
+        // so a consumer can threshold rather than only classify.
+        assert!((guessed["score"].as_f64().unwrap() - 2.5).abs() < 1e-6);
+
+        // A daemon predating the field reports unknown, never "name". Absent
+        // provenance must not read as a confirmed match.
+        let legacy: DaemonSearchEntityRecord = serde_json::from_value(serde_json::json!({
+            "id": "e1", "name": "NotBool", "kind": "Class", "language": "rust",
+            "file": null, "start_line": null, "end_line": null,
+            "start_byte": null, "end_byte": null, "signature": null, "score": null
+        }))
+        .expect("deserialize a record from before the field existed");
+        assert_eq!(legacy.match_kind, None);
+    }
+
+    /// The provenance has to survive the daemon hop, not just the struct.
+    ///
+    /// `kin search` reaches the graph through the daemon, so every field a
+    /// consumer relies on crosses a `serde_json` round trip on the way back. A
+    /// field that serialized but did not deserialize would leave the CLI reading
+    /// `None` — unknown — for every row of a live search while every in-process
+    /// test still passed.
+    #[test]
+    fn match_kind_and_score_survive_the_daemon_wire_format() {
+        use super::{
+            DaemonSearchArtifactRecord, DaemonSearchEntityRecord, DaemonSearchRecord,
+            DaemonSearchResponse, SearchMatchKind,
+        };
+
+        let response = DaemonSearchResponse {
+            query: "zzz_this_symbol_does_not_exist_anywhere_9f3a".into(),
+            semantic: false,
+            text_fallback: true,
+            total_matches: 2,
+            records: vec![
+                DaemonSearchRecord::Entity(DaemonSearchEntityRecord {
+                    id: "e1".into(),
+                    name: "NotBool".into(),
+                    kind: "Class".into(),
+                    language: "rust".into(),
+                    file: Some("tests/ui/ensure-nonbool.rs".into()),
+                    start_line: Some(3),
+                    end_line: Some(4),
+                    start_byte: None,
+                    end_byte: None,
+                    signature: None,
+                    score: Some(1.75),
+                    match_kind: Some(SearchMatchKind::TextFallback),
+                    body: None,
+                    body_omitted_line_count: 0,
+                }),
+                DaemonSearchRecord::Artifact(DaemonSearchArtifactRecord {
+                    title: "lib.rs".into(),
+                    context: "StructuredArtifact, Doc".into(),
+                    file: Some("src/lib.rs".into()),
+                    artifact_kind: "Doc".into(),
+                    line: 1,
+                    preview: None,
+                    score: Some(0.5),
+                    match_kind: Some(SearchMatchKind::TextFallback),
+                }),
+            ],
+            semantic_coverage: None,
+        };
+
+        let wire = serde_json::to_string(&response).expect("serialize");
+        let back: DaemonSearchResponse = serde_json::from_str(&wire).expect("deserialize");
+
+        assert!(back.text_fallback, "the response-level flag must survive");
+        for record in &back.records {
+            let match_kind = match record {
+                DaemonSearchRecord::Entity(entity) => entity.match_kind,
+                DaemonSearchRecord::Artifact(artifact) => artifact.match_kind,
+            };
+            assert_eq!(
+                match_kind,
+                Some(SearchMatchKind::TextFallback),
+                "provenance must cross the wire: {record:?}"
+            );
+        }
+        let DaemonSearchRecord::Entity(entity) = &back.records[0] else {
+            panic!("expected an entity record");
+        };
+        assert!((entity.score.expect("score survives") - 1.75).abs() < 1e-6);
     }
 
     #[test]
