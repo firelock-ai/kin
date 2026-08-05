@@ -22,7 +22,7 @@ kin-review = { workspace = true }
 kin-runtime = { workspace = true }
 kin-ranking = { workspace = true }
 kin-spine = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 hex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

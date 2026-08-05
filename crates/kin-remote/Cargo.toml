@@ -27,7 +27,7 @@ tracing = { workspace = true }
 kin-model = { workspace = true }
 kin-db = { workspace = true }
 sha2 = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 ureq = { version = "3", optional = true, features = ["json"] }
 
 [dev-dependencies]
