@@ -669,6 +669,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// List the languages Kin extracts semantics from
+    Languages {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Emit benchmark/runtime metadata for strict prepared-state cache keys
     #[command(hide = true)]
     BenchMeta {
@@ -2872,6 +2878,7 @@ fn main() -> Result<()> {
                     TelemetryAction::Purge => commands::telemetry::run_purge().await,
                 },
                 Command::Support { json } => commands::support::run(json).await,
+                Command::Languages { json } => commands::languages::run(json).await,
                 Command::BenchMeta {
                     json,
                     prepared_state,

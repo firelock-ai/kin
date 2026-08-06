@@ -36,6 +36,7 @@ pub mod history;
 pub mod impact;
 pub mod init;
 pub mod intent;
+pub mod languages;
 pub mod locate;
 pub mod locate_cursor;
 pub mod locate_debug;

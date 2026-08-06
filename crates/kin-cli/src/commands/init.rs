@@ -233,7 +233,36 @@ fn print_human_result(
         "  Semantic enrichment: {}",
         render_semantic_enrichment(semantic_enrichment)
     );
+    if let Some(notice) = semantic_absence_notice(semantic_enrichment) {
+        println!("{notice}");
+    }
     Ok(())
+}
+
+/// What to say when initialization produced no semantic entities at all.
+///
+/// Absence here was previously reported as a number and nothing else, and a
+/// repository whose languages Kin does not parse then answers every later query
+/// with an empty list — byte-identical to a query that legitimately found
+/// nothing. The two call for opposite next actions and the operator had no way
+/// to tell them apart, on any surface, in any output.
+///
+/// The wording is deliberately CONDITIONAL rather than diagnostic. This function
+/// knows that zero entities were extracted; it does NOT know whether that is
+/// because no admitted file had an adapter or because something went wrong for a
+/// language Kin does support, and asserting the first would be a confident guess
+/// dressed as a finding. Naming the possibility and handing over the command
+/// that settles it costs one line and cannot be wrong.
+fn semantic_absence_notice(enrichment: &SemanticEnrichmentStatus) -> Option<String> {
+    if !matches!(enrichment.presence, SemanticEnrichmentPresence::Absent) {
+        return None;
+    }
+    Some(
+        "  No semantic entities were extracted. If this repository's languages are not \
+         ones Kin parses, that is expected, and `kin languages` lists the ones it does; \
+         content and history are still under repository authority either way."
+            .to_string(),
+    )
 }
 
 fn render_semantic_enrichment(enrichment: &SemanticEnrichmentStatus) -> String {
@@ -269,4 +298,56 @@ fn initialized_raw_git_head(result: &kin_core::InitResult) -> Option<&kin_model:
         .as_ref()
         .and_then(|delta| delta.new.as_ref())
         .map(|authority| &authority.raw_head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::status::SemanticEnrichmentView;
+
+    fn enrichment(
+        presence: SemanticEnrichmentPresence,
+        entities: usize,
+    ) -> SemanticEnrichmentStatus {
+        SemanticEnrichmentStatus {
+            view: SemanticEnrichmentView::DurableRepositoryAuthority,
+            authority_generation: 1,
+            workspace_generation: 1,
+            presence,
+            entity_count: entities,
+            relation_count: 0,
+            semantic_change_count: 0,
+            completion_attested: false,
+        }
+    }
+
+    /// A repository Kin could not extract anything from must SAY so and name the
+    /// command that explains why. Silence here is what made "no parser for my
+    /// language" indistinguishable from "my search was bad".
+    #[test]
+    fn an_empty_semantic_layer_points_at_the_supported_languages() {
+        let notice = semantic_absence_notice(&enrichment(SemanticEnrichmentPresence::Absent, 0))
+            .expect("absence must be explained, not merely counted");
+        assert!(
+            notice.contains("kin languages"),
+            "the notice must hand over the command that settles it: {notice}"
+        );
+        // The claim must stay conditional. Asserting the cause outright would be
+        // a guess: this code knows the count, not the reason.
+        assert!(
+            notice.contains("If this repository's languages are not"),
+            "the notice must not assert a cause it cannot know: {notice}"
+        );
+    }
+
+    /// The falsification: a repository that DID get semantics must print
+    /// nothing extra, or the notice is noise on every successful init rather
+    /// than a signal on the failing ones.
+    #[test]
+    fn a_repository_with_semantics_gets_no_notice() {
+        assert!(
+            semantic_absence_notice(&enrichment(SemanticEnrichmentPresence::Present, 19_405))
+                .is_none()
+        );
+    }
 }
