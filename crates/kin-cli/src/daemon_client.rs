@@ -2562,6 +2562,22 @@ impl PreservedDaemonEndpoint {
     }
 }
 
+/// Build a preserved-endpoint value so the CLI's stop-report tests can exercise
+/// the exit-code decision without standing up a daemon.
+///
+/// Hidden rather than `#[cfg(test)]`: the report lives in another module, and a
+/// `cfg(test)` item is invisible to it.
+#[doc(hidden)]
+pub fn preserved_daemon_endpoint_for_test(
+    pid_path: &Path,
+    reason: &str,
+) -> PreservedDaemonEndpoint {
+    PreservedDaemonEndpoint {
+        pid_path: pid_path.to_path_buf(),
+        reason: reason.to_string(),
+    }
+}
+
 impl fmt::Display for PreservedDaemonEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} survives ({})", self.pid_path.display(), self.reason)

@@ -1487,7 +1487,14 @@ fn finish_stop_with_output(
             failed.join(", ")
         );
     }
-    if !endpoints_retired {
+    // Deliberately NOT raised on the quiet path. `quiet` is full uninstall's
+    // nested stop, and uninstall's job is to leave no PROCESS running: it
+    // re-verifies exactly that through its own quiescence fence, which reads
+    // processes and not endpoint records. A leftover pid file inside some repo
+    // does not keep an install alive, and refusing to uninstall over one would
+    // turn a reporting improvement into a command the operator cannot complete.
+    // A surviving process still fails uninstall, above, as it always has.
+    if !quiet && !endpoints_retired {
         // The process died and its endpoint did not, so `status`, autostart, and
         // every other reader of `daemon.pid` still see a published owner for this
         // repo. Reporting success here is what made the failure invisible.
@@ -1507,6 +1514,58 @@ fn finish_stop_with_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stop_report(preserved: Option<PreservedDaemonEndpoint>) -> StopReport {
+        StopReport {
+            kind: "repo-daemon",
+            label: "repo".to_string(),
+            pid: 4242,
+            outcome: StopOutcome::Stopped,
+            preserved_endpoint: preserved,
+        }
+    }
+
+    /// A stop whose endpoint survived must fail, and must name the survivor.
+    #[test]
+    fn a_surviving_endpoint_fails_the_stop_and_names_the_pid_file() {
+        let preserved = crate::daemon_client::preserved_daemon_endpoint_for_test(
+            Path::new("/repo/.kin/daemon.pid"),
+            "recorded owner pid 4242 never became affirmatively dead",
+        );
+        let error = finish_stop_with_output(
+            "current-repo",
+            &[stop_report(Some(preserved))],
+            false,
+            false,
+        )
+        .expect_err("a published endpoint outliving a confirmed stop is a failure");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("/repo/.kin/daemon.pid"),
+            "the operator needs the path, not just a verdict: {rendered}"
+        );
+
+        // The falsification: the identical report with nothing preserved passes,
+        // so the assertion above is about the survivor and not about the shape
+        // of the report.
+        finish_stop_with_output("current-repo", &[stop_report(None)], false, false)
+            .expect("a retired endpoint is a clean stop");
+    }
+
+    /// Full uninstall's nested stop must not be blocked by a leftover pid file.
+    /// Uninstall's contract is that no PROCESS survives, which it re-verifies
+    /// itself; refusing over an endpoint record would leave the operator unable
+    /// to complete the command.
+    #[test]
+    fn the_uninstall_path_is_not_blocked_by_a_surviving_endpoint() {
+        let preserved = crate::daemon_client::preserved_daemon_endpoint_for_test(
+            Path::new("/repo/.kin/daemon.pid"),
+            "recorded owner pid 4242 never became affirmatively dead",
+        );
+        finish_stop_with_output("all", &[stop_report(Some(preserved))], false, true)
+            .expect("a leftover endpoint record does not keep an install alive");
+    }
+
     #[cfg(windows)]
     use std::fs;
 
