@@ -496,9 +496,12 @@ fn check_supervisor_startup_protocol() -> HealthCheck {
 /// the binary is installed.
 ///
 /// Outside a Kin repository there is no repo-scoped daemon to probe, so this is
-/// reported as Unsupported rather than a failure. Inside a repo, a daemon that
-/// is not reachable is reported as Stale (recoverable): any `kin` command in the
-/// repo auto-starts it, so it is not a hard first-run blocker.
+/// reported as Unsupported rather than a failure. Inside a repo, severity turns
+/// on whether a daemon was ever published for it, which the endpoint record
+/// answers: no record is the resting state every repository starts in and stays
+/// in until a command needs a daemon, so it is skipped rather than flagged; a
+/// record left behind by a daemon that is no longer reachable is a real
+/// leftover and stays advisory.
 async fn check_daemon_running() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
     let layout = match kin_core::KinLayout::discover(&cwd) {
@@ -524,14 +527,43 @@ async fn check_daemon_running() -> HealthCheck {
             HealthStatus::Healthy,
             format!("daemon reachable for {repo} ({url})"),
         ),
-        None => HealthCheck::new(
+        None => daemon_not_running_check_for(
+            &repo,
+            &crate::daemon_client::repo_daemon_pid_path(layout.root()),
+        ),
+    }
+}
+
+/// Build the `daemon_running` check for a repository with no reachable daemon.
+///
+/// The endpoint record is the discriminator, and it is written when a daemon
+/// publishes itself and removed when one shuts down cleanly. Its absence means
+/// no daemon was ever started here, which is what a repository looks like the
+/// moment `kin init` finishes; reporting that as needing attention makes a
+/// correct install read as a broken one. Its presence beside an unreachable
+/// endpoint means a daemon did start and did not clean up after itself.
+fn daemon_not_running_check_for(repo: &str, endpoint_record: &Path) -> HealthCheck {
+    if endpoint_record.exists() {
+        HealthCheck::new(
             "daemon_running",
             "kin-daemon running",
             HealthStatus::Stale,
-            format!("no daemon reachable for {repo} — it auto-starts on first use"),
+            format!(
+                "a daemon was started for {repo} but is no longer reachable; its endpoint record {} is still on disk",
+                endpoint_record.display()
+            ),
         )
         .fixable()
-        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon"),
+        .with_manual_fix("run any `kin` command in the repo to start a fresh daemon")
+    } else {
+        HealthCheck::new(
+            "daemon_running",
+            "kin-daemon running",
+            HealthStatus::Unsupported,
+            format!("no daemon started for {repo} yet — one starts on first use"),
+        )
+        .fixable()
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")
     }
 }
 
@@ -553,8 +585,8 @@ fn check_vfs_projection() -> HealthCheck {
         );
     }
 
-    let lib_path = match kin_dir() {
-        Ok(dir) => dir.join("lib").join(shim_filename()),
+    let kin_home = match kin_dir() {
+        Ok(dir) => dir,
         Err(e) => {
             return HealthCheck::new(
                 "vfs_projection",
@@ -564,8 +596,34 @@ fn check_vfs_projection() -> HealthCheck {
             );
         }
     };
+    let lib_path = kin_home.join("lib").join(shim_filename());
 
-    vfs_projection_check_for(&lib_path)
+    vfs_projection_check_for(&lib_path, projection_installed_under(&kin_home))
+}
+
+/// Name of the projection driver binary the installer places beside `kin`.
+fn vfs_binary_filename() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "kin-vfs.exe"
+    } else {
+        "kin-vfs"
+    }
+}
+
+/// Whether filesystem projection was actually installed under `kin_home`.
+///
+/// The installer ships projection only where it can run. When the archive
+/// carries no projection, or the host loader cannot execute the one it carries,
+/// the installer deletes `kin-vfs` and the shim together and says so out loud:
+/// "Filesystem projection is unavailable on this platform; core CLI and daemon
+/// are fully functional without it." So a shim absent beside an absent
+/// `kin-vfs` is that sanctioned outcome, not a broken install — and telling
+/// such a user to reinstall contradicts what the installer just told them and
+/// sends them somewhere that cannot help. A shim absent while `kin-vfs` is
+/// installed is the opposite case: projection is on this machine and the half
+/// that gets injected into processes is gone.
+fn projection_installed_under(kin_home: &Path) -> bool {
+    kin_home.join("bin").join(vfs_binary_filename()).exists()
 }
 
 /// The durable step that repairs a missing or corrupt shim when `kin doctor
@@ -661,10 +719,23 @@ fn shim_object_kind() -> &'static str {
     }
 }
 
-/// Build the `vfs_projection` check from a resolved shim path. Split out from
+/// Build the `vfs_projection` check from a resolved shim path and whether
+/// projection is installed on this machine at all. Split out from
 /// [`check_vfs_projection`] so the size/magic classification is testable.
-fn vfs_projection_check_for(lib_path: &Path) -> HealthCheck {
+fn vfs_projection_check_for(lib_path: &Path, projection_installed: bool) -> HealthCheck {
     match classify_shim(lib_path) {
+        ShimState::Missing if !projection_installed => HealthCheck::new(
+            "vfs_projection",
+            "VFS projection",
+            HealthStatus::Unsupported,
+            "filesystem projection is not installed on this system; the CLI and daemon \
+             are fully functional without it",
+        )
+        .with_platform_note(
+            "The installer ships projection only where it can run, and removes the kin-vfs \
+             driver and its shim together when it cannot. Neither is present here, so nothing \
+             is missing.",
+        ),
         ShimState::Valid(size) => HealthCheck::new(
             "vfs_projection",
             "VFS projection",
@@ -707,20 +778,66 @@ fn vfs_projection_check_for(lib_path: &Path) -> HealthCheck {
 
 fn check_repo_init() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
-    match kin_core::KinLayout::discover(&cwd) {
-        Some(layout) => HealthCheck::new(
+    let layout = kin_core::KinLayout::discover(&cwd);
+    repo_init_check_for(&cwd, layout.as_ref(), kin_dir().ok().as_deref())
+}
+
+/// Report whether the working directory is inside a Kin repository.
+///
+/// Not being in one is the state every install finishes in and the literal next
+/// step of the quickstart, so it is skipped rather than failed: nothing is
+/// broken, `kin init` has simply not been run here yet. What stays a failure is
+/// a directory carrying a `.kin` that the layout refuses — a partial or corrupt
+/// repository, where something that should work does not. The managed toolchain
+/// directory is excluded from that test: `~/.kin` is where the CLI installs
+/// itself, not a repository anyone failed to initialize.
+fn repo_init_check_for(
+    cwd: &Path,
+    layout: Option<&kin_core::KinLayout>,
+    managed_kin_dir: Option<&Path>,
+) -> HealthCheck {
+    if let Some(layout) = layout {
+        return HealthCheck::new(
             "repo_init",
             "Repository",
             HealthStatus::Healthy,
             format!("Kin repository at {}", layout.root().display()),
-        ),
-        None => HealthCheck::new(
+        );
+    }
+
+    let local_kin = cwd.join(".kin");
+    let is_managed_toolchain =
+        managed_kin_dir.is_some_and(|managed| same_path(managed, &local_kin));
+    if local_kin.exists() && !is_managed_toolchain {
+        return HealthCheck::new(
             "repo_init",
             "Repository",
             HealthStatus::Missing,
-            "current directory is not inside a Kin repository",
+            format!(
+                "{} exists but is not a usable Kin repository",
+                local_kin.display()
+            ),
         )
-        .with_manual_fix("run `kin init .` to initialize a repository here"),
+        .with_manual_fix(
+            "re-run `kin init .`; if it keeps refusing, remove the partial `.kin` directory first",
+        );
+    }
+
+    HealthCheck::new(
+        "repo_init",
+        "Repository",
+        HealthStatus::Unsupported,
+        "not inside a Kin repository yet",
+    )
+    .with_manual_fix("run `kin init .` to initialize a repository here")
+}
+
+/// Compare two paths by their resolved form when both resolve, and literally
+/// otherwise. A path that cannot be canonicalized has not been proven different.
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 
@@ -1225,6 +1342,77 @@ fn evaluate_codex_binding(path: &Path) -> Option<(HealthStatus, String)> {
     evaluate_codex_binding_for(path, &expected_repo)
 }
 
+/// Config files `kin setup` recorded merging a kin MCP server entry into.
+///
+/// An AI client's config is not Kin's artifact. Kin merges one `kin` key into a
+/// file the client owns and leaves every sibling alone, and the install ledger
+/// is the record of having done it. That record is what separates the two
+/// meanings of "no kin entry here": a client Kin has never been registered with,
+/// where nothing of Kin's is broken, from a client Kin did register and whose
+/// entry has since been removed, which is a real regression.
+///
+/// An unreadable or absent ledger yields no paths, which is the conservative
+/// direction: it can only make this report a third-party config as untouched.
+fn mcp_paths_recorded_by_setup() -> Vec<PathBuf> {
+    use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
+
+    let Ok(path) = ledger_path() else {
+        return Vec::new();
+    };
+    let Ok(ledger) = SetupLedger::load(&path) else {
+        return Vec::new();
+    };
+    ledger
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == ArtifactKind::McpConfig)
+        .map(|entry| entry.path)
+        .collect()
+}
+
+/// Build one `mcp_client_*` check from an evaluated client config.
+///
+/// `recorded_by_setup` decides the severity of an absent kin entry, and only
+/// that. A kin entry that is present but wrong stays a failure whoever wrote the
+/// surrounding file: it is Kin's own binding, and an agent pointed at it gets a
+/// dead server.
+fn mcp_client_check_from(
+    client_id: &str,
+    label: &str,
+    path: &Path,
+    status: HealthStatus,
+    detail: String,
+    recorded_by_setup: bool,
+) -> HealthCheck {
+    let id = format!("mcp_client_{client_id}");
+    let label = format!("MCP: {label}");
+    let unregistered = matches!(status, HealthStatus::Missing) && !recorded_by_setup;
+    if unregistered {
+        HealthCheck::new(
+            &id,
+            &label,
+            HealthStatus::Unsupported,
+            format!(
+                "kin is not registered in this client — {} is a config Kin has not written to",
+                path.display()
+            ),
+        )
+        .fixable()
+        .with_manual_fix(
+            "run `kin setup` (or `kin doctor --fix`) to merge the kin MCP server entry into this client",
+        )
+    } else {
+        let check = HealthCheck::new(&id, &label, status, detail);
+        if is_failing(&check.status) {
+            check.fixable().with_manual_fix(
+                "run `kin setup` (or `kin doctor --fix`) to re-merge the kin MCP server entry",
+            )
+        } else {
+            check
+        }
+    }
+}
+
 fn check_mcp_clients() -> Vec<HealthCheck> {
     let clients: Vec<McpClient> = mcp_client_config_paths()
         .into_iter()
@@ -1240,6 +1428,8 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
             "no AI client config files detected — nothing to configure",
         )];
     }
+
+    let recorded = mcp_paths_recorded_by_setup();
 
     clients
         .into_iter()
@@ -1262,18 +1452,15 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
                     detail = binding_detail;
                 }
             }
-            let mut check = HealthCheck::new(
-                &format!("mcp_client_{}", client.id),
-                &format!("MCP: {}", client.label),
+            let recorded_by_setup = recorded.iter().any(|path| same_path(path, &client.path));
+            mcp_client_check_from(
+                client.id,
+                client.label,
+                &client.path,
                 status,
                 detail,
-            );
-            if is_failing(&check.status) {
-                check = check.fixable().with_manual_fix(
-                    "run `kin setup` (or `kin doctor --fix`) to re-merge the kin MCP server entry",
-                );
-            }
-            check
+                recorded_by_setup,
+            )
         })
         .collect()
 }
@@ -1424,6 +1611,26 @@ async fn check_semantic_query_readiness() -> HealthCheck {
     .with_platform_note("this platform ships the supported vector-free Kin runtime")
 }
 
+/// Semantic readiness when no daemon is running to ask.
+///
+/// This is where every repository sits until its first command needs a daemon,
+/// so it is an unread state rather than a failed one, and reporting it as a
+/// failure is what makes an install that did everything right end on a red
+/// summary. The authority gate is unchanged for every state that *can* be read:
+/// a reachable daemon whose graph coverage is incomplete or unreadable is still
+/// Stale, and Stale on this check still blocks readiness.
+#[cfg(feature = "vector")]
+fn semantic_query_readiness_without_a_daemon() -> HealthCheck {
+    HealthCheck::new(
+        "semantic_query_readiness",
+        "Semantic query readiness",
+        HealthStatus::Unsupported,
+        "n/a — no daemon running for this repository, so graph embedding coverage cannot \
+         be read; a daemon starts on first use",
+    )
+    .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")
+}
+
 #[cfg(feature = "vector")]
 fn semantic_query_health_from_runtime(
     daemon_url: &str,
@@ -1483,13 +1690,7 @@ async fn check_semantic_query_readiness() -> HealthCheck {
 
     let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await;
     let Some(daemon_url) = daemon_url else {
-        return HealthCheck::new(
-            "semantic_query_readiness",
-            "Semantic query readiness",
-            HealthStatus::Missing,
-            "daemon not reachable for this repository",
-        )
-        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon");
+        return semantic_query_readiness_without_a_daemon();
     };
 
     let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
@@ -1699,7 +1900,7 @@ mod tests {
         write_file(&corrupt, b"not an object file");
 
         for path in [&missing, &empty, &corrupt] {
-            let check = vfs_projection_check_for(path);
+            let check = vfs_projection_check_for(path, true);
             assert!(check.fixable, "{}: should be fixable", path.display());
             let fix = check.manual_fix.clone().unwrap_or_default();
             assert!(!fix.is_empty(), "{}: missing manual fix", path.display());
@@ -1709,6 +1910,287 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// A shim absent on a machine that never installed projection is the
+    /// installer's own sanctioned outcome, and must not be scored as a defect
+    /// or answered with a reinstall the installer already declined to perform.
+    /// The same absent shim on a machine that *does* carry the projection
+    /// driver is a real missing artifact and stays a failure.
+    #[test]
+    fn absent_shim_is_a_failure_only_where_projection_was_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("libkin_vfs_shim");
+
+        let uninstalled = vfs_projection_check_for(&missing, false);
+        assert!(
+            matches!(uninstalled.status, HealthStatus::Unsupported),
+            "no projection on this machine must be skipped, got {:?}",
+            uninstalled.status
+        );
+        assert!(!is_failing(&uninstalled.status));
+        assert!(
+            !uninstalled.fixable,
+            "a machine with no projection must not be offered a shim repair"
+        );
+        assert!(
+            uninstalled.manual_fix.is_none(),
+            "must not send a user to reinstall for something the installer removed on purpose"
+        );
+        assert!(uninstalled.platform_note.is_some());
+
+        // Falsification: flip only the installed flag, keep the same path.
+        let installed = vfs_projection_check_for(&missing, true);
+        assert!(
+            matches!(installed.status, HealthStatus::Missing),
+            "a shim missing where projection is installed must stay a failure, got {:?}",
+            installed.status
+        );
+        assert!(is_failing(&installed.status));
+        assert!(installed.fixable);
+        assert_eq!(installed.manual_fix.as_deref(), Some(SHIM_REINSTALL_HINT));
+    }
+
+    /// A corrupt shim is a failure whether or not the driver is present: the
+    /// bytes on disk are the proof, and a 0-byte injected library crashes every
+    /// process it is loaded into.
+    #[test]
+    fn a_corrupt_shim_stays_a_failure_even_with_no_projection_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        write_file(&empty, b"");
+        let corrupt = dir.path().join("corrupt");
+        write_file(&corrupt, b"not an object file");
+
+        for path in [&empty, &corrupt] {
+            let check = vfs_projection_check_for(path, false);
+            if cfg!(any(target_os = "macos", target_os = "linux")) || path == &empty {
+                assert!(
+                    is_failing(&check.status),
+                    "{}: corrupt shim must stay a failure, got {:?}",
+                    path.display(),
+                    check.status
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projection_is_detected_from_the_driver_beside_the_managed_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!projection_installed_under(dir.path()));
+
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_file(&bin.join(vfs_binary_filename()), b"driver");
+        assert!(projection_installed_under(dir.path()));
+    }
+
+    /// A repository that has never started a daemon is the resting state every
+    /// `kin init` finishes in, so it is skipped. An endpoint record left behind
+    /// by a daemon that is no longer reachable is a real leftover and stays
+    /// flagged.
+    #[test]
+    fn daemon_not_running_is_skipped_until_one_has_actually_been_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("daemon.pid");
+
+        let never_started = daemon_not_running_check_for("/repo", &record);
+        assert!(
+            matches!(never_started.status, HealthStatus::Unsupported),
+            "a repo with no daemon record must be skipped, got {:?}",
+            never_started.status
+        );
+        assert!(never_started.detail.contains("/repo"));
+        assert!(never_started.manual_fix.is_some());
+
+        // Falsification: publish the record, change nothing else.
+        write_file(&record, b"4242");
+        let left_behind = daemon_not_running_check_for("/repo", &record);
+        assert!(
+            matches!(left_behind.status, HealthStatus::Stale),
+            "an unreachable daemon that left its endpoint record must stay flagged, got {:?}",
+            left_behind.status
+        );
+        assert!(left_behind.detail.contains("daemon.pid"));
+        assert!(left_behind.manual_fix.is_some());
+        // Neither arm may hard-fail: the daemon is started on demand.
+        assert!(!is_failing(&never_started.status));
+        assert!(!is_failing(&left_behind.status));
+    }
+
+    /// Not being in a repository is the next step of the quickstart, not a
+    /// broken install. A directory carrying a `.kin` the layout refuses is a
+    /// partial repository and stays a failure — except the managed toolchain
+    /// directory, which is where the CLI installs itself.
+    #[test]
+    fn outside_a_repository_is_skipped_but_a_refused_dot_kin_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let outside = repo_init_check_for(&plain, None, None);
+        assert!(
+            matches!(outside.status, HealthStatus::Unsupported),
+            "a directory that is simply not a repo must be skipped, got {:?}",
+            outside.status
+        );
+        assert!(!is_failing(&outside.status));
+        assert!(outside.manual_fix.unwrap().contains("kin init"));
+
+        // Falsification: add the `.kin` a partial init leaves behind, keep the
+        // same refused layout.
+        let partial = dir.path().join("partial");
+        std::fs::create_dir_all(partial.join(".kin")).unwrap();
+        let refused = repo_init_check_for(&partial, None, None);
+        assert!(
+            matches!(refused.status, HealthStatus::Missing),
+            "a `.kin` the layout refuses must stay a failure, got {:?}",
+            refused.status
+        );
+        assert!(is_failing(&refused.status));
+
+        // The managed toolchain directory is not a failed repository.
+        let home = dir.path().join("home");
+        let toolchain = home.join(".kin");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        let toolchain_home = repo_init_check_for(&home, None, Some(&toolchain));
+        assert!(
+            matches!(toolchain_home.status, HealthStatus::Unsupported),
+            "~/.kin is the toolchain dir, not a failed repository, got {:?}",
+            toolchain_home.status
+        );
+    }
+
+    /// Kin owns one key inside an AI client's config, never the file. A config
+    /// with no kin entry that Kin never wrote to is a client Kin is simply not
+    /// registered with; the same absence in a config the install ledger records
+    /// means Kin's own entry was removed, which is a real regression.
+    #[test]
+    fn a_config_kin_never_wrote_does_not_fail_kin() {
+        let path = Path::new("/tmp/third-party/mcp_config.json");
+
+        let untouched = mcp_client_check_from(
+            "cursor",
+            "Cursor",
+            path,
+            HealthStatus::Missing,
+            "no mcpServers.kin entry".to_string(),
+            false,
+        );
+        assert_eq!(untouched.id, "mcp_client_cursor");
+        assert!(
+            matches!(untouched.status, HealthStatus::Unsupported),
+            "a third-party config Kin never wrote must not fail Kin, got {:?}",
+            untouched.status
+        );
+        assert!(!is_failing(&untouched.status));
+        assert!(
+            untouched.fixable && untouched.manual_fix.is_some(),
+            "the offer to register must survive the reclassification"
+        );
+
+        // Falsification: flip only the ledger record.
+        let removed = mcp_client_check_from(
+            "cursor",
+            "Cursor",
+            path,
+            HealthStatus::Missing,
+            "no mcpServers.kin entry".to_string(),
+            true,
+        );
+        assert!(
+            matches!(removed.status, HealthStatus::Missing),
+            "an entry Kin recorded writing and that is now gone must stay a failure, got {:?}",
+            removed.status
+        );
+        assert!(is_failing(&removed.status));
+
+        // A kin entry that exists and is wrong is Kin's own broken binding, and
+        // stays a failure whoever owns the surrounding file.
+        let broken = mcp_client_check_from(
+            "cursor",
+            "Cursor",
+            path,
+            HealthStatus::Misconfigured,
+            "mcpServers.kin uses the retired `--global` mode".to_string(),
+            false,
+        );
+        assert!(
+            matches!(broken.status, HealthStatus::Misconfigured),
+            "a present-but-broken kin entry must stay a failure, got {:?}",
+            broken.status
+        );
+        assert!(is_failing(&broken.status));
+        assert!(broken.detail.contains("--global"));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn semantic_readiness_is_unread_not_failed_when_no_daemon_is_running() {
+        let check = semantic_query_readiness_without_a_daemon();
+        assert!(
+            matches!(check.status, HealthStatus::Unsupported),
+            "an unstarted daemon is an unread state, got {:?}",
+            check.status
+        );
+        assert!(!is_failing(&check.status));
+        assert!(check.manual_fix.is_some());
+        assert!(!blocks_readiness(&check));
+
+        // Falsification: the states that CAN be read still gate readiness.
+        let unreadable = HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Stale,
+            "daemon reachable, but graph embedding status is unavailable",
+        );
+        assert!(blocks_readiness(&unreadable));
+    }
+
+    /// The headline: a fresh install that did everything right ends green.
+    /// Every state below is what a correct install actually produces, and the
+    /// old classification made four of them flip the summary to a red X.
+    #[test]
+    fn a_correct_fresh_install_reports_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let checks = vec![
+            check_with("kin_binary", HealthStatus::Healthy),
+            check_with("kin_daemon_binary", HealthStatus::Healthy),
+            vfs_projection_check_for(&dir.path().join("no-shim"), false),
+            repo_init_check_for(&repo, None, None),
+            daemon_not_running_check_for("/repo", &dir.path().join("daemon.pid")),
+            mcp_client_check_from(
+                "claude",
+                "Claude Code",
+                Path::new("/tmp/third-party/.claude.json"),
+                HealthStatus::Missing,
+                "no mcpServers.kin entry".to_string(),
+                false,
+            ),
+        ];
+        let report = assemble_health_report("test".to_string(), checks);
+        let summary = report.summary();
+
+        assert!(
+            report.healthy,
+            "a correct fresh install must not report as broken: {:?}",
+            report
+                .checks
+                .iter()
+                .filter(|check| blocks_readiness(check))
+                .map(|check| (check.id.clone(), check.detail.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            summary.attention, 0,
+            "nothing on a correct fresh install needs attention"
+        );
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.skipped, 4);
     }
 
     #[tokio::test]
