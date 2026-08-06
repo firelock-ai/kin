@@ -2538,14 +2538,179 @@ fn endpoint_owner_liveness_with_probes(
     })
 }
 
+/// An endpoint that survived a retirement attempt, and why.
+///
+/// `daemon.pid` is what publishes an endpoint, so a record left behind is a
+/// standing claim on the repo that outlives the daemon it names. Carrying the
+/// path and the reason together is what lets a caller report the survivor
+/// instead of only knowing that something went wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedDaemonEndpoint {
+    pid_path: PathBuf,
+    reason: String,
+}
+
+impl PreservedDaemonEndpoint {
+    /// The pid file still publishing the endpoint.
+    pub fn pid_path(&self) -> &Path {
+        &self.pid_path
+    }
+
+    /// Why retirement did not happen.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// Build a preserved-endpoint value so the CLI's stop-report tests can exercise
+/// the exit-code decision without standing up a daemon.
+///
+/// Hidden rather than `#[cfg(test)]`: the report lives in another module, and a
+/// `cfg(test)` item is invisible to it.
+#[doc(hidden)]
+pub fn preserved_daemon_endpoint_for_test(
+    pid_path: &Path,
+    reason: &str,
+) -> PreservedDaemonEndpoint {
+    PreservedDaemonEndpoint {
+        pid_path: pid_path.to_path_buf(),
+        reason: reason.to_string(),
+    }
+}
+
+impl fmt::Display for PreservedDaemonEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} survives ({})", self.pid_path.display(), self.reason)
+    }
+}
+
+/// What a retirement attempt left on disk.
+///
+/// `#[must_use]` on purpose. Discarding this verdict is the defect this type
+/// exists to close: retirement is conditional on a liveness probe, the skip is
+/// silent, and a caller that ignores the answer reports a clean stop while the
+/// stopped daemon's endpoint stays published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum DaemonEndpointCleanup {
+    /// Nothing publishes the judged endpoint any more: it was retired here or
+    /// was already gone.
+    Retired,
+    /// The record on disk names a different daemon than the one judged, so it
+    /// belongs to a successor and preserving it is the correct outcome.
+    Superseded,
+    /// The judged endpoint is still published.
+    Preserved(PreservedDaemonEndpoint),
+}
+
+impl DaemonEndpointCleanup {
+    /// The surviving endpoint, when the judged one was preserved.
+    pub fn preserved(&self) -> Option<&PreservedDaemonEndpoint> {
+        match self {
+            Self::Preserved(preserved) => Some(preserved),
+            Self::Retired | Self::Superseded => None,
+        }
+    }
+}
+
+/// How long a caller that has just confirmed a stop waits for the operating
+/// system to finish tearing the process down before judging its endpoint.
+///
+/// A stop returns as soon as the daemon's incarnation stops answering; process
+/// teardown completes afterwards, and until it does a liveness probe can answer
+/// `Alive` or an indeterminate `Unknown`. Both refuse cleanup, and the refusal
+/// is permanent because nothing retries it, so one probe taken inside that
+/// window preserves a dead daemon's endpoint for good.
+const ENDPOINT_TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
+
+const ENDPOINT_TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Remove a repo worker daemon's pid/port endpoint files. The daemon deletes
-/// these itself on graceful shutdown; `kin daemon stop` also calls this after a
-/// confirmed stop so a later `status` never reports the dead endpoint as stale.
-pub fn remove_stale_daemon_files(kin_root: &Path) {
+/// these itself on graceful shutdown; hygiene paths call this to clear a record
+/// left behind by a daemon that is already gone.
+///
+/// Probes liveness once, so a caller that has *just* stopped the daemon should
+/// call [`retire_stopped_daemon_endpoint`] instead: this probe would run inside
+/// the teardown window it needs to wait out.
+pub fn remove_stale_daemon_files(kin_root: &Path) -> DaemonEndpointCleanup {
+    retire_daemon_endpoint(kin_root, Duration::ZERO)
+}
+
+/// Retire the endpoint of a worker daemon whose stop was just confirmed.
+///
+/// Waits boundedly for the recorded owner to become affirmatively dead before
+/// deciding, and reports what happened. Both halves matter: without the wait the
+/// decision is a coin flip against process teardown, and without the report a
+/// lost coin flip is invisible to the operator and to every later reader of the
+/// endpoint.
+pub fn retire_stopped_daemon_endpoint(kin_root: &Path) -> DaemonEndpointCleanup {
+    retire_daemon_endpoint(kin_root, ENDPOINT_TEARDOWN_BUDGET)
+}
+
+fn retire_daemon_endpoint(kin_root: &Path, teardown_budget: Duration) -> DaemonEndpointCleanup {
+    retire_daemon_endpoint_with_probe(kin_root, teardown_budget, |root, pid| {
+        // Judged against the recorded incarnation, not the bare PID. After the
+        // publisher exits, its number starts naming whatever the kernel handed
+        // it next, and a bare probe then reports a live stranger as the endpoint
+        // owner forever. Waiting a bounded window and then FAILING the stop over
+        // that would turn a recycled PID into a loud, permanent, wrong error on
+        // a command operators run constantly.
+        endpoint_owner_liveness(root, pid).authorizes_cleanup()
+    })
+}
+
+/// Wait, boundedly, for an endpoint's recorded owner to be affirmatively gone.
+///
+/// A zero budget probes exactly once, which is what the hygiene paths did before
+/// any of this waited.
+fn wait_until_retirable(
+    kin_root: &Path,
+    pid: u32,
+    budget: Duration,
+    retirable: &mut impl FnMut(&Path, u32) -> bool,
+) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if retirable(kin_root, pid) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(
+            ENDPOINT_TEARDOWN_POLL_INTERVAL.min(deadline.saturating_duration_since(now)),
+        );
+    }
+}
+
+/// The probe is injectable because the two arms that matter here are decisions,
+/// not observations: whether the wait actually retries, and whether a refused
+/// cleanup is reported. Both are invisible to a test that can only run against
+/// real processes on one platform, and the Windows arm is precisely where the
+/// refusal was observed.
+fn retire_daemon_endpoint_with_probe(
+    kin_root: &Path,
+    teardown_budget: Duration,
+    mut retirable: impl FnMut(&Path, u32) -> bool,
+) -> DaemonEndpointCleanup {
+    // Read the pid before the wait so the wait has something to watch, then take
+    // the snapshot after it. A dying daemon unlinks its own endpoint on the way
+    // out, so a snapshot captured mid-teardown is a torn read, and the
+    // unchanged-comparison would then refuse to act on it — preserving the very
+    // record this call exists to retire.
+    let judged_pid = read_pid_file(kin_root);
+    if let Some(pid) = judged_pid {
+        wait_until_retirable(kin_root, pid, teardown_budget, &mut retirable);
+    }
+
     let recorded = daemon_endpoint_snapshot(kin_root);
-    match recorded.pid {
-        Some(pid) if process_liveness(pid).authorizes_cleanup() => {
-            let _ = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
+    let preserved_reason = match recorded.pid {
+        Some(pid) if retirable(kin_root, pid) => {
+            match retire_daemon_endpoint_if_unchanged(kin_root, recorded) {
+                DaemonEndpointRetirement::Retired => None,
+                preserved => Some(preserved.preserved_reason()),
+            }
         }
         Some(pid) => {
             warn!(
@@ -2553,16 +2718,52 @@ pub fn remove_stale_daemon_files(kin_root: &Path) {
                 repo = %kin_root.display(),
                 "preserving daemon endpoint because its recorded owner may still be alive"
             );
+            Some(format!(
+                "recorded owner pid {pid} never became affirmatively dead"
+            ))
         }
         None if !recorded.pid_exists => {
-            let _ = retire_daemon_endpoint_if_unchanged(kin_root, recorded);
+            match retire_daemon_endpoint_if_unchanged(kin_root, recorded) {
+                DaemonEndpointRetirement::Retired => None,
+                preserved => Some(preserved.preserved_reason()),
+            }
         }
         None => {
             warn!(
                 repo = %kin_root.display(),
                 "preserving daemon endpoint because its PID record is unparseable"
             );
+            Some("its PID record is unparseable".to_string())
         }
+    };
+
+    match preserved_reason {
+        None => DaemonEndpointCleanup::Retired,
+        Some(reason) => classify_preserved_endpoint(kin_root, judged_pid, reason),
+    }
+}
+
+/// Decide whether a refused retirement actually left the judged endpoint
+/// published.
+///
+/// Only that case is a defect. A record that now names a different daemon is a
+/// successor's, and reporting a successor as a failed stop would be a false
+/// alarm on a command operators run constantly.
+fn classify_preserved_endpoint(
+    kin_root: &Path,
+    judged_pid: Option<u32>,
+    reason: String,
+) -> DaemonEndpointCleanup {
+    let pid_path = repo_daemon_pid_path(kin_root);
+    let current_pid = read_pid_file(kin_root);
+    if current_pid.is_none() && !pid_path.exists() {
+        // Nothing publishes an endpoint here: another participant retired it
+        // while this call was deciding. Nothing was preserved.
+        return DaemonEndpointCleanup::Retired;
+    }
+    match (current_pid, judged_pid) {
+        (Some(current), Some(judged)) if current != judged => DaemonEndpointCleanup::Superseded,
+        _ => DaemonEndpointCleanup::Preserved(PreservedDaemonEndpoint { pid_path, reason }),
     }
 }
 
@@ -8498,10 +8699,171 @@ mod tests {
         let root = dir.path();
         write_endpoint_files(root, std::process::id(), 51000);
 
-        remove_stale_daemon_files(root);
+        let cleanup = remove_stale_daemon_files(root);
 
         assert_eq!(read_pid_file(root), Some(std::process::id()));
         assert_eq!(read_port_file(root), Some(51000));
+        let preserved = cleanup
+            .preserved()
+            .expect("a live owner's endpoint is preserved, and the caller must be told");
+        assert_eq!(preserved.pid_path(), repo_daemon_pid_path(root));
+    }
+
+    /// A probe refusing retirement for the first `refusals` calls and allowing it
+    /// after, so the wait's retry is exercised as a decision rather than as a
+    /// timing accident. Counts every call so a caller can prove how many probes
+    /// a budget actually spent.
+    fn probe_that_flips_after(
+        refusals: usize,
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    ) -> impl FnMut(&Path, u32) -> bool {
+        move |_, _| {
+            let seen = calls.get();
+            calls.set(seen + 1);
+            seen >= refusals
+        }
+    }
+
+    #[test]
+    fn stopped_endpoint_retirement_waits_out_a_teardown_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let cleanup = retire_daemon_endpoint_with_probe(
+            root,
+            Duration::from_secs(5),
+            probe_that_flips_after(3, calls.clone()),
+        );
+
+        assert_eq!(cleanup, DaemonEndpointCleanup::Retired);
+        assert!(!root.join("daemon.pid").exists());
+        assert!(!root.join("daemon.port").exists());
+        assert!(
+            calls.get() > 1,
+            "a single probe cannot have observed the flip; the wait must retry"
+        );
+    }
+
+    #[test]
+    fn a_single_probe_would_have_preserved_the_same_endpoint() {
+        // The falsification of the test above: the identical fixture, decided on
+        // one probe, keeps the endpoint. Without this, "retired" says nothing
+        // about whether the wait did any work.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let cleanup = retire_daemon_endpoint_with_probe(
+            root,
+            Duration::ZERO,
+            probe_that_flips_after(3, calls),
+        );
+
+        assert!(cleanup.preserved().is_some());
+        assert!(root.join("daemon.pid").exists());
+    }
+
+    #[test]
+    fn a_permanently_indeterminate_owner_reports_the_surviving_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let cleanup =
+            retire_daemon_endpoint_with_probe(root, Duration::from_millis(120), |_, _| false);
+
+        let preserved = cleanup.preserved().expect(
+            "an endpoint that outlived a confirmed stop must be reported, not warned about",
+        );
+        assert_eq!(preserved.pid_path(), repo_daemon_pid_path(root));
+        assert!(
+            preserved.reason().contains("4242"),
+            "the reason must name the owner that never died: {}",
+            preserved.reason()
+        );
+        assert!(root.join("daemon.pid").exists());
+    }
+
+    #[test]
+    fn a_successors_endpoint_is_not_reported_as_a_failed_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        // Republish under a different pid at the instant the wait ends, the way a
+        // successor daemon would. Preserving that record is correct, and calling
+        // it a failed stop would be a false alarm.
+        let republished = std::cell::Cell::new(false);
+        let cleanup = retire_daemon_endpoint_with_probe(root, Duration::ZERO, |_, _| {
+            if !republished.replace(true) {
+                write_endpoint_files(root, 4243, 51001);
+            }
+            false
+        });
+
+        assert_eq!(cleanup, DaemonEndpointCleanup::Superseded);
+        assert_eq!(read_pid_file(root), Some(4243));
+    }
+
+    #[test]
+    fn an_unparseable_pid_record_is_a_preserved_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("daemon.pid"), "indeterminate").unwrap();
+        std::fs::write(root.join("daemon.port"), "51000").unwrap();
+
+        let cleanup =
+            retire_daemon_endpoint_with_probe(root, Duration::from_millis(120), |_, _| {
+                panic!("an unparseable record names no process to probe")
+            });
+
+        assert!(cleanup.preserved().is_some());
+        assert!(root.join("daemon.pid").exists());
+    }
+
+    /// A recycled PID must not become a loud, permanent, WRONG stop failure.
+    ///
+    /// This is what forced the retirement probe to judge the recorded
+    /// incarnation rather than the bare PID. Reporting a preserved endpoint is
+    /// only worth doing if the report is right, and a bare probe answers `Alive`
+    /// about a live stranger holding the dead publisher's number — forever. The
+    /// old code merely warned about that and moved on; a bounded wait followed by
+    /// a nonzero exit would have promoted it to a hard error on a command
+    /// operators run constantly.
+    #[test]
+    fn a_recycled_pid_does_not_fail_a_stop_that_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pid =
+            write_attributed_endpoint_files(root, recycled_identity_for_this_process(), 51000);
+        // The bare probe every earlier version used still calls this PID alive:
+        // it is this test process.
+        assert_eq!(process_liveness(pid), ProcessLiveness::Alive);
+
+        let cleanup = retire_stopped_daemon_endpoint(root);
+
+        assert_eq!(
+            cleanup,
+            DaemonEndpointCleanup::Retired,
+            "the daemon that published this endpoint is gone, so the stop succeeded"
+        );
+        assert!(!root.join("daemon.pid").exists());
+    }
+
+    #[test]
+    fn an_absent_endpoint_is_retired_rather_than_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let cleanup =
+            retire_daemon_endpoint_with_probe(root, Duration::from_millis(120), |_, _| {
+                panic!("there is no recorded owner to probe")
+            });
+
+        assert_eq!(cleanup, DaemonEndpointCleanup::Retired);
     }
 
     #[test]

@@ -29,9 +29,9 @@ use crate::daemon_client::{
     process_identity_is_current, read_endpoint_owner_record, read_supervisor_owner_record,
     remove_stale_daemon_files, remove_stale_supervisor_files, repo_daemon_owner_path,
     repo_daemon_pid_path, repo_daemon_port_path, repo_daemon_recorded_endpoint,
-    supervisor_owner_path, supervisor_pid_path, supervisor_port_path, supervisor_recorded_endpoint,
-    try_acquire_supervisor_startup_lock_in_dir, ProcessIdentity, RegisteredRepoDaemon,
-    SupervisorStartupLock,
+    retire_stopped_daemon_endpoint, supervisor_owner_path, supervisor_pid_path,
+    supervisor_port_path, supervisor_recorded_endpoint, try_acquire_supervisor_startup_lock_in_dir,
+    PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon, SupervisorStartupLock,
 };
 
 /// Liveness of a recorded daemon/supervisor endpoint. Pure classification of the
@@ -885,6 +885,34 @@ struct StopReport {
     label: String,
     pid: u32,
     outcome: StopOutcome,
+    /// The endpoint this stop should have retired, when it survived the attempt.
+    ///
+    /// A stopped process whose `daemon.pid` is still published is not a stopped
+    /// daemon as far as any later reader is concerned: `status`, autostart, and
+    /// every other surface read that file to decide who owns the repo.
+    preserved_endpoint: Option<PreservedDaemonEndpoint>,
+}
+
+/// Retire the endpoint of a worker whose stop attempt is over, and hand back the
+/// survivor for the report.
+///
+/// A worker that was never running keeps the old best-effort hygiene: there was
+/// no teardown to wait out, and a record that outlives an unrelated process is
+/// not this command's failure to report.
+fn retire_worker_endpoint(
+    kin_root: &Path,
+    outcome: &StopOutcome,
+) -> Option<PreservedDaemonEndpoint> {
+    match outcome {
+        StopOutcome::Stopped => retire_stopped_daemon_endpoint(kin_root)
+            .preserved()
+            .cloned(),
+        StopOutcome::NotRunning => {
+            let _ = remove_stale_daemon_files(kin_root);
+            None
+        }
+        StopOutcome::Timeout | StopOutcome::SignalFailed(_) => None,
+    }
 }
 
 async fn stop_current_repo(json: bool) -> Result<()> {
@@ -904,7 +932,7 @@ async fn stop_current_repo(json: bool) -> Result<()> {
     let Some(pid) = pid else {
         // Nothing live to stop. Clear any stale endpoint files so a later status
         // does not report a dead endpoint.
-        remove_stale_daemon_files(&kin_root);
+        let _ = remove_stale_daemon_files(&kin_root);
         if json {
             let payload = serde_json::json!({
                 "schema": "kin.daemon-stop.v1",
@@ -921,14 +949,13 @@ async fn stop_current_repo(json: bool) -> Result<()> {
     };
 
     let outcome = stop_worker_at(&kin_root, pid, stop_timeout(), None)?;
-    if outcome.is_success() {
-        remove_stale_daemon_files(&kin_root);
-    }
+    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
     let report = vec![StopReport {
         kind: "repo-daemon",
         label: label.clone(),
         pid,
         outcome,
+        preserved_endpoint,
     }];
     finish_stop("current-repo", &report, json)
 }
@@ -1031,6 +1058,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
                 label: "supervisor".to_string(),
                 pid,
                 outcome,
+                preserved_endpoint: None,
             });
         }
     }
@@ -1048,14 +1076,13 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
             remaining_budget(worker_deadline),
             uninstall_root,
         )?;
-        if outcome.is_success() {
-            remove_stale_daemon_files(&kin_root);
-        }
+        let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
         reports.push(StopReport {
             kind: "repo-daemon",
             label,
             pid: daemon.pid,
             outcome,
+            preserved_endpoint,
         });
     }
 
@@ -1075,14 +1102,13 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
                         remaining_budget(worker_deadline),
                         uninstall_root,
                     )?;
-                    if outcome.is_success() {
-                        remove_stale_daemon_files(&kin_root);
-                    }
+                    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
                     reports.push(StopReport {
                         kind: "repo-daemon",
                         label: repo_label(&working_dir),
                         pid,
                         outcome,
+                        preserved_endpoint,
                     });
                 }
             }
@@ -1102,6 +1128,7 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
                 label: "supervisor".to_string(),
                 pid,
                 outcome,
+                preserved_endpoint: None,
             });
         }
     }
@@ -1323,14 +1350,13 @@ fn stop_install_owned_daemons(
                         remaining_budget(deadline),
                         Some(install_root),
                     )?;
-                    if outcome.is_success() {
-                        remove_stale_daemon_files(&kin_root);
-                    }
+                    let preserved_endpoint = retire_worker_endpoint(&kin_root, &outcome);
                     reports.push(StopReport {
                         kind: "repo-daemon",
                         label: repo_label(&repo_root),
                         pid: process.pid,
                         outcome,
+                        preserved_endpoint,
                     });
                 }
                 ManagedDaemonKind::Supervisor => {
@@ -1344,6 +1370,7 @@ fn stop_install_owned_daemons(
                         label: "supervisor".to_string(),
                         pid: process.pid,
                         outcome,
+                        preserved_endpoint: None,
                     });
                 }
                 ManagedDaemonKind::Unknown => bail!(
@@ -1381,6 +1408,11 @@ fn finish_stop_with_output(
     quiet: bool,
 ) -> Result<()> {
     let all_stopped = reports.iter().all(|r| r.outcome.is_success());
+    // Reported separately from `all_stopped`, which stays a statement about
+    // processes. A daemon can stop and still leave its endpoint published, and
+    // collapsing the two would reintroduce the ambiguity: every later reader
+    // treats `daemon.pid` as the live owner of the repo.
+    let endpoints_retired = reports.iter().all(|r| r.preserved_endpoint.is_none());
 
     if quiet {
         // The caller owns user-facing output. We still evaluate every result
@@ -1389,12 +1421,19 @@ fn finish_stop_with_output(
         let stopped: Vec<_> = reports
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "kind": r.kind,
                     "label": r.label,
                     "pid": r.pid,
                     "result": r.outcome.detail(),
-                })
+                });
+                if let Some(preserved) = &r.preserved_endpoint {
+                    entry["preserved_endpoint"] = serde_json::json!({
+                        "pid_path": preserved.pid_path().display().to_string(),
+                        "reason": preserved.reason(),
+                    });
+                }
+                entry
             })
             .collect();
         let payload = serde_json::json!({
@@ -1402,6 +1441,7 @@ fn finish_stop_with_output(
             "scope": scope,
             "stopped": stopped,
             "all_stopped": all_stopped,
+            "endpoints_retired": endpoints_retired,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -1423,7 +1463,15 @@ fn finish_stop_with_output(
             };
             println!("  {line}");
         }
-        if all_stopped {
+        for r in reports {
+            if let Some(preserved) = &r.preserved_endpoint {
+                println!(
+                    "  {} (pid {}): endpoint NOT retired: {preserved}",
+                    r.label, r.pid
+                );
+            }
+        }
+        if all_stopped && endpoints_retired {
             println!("All targeted Kin daemons stopped.");
         }
     }
@@ -1439,12 +1487,85 @@ fn finish_stop_with_output(
             failed.join(", ")
         );
     }
+    // Deliberately NOT raised on the quiet path. `quiet` is full uninstall's
+    // nested stop, and uninstall's job is to leave no PROCESS running: it
+    // re-verifies exactly that through its own quiescence fence, which reads
+    // processes and not endpoint records. A leftover pid file inside some repo
+    // does not keep an install alive, and refusing to uninstall over one would
+    // turn a reporting improvement into a command the operator cannot complete.
+    // A surviving process still fails uninstall, above, as it always has.
+    if !quiet && !endpoints_retired {
+        // The process died and its endpoint did not, so `status`, autostart, and
+        // every other reader of `daemon.pid` still see a published owner for this
+        // repo. Reporting success here is what made the failure invisible.
+        let preserved: Vec<String> = reports
+            .iter()
+            .filter_map(|r| r.preserved_endpoint.as_ref())
+            .map(PreservedDaemonEndpoint::to_string)
+            .collect();
+        bail!(
+            "Kin daemons stopped but their endpoints were not retired: {}",
+            preserved.join(", ")
+        );
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stop_report(preserved: Option<PreservedDaemonEndpoint>) -> StopReport {
+        StopReport {
+            kind: "repo-daemon",
+            label: "repo".to_string(),
+            pid: 4242,
+            outcome: StopOutcome::Stopped,
+            preserved_endpoint: preserved,
+        }
+    }
+
+    /// A stop whose endpoint survived must fail, and must name the survivor.
+    #[test]
+    fn a_surviving_endpoint_fails_the_stop_and_names_the_pid_file() {
+        let preserved = crate::daemon_client::preserved_daemon_endpoint_for_test(
+            Path::new("/repo/.kin/daemon.pid"),
+            "recorded owner pid 4242 never became affirmatively dead",
+        );
+        let error = finish_stop_with_output(
+            "current-repo",
+            &[stop_report(Some(preserved))],
+            false,
+            false,
+        )
+        .expect_err("a published endpoint outliving a confirmed stop is a failure");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("/repo/.kin/daemon.pid"),
+            "the operator needs the path, not just a verdict: {rendered}"
+        );
+
+        // The falsification: the identical report with nothing preserved passes,
+        // so the assertion above is about the survivor and not about the shape
+        // of the report.
+        finish_stop_with_output("current-repo", &[stop_report(None)], false, false)
+            .expect("a retired endpoint is a clean stop");
+    }
+
+    /// Full uninstall's nested stop must not be blocked by a leftover pid file.
+    /// Uninstall's contract is that no PROCESS survives, which it re-verifies
+    /// itself; refusing over an endpoint record would leave the operator unable
+    /// to complete the command.
+    #[test]
+    fn the_uninstall_path_is_not_blocked_by_a_surviving_endpoint() {
+        let preserved = crate::daemon_client::preserved_daemon_endpoint_for_test(
+            Path::new("/repo/.kin/daemon.pid"),
+            "recorded owner pid 4242 never became affirmatively dead",
+        );
+        finish_stop_with_output("all", &[stop_report(Some(preserved))], false, true)
+            .expect("a leftover endpoint record does not keep an install alive");
+    }
+
     #[cfg(windows)]
     use std::fs;
 
