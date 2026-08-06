@@ -131,9 +131,19 @@ The npm entry point resolves the same public release channel:
 npm install -g @kinlab/kin@latest
 ```
 
-A Homebrew tap exists but publishes on its own cadence and can lag the latest
-release; prefer the installer, the release archives, or npm until a version
-you can verify appears there.
+A Homebrew tap tracks the same release channel:
+
+```sh
+brew install firelock-ai/kin/kin
+```
+
+The tap's formula is generated rather than hand-maintained. Its version and its
+per-platform SHA-256 are regenerated from each Kin release by
+`update-formula.yml` in the tap repository, on a dispatch the release itself
+sends, with a six-hourly reconcile that self-heals a missed one. That is why the
+checksum Homebrew verifies is the one published beside the archive rather than a
+separately curated copy of it. Confirm what you installed with `kin --version`,
+as you should on any install path.
 
 On Windows, run `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell.
 Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. Transparent filesystem projection is not shipped on Windows, and the end-to-end install proof does not yet cover MCP or review workflows there, so WSL2 remains the recommended path for the full Kin experience.
@@ -162,6 +172,38 @@ authority view; `kin graph status` separately reports the daemon's mutable live
 query graph, which may include later derived enrichment.
 Query surfaces consume graph-owned enrichment when it exists and report its
 absence instead of hiding the gap behind raw file search.
+
+#### Which files become entities
+
+"Supported entity-source file" means a file one of Kin's language adapters
+claims. The adapter registry is the whole set, and every file in a repository
+resolves through it:
+
+| Language | Extensions |
+| --- | --- |
+| TypeScript | `.ts`, `.tsx` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Python | `.py`, `.pyi` |
+| Go | `.go` |
+| Java | `.java` |
+| Rust | `.rs` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.hpp`, `.cc`, `.cxx` |
+| C# | `.cs` |
+| Ruby | `.rb` |
+| PHP | `.php` |
+| Swift | `.swift` |
+| Kotlin | `.kt`, `.kts` |
+| HCL / Terraform | `.tf`, `.tfvars` |
+
+A `.h` header is read as C++ when its contents say so, so a C++ project does not
+lose namespaces and templates to the C grammar.
+
+Everything else is admitted as content and stays queryable as history and text,
+but is not parsed into entities and relations. That includes Markdown, HTML and
+CSS, SQL, YAML, JSON and TOML, shell scripts, Objective-C, Scala, Elixir, Dart,
+Lua, R, Zig, Haskell, and Nix. If your language is on that list, `locate` and
+`refs` will not find symbols in it.
 
 ### 3. Ask the graph a real question
 
