@@ -1292,7 +1292,7 @@ pub fn local_semantic_coverage(
 
 /// Push a degradation once per (component, reason); repeated hits within one
 /// query add no new information and would bloat the payload.
-fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: RetrievalDegradation) {
+pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: RetrievalDegradation) {
     if sink
         .iter()
         .any(|existing| existing.component == event.component && existing.reason == event.reason)
@@ -15589,7 +15589,21 @@ pub fn attach_snippets(
                 Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    record_degradation(
+                        &mut result.degradations,
+                        RetrievalDegradation {
+                            component: "entity_source".to_string(),
+                            reason: "source_unreadable".to_string(),
+                            detail: format!(
+                                "could not read graph-owned source for entity {}: {error}",
+                                entity.id
+                            ),
+                            remediation: "re-ingest repository or reconcile graph".to_string(),
+                        },
+                    );
+                    continue;
+                }
             };
             if let Some(source) = source {
                 sym.snippet = Some(source.body);
@@ -15636,7 +15650,8 @@ fn bounded_entity_body_with_note(
     max_lines: usize,
     max_chars: usize,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
-) -> Result<Option<String>> {
+    degradations: &mut Vec<RetrievalDegradation>,
+) -> Option<String> {
     // No body exists for an entity the current workspace does not contain, and
     // that is an ordinary answer on a store carrying history, not a read
     // failure: the caller renders the hit without a body.
@@ -15649,13 +15664,25 @@ fn bounded_entity_body_with_note(
     ) {
         Ok(source) => source,
         Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {
-            return Ok(None)
+            return None;
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            record_degradation(
+                degradations,
+                RetrievalDegradation {
+                    component: "entity_source".to_string(),
+                    reason: "source_unreadable".to_string(),
+                    detail: format!(
+                        "could not read graph-owned source for entity {}: {error}",
+                        entity.id
+                    ),
+                    remediation: "re-ingest repository or reconcile graph".to_string(),
+                },
+            );
+            return None;
+        }
     };
-    let Some(source) = source else {
-        return Ok(None);
-    };
+    let source = source?;
     let body = source.body;
     if let Some(span) = entity.span.as_ref() {
         let total_lines =
@@ -15663,14 +15690,14 @@ fn bounded_entity_body_with_note(
         let shown = body.lines().count();
         if total_lines > shown {
             let remaining = total_lines - shown;
-            return Ok(Some(format!(
+            return Some(format!(
                 "{body}\n… (+{remaining} more line{} — get_entity_source {} for the full body)",
                 if remaining == 1 { "" } else { "s" },
                 entity.id
-            )));
+            ));
         }
     }
-    Ok(Some(body))
+    Some(body)
 }
 
 /// Re-project the file-attributed ranked symbols already built into `result`
@@ -15738,7 +15765,8 @@ pub fn build_entity_view(
                     opts.max_lines,
                     opts.max_chars,
                     source_scope,
-                )?
+                    &mut result.degradations,
+                )
                 .or_else(|| sym.snippet.clone())
             } else {
                 None

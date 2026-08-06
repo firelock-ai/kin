@@ -5922,6 +5922,7 @@ fn semantic_locate_payload(
     page: usize,
     page_size: usize,
     rows: &[serde_json::Value],
+    degradations: &[kin_cli::commands::locate::RetrievalDegradation],
 ) -> kin_mcp::ToolCallResult {
     let (window, total, has_more) = window_semantic_rows(rows, page, page_size);
     let next_cursor = has_more.then(|| {
@@ -5931,7 +5932,7 @@ fn semantic_locate_payload(
         }
         .encode()
     });
-    let payload = json!({
+    let mut payload = json!({
         "query": query,
         "granularity": if file_granularity { "file" } else { "entity" },
         "routing": "cosine-v0",
@@ -5941,6 +5942,9 @@ fn semantic_locate_payload(
         "next_cursor": next_cursor,
         "results": window,
     });
+    if !degradations.is_empty() {
+        payload["degradations"] = json!(degradations);
+    }
     match serde_json::to_string_pretty(&payload) {
         Ok(text) => kin_mcp::ToolCallResult::text(text),
         Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
@@ -6051,6 +6055,7 @@ fn build_semantic_locate_result(
                     parsed.page,
                     page_size,
                     &rows,
+                    &[],
                 );
             }
         }
@@ -6113,6 +6118,7 @@ fn build_semantic_locate_result(
     // above has already reordered `raw`, so paging windows the re-ranked set.
     let max_rows = page_size.saturating_mul(SEMANTIC_LOCATE_MAX_PAGES);
     let mut rows: Vec<serde_json::Value> = Vec::with_capacity(page_size);
+    let mut degradations: Vec<kin_cli::commands::locate::RetrievalDegradation> = Vec::new();
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen_entities: HashSet<String> = HashSet::new();
     // Constant across the page and reported per hit in `match_evidence`: whether
@@ -6191,11 +6197,19 @@ fn build_semantic_locate_result(
                         continue;
                     }
                     Err(error) => {
-                        return kin_mcp::ToolCallResult::error(format!(
-                            "semantic_locate could not read graph-owned source for entity {}: \
-                             {error}",
-                            entity.id
-                        ));
+                        kin_cli::commands::locate::record_degradation(
+                            &mut degradations,
+                            kin_cli::commands::locate::RetrievalDegradation {
+                                component: "entity_source".to_string(),
+                                reason: "source_unreadable".to_string(),
+                                detail: format!(
+                                    "could not read graph-owned source for entity {}: {error}",
+                                    entity.id
+                                ),
+                                remediation: "re-ingest repository or reconcile graph".to_string(),
+                            },
+                        );
+                        continue;
                     }
                 }
             } else {
@@ -6273,6 +6287,7 @@ fn build_semantic_locate_result(
         0,
         page_size,
         &rows,
+        &degradations,
     )
 }
 
@@ -25329,6 +25344,109 @@ mod tests {
             assert!(
                 degradations.is_array(),
                 "degradations must serialize as an array"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_semantic_locate_handles_unreadable_entity_degradation_without_failing_page() {
+        let state = test_state();
+        let valid_source = "def valid_func():\n    return 42\n";
+        install_repository_file(&state, "src/good.py", valid_source.as_bytes());
+        install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
+        let mut valid_entity = test_entity("valid_func", "src/good.py");
+        valid_entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new("src/good.py"),
+            start_byte: 0,
+            end_byte: valid_source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 15,
+        });
+        valid_entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!("def valid_func():"),
+        );
+        state.graph.upsert_entity(&valid_entity).unwrap();
+
+        // bad.py has valid source text but bad_entity has an out-of-bounds span (100..200 > 25)
+        let bad_source = "def bad_func():\n    pass\n";
+        install_repository_file(&state, "src/bad.py", bad_source.as_bytes());
+        install_working_copy_file(&state, "src/bad.py", bad_source.as_bytes(), false);
+        let mut bad_entity = test_entity("bad_func", "src/bad.py");
+        bad_entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new("src/bad.py"),
+            start_byte: 100,
+            end_byte: 200,
+            start_line: 10,
+            start_col: 0,
+            end_line: 20,
+            end_col: 0,
+        });
+        bad_entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!("def bad_func():"),
+        );
+        state.graph.upsert_entity(&bad_entity).unwrap();
+
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let payload =
+            call_semantic_locate(app, json!({ "query": "func", "pipeline": "fused", "include_snippet": true })).await;
+
+        assert_eq!(payload["routing"], "fused-v1");
+        let degradations = payload["degradations"]
+            .as_array()
+            .expect("degradations array present");
+        let has_entity_source_degradation = degradations.iter().any(|d| {
+            d["component"] == "entity_source" && d["reason"] == "source_unreadable"
+        });
+        assert!(
+            has_entity_source_degradation,
+            "unreadable entity must be reported in degradations: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_semantic_locate_clean_run_omits_entity_source_degradation() {
+        let state = test_state();
+        let valid_source = "def valid_func():\n    return 42\n";
+        install_repository_file(&state, "src/good.py", valid_source.as_bytes());
+        install_working_copy_file(&state, "src/good.py", valid_source.as_bytes(), false);
+        let mut valid_entity = test_entity("valid_func", "src/good.py");
+        valid_entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new("src/good.py"),
+            start_byte: 0,
+            end_byte: valid_source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 15,
+        });
+        valid_entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!("def valid_func():"),
+        );
+        state.graph.upsert_entity(&valid_entity).unwrap();
+
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let payload =
+            call_semantic_locate(app, json!({ "query": "valid_func", "pipeline": "fused", "include_snippet": true })).await;
+
+        assert_eq!(payload["routing"], "fused-v1");
+        if let Some(degradations) = payload.get("degradations").and_then(|d| d.as_array()) {
+            let has_entity_source = degradations.iter().any(|d| d["component"] == "entity_source");
+            assert!(
+                !has_entity_source,
+                "clean run must not carry an entity_source degradation entry"
             );
         }
     }
