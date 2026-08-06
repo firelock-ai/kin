@@ -84,17 +84,17 @@ flowchart TD
         editor["kin-editor for VS Code"]
     end
 
-    subgraph core["kin"]
+    subgraph runtime["Kin runtime"]
         daemon["kin daemon"]
         authority["Graph authority<br/>entities, relations, changes, provenance"]
+        vfs["kin-vfs<br/>transparent file projection"]
     end
 
     subgraph layers["Storage and retrieval"]
-        db["kin-db<br/>graph storage, snapshots, index, text and vector search"]
+        db["kin-db<br/>graph storage, snapshots,<br/>index, text and vector search"]
         prims["kin-model, kin-blobs, kin-search,<br/>kin-vector, kin-infer, kin-lsp"]
     end
 
-    vfs["kin-vfs<br/>transparent file projection"]
     tools["Editors, compilers, build systems"]
     git["Git<br/>import and export boundary"]
     kinlab["KinLab<br/>hosted collaboration and control plane"]
@@ -106,10 +106,10 @@ flowchart TD
     mcp --> daemon
     editor --> daemon
     daemon --> authority
-    authority --> db
-    db --> prims
     authority --> vfs
     vfs --> tools
+    authority --> db
+    db --> prims
     git -->|"kin init imports"| authority
     authority -->|"kin git export"| git
     authority -->|"publish and sync"| kinlab
