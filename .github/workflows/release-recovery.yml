@@ -341,8 +341,17 @@ jobs:
           # they are kept apart so the alert can state which one it observed
           # instead of asserting the stronger claim on both.
           distinct="$(sort -u "$signatures" | wc -l | tr -d '[:space:]')"
+          # Readability is judged on the two signatures the stop rule actually
+          # compares, not on the whole run. A whole-run unknown count vetoed the
+          # repeat stop for every later attempt as well, so one unreadable early
+          # attempt spent the entire remaining budget on attempts whose
+          # signatures were readable and identical. A job cancelled mid-outage
+          # is the shape that reads as unreadable, because it records neither a
+          # failing step nor a failing job conclusion. An
+          # `unrecorded` latest can never establish a repeat on its own, and it
+          # cannot equal a readable previous, so testing it is enough.
           repeated=false
-          if [ "$ATTEMPTS" -ge 2 ] && [ "$unknown" -eq 0 ] &&
+          if [ "$ATTEMPTS" -ge 2 ] && [ "$latest" != unrecorded ] &&
              [ "$latest" = "$previous" ]; then
             repeated=true
           fi
@@ -420,10 +429,12 @@ jobs:
             printf 'unrecorded\n' > "$signatures"
           fi
           failing_steps="$(tail -1 "$signatures")"
-          if [ "${UNKNOWN:-1}" -ne 0 ]; then
-            verdict="indeterminate"
-            advice="At least one attempt could not be read or carried no concrete failed step, so neither a deterministic nor a transient cause is established. Inspect the unrecorded attempts before choosing a same-release rerun or a source-fixed recut."
-          elif [ "${REPEATED:-false}" = true ]; then
+          # An established repeat is the stronger reading and is tested first. An
+          # unreadable attempt elsewhere in the run does not weaken two readable
+          # adjacent attempts that failed identically, and reporting that state
+          # as indeterminate sent the operator to inspect the unrecorded attempt
+          # while the actual repeated failure went unnamed.
+          if [ "${REPEATED:-false}" = true ]; then
             verdict="repeated failure signature"
             # The stop rule is last-two equality, so a run that reached the end
             # of its budget is one whose earlier attempts differed: an identical
@@ -436,8 +447,11 @@ jobs:
             if [ "${DISTINCT:-0}" = 1 ]; then
               advice="Every observed attempt failed in the same job and step set, so another immediate rerun is unlikely to help. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
             else
-              advice="The two most recent attempts failed in the same job and step set, so another immediate rerun is unlikely to help. Earlier attempts failed differently, which is evidence in its own right that the cause is not purely deterministic, so read the whole per-attempt list below before choosing a remedy. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
+              advice="The two most recent attempts failed in the same job and step set, so another immediate rerun is unlikely to help. Earlier attempts failed differently or could not be read, which is evidence in its own right that the cause is not purely deterministic, so read the whole per-attempt list below before choosing a remedy. Step identity does not prove the root cause: inspect the logs, recut only after confirming a source-bound defect, and preserve this tag for a same-release rerun if the cause is external."
             fi
+          elif [ "${UNKNOWN:-1}" -ne 0 ]; then
+            verdict="indeterminate"
+            advice="At least one attempt could not be read or carried no concrete failed step, and no two adjacent readable attempts failed identically, so neither a deterministic nor a transient cause is established. Inspect the unrecorded attempts before choosing a same-release rerun or a source-fixed recut."
           else
             verdict="varying failure signatures"
             advice="The observed failing job and step sets differed, which is consistent with the transient shape this controller exists for. Diagnose and rerun the same release rather than cutting a newer version unless the logs identify a source-bound defect."
