@@ -59,7 +59,8 @@ pub use repository_export::{
     RepositoryGitExportPlan, RepositoryGitExportProof, RepositoryGitExportResult,
 };
 pub use sealed_observation::{
-    seal_all_content_observation, AdmittedContentClosure, ContentExclusionReason,
-    DeclaredContentExclusion, SealedContentCoverage, SealedContentObservation, SealedContentSource,
+    seal_all_content_observation, seal_all_content_observation_observed, AdmittedContentClosure,
+    ContentExclusionReason, DeclaredContentExclusion, SealedContentCoverage,
+    SealedContentObservation, SealedContentSource,
 };
 pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};

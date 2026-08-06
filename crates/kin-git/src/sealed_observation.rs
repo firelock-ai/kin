@@ -180,6 +180,22 @@ pub fn seal_all_content_observation(
     closure: &impl AdmittedContentClosure,
     content: &impl SealedContentSource,
 ) -> Result<SealedContentObservation> {
+    seal_all_content_observation_observed(closure, content, &mut |_, _| {})
+}
+
+/// Prove sealed all-content observation, reporting progress as it walks.
+///
+/// The observation is Sigma over every admitted tree of that tree's full entry
+/// count, so on a repository with deep history it runs for minutes. `observe`
+/// is called with `(trees_completed, trees_total)` after each tree so a caller
+/// can show that the walk is advancing. It changes nothing the observation
+/// proves: [`seal_all_content_observation`] is this function with an observer
+/// that does nothing.
+pub fn seal_all_content_observation_observed(
+    closure: &impl AdmittedContentClosure,
+    content: &impl SealedContentSource,
+    observe: &mut dyn FnMut(usize, usize),
+) -> Result<SealedContentObservation> {
     let mut coverage = SealedContentCoverage::default();
     let mut observed_entries = 0usize;
     let mut observed_trees = 0usize;
@@ -190,7 +206,9 @@ pub fn seal_all_content_observation(
     let mut non_utf8_paths = BTreeSet::<RepoPath>::new();
     let mut tree_digests = Vec::<Hash256>::new();
 
-    for tree in closure.admitted_trees() {
+    let admitted_trees = closure.admitted_trees();
+    let total_trees = admitted_trees.len();
+    for tree in admitted_trees {
         observed_trees += 1;
         // One digest per admitted tree over its exact (path, shape, body)
         // sequence. Counts alone cannot distinguish two closures that agree on
@@ -264,6 +282,7 @@ pub fn seal_all_content_observation(
             }
         }
         tree_digests.push(digest(&tree_content));
+        observe(observed_trees, total_trees);
     }
 
     // One gap per distinct unsealed body, so a report that lists every gap it

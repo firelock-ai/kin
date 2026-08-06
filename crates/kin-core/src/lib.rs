@@ -23,6 +23,7 @@ pub mod exact_tree;
 pub mod git_init;
 pub mod hooks;
 pub mod init;
+mod init_progress;
 pub mod layout;
 pub mod manifest;
 pub mod ranking;

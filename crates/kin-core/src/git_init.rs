@@ -16,8 +16,9 @@ use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
     plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
-    seal_all_content_observation, AdmittedContentClosure, GitLocalIgnoreSourceKind,
+    seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
     GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
+    SealedContentSource,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -27,7 +28,7 @@ use kin_model::{
     RepositoryId, RepositoryTransaction, TreeDelta, WorkspaceExpectation, WorkspaceMutation,
     WorkspaceSemanticDelta,
 };
-use tracing::info;
+use tracing::{info, info_span};
 
 use crate::config::{
     GitBranchTrackingConfig, GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig,
@@ -38,6 +39,7 @@ use crate::init::{
     prepare_repository_layout_at, publish_repository_layout_linearized, GraphOwnedContent,
     InitResult,
 };
+use crate::init_progress::{PhaseProgress, GIT_ADMISSION_PHASES};
 use crate::layout::KinLayout;
 use crate::manifest::KinManifest;
 
@@ -207,74 +209,172 @@ fn init_from_git_with_hooks(
     let capture_store = BlobStore::new(capture_dir.path().join("objects"))
         .map_err(|error| git_boundary_error("create capture CAS", error))?;
 
-    let snapshot = capture_lossless_git_repository(&source, repository_id, &capture_store)
-        .map_err(|error| git_boundary_error("capture exact Git repository", error))?;
-    let git_authority = build_git_external_authority(&snapshot, &capture_store)
-        .map_err(|error| git_boundary_error("build exact Git authority", error))?;
-    let semantic_plan = plan_semantic_git_import(&snapshot, &capture_store)
-        .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
-    verify_material_workspace_seed(&semantic_plan.workspace_seed, &git_authority.material_head)?;
-    let semantic_plan = bind_historical_semantics(semantic_plan, &capture_store)?;
-    let admitted = admit_semantic_git_import(&semantic_plan, &capture_store)
-        .map_err(|error| git_boundary_error("derive branch-versioned admission policy", error))?;
-    let source_proof = preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
-        .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?;
+    let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);
+
+    progress.begin("capture Git repository");
+    let snapshot = {
+        let _span = info_span!("kin.init.capture_git_repository").entered();
+        capture_lossless_git_repository(&source, repository_id, &capture_store)
+            .map_err(|error| git_boundary_error("capture exact Git repository", error))?
+    };
+
+    progress.begin("build Git authority");
+    let git_authority = {
+        let _span = info_span!(
+            "kin.init.build_git_authority",
+            objects = snapshot.objects.len()
+        )
+        .entered();
+        build_git_external_authority(&snapshot, &capture_store)
+            .map_err(|error| git_boundary_error("build exact Git authority", error))?
+    };
+
+    progress.begin("plan semantic import");
+    let semantic_plan = {
+        let _span = info_span!("kin.init.plan_semantic_import").entered();
+        let plan = plan_semantic_git_import(&snapshot, &capture_store)
+            .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
+        verify_material_workspace_seed(&plan.workspace_seed, &git_authority.material_head)?;
+        plan
+    };
+
+    progress.begin("derive semantic history");
+    let semantic_plan = {
+        let _span = info_span!(
+            "kin.init.bind_historical_semantics",
+            changes = semantic_plan.commit_trees.len()
+        )
+        .entered();
+        bind_historical_semantics(semantic_plan, &capture_store)?
+    };
+
+    progress.begin("apply admission policy");
+    let admitted = {
+        let _span = info_span!("kin.init.admit_semantic_import").entered();
+        admit_semantic_git_import(&semantic_plan, &capture_store).map_err(|error| {
+            git_boundary_error("derive branch-versioned admission policy", error)
+        })?
+    };
+
+    progress.begin("prove Git source");
+    let source_proof = {
+        let _span = info_span!("kin.init.source_proof_staged").entered();
+        preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
+            .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?
+    };
 
     let final_kin_dir = source.join(".kin");
     let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let config = config_for_source(&snapshot, &source_proof.remote_mapping)?;
-    let mut prepared =
-        prepare_repository_layout_at(&staging_dir, &final_kin_dir, config, manifest)?;
-    copy_captured_authority(&prepared, &snapshot, &capture_store, &source_proof)?;
-    let sealed_observation = seal_all_content_observation(&admitted, &prepared)
-        .map_err(|error| git_boundary_error("seal all-content observation", error))?;
+
+    progress.begin("stage repository layout");
+    let mut prepared = {
+        let _span = info_span!("kin.init.prepare_layout").entered();
+        prepare_repository_layout_at(&staging_dir, &final_kin_dir, config, manifest)?
+    };
+
+    progress.begin("copy Git objects");
+    {
+        let _span = info_span!(
+            "kin.init.copy_captured_authority",
+            objects = snapshot.objects.len()
+        )
+        .entered();
+        copy_captured_authority(
+            &prepared,
+            &snapshot,
+            &capture_store,
+            &source_proof,
+            &mut progress,
+        )?;
+    }
+
+    progress.begin("seal staged content");
+    let sealed_observation = {
+        let _span = info_span!("kin.init.seal_staged_content").entered();
+        seal_observed_content(&admitted, &prepared, &mut progress)
+            .map_err(|error| git_boundary_error("seal all-content observation", error))?
+    };
 
     let workspace_seed = admitted.workspace_seed.clone();
     let workspace_policy = admitted.workspace_policy().clone();
     let workspace_base_change_id = admitted.workspace_base_change_id();
-    let mut transaction = admitted
-        .into_generation_zero_repository_transaction(
-            &capture_store,
-            OperationId::new(),
-            prepared.initial_roots().clone(),
-            AuthorId::new("kin-git-import"),
-            "admit exact Git repository authority",
+
+    progress.begin("build bootstrap transaction");
+    let transaction = {
+        let _span = info_span!(
+            "kin.init.build_bootstrap_transaction",
+            observed_trees = sealed_observation.observed_trees,
+            observed_entries = sealed_observation.observed_entries
         )
-        .map_err(|error| git_boundary_error("construct Git bootstrap transaction", error))?;
-    bind_workspace_authority(
-        &mut transaction,
-        prepared.workspace_id(),
-        workspace_seed,
-        workspace_policy,
-        &source_proof,
-    )?;
-    transaction.git_authority_delta = Some(GitExternalAuthorityDelta::initialize(git_authority));
-    transaction
-        .validate()
-        .map_err(|error| KinError::Other(format!("invalid Git bootstrap transaction: {error}")))?;
-    prepared.commit_repository_bootstrap(&transaction)?;
+        .entered();
+        let mut transaction = admitted
+            .into_generation_zero_repository_transaction(
+                &capture_store,
+                OperationId::new(),
+                prepared.initial_roots().clone(),
+                AuthorId::new("kin-git-import"),
+                "admit exact Git repository authority",
+            )
+            .map_err(|error| git_boundary_error("construct Git bootstrap transaction", error))?;
+        bind_workspace_authority(
+            &mut transaction,
+            prepared.workspace_id(),
+            workspace_seed,
+            workspace_policy,
+            &source_proof,
+        )?;
+        transaction.git_authority_delta =
+            Some(GitExternalAuthorityDelta::initialize(git_authority));
+        transaction
+    };
+
+    progress.begin("validate bootstrap transaction");
+    {
+        let _span = info_span!("kin.init.validate_bootstrap_transaction").entered();
+        transaction.validate().map_err(|error| {
+            KinError::Other(format!("invalid Git bootstrap transaction: {error}"))
+        })?;
+    }
+
+    progress.begin("commit bootstrap transaction");
+    {
+        let _span = info_span!("kin.init.commit_bootstrap_transaction").entered();
+        prepared.commit_repository_bootstrap(&transaction)?;
+    }
 
     let mut result = publish_repository_layout_linearized(prepared, |publication| {
         before_final_source_proof();
-        let final_proof =
+        progress.begin("re-prove Git source");
+        let final_proof = {
+            let _span = info_span!("kin.init.source_proof_final").entered();
             preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
-                .map_err(|error| git_boundary_error("repeat final Git source proof", error))?;
+                .map_err(|error| git_boundary_error("repeat final Git source proof", error))?
+        };
         if final_proof != source_proof {
             return Err(KinError::Other(
                 "Git source proof changed before repository publication; retry from a fresh capture"
                     .to_string(),
             ));
         }
-        let published = publication.publish()?;
+        progress.begin("publish repository");
+        let published = {
+            let _span = info_span!("kin.init.publish_repository").entered();
+            publication.publish()?
+        };
         after_repository_publication();
-        let published_proof = preflight_git_migration_after_publication(
-            &source,
-            published.path(),
-            &snapshot,
-            &semantic_plan,
-            &capture_store,
-        )
-        .map_err(|error| git_boundary_error("prove Git source after publication", error))?;
+        progress.begin("prove Git source after publication");
+        let published_proof = {
+            let _span = info_span!("kin.init.source_proof_published").entered();
+            preflight_git_migration_after_publication(
+                &source,
+                published.path(),
+                &snapshot,
+                &semantic_plan,
+                &capture_store,
+            )
+            .map_err(|error| git_boundary_error("prove Git source after publication", error))?
+        };
         if published_proof != source_proof {
             return Err(KinError::Other(
                 "Git source proof changed across repository publication; published authority is \
@@ -294,8 +394,11 @@ fn init_from_git_with_hooks(
         // source proof above. The staged observation before publication is what
         // keeps a repository that cannot answer for its content from being
         // published at all. Neither site degrades into a filesystem read.
-        let published_observation =
-            seal_published_content_observation(published.path(), &semantic_plan)?;
+        progress.begin("seal published content");
+        let published_observation = {
+            let _span = info_span!("kin.init.seal_published_content").entered();
+            seal_published_content_observation(published.path(), &semantic_plan, &mut progress)?
+        };
         if published_observation.fingerprint != sealed_observation.fingerprint {
             return Err(KinError::Other(
                 "sealed all-content observation changed across repository publication; published \
@@ -303,6 +406,7 @@ fn init_from_git_with_hooks(
                     .to_string(),
             ));
         }
+        progress.finish("admitted exact Git repository");
         Ok(())
     })?;
     // Exact Git refs intentionally retain external-object targets, so the
@@ -337,6 +441,7 @@ fn init_from_git_with_hooks(
 fn seal_published_content_observation(
     published_kin_dir: &Path,
     closure: &impl AdmittedContentClosure,
+    progress: &mut PhaseProgress,
 ) -> Result<SealedContentObservation> {
     let layout = KinLayout::new(published_kin_dir.to_path_buf());
     let authority = RepositoryAuthorityManager::open(
@@ -348,10 +453,10 @@ fn seal_published_content_observation(
     #[cfg(all(unix, test))]
     if published_closure_is_diverged() {
         let diverged = DivergedClosure::from_closure(closure);
-        return seal_all_content_observation(&diverged, &content)
+        return seal_observed_content(&diverged, &content, progress)
             .map_err(|error| git_boundary_error("seal published all-content observation", error));
     }
-    seal_all_content_observation(closure, &content)
+    seal_observed_content(closure, &content, progress)
         .map_err(|error| git_boundary_error("seal published all-content observation", error))
 }
 
@@ -525,8 +630,14 @@ fn copy_captured_authority(
     snapshot: &LosslessGitRepository,
     capture_store: &BlobStore,
     proof: &GitMigrationPreflightProof,
+    progress: &mut PhaseProgress,
 ) -> Result<()> {
-    for record in &snapshot.objects {
+    let total_objects = snapshot.objects.len();
+    let report_every = progress_interval(total_objects);
+    for (copied, record) in snapshot.objects.iter().enumerate() {
+        if copied.is_multiple_of(report_every) {
+            progress.detail(format_args!("{copied}/{total_objects} objects"));
+        }
         let capture_hash = kin_blobs::Hash256::from_bytes(*record.body_hash.as_bytes());
         let body = capture_store.read(&capture_hash).map_err(|error| {
             git_boundary_error(
@@ -551,7 +662,32 @@ fn copy_captured_authority(
         }
         prepared.save_source_blob(input.body_hash, &input.body)?;
     }
+    progress.detail(format_args!("{total_objects}/{total_objects} objects"));
     Ok(())
+}
+
+/// How often a bounded walk should report, so a long phase stays visible
+/// without the reporting itself becoming the cost. Never zero, so the caller's
+/// modulo is always defined on an empty walk.
+fn progress_interval(total: usize) -> usize {
+    (total / 100).max(1)
+}
+
+/// Seal the staged closure, reporting the walk as it advances.
+fn seal_observed_content(
+    closure: &impl AdmittedContentClosure,
+    content: &impl SealedContentSource,
+    progress: &mut PhaseProgress,
+) -> kin_git::Result<SealedContentObservation> {
+    let mut report_every = 0usize;
+    seal_all_content_observation_observed(closure, content, &mut |done, total| {
+        if report_every == 0 {
+            report_every = progress_interval(total);
+        }
+        if done.is_multiple_of(report_every) || done == total {
+            progress.detail(format_args!("{done}/{total} trees"));
+        }
+    })
 }
 
 fn bind_workspace_authority(
