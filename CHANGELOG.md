@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fail closed when a release gate assertion is defined but never runs (#636)
 - Tell a locate caller when nothing it asked for was actually found (#645)
+- Wait for the daemon to die before retiring its endpoint, and report a survivor (#642)
 
 
 ## [0.5.5] - 2026-08-05
