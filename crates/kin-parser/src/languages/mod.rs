@@ -102,6 +102,22 @@ impl AdapterRegistry {
     pub fn supported_languages(&self) -> Vec<LanguageId> {
         self.adapters.iter().map(|a| a.language_id()).collect()
     }
+
+    /// Every registered adapter's language and the extensions it claims, in
+    /// registration order.
+    ///
+    /// This registry IS the supported set: admission asks it which adapter
+    /// matches an extension and there is no second gate, so anything that
+    /// reports Kin's supported languages must read THIS rather than keep its own
+    /// list. A separate list is a second statement of one fact, and the two can
+    /// only ever come to disagree — silently, because the disagreement looks
+    /// like a language simply not working.
+    pub fn supported_languages_with_extensions(&self) -> Vec<(LanguageId, &[&str])> {
+        self.adapters
+            .iter()
+            .map(|adapter| (adapter.language_id(), adapter.file_extensions()))
+            .collect()
+    }
 }
 
 impl Default for AdapterRegistry {
