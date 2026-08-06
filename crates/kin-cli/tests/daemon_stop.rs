@@ -67,6 +67,24 @@ fn wait_until_dead(pid: u32, timeout: Duration) {
     }
 }
 
+/// Wait for a path to disappear, the file-side analogue of `wait_until_dead`.
+///
+/// Process death and endpoint retirement are two different events, and the stop
+/// path decides the second one against a liveness probe that can still read
+/// `Alive` — or an indeterminate `Unknown` — for a moment after the first. This
+/// wait is what makes the assertion below a statement about the product rather
+/// than about which of the two events the test happened to observe first.
+///
+/// It cannot weaken the assertion: the caller asserts after the wait, so an
+/// endpoint that genuinely never retires exhausts the deadline and fails exactly
+/// as loudly as before.
+fn wait_until_gone(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn daemon_status_and_stop_lifecycle() {
     let root = tempfile::tempdir().expect("temp root");
@@ -140,6 +158,7 @@ fn daemon_status_and_stop_lifecycle() {
         !is_process_alive(worker_pid),
         "worker daemon pid {worker_pid} still alive after `kin daemon stop`"
     );
+    wait_until_gone(&pid_path, Duration::from_secs(5));
     assert!(
         !pid_path.exists(),
         "daemon.pid must be cleared after a confirmed stop"
