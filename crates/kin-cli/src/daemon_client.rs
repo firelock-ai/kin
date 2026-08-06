@@ -2054,6 +2054,144 @@ pub fn process_liveness(pid: u32) -> ProcessLiveness {
     }
 }
 
+/// Prefix of the macOS boot identity this build no longer mints, but must still
+/// be able to read.
+///
+/// `kern.boottime` is not a boot token. macOS derives it as (now - uptime) and
+/// re-derives it whenever the clock moves, so an NTP correction shifts it while
+/// the machine stays up. Measured on one host: the same boot reported
+/// `sec=1785713468 usec=118135` and, ninety minutes later with no reboot,
+/// `usec=168489`. An identity carrying that microsecond therefore stops
+/// matching itself, and every path gated on process identity - stop, autostart
+/// singleton detection, stale-endpoint cleanup, eject - concludes the process it
+/// is looking at is a different incarnation. The reported symptom is `kin daemon
+/// stop` answering "nothing to stop" while the daemon it cannot see burns a
+/// core.
+///
+/// The boot second is far more stable than the microsecond but is not immune
+/// either: a slew that accumulates past one second moves it too. That is
+/// tolerable only because this format is now read-only. Identities recorded from
+/// here on carry `kern.bootsessionuuid`, which the kernel generates once per boot
+/// and never derives from a clock, so any daemon that restarts leaves the legacy
+/// format behind for good.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_LEGACY_BOOTTIME_PREFIX: &str = "macos-kern-boottime:";
+
+/// The kernel's per-boot UUID, or `None` when it cannot be read.
+///
+/// `None` is a fallback signal rather than an error: the caller degrades to the
+/// boot second, which is still a usable identity, instead of failing closed and
+/// making every identity-gated path indeterminate on a host whose kernel does
+/// not publish this key.
+#[cfg(target_os = "macos")]
+fn macos_boot_session_uuid() -> Option<String> {
+    const NAME: &[u8] = b"kern.bootsessionuuid\0";
+
+    let mut len: usize = 0;
+    let sized = unsafe {
+        libc::sysctlbyname(
+            NAME.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    let read = unsafe {
+        libc::sysctlbyname(
+            NAME.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    let uuid = String::from_utf8(buf).ok()?;
+    let uuid = uuid.trim();
+    if uuid.is_empty() {
+        None
+    } else {
+        Some(uuid.to_string())
+    }
+}
+
+/// The boot second from `kern.boottime`, deliberately without its microsecond.
+#[cfg(target_os = "macos")]
+fn macos_kern_boottime_seconds() -> std::io::Result<i64> {
+    let mut boot_time = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as _,
+            &mut boot_time as *mut libc::timeval as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<libc::timeval>() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(boot_time.tv_sec as i64)
+}
+
+/// Whether a legacy `macos-kern-boottime:` identity names the boot whose second
+/// is `live_seconds`.
+///
+/// Compares the second and discards the microsecond, which is the whole point:
+/// the microsecond is the field the clock moves. The second is compared exactly
+/// rather than with tolerance, because a window wide enough to absorb a large
+/// slew is also wide enough to accept a different boot, and a guard that accepts
+/// every boot protects nothing.
+///
+/// Pure and target-independent so the slew case is testable on every platform
+/// rather than only on the one where it happens.
+#[cfg(any(target_os = "macos", test))]
+fn macos_legacy_boottime_matches(recorded: &str, live_seconds: i64) -> bool {
+    recorded
+        .strip_prefix(MACOS_LEGACY_BOOTTIME_PREFIX)
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|seconds| seconds.parse::<i64>().ok())
+        .is_some_and(|seconds| seconds == live_seconds)
+}
+
+/// Whether `recorded` names the boot this process is running under.
+///
+/// Reads the recorded identity's own scheme rather than assuming it was minted
+/// by this build. A daemon started before the boot-session-UUID change recorded
+/// the legacy format and is still running, so an upgraded binary that compared
+/// only against the format it now mints would declare every one of those daemons
+/// a stranger - reproducing the bug it was meant to fix, once, for every process
+/// already on the machine.
+fn boot_identity_matches(recorded: &str) -> std::io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        if recorded.starts_with(MACOS_LEGACY_BOOTTIME_PREFIX) {
+            return Ok(macos_legacy_boottime_matches(
+                recorded,
+                macos_kern_boottime_seconds()?,
+            ));
+        }
+    }
+    Ok(recorded == stable_boot_identity()?)
+}
+
 fn stable_boot_identity() -> std::io::Result<String> {
     #[cfg(target_os = "linux")]
     {
@@ -2070,28 +2208,15 @@ fn stable_boot_identity() -> std::io::Result<String> {
 
     #[cfg(target_os = "macos")]
     {
-        let mut boot_time = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        };
-        let mut len = std::mem::size_of::<libc::timeval>();
-        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-        let status = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as _,
-                &mut boot_time as *mut libc::timeval as *mut _,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != 0 || len != std::mem::size_of::<libc::timeval>() {
-            return Err(std::io::Error::last_os_error());
+        if let Some(uuid) = macos_boot_session_uuid() {
+            return Ok(format!("macos-boot-session:{uuid}"));
         }
+        // Fall back to the boot second, never the microsecond. See
+        // `MACOS_LEGACY_BOOTTIME_PREFIX` for why the microsecond cannot be part
+        // of an identity.
         return Ok(format!(
-            "macos-kern-boottime:{}:{:06}",
-            boot_time.tv_sec, boot_time.tv_usec
+            "{MACOS_LEGACY_BOOTTIME_PREFIX}{}",
+            macos_kern_boottime_seconds()?
         ));
     }
 
@@ -2291,8 +2416,24 @@ pub fn current_process_identity() -> std::io::Result<ProcessIdentity> {
     })
 }
 
+/// Whether `identity` still names the process incarnation running at its PID.
+///
+/// The PID and the birth token are compared exactly: they are what separate a
+/// process from an unrelated successor that inherited its number. The boot
+/// component goes through [`boot_identity_matches`] instead of struct equality,
+/// because on macOS the recorded boot string can be a wall-clock derivation that
+/// moves under the recorder's feet. Whole-struct equality is what turned that
+/// movement into "this is a different process", so the single comparison that
+/// every identity-gated path funnels through is the right and only place to fix
+/// it.
 pub fn process_identity_is_current(identity: &ProcessIdentity) -> std::io::Result<bool> {
-    Ok(process_identity(identity.pid)?.as_ref() == Some(identity))
+    let Some(live) = process_identity(identity.pid)? else {
+        return Ok(false);
+    };
+    if live.pid != identity.pid || live.birth_token != identity.birth_token {
+        return Ok(false);
+    }
+    boot_identity_matches(&identity.boot_id)
 }
 
 #[cfg(windows)]
@@ -8337,16 +8478,89 @@ mod tests {
         assert!(diagnostic.len() <= 400);
     }
 
+    /// A recorded identity whose boot microsecond has slewed still names the
+    /// same boot, and one whose boot second differs does not.
+    ///
+    /// This is the defect in one assertion pair. The reported case measured the
+    /// microsecond moving 57,694 on a machine that never rebooted, which made
+    /// `kin daemon stop` answer "nothing to stop" about a daemon pinning a core.
+    /// The second half is what keeps the fix from being a hole: tolerating the
+    /// microsecond must not tolerate a different boot.
+    #[test]
+    fn legacy_boot_identity_survives_clock_slew_but_still_refuses_another_boot() {
+        let live_seconds = 1_785_713_468_i64;
+
+        // Recorded before the slew, live value after it. Only the microsecond
+        // differs, which is exactly the field the clock moves.
+        assert!(
+            macos_legacy_boottime_matches("macos-kern-boottime:1785713468:118135", live_seconds),
+            "a slewed boot microsecond must not read as a different boot"
+        );
+        assert!(
+            macos_legacy_boottime_matches("macos-kern-boottime:1785713468:175829", live_seconds),
+            "the same boot must match whatever the microsecond has drifted to"
+        );
+        // The seconds-only form this build mints as a fallback.
+        assert!(macos_legacy_boottime_matches(
+            "macos-kern-boottime:1785713468",
+            live_seconds
+        ));
+
+        // Falsification: change the second, keep everything else. A real reboot
+        // must still be refused, or the guard protects nothing.
+        assert!(
+            !macos_legacy_boottime_matches("macos-kern-boottime:1785713469:118135", live_seconds),
+            "a different boot second must still be refused"
+        );
+        assert!(!macos_legacy_boottime_matches(
+            "macos-kern-boottime:1785799868:118135",
+            live_seconds
+        ));
+        // Neither a foreign scheme nor an unparseable second may match.
+        assert!(!macos_legacy_boottime_matches(
+            "linux-boot-id:1785713468",
+            live_seconds
+        ));
+        assert!(!macos_legacy_boottime_matches(
+            "macos-kern-boottime:not-a-number",
+            live_seconds
+        ));
+        assert!(!macos_legacy_boottime_matches("", live_seconds));
+    }
+
+    /// The minted identity must not carry a field the clock can move.
+    ///
+    /// The assertion this replaces sampled `stable_boot_identity()` twice ten
+    /// milliseconds apart and required them equal, with the message "boot
+    /// identity must be a kernel boot token, not wall-clock-minus-uptime". It
+    /// was written for this exact defect and could never observe it: the slew
+    /// arrives in sporadic NTP steps, so five samples over four seconds are
+    /// byte-identical on a host actively exhibiting the bug. A test that cannot
+    /// fail is not evidence, so this asserts the shape of the identity instead
+    /// of the stability of two samples taken a moment apart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_boot_identity_carries_no_wall_clock_microsecond() {
+        let identity = stable_boot_identity().unwrap();
+        assert!(
+            !identity.starts_with("macos-kern-boottime:")
+                || !identity
+                    .trim_start_matches("macos-kern-boottime:")
+                    .contains(':'),
+            "minted boot identity still carries a boot microsecond: {identity}"
+        );
+        if let Some(uuid) = identity.strip_prefix("macos-boot-session:") {
+            assert!(!uuid.is_empty(), "empty boot session uuid");
+            assert_eq!(
+                uuid,
+                macos_boot_session_uuid().unwrap(),
+                "the boot session uuid must be stable across reads"
+            );
+        }
+    }
+
     #[test]
     fn process_identity_rejects_pid_reuse_and_reboot_boundaries() {
-        let first_boot = stable_boot_identity().unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-        assert_eq!(
-            stable_boot_identity().unwrap(),
-            first_boot,
-            "boot identity must be a kernel boot token, not wall-clock-minus-uptime"
-        );
-
         let current = current_process_identity().unwrap();
         assert!(process_identity_is_current(&current).unwrap());
 
