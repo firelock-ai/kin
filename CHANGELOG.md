@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-08-06
+
+### Changed
+
+- Fail closed when a release gate assertion is defined but never runs (#636)
+- Tell a locate caller when nothing it asked for was actually found (#645)
+
+
 ## [0.5.5] - 2026-08-05
 
 ### Changed
