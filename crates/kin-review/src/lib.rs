@@ -41,9 +41,10 @@ pub use ranked_impact::{
 };
 pub use ref_graph::GraphAtRef;
 pub use release_gate::{
-    entities_touched_by_change, passing_proof_coverage, security_findings,
-    source_bound_release_proof_coverage, source_bound_release_proof_coverage_for_entities,
-    unapproved_changes, SecurityFinding, SecurityFindingCounts, SecuritySeverity, UnapprovedChange,
+    entities_touched_by_change, passing_proof_coverage, passing_proof_coverage_with_provenance,
+    security_findings, source_bound_release_proof_coverage,
+    source_bound_release_proof_coverage_for_entities, unapproved_changes, CoverageProvenance,
+    SecurityFinding, SecurityFindingCounts, SecuritySeverity, UnapprovedChange,
 };
 pub use review::{Review, SemanticReview};
 pub use risk::assess_risk;
