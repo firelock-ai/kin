@@ -5733,16 +5733,11 @@ fn semloc_query_is_test_related(query: &str) -> bool {
 /// including the last dotted segment of a qualified name (e.g. query
 /// "constant.Raspbian" matches entity "Raspbian"). Tokens split on non-[a-z0-9_].
 fn semloc_query_has_exact_token(query: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let target = name.to_ascii_lowercase();
-    let last = target.rsplit('.').next().unwrap_or(&target).to_string();
-    query
-        .to_ascii_lowercase()
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|t| !t.is_empty())
-        .any(|tok| tok == target || tok == last)
+    // Delegated so the `match_evidence.name_match` this surface reports and the
+    // `match_kind` carried on every located entity are decided by ONE rule. Two
+    // copies of a predicate are two things to keep in step, and these two answer
+    // the same question about the same hit on the same response.
+    kin_cli::commands::locate::query_names_entity(query, name)
 }
 
 /// Re-rank PRIORITY for one cosine hit (LOWER = better rank). Pure: no graph.
@@ -10906,6 +10901,7 @@ mod tests {
             definition: true,
             span: None,
             body: None,
+            match_kind: None,
             provenance: LocateProvenance {
                 file: Some("src/lib.rs".into()),
                 origin: "vector".into(),
@@ -11025,6 +11021,7 @@ mod tests {
             definition: true,
             span: None,
             body: None,
+            match_kind: None,
             provenance: LocateProvenance {
                 file: Some("src/lib.rs".into()),
                 origin: String::new(),
@@ -11057,6 +11054,7 @@ mod tests {
             definition: true,
             span: Some([1, 2]),
             body: None,
+            match_kind: None,
             provenance: LocateProvenance {
                 file: Some("f.rs".into()),
                 origin: String::new(),

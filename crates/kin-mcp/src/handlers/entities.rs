@@ -109,7 +109,12 @@ model not cached, …), so a thin result set is attributable instead of silent. 
 the Kin daemon: retrieval runs against the daemon's live graph, so this tool returns an \
 error in offline/no-daemon mode. On an empty result the additive `negative` object's \
 `safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \
-yet embedded\".";
+yet embedded\". A NON-empty result needs the opposite check, because retrieval always \
+returns its best candidates: each hit carries `match_kind` (`name` when a query token is \
+that entity's name, else `semantic` or `text_fallback`), and the response carries \
+`all_fallback: true` when NOT ONE returned entity was named by the query. Asking for a \
+symbol that does not exist yields a full, confident-looking page with `all_fallback` set \
+— treat that as \"this symbol was not found\" rather than as the answer.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///

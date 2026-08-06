@@ -55,6 +55,18 @@ pub struct LocateResult {
     /// Total entities in the full ranking behind this paged view.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub total_ranked: usize,
+    /// True when entities were ranked and NOT ONE of them was named by the
+    /// query: every hit is a fallback.
+    ///
+    /// The one-field answer to "did this query find anything, or did retrieval
+    /// just return its best guesses". A caller asking for a symbol that exists
+    /// nowhere gets a full page either way, and this is the difference between
+    /// the two cases. Deliberately a fact about the whole page rather than a
+    /// relevance floor: a floor would need a threshold on a composite score
+    /// whose scale is not comparable across queries, so it would drop real
+    /// answers to hide wrong ones. This reports; the caller decides.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all_fallback: bool,
     pub files: Vec<LocateFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<LocateDebugInfo>,
@@ -223,6 +235,74 @@ fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
+/// `serde` skip predicate: omit a `bool` field when it is `false`.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// How a located entity relates to the query that surfaced it.
+///
+/// The distinction `kin search` already draws, on the surface agents actually
+/// read. A retrieval pipeline always returns its best candidates, so a query
+/// naming a symbol that exists nowhere still comes back with a full, confident
+/// page. Without this field the caller cannot tell that page from one where the
+/// query named a real symbol, because the scores look the same either way: they
+/// are composite ranks within a result set, not evidence that anything matched.
+///
+/// This never affects ranking or ordering. It is a statement about what the hit
+/// IS, computed from the same exact-token predicate the `semantic_locate`
+/// evidence object reports, so the two surfaces cannot drift apart.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateMatchKind {
+    /// A query token is this entity's name (or its last dotted segment). The
+    /// query asked for this symbol.
+    Name,
+    /// No query token named this entity; vector retrieval surfaced it from the
+    /// query's embedding. It is about the query, it is not the query.
+    Semantic,
+    /// No query token named this entity, and it came from the lexical/graph
+    /// pool. It shares content tokens with the query, not a name.
+    TextFallback,
+}
+
+/// Whether a query token IS this entity's name (or its last dotted segment).
+///
+/// The single definition of "the query named this symbol". `kin-daemon`'s
+/// `semantic_locate` evidence object calls this rather than keeping a second
+/// copy: one rule stated twice is one rule that can come to disagree with
+/// itself, and these two surfaces answer the same question about the same hit.
+pub fn query_names_entity(query: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let target = name.to_ascii_lowercase();
+    let last = target.rsplit('.').next().unwrap_or(&target).to_string();
+    query
+        .to_ascii_lowercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| !token.is_empty())
+        .any(|token| token == target || token == last)
+}
+
+/// Classify one located entity against the query.
+///
+/// Falls back on the resolution origin only when the name did not match, so a
+/// name hit that also came through the vector pool is still reported as a name
+/// hit. An unattributed origin (the common case, since origin is populated under
+/// `--explain`) reports `TextFallback`: the honest reading of "no name matched
+/// and this surface cannot say which pool answered" is the weaker claim, not the
+/// stronger one.
+fn classify_locate_match(query: &str, name: &str, origin: &str) -> LocateMatchKind {
+    if query_names_entity(query, name) {
+        LocateMatchKind::Name
+    } else if origin == "vector" {
+        LocateMatchKind::Semantic
+    } else {
+        LocateMatchKind::TextFallback
+    }
+}
+
 /// A single ranked graph ENTITY surfaced by `kin locate` — the graph-native unit
 /// of the result. Unlike [`LocateSymbol`] (a file-attributed symbol), a
 /// `LocateEntity` is self-describing and act-on-able: it carries the entity's
@@ -257,6 +337,11 @@ pub struct LocateEntity {
     /// for the remainder. `None` on a graph/blob miss (coordinates only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// How this entity relates to the query: did the query NAME it, or did
+    /// content/embedding retrieval answer instead. See [`LocateMatchKind`].
+    /// Absent only on a record produced by a daemon predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<LocateMatchKind>,
     /// Where this entity lives. The file is provenance, not the result.
     pub provenance: LocateProvenance,
     /// Under multi-query RRF fusion, the query variants that surfaced this entity
@@ -3830,7 +3915,13 @@ fn run_with_graph_capture_budgeted(
     // single globally-ranked entity list (file demoted to provenance). Reuses the
     // snippet projection's bounds; the daemon caches the full ranking and windows
     // one page. No-op unless the agent/JSON surface requested snippets.
-    build_entity_view(&mut result, &held_authority, &snippet_opts, source_scope)?;
+    build_entity_view(
+        &mut result,
+        &held_authority,
+        &snippet_opts,
+        source_scope,
+        text,
+    )?;
     Ok(result)
 }
 
@@ -15607,6 +15698,7 @@ pub fn build_entity_view(
     held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
     opts: &SnippetOptions,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    query: &str,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -15667,6 +15759,7 @@ pub fn build_entity_view(
                     definition: sym.definition,
                     span: sym.span,
                     body,
+                    match_kind: Some(classify_locate_match(query, &entity.name, &sym.origin)),
                     provenance: LocateProvenance {
                         file: file_origin,
                         origin: sym.origin.clone(),
@@ -15695,6 +15788,14 @@ pub fn build_entity_view(
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
     result.total_ranked = result.entities.len();
+    // Computed over the FULL ranking, before the daemon windows a page. A
+    // per-page verdict would call a query successful because page 1 happened to
+    // hold the one name hit, and a fallback because page 2 did not.
+    result.all_fallback = !result.entities.is_empty()
+        && !result
+            .entities
+            .iter()
+            .any(|entity| entity.match_kind == Some(LocateMatchKind::Name));
     Ok(())
 }
 
@@ -15929,12 +16030,22 @@ pub fn fuse_locate_results(
         }
     }
 
+    // Recomputed over the FUSED set rather than inherited from the primary
+    // variant. Each variant classified its own hits against its own text, so a
+    // symbol named by ANY variant is a name hit for the fan-out, and carrying
+    // the primary's verdict forward would report a successful fan-out as
+    // all-fallback whenever the primary phrasing happened to miss.
+    let all_fallback = !entities.is_empty()
+        && !entities
+            .iter()
+            .any(|entity| entity.match_kind == Some(LocateMatchKind::Name));
     let primary = results.into_iter().next().unwrap_or_default();
     LocateResult {
         entities,
         next_cursor: None,
         page: 0,
         total_ranked: 0,
+        all_fallback,
         files,
         debug: primary.debug,
         semantic_coverage: primary.semantic_coverage,
@@ -16486,6 +16597,7 @@ mod tests {
             definition,
             span: Some([10, 20]),
             body: Some(format!("fn {name}() {{ /* … */ }}")),
+            match_kind: None,
             provenance: LocateProvenance {
                 file: Some(format!("src/{name}.rs")),
                 origin: "vector".to_string(),
@@ -16700,6 +16812,7 @@ mod tests {
             definition: true,
             span: None,
             body: None,
+            match_kind: None,
             provenance: LocateProvenance {
                 file: Some(path.to_string()),
                 origin: String::new(),
@@ -17043,6 +17156,142 @@ mod tests {
         assert_eq!(first_ids, second_ids);
     }
 
+    /// The positive control: a query that NAMES a symbol classifies as a name
+    /// hit, whichever pool surfaced it.
+    #[test]
+    fn a_query_that_names_a_symbol_is_a_name_match() {
+        assert_eq!(
+            classify_locate_match(
+                "cross_encoder_model_cached",
+                "cross_encoder_model_cached",
+                ""
+            ),
+            LocateMatchKind::Name
+        );
+        // Case and surrounding prose do not change the verdict, and neither does
+        // the seed pool: a name hit that also came through the vector arm is
+        // still a name hit.
+        assert_eq!(
+            classify_locate_match(
+                "where is Cross_Encoder_Model_Cached decided?",
+                "cross_encoder_model_cached",
+                "vector"
+            ),
+            LocateMatchKind::Name
+        );
+        // A dotted name is named by its last segment, the same way the exact
+        // name boost reads it.
+        assert_eq!(
+            classify_locate_match("call parse_request", "http.parse_request", ""),
+            LocateMatchKind::Name
+        );
+    }
+
+    /// The negative control, which is the whole point of the field: a query for
+    /// a symbol that exists nowhere still returns the retriever's best
+    /// candidates, and every one of them must be flagged as a fallback.
+    #[test]
+    fn a_nonexistent_symbol_leaves_every_hit_flagged_as_fallback() {
+        let absent = "kin_absent_symbol_negative_control";
+        for (name, origin, expected) in [
+            ("candidate", "", LocateMatchKind::TextFallback),
+            ("query_trace_matches", "text", LocateMatchKind::TextFallback),
+            ("exact_name_match", "vector", LocateMatchKind::Semantic),
+        ] {
+            assert_eq!(
+                classify_locate_match(absent, name, origin),
+                expected,
+                "no token of {absent} names {name}"
+            );
+            assert_ne!(
+                classify_locate_match(absent, name, origin),
+                LocateMatchKind::Name
+            );
+        }
+    }
+
+    /// A shared substring is not a name. Without this the field would classify
+    /// nearly everything as a name hit and answer nothing.
+    #[test]
+    fn a_merely_related_word_is_not_a_name_match() {
+        assert_eq!(
+            classify_locate_match(
+                "Where does Kin decide whether to use the reranker?",
+                "decide_review_with_graph",
+                ""
+            ),
+            LocateMatchKind::TextFallback
+        );
+        assert!(!query_names_entity("encoder", "cross_encoder_model_cached"));
+        assert!(!query_names_entity("", "anything"));
+        assert!(!query_names_entity("anything", ""));
+    }
+
+    #[test]
+    fn all_fallback_is_a_verdict_on_the_whole_ranking() {
+        let with_kind = |name: &str, kind| {
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(kind);
+            entity
+        };
+        // One name hit anywhere in the ranking means the query found something.
+        let found = fuse_locate_results(
+            vec!["q0".to_string(), "q1".to_string()],
+            vec![
+                fusion_result(vec![with_kind("a", LocateMatchKind::TextFallback)]),
+                fusion_result(vec![with_kind("b", LocateMatchKind::Name)]),
+            ],
+            60.0,
+        );
+        assert!(
+            !found.all_fallback,
+            "a name hit surfaced by a non-primary variant still counts as found"
+        );
+
+        let missed = fuse_locate_results(
+            vec!["q0".to_string(), "q1".to_string()],
+            vec![
+                fusion_result(vec![with_kind("a", LocateMatchKind::TextFallback)]),
+                fusion_result(vec![with_kind("b", LocateMatchKind::Semantic)]),
+            ],
+            60.0,
+        );
+        assert!(
+            missed.all_fallback,
+            "a full page of fallbacks is exactly what the caller needs told"
+        );
+
+        // An empty result is not a fallback verdict: nothing was returned to
+        // mislabel, and reporting one would make "no results" and "wrong
+        // results" look alike.
+        let empty = fuse_locate_results(
+            vec!["q0".to_string(), "q1".to_string()],
+            vec![fusion_result(vec![]), fusion_result(vec![])],
+            60.0,
+        );
+        assert!(!empty.all_fallback);
+    }
+
+    #[test]
+    fn match_kind_serializes_under_the_search_surface_vocabulary() {
+        let mut entity = mk_locate_entity("a", 1.0, true);
+        entity.match_kind = Some(LocateMatchKind::TextFallback);
+        let json = serde_json::to_value(&entity).unwrap();
+        assert_eq!(json["match_kind"].as_str(), Some("text_fallback"));
+        entity.match_kind = Some(LocateMatchKind::Name);
+        assert_eq!(
+            serde_json::to_value(&entity).unwrap()["match_kind"].as_str(),
+            Some("name")
+        );
+        // Absent rather than null on a record that predates the field, so an
+        // older daemon's payload still deserializes.
+        entity.match_kind = None;
+        assert!(serde_json::to_value(&entity)
+            .unwrap()
+            .get("match_kind")
+            .is_none());
+    }
+
     #[test]
     fn build_entity_view_is_noop_when_snippets_disabled() {
         let graph = kin_db::InMemoryGraph::new();
@@ -17066,6 +17315,7 @@ mod tests {
             &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
             &SnippetOptions::default(),
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "query",
         )
         .unwrap();
         assert!(
