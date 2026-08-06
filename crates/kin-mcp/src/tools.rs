@@ -1075,6 +1075,10 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "semantic_locate",
         "semantic_search",
         "get_context_pack",
+        // The flagship question a Kin agent is asked is "what breaks if I change
+        // this". Its named tool belongs in the profile every configured agent
+        // receives; without it the CLI can answer what the agent cannot.
+        "impact_analysis",
         // A profile carrying the transaction write surface must carry a direct
         // entity-body read. Staging a body update means restating the entity's
         // current source, so an agent without a body read can only guess it --
@@ -1277,7 +1281,7 @@ mod tests {
         let profile = agent_default_tool_names();
 
         assert!(
-            profile.len() >= 10 && profile.len() <= 18,
+            profile.len() >= 10 && profile.len() <= 19,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
@@ -1306,6 +1310,10 @@ mod tests {
             "kin_session_heartbeat",
             // The only clean exit from a transaction the agent decided against.
             "kin_transaction_abort",
+            // The flagship question. A configured agent that cannot ask what a
+            // change affects cannot do the thing Kin is described as doing, and
+            // the CLI answering it is no help to the agent surface.
+            "impact_analysis",
         ] {
             assert!(
                 profile.contains(&required),
