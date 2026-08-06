@@ -63,9 +63,65 @@ Kin is one system with a few clear public surfaces:
 | **[Kin MCP](docs/mcp-tools.md)** | Typed graph tools for AI agents, bundled into `kin` and launched with `kin mcp start`. |
 | **[KinLab](https://kinlab.ai)** | Hosted collaboration and control plane. Public repository connection is not a first-run flow yet. |
 
-Supporting repositories provide graph storage, retrieval, embeddings, blobs,
-language enrichment, and reproducible proof. They are implementation layers,
-not separate products a new user needs to assemble.
+## How the pieces fit
+
+Kin is the semantic system of record for AI-written software, and everything in
+the map below either reaches that authority or supports it. Humans and AI agents
+come in through the CLI, the bundled MCP server, or the VS Code extension. All
+three ask the same daemon, and the daemon answers from graph authority rather
+than by re-reading the tree. `kin-vfs` projects that same graph back through
+ordinary filesystem calls, so editors, compilers, and build systems keep seeing
+files. Git sits beside the graph as an import and export boundary rather than as
+an answer path, and KinLab is the hosted layer over the same authority.
+
+```mermaid
+flowchart TD
+    people["Humans and AI agents"]
+
+    subgraph surfaces["Access surfaces"]
+        cli["kin CLI"]
+        mcp["Kin MCP server"]
+        editor["kin-editor for VS Code"]
+    end
+
+    daemon["kin daemon"]
+    authority["Graph authority<br/>entities, relations, changes, provenance"]
+    db["kin-db<br/>graph storage, snapshots,<br/>index, text and vector search"]
+    prims["kin-model, kin-blobs, kin-search,<br/>kin-vector, kin-infer, kin-lsp"]
+    vfs["kin-vfs<br/>transparent file projection"]
+    tools["Editors, compilers, build systems"]
+    git["Git<br/>import and export boundary"]
+    kinlab["KinLab<br/>hosted collaboration and control plane"]
+
+    people --> cli
+    people --> mcp
+    people --> editor
+    cli --> daemon
+    mcp --> daemon
+    editor --> daemon
+    daemon --> authority
+    authority --> db
+    db --> prims
+    authority <-->|"kin init imports, kin git export"| git
+    authority -->|"publish and sync"| kinlab
+    authority --> vfs
+    vfs --> tools
+```
+
+Underneath those surfaces are the layers the system is built from:
+
+| Layer | Role |
+| --- | --- |
+| **[kin-db](https://github.com/firelock-ai/kin-db)** | Graph storage, snapshots, indexing, text search, and vector search. |
+| **[kin-model](https://github.com/firelock-ai/kin-model)** | Canonical types and domain models shared across the stack. |
+| **[kin-blobs](https://github.com/firelock-ai/kin-blobs)** | Content-addressable blob storage. |
+| **[kin-search](https://github.com/firelock-ai/kin-search)** | Lexical search primitives and staged retrieval. |
+| **[kin-vector](https://github.com/firelock-ai/kin-vector)** | Vector and nearest-neighbor substrate. |
+| **[kin-infer](https://github.com/firelock-ai/kin-infer)** | Inference and embedding substrate. |
+| **[kin-lsp](https://github.com/firelock-ai/kin-lsp)** | Language-server enrichment feeding the semantic layer. |
+
+These are implementation layers of one system, not separate products a new user
+needs to assemble. None of them is installed separately.
 
 ## Open source and the Kin ecosystem
 
