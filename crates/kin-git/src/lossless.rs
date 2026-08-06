@@ -2213,6 +2213,27 @@ mod tests {
         ));
     }
 
+    /// `actions/checkout` clones at depth 1 by default, so this refusal is the
+    /// first thing Kin says to anyone trying it inside GitHub Actions. Stating
+    /// the property that was violated without stating the one command that fixes
+    /// it leaves that user with nothing to do.
+    #[test]
+    fn the_shallow_refusal_names_its_recovery_command() {
+        let message = GitError::ShallowRepository.to_string();
+        assert!(
+            message.contains("shallow Git repositories cannot be imported losslessly"),
+            "the reason for the refusal is unchanged: {message}"
+        );
+        assert!(
+            message.contains("git fetch --unshallow"),
+            "must name the recovery command: {message}"
+        );
+        assert!(
+            message.contains("fetch-depth: 0"),
+            "must name the CI form of the same fix: {message}"
+        );
+    }
+
     #[test]
     fn sha256_capture_is_exact_but_rehydration_fails_before_creating_output() {
         let root = tempdir().unwrap();
