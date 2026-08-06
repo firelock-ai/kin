@@ -22,9 +22,9 @@ use kin_model::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::info;
 #[cfg(unix)]
 use tracing::warn;
+use tracing::{info, info_span};
 
 use crate::config::KinConfig;
 use crate::error::{KinError, Result};
@@ -269,13 +269,16 @@ impl PreparedRepositoryInit {
                 Ok(bootstrap)
             }
             slot @ None => {
-                validate_bootstrap_transaction(
-                    transaction,
-                    repository_id,
-                    workspace_id,
-                    default_ref,
-                    initial_roots,
-                )?;
+                {
+                    let _span = info_span!("kin.init.commit.validate_bootstrap").entered();
+                    validate_bootstrap_transaction(
+                        transaction,
+                        repository_id,
+                        workspace_id,
+                        default_ref,
+                        initial_roots,
+                    )?;
+                }
                 let bootstrap = commit_bootstrap_transaction(
                     authority,
                     transaction,
@@ -1359,17 +1362,38 @@ fn commit_bootstrap_transaction<B>(
 where
     B: StorageBackend + 'static,
 {
-    let receipt = authority
-        .commit_repository_transaction(transaction.clone())
-        .map_err(graph_error)?;
-    let workspace = authority
-        .workspace_snapshot_binding(repository_id, &workspace_id)
-        .map_err(graph_error)?
-        .ok_or_else(|| {
-            KinError::Graph(format!(
-                "repository authority committed without workspace {workspace_id}"
-            ))
-        })?;
+    // The clone is measured separately from the commit it feeds. A bootstrap
+    // transaction carries every reachable external object and every change in
+    // history, so on a real repository this copies tens of thousands of records
+    // to satisfy an owned-parameter API, and the caller drops the original
+    // immediately afterwards. Whether that is worth removing is a measurement,
+    // not a guess, so it gets its own span rather than hiding inside the commit.
+    let owned_transaction = {
+        let _span = info_span!(
+            "kin.init.commit.clone_transaction",
+            external_objects = transaction.external_objects.len(),
+            changes = transaction.changes.len()
+        )
+        .entered();
+        transaction.clone()
+    };
+    let receipt = {
+        let _span = info_span!("kin.init.commit.authority_commit").entered();
+        authority
+            .commit_repository_transaction(owned_transaction)
+            .map_err(graph_error)?
+    };
+    let workspace = {
+        let _span = info_span!("kin.init.commit.workspace_binding").entered();
+        authority
+            .workspace_snapshot_binding(repository_id, &workspace_id)
+            .map_err(graph_error)?
+            .ok_or_else(|| {
+                KinError::Graph(format!(
+                    "repository authority committed without workspace {workspace_id}"
+                ))
+            })?
+    };
     if workspace.roots != receipt.roots_after {
         return Err(KinError::Graph(
             "repository bootstrap workspace is not bound to the committed roots".to_string(),
@@ -1379,6 +1403,7 @@ where
         .validate()
         .map_err(|error| KinError::Other(error.to_string()))?;
     let semantic_enrichment = {
+        let _span = info_span!("kin.init.commit.enrichment_summary").entered();
         let lease = authority.read_authority();
         if lease.roots() != &receipt.roots_after {
             return Err(KinError::Graph(
