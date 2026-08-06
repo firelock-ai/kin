@@ -57,6 +57,8 @@ ABANDONED_TAGS = ROOT / "scripts" / "abandoned-release-tags.json"
 TAG_SELECTOR = ROOT / "scripts" / "select-admissible-release-tag.py"
 ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
 TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
+ASSERTION_REACHABILITY = ROOT / "scripts" / "test-assertion-reachability.py"
+ASSERTION_REACHABILITY_POLICY = "scripts/test-assertion-reachability.py"
 TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
 TAG_LISTING_FORMAT = (
     "--format='%(refname:strip=2) "
@@ -3122,6 +3124,40 @@ def real_check_job_authority_source(job: str) -> str:
         if len(line) - len(line.lstrip()) == 2
     )
     return "\n".join(authority)
+
+
+def assert_assertion_reachability_gate_wired(workflow: str) -> None:
+    """Keep the gate that proves this suite's own checks are reachable.
+
+    This suite cannot notice that one of its assertions stopped being called;
+    that is how `assert_windows_public_support_contract` sat defined and
+    unreferenced after a stale-base merge removed its call site. A separate
+    gate answers that question, and this assertion is the other half of the
+    pair: the reachability gate reports an orphaned check in this file, and
+    this check reports a reachability gate that CI no longer runs. Removing
+    either one turns the other red, so neither can be lost quietly.
+    """
+
+    # Match the invocation exactly rather than searching for the path. A
+    # substring search accepts `run: # python3 <path>`, which leaves the path
+    # in a line that does not itself start with `#` while running nothing.
+    # active_lines() is the wrong tool here for a second reason: it strips
+    # `/* */` for the shell and JavaScript it is normally handed, and ci.yml
+    # holds a bare `docs/*` glob and a later `**/Cargo.lock` that the pattern
+    # spans as one 24KB comment, taking most of the check job with it.
+    command = f"python3 {ASSERTION_REACHABILITY_POLICY}"
+    invocations = {command, f"run: {command}"}
+    if not any(line.strip() in invocations for line in workflow.splitlines()):
+        raise AssertionError(
+            "ci.yml must run "
+            f"{ASSERTION_REACHABILITY_POLICY}; without it an assertion can lose "
+            "its call site and keep reporting green"
+        )
+    if not ASSERTION_REACHABILITY.is_file():
+        raise AssertionError(
+            f"{ASSERTION_REACHABILITY_POLICY} is missing; the release gates "
+            "would no longer prove their own checks run"
+        )
 
 
 def assert_check_consumer_authority(workflow: str) -> None:
@@ -9041,6 +9077,34 @@ def main() -> None:
     classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(ci_workflow)
+    assert_assertion_reachability_gate_wired(ci_workflow)
+    expect_assertion(
+        "ci.yml drops the step that proves every assertion still runs",
+        "ci.yml must run",
+        lambda: assert_assertion_reachability_gate_wired(
+            ci_workflow.replace(ASSERTION_REACHABILITY_POLICY, "scripts/absent.py")
+        ),
+    )
+    expect_assertion(
+        "the reachability gate survives only as a commented-out ci.yml step",
+        "ci.yml must run",
+        lambda: assert_assertion_reachability_gate_wired(
+            ci_workflow.replace(
+                f"run: python3 {ASSERTION_REACHABILITY_POLICY}",
+                f"# run: python3 {ASSERTION_REACHABILITY_POLICY}",
+            )
+        ),
+    )
+    expect_assertion(
+        "the reachability step keeps its path but comments out the command",
+        "ci.yml must run",
+        lambda: assert_assertion_reachability_gate_wired(
+            ci_workflow.replace(
+                f"run: python3 {ASSERTION_REACHABILITY_POLICY}",
+                f"run: # python3 {ASSERTION_REACHABILITY_POLICY}",
+            )
+        ),
+    )
     assert_check_consumer_authority(ci_workflow)
     consumer_blocks = workflow_job_blocks(ci_workflow)
     docs_only_check = consumer_blocks["check-docs-only"]

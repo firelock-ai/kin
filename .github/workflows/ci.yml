@@ -776,6 +776,18 @@ jobs:
       - name: Validate installer checksum fixtures
         run: python3 scripts/test-install-checksum.py
 
+      # A gate whose assertion lost its call site still exits 0, so passing the
+      # suites this polices proves nothing until this step confirms every check
+      # in them is still reachable and still runs on pull requests. Ordering is
+      # not what makes that true and is not claimed: this step precedes the
+      # other two within this job, but test-release-workflow-authority.py also
+      # runs in the npm-launchers job, which shares no dependency with this one,
+      # so the two are unordered. Either way a red gate reds the pull request.
+      # scripts/test-release-workflow-authority.py asserts this step exists, so
+      # the pair cannot be half-removed.
+      - name: Validate that every release gate assertion still runs
+        run: python3 scripts/test-assertion-reachability.py
+
       - name: Validate mandatory Homebrew release outcome gate
         run: python3 scripts/test-homebrew-release-gate.py
 
