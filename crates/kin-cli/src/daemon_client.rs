@@ -2684,6 +2684,51 @@ fn wait_until_retirable(
     }
 }
 
+/// Attempt retirement, retrying while the only thing standing in the way is a
+/// lock a dead daemon has not finished releasing.
+///
+/// Waiting for the process to be affirmatively dead is NOT enough, and assuming
+/// it was is what left this half of the defect in place. Process death and
+/// handle release are two events: on Windows the exited daemon's `daemon.lock`
+/// handle outlives the moment `GetExitCodeProcess` reports it gone, so the
+/// non-blocking `try_lock_exclusive` still reports contention and retirement is
+/// refused for good. Observed in CI as a stop that correctly waited, correctly
+/// judged the owner dead, and then preserved the endpoint anyway with
+/// "the repository daemon singleton is still held by a current or legacy owner".
+///
+/// Only the two LOCK outcomes retry. `Changed` must not: a successor published
+/// its own endpoint, retrying would race a live daemon's record, and preserving
+/// it is the correct answer rather than a delay. `CoordinationUnavailable` must
+/// not either, since it reports a real IO failure rather than contention.
+///
+/// Returns `None` when the endpoint is gone, or the reason it survived.
+fn retire_within_budget(kin_root: &Path, budget: Duration) -> Option<String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        // Re-snapshot each attempt. The comparison inside retirement is against
+        // the endpoint as it is NOW, and a record that changed between attempts
+        // must be judged as the successor it is rather than against a stale read.
+        let judged = daemon_endpoint_snapshot(kin_root);
+        let outcome = retire_daemon_endpoint_if_unchanged(kin_root, judged);
+        let retryable = matches!(
+            outcome,
+            DaemonEndpointRetirement::LifecycleContended | DaemonEndpointRetirement::SingletonHeld
+        );
+        match outcome {
+            DaemonEndpointRetirement::Retired => return None,
+            preserved => {
+                let now = Instant::now();
+                if !retryable || now >= deadline {
+                    return Some(preserved.preserved_reason());
+                }
+                std::thread::sleep(
+                    ENDPOINT_TEARDOWN_POLL_INTERVAL.min(deadline.saturating_duration_since(now)),
+                );
+            }
+        }
+    }
+}
+
 /// The probe is injectable because the two arms that matter here are decisions,
 /// not observations: whether the wait actually retries, and whether a refused
 /// cleanup is reported. Both are invisible to a test that can only run against
@@ -2706,12 +2751,7 @@ fn retire_daemon_endpoint_with_probe(
 
     let recorded = daemon_endpoint_snapshot(kin_root);
     let preserved_reason = match recorded.pid {
-        Some(pid) if retirable(kin_root, pid) => {
-            match retire_daemon_endpoint_if_unchanged(kin_root, recorded) {
-                DaemonEndpointRetirement::Retired => None,
-                preserved => Some(preserved.preserved_reason()),
-            }
-        }
+        Some(pid) if retirable(kin_root, pid) => retire_within_budget(kin_root, teardown_budget),
         Some(pid) => {
             warn!(
                 pid,
@@ -2722,12 +2762,7 @@ fn retire_daemon_endpoint_with_probe(
                 "recorded owner pid {pid} never became affirmatively dead"
             ))
         }
-        None if !recorded.pid_exists => {
-            match retire_daemon_endpoint_if_unchanged(kin_root, recorded) {
-                DaemonEndpointRetirement::Retired => None,
-                preserved => Some(preserved.preserved_reason()),
-            }
-        }
+        None if !recorded.pid_exists => retire_within_budget(kin_root, teardown_budget),
         None => {
             warn!(
                 repo = %kin_root.display(),
@@ -8851,6 +8886,81 @@ mod tests {
             "the daemon that published this endpoint is gone, so the stop succeeded"
         );
         assert!(!root.join("daemon.pid").exists());
+    }
+
+    /// A lock a DEAD daemon has not finished releasing must not decide the
+    /// endpoint's fate.
+    ///
+    /// This is the half the first fix missed, and the miss was an assumption
+    /// rather than an oversight: waiting for affirmative death was treated as
+    /// also waiting out the dead process's locks. It is not. CI caught it on
+    /// Windows with the endpoint preserved because "the repository daemon
+    /// singleton is still held by a current or legacy owner" AFTER the owner was
+    /// confirmed dead.
+    ///
+    /// Holds `daemon.lock` for real and releases it partway through the budget,
+    /// which is the actual contention rather than a simulation of it.
+    #[test]
+    fn a_singleton_still_held_by_a_dead_owner_is_waited_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_endpoint_files(&root, 4242, 51000);
+
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        singleton.try_lock_exclusive().expect("take the singleton");
+
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = fs2::FileExt::unlock(&singleton);
+        });
+
+        let cleanup = retire_daemon_endpoint_with_probe(&root, Duration::from_secs(5), |_, _| true);
+        holder.join().unwrap();
+
+        assert_eq!(
+            cleanup,
+            DaemonEndpointCleanup::Retired,
+            "a lock the dead owner had not yet released must be waited out, not reported"
+        );
+        assert!(!root.join("daemon.pid").exists());
+    }
+
+    /// The falsification of the test above: the SAME contention with no budget
+    /// to wait in still reports the survivor. Without this, "retired" would say
+    /// nothing about whether the retry did any work.
+    #[test]
+    fn a_held_singleton_with_no_budget_still_reports_the_survivor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_endpoint_files(root, 4242, 51000);
+
+        let singleton = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("daemon.lock"))
+            .unwrap();
+        singleton.try_lock_exclusive().expect("take the singleton");
+
+        let cleanup = retire_daemon_endpoint_with_probe(root, Duration::ZERO, |_, _| true);
+
+        let preserved = cleanup
+            .preserved()
+            .expect("contention that outlives the budget is still reported");
+        assert!(
+            preserved.reason().contains("singleton"),
+            "the reason must name what actually blocked it: {}",
+            preserved.reason()
+        );
+        assert!(root.join("daemon.pid").exists());
+        let _ = fs2::FileExt::unlock(&singleton);
     }
 
     #[test]
