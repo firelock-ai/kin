@@ -58,16 +58,25 @@ pub fn handle_verify_entity<G: GraphStore>(
 }
 
 pub const COVERAGE_SUMMARY_DESC: &str = "\
-Get repo-wide test coverage at a glance: total entities, how many are covered, the \
-coverage ratio, and the list of entities still missing test proof. Reach for it to \
-assess current test health or find what's untested. Verification runs are not yet \
-bound to immutable source changes, so this advisory live view does not authorize a release. It's \
-the whole-repo counterpart to kin_verify_entity (one entity) and underlies \
-kin_release_check's proof requirement.";
+Get repo-wide proof coverage at a glance: total entities, how many carry a passing \
+verification run, the coverage ratio, and the list of entities still missing proof. \
+Reach for it to assess recorded test health or find what's unproven. Verification runs \
+are not yet bound to immutable source changes, so this advisory live view does not \
+authorize a release. It's the whole-repo counterpart to kin_verify_entity (one entity) \
+and underlies kin_release_check's proof requirement. \
+Read `coverage_trust` BEFORE treating a low or zero number as a fact about the \
+repository: this tool counts RECORDED VERIFICATION RUNS, never the repository's test \
+files, so a graph with no runs reports zero coverage while the code may be thoroughly \
+tested. `safe_to_conclude_uncovered` is false in exactly that case, which is the normal \
+state of a freshly-initialised repo. `population` names what `total_entities` counts — \
+the current-generation entity map, which is NOT the set retrieval ranks over, so it is \
+the wrong denominator for a completeness claim about everything semantic_locate can \
+return.";
 
 pub fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResult> {
-    let coverage = kin_review::passing_proof_coverage(store)
+    let (coverage, provenance) = kin_review::passing_proof_coverage_with_provenance(store)
         .map_err(|error| McpError::Review(error.to_string()))?;
+    let (safe_to_conclude_uncovered, reason) = provenance.coverage_trust();
 
     let result = serde_json::json!({
         "total_entities": coverage.total_entities,
@@ -75,6 +84,25 @@ pub fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResul
         "coverage_ratio": coverage.coverage_ratio,
         "missing_proof_count": coverage.missing_proof.len(),
         "missing_proof": coverage.missing_proof,
+        // What the coverage number was derived from. A zero with
+        // runs_observed == 0 counted nothing; it is not a finding about the
+        // repository, and the sibling retrieval tools already set this bar with
+        // their `negative.safe_to_conclude_absent` contract.
+        "coverage_trust": {
+            "safe_to_conclude_uncovered": safe_to_conclude_uncovered,
+            "reason": reason,
+            "trust": if safe_to_conclude_uncovered { "recorded" } else { "inconclusive" },
+            "runs_observed": provenance.runs_observed,
+            "entities_with_any_run": provenance.entities_with_any_run,
+            "counts": "recorded verification runs, never the repository's test files",
+        },
+        // What the denominator is. total_entities is the live current-generation
+        // entity map; retrieval ranks over the vector index, a separate
+        // structure that can retain entities this map no longer holds.
+        "population": {
+            "total_entities_counts": "current_generation_entities",
+            "note": "total_entities is the graph's live entity map. Retrieval (semantic_locate) ranks over the vector index, which is a separate structure and may contain entities absent from this map, so this is not the denominator for 'everything locate can return'.",
+        },
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;

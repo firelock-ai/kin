@@ -93,22 +93,88 @@ pub fn unapproved_changes<G: GraphStore>(
     Ok(unapproved)
 }
 
+/// What the coverage numbers were derived from, so a caller can tell a measured
+/// zero from a structural one.
+///
+/// `covered_entities: 0` has two entirely different meanings and the number
+/// alone cannot distinguish them: "runs exist and none of them prove anything"
+/// versus "no verification run has ever been recorded, so there was nothing to
+/// count". The second is the state of every freshly-initialised repository, and
+/// reported bare it reads as the confident claim *this code is untested* — a
+/// fact about the repository that this computation cannot know, because it
+/// never looks at the repository's tests, only at recorded run linkage.
+///
+/// `runs_observed` is the discriminator, and it is free: the coverage loop
+/// already fetches each entity's runs and currently discards everything except
+/// the `Passing` predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageProvenance {
+    /// Verification runs seen across all entities, in any status.
+    pub runs_observed: usize,
+    /// Entities linked to at least one run, in any status.
+    pub entities_with_any_run: usize,
+}
+
+impl CoverageProvenance {
+    /// Whether a zero (or low) coverage number may be read as a statement about
+    /// the repository, with the machine-stable reason naming which gate ruled.
+    ///
+    /// Mirrors the confidence-qualified-negative contract the retrieval tools
+    /// already carry: an absence is only authoritative when the substrate that
+    /// would have supplied evidence was actually populated.
+    pub fn coverage_trust(&self) -> (bool, &'static str) {
+        if self.runs_observed == 0 {
+            return (
+                false,
+                "no_runs_recorded: no verification run of any status exists in this graph, so the coverage number counts nothing and says nothing about whether the code is tested",
+            );
+        }
+        (
+            true,
+            "runs_recorded: verification runs exist in this graph, so the coverage number reflects recorded proof linkage",
+        )
+    }
+}
+
 /// Compute current, advisory proof coverage for a graph.
 ///
 /// Structural `Test -> Covers -> Entity` links describe intended coverage,
 /// but do not prove that a test ran or passed. Release proof therefore counts
 /// an entity only when at least one persisted `VerificationRun` linked through
 /// `run_proves_entity` has status `Passing`.
+///
+/// The population is the graph's **current-generation** entity map
+/// (`list_all_entities`), which is not the same set retrieval ranks over: the
+/// vector index is a separate structure and can retain entities this map no
+/// longer holds. A caller reasoning about repository completeness from
+/// `total_entities` is reasoning about the live map, and the surface says so.
 pub fn passing_proof_coverage<G: GraphStore>(store: &G) -> Result<CoverageSummary, ReviewError> {
+    Ok(passing_proof_coverage_with_provenance(store)?.0)
+}
+
+/// [`passing_proof_coverage`] plus the evidence needed to qualify it.
+///
+/// Prefer this at any surface that shows the number to a human or an agent;
+/// the bare form remains for callers that already know runs exist.
+pub fn passing_proof_coverage_with_provenance<G: GraphStore>(
+    store: &G,
+) -> Result<(CoverageSummary, CoverageProvenance), ReviewError> {
     let mut entities = store.list_all_entities().map_err(ReviewError::graph)?;
     entities.sort_by_key(|entity| entity.id.to_string());
 
     let mut covered_entities = 0_usize;
     let mut missing_proof = Vec::new();
+    let mut runs_observed = 0_usize;
+    let mut entities_with_any_run = 0_usize;
     for entity in &entities {
-        let has_passing_run = store
+        let runs = store
             .list_runs_proving_entity(&entity.id)
-            .map_err(ReviewError::graph)?
+            .map_err(ReviewError::graph)?;
+        runs_observed += runs.len();
+        if !runs.is_empty() {
+            entities_with_any_run += 1;
+        }
+        let has_passing_run = runs
             .iter()
             .any(|run| run.status == VerificationStatus::Passing);
         if has_passing_run {
@@ -124,12 +190,18 @@ pub fn passing_proof_coverage<G: GraphStore>(store: &G) -> Result<CoverageSummar
     } else {
         covered_entities as f64 / total_entities as f64
     };
-    Ok(CoverageSummary {
-        total_entities,
-        covered_entities,
-        coverage_ratio,
-        missing_proof,
-    })
+    Ok((
+        CoverageSummary {
+            total_entities,
+            covered_entities,
+            coverage_ratio,
+            missing_proof,
+        },
+        CoverageProvenance {
+            runs_observed,
+            entities_with_any_run,
+        },
+    ))
 }
 
 /// Compute proof coverage admissible for an immutable release source.
@@ -422,6 +494,139 @@ mod tests {
     use kin_model::provenance::{Actor, ActorId, Approval, ApprovalId};
     use kin_model::relation::{Relation, RelationOrigin};
     use kin_model::timestamp::Timestamp;
+
+    /// Record a verification run and link it as proving `entity_id`.
+    fn record_run(
+        store: &InMemoryGraph,
+        entity_id: &EntityId,
+        status: VerificationStatus,
+    ) -> kin_model::verification::VerificationRunId {
+        let run = kin_model::verification::VerificationRun {
+            run_id: kin_model::verification::VerificationRunId(Hash256::from_bytes([7; 32])),
+            test_ids: vec![],
+            status,
+            runner: kin_model::verification::TestRunner::Cargo,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            duration_ms: None,
+            evidence_blob: None,
+            exit_code: None,
+        };
+        store
+            .create_verification_run(&run)
+            .expect("in-memory store must record a verification run");
+        store
+            .link_run_proves_entity(&run.run_id, entity_id)
+            .expect("in-memory store must link a run to an entity");
+        run.run_id
+    }
+
+    /// A graph with NO verification runs reports zero coverage, and says so.
+    ///
+    /// This is the state of every freshly-initialised repository. The number is
+    /// internally correct as "no recorded linkage" and completely wrong as the
+    /// claim "this code is untested", which is how a bare zero reads. The
+    /// provenance must mark it inconclusive so a caller cannot make that leap.
+    #[test]
+    fn zero_coverage_without_any_run_is_inconclusive() {
+        let store = InMemoryGraph::new();
+        let entity = entity("undertested", EntityKind::Function, Visibility::Public);
+        store.upsert_entity(&entity).expect("upsert");
+
+        let (coverage, provenance) =
+            passing_proof_coverage_with_provenance(&store).expect("coverage must compute");
+
+        assert_eq!(coverage.total_entities, 1);
+        assert_eq!(coverage.covered_entities, 0);
+        assert_eq!(provenance.runs_observed, 0);
+        assert_eq!(provenance.entities_with_any_run, 0);
+
+        let (safe, reason) = provenance.coverage_trust();
+        assert!(
+            !safe,
+            "a zero derived from no recorded runs must NOT be safe to read as 'uncovered'"
+        );
+        assert!(
+            reason.starts_with("no_runs_recorded:"),
+            "the reason must name the gate that ruled, got: {reason}"
+        );
+    }
+
+    /// A graph WITH a passing run reports coverage plainly and authoritatively.
+    ///
+    /// The other half of the two-sided test: the envelope must not be a blanket
+    /// disclaimer that fires always. When runs exist, the number means what it
+    /// says and `safe_to_conclude_uncovered` flips to true.
+    #[test]
+    fn coverage_with_recorded_runs_is_authoritative() {
+        let store = InMemoryGraph::new();
+        let covered = entity("covered", EntityKind::Function, Visibility::Public);
+        let bare = entity("bare", EntityKind::Function, Visibility::Public);
+        store.upsert_entity(&covered).expect("upsert");
+        store.upsert_entity(&bare).expect("upsert");
+        record_run(&store, &covered.id, VerificationStatus::Passing);
+
+        let (coverage, provenance) =
+            passing_proof_coverage_with_provenance(&store).expect("coverage must compute");
+
+        assert_eq!(coverage.total_entities, 2);
+        assert_eq!(coverage.covered_entities, 1);
+        assert_eq!(coverage.missing_proof, vec![bare.id]);
+        assert!(provenance.runs_observed >= 1);
+        assert_eq!(provenance.entities_with_any_run, 1);
+
+        let (safe, reason) = provenance.coverage_trust();
+        assert!(
+            safe,
+            "with runs recorded, the coverage number IS a statement about recorded proof"
+        );
+        assert!(
+            reason.starts_with("runs_recorded:"),
+            "the reason must name the gate that ruled, got: {reason}"
+        );
+    }
+
+    /// A run that exists but did NOT pass still makes the number meaningful.
+    ///
+    /// The discriminator is "was there anything to count", not "did anything
+    /// pass". A failing run is real evidence that verification ran, so a zero
+    /// alongside it is a genuine finding rather than an empty substrate.
+    #[test]
+    fn failing_run_still_makes_zero_coverage_conclusive() {
+        let store = InMemoryGraph::new();
+        let entity = entity("tried", EntityKind::Function, Visibility::Public);
+        store.upsert_entity(&entity).expect("upsert");
+        record_run(&store, &entity.id, VerificationStatus::Failing);
+
+        let (coverage, provenance) =
+            passing_proof_coverage_with_provenance(&store).expect("coverage must compute");
+
+        assert_eq!(coverage.covered_entities, 0, "a failing run proves nothing");
+        assert_eq!(
+            provenance.runs_observed, 1,
+            "but it IS a run, so the substrate is not empty"
+        );
+        let (safe, _) = provenance.coverage_trust();
+        assert!(
+            safe,
+            "zero-with-a-failing-run is a real finding, not an unpopulated substrate"
+        );
+    }
+
+    /// The bare wrapper must stay byte-identical to the provenance-carrying form.
+    #[test]
+    fn bare_wrapper_matches_provenance_form() {
+        let store = InMemoryGraph::new();
+        let entity = entity("same", EntityKind::Function, Visibility::Public);
+        store.upsert_entity(&entity).expect("upsert");
+        record_run(&store, &entity.id, VerificationStatus::Passing);
+
+        let bare = passing_proof_coverage(&store).expect("coverage");
+        let (paired, _) = passing_proof_coverage_with_provenance(&store).expect("coverage");
+        assert_eq!(bare.total_entities, paired.total_entities);
+        assert_eq!(bare.covered_entities, paired.covered_entities);
+        assert_eq!(bare.missing_proof, paired.missing_proof);
+    }
 
     fn entity(name: &str, kind: EntityKind, visibility: Visibility) -> Entity {
         Entity {
