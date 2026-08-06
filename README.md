@@ -121,7 +121,7 @@ Underneath those surfaces are the layers the system is built from:
 | **[kin-lsp](https://github.com/firelock-ai/kin-lsp)** | Language-server enrichment feeding the semantic layer. |
 
 These are implementation layers of one system, not separate products a new user
-needs to assemble. The install path below is the only one a user runs.
+needs to assemble. None of them is installed separately.
 
 ## Open source and the Kin ecosystem
 
