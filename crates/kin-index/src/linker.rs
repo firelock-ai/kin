@@ -344,7 +344,7 @@ fn link_cross_file_against_entities_internal(
             .par_iter()
             .map(|file| {
                 let relations = resolve_one_file(file, &ctx, completeness);
-                if total_files > 50 {
+                if shows_progress_bar(total_files) {
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     let total =
                         found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
@@ -366,7 +366,7 @@ fn link_cross_file_against_entities_internal(
 
     let resolved = merge_resolved(per_file_relations, files, &ctx, artifact_ids, completeness);
 
-    if total_files > 0 {
+    if shows_progress_bar(total_files) {
         eprintln!(); // newline after \r progress
     }
     debug!(resolved = resolved.len(), "cross-file linking complete");
@@ -3898,6 +3898,24 @@ fn resolve_default_export_incremental(
     first_in_file
 }
 
+/// Files below which the cross-file linker prints no progress bar.
+///
+/// The bar and the newline that terminates it must be gated on the SAME
+/// condition. They were not: the bar was gated on this threshold while its
+/// terminator fired on any non-zero file count, so every link pass under the
+/// threshold emitted one bare newline and nothing else. The linker runs once per commit
+/// during admission, so a 929-commit repository with 37 entity-source files
+/// printed 927 blank lines as its entire progress output, measured with `xxd`
+/// as 0x0a and nothing more. Routing both decisions through one predicate is
+/// what stops the two from drifting apart again.
+const PROGRESS_BAR_MIN_FILES: usize = 50;
+
+/// Whether this link pass prints a progress bar, and therefore whether it has a
+/// line to terminate.
+fn shows_progress_bar(total_files: usize) -> bool {
+    total_files > PROGRESS_BAR_MIN_FILES
+}
+
 /// Resolve cross-file relations using the incrementally updated linker state.
 pub fn link_cross_file_incremental(
     files: &[FileParseData],
@@ -3960,7 +3978,7 @@ fn link_cross_file_incremental_internal(
                 &class_bases,
                 completeness,
             );
-            if total_files > 50 {
+            if shows_progress_bar(total_files) {
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let total = found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
                 if done.is_multiple_of(progress_interval) || done == total_files {
@@ -3977,7 +3995,7 @@ fn link_cross_file_incremental_internal(
             relations
         })
         .collect();
-    if total_files > 50 {
+    if shows_progress_bar(total_files) {
         eprintln!(); // newline after \r progress
     }
 
@@ -4614,6 +4632,53 @@ mod tests {
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn the_progress_gate_excludes_its_own_threshold() {
+        assert!(!shows_progress_bar(0));
+        assert!(!shows_progress_bar(1));
+        assert!(!shows_progress_bar(PROGRESS_BAR_MIN_FILES));
+        assert!(shows_progress_bar(PROGRESS_BAR_MIN_FILES + 1));
+    }
+
+    /// A progress bar and the newline that terminates it must be decided by the
+    /// same predicate. When they were two separate comparisons they drifted, and
+    /// the terminator fired for link passes that had drawn nothing, so admission
+    /// printed one bare newline per commit as its entire progress output.
+    ///
+    /// A unit test on the predicate cannot catch that, because the defect is a
+    /// call site not using it. This reads the module's own source and fails if
+    /// any gate is written inline again.
+    ///
+    /// Only the production half is scanned. The first version of this test read
+    /// the whole file and failed immediately on the comparison literals in its
+    /// own assertions, which is the mirror of a check that cannot fail: a check
+    /// that cannot pass. Cutting the source at the test module keeps the guard
+    /// pointed at the code it is guarding.
+    #[test]
+    fn every_progress_gate_routes_through_one_predicate() {
+        let source = include_str!("linker.rs");
+        let test_module = source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("linker.rs carries its test module");
+        let production = &source[..test_module];
+
+        let routed = production
+            .matches("shows_progress_bar(total_files)")
+            .count();
+        assert_eq!(
+            routed, 4,
+            "expected both link paths to gate their bar and their terminator through \
+             shows_progress_bar; found {routed} production call sites"
+        );
+        for inline in ["total_files > 0", "total_files > 50"] {
+            assert!(
+                !production.contains(inline),
+                "a progress gate is written inline as `{inline}`; route it through \
+                 shows_progress_bar so the bar and its terminator cannot disagree"
+            );
+        }
+    }
 
     /// Test-only admission registry. The first fixture that admits a path gets
     /// a fresh graph-style identity; later assertions resolve that stored ID.
