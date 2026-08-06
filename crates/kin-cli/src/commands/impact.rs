@@ -49,6 +49,30 @@ pub struct ImpactQuery {
     pub kind: Option<String>,
     pub signature: Option<String>,
     pub match_count: usize,
+    /// Identities the name alone resolves to, before `--file`, `--kind`, and
+    /// `--signature` narrow them. A structured caller whose qualifiers matched
+    /// nothing reads this to see what it could have qualified with, instead of
+    /// having to infer it from a count of zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub name_candidates: Vec<CandidateIdentity>,
+}
+
+/// One entity a name resolves to, in the spelling the human listing uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateIdentity {
+    pub name: String,
+    pub kind: String,
+    pub location: String,
+}
+
+impl CandidateIdentity {
+    fn from_entity(entity: &kin_model::Entity) -> Self {
+        Self {
+            name: entity.name.clone(),
+            kind: format!("{:?}", entity.kind),
+            location: entity_location(entity).unwrap_or_else(|| "unknown".to_string()),
+        }
+    }
 }
 
 pub async fn run(
@@ -111,24 +135,61 @@ pub async fn build_impact_response(
     graph: &kin_db::InMemoryGraph,
     request: &ImpactRequest,
 ) -> Result<ImpactResponse> {
-    let mut matches = resolve_entities(graph, request)?;
-    matches.sort_by(|left, right| {
+    let ResolvedEntities {
+        mut matches,
+        mut name_matches,
+    } = resolve_entities(graph, request)?;
+    let stable_order = |left: &kin_model::Entity, right: &kin_model::Entity| {
         kin_review::StableEntityIdentity::from_entity(left)
             .cmp(&kin_review::StableEntityIdentity::from_entity(right))
             .then_with(|| left.id.cmp(&right.id))
-    });
+    };
+    matches.sort_by(stable_order);
+    name_matches.sort_by(stable_order);
 
-    let query = ImpactQuery {
+    let mut query = ImpactQuery {
         entity: request.entity.clone(),
         file: request.file.clone(),
         kind: request.kind.clone(),
         signature: request.signature.clone(),
         match_count: matches.len(),
+        name_candidates: Vec::new(),
     };
+    if name_matches.len() > 1 || matches.is_empty() {
+        query.name_candidates = name_matches
+            .iter()
+            .map(CandidateIdentity::from_entity)
+            .collect();
+    }
 
     if matches.is_empty() {
+        let qualifiers = active_qualifiers(request);
+        // A name that resolves to nothing at all is a genuine miss. A name that
+        // resolves and is then filtered out by the qualifiers is not, and must
+        // not be reported as one.
+        let lines = if name_matches.is_empty() || qualifiers.is_empty() {
+            impact_not_found_guidance(&request.entity)
+        } else {
+            let members_in_scope = match request.file.as_deref() {
+                Some(file) => crate::commands::declaration_neighbors::collect(
+                    graph,
+                    &name_matches[0],
+                    IMPACT_MEMBER_RELATION_KINDS,
+                )?
+                .members_in_file(file)
+                .map(|member| format!("{} ({}) @ {}", member.name, member.kind, member.location))
+                .collect(),
+                None => Vec::new(),
+            };
+            qualifier_miss_guidance(
+                &request.entity,
+                &qualifiers,
+                &name_matches,
+                &members_in_scope,
+            )
+        };
         return Ok(ImpactResponse {
-            lines: impact_not_found_guidance(&request.entity),
+            lines,
             schema_version: IMPACT_RESPONSE_SCHEMA_VERSION.to_string(),
             resolution: "not_found".to_string(),
             query,
@@ -150,6 +211,8 @@ pub async fn build_impact_response(
         });
     }
 
+    prefer_entities_owning_incoming_relations(graph, &mut matches)?;
+
     let target = &matches[0];
     let target_at = entity_location(target)
         .map(|loc| format!(" @ {loc}"))
@@ -163,6 +226,28 @@ pub async fn build_impact_response(
             "  Note: {} matches; showing the deterministic first match. Use --json with --file/--kind/--signature for fail-closed resolution.",
             matches.len()
         ));
+        // Naming the identities that were passed over is what lets a reader tell
+        // an answer about the wrong node from an answer about a node with
+        // nothing to report.
+        lines.push("  Other matches:".to_string());
+        for other in matches
+            .iter()
+            .skip(1)
+            .take(crate::commands::declaration_neighbors::MAX_LISTED)
+        {
+            lines.push(format!(
+                "    - {} ({:?}) @ {}",
+                other.name,
+                other.kind,
+                entity_location(other).unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
+            crate::commands::declaration_neighbors::MAX_LISTED,
+            matches.len() - 1,
+        ) {
+            lines.push(format!("    {more}"));
+        }
     }
 
     // 1. Local Impact, grouped by traversal distance so a reader can tell the
@@ -172,6 +257,7 @@ pub async fn build_impact_response(
     let local_impacted = downstream_impact_by_hop(graph, &target.id, request.depth)?;
     if local_impacted.is_empty() {
         lines.push("  No local downstream impact found.".to_string());
+        lines.extend(empty_impact_context(graph, target)?);
     } else {
         lines.push(format!(
             "  {} local entities impacted within {} hop{}:",
@@ -208,6 +294,113 @@ pub async fn build_impact_response(
         query,
         ranked,
     })
+}
+
+/// Move the identities that own incoming relations to the front, preserving the
+/// deterministic order within each group.
+///
+/// When one name covers several graph identities, only some of them are what
+/// impact analysis is about. A re-export, a forward declaration, or a test
+/// fixture sharing the name carries no dependents, and answering for it prints
+/// an empty result that is indistinguishable from a subject nothing depends on.
+/// The identity that owns incoming edges is the one the question was about.
+///
+/// A tie leaves the order untouched, so a set where nothing carries edges still
+/// resolves to the same deterministic first match it always did. That is what
+/// keeps this from being a reshuffle dressed as a preference.
+fn prefer_entities_owning_incoming_relations(
+    graph: &kin_db::InMemoryGraph,
+    matches: &mut [kin_model::Entity],
+) -> Result<()> {
+    if matches.len() < 2 {
+        return Ok(());
+    }
+    let mut owns_incoming = std::collections::HashSet::new();
+    for entity in matches.iter() {
+        if !graph
+            .get_all_relations_for_entity(&entity.id)?
+            .into_iter()
+            .any(|relation| {
+                relation.dst == GraphNodeId::Entity(entity.id)
+                    && relation.src != GraphNodeId::Entity(entity.id)
+            })
+        {
+            continue;
+        }
+        owns_incoming.insert(entity.id);
+    }
+    matches.sort_by_key(|entity| !owns_incoming.contains(&entity.id));
+    Ok(())
+}
+
+/// The relation kinds a member's dependent count is read over.
+///
+/// The same set `kin refs` answers on, so the count printed beside a suggested
+/// `kin impact <member>` is a number the reader can go and confirm. Containment
+/// is deliberately absent: a declaration contains its own members, and counting
+/// that edge would give every member a dependent it does not have.
+const IMPACT_MEMBER_RELATION_KINDS: &[kin_model::RelationKind] = &[
+    kin_model::RelationKind::Calls,
+    kin_model::RelationKind::Imports,
+    kin_model::RelationKind::References,
+];
+
+/// What the graph still says about a target with no downstream impact of its
+/// own.
+///
+/// A Rust type declaration owns one outgoing containment edge and nothing else,
+/// so "no local downstream impact" is true of the node and wrong about the
+/// repository: everything that depends on the type reaches it through a member.
+/// Naming those members, with the count a reader can verify, replaces an answer
+/// that looked like proof of no dependents with one that says where they are.
+///
+/// A target with no referenced members keeps the bare line. That is what keeps
+/// this from becoming a footer on every empty result.
+fn empty_impact_context(
+    graph: &kin_db::InMemoryGraph,
+    target: &kin_model::Entity,
+) -> Result<Vec<String>> {
+    let neighbors = crate::commands::declaration_neighbors::collect(
+        graph,
+        target,
+        IMPACT_MEMBER_RELATION_KINDS,
+    )?;
+    let referenced: Vec<_> = neighbors.referenced_members().collect();
+    let Some(first) = referenced.first() else {
+        return Ok(Vec::new());
+    };
+
+    let mut lines = vec![format!(
+        "  {} member{} of '{}' do have dependents:",
+        referenced.len(),
+        if referenced.len() == 1 { "" } else { "s" },
+        target.name
+    )];
+    for member in referenced
+        .iter()
+        .take(crate::commands::declaration_neighbors::MAX_LISTED)
+    {
+        lines.push(format!(
+            "    - {} ({}) @ {} [{} referencing {}]",
+            member.name,
+            member.kind,
+            member.location,
+            member.referencing_entities,
+            if member.referencing_entities == 1 {
+                "entity"
+            } else {
+                "entities"
+            },
+        ));
+    }
+    if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
+        crate::commands::declaration_neighbors::MAX_LISTED,
+        referenced.len(),
+    ) {
+        lines.push(format!("    {more}"));
+    }
+    lines.push(format!("    try: kin impact {}", first.name));
+    Ok(lines)
 }
 
 /// One breadth-first walk over inbound entity edges, pairing every reached
@@ -283,10 +476,23 @@ fn downstream_impact_by_hop<G: ImpactWalkGraph>(
     Ok(reached)
 }
 
+/// What a query resolved to, at both stages of resolution.
+///
+/// The two are kept apart so a qualifier that narrows the set to nothing can be
+/// reported as the filter miss it is. Collapsing them is what let
+/// `kin impact Error --file src/error.rs` answer "Entity 'Error' not found in
+/// this repo's graph" about an entity the unfiltered lookup had just found.
+struct ResolvedEntities {
+    /// After `--file`, `--kind`, and `--signature`.
+    matches: Vec<kin_model::Entity>,
+    /// Before them: what the name alone resolves to.
+    name_matches: Vec<kin_model::Entity>,
+}
+
 fn resolve_entities(
     graph: &kin_db::InMemoryGraph,
     request: &ImpactRequest,
-) -> Result<Vec<kin_model::Entity>> {
+) -> Result<ResolvedEntities> {
     let mut matches = if let Ok(uuid) = uuid::Uuid::parse_str(&request.entity) {
         graph.get_entity(&EntityId(uuid))?.into_iter().collect()
     } else {
@@ -325,6 +531,7 @@ fn resolve_entities(
         }
         matches
     };
+    let name_matches = matches.clone();
     if let Some(file) = request.file.as_deref() {
         matches.retain(|entity| kin_review::StableEntityIdentity::from_entity(entity).file == file);
     }
@@ -337,7 +544,89 @@ fn resolve_entities(
             kin_review::StableEntityIdentity::from_entity(entity).signature == normalized
         });
     }
-    Ok(matches)
+    Ok(ResolvedEntities {
+        matches,
+        name_matches,
+    })
+}
+
+/// The qualifiers a request carried, spelled the way the user passed them.
+fn active_qualifiers(request: &ImpactRequest) -> Vec<String> {
+    [
+        request.file.as_deref().map(|v| format!("--file {v}")),
+        request.kind.as_deref().map(|v| format!("--kind {v}")),
+        request
+            .signature
+            .as_deref()
+            .map(|v| format!("--signature {v}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The answer when a name resolves but the identity qualifiers exclude every
+/// match.
+///
+/// The entity is in the graph, so saying it is not is false, and it is the
+/// answer a user gets by following Kin's own advice to disambiguate by file.
+/// Report the miss as a miss and name what the name alone does resolve to, so
+/// the next command is a copy of one of these lines.
+fn qualifier_miss_guidance(
+    entity: &str,
+    qualifiers: &[String],
+    candidates: &[kin_model::Entity],
+    members_in_scope: &[String],
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "No entity named '{}' matches {}.",
+        entity,
+        qualifiers.join(" ")
+    )];
+    lines.push(format!(
+        "'{}' resolves in this repo's graph to {} entit{}:",
+        entity,
+        candidates.len(),
+        if candidates.len() == 1 { "y" } else { "ies" }
+    ));
+    for candidate in candidates
+        .iter()
+        .take(crate::commands::declaration_neighbors::MAX_LISTED)
+    {
+        lines.push(format!(
+            "  {} ({:?}) @ {}",
+            candidate.name,
+            candidate.kind,
+            entity_location(candidate).unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
+        crate::commands::declaration_neighbors::MAX_LISTED,
+        candidates.len(),
+    ) {
+        lines.push(format!("  {more}"));
+    }
+    if !members_in_scope.is_empty() {
+        lines.push(format!("Members of '{entity}' the graph does place there:"));
+        for member in members_in_scope
+            .iter()
+            .take(crate::commands::declaration_neighbors::MAX_LISTED)
+        {
+            lines.push(format!("  {member}"));
+        }
+        if let Some(more) = crate::commands::declaration_neighbors::and_more_suffix(
+            crate::commands::declaration_neighbors::MAX_LISTED,
+            members_in_scope.len(),
+        ) {
+            lines.push(format!("  {more}"));
+        }
+    }
+    lines.push(
+        "hint: qualify with one of the identities above, or drop the qualifier to analyze the \
+         first match."
+            .to_string(),
+    );
+    lines
 }
 
 /// `path:line` for an entity, or just the path when the graph carries no span.
@@ -345,11 +634,7 @@ fn resolve_entities(
 /// Location is projection metadata for the human reading the listing; the
 /// analysis itself is keyed on graph identity, never on paths.
 fn entity_location(entity: &kin_model::Entity) -> Option<String> {
-    let path = entity.file_origin.as_ref().map(|f| f.0.clone())?;
-    Some(match entity.span.as_ref().map(|s| s.start_line) {
-        Some(line) => format!("{path}:{line}"),
-        None => path,
-    })
+    crate::commands::declaration_neighbors::entity_location(entity)
 }
 
 /// Actionable guidance when `kin impact <symbol>` can't resolve the symbol in
@@ -660,6 +945,252 @@ mod tests {
             response.lines
         );
         assert!(response.lines[0].contains("'resolve_binary'"));
+    }
+
+    fn calls(graph: &kin_db::InMemoryGraph, src: &Entity, dst: &Entity) {
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::from_content(&src.id.to_string(), &dst.id.to_string(), "calls"),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(src.id),
+                dst: GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    /// One name, two graph identities: a declaration nothing points at, sorting
+    /// first, and the definition every caller reaches. Answering for the first
+    /// prints an empty result about a subject that has dependents.
+    #[tokio::test]
+    async fn resolution_prefers_the_identity_that_owns_incoming_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let declaration = entity_at("Thing", "src/a_declaration.rs", 3);
+        let definition = entity_at("Thing", "src/z_definition.rs", 40);
+        let caller = entity_at("caller", "src/caller.rs", 7);
+        for e in [&declaration, &definition, &caller] {
+            graph.upsert_entity(e).unwrap();
+        }
+        calls(&graph, &caller, &definition);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Thing".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.lines[0].contains("src/z_definition.rs"),
+            "must answer for the identity that owns callers: {:?}",
+            response.lines
+        );
+        let joined = response.lines.join("\n");
+        assert!(
+            joined.contains("caller"),
+            "the dependents must actually be reported: {joined}"
+        );
+        assert!(
+            joined.contains("src/a_declaration.rs"),
+            "the identity passed over must still be named: {joined}"
+        );
+    }
+
+    /// The falsification for the preference above. When nothing carries incoming
+    /// relations there is no definition site to prefer, and the deterministic
+    /// first match must be exactly what it was before.
+    #[tokio::test]
+    async fn resolution_order_is_unchanged_when_no_identity_owns_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        for e in [
+            &entity_at("Thing", "src/a_declaration.rs", 3),
+            &entity_at("Thing", "src/z_definition.rs", 40),
+        ] {
+            graph.upsert_entity(e).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Thing".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.lines[0].contains("src/a_declaration.rs"),
+            "a tie keeps the deterministic first match: {:?}",
+            response.lines
+        );
+    }
+
+    /// A self-recursive edge is the entity pointing at itself. It says nothing
+    /// about whether anything else depends on it, so it must not promote an
+    /// identity over one that real callers reach.
+    #[tokio::test]
+    async fn a_self_edge_does_not_count_as_owning_incoming_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let recursive = entity_at("Thing", "src/a_declaration.rs", 3);
+        let definition = entity_at("Thing", "src/z_definition.rs", 40);
+        let caller = entity_at("caller", "src/caller.rs", 7);
+        for e in [&recursive, &definition, &caller] {
+            graph.upsert_entity(e).unwrap();
+        }
+        calls(&graph, &recursive, &recursive);
+        calls(&graph, &caller, &definition);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Thing".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response.lines[0].contains("src/z_definition.rs"),
+            "a self-edge must not outrank a real caller: {:?}",
+            response.lines
+        );
+    }
+
+    /// FIR-2032, at the unit boundary: the qualifier miss is reported as a miss,
+    /// the machine surface carries the identities the name does resolve to, and
+    /// the count of matches after qualification stays zero.
+    #[tokio::test]
+    async fn qualifier_miss_names_the_unfiltered_candidates_on_both_surfaces() {
+        let graph = kin_db::InMemoryGraph::new();
+        for e in [
+            &entity_at("Thing", "src/a.rs", 3),
+            &entity_at("Thing", "src/b.rs", 9),
+        ] {
+            graph.upsert_entity(e).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Thing".to_string(),
+                depth: 3,
+                file: Some("src/nowhere.rs".to_string()),
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let joined = response.lines.join("\n");
+        assert!(
+            !joined.contains("not found in this repo's graph"),
+            "the entity is in the graph; the filter is what missed: {joined}"
+        );
+        assert!(joined.contains("--file src/nowhere.rs"), "{joined}");
+        assert!(
+            joined.contains("src/a.rs:3") && joined.contains("src/b.rs:9"),
+            "{joined}"
+        );
+        assert_eq!(response.query.match_count, 0);
+        assert_eq!(
+            response
+                .query
+                .name_candidates
+                .iter()
+                .map(|candidate| candidate.location.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs:3", "src/b.rs:9"],
+        );
+    }
+
+    /// A qualifier that does match must be unaffected by the miss path, and a
+    /// clean single resolution must not start carrying candidate noise.
+    #[tokio::test]
+    async fn a_matching_qualifier_still_resolves_and_carries_no_candidates() {
+        let graph = kin_db::InMemoryGraph::new();
+        for e in [
+            &entity_at("Thing", "src/a.rs", 3),
+            &entity_at("Thing", "src/b.rs", 9),
+        ] {
+            graph.upsert_entity(e).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Thing".to_string(),
+                depth: 3,
+                file: Some("src/b.rs".to_string()),
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.resolution, "resolved");
+        assert_eq!(response.query.match_count, 1);
+        assert!(
+            response.lines[0].contains("src/b.rs:9"),
+            "{:?}",
+            response.lines
+        );
+
+        let single = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "caller_only".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(single.resolution, "not_found");
+        assert!(single.query.name_candidates.is_empty());
     }
 
     #[tokio::test]

@@ -7,6 +7,8 @@ use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::commands::declaration_neighbors;
+
 /// Resolve session id from KIN_SESSION_ID env var.
 ///
 /// Optional: returns None if unset/empty (commands behave as if no scope).
@@ -196,6 +198,8 @@ pub fn build_refs_response(
             "No incoming {} relations.",
             relation_kinds_label(&relation_kinds)
         ));
+        let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
+        lines.extend(empty_result_context(target, &neighbors));
         return Ok(RefsResponse { lines });
     }
 
@@ -217,6 +221,101 @@ pub fn build_refs_response(
     }
 
     Ok(RefsResponse { lines })
+}
+
+/// What the graph still says about a target whose incoming relations are empty.
+///
+/// An empty answer on a type declaration is true of that entity and misleading
+/// about the repository: the references went to its members, and Kin knows
+/// exactly which ones. Naming them turns "no callers" into "these are the
+/// callers, one level down", and naming the same-name identities resolution
+/// passed over says which node was actually answered for.
+///
+/// An entity with neither members nor same-name siblings adds nothing here, so
+/// it keeps the plain empty answer. That is what stops this note from becoming
+/// noise that a reader learns to skip.
+fn empty_result_context(
+    target: &Entity,
+    neighbors: &declaration_neighbors::DeclarationNeighbors,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let referenced: Vec<_> = neighbors.referenced_members().collect();
+    if let Some(first) = referenced.first() {
+        lines.push(format!(
+            "{} member{} of '{}' do carry them:",
+            referenced.len(),
+            if referenced.len() == 1 { "" } else { "s" },
+            target.name
+        ));
+        for member in referenced.iter().take(declaration_neighbors::MAX_LISTED) {
+            lines.push(format!(
+                "  {} @ {} [{} referencing {}]",
+                member.name,
+                member.location,
+                member.referencing_entities,
+                if member.referencing_entities == 1 {
+                    "entity"
+                } else {
+                    "entities"
+                },
+            ));
+        }
+        if let Some(more) = declaration_neighbors::and_more_suffix(
+            declaration_neighbors::MAX_LISTED,
+            referenced.len(),
+        ) {
+            lines.push(format!("  {more}"));
+        }
+        lines.push(format!("  try: kin refs {}", first.name));
+    }
+
+    if !neighbors.siblings.is_empty() {
+        lines.push(format!(
+            "{} other graph identit{} the name '{}':",
+            neighbors.siblings.len(),
+            if neighbors.siblings.len() == 1 {
+                "y carries"
+            } else {
+                "ies carry"
+            },
+            target.name
+        ));
+        for sibling in neighbors
+            .siblings
+            .iter()
+            .take(declaration_neighbors::MAX_LISTED)
+        {
+            lines.push(format!(
+                "  {} ({}) @ {}",
+                sibling.name, sibling.kind, sibling.location
+            ));
+        }
+        if let Some(more) = declaration_neighbors::and_more_suffix(
+            declaration_neighbors::MAX_LISTED,
+            neighbors.siblings.len(),
+        ) {
+            lines.push(format!("  {more}"));
+        }
+    }
+
+    lines
+}
+
+/// Distinct entities that reference `entity_id` over the given relation kinds.
+///
+/// Counted through the same collector the listing is built from, so a count
+/// reported beside a suggested `kin refs <member>` is the number that command
+/// will print. A source id the graph carries an edge for but no entity record
+/// for is still a distinct referencing identity, so it counts here; the ordinary
+/// listing path fails loud on that same gap rather than reporting the row.
+pub(crate) fn distinct_referencing_entities(
+    graph: &impl GraphStore,
+    entity_id: &EntityId,
+    relation_kinds: &[RelationKind],
+) -> Result<usize> {
+    let collected = collect_graph_references(graph, entity_id, relation_kinds)?;
+    Ok(collected.references.len() + collected.missing_source_ids.len())
 }
 
 /// Actionable guidance when `kin refs <symbol>` misses in the current repo's
