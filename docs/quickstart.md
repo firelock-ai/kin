@@ -169,6 +169,53 @@ publication.
 - `--json`: report the exact committed repository/workspace authority result,
   including the semantic enrichment admission produced.
 
+### How long admission takes, and what it prints
+
+Admission is a one-time cost that scales with the size of your history rather
+than the size of your checkout, because every reachable commit's tree is
+observed and proven. On a small repository it takes seconds. On a repository
+with thousands of commits it takes minutes and can hold several gigabytes of
+memory while it runs.
+
+`kin init` prints its phase ladder to stderr so the terminal is never silent
+while that happens:
+
+```
+  [ 1/15] capture Git repository 1.4s
+  [ 2/15] build Git authority 0.2s
+  [ 3/15] plan semantic import 3.1s
+  [ 4/15] derive semantic history 41.7s
+  ...
+  [15/15] seal published content 12.9s
+  admitted exact Git repository in 118.3s
+```
+
+The long phases report their own progress while they run, so a phase that is
+walking history shows how far it has gone. Stdout stays clean, so
+`kin init --json` is still safe to pipe.
+
+### Profiling a slow command
+
+Every `kin` command can profile itself. No rebuild, no external profiler, and
+no debug symbols are needed:
+
+```sh
+# Print the hottest stages to stderr when the command finishes
+kin init --profile-summary
+
+# Write the full machine-readable profile to a file
+kin init --profile-out /tmp/kin-init-profile.json
+```
+
+`--profile-summary` (or `KIN_PROFILE_SUMMARY=1`) prints a ranked list of the
+slowest stages with their self time, plus peak CPU, peak resident memory, and
+peak thread count. `--profile-out` (or `KIN_PROFILE_OUT=<path>`) writes a JSON
+report carrying every instrumented span with its start and end offsets, a
+resource timeline sampled every 250 ms (`KIN_PROFILE_SAMPLE_MS`), and per-stage
+rollups. Use `--profile-out` when reporting a performance problem: it is the
+fastest way to say which phase owns the time rather than guessing from wall
+clock.
+
 ---
 
 ## 4. Add embeddings for semantic search
