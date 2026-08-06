@@ -1551,10 +1551,28 @@ fn check_retrieval_profile() -> HealthCheck {
                 crate::retrieval_profile::RetrievalProfile::AccuracyV1
             ) && ce_cached,
         );
+    // Every lever is read back from the profile rather than assumed from its
+    // name, so a profile whose defaults change cannot leave this check
+    // asserting a lever set the serving path no longer uses.
+    //
+    // `declaration_cutoff_default` is deliberately excluded: it is dark for
+    // EVERY profile pending its A/B graduation gate, so counting it would make
+    // the best available profile report degraded forever, and a check that can
+    // never be green is a check nobody reads.
+    let levers_off: Vec<&str> = [
+        (!profile.semantic_locate_fused()).then_some("fused semantic_locate routing"),
+        (!profile.entity_fusion_default()).then_some("entity fusion"),
+        (!profile.lexical_floor_readmit_default()).then_some("lexical parity floor"),
+        (!ce_active).then_some("cross-encoder rerank"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let detail =
         format!(
-        "profile {} — semantic_locate routing: {}; entity fusion: {}; lexical parity floor: {}; \
+        "{}profile {} — semantic_locate routing: {}; entity fusion: {}; lexical parity floor: {}; \
          cross-encoder rerank: {} (model {} {})",
+        if levers_off.is_empty() { "" } else { "degraded: " },
         profile.name(),
         if profile.semantic_locate_fused() {
             "fused locate pipeline"
@@ -1567,20 +1585,45 @@ fn check_retrieval_profile() -> HealthCheck {
         ce_model,
         if ce_cached { "cached" } else { "not cached" },
     );
+    // A profile serving with levers off is answering worse than this build can,
+    // and reporting that as a passing check tells a first-run user their weakest
+    // retrieval configuration is the healthy one. Stale is this report's
+    // advisory tier: it renders as a yellow warning and counts as needing
+    // attention, without blocking readiness the way Missing/Misconfigured do,
+    // because a degraded profile still serves.
+    let status = if levers_off.is_empty() {
+        HealthStatus::Healthy
+    } else {
+        HealthStatus::Stale
+    };
     let check = HealthCheck::new(
         "retrieval_profile",
         "Retrieval quality profile",
-        HealthStatus::Healthy,
+        status,
         detail,
     );
-    if !ce_cached {
-        check.with_manual_fix(
-            "to enable the reranker, prefetch its model once with \
-             KIN_LOCATE_CROSS_ENCODER_ENABLED=1 (downloads on first use)",
-        )
-    } else {
-        check
+    if levers_off.is_empty() {
+        return check;
     }
+    // The remediation was previously attached only when the reranker model was
+    // uncached, and the Healthy status meant the renderer never printed it. Name
+    // what is off, and name the better profile from its own identifier so this
+    // string cannot drift from the enum.
+    let best = crate::retrieval_profile::RetrievalProfile::AccuracyV1;
+    let mut fix = format!("off: {}", levers_off.join(", "));
+    if profile != best {
+        fix.push_str(&format!(
+            "; set KIN_PROFILE={} for the measured-accuracy defaults",
+            best.name()
+        ));
+    }
+    if !ce_cached {
+        fix.push_str(
+            "; prefetch the reranker model once with \
+             KIN_LOCATE_CROSS_ENCODER_ENABLED=1 (downloads on first use)",
+        );
+    }
+    check.with_manual_fix(fix)
 }
 
 #[cfg(test)]
@@ -2783,5 +2826,71 @@ mod tests {
             .manual_fix
             .as_deref()
             .is_some_and(|fix| fix.contains("kin reconcile")));
+    }
+
+    /// The degraded default must not report as a passing check. A first-run
+    /// user otherwise measures this build's weakest retrieval configuration
+    /// and is told it is the healthy one.
+    #[test]
+    #[serial]
+    fn doctor_warns_on_a_profile_serving_with_levers_off() {
+        let _profile = EnvVarGuard::set("KIN_PROFILE", "compat-v0");
+        let _ce = EnvVarGuard::unset("KIN_LOCATE_CROSS_ENCODER_ENABLED");
+
+        let check = check_retrieval_profile();
+
+        assert!(
+            matches!(check.status, HealthStatus::Stale),
+            "a profile with levers off must not report Healthy, got {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("degraded"),
+            "detail must say so plainly: {}",
+            check.detail
+        );
+        let fix = check
+            .manual_fix
+            .as_deref()
+            .expect("a degraded profile must carry remediation");
+        assert!(
+            fix.contains("cross-encoder rerank"),
+            "remediation must name what is off: {fix}"
+        );
+        assert!(
+            fix.contains("accuracy-v1"),
+            "remediation must name the better profile: {fix}"
+        );
+    }
+
+    /// The falsifying half. Without this the check above would pass just as
+    /// well against a gate hardcoded to warn, which would prove nothing.
+    #[test]
+    #[serial]
+    fn doctor_stays_green_when_every_lever_the_profile_governs_is_on() {
+        let _profile = EnvVarGuard::set("KIN_PROFILE", "accuracy-v1");
+        // The explicit override wins over the cached-model + resident-daemon
+        // default, so this exercises the all-levers-on state from a test
+        // binary, which is never a serving daemon.
+        let _ce = EnvVarGuard::set("KIN_LOCATE_CROSS_ENCODER_ENABLED", "1");
+
+        let check = check_retrieval_profile();
+
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "the best available profile must be able to report Healthy, got {:?} ({})",
+            check.status,
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("degraded"),
+            "a fully-levered profile must not be labelled degraded: {}",
+            check.detail
+        );
+        assert!(
+            check.manual_fix.is_none(),
+            "nothing to remediate when nothing is off: {:?}",
+            check.manual_fix
+        );
     }
 }
