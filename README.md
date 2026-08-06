@@ -106,13 +106,12 @@ flowchart TD
     mcp --> daemon
     editor --> daemon
     daemon --> authority
-    authority --> vfs
-    vfs --> tools
     authority --> db
     db --> prims
-    git -->|"kin init imports"| authority
-    authority -->|"kin git export"| git
+    authority <-->|"kin init imports, kin git export"| git
     authority -->|"publish and sync"| kinlab
+    authority --> vfs
+    vfs --> tools
 ```
 
 Underneath those surfaces are the layers the system is built from:
