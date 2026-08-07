@@ -206,7 +206,16 @@ fn init_from_git_with_hooks(
         .prefix(".kin-git-capture-")
         .tempdir_in(source_parent)
         .map_err(|error| KinError::io(source_parent, error))?;
-    let capture_store = BlobStore::new(capture_dir.path().join("objects"))
+    // The capture store lives and dies inside this call, so its bodies are
+    // written without device barriers. Its root is the per-init `capture_dir`
+    // above, removed when that handle drops; every later init mints a fresh
+    // random name rather than reopening this one; and nothing durable ever
+    // records a path inside it. Every body that has to outlive init is copied
+    // into the repository's own source-blob store by `copy_captured_authority`,
+    // under that store's unchanged durability. A crash that could tear these
+    // bytes therefore destroys the only reader they ever had, and leaves no
+    // published `.kin` behind to reference them.
+    let capture_store = BlobStore::new_ephemeral(capture_dir.path().join("objects"))
         .map_err(|error| git_boundary_error("create capture CAS", error))?;
 
     let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);

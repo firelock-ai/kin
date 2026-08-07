@@ -125,7 +125,7 @@ serial_test = "3"
 
 # Internal crates
 kin-model = { version = "=0.7.5", registry = "kin" }
-kin-blobs = { version = "=0.1.4", registry = "kin" }
+kin-blobs = { version = "=0.1.5", registry = "kin" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
 kin-index = { path = "crates/kin-index" }
