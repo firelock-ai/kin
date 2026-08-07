@@ -463,6 +463,14 @@ pub struct HealthResponse {
     /// merely whether the opt-in environment variable was present.
     #[serde(default)]
     pub filesystem_reconcile_disabled: bool,
+    /// Whether an operator turned the automatic background embedding pass off
+    /// (`KIN_DAEMON_AUTO_EMBED` falsy). Distinct from
+    /// `embed_persistence_unavailable`, which is the daemon refusing because it
+    /// cannot durably persist a sidecar. Deferred, not disabled: an explicit
+    /// embed request still runs. Does not drive `status: "attention"`, because
+    /// it is a chosen configuration rather than a fault.
+    #[serde(default)]
+    pub background_embed_deferred: bool,
     /// Monotonic authority-head marker (`.kin/kindb/head-generation`), bumped
     /// when the daemon commits a newer graph snapshot. A freshness token that
     /// lets clients and the MCP envelope express `graph_as_of` and detect stale
@@ -2208,6 +2216,7 @@ async fn health(
         embed_persistence_unavailable,
         vector_index_discarded,
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
+        background_embed_deferred: !crate::daemon::auto_embed_enabled(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
         behavior_env: kin_core::behavior_env::snapshot_from_process(),
         coordination: Some(
@@ -24673,6 +24682,48 @@ mod tests {
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.status, "attention");
         assert!(json.embed_worker_failed);
+    }
+
+    #[tokio::test]
+    async fn health_surfaces_a_deferred_background_embed_without_calling_it_a_fault() {
+        // An operator who turned auto-embed off must be able to read that back
+        // off the daemon rather than infer it from a pass that never ran. It is
+        // a chosen configuration, so unlike the embed faults beside it, it does
+        // not move `status` off "ok".
+        async fn deferred_flag(state: Arc<DaemonState>) -> HealthResponse {
+            let response = router(state)
+                .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let default = {
+            let _env = kin_core::test_env::EnvVarGuard::unset(crate::daemon::AUTO_EMBED_ENV);
+            deferred_flag(test_state()).await
+        };
+        assert!(
+            !default.background_embed_deferred,
+            "the shipped default embeds in the background and must not report deferred"
+        );
+        assert_eq!(default.status, "ok");
+
+        let opted_out = {
+            let _env = kin_core::test_env::EnvVarGuard::set(crate::daemon::AUTO_EMBED_ENV, "0");
+            deferred_flag(test_state()).await
+        };
+        assert!(
+            opted_out.background_embed_deferred,
+            "an opt-out must be readable off /health"
+        );
+        assert_eq!(
+            opted_out.status, "ok",
+            "a chosen configuration is not a fault and must not raise attention"
+        );
     }
 
     #[tokio::test]
