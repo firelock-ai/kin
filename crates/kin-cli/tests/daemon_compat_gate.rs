@@ -90,9 +90,9 @@ fn a_compat_payload_without_build_identity_is_not_reusable() {
 }
 
 /// Pins the harness's `build.sha` + `build.dirty` join against
-/// `kin_buildinfo::sha_with_dirty`, which is what the daemon actually stamps
-/// sidecars with. If that rule changes and this join does not, every daemon
-/// would look skewed and no rebuild would clear it.
+/// `kin_buildinfo::sha_with_dirty`, the joining rule it borrows. If that rule
+/// changes and this join does not, every daemon would look skewed and no
+/// rebuild would clear it.
 #[test]
 fn the_joined_stamp_agrees_with_kin_buildinfo() {
     let info = kin_buildinfo::get();

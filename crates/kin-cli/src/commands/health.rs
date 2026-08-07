@@ -1656,21 +1656,41 @@ fn semantic_query_health_from_runtime(
     }
 
     if total == 0 || (indexed == total && pending == 0) {
-        HealthCheck::new(
+        // Coverage is whole. A discard earlier in this daemon's life has been
+        // paid off and leaves nothing to act on, and a check that stays yellow
+        // after its cause is gone is a check nobody reads.
+        return HealthCheck::new(
             "semantic_query_readiness",
             "Semantic query readiness",
             HealthStatus::Healthy,
             detail,
-        )
-    } else {
-        HealthCheck::new(
+        );
+    }
+
+    // Incomplete coverage reads identically whether this is a first run or a
+    // repository whose finished index was thrown away at open. Only one of them
+    // means work already paid for is being paid for again, so when the daemon
+    // knows which it is, say so instead of leaving it to be inferred.
+    let Some(reason) = &runtime.vector_index_discarded else {
+        return HealthCheck::new(
             "semantic_query_readiness",
             "Semantic query readiness",
             HealthStatus::Stale,
             detail,
         )
-        .with_manual_fix("allow daemon embedding to finish or run `kin embed`")
-    }
+        .with_manual_fix("allow daemon embedding to finish or run `kin embed`");
+    };
+
+    HealthCheck::new(
+        "semantic_query_readiness",
+        "Semantic query readiness",
+        HealthStatus::Stale,
+        format!("{detail}; {reason}, so it is being rebuilt from scratch"),
+    )
+    .with_manual_fix(
+        "allow daemon embedding to finish or run `kin embed`; the rebuild is not lost work \
+         repeating itself once it completes",
+    )
 }
 
 #[cfg(feature = "vector")]
@@ -2519,6 +2539,50 @@ mod tests {
         assert!(matches!(missing.status, HealthStatus::Missing));
         assert!(missing.detail.contains("embedding worker failed"));
         assert!(missing.manual_fix.is_some());
+    }
+
+    /// A repository whose finished index was thrown away at open looks exactly
+    /// like a first run if only the coverage counters are reported: partial
+    /// coverage, work in progress, nothing wrong. Naming the discard is the
+    /// difference between "Kin is indexing" and "Kin is indexing this again".
+    #[cfg(feature = "vector")]
+    #[test]
+    fn semantic_query_readiness_names_a_discarded_vector_index() {
+        let discarded = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 0,
+            embeddings_total: 41,
+            embeddings_pending: 41,
+            vector_index_discarded: Some(
+                "the persisted vector index at .kin/kindb/graph.kvec could not be read".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let semantic = semantic_query_health_from_runtime("http://daemon", &discarded);
+
+        assert!(matches!(semantic.status, HealthStatus::Stale));
+        assert!(
+            semantic.detail.contains("graph.kvec")
+                && semantic.detail.contains("rebuilt from scratch"),
+            "a discarded index must be named, not left to be inferred from coverage: {}",
+            semantic.detail
+        );
+        assert!(semantic.manual_fix.is_some());
+
+        // Once the rebuild lands there is nothing left to act on, and a check
+        // that stays yellow after its cause is gone is a check nobody reads.
+        let rebuilt = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 41,
+            embeddings_pending: 0,
+            ..discarded
+        };
+        let settled = semantic_query_health_from_runtime("http://daemon", &rebuilt);
+        assert!(
+            matches!(settled.status, HealthStatus::Healthy),
+            "a paid-off discard must not hold the check yellow forever: {:?}",
+            settled.status
+        );
+        assert!(!settled.detail.contains("graph.kvec"));
     }
 
     #[test]

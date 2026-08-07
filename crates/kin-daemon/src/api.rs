@@ -446,6 +446,18 @@ pub struct HealthResponse {
     /// A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_persistence_unavailable: bool,
+    /// Why the persisted vector index was not installed when this daemon
+    /// opened, when one was on disk and was not. The graph is intact and every
+    /// query is still served; the index is being re-derived from zero, which is
+    /// worth stating because the only other evidence is a coverage counter that
+    /// restarted without explanation. A value drives `status: "attention"`.
+    ///
+    /// This describes one daemon's open and so holds for that process's life,
+    /// the same way `embed_worker_failed` does, rather than clearing when the
+    /// rebuild catches up. `kin health` is the surface that tracks the rebuild
+    /// and goes quiet once coverage is whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index_discarded: Option<String>,
     /// Effective filesystem-to-graph admission policy. This reports the frozen
     /// daemon state, including intrinsic storage-backend graph authority, not
     /// merely whether the opt-in environment variable was present.
@@ -2072,6 +2084,7 @@ async fn health(
         .embed_worker_failed
         .load(std::sync::atomic::Ordering::Relaxed);
     let embed_persistence_unavailable = !state.can_persist_embed_progress_locally();
+    let vector_index_discarded = state.vector_index_discarded().map(str::to_string);
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2079,11 +2092,13 @@ async fn health(
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
     // permanently stopped (embed-degraded), OR the configured storage backend
-    // cannot durably persist vector progress, OR coordination evidence could not
-    // be persisted. The graph itself stays intact and served in all cases.
+    // cannot durably persist vector progress, OR the persisted vector index was
+    // discarded at open and is being re-derived, OR coordination evidence could
+    // not be persisted. The graph itself stays intact and served in all cases.
     let status = if mass_deletion_blocked
         || embed_worker_failed
         || embed_persistence_unavailable
+        || vector_index_discarded.is_some()
         || coordination_event_persist_failures > 0
     {
         "attention"
@@ -2118,6 +2133,7 @@ async fn health(
         mass_deletion_blocked,
         embed_worker_failed,
         embed_persistence_unavailable,
+        vector_index_discarded,
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         graph_generation: DaemonState::read_generation_marker(&state.layout),
         behavior_env: kin_core::behavior_env::snapshot_from_process(),
@@ -2691,6 +2707,7 @@ async fn command_resources(
         embeddings_total: embed_status.total,
         hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
+        vector_index_discarded: state.vector_index_discarded().map(str::to_string),
     };
 
     let actual = kin_cli::commands::resources::ActualResources::capture();
@@ -15922,6 +15939,11 @@ mod tests {
             "local repository authority must allow derived vector persistence"
         );
         assert!(
+            json.vector_index_discarded.is_none(),
+            "a repository with no index to discard must not report one: {:?}",
+            json.vector_index_discarded
+        );
+        assert!(
             !json.filesystem_reconcile_disabled,
             "local authority remains file-compatible unless explicitly disabled"
         );
@@ -16672,6 +16694,50 @@ mod tests {
         assert!(
             message.contains(BACKEND_FAULT_TEXT),
             "the fault must carry the backend error rather than discard it: {message}"
+        );
+    }
+
+    /// Discarding the user's whole vector index is a degradation, and a
+    /// degradation nobody can read is indistinguishable from silence. The graph
+    /// still serves every query, so this is not a fault; it is minutes to hours
+    /// of embedding about to be paid for twice, and `/health` says so.
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    async fn health_surfaces_a_discarded_vector_index_as_attention() {
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-kvec-discard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = kin_core::init(&dir).unwrap().layout;
+        // An index on disk that this build cannot bind to graph truth: the
+        // shape every rejected sidecar arrives in, whatever rejected it.
+        std::fs::create_dir_all(layout.kindb_dir()).unwrap();
+        std::fs::write(layout.kindb_vector_index_path(), b"unbindable index").unwrap();
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+
+        let reason = json
+            .vector_index_discarded
+            .expect("a discarded index must be reported, not left to a coverage counter");
+        assert!(
+            reason.contains("graph.kvec"),
+            "the report must name what was discarded: {reason}"
+        );
+        assert_eq!(
+            json.status, "attention",
+            "re-deriving the whole index is not an `ok` steady state"
+        );
+        assert!(
+            !json.embed_worker_failed,
+            "a discarded index is not a worker crash"
         );
     }
 

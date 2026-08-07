@@ -937,6 +937,15 @@ pub struct DaemonState {
     /// error, so an un-hydrated store is reported as the authority gap it is
     /// rather than as a mysteriously absent object.
     ingest_cas_hydration_gap: Option<String>,
+    /// Why the persisted vector index on disk was not installed when this state
+    /// was opened, when one was there and was not.
+    ///
+    /// A discarded index is re-derived from scratch, which is minutes to hours
+    /// of embedding on a real repository, so it is stated rather than left to
+    /// be inferred from a coverage counter that silently restarted at zero.
+    /// `None` means either that the index loaded or that there was none to
+    /// load, which are the two states that need no explanation.
+    vector_index_discarded: Option<String>,
     pub reconciler: RwLock<Reconciler>,
     /// Cached FileLayouts for all tracked files.
     /// Populated on init, updated on commits.
@@ -1411,26 +1420,73 @@ impl DaemonState {
     ///
     /// The `SnapshotManager::open` / `open_read_only_for_locate` path already
     /// performs this validated load during construction, so it does not call this.
-    fn load_validated_vector_index(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
+    ///
+    /// # Reuse is keyed on format, not on the product version
+    ///
+    /// No build identity is pinned here. Whether previously derived vectors are
+    /// reusable is decided entirely by keys that describe the vectors and the
+    /// graph, all of which kin-db compares on its own: the sidecar envelope
+    /// version, the on-disk index format version, the embedding
+    /// provider/model/revision/pipeline-epoch/dimensions, the index's own
+    /// self-described model, and the retrieval-authority hash binding it to
+    /// graph truth. None of those move when Kin's version does.
+    ///
+    /// Passing the daemon's build SHA as the expected producer identity made
+    /// every upgrade reject the whole index and re-embed the repository from
+    /// zero, because that SHA changes on every commit whether or not anything
+    /// about embedding did. It is deliberately absent, and the same call in
+    /// `require_complete_prepared_embeddings` pins nothing either. Invalidating
+    /// deliberately is still available and belongs on the key that describes
+    /// the pipeline (kin-db's embedding pipeline epoch), which every persisted
+    /// sidecar already carries and every load already checks.
+    ///
+    /// Returns `Some(reason)` when an index was on disk and was not installed,
+    /// so the caller can record and announce what was discarded. `None` means
+    /// the index loaded, or there was none to load.
+    fn load_validated_vector_index(
+        layout: &KinLayout,
+        graph: &kin_db::InMemoryGraph,
+    ) -> Option<String> {
         let snapshot_path = layout.kindb_snapshot_path();
-        let expected_embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
-        match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+        let vector_path = layout.kindb_vector_index_path();
+        // Sampled BEFORE the load so a discard can be told apart from a repo
+        // that simply has no index yet. kin-db reports both as `Ok(false)`, and
+        // announcing the second would fire this on every fresh repository.
+        let had_persisted_index = vector_path.exists();
+        let outcome = kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
             graph,
             &snapshot_path,
-            Some(expected_embedder_identity.as_str()),
-        ) {
+            None,
+        );
+        let discarded = match outcome {
             Ok(true) => {
                 debug!(path = %snapshot_path.display(), "loaded validated persisted vector index");
+                return None;
             }
-            Ok(false) => {}
-            Err(error) => {
-                debug!(
-                    error = %error,
-                    path = %snapshot_path.display(),
-                    "failed to load persisted vector index"
-                );
-            }
-        }
+            Ok(false) if !had_persisted_index => return None,
+            Ok(false) => format!(
+                "the persisted vector index at {} no longer matches this repository's graph or \
+                 embedding model, so it was not loaded",
+                vector_path.display()
+            ),
+            Err(error) => format!(
+                "the persisted vector index at {} could not be read ({error}), so it was not loaded",
+                vector_path.display()
+            ),
+        };
+        warn!(
+            path = %vector_path.display(),
+            "{discarded}; every entity will be embedded again from scratch. \
+             Run `kin embed` to rebuild it now, or `kin health` to watch coverage recover."
+        );
+        Some(discarded)
+    }
+
+    /// Why the persisted vector index was not installed at open, when it was
+    /// there and was not. Reported by `/health` and by semantic-query readiness
+    /// so a coverage counter that restarted at zero comes with its reason.
+    pub fn vector_index_discarded(&self) -> Option<&str> {
+        self.vector_index_discarded.as_deref()
     }
 
     fn spine_disabled() -> bool {
@@ -1872,7 +1928,7 @@ impl DaemonState {
         // `from_snapshot_with_text_index` restores the text index but not the
         // vector sidecar, so without this the reopened repository reports every
         // entity as unembedded and re-derives an index it already has on disk.
-        Self::load_validated_vector_index(&layout, graph.as_ref());
+        let vector_index_discarded = Self::load_validated_vector_index(&layout, graph.as_ref());
 
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         // Seed LKG from persisted graph so the first reconcile after daemon
@@ -1903,6 +1959,7 @@ impl DaemonState {
             graph,
             blobs: Arc::new(blobs),
             ingest_cas_hydration_gap: None,
+            vector_index_discarded,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -2081,7 +2138,7 @@ impl DaemonState {
         // The backend path builds the graph via `from_snapshot_with_text_index`,
         // which does NOT load the vector-index sidecar — do the validated load
         // here (no-ops if no/stale sidecar).
-        Self::load_validated_vector_index(&layout, graph.as_ref());
+        let vector_index_discarded = Self::load_validated_vector_index(&layout, graph.as_ref());
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
 
@@ -2104,6 +2161,7 @@ impl DaemonState {
             graph: Arc::clone(&graph),
             blobs: Arc::new(blobs),
             ingest_cas_hydration_gap,
+            vector_index_discarded,
             reconciler: RwLock::new(reconciler),
             projection: RwLock::new(ProjectionState::new()),
             coordinator,
@@ -4150,11 +4208,14 @@ impl DaemonState {
             self.vector_checkpoint_authority_match
                 .record(generation, live_tree);
         }
-        let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        // No producer identity: kin-db stamps the embedding runtime's own
+        // provider/model/revision/epoch, which is what decides on reload
+        // whether these vectors are still usable. Stamping this binary's build
+        // SHA instead made the sidecar unloadable by the next release.
         kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
-            Some(embedder_identity.as_str()),
+            None,
         )
         .map_err(DaemonError::from)?;
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
@@ -4189,11 +4250,12 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
-        let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        // See `flush_embed_progress`: the sidecar carries the embedding
+        // runtime's identity, never this binary's build SHA.
         kin_db::SnapshotManager::save_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
-            Some(embedder_identity.as_str()),
+            None,
         )
         .map_err(DaemonError::from)
     }
@@ -7773,6 +7835,181 @@ mod tests {
             reported.contains("never hydrated on this open path")
                 && reported.contains("hosted backend carries no authority"),
             "the error must name the hydration gap: {reported}"
+        );
+    }
+
+    /// Build a store carrying one entity and a persisted vector index, and
+    /// stamp the sidecar with `producer` as its producing-artifact identity.
+    ///
+    /// The index is four synthetic dimensions written straight into a
+    /// `VectorIndex`, so no embedding model is loaded and no inference runs.
+    /// That is enough to exercise every gate a real index passes through on
+    /// reopen, because those gates read the sidecar's metadata and the graph's
+    /// authority hash, never the vectors themselves.
+    #[cfg(feature = "vector")]
+    fn store_with_persisted_vector_index(
+        layout: &KinLayout,
+        producer: Option<&str>,
+    ) -> Arc<kin_db::InMemoryGraph> {
+        std::fs::create_dir_all(layout.kindb_dir()).unwrap();
+        let snapshot_path = layout.kindb_snapshot_path();
+        let manager = kin_db::SnapshotManager::new(&snapshot_path);
+        let graph = manager.graph();
+        let entity = test_entity("semantic_query_target", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+
+        // The placeholder binding only has to let the index install; the
+        // `save_vector_index_for_graph` below re-stamps it with the exact model
+        // identity and authority hash, which is what a reopen checks.
+        let placeholder = kin_db::IndexDescriptor {
+            model_id: Some("fixture-model".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let index = kin_db::VectorIndex::new(4).unwrap();
+        index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.set_descriptor(placeholder.clone());
+        index.save(&layout.kindb_vector_index_path()).unwrap();
+        assert!(
+            matches!(
+                graph.load_vector_index_compatible(&layout.kindb_vector_index_path(), &placeholder),
+                kin_db::VectorIndexLoad::Loaded(_)
+            ),
+            "fixture index must install before the store is persisted"
+        );
+
+        manager.save().unwrap();
+        kin_db::SnapshotManager::save_vector_index_for_graph(
+            &snapshot_path,
+            graph.as_ref(),
+            producer,
+        )
+        .unwrap();
+        graph
+    }
+
+    /// The daemon's real open path builds its graph with
+    /// `from_snapshot_with_text_index`, which restores no vector index. Clear
+    /// the fixture's index to reproduce that state exactly.
+    #[cfg(feature = "vector")]
+    fn as_reopened_by_the_daemon(graph: &kin_db::InMemoryGraph) {
+        graph.reset_vector_index();
+        assert_eq!(
+            graph.embedding_status().indexed,
+            0,
+            "a daemon reopen starts with no vector index installed"
+        );
+    }
+
+    /// A Kin upgrade must not throw the user's embeddings away.
+    ///
+    /// Releases before this one pinned index reuse to the daemon's own build
+    /// SHA, which changes on every commit, so moving between any two versions
+    /// rejected the whole index and re-embedded the repository from zero. The
+    /// sidecar here is stamped with a foreign build SHA exactly as an older
+    /// release would have left it, and it must still load: nothing about the
+    /// format, the model, or the graph moved.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn an_index_written_by_a_different_build_survives_the_upgrade() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo_dir.path().join(".kin"));
+        let graph = store_with_persisted_vector_index(
+            &layout,
+            Some("6c1f0a9d3b74e25a8f0c1d6e4b93a27f5d8e0c14"),
+        );
+        as_reopened_by_the_daemon(graph.as_ref());
+
+        let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
+
+        assert_eq!(
+            discarded, None,
+            "an index from another build is not a discard: {discarded:?}"
+        );
+        assert_eq!(
+            graph.embedding_status().indexed,
+            1,
+            "the persisted index must survive a version change, not be re-derived"
+        );
+    }
+
+    /// The other side of the same contract: a sidecar this build genuinely
+    /// cannot use is still refused, and now says so.
+    ///
+    /// A metadata envelope version this build does not know is the real format
+    /// change the old build-SHA pin was standing in for. It must reject, and
+    /// the rejection must name what was discarded rather than land in a debug
+    /// log nobody reads.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_sidecar_in_an_unknown_format_is_refused_and_announced() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo_dir.path().join(".kin"));
+        let graph = store_with_persisted_vector_index(&layout, None);
+        as_reopened_by_the_daemon(graph.as_ref());
+
+        let metadata_path = layout.kindb_dir().join("graph.kvec.meta.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["version"] = json!(u32::MAX);
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
+
+        let reason = discarded.expect("a refused sidecar must be announced, not dropped silently");
+        assert!(
+            reason.contains("graph.kvec") && reason.contains("could not be read"),
+            "the announcement must name what was discarded and why: {reason}"
+        );
+        assert_eq!(
+            graph.embedding_status().indexed,
+            0,
+            "an unreadable sidecar must not be installed"
+        );
+    }
+
+    /// A sidecar bound to a graph that has since moved on describes entities
+    /// this store no longer has, so it is refused and announced too.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn an_index_bound_to_stale_graph_truth_is_refused_and_announced() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo_dir.path().join(".kin"));
+        let graph = store_with_persisted_vector_index(&layout, None);
+        as_reopened_by_the_daemon(graph.as_ref());
+        graph
+            .upsert_entity(&test_entity("added_after_the_index", "src/added.rs"))
+            .unwrap();
+
+        let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
+
+        let reason = discarded.expect("a refused sidecar must be announced, not dropped silently");
+        assert!(
+            reason.contains("graph.kvec") && reason.contains("no longer matches"),
+            "the announcement must name what was discarded and why: {reason}"
+        );
+        assert_eq!(
+            graph.embedding_status().indexed,
+            0,
+            "an index bound to stale graph truth must not be installed"
+        );
+    }
+
+    /// The announcement must distinguish "your index was thrown away" from
+    /// "you have not built one yet". Every repository is in the second state
+    /// until its first embed, and an announcement that fires there is noise
+    /// that trains people to ignore the one that matters.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_repository_with_no_persisted_index_announces_nothing() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo_dir.path().join(".kin"));
+        std::fs::create_dir_all(layout.kindb_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        assert_eq!(
+            DaemonState::load_validated_vector_index(&layout, &graph),
+            None,
+            "a repository that never had an index has had nothing discarded"
         );
     }
 
