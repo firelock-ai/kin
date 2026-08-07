@@ -25395,16 +25395,19 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state);
 
-        let payload =
-            call_semantic_locate(app, json!({ "query": "func", "pipeline": "fused", "include_snippet": true })).await;
+        let payload = call_semantic_locate(
+            app,
+            json!({ "query": "func", "pipeline": "fused", "include_snippet": true }),
+        )
+        .await;
 
         assert_eq!(payload["routing"], "fused-v1");
         let degradations = payload["degradations"]
             .as_array()
             .expect("degradations array present");
-        let has_entity_source_degradation = degradations.iter().any(|d| {
-            d["component"] == "entity_source" && d["reason"] == "source_unreadable"
-        });
+        let has_entity_source_degradation = degradations
+            .iter()
+            .any(|d| d["component"] == "entity_source" && d["reason"] == "source_unreadable");
         assert!(
             has_entity_source_degradation,
             "unreadable entity must be reported in degradations: {payload}"
@@ -25438,12 +25441,17 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let app = router(state);
 
-        let payload =
-            call_semantic_locate(app, json!({ "query": "valid_func", "pipeline": "fused", "include_snippet": true })).await;
+        let payload = call_semantic_locate(
+            app,
+            json!({ "query": "valid_func", "pipeline": "fused", "include_snippet": true }),
+        )
+        .await;
 
         assert_eq!(payload["routing"], "fused-v1");
         if let Some(degradations) = payload.get("degradations").and_then(|d| d.as_array()) {
-            let has_entity_source = degradations.iter().any(|d| d["component"] == "entity_source");
+            let has_entity_source = degradations
+                .iter()
+                .any(|d| d["component"] == "entity_source");
             assert!(
                 !has_entity_source,
                 "clean run must not carry an entity_source degradation entry"
