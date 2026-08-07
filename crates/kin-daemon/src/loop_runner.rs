@@ -3039,6 +3039,10 @@ mod tests {
 
     /// A file wide enough that indexing it takes long enough for a replacement to
     /// land between the reconciler's two reads.
+    ///
+    /// Gated with its only caller: a helper whose call site is platform-gated is
+    /// dead code on every other platform, and no macOS build can see that.
+    #[cfg(unix)]
     fn wide_source(tag: &str) -> Vec<u8> {
         let mut source = String::new();
         for index in 0..4000 {
