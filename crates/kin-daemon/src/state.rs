@@ -4632,6 +4632,21 @@ impl DaemonState {
         self.background_embed_paused.store(false, Ordering::SeqCst);
     }
 
+    /// True when the background embedding worker will still consume whatever is
+    /// queued. Mirrors the three conditions under which the worker stands down:
+    /// a storage-backend graph has no durable vector-sidecar contract so the
+    /// worker never starts, a permanently failed worker has already exited, and
+    /// a paused worker leaves the queue alone until an explicit embed resumes it.
+    ///
+    /// Callers that treat a queued backlog as live work must gate on this.
+    /// A backlog nobody will drain is not work in progress, and counting it as
+    /// such keeps a daemon alive that has nothing left to do.
+    pub fn background_embed_worker_can_drain(&self) -> bool {
+        self.can_persist_embed_progress_locally()
+            && !self.embed_worker_failed.load(Ordering::Relaxed)
+            && !self.background_embed_paused()
+    }
+
     /// Mark a daemon-side embed pass as in flight for the lifetime of the
     /// returned guard. Counter-based so overlapping callers compose; the
     /// guard decrements on drop, including error returns and panic unwinds
