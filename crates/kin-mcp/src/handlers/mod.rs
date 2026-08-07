@@ -17,7 +17,9 @@ pub mod sessions;
 pub mod verification;
 pub mod work;
 
-pub use repository_authority::LocalRepositoryAuthorityBinding;
+pub use repository_authority::{
+    ActiveRepositoryAuthority, LocalRepositoryAuthorityBinding, RequestRepositoryAuthority,
+};
 
 use std::collections::HashMap;
 
@@ -35,7 +37,7 @@ pub async fn handle_tool_call<G: GraphStore>(
     store: &G,
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     match tool_name {
         // Exact repository membership and bytes
@@ -815,7 +817,15 @@ mod tests {
         initialize_test_repository(root, &change);
     }
 
-    fn test_repository_authority(
+    /// The default arm: a request that opens authority for itself. Tests that
+    /// bound the open COUNT depend on this staying the pinned arm, because a
+    /// shared open would hold that count flat whether or not the path under
+    /// test still holds authority once per request.
+    fn test_repository_authority(root: &std::path::Path) -> RequestRepositoryAuthority {
+        RequestRepositoryAuthority::pinned(test_repository_binding(root))
+    }
+
+    fn test_repository_binding(
         root: &std::path::Path,
     ) -> kin_core::LocalRepositoryAuthorityBinding {
         let layout = kin_core::KinLayout::discover(root)
@@ -2682,7 +2692,8 @@ mod tests {
 
         // The bootstrap mints its own artifact ids, so the update has to name the
         // identity that actually occupies the path rather than the fixture's.
-        let admitted = super::repository_authority::ActiveRepositoryAuthority::open(&authority)
+        let admitted = authority
+            .open_fresh()
             .unwrap()
             .workspace()
             .unwrap()
@@ -4891,12 +4902,7 @@ mod tests {
         before: &str,
         after: &str,
         stamp: SpanStamp,
-    ) -> (
-        Entity,
-        EmptyStore,
-        kin_core::LocalRepositoryAuthorityBinding,
-        Hash256,
-    ) {
+    ) -> (Entity, EmptyStore, RequestRepositoryAuthority, Hash256) {
         let kin_dir = dir.join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();
         let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
@@ -6029,12 +6035,14 @@ mod tests {
         initialize_release_test_repository(dir.path(), store);
         let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-        let authority = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let authority = RequestRepositoryAuthority::pinned(
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap(),
+        );
         verification::handle_release_check(args, store, Some(&authority))
     }
 
     pub(super) fn with_empty_test_repository<T>(
-        call: impl FnOnce(&kin_core::LocalRepositoryAuthorityBinding) -> T,
+        call: impl FnOnce(&RequestRepositoryAuthority) -> T,
     ) -> T {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
@@ -6043,8 +6051,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let init = kin_core::init(dir.path()).unwrap();
         let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
-        let authority =
-            kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let authority = RequestRepositoryAuthority::pinned(
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap(),
+        );
         call(&authority)
     }
 

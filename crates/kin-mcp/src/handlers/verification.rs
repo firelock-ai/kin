@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use kin_core::LocalRepositoryAuthorityBinding;
+use super::repository_authority::RequestRepositoryAuthority;
 use kin_model::graph::GraphStore;
 
 use crate::error::{McpError, Result};
@@ -213,7 +213,7 @@ fn release_optional_entity_count(
 pub fn handle_release_check<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let require_proof = release_optional_bool(args, "require_proof", false)?;
     let require_approval = release_optional_bool(args, "require_approval", false)?;
@@ -231,8 +231,12 @@ pub fn handle_release_check<G: GraphStore>(
                 .to_string(),
         )
     })?;
-    let authority =
-        super::repository_authority::ActiveRepositoryAuthority::open(repository_authority)?;
+    // Both opens on this path load from storage rather than reading through an
+    // authority a server already holds. The pair exists to compare the branch
+    // head before the source checks against the head after them, and two reads
+    // of one shared open are the same read: it describes the publication its
+    // owner sampled, so a move that landed since could not appear in either.
+    let authority = repository_authority.open_fresh()?;
     let mut branches = authority
         .repository_refs()
         .into_iter()
@@ -347,8 +351,7 @@ pub fn handle_release_check<G: GraphStore>(
     // This tool is advisory and cannot hold the daemon's mutation gate, but it
     // must at least detect a branch move that happened while the source checks
     // above were running. Publication still performs the authoritative CAS.
-    let final_authority =
-        super::repository_authority::ActiveRepositoryAuthority::open(repository_authority)?;
+    let final_authority = repository_authority.open_fresh()?;
     let final_branch = final_authority.repository_ref(&branch.name);
     let final_branch_head = final_branch
         .as_ref()

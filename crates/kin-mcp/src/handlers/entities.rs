@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use kin_core::LocalRepositoryAuthorityBinding;
+use super::repository_authority::RequestRepositoryAuthority;
 use kin_model::entity::EntityKind;
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::relation::RelationKind;
@@ -158,7 +158,7 @@ get_entity_source when you actually need to read the code.";
 pub fn handle_get_entity<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
@@ -195,7 +195,7 @@ trace_data_flow when you also need the entity's neighborhood rather than just it
 pub fn handle_get_entity_source<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let id_str = get_string_param(args, "entity_id")?;
     let entity_id = parse_entity_id(&id_str)?;
@@ -558,7 +558,7 @@ fn resolve_entity_source_generic<G: GraphStore>(
 pub fn handle_get_entity_sources<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let (entity_ids, opts) = parse_batch_source_args(args)?;
     // A batch is one request: it holds authority once for every id it resolves.
@@ -590,7 +590,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     use kin_context::{build_context_pack_with_traffic, ContextOptions};
     use kin_model::context::TokenBudget;
@@ -788,7 +788,7 @@ pub fn handle_trace_computation<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     sessions: &SessionRegistry,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let mut merged: HashMap<String, serde_json::Value> = args.clone();
 
@@ -1009,7 +1009,7 @@ fn daemon_spine_xref(
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     handle_find_references_with_authority_source(
         args,
@@ -1031,7 +1031,7 @@ pub async fn handle_find_references_with_ambient_binding<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     binding: AmbientCrossRepoBinding,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     handle_find_references_with_authority_source(
         args,
@@ -1051,7 +1051,7 @@ pub async fn handle_find_references_with_authority<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     authority: FindReferencesAuthority<'_>,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     handle_find_references_with_authority_source(
         args,
@@ -1066,7 +1066,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     authority_source: FindReferencesAuthoritySource<'_>,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
@@ -1620,7 +1620,7 @@ get_context_pack, find_references, trace_data_flow) let you go deeper precisely.
 pub fn handle_explore_codebase<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     use kin_context::{build_context_pack, estimate_tokens, ContextOptions};
     use kin_model::context::TokenBudget;
