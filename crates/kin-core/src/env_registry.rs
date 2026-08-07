@@ -718,7 +718,7 @@ pub fn enforce_startup_env() -> Result<(), String> {
         }
         tracing::warn!(
             unknown = %report.unknown.join(", "),
-            "unrecognized KIN_* environment variable(s); possible typo — these have no effect (see docs/env-vars.md)"
+            "unrecognized KIN_* environment variable(s); these have no effect and are probably typos (see docs/env-vars.md)"
         );
     }
 
