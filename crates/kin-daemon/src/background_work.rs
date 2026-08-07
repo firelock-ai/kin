@@ -41,6 +41,27 @@ use kin_cli::commands::resources::{BackgroundPassReport, DaemonWorkState};
 pub const PASS_EMBED: &str = "embed";
 /// The filesystem reconciliation loop.
 pub const PASS_RECONCILE: &str = "reconcile";
+/// The LSP enrichment worker.
+pub const PASS_LSP: &str = "lsp_enrichment";
+/// The startup projection rebuild. Disclosed only; see [`PassEnforcement`].
+pub const PASS_PROJECTION: &str = "projection_rebuild";
+
+/// Whether the supervisor may stop a pass, or only report on it.
+///
+/// Stopping is cooperative: the supervisor raises a flag and the pass reads it at
+/// its own checkpoint. A pass with no checkpoint therefore cannot be stopped, and
+/// halting one anyway would publish a `stopped` state and a reason for work that
+/// is still running. A watchdog that reports a stop it did not perform is worse
+/// than one that reports nothing, so the distinction is in the type rather than
+/// left to whoever registers next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassEnforcement {
+    /// The pass polls [`BackgroundPass::halted`] and will stop when told.
+    Stoppable,
+    /// The pass has nowhere to observe a halt. It is disclosed — working
+    /// stretch, progress age, CPU — and never claimed to have been stopped.
+    DiscloseOnly,
+}
 
 /// How long a pass may hold the CPU with no persisted progress before the daemon
 /// stops it.
@@ -92,6 +113,7 @@ pub fn configured_retry_budget() -> Duration {
 #[derive(Debug)]
 pub struct BackgroundPass {
     name: &'static str,
+    enforcement: PassEnforcement,
     /// Mirrors `inner.halt.is_some()` so a pass can poll its own checkpoint
     /// without taking the lock. Published after the reason, so a reader that
     /// observes `true` always finds a reason behind it.
@@ -115,9 +137,10 @@ struct PassInner {
 }
 
 impl BackgroundPass {
-    fn new(name: &'static str) -> Self {
+    fn new(name: &'static str, enforcement: PassEnforcement) -> Self {
         Self {
             name,
+            enforcement,
             halted: AtomicBool::new(false),
             inner: Mutex::new(PassInner {
                 progress: 0,
@@ -127,6 +150,11 @@ impl BackgroundPass {
                 retry_spent: Duration::ZERO,
             }),
         }
+    }
+
+    /// Whether the supervisor may stop this pass or only report on it.
+    pub fn enforcement(&self) -> PassEnforcement {
+        self.enforcement
     }
 
     /// A poisoned lock must not disarm the watchdog. A panic elsewhere in the
@@ -338,6 +366,20 @@ impl BackgroundWorkSupervisor {
     /// worker without its feature, the reconcile loop on a bare repository —
     /// never appears in the report claiming to be idle when it does not exist.
     pub fn pass(&self, name: &'static str) -> Arc<BackgroundPass> {
+        self.register(name, PassEnforcement::Stoppable)
+    }
+
+    /// The handle for a pass the supervisor may report on but never stop.
+    ///
+    /// For work with no checkpoint between start and finish. It still answers
+    /// "why is my fan on" through its working stretch and progress age, which is
+    /// the disclosure the product owes; what it does not do is claim a stop that
+    /// could not happen.
+    pub fn disclosed_pass(&self, name: &'static str) -> Arc<BackgroundPass> {
+        self.register(name, PassEnforcement::DiscloseOnly)
+    }
+
+    fn register(&self, name: &'static str, enforcement: PassEnforcement) -> Arc<BackgroundPass> {
         if let Some(pass) = self.passes().get(name) {
             return Arc::clone(pass);
         }
@@ -345,7 +387,7 @@ impl BackgroundWorkSupervisor {
         Arc::clone(
             passes
                 .entry(name)
-                .or_insert_with(|| Arc::new(BackgroundPass::new(name))),
+                .or_insert_with(|| Arc::new(BackgroundPass::new(name, enforcement))),
         )
     }
 
@@ -381,6 +423,13 @@ impl BackgroundWorkSupervisor {
                 continue;
             }
             if !is_stalled(working_for, since_progress, self.stall_threshold) {
+                continue;
+            }
+            // A pass with no checkpoint cannot honour a halt, so raising one
+            // would publish `stopped` for work that is still running. It stays
+            // disclosed — its working stretch and progress age keep climbing
+            // where a user can see them — and is not announced as stopped.
+            if pass.enforcement() == PassEnforcement::DiscloseOnly {
                 continue;
             }
             let working_for = working_for.unwrap_or_default();
@@ -564,6 +613,53 @@ mod tests {
             .halt_reason()
             .expect("a stopped pass carries a reason")
             .contains("without recording any progress"));
+    }
+
+    /// A pass with nowhere to read a halt must never be announced as stopped.
+    ///
+    /// Paired with the test above rather than written alone: the two run the
+    /// identical wedged scenario and differ only in how the pass registered, so
+    /// a sweep that stopped everything, or one that stopped nothing, fails one
+    /// of them. The projection rebuild is the real case — a single `await` with
+    /// no loop — and publishing `stopped` for work still running would make the
+    /// health surface lie about the one thing it exists to report.
+    #[test]
+    fn a_disclose_only_pass_is_reported_but_never_claimed_stopped() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.disclosed_pass(PASS_PROJECTION);
+        let base = Instant::now();
+
+        pass.working(base);
+        assert!(
+            supervisor.sweep(at(base, 61)).is_empty(),
+            "a pass that cannot observe a halt must not be stopped by the sweep"
+        );
+        assert!(!pass.halted());
+        assert_eq!(pass.halt_reason(), None);
+        assert!(!supervisor.any_stopped());
+
+        // It is still disclosed: the working stretch is what answers "why is my
+        // fan on" for work the supervisor cannot end.
+        let report = supervisor
+            .reports(at(base, 61))
+            .into_iter()
+            .find(|report| report.name == PASS_PROJECTION)
+            .expect("a disclose-only pass still reports");
+        assert_eq!(report.state, "working");
+        assert_eq!(report.working_seconds, Some(61));
+    }
+
+    #[test]
+    fn registration_records_which_passes_the_supervisor_may_stop() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        assert_eq!(
+            supervisor.pass(PASS_LSP).enforcement(),
+            PassEnforcement::Stoppable
+        );
+        assert_eq!(
+            supervisor.disclosed_pass(PASS_PROJECTION).enforcement(),
+            PassEnforcement::DiscloseOnly
+        );
     }
 
     /// The other half of the same scenario. Only the progress feed differs, so a
