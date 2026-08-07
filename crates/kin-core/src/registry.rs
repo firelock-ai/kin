@@ -688,26 +688,39 @@ fn normalized_parent(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// A sibling creating the same ancestor chain publishes each directory before
+/// its mode settles, so traversal can be refused by the kernel for as long as
+/// that thread stays descheduled. Only a kernel `EACCES` is transient; a policy
+/// refusal carries no OS error and stays terminal.
+#[cfg(unix)]
+const REGISTRY_CREATE_RACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(unix)]
+fn is_transient_traversal_refusal(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EACCES)
+}
+
 #[cfg(unix)]
 fn prepare_anchor(path: &Path) -> Result<RegistryAnchor, Box<dyn std::error::Error>> {
-    let mut last_permission_error = None;
-    for _ in 0..50 {
-        match RegistryAnchor::open(path) {
+    let deadline = std::time::Instant::now() + REGISTRY_CREATE_RACE_TIMEOUT;
+    loop {
+        let refusal = match RegistryAnchor::open(path) {
             Ok(anchor) => return Ok(anchor),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let parent = create_private_dir_all(&normalized_parent(path))?;
-                return Ok(RegistryAnchor::from_parent(path, parent)?);
+                match create_private_dir_all(&normalized_parent(path)) {
+                    Ok(parent) => return Ok(RegistryAnchor::from_parent(path, parent)?),
+                    Err(err) if is_transient_traversal_refusal(&err) => err,
+                    Err(err) => return Err(Box::new(err)),
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                last_permission_error = Some(err);
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            Err(err) if is_transient_traversal_refusal(&err) => err,
             Err(err) => return Err(Box::new(err)),
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(Box::new(refusal));
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    Err(Box::new(last_permission_error.unwrap_or_else(|| {
-        std::io::Error::other("registry parent create race did not converge")
-    })))
 }
 
 #[cfg(unix)]
@@ -820,8 +833,8 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<File> {
 fn open_directory_after_create_race(parent: &File, name: &std::ffi::CStr) -> std::io::Result<File> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    let mut last_error = None;
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + REGISTRY_CREATE_RACE_TIMEOUT;
+    loop {
         // SAFETY: the retained parent fd and NUL-terminated name are valid.
         // O_NOFOLLOW prevents a raced symlink from becoming a creation anchor.
         let fd = unsafe {
@@ -836,19 +849,15 @@ fn open_directory_after_create_race(parent: &File, name: &std::ffi::CStr) -> std
             return Ok(unsafe { File::from_raw_fd(fd) });
         }
         let err = std::io::Error::last_os_error();
-        if matches!(
+        if !matches!(
             err.kind(),
             std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-        ) {
-            last_error = Some(err);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            continue;
+        ) || std::time::Instant::now() >= deadline
+        {
+            return Err(err);
         }
-        return Err(err);
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::other("registry directory create race did not converge")
-    }))
 }
 
 #[cfg(unix)]
@@ -1195,8 +1204,8 @@ fn open_private_lock_at(anchor: &RegistryAnchor) -> std::io::Result<File> {
 
 #[cfg(unix)]
 fn open_lock_after_create_race(anchor: &RegistryAnchor) -> std::io::Result<File> {
-    let mut last_error = None;
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + REGISTRY_CREATE_RACE_TIMEOUT;
+    loop {
         match open_at(
             anchor,
             &anchor.lock_name,
@@ -1210,14 +1219,14 @@ fn open_lock_after_create_race(anchor: &RegistryAnchor) -> std::io::Result<File>
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
                 ) =>
             {
-                last_error = Some(err);
+                if std::time::Instant::now() >= deadline {
+                    return Err(err);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(err) => return Err(err),
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| std::io::Error::other("registry lock create race did not converge")))
 }
 
 #[cfg(unix)]
