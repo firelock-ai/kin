@@ -73,9 +73,10 @@ fn run_git(path: &Path, args: &[&str]) {
 
 /// Build the one fixture both admissions read.
 ///
-/// The rename in the second commit is load-bearing: artifact identity has to
-/// survive a path change, so a derivation keyed on the current path would pass
-/// a fixture without one and still be wrong.
+/// The rename in the second commit is load-bearing: it forces a later commit to
+/// mint identity for a path its parent tree has none for, which is the only
+/// case the derivation runs at all. A single-commit fixture would exercise the
+/// root-commit case and nothing else.
 fn seed_git_repo(path: &Path) {
     fs::create_dir_all(path).expect("create repo dir");
     run_git(path, &["init", "--initial-branch=main"]);

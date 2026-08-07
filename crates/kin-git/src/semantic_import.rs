@@ -783,9 +783,12 @@ fn assign_artifact_identities(
 /// opposite of content addressing and is what left two clones unable to agree
 /// on a single graph root.
 ///
-/// Keyed on the *introducing* commit rather than the current path, so identity
-/// survives a rename — the property that makes an artifact id worth carrying at
-/// all rather than just using the path.
+/// This runs only for a path the parent tree has no identity for. Continuity
+/// across a commit comes from reusing the first parent's id, and across a merge
+/// from the secondary-candidate matching above; neither is changed here. So the
+/// commit in the key is the commit that *introduced* the path, and the id stays
+/// a fact about where content entered history rather than about where the file
+/// currently sits.
 ///
 /// Two repositories deriving one id means they share the commit and the path,
 /// so they hold the same content under the same identity, which is the intended
