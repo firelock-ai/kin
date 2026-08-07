@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-08-07
+
+### Changed
+
+- Add a repo map and architecture diagram to the README (#643)
+- Instrument every init phase and stop the terminal going silent (#644)
+- Report a retrieval profile serving with levers off as needing attention (#646)
+- Give the configured agent profile the tool for the question Kin is described by (#647)
+- Describe the Homebrew tap by its mechanism, and name the languages Kin parses (#649)
+- Report expected first-run states as skipped rather than failed (#648)
+- Say which languages Kin parses, and say so when it parsed none (#652)
+- Wait out a lock the dead daemon has not finished releasing (#656)
+- Stop init printing one blank line per commit (#651)
+- Qualify coverage_summary's number instead of stating it as repository fact (#655)
+- Split the bootstrap commit into named stages (#654)
+- Identify a macOS boot by the kernel's boot session, not by wall time (#653)
+- chore(ci): pin kin-actions v0.1.22 (#667)
+- fix(locate): handle unreadable entity source gracefully with degradation reporting (#657)
+- Name the fix in the shallow-clone and submodule init refusals (#660)
+- Name the checkout filter instead of accusing a clean tree of unstaged edits (#663)
+- Let a recovered release publish, and stop one unreadable attempt vetoing a repeat (#661)
+- Record v0.5.6 as abandoned so the release rail stops holding on it (#665)
+- Refuse assistant-session traces in the pull request title and body (#662)
+- Keep an idle timeout from discarding work the daemon is still doing (#664)
+- chore(ci): pin kin-actions v0.1.23 (#670)
+- Answer refs and impact from graph truth when a declaration owns no edges (#658)
+- Install as the user who ran the installer, and configure a shell the host has (#671)
+- Keep the vector index across upgrades, and say so when one is discarded (#669)
+- chore(ci): pin kin-actions v0.1.24 (#677)
+- Stop the agent-facing surface behaving worse than the human-facing one (#672)
+- Report what the store costs on disk and what it costs next to Git (#668)
+- Hold one repository authority for a whole trace instead of one per step (#673)
+- Announce the background embedding pass, and let an operator decline it (#666)
+- Reuse a read index that already describes the loaded generation (#675)
+- chore(ci): pin kin-actions v0.1.25 (#679)
+- Copy a captured Git repository under one source authority envelope (#674)
+- Stop rebuilding the semantic universe by value on every commit of history (#676)
+- Stop a trace walk when the requester stops waiting for it (#678)
+
+
 ## [0.5.6] - 2026-08-06
 
 ### Changed
