@@ -75,6 +75,18 @@ printf '\n'
 
 info "Platform: $OS ($ARCH)"
 
+# ── Declare the one host tool Kin needs but does not install ──────────
+
+# Installing Kin needs no git, and Kin reads a repository's Git history itself
+# rather than shelling out for it. The host binary is still required in two
+# places a first-run user reaches immediately: `kin setup` validates workspace
+# MCP authority through git when it runs inside a Git repository, and adopting
+# an existing project means committing it to Git first, which `kin init` asks
+# for. Declaring that here beats letting the first real command fail on it.
+if ! has_cmd git; then
+    info 'git not found. Kin installs and runs without it, but `kin setup` inside a Git repository and adopting an existing project both require it.'
+fi
+
 # ── Detect an existing install (reinstall / upgrade) ──────────────────
 
 PREVIOUS_VERSION=""
@@ -190,12 +202,32 @@ info "Installing to $KIN_DIR..."
 
 mkdir -p "$KIN_BIN" "$KIN_LIB"
 
-tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
+# Everything under $KIN_DIR must end owned by the user doing the install. GNU
+# tar restores the uid/gid recorded in the archive when it runs as root, and
+# release archives are built by CI under an unrelated uid, so a root install
+# otherwise lands foreign-owned binaries and a foreign-owned projection shim in
+# the user's own home. Kin then refuses to verify the shim it just installed
+# ("managed config is not owned by the current user") and `kin doctor` reports
+# the install ledger STALE on a perfectly good install.
+#
+# --no-same-owner is the fix, but it is not universal: busybox tar spells it -o
+# and rejects the long option. Fall back to a plain extraction and repair the
+# ownership directly, which is the only case where the chown has anything to do.
+if ! tar --no-same-owner -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" 2>/dev/null; then
+    tar xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
+fi
 
 # Find the extracted directory (archive contains a subdirectory)
 EXTRACT_DIR=$(find "$TMPDIR" -maxdepth 1 -type d -name "kin-*" | head -1)
 if [ -z "$EXTRACT_DIR" ]; then
     EXTRACT_DIR="$TMPDIR"
+fi
+
+# Only root can be handed foreign ownership by tar, and only root can repair it.
+# Every file below is moved, not copied, so fixing the extracted tree here is
+# what makes the installed tree caller-owned.
+if [ "$(id -u)" = "0" ]; then
+    chown -R "$(id -u):$(id -g)" "$EXTRACT_DIR" 2>/dev/null || true
 fi
 
 # kin-daemon is mandatory — `kin status`/`kin search` and the MCP server all

@@ -1223,7 +1223,34 @@ pub(crate) fn detect_shell() -> &'static str {
         return "powershell";
     }
 
-    "zsh"
+    fallback_shell()
+}
+
+/// The shell to configure when nothing in the environment names one.
+///
+/// `SHELL` is unset in containers, cron, and most non-login invocations, which
+/// is exactly where first-run happens. A flat default of zsh then wrote the hook
+/// and the PATH line into a `.zshrc` on hosts with no zsh installed, reported
+/// that as shell integration installed, and disagreed with the installer, which
+/// had already chosen `.bashrc` for the same install. Choose a shell the host
+/// actually has, in the platform's own order of preference, so the two agree.
+fn fallback_shell() -> &'static str {
+    // On Windows the PowerShell markers above are the signal Kin acts on, and a
+    // Git-for-Windows PATH routinely carries a bash that is not the shell anyone
+    // configures Kin for. Leave that platform on its historical default.
+    if cfg!(target_os = "windows") {
+        return "zsh";
+    }
+
+    let ordered: [&'static str; 3] = if cfg!(target_os = "macos") {
+        ["zsh", "bash", "fish"]
+    } else {
+        ["bash", "zsh", "fish"]
+    };
+    ordered
+        .into_iter()
+        .find(|shell| check_binary_in_path(shell).is_some())
+        .unwrap_or(ordered[0])
 }
 
 pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
@@ -2060,6 +2087,40 @@ fn rc_declares_kin_bin(content: &str, bin_dir: &Path) -> bool {
     content.contains(bin.as_ref()) || content.contains(".kin/bin") || content.contains("kin/bin")
 }
 
+/// Whether this `kin` is the binary the published installer placed in
+/// `~/.kin/bin`, rather than one built from a source checkout.
+fn is_managed_install(exe: Option<&Path>, kin_home: &Path) -> bool {
+    let Some(exe_dir) = exe.and_then(Path::parent) else {
+        return false;
+    };
+    let managed_bin = kin_home.join("bin");
+    match (exe_dir.canonicalize(), managed_bin.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => exe_dir == managed_bin,
+    }
+}
+
+/// Headline and command to print when the projection shim is missing.
+///
+/// A cargo target is the right remedy only for someone running a `kin` they
+/// built from this source tree. A user who installed through the published
+/// one-liner has neither a checkout nor cargo, so naming a cargo build sends
+/// them to a command they cannot run; the installer that ships the shim is
+/// their route back, and it is the same remedy `kin doctor` already gives.
+fn missing_shim_guidance(exe: Option<&Path>, kin_home: &Path) -> (&'static str, &'static str) {
+    if is_managed_install(exe, kin_home) {
+        (
+            "VFS shim not found. Reinstall Kin to restore it:",
+            crate::daemon_client::KIN_INSTALL_COMMAND,
+        )
+    } else {
+        (
+            "VFS shim not found. Build it with:",
+            "cargo build --release -p kin-vfs-shim",
+        )
+    }
+}
+
 fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
     let kin_home = kin_dir()?;
     let bin_dir = kin_home.join("bin");
@@ -2093,57 +2154,99 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
             }
         }
     } else {
-        println!("  VFS shim not found. Build it with:");
-        println!("    cargo build --release -p kin-vfs-shim");
+        let (headline, command) =
+            missing_shim_guidance(env::current_exe().ok().as_deref(), &kin_home);
+        println!("  {headline}");
+        println!("    {command}");
     }
 
     let source_line = rc_source_line(shell_name, &hook_file);
 
     let rc_path = shell_rc(shell_name)?;
-    let mut rc_content = if rc_path.exists() {
+    let rc_content = if rc_path.exists() {
         fs::read_to_string(&rc_path)?
     } else {
         String::new()
     };
-    let hook_installed = rc_content.contains("kin-vfs");
-    let path_installed = rc_declares_kin_bin(&rc_content, &bin_dir);
 
-    if hook_installed {
-        println!(
-            "  Shell rc already sources kin-vfs hook: {}",
-            rc_path.display()
-        );
-    } else {
-        if !rc_content.ends_with('\n') && !rc_content.is_empty() {
-            rc_content.push('\n');
-        }
-        rc_content.push_str(&rc_integration_block(&source_line));
-        println!("  Appended to {}", rc_path.display());
+    let update = plan_rc_update(&rc_content, shell_name, &source_line, &rc_path, &bin_dir);
+    for line in &update.already_present {
+        println!("{line}");
     }
-
-    if path_installed {
-        println!("  Shell rc already adds {} to PATH", bin_dir.display());
-    } else {
-        if !rc_content.ends_with('\n') && !rc_content.is_empty() {
-            rc_content.push('\n');
-        }
-        rc_content.push_str(&rc_path_block(shell_name, &bin_dir));
-        println!(
-            "  Added {} to PATH for new shell sessions",
-            bin_dir.display()
-        );
-    }
-
-    if !hook_installed || !path_installed {
+    if !update.applied.is_empty() {
         if let Some(parent) = rc_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        fs::write(&rc_path, &rc_content)
+        fs::write(&rc_path, &update.content)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
+        for line in &update.applied {
+            println!("{line}");
+        }
     }
 
     Ok((hook_file, source_line))
+}
+
+/// The rc file Kin wants on disk, split from what it may say about it.
+///
+/// `applied` is non-empty exactly when a write is needed, and every line in it
+/// describes rc state that exists only once that write lands. Keeping the two
+/// apart is what stops setup announcing "Appended to ~/.zshrc" and then failing
+/// the run out from under the claim.
+#[derive(Debug)]
+struct RcUpdate {
+    content: String,
+    applied: Vec<String>,
+    already_present: Vec<String>,
+}
+
+fn plan_rc_update(
+    existing: &str,
+    shell_name: &str,
+    source_line: &str,
+    rc_path: &Path,
+    bin_dir: &Path,
+) -> RcUpdate {
+    let mut content = existing.to_string();
+    let mut applied = Vec::new();
+    let mut already_present = Vec::new();
+
+    let append = |content: &mut String, block: &str| {
+        if !content.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(block);
+    };
+
+    if existing.contains("kin-vfs") {
+        already_present.push(format!(
+            "  Shell rc already sources kin-vfs hook: {}",
+            rc_path.display()
+        ));
+    } else {
+        append(&mut content, &rc_integration_block(source_line));
+        applied.push(format!("  Appended to {}", rc_path.display()));
+    }
+
+    if rc_declares_kin_bin(existing, bin_dir) {
+        already_present.push(format!(
+            "  Shell rc already adds {} to PATH",
+            bin_dir.display()
+        ));
+    } else {
+        append(&mut content, &rc_path_block(shell_name, bin_dir));
+        applied.push(format!(
+            "  Added {} to PATH for new shell sessions",
+            bin_dir.display()
+        ));
+    }
+
+    RcUpdate {
+        content,
+        applied,
+        already_present,
+    }
 }
 
 /// Reinstall the shell hook + rc source line for the detected shell.
@@ -14664,6 +14767,13 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
     #[test]
     #[serial]
     fn detect_shell_uses_powershell_markers_when_no_posix_shell_names_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        // Pin the host evidence the nothing-named-itself fallback reads, so this
+        // test stays about the markers on every platform.
+        write_stub_shell(&bin, "zsh");
+        let _path = EnvVarGuard::set("PATH", &bin);
+
         let mut shell_env = EnvVarGuard::unset("SHELL")
             .without("PSModulePath")
             .without("PSVersionTable");
@@ -14677,6 +14787,153 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
         // still decide.
         shell_env.apply("SHELL", Some("/usr/bin/false"));
         assert_eq!(detect_shell(), "powershell");
+    }
+
+    fn write_stub_shell(bin: &Path, name: &str) {
+        fs::create_dir_all(bin).unwrap();
+        let shell = bin.join(name);
+        fs::write(&shell, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mut permissions = fs::metadata(&shell).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&shell, permissions).unwrap();
+        }
+    }
+
+    /// `SHELL` is unset in containers, cron, and most non-login invocations —
+    /// exactly where first-run happens. Measured on ubuntu:24.04, a flat zsh
+    /// default wrote the hook into a `.zshrc` on a host with no zsh, while the
+    /// installer had already chosen `.bashrc` for the same install.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn detect_shell_falls_back_to_a_shell_the_host_actually_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        let _shell_env = EnvVarGuard::unset("SHELL")
+            .without("PSModulePath")
+            .without("PSVersionTable");
+        let _path = EnvVarGuard::set("PATH", &bin);
+
+        write_stub_shell(&bin, "bash");
+        assert_eq!(
+            detect_shell(),
+            "bash",
+            "a host carrying only bash must be configured as bash"
+        );
+
+        fs::remove_file(bin.join("bash")).unwrap();
+        write_stub_shell(&bin, "zsh");
+        assert_eq!(
+            detect_shell(),
+            "zsh",
+            "a host carrying only zsh must be configured as zsh"
+        );
+
+        // Both present: the platform's own preference decides, and it is the
+        // same one the installer applies when it picks an rc file.
+        write_stub_shell(&bin, "bash");
+        let expected = if cfg!(target_os = "macos") {
+            "zsh"
+        } else {
+            "bash"
+        };
+        assert_eq!(detect_shell(), expected);
+
+        // No shell resolvable at all still yields the platform default rather
+        // than failing setup.
+        fs::remove_file(bin.join("bash")).unwrap();
+        fs::remove_file(bin.join("zsh")).unwrap();
+        assert_eq!(
+            detect_shell(),
+            if cfg!(target_os = "macos") {
+                "zsh"
+            } else {
+                "bash"
+            }
+        );
+    }
+
+    /// A curl-installed user has neither a checkout nor cargo, so naming a cargo
+    /// target as the remedy sends them to a command they cannot run.
+    #[test]
+    fn missing_shim_guidance_routes_managed_installs_to_the_installer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let managed_bin = kin_home.join("bin");
+        fs::create_dir_all(&managed_bin).unwrap();
+
+        let (headline, command) = missing_shim_guidance(Some(&managed_bin.join("kin")), &kin_home);
+        assert_eq!(command, crate::daemon_client::KIN_INSTALL_COMMAND);
+        assert!(
+            !headline.contains("cargo") && !command.contains("cargo"),
+            "a managed install must never be told to build the shim: {headline} / {command}"
+        );
+    }
+
+    #[test]
+    fn missing_shim_guidance_keeps_the_cargo_build_for_source_checkouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        let checkout_bin = tmp.path().join("checkout").join("target").join("release");
+        fs::create_dir_all(&checkout_bin).unwrap();
+
+        let (_headline, command) =
+            missing_shim_guidance(Some(&checkout_bin.join("kin")), &kin_home);
+        assert_eq!(command, "cargo build --release -p kin-vfs-shim");
+    }
+
+    #[test]
+    fn missing_shim_guidance_without_a_resolvable_exe_does_not_claim_a_managed_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let (_headline, command) = missing_shim_guidance(None, &kin_home);
+        assert_eq!(command, "cargo build --release -p kin-vfs-shim");
+    }
+
+    /// `applied` is the exact set of claims that become true only when the rc
+    /// write lands, so an rc that already carries both blocks must produce none
+    /// — there is no write, and nothing to announce.
+    #[test]
+    fn plan_rc_update_announces_only_what_a_write_would_change() {
+        let rc_path = Path::new("/home/u/.zshrc");
+        let bin_dir = Path::new("/home/u/.kin/bin");
+        let source_line = "source /home/u/.kin/shell/kin-vfs.zsh";
+
+        let fresh = plan_rc_update("", "zsh", source_line, rc_path, bin_dir);
+        assert_eq!(fresh.applied.len(), 2, "{:?}", fresh.applied);
+        assert!(fresh.already_present.is_empty());
+        assert!(fresh.content.contains(source_line));
+        assert!(fresh.content.contains(&rc_path_line("zsh", bin_dir)));
+
+        let settled = plan_rc_update(&fresh.content, "zsh", source_line, rc_path, bin_dir);
+        assert!(
+            settled.applied.is_empty(),
+            "nothing is written on a second run, so nothing may be claimed: {:?}",
+            settled.applied
+        );
+        assert_eq!(settled.already_present.len(), 2);
+        assert_eq!(settled.content, fresh.content);
+    }
+
+    #[test]
+    fn plan_rc_update_claims_only_the_half_that_is_missing() {
+        let rc_path = Path::new("/home/u/.bashrc");
+        let bin_dir = Path::new("/home/u/.kin/bin");
+        let source_line = "source /home/u/.kin/shell/kin-vfs.bash";
+
+        let hook_only = format!("{}\n", rc_integration_block(source_line));
+        let update = plan_rc_update(&hook_only, "bash", source_line, rc_path, bin_dir);
+        assert_eq!(update.applied.len(), 1, "{:?}", update.applied);
+        assert!(update.applied[0].contains("PATH"));
+        assert_eq!(update.already_present.len(), 1);
+        assert!(update.already_present[0].contains("already sources"));
     }
 
     #[test]

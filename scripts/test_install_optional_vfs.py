@@ -11,6 +11,7 @@ import hashlib
 import os
 import platform
 import pty
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -43,6 +44,8 @@ def executable(path: Path, body: str) -> None:
 
 
 class OptionalVfsInstallerTests(unittest.TestCase):
+    tar_argv_log: Path | None = None
+
     def run_installer(
         self,
         *,
@@ -54,6 +57,8 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         existing_notifier: bool = False,
         seed_current_install: bool = False,
         seed_launcher_stamp: bool = False,
+        archive_owner: tuple[int, int] | None = None,
+        tar_stub: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -95,9 +100,20 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         release_dir = root / "download" / f"v{VERSION}"
         release_dir.mkdir(parents=True)
         archive = release_dir / f"kin-{target}.tar.gz"
+        def stamp_archive_owner(info: tarfile.TarInfo) -> tarfile.TarInfo:
+            if archive_owner is not None:
+                info.uid, info.gid = archive_owner
+                # Empty names force tar to honour the numeric ids, which is what
+                # a release archive built on a CI runner effectively carries.
+                info.uname = ""
+                info.gname = ""
+            return info
+
         with tarfile.open(archive, "w:gz") as bundle:
             bundle.dereference = False
-            bundle.add(archive_root, arcname=archive_root.name)
+            bundle.add(
+                archive_root, arcname=archive_root.name, filter=stamp_archive_owner
+            )
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         archive.with_suffix(archive.suffix + ".sha256").write_text(
             f"{digest}  {archive.name}\n", encoding="utf-8"
@@ -137,9 +153,11 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "SHELL": "/bin/sh",
             }
         )
+        fake_bin = root / "fake-bin"
+        if pretend_macos or tar_stub is not None:
+            fake_bin.mkdir(exist_ok=True)
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
         if pretend_macos:
-            fake_bin = root / "fake-bin"
-            fake_bin.mkdir()
             executable(
                 fake_bin / "uname",
                 "#!/bin/sh\n"
@@ -149,7 +167,30 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "  *) exit 2 ;;\n"
                 "esac\n",
             )
-            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        if tar_stub is not None:
+            real_tar = shutil.which("tar", path=os.defpath)
+            assert real_tar is not None, "no system tar to delegate to"
+            self.tar_argv_log = root / "tar-argv.log"
+            # "reject" stands in for busybox tar, which spells no-same-owner `-o`
+            # and refuses the long option outright, so the installer's fallback
+            # is exercised rather than assumed.
+            refusal = (
+                'for arg in "$@"; do\n'
+                '  if [ "$arg" = "--no-same-owner" ]; then\n'
+                '    echo "tar: unrecognized option: no-same-owner" >&2\n'
+                "    exit 1\n"
+                "  fi\n"
+                "done\n"
+                if tar_stub == "reject"
+                else ""
+            )
+            executable(
+                fake_bin / "tar",
+                "#!/bin/sh\n"
+                f'printf \'%s\\n\' "$*" >> "{self.tar_argv_log}"\n'
+                f"{refusal}"
+                f'exec "{real_tar}" "$@"\n',
+            )
         args = ["sh", str(INSTALLER)]
         if progress_tty:
             master, slave = pty.openpty()
@@ -211,6 +252,62 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         self.assertIn("Filesystem projection is unavailable", result.stdout)
         self.assertFalse((kin_home / "bin" / "kin-vfs").exists())
         self.assertFalse(any((kin_home / "lib").glob("libkin_vfs_shim.*")))
+
+    def test_extraction_refuses_the_archives_recorded_ownership(self) -> None:
+        # tar running as root restores the uid/gid the archive records, and
+        # release archives are built by CI under an unrelated uid. Left alone,
+        # a root install lands a foreign-owned projection shim in the user's own
+        # ~/.kin, Kin refuses to verify the shim it just installed, and doctor
+        # reports the install ledger STALE on a clean install.
+        result, _ = self.run_installer(vfs_exit=0, tar_stub="record")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assert self.tar_argv_log is not None
+        invocations = self.tar_argv_log.read_text(encoding="utf-8")
+        self.assertIn(
+            "--no-same-owner",
+            invocations,
+            f"the installer must not let tar restore archived ownership: {invocations!r}",
+        )
+
+    def test_extraction_falls_back_when_tar_rejects_no_same_owner(self) -> None:
+        result, kin_home = self.run_installer(vfs_exit=0, tar_stub="reject")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assert self.tar_argv_log is not None
+        invocations = self.tar_argv_log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(
+            any("--no-same-owner" in line for line in invocations),
+            f"the long option is still tried first: {invocations!r}",
+        )
+        self.assertTrue(
+            any("--no-same-owner" not in line for line in invocations),
+            f"a tar that refuses the option must still extract: {invocations!r}",
+        )
+        self.assertTrue((kin_home / "bin" / "kin").exists())
+        self.assertTrue((kin_home / "bin" / "kin-daemon").exists())
+
+    @unittest.skipUnless(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "only root is handed the archive's recorded ownership by tar",
+    )
+    def test_root_install_lands_every_file_owned_by_the_installing_user(self) -> None:
+        result, kin_home = self.run_installer(vfs_exit=0, archive_owner=(1001, 1001))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = [
+            kin_home / "bin" / "kin",
+            kin_home / "bin" / "kin-daemon",
+            kin_home / "bin" / "kin-vfs",
+            *(kin_home / "lib").glob("libkin_vfs_shim.*"),
+        ]
+        self.assertGreaterEqual(len(installed), 4)
+        for path in installed:
+            self.assertEqual(
+                path.stat().st_uid,
+                os.geteuid(),
+                f"{path} kept the archive's uid instead of the installing user's",
+            )
 
     def test_interactive_archive_download_exposes_live_byte_percent_meter(self) -> None:
         result, _ = self.run_installer(vfs_exit=0, progress_tty=True)
