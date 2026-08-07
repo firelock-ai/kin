@@ -402,7 +402,7 @@ dependencies = [
  "faster-hex",
  "gix-features",
  "sha1-checked",
- "sha2 0.11.0",
+ "sha2",
  "thiserror",
 ]
 
@@ -630,14 +630,14 @@ dependencies = [
 
 [[package]]
 name = "kin-blobs"
-version = "0.1.4"
+version = "0.1.5"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "83136143d2f8b72f835ca7d9e3d7793e415bd072445a648713d5d797e9e6bc9e"
+checksum = "bde2186360c16ff9fda080b4b9f6489e7aee8cb0cb30f803e8bd22b1ed4af609"
 dependencies = [
  "hex",
  "schemars",
  "serde",
- "sha2 0.10.9",
+ "sha2",
  "thiserror",
  "tracing",
  "windows-sys",
@@ -645,9 +645,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.5"
+version = "0.7.7"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "6c63c8f3dbc38fbbcea9f7781c234c97e65f944987a22b0590ac1068df3db3ff"
+checksum = "9e39741a0edad255687301dc087a915f787a31c0a9eee028150081c884e940ea"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -658,8 +658,8 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha1",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -671,7 +671,7 @@ dependencies = [
  "kin-model",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2",
  "thiserror",
  "tracing",
  "tree-sitter",
@@ -702,9 +702,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.8"
+version = "0.1.9"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "ce7d0f0c3323b2cea676e7832d0f553874490cae7e157420dd7ddb8af49f70bd"
+checksum = "fd4c2a7ebb07f6ca4ae49fe57eaafa91adbca5e38e76d133b25008c87679f7e8"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -713,7 +713,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2",
  "thiserror",
  "tracing",
  "uuid",
@@ -1031,13 +1031,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha1-checked"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89f599ac0c323ebb1c6082821a54962b839832b03984598375bff3975b804423"
 dependencies = [
  "digest 0.10.7",
- "sha1",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -1045,17 +1056,6 @@ name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
 
 [[package]]
 name = "sha2"
