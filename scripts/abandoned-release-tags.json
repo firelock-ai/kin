@@ -42,6 +42,13 @@
       "reason": "The public install proof frozen at this tag fails on three of its five legs, and the tag can receive none of the repairs. The macos-15-intel and ubuntu-24.04-arm legs fail the installed-capability proof: the tagged binary reports embedding coverage as unobserved with reason graph_mutation_in_flight, so the proof reads a transient window in which the graph is still being mutated as a failure to prove complete coverage rather than waiting for it to settle. The failure is a race and not a fixed property of the platform, which is why the same two legs pass on some attempts and a third Unix leg failed on the first attempt. The windows-latest leg fails separately at the graph and MCP tool-call proof, where the daemon port file the step reads never appears. Both the proof workflow and the binary resolve from the tag, and the repairs landed on main only after it, so no later change to main can reach the failing steps. All three attempts of the cited run failed and automatic release recovery exhausted its bounded retries. The only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, so the tag never became the finalized Latest release and nothing downstream of the proof ever ran.",
       "superseded_by": "v0.5.0",
       "failed_release_run_id": "30947137583"
+    },
+    {
+      "tag": "v0.5.6",
+      "sha": "e01955f4b8f0174536885ccffaa0fbbfaffd96e7",
+      "reason": "The provenance aggregator frozen at this tag requires every per-artifact manifest to carry the same run_attempt as the publishing job. The five platform builds succeeded on the first attempt and were never re-run, so their manifests record attempt 1, while a runner outage failed the daemon-image job on that same attempt and pushed the aggregator to attempt 3, where Publish Release is refused with 'kin-linux-x86_64.provenance.json run attempt does not match this run'. Automatic release recovery cannot remedy this and made it worse on each pass, because rerunning failed jobs is its only remedy and every retry moves the publishing attempt further from the attempt the manifests record. The repair for FIR-1571 landed on main only after the tag, and the release workflow resolves from the tag, so no later change to main can reach the failing step. All three attempts of the cited run failed, no GitHub Release object was ever created for this tag, and no channel published it.",
+      "superseded_by": "v0.5.7",
+      "failed_release_run_id": "31114407438"
     }
   ]
 }
