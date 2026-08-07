@@ -158,6 +158,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
+    checks.push(check_background_work().await);
     checks.push(check_retrieval_profile());
     checks.push(check_binary_assessment_load());
 
@@ -1631,6 +1632,110 @@ async fn check_semantic_query_readiness() -> HealthCheck {
 /// a reachable daemon whose graph coverage is incomplete or unreadable is still
 /// Stale, and Stale on this check still blocks readiness.
 #[cfg(feature = "vector")]
+/// Render the daemon's background-work disclosure as a health check.
+///
+/// Split from its fetch so the reporting rule is testable without a daemon.
+/// Healthy is the answer whenever nothing was stopped, including while passes
+/// are working hard: this check reports faults, and the ordinary account of what
+/// the daemon is spending lives in `kin resources`.
+pub fn background_work_health_from_state(
+    work: &crate::commands::resources::DaemonWorkState,
+) -> HealthCheck {
+    let stopped: Vec<&crate::commands::resources::BackgroundPassReport> = work
+        .passes
+        .iter()
+        .filter(|pass| pass.stopped_reason.is_some())
+        .collect();
+    let cpu = match work.daemon_cpu_seconds {
+        Some(seconds) => format!("daemon has used {seconds:.0}s of CPU"),
+        None => "daemon CPU not sampled yet".to_string(),
+    };
+    if stopped.is_empty() {
+        let working = work
+            .passes
+            .iter()
+            .filter(|pass| pass.state == "working")
+            .count();
+        return HealthCheck::new(
+            "background_work",
+            "Background work",
+            HealthStatus::Healthy,
+            format!(
+                "{cpu}; {} background pass(es), {working} working, none stopped",
+                work.passes.len()
+            ),
+        );
+    }
+    let reasons = stopped
+        .iter()
+        .filter_map(|pass| pass.stopped_reason.as_deref())
+        .collect::<Vec<_>>()
+        .join("; ");
+    HealthCheck::new(
+        "background_work",
+        "Background work",
+        HealthStatus::Stale,
+        format!("{cpu}; {reasons}"),
+    )
+    .with_manual_fix(
+        "restart the daemon (`kin daemon restart`) to retry the stopped pass, and report the \
+         reason above if it stops again",
+    )
+}
+
+async fn check_background_work() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            "background_work",
+            "Background work",
+            HealthStatus::Unsupported,
+            "n/a — not in a Kin repository",
+        );
+    };
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
+    else {
+        return HealthCheck::new(
+            "background_work",
+            "Background work",
+            HealthStatus::Unsupported,
+            "n/a — no daemon running for this repository, so there is no background work to \
+             account for; a daemon starts on first use",
+        );
+    };
+    let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
+        daemon_url.clone(),
+        &layout,
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            return HealthCheck::new(
+                "background_work",
+                "Background work",
+                HealthStatus::Stale,
+                format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
+            )
+            .with_manual_fix("run `kin status --json` and resolve the reported daemon error");
+        }
+    };
+    match client
+        .command_resources(&crate::commands::resources::CommandResourcesRequest::default())
+        .await
+    {
+        Ok(response) => background_work_health_from_state(&response.daemon_work),
+        Err(error) => HealthCheck::new(
+            "background_work",
+            "Background work",
+            HealthStatus::Stale,
+            format!(
+                "daemon reachable ({daemon_url}), but its background-work state is unavailable: \
+                 {error}"
+            ),
+        )
+        .with_manual_fix("run `kin status --json` and resolve the reported daemon error"),
+    }
+}
+
 fn semantic_query_readiness_without_a_daemon() -> HealthCheck {
     HealthCheck::new(
         "semantic_query_readiness",
@@ -1870,6 +1975,81 @@ mod tests {
             .unwrap()
             .write_all(bytes)
             .unwrap();
+    }
+
+    fn pass_report(
+        name: &str,
+        state: &str,
+        stopped_reason: Option<&str>,
+    ) -> crate::commands::resources::BackgroundPassReport {
+        crate::commands::resources::BackgroundPassReport {
+            name: name.to_string(),
+            state: state.to_string(),
+            progress: 128,
+            progress_age_seconds: Some(4),
+            working_seconds: Some(9),
+            stopped_reason: stopped_reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn background_work_is_healthy_while_passes_are_merely_busy() {
+        let check =
+            background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
+                daemon_cpu_seconds: Some(41.6),
+                passes: vec![
+                    pass_report("embed", "working", None),
+                    pass_report("reconcile", "idle", None),
+                ],
+            });
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check.detail.contains("42s of CPU"),
+            "the check must disclose cumulative CPU: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("none stopped"),
+            "a busy daemon is not a faulty one: {}",
+            check.detail
+        );
+    }
+
+    /// The falsification: the same shape with a stopped pass must NOT read
+    /// healthy, and must carry the daemon's own reason rather than a summary
+    /// invented here.
+    #[test]
+    fn background_work_reports_a_stopped_pass_and_repeats_its_reason() {
+        let check =
+            background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
+                daemon_cpu_seconds: Some(48_180.0),
+                passes: vec![
+                    pass_report(
+                        "embed",
+                        "stopped",
+                        Some("the embed pass held the CPU for 601s"),
+                    ),
+                    pass_report("reconcile", "idle", None),
+                ],
+            });
+        assert!(matches!(check.status, HealthStatus::Stale));
+        assert!(check
+            .detail
+            .contains("the embed pass held the CPU for 601s"));
+        assert!(check.manual_fix.is_some());
+    }
+
+    #[test]
+    fn background_work_says_so_when_cpu_has_not_been_sampled() {
+        let check = background_work_health_from_state(
+            &crate::commands::resources::DaemonWorkState::default(),
+        );
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check.detail.contains("not sampled yet"),
+            "an unsampled total must not be reported as zero CPU: {}",
+            check.detail
+        );
     }
 
     /// The magic bytes a valid shim carries on the current platform.

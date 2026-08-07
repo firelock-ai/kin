@@ -1275,6 +1275,11 @@ pub struct DaemonState {
     /// daemon-health signal so this degraded state is LOUD, never silent (the
     /// worker dying must NOT take the whole daemon down).
     pub embed_worker_failed: AtomicBool,
+    /// Watches every pass this daemon runs on its own initiative and stops the
+    /// ones spending the machine without advancing. The daemon is the only Kin
+    /// process on a user's box, so nothing outside it can notice a wedged pass;
+    /// this is where that noticing lives.
+    pub background_work: Arc<crate::background_work::BackgroundWorkSupervisor>,
     /// Why the views this daemon derives from repository authority stopped
     /// matching it, or `None` when they match.
     ///
@@ -2138,6 +2143,7 @@ impl DaemonState {
             spine: std::sync::OnceLock::new(),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
             #[cfg(all(test, feature = "embeddings"))]
@@ -2354,6 +2360,7 @@ impl DaemonState {
             spine: std::sync::OnceLock::new(),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
+            background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
             #[cfg(all(test, feature = "embeddings"))]
