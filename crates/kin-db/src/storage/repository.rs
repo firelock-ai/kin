@@ -46,7 +46,7 @@ use crate::storage::backend::{
     load_recovered_repository_authority, validate_source_blob_size, verify_source_blob_digest,
     AuthorityPayloadStats, Generation, LocalAuthorityFreezeLock, LocalFileBackend,
     RecoveredSnapshot, SnapshotCursor, SnapshotSaveOutcome, SourceBlobValidationRequest,
-    StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
+    SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch, MAX_SOURCE_BLOB_BYTES,
 };
 use crate::storage::format::GraphSnapshot;
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
@@ -1035,6 +1035,23 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
     pub fn save_source_blob(&self, digest: Hash256, data: &[u8]) -> Result<(), KinDbError> {
         self.backend
             .save_source_blob(self.repository_id.as_str(), *digest.as_bytes(), data)
+    }
+
+    /// Persist many exact bodies under one repository authority envelope.
+    ///
+    /// This is the bulk form of [`save_source_blob`](Self::save_source_blob)
+    /// and it persists exactly the same bodies. It grants no authority either:
+    /// a later transaction still has to name every digest through exact tree
+    /// and history authority before the repository publishes. Bodies are
+    /// durable when this call returns `Ok`, which is why a caller that is
+    /// about to cross an authority boundary can run its whole ingest inside
+    /// one session and cross afterwards.
+    pub fn with_source_blob_write_batch(
+        &self,
+        operation: &mut dyn FnMut(&dyn SourceBlobWriteBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        self.backend
+            .with_source_blob_write_batch(self.repository_id.as_str(), operation)
     }
 
     /// Load exact immutable source bytes from repository-owned CAS authority.

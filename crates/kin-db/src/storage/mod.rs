@@ -27,8 +27,8 @@ pub use backend::{
     load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
     LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, RecoveredSnapshot,
     SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome,
-    SourceBlobValidationRequest, StorageBackend, VerifiedSourceBlob, VerifiedSourceBlobBatch,
-    GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlob,
+    VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
 };
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,

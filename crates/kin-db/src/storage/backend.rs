@@ -108,6 +108,27 @@ pub trait VerifiedSourceBlobBatch {
     ) -> Result<Option<VerifiedSourceBlob>, KinDbError>;
 }
 
+/// One immutable-body write session against a single repository.
+///
+/// A backend may hold a repository lock and a retained namespace capability
+/// for the lifetime of this value, so a bulk ingest pays the repository
+/// authority envelope once instead of once per content address.
+///
+/// [`save`](Self::save) publishes a body under its content identity with the
+/// same validation, no-clobber, and collision rules as
+/// [`StorageBackend::save_source_blob`]. It does not promise that the body has
+/// reached the storage device: a batch amortizes its durability barriers and
+/// discharges them at a flush. Bodies written through a batch are durable when
+/// [`StorageBackend::with_source_blob_write_batch`] returns `Ok`, or at an
+/// earlier explicit [`flush`](Self::flush).
+pub trait SourceBlobWriteBatch {
+    /// Publish exact bytes under their SHA-256 content identity.
+    fn save(&self, digest: [u8; 32], data: &[u8]) -> Result<(), KinDbError>;
+
+    /// Make every body written since the last flush durable.
+    fn flush(&self) -> Result<(), KinDbError>;
+}
+
 impl VerifiedSourceBlob {
     /// Bind bytes to `digest` after recomputing their SHA-256 identity.
     pub fn from_verified_bytes(digest: [u8; 32], bytes: Vec<u8>) -> Result<Self, KinDbError> {
@@ -317,6 +338,25 @@ pub(crate) fn validate_source_blob_size(byte_len: u64, authority: &str) -> Resul
         )));
     }
     Ok(())
+}
+
+/// Reject a write request before it reaches a repository lock or the disk.
+///
+/// One body and a whole batch validate identically, so a batch never accepts
+/// bytes a single write would have refused.
+fn validate_source_blob_write_request(
+    repo_id: &str,
+    digest: [u8; 32],
+    data: &[u8],
+) -> Result<(), KinDbError> {
+    validate_source_blob_repo_id(repo_id)?;
+    let byte_len = u64::try_from(data.len()).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "immutable source blob for repo {repo_id} does not fit the size boundary"
+        ))
+    })?;
+    validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
+    verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))
 }
 
 pub(crate) fn validate_source_blob_read_size(
@@ -622,10 +662,19 @@ fn read_source_file_at(
 }
 
 #[cfg(unix)]
+/// Stage, fsync, and no-clobber link one body into its pinned digest
+/// directory.
+///
+/// `confirm_directory` decides whether the directory entry is made durable
+/// before this call returns. A batch clears it and issues one directory
+/// barrier per touched directory at its flush instead. The body's own fsync
+/// always happens before the `linkat` that names it, in both modes, so a
+/// deferred barrier can only lose the name.
 fn publish_source_file_at(
     directory: &std::fs::File,
     digest_hex: &str,
     data: &[u8],
+    confirm_directory: bool,
 ) -> Result<bool, KinDbError> {
     let staging = format!(".{digest_hex}.no-clobber-{}", uuid::Uuid::new_v4());
     let staging_name = source_component(&staging)?;
@@ -682,7 +731,9 @@ fn publish_source_file_at(
             )));
         }
     };
-    mmap::sync_directory_handle(directory, Path::new("pinned immutable source directory"))?;
+    if confirm_directory {
+        mmap::sync_directory_handle(directory, Path::new("pinned immutable source directory"))?;
+    }
     // SAFETY: cleanup is relative to the same pinned directory and never
     // follows an ancestor path.
     unsafe { libc::unlinkat(directory.as_raw_fd(), staging_name.as_ptr(), 0) };
@@ -1872,6 +1923,33 @@ pub trait StorageBackend: Send + Sync {
         operation(&batch)
     }
 
+    /// Write many immutable bodies under one repository authority envelope.
+    ///
+    /// A local backend takes the repository lock once for the whole session
+    /// and issues one set of durability barriers at the flush instead of a
+    /// full lock-and-barrier cycle per content address. The bodies a batch
+    /// publishes are exactly the bodies the same sequence of
+    /// [`save_source_blob`](Self::save_source_blob) calls would publish.
+    ///
+    /// Implementations must invoke `operation` exactly once, must not report
+    /// success when it fails, and must leave every body it accepted durable
+    /// before returning `Ok`. A caller that needs an earlier durability point
+    /// calls [`SourceBlobWriteBatch::flush`] inside the session.
+    ///
+    /// The default implementation writes each body through `save_source_blob`,
+    /// which is already durable per body and makes `flush` a no-op.
+    fn with_source_blob_write_batch(
+        &self,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn SourceBlobWriteBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        let batch = DefaultSourceBlobWriteBatch {
+            backend: self,
+            repo_id,
+        };
+        operation(&batch)
+    }
+
     /// Load the exact byte length of an immutable source blob.
     ///
     /// Backends should override this with a metadata-only implementation.
@@ -2028,6 +2106,21 @@ pub trait StorageBackend: Send + Sync {
 struct DefaultVerifiedSourceBlobBatch<'a, B: StorageBackend + ?Sized> {
     backend: &'a B,
     repo_id: &'a str,
+}
+
+struct DefaultSourceBlobWriteBatch<'a, B: StorageBackend + ?Sized> {
+    backend: &'a B,
+    repo_id: &'a str,
+}
+
+impl<B: StorageBackend + ?Sized> SourceBlobWriteBatch for DefaultSourceBlobWriteBatch<'_, B> {
+    fn save(&self, digest: [u8; 32], data: &[u8]) -> Result<(), KinDbError> {
+        self.backend.save_source_blob(self.repo_id, digest, data)
+    }
+
+    fn flush(&self) -> Result<(), KinDbError> {
+        Ok(())
+    }
 }
 
 impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSourceBlobBatch<'_, B> {
@@ -2207,6 +2300,189 @@ struct LocalRepositoryCapability {
         parking_lot::Mutex<std::collections::HashMap<String, LocalStorageRootIdentity>>,
     lock_identity: parking_lot::Mutex<Option<LocalRepositoryLockIdentity>>,
     lock_publication_sync_pending: std::sync::atomic::AtomicBool,
+}
+
+/// Directory entries a write batch has published but not yet made durable.
+///
+/// One handle is retained per digest prefix the batch wrote into, which bounds
+/// the set at the 256 possible prefixes however many bodies the batch carries.
+#[cfg(unix)]
+#[derive(Default)]
+struct DeferredSourceDurability {
+    leaves: parking_lot::Mutex<std::collections::BTreeMap<String, (std::fs::File, PathBuf)>>,
+}
+
+#[cfg(unix)]
+impl DeferredSourceDurability {
+    fn record(
+        &self,
+        capability: &SourceBlobCapability,
+        digest_hex: &str,
+    ) -> Result<(), KinDbError> {
+        let prefix = &digest_hex[..2];
+        let mut leaves = self.leaves.lock();
+        if leaves.contains_key(prefix) {
+            return Ok(());
+        }
+        let retained = capability.leaf_dir.try_clone().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to retain immutable source directory {} for a deferred durability barrier: {error}",
+                capability.leaf_path.display()
+            ))
+        })?;
+        leaves.insert(prefix.to_string(), (retained, capability.leaf_path.clone()));
+        Ok(())
+    }
+
+    /// Issue every outstanding barrier child before parent: each digest
+    /// directory that names bodies, then the prefix chain naming those
+    /// directories, then the repository directory naming the chain.
+    ///
+    /// The record is cleared only once every barrier succeeded, so a failed
+    /// flush stays outstanding and a retry reissues it rather than reporting
+    /// durability this batch never reached.
+    fn flush(&self, namespace: &LocalRepositoryCapability) -> Result<(), KinDbError> {
+        let mut leaves = self.leaves.lock();
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        for (directory, display) in leaves.values() {
+            mmap::sync_directory_handle(directory, display)?;
+        }
+        sync_source_blob_chain(namespace)?;
+        leaves.clear();
+        Ok(())
+    }
+}
+
+/// Make the `source-blobs/sha256` chain durable, child before parent.
+#[cfg(unix)]
+fn sync_source_blob_chain(namespace: &LocalRepositoryCapability) -> Result<(), KinDbError> {
+    let repo_dir = mmap::open_directory_handle_at(
+        &namespace.directory,
+        Path::new("."),
+        &namespace.display_path,
+    )
+    .map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository capability {}: {error}",
+            namespace.display_path.display()
+        ))
+    })?;
+    let clone_failed = |display: &Path, error: std::io::Error| {
+        KinDbError::StorageError(format!(
+            "failed to retain immutable source directory {} for a deferred durability barrier: {error}",
+            display.display()
+        ))
+    };
+    let mut display = namespace.display_path.clone();
+    let mut parent = repo_dir
+        .try_clone()
+        .map_err(|error| clone_failed(&display, error))?;
+    let mut chain = Vec::new();
+    for component in ["source-blobs", "sha256"] {
+        display.push(component);
+        parent = open_source_directory_at(&parent, component, &display, false, false)?;
+        chain.push((
+            parent
+                .try_clone()
+                .map_err(|error| clone_failed(&display, error))?,
+            display.clone(),
+        ));
+    }
+    for (directory, display) in chain.iter().rev() {
+        mmap::sync_directory_handle(directory, display)?;
+    }
+    mmap::sync_directory_handle(&repo_dir, &namespace.display_path)
+}
+
+/// When a local immutable-body write issues its durability barriers.
+///
+/// The body's own fsync is not part of this choice: it always precedes the
+/// `linkat` that names the body, in both modes. Only the directory and
+/// acknowledgement barriers move, so a batch that loses power before its
+/// flush loses names, and every body it wrote reads as absent rather than
+/// torn. That is the same failure class as crashing partway through a
+/// sequence of per-body writes.
+#[cfg(unix)]
+enum LocalSourceDurability<'a> {
+    /// Every barrier is issued before the write returns.
+    Immediate,
+    /// Directory barriers are recorded and issued at the batch's flush.
+    Deferred(&'a DeferredSourceDurability),
+}
+
+#[cfg(unix)]
+impl LocalSourceDurability<'_> {
+    fn confirms_ancestors_inline(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    fn confirms_leaf_inline(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    /// Acknowledge the inode a body actually landed on.
+    ///
+    /// A batch owes nothing here. A body this call published was fsynced
+    /// before the `linkat` that named it. A body an earlier writer published
+    /// is durable too, because a writer releases the repository lock only
+    /// after its own barriers, and the bytes are re-verified against the
+    /// digest before this point either way.
+    fn sync_body(&self, file: &std::fs::File, display: &Path) -> Result<(), KinDbError> {
+        match self {
+            Self::Immediate => sync_source_file_for_ack(file, display),
+            Self::Deferred(_) => Ok(()),
+        }
+    }
+
+    fn sync_leaf(
+        &self,
+        capability: &SourceBlobCapability,
+        digest_hex: &str,
+    ) -> Result<(), KinDbError> {
+        match self {
+            Self::Immediate => {
+                mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)
+            }
+            Self::Deferred(deferred) => deferred.record(capability, digest_hex),
+        }
+    }
+}
+
+/// One repository-scoped write session over a held authority lock.
+struct LocalSourceBlobWriteBatch<'a> {
+    backend: &'a LocalFileBackend,
+    namespace: &'a LocalRepositoryCapability,
+    repo_id: &'a str,
+    #[cfg(unix)]
+    deferred: DeferredSourceDurability,
+}
+
+impl SourceBlobWriteBatch for LocalSourceBlobWriteBatch<'_> {
+    fn save(&self, digest: [u8; 32], data: &[u8]) -> Result<(), KinDbError> {
+        validate_source_blob_write_request(self.repo_id, digest, data)?;
+        #[cfg(unix)]
+        {
+            self.backend.publish_source_blob_in_namespace(
+                self.namespace,
+                digest,
+                data,
+                &LocalSourceDurability::Deferred(&self.deferred),
+            )
+        }
+        #[cfg(windows)]
+        {
+            self.backend
+                .publish_source_blob_in_namespace(self.namespace, digest, data)
+        }
+    }
+
+    fn flush(&self) -> Result<(), KinDbError> {
+        #[cfg(unix)]
+        self.deferred.flush(self.namespace)?;
+        self.backend.confirm_repository_visible(self.namespace)
+    }
 }
 
 struct LocalVerifiedSourceBlobBatch<'a> {
@@ -5656,6 +5932,225 @@ impl LocalFileBackend {
     fn set_source_blob_before_publish_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.source_blob_before_publish_hook.lock() = Some(Box::new(hook));
     }
+
+    /// Publish one already-validated body inside a held repository lock.
+    ///
+    /// `durability` decides when this body's directory and acknowledgement
+    /// barriers are issued. The body's own pre-link fsync is never deferred,
+    /// so a directory entry can never become durable ahead of the bytes it
+    /// names and a lost barrier reads the body as absent rather than torn.
+    #[cfg(unix)]
+    fn publish_source_blob_in_namespace(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        digest: [u8; 32],
+        data: &[u8],
+        durability: &LocalSourceDurability<'_>,
+    ) -> Result<(), KinDbError> {
+        self.confirm_repository_visible(namespace)?;
+        let capability = open_source_blob_capability_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            digest,
+            true,
+            durability.confirms_ancestors_inline(),
+        )?;
+        #[cfg(test)]
+        if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
+            hook();
+        }
+        let digest_hex = hex::encode(digest);
+
+        if let Some(existing) =
+            read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
+        {
+            verify_source_blob_digest(
+                digest,
+                &existing.data,
+                &capability.leaf_path.display().to_string(),
+            )?;
+            if existing.data != data {
+                return Err(KinDbError::StorageError(format!(
+                    "immutable source blob collision below {}",
+                    capability.leaf_path.display()
+                )));
+            }
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            durability.sync_body(&existing.file, &capability.leaf_path.join(&digest_hex))?;
+            durability.sync_leaf(&capability, &digest_hex)?;
+            self.confirm_repository_visible(namespace)?;
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
+            hook();
+        }
+
+        // Re-walk without creating anything and compare the directory
+        // identity to the pinned handle. A substituted ancestor is rejected
+        // before publication; all writes remain relative to the old handle.
+        confirm_source_blob_namespace_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            digest,
+            &capability,
+        )?;
+
+        let _published = publish_source_file_at(
+            &capability.leaf_dir,
+            &digest_hex,
+            data,
+            durability.confirms_leaf_inline(),
+        )?;
+        let installed =
+            read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
+                .ok_or_else(|| {
+                    KinDbError::StorageError(format!(
+                        "immutable source blob disappeared after publication below {}",
+                        capability.leaf_path.display()
+                    ))
+                })?;
+        verify_source_blob_digest(
+            digest,
+            &installed.data,
+            &capability.leaf_path.display().to_string(),
+        )?;
+        if installed.data != data {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob changed while installing below {}",
+                capability.leaf_path.display()
+            )));
+        }
+        // `linkat` may have lost a no-clobber race to an identical object.
+        // Confirm the inode actually selected at the target name, then
+        // reconfirm its directory entry in file-before-directory order.
+        durability.sync_body(&installed.file, &capability.leaf_path.join(&digest_hex))?;
+        durability.sync_leaf(&capability, &digest_hex)?;
+        self.confirm_repository_visible(namespace)?;
+        Ok(())
+    }
+
+    /// Publish one already-validated body inside a held repository lock.
+    #[cfg(windows)]
+    fn publish_source_blob_in_namespace(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        digest: [u8; 32],
+        data: &[u8],
+    ) -> Result<(), KinDbError> {
+        self.confirm_repository_visible(namespace)?;
+        let capability = open_windows_source_blob_capability_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            digest,
+            true,
+        )?;
+        #[cfg(test)]
+        if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
+            hook();
+        }
+        confirm_windows_source_blob_namespace_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            digest,
+            &capability,
+        )?;
+        let digest_hex = hex::encode(digest);
+
+        if let Some(existing) = read_windows_source_file_at(
+            capability.leaf_dir(),
+            std::ffi::OsStr::new(&digest_hex),
+            MAX_SOURCE_BLOB_BYTES,
+            true,
+        )? {
+            verify_source_blob_digest(
+                digest,
+                &existing.data,
+                &capability.leaf_path.display().to_string(),
+            )?;
+            if existing.data != data {
+                return Err(KinDbError::StorageError(format!(
+                    "immutable source blob collision below {}",
+                    capability.leaf_path.display()
+                )));
+            }
+            confirm_windows_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+            sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
+            capability.sync_leaf_publication()?;
+            self.confirm_repository_visible(namespace)?;
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
+            hook();
+        }
+        confirm_windows_source_blob_namespace_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            digest,
+            &capability,
+        )?;
+        let published_identity = publish_windows_source_file_at(
+            capability.leaf_dir(),
+            &capability.leaf_path,
+            &digest_hex,
+            data,
+        )?;
+        let installed = read_windows_source_file_at(
+            capability.leaf_dir(),
+            std::ffi::OsStr::new(&digest_hex),
+            MAX_SOURCE_BLOB_BYTES,
+            true,
+        )?
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "immutable source blob disappeared after Windows publication below {}",
+                capability.leaf_path.display()
+            ))
+        })?;
+        verify_source_blob_digest(
+            digest,
+            &installed.data,
+            &capability.leaf_path.display().to_string(),
+        )?;
+        if installed.data != data {
+            return Err(KinDbError::StorageError(format!(
+                "immutable source blob changed while installing below {}",
+                capability.leaf_path.display()
+            )));
+        }
+        if let Some(published_identity) = published_identity {
+            let installed_identity = windows_source_file_identity(&installed.file)?;
+            if installed_identity != published_identity {
+                return Err(KinDbError::StorageError(format!(
+                    "immutable source blob was replaced after Windows publication below {}",
+                    capability.leaf_path.display()
+                )));
+            }
+        }
+        confirm_windows_source_blob_namespace_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            digest,
+            &capability,
+        )?;
+        sync_source_file_for_ack(&installed.file, &capability.leaf_path.join(&digest_hex))?;
+        capability.sync_leaf_publication()?;
+        self.confirm_repository_visible(namespace)?;
+        Ok(())
+    }
 }
 
 impl StorageBackend for LocalFileBackend {
@@ -5675,14 +6170,7 @@ impl StorageBackend for LocalFileBackend {
         digest: [u8; 32],
         data: &[u8],
     ) -> Result<(), KinDbError> {
-        validate_source_blob_repo_id(repo_id)?;
-        let byte_len = u64::try_from(data.len()).map_err(|_| {
-            KinDbError::StorageError(format!(
-                "immutable source blob for repo {repo_id} does not fit the size boundary"
-            ))
-        })?;
-        validate_source_blob_size(byte_len, &format!("repo {repo_id}"))?;
-        verify_source_blob_digest(digest, data, &format!("repo {repo_id}"))?;
+        validate_source_blob_write_request(repo_id, digest, data)?;
         #[cfg(unix)]
         prepare_source_trust_root(
             &self.base_path,
@@ -5699,201 +6187,56 @@ impl StorageBackend for LocalFileBackend {
                     .to_string(),
             ));
         }
-        #[cfg(windows)]
-        {
-            let namespace = &authority_lock.namespace;
-            self.confirm_repository_visible(namespace)?;
-            let capability = open_windows_source_blob_capability_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                true,
-            )?;
-            #[cfg(test)]
-            if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
-                hook();
-            }
-            confirm_windows_source_blob_namespace_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                &capability,
-            )?;
-            let digest_hex = hex::encode(digest);
-
-            if let Some(existing) = read_windows_source_file_at(
-                capability.leaf_dir(),
-                std::ffi::OsStr::new(&digest_hex),
-                MAX_SOURCE_BLOB_BYTES,
-                true,
-            )? {
-                verify_source_blob_digest(
-                    digest,
-                    &existing.data,
-                    &capability.leaf_path.display().to_string(),
-                )?;
-                if existing.data != data {
-                    return Err(KinDbError::StorageError(format!(
-                        "immutable source blob collision below {}",
-                        capability.leaf_path.display()
-                    )));
-                }
-                confirm_windows_source_blob_namespace_from_repository(
-                    &namespace.directory,
-                    &namespace.display_path,
-                    digest,
-                    &capability,
-                )?;
-                sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
-                capability.sync_leaf_publication()?;
-                self.confirm_repository_visible(namespace)?;
-                return Ok(());
-            }
-
-            #[cfg(test)]
-            if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
-                hook();
-            }
-            confirm_windows_source_blob_namespace_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                &capability,
-            )?;
-            let published_identity = publish_windows_source_file_at(
-                capability.leaf_dir(),
-                &capability.leaf_path,
-                &digest_hex,
-                data,
-            )?;
-            let installed = read_windows_source_file_at(
-                capability.leaf_dir(),
-                std::ffi::OsStr::new(&digest_hex),
-                MAX_SOURCE_BLOB_BYTES,
-                true,
-            )?
-            .ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "immutable source blob disappeared after Windows publication below {}",
-                    capability.leaf_path.display()
-                ))
-            })?;
-            verify_source_blob_digest(
-                digest,
-                &installed.data,
-                &capability.leaf_path.display().to_string(),
-            )?;
-            if installed.data != data {
-                return Err(KinDbError::StorageError(format!(
-                    "immutable source blob changed while installing below {}",
-                    capability.leaf_path.display()
-                )));
-            }
-            if let Some(published_identity) = published_identity {
-                let installed_identity = windows_source_file_identity(&installed.file)?;
-                if installed_identity != published_identity {
-                    return Err(KinDbError::StorageError(format!(
-                        "immutable source blob was replaced after Windows publication below {}",
-                        capability.leaf_path.display()
-                    )));
-                }
-            }
-            confirm_windows_source_blob_namespace_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                &capability,
-            )?;
-            sync_source_file_for_ack(&installed.file, &capability.leaf_path.join(&digest_hex))?;
-            capability.sync_leaf_publication()?;
-            self.confirm_repository_visible(namespace)?;
-            return Ok(());
-        }
         #[cfg(unix)]
         {
-            let namespace = &authority_lock.namespace;
-            self.confirm_repository_visible(namespace)?;
-            let capability = open_source_blob_capability_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
+            self.publish_source_blob_in_namespace(
+                &authority_lock.namespace,
                 digest,
-                true,
-                true,
-            )?;
-            #[cfg(test)]
-            if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
-                hook();
-            }
-            let digest_hex = hex::encode(digest);
+                data,
+                &LocalSourceDurability::Immediate,
+            )
+        }
+        #[cfg(windows)]
+        {
+            self.publish_source_blob_in_namespace(&authority_lock.namespace, digest, data)
+        }
+    }
 
-            if let Some(existing) =
-                read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
-            {
-                verify_source_blob_digest(
-                    digest,
-                    &existing.data,
-                    &capability.leaf_path.display().to_string(),
-                )?;
-                if existing.data != data {
-                    return Err(KinDbError::StorageError(format!(
-                        "immutable source blob collision below {}",
-                        capability.leaf_path.display()
-                    )));
-                }
-                confirm_source_blob_namespace_from_repository(
-                    &namespace.directory,
-                    &namespace.display_path,
-                    digest,
-                    &capability,
-                )?;
-                sync_source_file_for_ack(&existing.file, &capability.leaf_path.join(&digest_hex))?;
-                mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
-                self.confirm_repository_visible(namespace)?;
-                return Ok(());
-            }
-
-            #[cfg(test)]
-            if let Some(hook) = self.source_blob_before_publish_hook.lock().take() {
-                hook();
-            }
-
-            // Re-walk without creating anything and compare the directory
-            // identity to the pinned handle. A substituted ancestor is rejected
-            // before publication; all writes remain relative to the old handle.
-            confirm_source_blob_namespace_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                &capability,
-            )?;
-
-            let _published = publish_source_file_at(&capability.leaf_dir, &digest_hex, data)?;
-            let installed =
-                read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
-                    .ok_or_else(|| {
-                        KinDbError::StorageError(format!(
-                            "immutable source blob disappeared after publication below {}",
-                            capability.leaf_path.display()
-                        ))
-                    })?;
-            verify_source_blob_digest(
-                digest,
-                &installed.data,
-                &capability.leaf_path.display().to_string(),
-            )?;
-            if installed.data != data {
-                return Err(KinDbError::StorageError(format!(
-                    "immutable source blob changed while installing below {}",
-                    capability.leaf_path.display()
-                )));
-            }
-            // `linkat` may have lost a no-clobber race to an identical object.
-            // Confirm the inode actually selected at the target name, then
-            // reconfirm its directory entry in file-before-directory order.
-            sync_source_file_for_ack(&installed.file, &capability.leaf_path.join(&digest_hex))?;
-            mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
-            self.confirm_repository_visible(namespace)?;
-            Ok(())
+    fn with_source_blob_write_batch(
+        &self,
+        repo_id: &str,
+        operation: &mut dyn FnMut(&dyn SourceBlobWriteBatch) -> Result<(), KinDbError>,
+    ) -> Result<(), KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        #[cfg(unix)]
+        prepare_source_trust_root(
+            &self.base_path,
+            true,
+            &self.source_root_confirmed_for_process,
+        )?;
+        #[cfg(any(unix, windows))]
+        let authority_lock = self.acquire_lock_for_initialization(repo_id)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (repo_id, operation);
+            return Err(KinDbError::StorageError(
+                "secure local immutable source storage is unavailable on this platform; use the GCS backend"
+                    .to_string(),
+            ));
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let batch = LocalSourceBlobWriteBatch {
+                backend: self,
+                namespace: &authority_lock.namespace,
+                repo_id,
+                #[cfg(unix)]
+                deferred: DeferredSourceDurability::default(),
+            };
+            // A failing session never reports durability, so its outstanding
+            // barriers stay unissued and its bodies stay unreachable.
+            operation(&batch)?;
+            batch.flush()
         }
     }
 
@@ -6896,6 +7239,232 @@ mod tests {
                 .acquire_lock(repo_id)
                 .expect("test repository namespace must initialize"),
         );
+    }
+
+    fn collect_store_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(
+            directory: &Path,
+            root: &Path,
+            out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[test]
+    fn local_source_blob_batch_writes_the_same_store_content_as_per_object_writes() {
+        let bodies: Vec<Vec<u8>> = (0..24)
+            .map(|i| format!("parity body {i} with enough bytes to differ").into_bytes())
+            .collect();
+        let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+
+        let per_object_dir = TempDir::new().unwrap();
+        let per_object = LocalFileBackend::new(per_object_dir.path());
+        for (digest, body) in digests.iter().zip(&bodies) {
+            per_object
+                .save_source_blob("repo-a", *digest, body)
+                .unwrap();
+        }
+
+        let batched_dir = TempDir::new().unwrap();
+        let batched = LocalFileBackend::new(batched_dir.path());
+        batched
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .expect("a batch publishes every body it accepted");
+
+        let written_per_object =
+            collect_store_tree(&per_object_dir.path().join("repo-a").join("source-blobs"));
+        let written_by_batch =
+            collect_store_tree(&batched_dir.path().join("repo-a").join("source-blobs"));
+        assert_eq!(
+            written_per_object, written_by_batch,
+            "a batch must publish the same bytes at the same content addresses"
+        );
+        assert_eq!(written_by_batch.len(), bodies.len());
+
+        // Durability is promised when the batch returns, so a backend that
+        // never saw the session reads every body back.
+        let reopened = LocalFileBackend::new(batched_dir.path());
+        for (digest, body) in digests.iter().zip(&bodies) {
+            assert_eq!(
+                reopened.load_source_blob("repo-a", *digest).unwrap(),
+                Some(body.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn local_source_blob_batch_and_per_object_writes_interoperate() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let shared = b"a body both paths publish";
+        let shared_digest = source_digest(shared);
+        let fresh = b"a body only the batch publishes";
+        let fresh_digest = source_digest(fresh);
+
+        backend
+            .save_source_blob("repo-a", shared_digest, shared)
+            .unwrap();
+        backend
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                // An exact repeat of an already-published body is success, and
+                // repeating it inside one session is too.
+                batch.save(shared_digest, shared)?;
+                batch.save(shared_digest, shared)?;
+                batch.save(fresh_digest, fresh)
+            })
+            .expect("an exact repeat is success on both paths");
+
+        let reopened = LocalFileBackend::new(dir.path());
+        assert_eq!(
+            reopened.load_source_blob("repo-a", shared_digest).unwrap(),
+            Some(shared.to_vec())
+        );
+        assert_eq!(
+            reopened.load_source_blob("repo-a", fresh_digest).unwrap(),
+            Some(fresh.to_vec())
+        );
+        backend
+            .save_source_blob("repo-a", fresh_digest, fresh)
+            .expect("a per-object retry of a batched body is success");
+    }
+
+    #[test]
+    fn local_source_blob_batch_validates_every_body_like_a_single_write() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let error = backend
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                batch.save(source_digest(b"claimed"), b"actual")
+            })
+            .expect_err("a batch must refuse a body that does not match its digest");
+        assert!(error.to_string().contains("digest mismatch"), "{error}");
+
+        // A body already at a taken identity is refused for the same reason a
+        // single write refuses it: the bytes are not the ones that identity
+        // names.
+        let data = b"first bytes at this identity";
+        let digest = source_digest(data);
+        backend.save_source_blob("repo-a", digest, data).unwrap();
+        let replaced = backend
+            .with_source_blob_write_batch("repo-a", &mut |batch| batch.save(digest, b"other bytes"))
+            .expect_err("a batch must never replace bytes already at an identity");
+        assert!(
+            replaced.to_string().contains("digest mismatch"),
+            "{replaced}"
+        );
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(data.to_vec()),
+            "the refused write must leave the published body untouched"
+        );
+
+        let invalid = backend
+            .with_source_blob_write_batch("../escape", &mut |_| Ok(()))
+            .expect_err("a batch must validate its repository id before taking a lock");
+        assert!(invalid.to_string().contains("invalid repo id"), "{invalid}");
+    }
+
+    #[test]
+    fn local_source_blob_batch_reports_a_failed_session_as_failure() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let data = b"written before the session aborts";
+        let digest = source_digest(data);
+        let error = backend
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                batch.save(digest, data)?;
+                Err(KinDbError::StorageError(
+                    "caller aborted the session".to_string(),
+                ))
+            })
+            .expect_err("a failed session must never report success");
+        assert!(error.to_string().contains("caller aborted the session"));
+    }
+
+    #[test]
+    fn source_blob_batch_default_writes_through_the_per_object_path() {
+        let error = UnboundedOnlyBackend
+            .with_source_blob_write_batch("repo-a", &mut |batch| batch.save([0; 32], b"body"))
+            .expect_err("the default batch delegates to save_source_blob");
+        assert!(
+            error
+                .to_string()
+                .contains("immutable source blob storage is not supported"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_holds_the_repository_lock_across_the_session() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+
+        let bodies: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("exclusion body {i}").into_bytes())
+            .collect();
+        let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+        let probe = digests[0];
+        let base = dir.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let mut reader = None;
+
+        backend
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                let base = base.clone();
+                let finished_tx = finished_tx.clone();
+                let started_tx = started_tx.clone();
+                reader = Some(std::thread::spawn(move || {
+                    let competing = LocalFileBackend::new(&base);
+                    started_tx.send(()).unwrap();
+                    finished_tx
+                        .send(competing.load_source_blob("repo-a", probe))
+                        .unwrap();
+                }));
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the competing reader reaches its load");
+                assert!(
+                    finished_rx
+                        .recv_timeout(std::time::Duration::from_millis(200))
+                        .is_err(),
+                    "a reader must wait on the repository lock the batch holds"
+                );
+                Ok(())
+            })
+            .expect("a batch publishes every body it accepted");
+
+        let observed = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader proceeds once the batch releases the lock")
+            .expect("the reader observes a complete store");
+        assert_eq!(observed, Some(bodies[0].clone()));
+        reader.unwrap().join().unwrap();
     }
 
     #[test]
