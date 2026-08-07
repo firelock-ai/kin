@@ -11,7 +11,7 @@ use std::process;
 use std::time::Duration;
 
 use kin_core::KinLayout;
-use kin_daemon::{acquire_daemon_authority, run_with_authority, DaemonConfig, DaemonState};
+use kin_daemon::{acquire_daemon_authority, DaemonConfig, DaemonState};
 use tracing_subscriber::EnvFilter;
 
 kin_buildinfo::embed_update_build_identity!(
@@ -514,12 +514,64 @@ async fn async_main() -> i32 {
     };
 
     let kin_root = layout.root().to_path_buf();
-    let (state, authority) = match acquire_before_state(&kin_root, acquire_daemon_authority, || {
-        create_state(layout, &args.storage, &repo_id, allowed_repo_ids)
-    }) {
+    // Bind, publish, and start answering BEFORE opening state.
+    //
+    // Opening state reads and re-verifies the whole durable publication, which
+    // is proportional to repository size. Binding after it meant every client
+    // arriving during that window got a connection refusal and no endpoint file
+    // to find, so first contact on a large repository looked like a dead daemon.
+    // Binding first turns that into an answered "not ready yet".
+    //
+    // It runs INSIDE `acquire_before_state`'s create step, so singleton
+    // authority is already held: a daemon that lost the race must never bind the
+    // port it would then have to give up.
+    //
+    // The ENDPOINT is deliberately still published later, after state opens.
+    // Publishing it here is what would let a client find and use this daemon
+    // during the open window, and the client does not gate its commands on
+    // `/readiness` yet — it gates only its spawn-wait — so it would send a real
+    // command and take the readiness refusal as a failed command rather than as
+    // "not yet". Moving publication earlier belongs with the client half; until
+    // then this closes the refusal window for anyone who already knows the port
+    // without advertising a daemon that cannot answer commands.
+    let bind_port = args.port;
+    let bind_layout = layout.clone();
+    let storage = args.storage.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let opened = tokio::task::spawn_blocking(move || {
+        acquire_before_state(&kin_root, acquire_daemon_authority, move || {
+            let (warming_listener, api_listener, bound_port) =
+                kin_daemon::api::bind_api_listener_pair(&bind_layout, bind_port)?;
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+            // The readiness surface runs on the async runtime while this thread
+            // blocks in the open. That split is the whole mechanism: a warming
+            // answer is only possible because the load is not on the reactor.
+            runtime.spawn(kin_daemon::api::serve_warming_until(
+                warming_listener,
+                ready_rx,
+            ));
+            // A failed open drops both handles here, which closes the socket. No
+            // endpoint was published for it, so nothing outlives the failure.
+            let state = create_state(bind_layout, &storage, &repo_id, allowed_repo_ids)?;
+            Ok((state, api_listener, bound_port, ready_tx))
+        })
+        // The boxed startup error is not `Send`, and this result crosses back
+        // off the blocking thread. Its text is the whole of what the caller
+        // does with it.
+        .map_err(|error| error.to_string())
+    })
+    .await;
+    let opened = opened
+        .map_err(|error| format!("daemon startup task failed: {error}"))
+        .and_then(|inner| {
+            inner.map_err(|error| {
+                format!("failed to acquire daemon authority or open state: {error}")
+            })
+        });
+    let ((state, api_listener, bound_port, ready_tx), authority) = match opened {
         Ok(opened) => opened,
-        Err(error) => {
-            eprintln!("kin-daemon: failed to acquire daemon authority or open state: {error}");
+        Err(message) => {
+            eprintln!("kin-daemon: {message}");
             process::exit(1);
         }
     };
@@ -559,7 +611,18 @@ async fn async_main() -> i32 {
         ..DaemonConfig::default()
     };
 
-    if let Err(error) = run_with_authority(state, config, authority).await {
+    if let Err(error) = kin_daemon::daemon::run_with_authority_on(
+        state,
+        config,
+        authority,
+        Some(kin_daemon::daemon::PreboundApi {
+            listener: api_listener,
+            port: bound_port,
+            ready_tx,
+        }),
+    )
+    .await
+    {
         eprintln!("kin-daemon: {error}");
         return 1;
     }
