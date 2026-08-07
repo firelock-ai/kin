@@ -453,6 +453,9 @@ impl BackgroundWorkSupervisor {
     pub fn work_state(&self, now: Instant) -> DaemonWorkState {
         DaemonWorkState {
             daemon_cpu_seconds: self.daemon_cpu_seconds(),
+            // The supervisor watches background passes; the authority cache is
+            // not one, so the caller that can see both fills this in.
+            authority_loads: None,
             passes: self.reports(now),
         }
     }
@@ -542,6 +545,19 @@ mod tests {
             Some(Duration::from_secs(9_000)),
             Duration::ZERO
         ));
+    }
+
+    /// The supervisor must not answer a question it was never told the answer
+    /// to. Defaulting this to `Some(0)` would report "this daemon has never
+    /// loaded authority" on every surface, which is a claim, and a false one.
+    #[test]
+    fn the_supervisor_reports_no_authority_load_count_of_its_own() {
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        assert_eq!(
+            supervisor.work_state(Instant::now()).authority_loads,
+            None,
+            "the count belongs to the authority cache; the supervisor must leave it absent"
+        );
     }
 
     #[test]

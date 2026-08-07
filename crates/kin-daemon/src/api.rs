@@ -2995,7 +2995,11 @@ async fn command_resources(
     };
 
     let actual = kin_cli::commands::resources::ActualResources::capture();
-    let daemon_work = state.background_work.work_state(std::time::Instant::now());
+    let mut daemon_work = state.background_work.work_state(std::time::Instant::now());
+    // Filled here rather than inside `work_state`: the supervisor watches
+    // background passes and has no business knowing about the authority cache.
+    // This is the one place both are in scope.
+    daemon_work.authority_loads = Some(state.projection_authority.loads());
     let response = kin_cli::commands::resources::build_command_resources_response(
         plan,
         embed_runtime,
