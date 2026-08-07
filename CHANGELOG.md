@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-08-07
+
+### Changed
+
+- Select a serving resource profile instead of inheriting the proof fallback (#690)
+- Share one validated repository authority per publication (#691)
+- Stop making doomed Git capture blobs durable during init (#693)
+- Stop background passes that spend a machine without advancing (#694)
+- Tell a first embedding fill apart from coverage a store lost (#696)
+- Stop scoring an unconfigured install as a degraded retrieval profile (#697)
+- Answer probes while the daemon opens its state (#692)
+- Take the published v0.5.8 dependency ladder from the kin registry (#700)
+- Declare v0.5.7 abandoned so the release train can plan v0.5.8 (#707)
+
+
 ## [0.5.7] - 2026-08-07
 
 ### Changed
