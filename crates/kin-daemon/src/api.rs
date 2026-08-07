@@ -2900,13 +2900,50 @@ async fn command_trace_data_flow(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
-        &repository_authority,
-        graph.as_ref(),
-        &request,
-    )
-    .map_err(internal_error)?;
+    let response = run_trace_data_flow_off_runtime(repository_authority, graph, request)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(response))
+}
+
+/// Run one trace walk on the blocking pool instead of on a Tokio worker.
+///
+/// The walk is entirely synchronous and, on a large store, long. Called
+/// directly from the async handler it held a worker thread for its whole
+/// duration.
+///
+/// Being precise about what that did and did not cause, because the reported
+/// symptom is a dead daemon and this is not what killed it. Probing a daemon
+/// every two seconds through a 180s trace, it answered 26 of 26 probes and
+/// survived: the runtime carries roughly eighteen workers, so one blocked worker
+/// leaves seventeen and a single trace does not wedge it. The "daemon exited;
+/// restart required" the user saw comes from the client, which times out at 60s,
+/// reads a timeout as a possible exit, retries into the same timeout because
+/// server-side work is not cancelled, then revives and loses the race for a repo
+/// lock the live daemon still holds. What actually made the call slow enough to
+/// trip that ladder was one repository-authority open per step, fixed alongside
+/// this (FIR-1937).
+///
+/// So this is defence in depth for the concurrent case rather than the fix, and
+/// it is what makes cancellation reachable at all: a walk inline in the handler
+/// future cannot be told to stop.
+///
+/// The walk carries its own time and edge ceilings, so this seam does not need
+/// a timeout of its own: it moves the work, and the budget bounds it.
+async fn run_trace_data_flow_off_runtime(
+    repository_authority: kin_core::LocalRepositoryAuthorityBinding,
+    graph: Arc<kin_db::InMemoryGraph>,
+    request: kin_cli::commands::trace_data_flow::TraceDataFlowRequest,
+) -> anyhow::Result<kin_cli::commands::trace_data_flow::TraceDataFlowResponse> {
+    tokio::task::spawn_blocking(move || {
+        kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
+            &repository_authority,
+            graph.as_ref(),
+            &request,
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("trace-data-flow worker failed: {error}"))?
 }
 
 /// POST /commands/refs — render incoming references from daemon-owned graph state.
@@ -6801,17 +6838,19 @@ async fn mcp_tools_call(
             Ok(binding) => binding,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
-        let result = match kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
-            &repository_authority,
-            graph.as_ref(),
-            &req,
-        ) {
-            Ok(response) => match serde_json::to_string_pretty(&response) {
-                Ok(json) => kin_mcp::ToolCallResult::text(json),
+        // Same off-runtime seam as the CLI route. This is the arm the reported
+        // failure came through: the MCP client is the one whose request timeout
+        // turns a slow call into a dead-daemon verdict.
+        let result =
+            match run_trace_data_flow_off_runtime(repository_authority, Arc::clone(&graph), req)
+                .await
+            {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(json) => kin_mcp::ToolCallResult::text(json),
+                    Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+                },
                 Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-            },
-            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-        };
+            };
         return Ok(Json(result));
     }
 
@@ -20085,6 +20124,72 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Context pack for 'handler'")),
             "context response should identify the daemon graph entity"
+        );
+    }
+
+    /// A trace request must not be the only thing this daemon can be doing.
+    ///
+    /// The walk now runs on the blocking pool, so the runtime stays free to
+    /// serve other routes while it runs. This asserts the seam is wired and
+    /// that both routes answer when they overlap. It does NOT prove the
+    /// occupancy property on its own: a walk over a test-sized store is fast
+    /// enough that an inline one would also let `/health` through. What it
+    /// guards is the wiring — a regression that put the walk back on the async
+    /// worker would still answer here, so the occupancy claim rests on the
+    /// live-daemon measurement, not on this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_trace_in_flight_leaves_the_daemon_answering() {
+        let state = test_state();
+        let source = "def handler():\n    return 1\n";
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
+        let mut focal = test_entity("handler", "src/lib.py");
+        focal.span.as_mut().unwrap().end_byte = source.len();
+        focal.span.as_mut().unwrap().end_line = 2;
+        let focal_id = focal.id;
+        state.graph.upsert_entity(&focal).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let tracing_app = app.clone();
+        let trace = tokio::spawn(async move {
+            tracing_app
+                .oneshot(
+                    Request::post("/commands/trace-data-flow")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "focal": focal_id.to_string() }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "the daemon must keep answering while a trace runs"
+        );
+
+        let response = trace.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::trace_data_flow::TraceDataFlowResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.focal_id, focal_id.to_string());
+        assert!(
+            result.degradations.is_empty(),
+            "a healthy store's trace discloses no degradation: {:?}",
+            result.degradations
         );
     }
 
