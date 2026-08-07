@@ -354,6 +354,11 @@ const IMPACT_MEMBER_RELATION_KINDS: &[kin_model::RelationKind] = &[
 /// Naming those members, with the count a reader can verify, replaces an answer
 /// that looked like proof of no dependents with one that says where they are.
 ///
+/// The listing is gathered by name qualification and is worded as such, because
+/// containment reaches only same-file members and the cross-file ones are tied
+/// to the declaration by name alone. A declaration sharing its name with another
+/// must not be told the other's members are its own.
+///
 /// A target with no referenced members keeps the bare line. That is what keeps
 /// this from becoming a footer on every empty result.
 fn empty_impact_context(
@@ -371,10 +376,11 @@ fn empty_impact_context(
     };
 
     let mut lines = vec![format!(
-        "  {} member{} of '{}' do have dependents:",
+        "  {} entit{} named '{}::*' ha{} dependents:",
         referenced.len(),
-        if referenced.len() == 1 { "" } else { "s" },
-        target.name
+        if referenced.len() == 1 { "y" } else { "ies" },
+        target.name,
+        if referenced.len() == 1 { "s" } else { "ve" },
     )];
     for member in referenced
         .iter()
@@ -607,7 +613,9 @@ fn qualifier_miss_guidance(
         lines.push(format!("  {more}"));
     }
     if !members_in_scope.is_empty() {
-        lines.push(format!("Members of '{entity}' the graph does place there:"));
+        lines.push(format!(
+            "Entities named '{entity}::*' the graph does place there:"
+        ));
         for member in members_in_scope
             .iter()
             .take(crate::commands::declaration_neighbors::MAX_LISTED)

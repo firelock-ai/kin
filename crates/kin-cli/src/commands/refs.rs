@@ -226,10 +226,14 @@ pub fn build_refs_response(
 /// What the graph still says about a target whose incoming relations are empty.
 ///
 /// An empty answer on a type declaration is true of that entity and misleading
-/// about the repository: the references went to its members, and Kin knows
-/// exactly which ones. Naming them turns "no callers" into "these are the
-/// callers, one level down", and naming the same-name identities resolution
-/// passed over says which node was actually answered for.
+/// about the repository: the references went to entities the declaration's name
+/// qualifies, and Kin holds exactly which ones. Naming them turns "no callers"
+/// into "these are the callers, one level down", and naming the same-name
+/// identities resolution passed over says which node was actually answered for.
+///
+/// The listing is scoped by name and says so, because the graph ties a
+/// declaration only to its same-file members. Claiming ownership instead would
+/// tell a same-named declaration that another's members are its own.
 ///
 /// An entity with neither members nor same-name siblings adds nothing here, so
 /// it keeps the plain empty answer. That is what stops this note from becoming
@@ -243,10 +247,11 @@ fn empty_result_context(
     let referenced: Vec<_> = neighbors.referenced_members().collect();
     if let Some(first) = referenced.first() {
         lines.push(format!(
-            "{} member{} of '{}' do carry them:",
+            "{} entit{} named '{}::*' carr{} them:",
             referenced.len(),
-            if referenced.len() == 1 { "" } else { "s" },
-            target.name
+            if referenced.len() == 1 { "y" } else { "ies" },
+            target.name,
+            if referenced.len() == 1 { "ies" } else { "y" },
         ));
         for member in referenced.iter().take(declaration_neighbors::MAX_LISTED) {
             lines.push(format!(

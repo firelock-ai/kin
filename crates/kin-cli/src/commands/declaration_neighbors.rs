@@ -12,17 +12,27 @@
 //! reported no callers while the graph held callers for `Error::msg`,
 //! `Error::from`, and the rest, and the answer gave the reader no way to know.
 //!
-//! Two facts close that gap, and both are read out of graph truth: the members
+//! Two facts close that gap, and both are read out of graph truth: the entities
 //! the graph holds under the declaration's name, and the other graph identities
 //! carrying the same name that resolution did not choose. Nothing here consults
 //! the filesystem.
+//!
+//! Members are gathered by name qualification, not by edge, and the wording of
+//! every line built from them says so. The `Contains` edge a declaration owns
+//! reaches only its same-file members: the linker keys containment against a
+//! declaration in the same file, and a cross-file `impl` block has none, so
+//! `Error::chain` in `src/error.rs` is tied to `Error` in `src/lib.rs` by name
+//! alone. Collecting from edges would therefore drop exactly the members this
+//! exists to surface. The cost of the name is that two same-named declarations
+//! cannot be told apart, so a listing here is a claim about which entities share
+//! a name prefix and never a claim about which declaration owns them.
 
 use anyhow::Result;
 use kin_model::{Entity, EntityFilter, GraphStore, RelationKind};
 
-/// A member of a declaration, paired with how many distinct entities reference
-/// it. The count is the one `kin refs` reports for that member, so the note and
-/// the command it suggests cannot disagree.
+/// An entity whose name is qualified by the declaration's name, paired with how
+/// many distinct entities reference it. The count is the one `kin refs` reports
+/// for that member, so the note and the command it suggests cannot disagree.
 #[derive(Debug, Clone)]
 pub struct MemberSummary {
     pub name: String,
@@ -107,8 +117,10 @@ fn collect_members(
     relation_kinds: &[RelationKind],
 ) -> Result<Vec<MemberSummary>> {
     // The graph's name query is a case-insensitive substring match, so it also
-    // returns `OtherError::foo` for a `Error::` pattern. Only an exact prefix is
-    // a member of this declaration.
+    // returns `OtherError::foo` for a `Error::` pattern. Requiring an exact
+    // prefix drops those. What survives is every entity the name `Error::`
+    // qualifies, which is not the same set as the members this declaration owns
+    // when another declaration shares its name.
     let prefix = format!("{}::", target.name);
     let candidates = graph.query_entities(&EntityFilter {
         name_pattern: Some(prefix.clone()),

@@ -210,6 +210,54 @@ fn fixture_premise_declaration_owns_no_incoming_edges_but_members_do() {
     }
 }
 
+/// Why the listing is gathered by name and not by the containment edge.
+///
+/// The Rust extractor emits a `Contains` for both `impl` blocks, but the linker
+/// keys containment against a declaration in the same file, and `src/error.rs`
+/// declares none. So the cross-file edge is dropped and the declaration is left
+/// owning exactly one outgoing `Contains`, to its same-file member. Collecting
+/// members from edges alone would therefore lose `Error::chain`, which is the
+/// member this whole answer exists to surface.
+///
+/// If this reddens because the declaration now owns an edge to `Error::chain`,
+/// the graph gap is closed and the collector should move to edges, where a
+/// declaration's members can be told from a same-named declaration's.
+#[test]
+fn fixture_premise_containment_reaches_only_the_same_file_member() {
+    let graph = anyhow_shaped_graph();
+    let declaration = graph
+        .query_entities(&kin_model::EntityFilter {
+            name_pattern: Some("Error".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .find(|entity| {
+            entity.name == "Error"
+                && entity.file_origin.as_ref().map(|f| f.0.as_str()) == Some("src/lib.rs")
+        })
+        .expect("Error declared in src/lib.rs");
+
+    let contained: Vec<String> = graph
+        .get_all_relations_for_entity(&declaration.id)
+        .unwrap()
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == kin_model::RelationKind::Contains
+                && relation.src == kin_model::GraphNodeId::Entity(declaration.id)
+        })
+        .filter_map(|relation| relation.dst.as_entity())
+        .filter_map(|id| graph.get_entity(&id).unwrap())
+        .map(|entity| entity.name)
+        .collect();
+
+    assert_eq!(
+        contained,
+        vec!["Error::msg".to_string()],
+        "containment must reach the same-file member and not the cross-file one"
+    );
+}
+
 #[test]
 fn refs_on_a_declaration_names_the_members_that_carry_references() {
     let graph = anyhow_shaped_graph();
@@ -351,5 +399,67 @@ async fn absent_name_still_reports_not_found() {
     assert!(
         joined.contains("not found in this repo's graph"),
         "a genuinely absent name keeps the not-found answer: {joined}"
+    );
+}
+
+/// The listing is gathered by name qualification, and the graph does not tie a
+/// declaration to members declared in another file, so the wording has to claim
+/// a shared name and not ownership.
+///
+/// `tests/ui/no-impl.rs` declares a unit `struct Error;` that owns nothing at
+/// all, and qualifying an ordinary command to it is reachable from the CLI.
+/// Telling that declaration it owns `Error::msg` and `Error::chain`, which
+/// belong to the `Error` in `src/lib.rs`, is the same answer that is true of
+/// nothing and wrong about the repository, pointed the other way.
+#[tokio::test]
+async fn a_memberless_declaration_is_not_told_it_owns_the_other_declarations_members() {
+    let graph = anyhow_shaped_graph();
+    let joined = impact_lines(&graph, "Error", Some("tests/ui/no-impl.rs")).await;
+
+    assert!(
+        joined.contains("Error::msg") || joined.contains("Error::chain"),
+        "the entities the name qualifies are still worth naming: {joined}"
+    );
+    assert!(
+        !joined.contains("member"),
+        "a declaration that owns no members must not be told it has them: {joined}"
+    );
+    assert!(
+        joined.contains("named 'Error::*'"),
+        "the listing must say it is scoped by name: {joined}"
+    );
+}
+
+/// The same claim on the `refs` surface. Resolution by name prefers the
+/// `src/lib.rs` identity, so the memberless one is reached by id, which is a
+/// spelling `kin refs` accepts.
+#[test]
+fn refs_scopes_the_listing_by_name_rather_than_claiming_ownership() {
+    let graph = anyhow_shaped_graph();
+    let memberless = graph
+        .query_entities(&kin_model::EntityFilter {
+            name_pattern: Some("Error".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .find(|entity| {
+            entity.name == "Error"
+                && entity.file_origin.as_ref().map(|f| f.0.as_str()) == Some("tests/ui/no-impl.rs")
+        })
+        .expect("the unit struct Error in tests/ui/no-impl.rs");
+
+    let joined = refs_lines(&graph, &memberless.id.0.to_string());
+    assert!(
+        joined.contains("Error::msg") && joined.contains("Error::chain"),
+        "the entities the name qualifies are still worth naming: {joined}"
+    );
+    assert!(
+        !joined.contains("member"),
+        "a declaration that owns no members must not be told it has them: {joined}"
+    );
+    assert!(
+        joined.contains("named 'Error::*'"),
+        "the listing must say it is scoped by name: {joined}"
     );
 }
