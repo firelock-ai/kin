@@ -1,0 +1,109 @@
+name: PR Text Hygiene
+
+# Refuses assistant-session traces in the pull request title and body.
+#
+# On a merge-queue repository GitHub mints the squash commit message verbatim
+# from the pull request title and body. That happens server-side, after every
+# local Git hook has already run, with nobody at the merge button, so a trace
+# placed in the body is authored directly into public history and no
+# commit-message hook can see it. A check on the pull request is the only
+# surface that can refuse it, and it must run on `pull_request` because the
+# queue snapshots the title and body when the entry is submitted.
+#
+# Internal tracker references (FIR-1234, linear.app links) are sanctioned in a
+# commit message and deliberately pass.
+#
+# This check is intentionally self-contained. The shared implementation lives in
+# firelock-ai/kin-actions (`public-history-hygiene.yml`, `scan-history: false`),
+# but every released kin-actions tag predates body scanning, so consuming it by
+# pin would install a check that reads green while inspecting nothing. Migrate
+# to the shared workflow once a kin-actions release carries that input.
+on:
+  pull_request:
+    # `edited` is the one that cannot be left out. The default trigger set is
+    # opened/synchronize/reopened, none of which fires when someone changes the
+    # title or body of an open pull request -- which is the text the queue
+    # mints, and the one edit that needs no push. Without `edited` the gate
+    # would inspect the text a pull request opened with and then let any later
+    # rewrite of it through unread.
+    types: [opened, reopened, synchronize, edited]
+  # A required context must also report on the queue's speculative merge
+  # commits, or the queue waits forever for a check that never runs.
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  pr_text:
+    name: PR text hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan the pull request title and body
+        env:
+          # Read from the event payload and passed as quoted argv. Never
+          # interpolated into the shell, and never read from a checkout of the
+          # pull request's own code.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 - "$EVENT_NAME" "$PR_TITLE" "$PR_BODY" <<'PY'
+          import re
+          import sys
+
+          # Assistant-session traces and attribution markers. Tracker references
+          # are absent on purpose: they are sanctioned in a commit message.
+          PATTERNS = [
+              ("assistant session trailer",
+               r"(?i)\b(?:Claude|Codex|OpenAI|ChatGPT|Gemini|Copilot|Cursor)-Session\s*:"),
+              ("assistant session URL",
+               r"(?i)https?://(?:claude\.ai|chat\.openai\.com|chatgpt\.com)/\S+"),
+              ("assistant session id", r"\bsession_[A-Za-z0-9]{16,}\b"),
+              ("assistant co-author trailer",
+               r"(?i)Co-Authored-By\s*:.*\b(?:Claude|Codex|ChatGPT|Copilot|Gemini|Cursor)\b"),
+              ("assistant generation notice",
+               r"(?i)Generated\s+with\b.*\b(?:Claude|Codex|ChatGPT|Copilot|Gemini|Cursor)\b"),
+              ("assistant vendor no-reply address",
+               r"(?i)\bnoreply@(?:anthropic|openai)\.com\b"),
+          ]
+          COMPILED = [(label, re.compile(pat)) for label, pat in PATTERNS]
+
+          event, title, body = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          violations = []
+          for surface, text in (("PR title", title), ("PR body", body)):
+              for label, pat in COMPILED:
+                  if pat.search(text):
+                      violations.append(f"{surface} contains {label}")
+
+          # Report what was actually inspected. An input that never arrived and
+          # an input that scanned clean both produce zero violations, and a gate
+          # that prints the same thing for both cannot be audited.
+          def coverage(name, text):
+              return (f"  {name:<6}: {len(text)} chars scanned"
+                      if text else f"  {name:<6}: <none supplied, not scanned>")
+
+          print("Pull request text hygiene")
+          print(f"  event : {event}")
+          print(coverage("title", title))
+          print(coverage("body", body))
+          print("  tracker refs: FIR-... and linear.app links are sanctioned here")
+          if event != "pull_request":
+              print("  note  : no pull request payload on this event; the title and "
+                    "body were gated on the pull_request run that fed this queue entry")
+
+          if not violations:
+              print("OK: no assistant-session traces in the pull request text.")
+              raise SystemExit(0)
+
+          print(f"FAIL: {len(violations)} violation(s):")
+          for detail in violations:
+              print(f"    - {detail}")
+          print("")
+          print("The merge queue mints the squash commit message from this text, so "
+                "these bytes would become public history verbatim.")
+          print("Edit the pull request title/body to remove them, then re-run.")
+          raise SystemExit(1)
+          PY
