@@ -63,7 +63,7 @@ pub mod release_cmd;
 pub mod release_orch;
 pub mod remote;
 pub mod rename;
-pub(crate) mod repository_authority;
+pub mod repository_authority;
 pub mod resolve;
 pub mod resources;
 pub mod review;

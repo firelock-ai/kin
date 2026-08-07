@@ -202,18 +202,26 @@ fn read_local_publication_identity(
 /// revalidating it against the durable publication record keeps the answer
 /// exactly as fresh while making the common request a small metadata read.
 ///
-/// Two readers hold slots here, because they read through different crates'
-/// authority wrappers: the projection routes (`ActiveApiRepositoryAuthority`,
-/// for workspace tree state) and the MCP query tools (kin-mcp's
-/// `ActiveRepositoryAuthority`, for source projection). Both slots key on the
-/// same [`LocalPublicationIdentity`] under the same load gate and count into
-/// the same [`Self::loads`], so the contract is one contract; only the wrapper
-/// differs. The name predates the second reader and is kept because the field
-/// it fills is declared elsewhere.
+/// Three readers hold slots here, because they read through three different
+/// crates' authority wrappers: the projection routes
+/// (`ActiveApiRepositoryAuthority`, for workspace tree state), the MCP query
+/// tools (kin-mcp's `ActiveRepositoryAuthority`, for source projection), and the
+/// tools served by kin-cli command helpers (kin-cli's
+/// `ActiveRepositoryAuthority`, for entity source and trace bodies). All three
+/// slots key on the same [`LocalPublicationIdentity`] under the same load gate
+/// and count into the same [`Self::loads`], so the contract is one contract;
+/// only the wrapper differs. The name predates the other two readers and is kept
+/// because the field it fills is declared elsewhere.
+///
+/// Three wrappers over one durable state is migration debt, not the design.
+/// Collapsing them onto one shared `RepositoryAuthorityManager` would reshape
+/// the projection path, so each keeps its own slot and the cost stays
+/// O(publications) rather than O(requests) on all three.
 #[derive(Default)]
 pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
+    command: std::sync::Mutex<Option<HeldCommandAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -238,6 +246,14 @@ struct HeldQueryAuthority {
     /// [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     authority: Arc<kin_mcp::handlers::ActiveRepositoryAuthority>,
+}
+
+#[derive(Clone)]
+struct HeldCommandAuthority {
+    /// Read strictly before the authority it labels was loaded, exactly as for
+    /// [`HeldProjectionAuthority::published`] and for the same reason.
+    published: LocalPublicationIdentity,
+    authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
 }
 
 impl ProjectionAuthorityCache {
@@ -297,9 +313,31 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_command(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>> {
+        lock_recover(&self.command)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.authority))
+    }
+
+    fn install_command(
+        &self,
+        published: LocalPublicationIdentity,
+        authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+    ) {
+        *lock_recover(&self.command) = Some(HeldCommandAuthority {
+            published,
+            authority,
+        });
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
+        *lock_recover(&self.command) = None;
     }
 }
 
@@ -444,6 +482,102 @@ fn query_repository_authority(
         "query repository authority loaded"
     );
     Ok(authority)
+}
+
+/// Resolve the repository-v6 authority the kin-cli-backed query tools read
+/// source from: `get_entity_source`, `get_entity_sources`, `trace_data_flow`.
+///
+/// The same contract as [`query_repository_authority`], for the third wrapper.
+/// Those three tools resolve source through kin-cli command helpers, whose own
+/// `ActiveRepositoryAuthority` is a different type over the same durable state,
+/// so sharing the query slot's authority with them is not possible without
+/// reshaping how they read. Sharing the CONTRACT is: same publication key, same
+/// load gate, same counter, and the full staleness argument stated at
+/// [`query_repository_authority`] applies here unchanged.
+///
+/// What this removes is worse than one open per request. `get_entity_sources`
+/// resolves source per entity, and each resolution opened its own authority, so
+/// a batch of N entities paid N whole-store verifications. Every batch now reads
+/// at one publication through one open, which also makes the batch coherent:
+/// per-entity opens could straddle a publication and return rows from two
+/// different generations.
+///
+/// Blocking: reads storage metadata and, on a publication change, loads the
+/// complete durable authority.
+fn command_repository_authority(
+    state: &DaemonState,
+) -> Result<
+    Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+    (StatusCode, String),
+> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let repository_id = binding.repository_id().clone();
+
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse_command(&published) {
+        return Ok(authority);
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    // Re-read under the gate: the publication may have moved while this request
+    // waited, and the label installed below must be the one taken before the
+    // load it describes.
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse_command(&published) {
+        return Ok(authority);
+    }
+    let authority = Arc::new(
+        kin_cli::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
+            .map_err(repository_authority_error)?,
+    );
+    state.projection_authority.record_load();
+    state
+        .projection_authority
+        .install_command(published, Arc::clone(&authority));
+    tracing::debug!(
+        repository = %repository_id,
+        loads = state.projection_authority.loads(),
+        "command repository authority loaded"
+    );
+    Ok(authority)
+}
+
+/// Hand a command helper an authority this daemon already resolved.
+///
+/// The eager form: every caller reaches it only after deciding the request
+/// projects bodies, so there is no publication it might not consult and nothing
+/// to defer. The freshness obligation the shared arm states is discharged by
+/// [`command_repository_authority`], which read the publication record before
+/// the load it labels.
+fn shared_command_authority(
+    binding: kin_core::LocalRepositoryAuthorityBinding,
+    authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+) -> kin_cli::commands::repository_authority::RequestRepositoryAuthority {
+    kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
+        binding,
+        Arc::new(move || Ok(Arc::clone(&authority))),
+    )
+}
+
+/// The authority source for an MCP route that resolves source through a kin-cli
+/// command helper.
+fn require_mcp_command_repository_authority(
+    state: &DaemonState,
+) -> kin_mcp::Result<kin_cli::commands::repository_authority::RequestRepositoryAuthority> {
+    let binding = require_mcp_local_repository_binding(state)?;
+    let authority =
+        command_repository_authority(state).map_err(|(_, message)| mcp_authority_gap(message))?;
+    Ok(shared_command_authority(binding, authority))
 }
 
 /// Fail closed when an explicit filesystem-admission command is unavailable.
@@ -3200,9 +3334,12 @@ async fn command_trace_data_flow(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
+    let repository_authority = shared_command_authority(
+        state
+            .local_repository_authority_binding()
+            .map_err(repository_authority_error)?,
+        command_repository_authority(&state)?,
+    );
     let response = run_trace_data_flow_off_runtime(repository_authority, graph, request)
         .await
         .map_err(internal_error)?;
@@ -3234,7 +3371,7 @@ async fn command_trace_data_flow(
 /// The walk carries its own time and edge ceilings, so this seam does not need
 /// a timeout of its own: it moves the work, and the budget bounds it.
 async fn run_trace_data_flow_off_runtime(
-    repository_authority: kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: kin_cli::commands::repository_authority::RequestRepositoryAuthority,
     graph: Arc<kin_db::InMemoryGraph>,
     request: kin_cli::commands::trace_data_flow::TraceDataFlowRequest,
 ) -> anyhow::Result<kin_cli::commands::trace_data_flow::TraceDataFlowResponse> {
@@ -7076,8 +7213,8 @@ async fn mcp_tools_call(
                 "missing required parameter: entity_id".to_string(),
             )));
         };
-        let repository_authority = match require_mcp_local_repository_binding(&state) {
-            Ok(binding) => binding,
+        let repository_authority = match require_mcp_command_repository_authority(&state) {
+            Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
         let result =
@@ -7099,8 +7236,11 @@ async fn mcp_tools_call(
             Ok(parsed) => parsed,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
-        let repository_authority = match require_mcp_local_repository_binding(&state) {
-            Ok(binding) => binding,
+        // Resolved ONCE for the batch. Each entity used to resolve its own
+        // authority, so N entities cost N whole-store verifications and could
+        // straddle a publication; the batch now reads every row at one.
+        let repository_authority = match require_mcp_command_repository_authority(&state) {
+            Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
         let resolved = entity_ids
@@ -7166,8 +7306,8 @@ async fn mcp_tools_call(
             direction: parsed_direction,
             limit_per_step,
         };
-        let repository_authority = match require_mcp_local_repository_binding(&state) {
-            Ok(binding) => binding,
+        let repository_authority = match require_mcp_command_repository_authority(&state) {
+            Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
         // Same off-runtime seam as the CLI route. This is the arm the reported
@@ -25779,6 +25919,145 @@ mod tests {
         let repeat =
             call_mcp_tool(app, "get_entity", json!({ "entity_id": after.to_string() })).await;
         assert!(repeat["source_excerpt"].as_str().is_some());
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            2,
+            "a second read at the new publication must reuse the load the first one paid for"
+        );
+    }
+
+    /// The three tools that resolve source through kin-cli command helpers share
+    /// ONE authority load at one publication.
+    ///
+    /// The other wrapper, and the gap FIR-2079 left open. `get_entity_source`,
+    /// `get_entity_sources`, and `trace_data_flow` do not read through kin-mcp's
+    /// authority; they route into kin-cli's, which opened per call. The batched
+    /// one was worse than per-request: it resolves source per entity, so N
+    /// entities cost N whole-store verifications.
+    ///
+    /// A count, not elapsed time, for the same reason as the query-tool bound
+    /// above: what an open costs is a property of the store, so a timing
+    /// assertion on a small fixture would pass with the defect present.
+    #[tokio::test]
+    async fn kin_cli_backed_source_tools_share_one_authority_load_per_publication() {
+        const PAGE: usize = 3;
+        let state = test_state();
+        let entities = install_locate_page(&state, PAGE);
+        let app = router(Arc::clone(&state));
+
+        let before = state.projection_authority.loads();
+        let single = call_mcp_tool(
+            app.clone(),
+            "get_entity_source",
+            json!({ "entity_id": entities[0].to_string() }),
+        )
+        .await;
+        let batch = call_mcp_tool(
+            app.clone(),
+            "get_entity_sources",
+            json!({
+                "entity_ids": entities.iter().map(ToString::to_string).collect::<Vec<_>>()
+            }),
+        )
+        .await;
+        let traced = call_mcp_tool(
+            app.clone(),
+            "trace_data_flow",
+            json!({ "focal": entities[1].to_string(), "depth": 1 }),
+        )
+        .await;
+
+        // Non-vacuity: each call must actually have projected graph-owned
+        // source. A tool that returned without reading a body needs no authority
+        // at all, and three such calls would hold the count at one while proving
+        // nothing about sharing.
+        let single_text = single.to_string();
+        assert!(
+            single_text.contains("parse_config0"),
+            "get_entity_source must serve its graph-owned body: {single}"
+        );
+        let batch_text = batch.to_string();
+        for index in 0..PAGE {
+            assert!(
+                batch_text.contains(&format!("parse_config{index}")),
+                "get_entity_sources must serve every requested body, missing {index}: {batch}"
+            );
+        }
+        assert!(
+            traced.to_string().contains("parse_config1"),
+            "trace_data_flow must serve its focal body: {traced}"
+        );
+
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            1,
+            "the three kin-cli-backed source tools reading at one publication must load \
+             repository authority exactly once; a count that climbs with request volume -- or \
+             with BATCH SIZE -- is the per-call open this shares"
+        );
+    }
+
+    /// A publication boundary forces a fresh, fully validating load on this
+    /// wrapper too.
+    ///
+    /// The half that keeps the bound above honest: a count held at one by never
+    /// reloading would be a cache serving authority the store has moved past.
+    /// Freshness is asserted on the ANSWER as well as the counter -- the entity
+    /// installed after the boundary lives on a path the previous publication's
+    /// workspace tree does not carry, so authority reused across it could not
+    /// serve that body at all.
+    #[tokio::test]
+    async fn a_publication_boundary_costs_one_more_load_on_the_command_wrapper() {
+        const AFTER: &str = "def trace_after(path):\n    return {\"which\": \"after\"}\n";
+        let state = test_state();
+        let entities = install_locate_page(&state, 1);
+        let app = router(Arc::clone(&state));
+
+        let before = state.projection_authority.loads();
+        let first = call_mcp_tool(
+            app.clone(),
+            "get_entity_source",
+            json!({ "entity_id": entities[0].to_string() }),
+        )
+        .await;
+        assert!(
+            first.to_string().contains("parse_config0"),
+            "the first read must project a body, or it loaded no authority: {first}"
+        );
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            1,
+            "the first read must load once"
+        );
+
+        let after = install_source_entity(&state, "trace_after", "src/trace_after.py", AFTER);
+
+        let served = call_mcp_tool(
+            app.clone(),
+            "get_entity_source",
+            json!({ "entity_id": after.to_string() }),
+        )
+        .await;
+        assert!(
+            served.to_string().contains("trace_after"),
+            "a read after the boundary must serve the publication that replaced the one the \
+             previous read loaded: {served}"
+        );
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            2,
+            "crossing one publication boundary must cost exactly one more full validating load: \
+             fewer means authority was reused past the commit that replaced it, more means the \
+             reuse stopped holding within a publication"
+        );
+
+        let repeat = call_mcp_tool(
+            app,
+            "get_entity_source",
+            json!({ "entity_id": after.to_string() }),
+        )
+        .await;
+        assert!(repeat.to_string().contains("trace_after"));
         assert_eq!(
             state.projection_authority.loads() - before,
             2,

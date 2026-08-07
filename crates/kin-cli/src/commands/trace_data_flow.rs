@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use crate::commands::graph::{graph_source_record_from, GraphSourceRecord};
 use crate::commands::locate::{record_degradation, RetrievalDegradation};
-use crate::commands::repository_authority::ActiveRepositoryAuthority;
+use crate::commands::repository_authority::{
+    ActiveRepositoryAuthority, RequestRepositoryAuthority,
+};
 
 const DEFAULT_DEPTH: usize = 3;
 const MAX_DEPTH: usize = 8;
@@ -400,11 +402,16 @@ async fn run_daemon_trace_data_flow(
 /// This is the single substrate primitive used by both the CLI route and the
 /// MCP tool dispatcher so the chain construction stays in one place.
 pub fn build_trace_data_flow_response(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     request: &TraceDataFlowRequest,
 ) -> Result<TraceDataFlowResponse> {
-    build_trace_data_flow_response_within(binding, graph, request, TraceBudget::default())
+    build_trace_data_flow_response_within(
+        repository_authority,
+        graph,
+        request,
+        TraceBudget::default(),
+    )
 }
 
 /// The same walk under caller-supplied work ceilings.
@@ -413,7 +420,7 @@ pub fn build_trace_data_flow_response(
 /// the shipped budget is measured in seconds and hundreds of thousands of
 /// edges, and a test that had to exhaust it would be as slow as the defect.
 pub fn build_trace_data_flow_response_within(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     request: &TraceDataFlowRequest,
     budget: TraceBudget,
@@ -450,7 +457,7 @@ pub fn build_trace_data_flow_response_within(
     // always optional per step, and hoisting the open must not turn a payload
     // that used to arrive body-less into a failed call — so the failure is
     // disclosed and the walk continues on identity alone.
-    let projection = match open_body_projection(binding) {
+    let projection = match open_body_projection(repository_authority) {
         Ok(projection) => Some(projection),
         Err(error) => {
             record_degradation(
@@ -669,14 +676,15 @@ fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Opt
 /// Held for the whole walk so the repeated per-step open is structurally
 /// impossible rather than merely avoided at the current call sites.
 struct BodyProjection {
-    authority: ActiveRepositoryAuthority,
+    authority: std::sync::Arc<ActiveRepositoryAuthority>,
     workspace: kin_model::WorkspaceState,
 }
 
 fn open_body_projection(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: &RequestRepositoryAuthority,
 ) -> Result<BodyProjection> {
-    let authority = ActiveRepositoryAuthority::open(binding)
+    let authority = repository_authority
+        .open()
         .context("open repository authority for trace-data-flow")?;
     let workspace = authority
         .workspace()
@@ -776,7 +784,7 @@ mod tests {
         let graph = InMemoryGraph::new();
         let (_t, binding) = empty_binding();
         let err = build_trace_data_flow_response(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
                 focal: "   ".to_string(),
@@ -797,7 +805,7 @@ mod tests {
         let graph = InMemoryGraph::new();
         let (_t, binding) = empty_binding();
         let err = build_trace_data_flow_response(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
                 focal: "does_not_exist".to_string(),
@@ -844,7 +852,7 @@ mod tests {
             .unwrap();
 
         let response = build_trace_data_flow_response(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
                 focal: focal_id.to_string(),
@@ -899,7 +907,7 @@ mod tests {
             .unwrap();
 
         let response = build_trace_data_flow_response(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
                 focal: focal_id.to_string(),
@@ -943,7 +951,7 @@ mod tests {
         }
 
         let response = build_trace_data_flow_response(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &TraceDataFlowRequest {
                 focal: focal_id.to_string(),
@@ -991,7 +999,7 @@ mod tests {
         let (_t, binding) = empty_binding();
 
         let response = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &hub_request(focal_id),
             TraceBudget {
@@ -1032,7 +1040,7 @@ mod tests {
         // A zero budget is already spent at the first check, so this asserts
         // the bound without making the test wait for a real one to elapse.
         let response = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &hub_request(focal_id),
             TraceBudget {
@@ -1064,7 +1072,7 @@ mod tests {
         let (_t, binding) = empty_binding();
 
         let response = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &hub_request(focal_id),
             TraceBudget::default(),
@@ -1093,7 +1101,7 @@ mod tests {
         let (_t, binding) = empty_binding();
 
         let response = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &hub_request(focal_id),
             TraceBudget::default(),
@@ -1123,7 +1131,7 @@ mod tests {
         let cancel = TraceCancel::new();
         cancel.cancel();
         let response = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &hub_request(focal_id),
             TraceBudget::cancellable(cancel),
@@ -1170,7 +1178,7 @@ mod tests {
         };
 
         let uncancelled = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &request,
             TraceBudget::bounded(),
@@ -1191,7 +1199,7 @@ mod tests {
         let cancel = TraceCancel::new();
         cancel.cancel();
         let cancelled = build_trace_data_flow_response_within(
-            &binding,
+            &RequestRepositoryAuthority::pinned(binding.clone()),
             &graph,
             &request,
             TraceBudget::cancellable(cancel),
