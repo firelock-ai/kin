@@ -1096,9 +1096,34 @@ pub async fn run(state: DaemonState, config: DaemonConfig) -> Result<()> {
 /// held before `DaemonState::open*` can recover or publish persisted state.
 /// [`run`] remains as the source-compatible wrapper for library callers.
 pub async fn run_with_authority(
+    state: DaemonState,
+    config: DaemonConfig,
+    daemon_lock: crate::lifecycle::DaemonLock,
+) -> Result<()> {
+    run_with_authority_on(state, config, daemon_lock, None).await
+}
+
+/// The API socket a caller bound and published before opening state.
+///
+/// Opening state re-verifies the whole durable publication, so a daemon that
+/// binds only afterwards refuses every connection for the length of that load.
+/// A caller that binds first passes the second handle to its already-bound
+/// socket here, along with the signal that retires the readiness surface it has
+/// been answering probes on in the meantime.
+pub struct PreboundApi {
+    /// The serving handle of a socket already bound and already published.
+    pub listener: tokio::net::TcpListener,
+    pub port: u16,
+    /// Set when the full API takes over, which stops the readiness surface.
+    pub ready_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Run with singleton authority held, optionally on an already-bound socket.
+pub async fn run_with_authority_on(
     mut state: DaemonState,
     config: DaemonConfig,
     daemon_lock: crate::lifecycle::DaemonLock,
+    prebound: Option<PreboundApi>,
 ) -> Result<()> {
     // A singleton file handle is authority for one canonical repository, not a
     // process-global permission to run any DaemonState. Validate the binding
@@ -1161,22 +1186,52 @@ pub async fn run_with_authority(
 
     let state = Arc::new(state);
 
-    // Bind the API listener up front so the daemon owns port selection. With
+    // Bind the API listener so the daemon owns port selection. With
     // config.api_port == 0 the OS assigns a free ephemeral port; we then publish
-    // the *actual* bound port via the port file. Binding here — before the port
-    // file is written and before the slower graph/LSP startup — closes the
-    // reserve-release-rebind race (find_free_port TOCTOU) where a launcher picked
-    // a port, dropped it, and a sibling process stole it before the daemon bound.
-    let (api_listener, bound_port) = match api::bind_api_listener(&state, config.api_port) {
-        Ok(bound) => bound,
-        Err(error) => return Err(DaemonError::Io(error)),
+    // the *actual* bound port via the port file. Binding before the port file is
+    // written closes the reserve-release-rebind race (find_free_port TOCTOU)
+    // where a launcher picked a port, dropped it, and a sibling process stole it
+    // before the daemon bound.
+    //
+    // Binding HERE is still after `DaemonState::open*`, which reads and
+    // re-verifies the whole durable publication. An earlier comment claimed this
+    // ran "before the slower graph/LSP startup"; that was true of this function
+    // and false of the process, and it read as though first contact during the
+    // open window were already handled. It is not, on this path: a client
+    // arriving while state opens finds no socket. The process entrypoint passes
+    // `prebound` precisely to close that window, and when it does, the socket is
+    // already bound, already published, and already answering.
+    let (api_listener, bound_port, warming_retired) = match prebound {
+        Some(prebound) => (prebound.listener, prebound.port, Some(prebound.ready_tx)),
+        None => {
+            let (listener, port) = match api::bind_api_listener(&state.layout, config.api_port) {
+                Ok(bound) => bound,
+                Err(error) => return Err(DaemonError::Io(error)),
+            };
+            (listener, port, None)
+        }
     };
 
     // Publish PID and the actual bound port as one lifecycle-authorized
     // operation. Endpoint retirement takes the same authority, so no client can
     // delete a successor publication using a verdict about its predecessor.
+    //
+    // This happens HERE, after state is open, for a prebound caller too. The
+    // endpoint is what makes a daemon findable, and a client that finds one
+    // sends commands against it — it waits on readiness only when it spawned
+    // the daemon itself. Publishing during the open window would therefore turn
+    // "not ready yet" into a failed command on the attach path. Binding early
+    // costs nothing here because it advertises nothing; only publication does.
     crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port)
         .map_err(DaemonError::Io)?;
+
+    // Retire the readiness surface: the full API serves this socket from here.
+    // Both handles accept from one listen queue, so there is no instant at which
+    // neither is answering — during the handover a connection is answered by
+    // whichever accepts it, and both answers are correct.
+    if let Some(ready_tx) = warming_retired {
+        let _ = ready_tx.send(true);
+    }
 
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);

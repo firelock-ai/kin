@@ -637,9 +637,13 @@ pub struct BuildResponse {
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct ReadinessResponse {
     pub ready: bool,
-    /// The daemon is alive and its own repo is served, but a cross-repo spine
-    /// warm-up is still materializing sibling graphs. Clients must read this as
-    /// alive-and-waiting; it is never evidence that the daemon is dead.
+    /// The daemon is alive but something it needs is still materializing:
+    /// either it is still opening its own repository authority (the socket is
+    /// bound and answering before that load completes), or its own repo is
+    /// served and a cross-repo spine warm-up is still loading sibling graphs.
+    /// Clients must read this as alive-and-waiting; it is never evidence that
+    /// the daemon is dead. The two cases are distinguished by `ready`, which is
+    /// false only in the first.
     #[serde(default)]
     pub warming: bool,
 }
@@ -10573,15 +10577,118 @@ pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
 /// publishes the actual bound port via `.kin/daemon.port`, instead of a launcher
 /// reserving a port and releasing it before the daemon re-binds — a window a
 /// racing process can steal (the `find_free_port` TOCTOU).
+///
+/// Takes the layout rather than a `DaemonState` because binding needs only the
+/// layout, and the daemon binds BEFORE it opens state: opening state reads and
+/// re-verifies the whole durable publication, and a socket that appears only
+/// afterwards makes every first contact during that window a connection
+/// refusal rather than a wait.
 pub fn bind_api_listener(
-    state: &DaemonState,
+    layout: &kin_core::KinLayout,
     port: u16,
 ) -> std::io::Result<(tokio::net::TcpListener, u16)> {
     let bind_host = bind_host_from_env();
-    let auth_present = resolve_serve_auth_token(&state.layout).is_some();
+    let auth_present = resolve_serve_auth_token(layout).is_some();
     let listener = bind_listener(&bind_host, port, auth_present)?;
     let bound_port = listener.local_addr()?.port();
     Ok((listener, bound_port))
+}
+
+/// Bind the API socket ONCE and hand back two accept handles to it.
+///
+/// The daemon answers a readiness surface while it opens state and the full API
+/// afterwards, and those two servers must not rebind between them. A rebind
+/// reopens the refusal window this whole shape exists to close, drops whatever
+/// is already queued in the accept backlog, and on an explicit port can lose
+/// that port to a racing process in between. Duplicating the descriptor instead
+/// keeps one bound socket and one listen queue across the handover, so a
+/// connection either handle accepts came from the same queue and no client sees
+/// the socket disappear.
+pub fn bind_api_listener_pair(
+    layout: &kin_core::KinLayout,
+    port: u16,
+) -> std::io::Result<(tokio::net::TcpListener, tokio::net::TcpListener, u16)> {
+    let bind_host = bind_host_from_env();
+    let auth_present = resolve_serve_auth_token(layout).is_some();
+    let bound = bind_std_listener(&bind_host, port, auth_present)?;
+    // `try_clone` duplicates the descriptor rather than the socket, so both
+    // handles share one listen queue and one set of status flags -- including
+    // the non-blocking mode Tokio requires, which is why the clone needs no
+    // further configuration.
+    let duplicate = bound.try_clone()?;
+    let bound_port = bound.local_addr()?.port();
+    Ok((
+        tokio::net::TcpListener::from_std(bound)?,
+        tokio::net::TcpListener::from_std(duplicate)?,
+        bound_port,
+    ))
+}
+
+/// Answer probes on the bound socket while the daemon opens its state.
+///
+/// Opening state reads and re-verifies the whole durable publication, so the
+/// window is proportional to repository size rather than to anything a client
+/// did. Two shapes were available for that window and only one is safe. Holding
+/// the connections in the accept backlog says nothing, and a readiness probe
+/// that expects a reply then times out against a daemon that is working
+/// correctly and kills it -- the failure `state.rs` already documents in its own
+/// words. So this answers, immediately, every time.
+///
+/// Every answer is a REFUSAL status, and that is the load-bearing detail. The
+/// clients that can retire an endpoint do so on a verdict about repository
+/// identity, and they reach that verdict only from a body they successfully
+/// parsed: a non-2xx answer is classified as silence about identity, which is
+/// explicitly not allowed to authorize deleting the endpoint. A 200 carrying a
+/// fabricated status would instead be read as a live daemon whose repository
+/// could not be matched, which is the reading that wipes endpoint files and
+/// respawns into the same state. Refusing is what keeps a warming daemon
+/// alive-and-waiting rather than dead.
+pub async fn serve_warming_until(
+    listener: tokio::net::TcpListener,
+    mut ready_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let app = Router::new()
+        .route("/readiness", get(warming_readiness))
+        .fallback(warming_unavailable);
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            while !*ready_rx.borrow() {
+                if ready_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+    if let Err(error) = served {
+        // The full API takes over on the duplicate handle regardless, so a
+        // failure here costs answers during the open window and nothing after
+        // it. Reporting it beats a silent stretch of refused connections.
+        tracing::warn!(%error, "daemon readiness surface stopped before state was open");
+    }
+}
+
+/// `GET /readiness` while opening: the not-ready verdict clients already poll.
+async fn warming_readiness() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ReadinessResponse {
+            ready: false,
+            warming: true,
+        }),
+    )
+}
+
+async fn warming_unavailable() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "daemon_opening",
+            "ready": false,
+            "warming": true,
+            "detail": "the daemon is open and listening but has not finished loading \
+                       repository authority; poll /readiness",
+        })),
+    )
 }
 
 /// Serve the daemon API on an already-bound listener until shutdown is signaled.
@@ -10620,7 +10727,7 @@ pub async fn serve_with_shutdown(
     port: u16,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let (listener, _bound_port) = bind_api_listener(&state, port)?;
+    let (listener, _bound_port) = bind_api_listener(&state.layout, port)?;
     serve_bound_with_shutdown(state, listener, None, shutdown_rx).await
 }
 
@@ -10739,6 +10846,14 @@ fn bind_listener(
     port: u16,
     auth_token_present: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::from_std(bind_std_listener(bind_host, port, auth_token_present)?)
+}
+
+fn bind_std_listener(
+    bind_host: &str,
+    port: u16,
+    auth_token_present: bool,
+) -> std::io::Result<StdTcpListener> {
     let bind_ip = parse_bind_host(bind_host)?;
     if !bind_ip.is_loopback() && !auth_token_present {
         return Err(std::io::Error::new(
@@ -10790,7 +10905,7 @@ fn bind_listener(
             Err(error) => return Err(error),
         }
     };
-    tokio::net::TcpListener::from_std(listener)
+    Ok(listener)
 }
 
 #[cfg(test)]
@@ -12231,7 +12346,8 @@ mod tests {
     /// part that is new here, so the peer in these tests is a real bound
     /// listener serving the real router.
     async fn serve_replica(state: Arc<DaemonState>) -> String {
-        let (listener, port) = bind_api_listener(&state, 0).expect("bind an ephemeral peer port");
+        let (listener, port) =
+            bind_api_listener(&state.layout, 0).expect("bind an ephemeral peer port");
         let app = router(state);
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -13837,6 +13953,80 @@ mod tests {
         assert_eq!(advertisement.refs[0].head, remote_head);
     }
 
+    /// A daemon that has bound but not yet opened state ANSWERS.
+    ///
+    /// FIR-2081. Opening state re-verifies the whole durable publication, so the
+    /// window is proportional to repository size. Two failure modes bracket it:
+    /// binding after the open makes every arrival a connection refusal, and
+    /// binding without answering leaves probes in the accept backlog until a
+    /// readiness timeout kills a daemon that is working correctly.
+    ///
+    /// The assertions are on the exact statuses a client acts on, because the
+    /// statuses are the contract. `/readiness` must be the 503 the spawn-wait
+    /// loop already polls, and `/health` must be a refusal rather than a 200
+    /// carrying an invented status: a parsed 200 whose repository cannot be
+    /// matched is what authorizes a client to retire the endpoint and respawn,
+    /// while a non-2xx is classified as silence about identity and keeps it.
+    #[tokio::test]
+    async fn a_daemon_answers_while_it_is_still_opening_state() {
+        let state = test_state();
+        let (warming, serving, port) =
+            bind_api_listener_pair(&state.layout, 0).expect("bind the API socket");
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let warming_server = tokio::spawn(serve_warming_until(warming, ready_rx));
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        let readiness = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .expect("a bound socket with a readiness surface must answer, not hang");
+        assert_eq!(
+            readiness.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an opening daemon must report not-ready through the status clients poll"
+        );
+        let body: ReadinessResponse = readiness.json().await.expect("readiness body");
+        assert!(!body.ready, "an opening daemon is not ready");
+        assert!(
+            body.warming,
+            "an opening daemon must say it is alive-and-waiting, not merely not-ready"
+        );
+
+        let health = client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .expect("health must answer during the open window");
+        assert_eq!(
+            health.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "health must REFUSE while opening; a 200 with an invented status is what makes a \
+             client retire the endpoint and respawn into the same state"
+        );
+
+        // Handing over must not rebind. Both handles accept from one listen
+        // queue, so after the readiness surface stops, the same port is still
+        // bound and the serving handle owns it — there is no instant at which a
+        // client finds nothing listening.
+        ready_tx.send(true).expect("retire the readiness surface");
+        warming_server
+            .await
+            .expect("the readiness surface stops when the API takes over");
+        assert_eq!(
+            serving.local_addr().unwrap().port(),
+            port,
+            "the serving handle must hold the SAME bound port the warming handle answered on"
+        );
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "the socket must stay bound across the handover; a rebind reopens the refusal \
+             window this exists to close"
+        );
+    }
+
     #[tokio::test]
     async fn bind_api_listener_reports_real_ephemeral_port() {
         // Runs under a Tokio runtime because binding a tokio TcpListener needs
@@ -13849,7 +14039,7 @@ mod tests {
         // port a peer can steal before the daemon binds.
         let state = test_state();
 
-        let (listener_a, port_a) = bind_api_listener(&state, 0).expect("bind :0");
+        let (listener_a, port_a) = bind_api_listener(&state.layout, 0).expect("bind :0");
         assert_ne!(port_a, 0, "bind_api_listener must report a real bound port");
         assert_eq!(
             port_a,
@@ -13857,7 +14047,7 @@ mod tests {
             "reported port must equal the listener's actual bound port"
         );
 
-        let (_listener_b, port_b) = bind_api_listener(&state, 0).expect("second bind :0");
+        let (_listener_b, port_b) = bind_api_listener(&state.layout, 0).expect("second bind :0");
         assert_ne!(
             port_a, port_b,
             "two :0 binds must get distinct ports (no fixed-port reservation)"
