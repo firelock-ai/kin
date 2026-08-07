@@ -1110,6 +1110,7 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
 fn api_routes() -> Router<Arc<DaemonState>> {
     Router::new()
         .route("/health", get(health))
+        .route("/idle-timeout", get(idle_timeout).post(raise_idle_timeout))
         .route("/shutdown", post(request_daemon_shutdown))
         .route("/readiness", get(readiness))
         .route("/ready", get(readiness))
@@ -2033,6 +2034,78 @@ where
     Err(kin_mcp::McpError::Other(
         "graph authority changed repeatedly during bulk_check_references; retry".to_string(),
     ))
+}
+
+/// What an attached client asks this daemon to hold its idle window open for.
+#[derive(Debug, Deserialize)]
+struct RaiseIdleTimeoutRequest {
+    /// Seconds this client needs the daemon to survive without traffic.
+    at_least_secs: u64,
+    /// Who is asking, for the log line. Free-form and untrusted; it only ever
+    /// reaches a log field.
+    #[serde(default)]
+    client: Option<String>,
+}
+
+/// Report the idle window this daemon is running with.
+async fn idle_timeout(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let effective_secs = state.idle_timeout().map_or(0, |window| window.as_secs());
+    Json(json!({
+        "effective_secs": effective_secs,
+        "idles_out": effective_secs > 0,
+        "max_attached_secs": crate::state::MAX_ATTACHED_IDLE_TIMEOUT_SECS,
+    }))
+}
+
+/// Grow this daemon's idle window to cover a client whose session outlasts it.
+///
+/// The window is fixed by whichever process spawns the daemon, and that is
+/// usually not the process that ends up depending on it: an ordinary CLI
+/// command spawns with the short CLI default, and an MCP agent session that
+/// attaches afterwards used to inherit it and be cut off mid-session. Stating
+/// the need here is how a client carries its own lifetime to the daemon it
+/// attached to instead of hoping it spawned the thing.
+///
+/// Growth only. This cannot shorten another client's window and cannot switch
+/// idle shutdown off; see [`crate::state::resolve_idle_timeout_floor`].
+async fn raise_idle_timeout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<RaiseIdleTimeoutRequest>,
+) -> Response {
+    if request.at_least_secs == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "at_least_secs must be positive; a floor of forever is not a floor",
+            })),
+        )
+            .into_response();
+    }
+    let outcome = state.raise_idle_timeout(Duration::from_secs(request.at_least_secs));
+    let client = request.client.as_deref().unwrap_or("unnamed client");
+    let effective_secs = outcome.effective_secs();
+    match outcome.raised_from {
+        Some(previous) => info!(
+            client,
+            requested_secs = request.at_least_secs,
+            previous_secs = previous.as_secs(),
+            effective_secs,
+            "raised the daemon idle window for an attached client"
+        ),
+        None => tracing::debug!(
+            client,
+            requested_secs = request.at_least_secs,
+            effective_secs,
+            "idle window already covers an attached client's request"
+        ),
+    }
+    Json(json!({
+        "effective_secs": effective_secs,
+        "raised": outcome.raised(),
+        "previous_secs": outcome.raised_from.map(|window| window.as_secs()),
+        "idles_out": outcome.effective.is_some(),
+    }))
+    .into_response()
 }
 
 async fn health(
@@ -10449,6 +10522,79 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+
+    /// The HTTP contract an attached client uses to state its idle need
+    /// (FIR-1886), driven through the real router.
+    ///
+    /// Both sides: a client whose session outlasts the daemon's window grows
+    /// it, and a request that is not a floor is refused rather than silently
+    /// interpreted as "live forever".
+    #[tokio::test]
+    async fn the_idle_timeout_route_grows_the_window_and_refuses_a_zero_floor() {
+        async fn post_floor(
+            app: Router,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = tower::ServiceExt::oneshot(
+                app,
+                Request::post("/idle-timeout")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        state.install_idle_timeout(Some(Duration::from_secs(60)));
+        let app = api_routes().with_state(Arc::clone(&state));
+
+        let (status, body) = post_floor(
+            app.clone(),
+            json!({"at_least_secs": 1800, "client": "kin mcp"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["effective_secs"], 1800);
+        assert_eq!(body["raised"], true);
+        assert_eq!(body["previous_secs"], 60);
+        assert_eq!(state.idle_timeout(), Some(Duration::from_secs(1800)));
+
+        // Repeating it is a no-op, not a second raise.
+        let (status, body) = post_floor(app.clone(), json!({"at_least_secs": 1800})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["raised"], false);
+        assert_eq!(body["effective_secs"], 1800);
+
+        // A zero floor is refused and leaves the window untouched, rather than
+        // being read as "this daemon should never exit".
+        let (status, _) = post_floor(app.clone(), json!({"at_least_secs": 0})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.idle_timeout(), Some(Duration::from_secs(1800)));
+
+        // And reading it back reports what is in force.
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::get("/idle-timeout").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["effective_secs"], 1800);
+        assert_eq!(body["idles_out"], true);
+    }
 
     #[test]
     fn bounded_archive_writer_rejects_before_crossing_limit() {

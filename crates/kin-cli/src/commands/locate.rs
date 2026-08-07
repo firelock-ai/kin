@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 
-use crate::capability::LocateProfile;
+use crate::capability::{CapabilityDetection, LocateProfile};
 
 /// Deterministic-iteration map for transient locate accumulators. Fixed-seed
 /// hashing keeps fusion/resolution iteration order stable across processes so
@@ -1365,12 +1365,36 @@ fn record_vector_index_degradation(
 /// / PRF / LTR off on smaller tiers); without this entry the same query returns
 /// different-quality results on different hardware with no in-band signal. On
 /// the `Performance` tier nothing is disabled and no entry is added.
+///
+/// A tier chosen after a failed host probe is reported as its own thing. The
+/// ordinary entry's remediation tells the reader to run on a bigger host, which
+/// is wrong advice when the host was never read: the machine that produced
+/// FIR-2023 had eight times the RAM the entry implied it lacked.
 fn record_capability_tier_degradation(
-    profile: LocateProfile,
+    detection: &CapabilityDetection,
     sink: &mut Vec<RetrievalDegradation>,
 ) {
-    let disabled = profile.disabled_signals();
-    if disabled.is_empty() {
+    let profile = detection.profile;
+    if let Some(reason) = detection.misread_host() {
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "capability_tier".to_string(),
+                reason: "hardware_detection_failed".to_string(),
+                detail: format!(
+                    "host capability could not be read ({reason}); the tier was scored against a \
+                     conservative stand-in and resolved to '{}'{}",
+                    profile.name(),
+                    describe_disabled_signals(profile),
+                ),
+                remediation: "this tier was not derived from a reading of this host; set \
+                     KIN_LOCATE_PROFILE=performance|standard|minimal to state it explicitly"
+                    .to_string(),
+            },
+        );
+        return;
+    }
+    if profile.disabled_signals().is_empty() {
         return;
     }
     record_degradation(
@@ -1379,13 +1403,9 @@ fn record_capability_tier_degradation(
             component: "capability_tier".to_string(),
             reason: profile.name().to_string(),
             detail: format!(
-                "hardware capability tier '{}': {} disabled; multihop depth {}/{}, frontier {}/{}",
+                "hardware capability tier '{}'{}",
                 profile.name(),
-                disabled.join(", "),
-                profile.multihop_max_depth(),
-                LocateProfile::Performance.multihop_max_depth(),
-                profile.multihop_frontier_limit(),
-                LocateProfile::Performance.multihop_frontier_limit(),
+                describe_disabled_signals(profile),
             ),
             remediation:
                 "set KIN_LOCATE_PROFILE=performance to force the full pipeline, or run on a host \
@@ -1393,6 +1413,23 @@ fn record_capability_tier_degradation(
                     .to_string(),
         },
     );
+}
+
+/// The signals a tier turns off and the depths it narrows, as a clause both
+/// capability entries append to their own opening.
+fn describe_disabled_signals(profile: LocateProfile) -> String {
+    let disabled = profile.disabled_signals();
+    if disabled.is_empty() {
+        return ": full pipeline".to_string();
+    }
+    format!(
+        ": {} disabled; multihop depth {}/{}, frontier {}/{}",
+        disabled.join(", "),
+        profile.multihop_max_depth(),
+        LocateProfile::Performance.multihop_max_depth(),
+        profile.multihop_frontier_limit(),
+        LocateProfile::Performance.multihop_frontier_limit(),
+    )
 }
 
 fn file_path_from_retrieval_key(
@@ -1841,10 +1878,12 @@ fn run_with_graph_capture_budgeted(
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
 
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
-    let profile = LocateProfile::detect();
+    let detection = CapabilityDetection::detect();
+    let profile = detection.profile;
     // Surface a hardware-driven quality downgrade in-band: on a sub-Performance
-    // tier some retrieval signals are off, and that must never be silent.
-    record_capability_tier_degradation(profile, &mut degradations);
+    // tier some retrieval signals are off, and that must never be silent — nor
+    // must a tier that a failed host probe, rather than the host, chose.
+    record_capability_tier_degradation(&detection, &mut degradations);
     let test_query = is_test_query(text);
     let text_lower = text.to_ascii_lowercase();
     let source_text_priority_query = test_query
@@ -16341,6 +16380,76 @@ mod tests {
             RepoPath::from_utf8(path).expect("valid test repository path"),
             TreeEntry::blob(hash, false),
         )
+    }
+
+    fn capability_entry(sink: &[RetrievalDegradation]) -> &RetrievalDegradation {
+        sink.iter()
+            .find(|entry| entry.component == "capability_tier")
+            .expect("a sub-Performance tier must record a capability_tier degradation")
+    }
+
+    /// FIR-2023 in the surface a caller actually reads. A tier the host chose
+    /// and a tier a failed probe chose must not produce the same entry: the
+    /// first's remediation is sound advice, the second's told an operator with
+    /// 128 GB to obtain more RAM.
+    #[test]
+    fn a_misread_host_is_a_distinct_capability_entry_from_a_small_one() {
+        let mut misread = Vec::new();
+        record_capability_tier_degradation(
+            &CapabilityDetection {
+                profile: LocateProfile::Minimal,
+                forced_by_env: false,
+                cores: Some(18),
+                memory: Some(crate::capability::HostMemory::Undetected(
+                    "sysctlbyname(hw.memsize) failed".to_string(),
+                )),
+            },
+            &mut misread,
+        );
+        let entry = capability_entry(&misread);
+        assert_eq!(entry.reason, "hardware_detection_failed");
+        assert!(
+            entry.detail.contains("sysctlbyname(hw.memsize) failed"),
+            "the entry must name what failed: {}",
+            entry.detail
+        );
+        assert!(
+            !entry.remediation.contains("run on a host"),
+            "a host that was never read must not be told to become a bigger host: {}",
+            entry.remediation
+        );
+
+        let mut small = Vec::new();
+        record_capability_tier_degradation(
+            &CapabilityDetection {
+                profile: LocateProfile::Minimal,
+                forced_by_env: false,
+                cores: Some(2),
+                memory: Some(crate::capability::HostMemory::Detected(2.0)),
+            },
+            &mut small,
+        );
+        let entry = capability_entry(&small);
+        assert_eq!(entry.reason, "minimal");
+        assert!(entry.detail.contains("reranker"));
+        assert!(entry.remediation.contains(">=8 cores"));
+    }
+
+    /// The full pipeline on a host that was actually read stays silent, which
+    /// is what keeps the two entries above meaningful.
+    #[test]
+    fn a_read_performance_host_records_no_capability_entry() {
+        let mut sink = Vec::new();
+        record_capability_tier_degradation(
+            &CapabilityDetection {
+                profile: LocateProfile::Performance,
+                forced_by_env: false,
+                cores: Some(18),
+                memory: Some(crate::capability::HostMemory::Detected(128.0)),
+            },
+            &mut sink,
+        );
+        assert!(sink.is_empty());
     }
 
     fn native_change(

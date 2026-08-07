@@ -361,9 +361,11 @@ The wizard writes this entry to each client:
 }
 ```
 
-`KIN_MCP_TOOL_PROFILE=agent-default` exposes the small curated tool surface instead of the
-full internal one. (The wizard writes an absolute path to the installed `kin` binary as
-the `command`, so the entry works in agent processes that do not inherit your `PATH`.)
+`KIN_MCP_TOOL_PROFILE=agent-default` names the small curated tool surface. That is also
+what an unconfigured `kin mcp start` serves, so a hand-wired entry gets the same surface;
+set `full` (or pass `--tool-profile full`) when you want every tool. (The wizard writes an
+absolute path to the installed `kin` binary as the `command`, so the entry works in agent
+processes that do not inherit your `PATH`.)
 
 > Vector-backed MCP retrieval (`semantic_locate`) and the stateful session / transaction /
 > work / review tools operate against the repo's running Kin daemon. Daemon auto-start is

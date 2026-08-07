@@ -20,7 +20,11 @@ use std::pin::Pin;
 /// server starts anyway and each `tools/call` fails loud with a structured,
 /// actionable error (see `kin_mcp::daemon_delegate::daemon_unavailable_tool_result`)
 /// instead of the process silently never having started at all.
-pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
+pub async fn start(
+    global: bool,
+    repo: Option<PathBuf>,
+    tool_profile: Option<String>,
+) -> Result<()> {
     let repo_override = resolve_repo_override(repo);
     if let Some(repo_dir) = &repo_override {
         if global {
@@ -85,17 +89,12 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
     }
 
     let mut config = build_mcp_start_config();
-    let profile_tools: Option<&'static [&'static str]> =
-        match std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref() {
-            Some("agent-default") => Some(kin_mcp::agent_default_tool_names()),
-            Some("benchmark") => Some(kin_mcp::benchmark_tool_names()),
-            // Read-only graph-native ContextBench belt: no write-side session/
-            // transaction tools and no filesystem tools (none exist) — the
-            // purely graph-native arm.
-            Some("context-bench") => Some(kin_mcp::context_bench_tool_names()),
-            _ => None,
-        };
-    if let Some(names) = profile_tools {
+    let resolved_profile = resolve_tool_profile(
+        tool_profile.as_deref(),
+        std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref(),
+    );
+    eprintln!("{}", resolved_profile.startup_notice());
+    if let Some(names) = resolved_profile.profile.allowed_tool_names() {
         config.allowed_tools = Some(
             names
                 .iter()
@@ -134,6 +133,174 @@ pub async fn start(global: bool, repo: Option<PathBuf>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
 
     Ok(())
+}
+
+// ── Tool profile ────────────────────────────────────────────────────────
+
+/// Which tool surface this server exposes.
+///
+/// The curated agent belt is the default, and the whole surface is the opt-in.
+/// It used to be the other way round, which meant the safe surface was
+/// reachable only by going through `kin setup`: anything that wired MCP by hand
+/// — a hand-written `.mcp.json`, a container entrypoint, a CI harness, another
+/// tool spawning the server — silently received every tool the crate defines
+/// and paid roughly twelve thousand extra tokens of schemas in every session,
+/// with nothing saying a lighter profile existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolProfile {
+    /// The curated belt every configured agent gets. The default.
+    AgentDefault,
+    /// The retrieval belt the benchmark arm drives.
+    Benchmark,
+    /// Read-only graph-native ContextBench belt: no write-side session or
+    /// transaction tools, and no filesystem tools (there are none to expose).
+    ContextBench,
+    /// Every tool the crate defines. Explicit opt-in.
+    Full,
+}
+
+/// The canonical token for each profile: what `KIN_MCP_TOOL_PROFILE` and
+/// `--tool-profile` accept, in the order a help message should list them.
+const TOOL_PROFILE_TOKENS: &[(&str, McpToolProfile)] = &[
+    ("agent-default", McpToolProfile::AgentDefault),
+    ("full", McpToolProfile::Full),
+    ("benchmark", McpToolProfile::Benchmark),
+    ("context-bench", McpToolProfile::ContextBench),
+];
+
+impl McpToolProfile {
+    /// The tools this profile allows, or `None` for the unfiltered surface.
+    pub(crate) fn allowed_tool_names(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::AgentDefault => Some(kin_mcp::agent_default_tool_names()),
+            Self::Benchmark => Some(kin_mcp::benchmark_tool_names()),
+            Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
+            Self::Full => None,
+        }
+    }
+
+    pub(crate) fn token(self) -> &'static str {
+        TOOL_PROFILE_TOKENS
+            .iter()
+            .find(|(_, profile)| *profile == self)
+            .map(|(token, _)| *token)
+            .unwrap_or("agent-default")
+    }
+
+    /// How many tools this profile serves.
+    fn tool_count(self) -> usize {
+        match self.allowed_tool_names() {
+            Some(names) => names.len(),
+            None => kin_mcp::tool_definitions().tools.len(),
+        }
+    }
+}
+
+/// A resolved profile and how it was arrived at.
+///
+/// The source is carried rather than collapsed because an unconfigured server
+/// and a misconfigured one must not report the same thing: the first is the
+/// supported default, the second is a value nobody will otherwise notice was
+/// ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedToolProfile {
+    pub(crate) profile: McpToolProfile,
+    pub(crate) source: ToolProfileSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolProfileSource {
+    /// Nobody named a profile.
+    Default,
+    /// Named by `--tool-profile`.
+    Flag,
+    /// Named by `KIN_MCP_TOOL_PROFILE`.
+    Env,
+    /// A value was named and is not a profile. Carries what was asked for and
+    /// where it came from, so the notice can quote it back.
+    Unrecognized { origin: &'static str, value: String },
+}
+
+impl ResolvedToolProfile {
+    /// One line on stderr at startup naming the surface actually being served.
+    ///
+    /// MCP stdio reserves stdout for the protocol, so this is the only channel
+    /// available, and it is the whole point of the change: the previous default
+    /// was invisible.
+    pub(crate) fn startup_notice(&self) -> String {
+        let profile = self.profile;
+        let count = profile.tool_count();
+        let token = profile.token();
+        match &self.source {
+            ToolProfileSource::Unrecognized { origin, value } => format!(
+                "Kin MCP: {origin} requested tool profile '{value}', which is not a profile; \
+                 serving the default '{token}' profile ({count} tools). Accepted profiles: {}.",
+                accepted_tool_profiles()
+            ),
+            ToolProfileSource::Default => format!(
+                "Kin MCP: serving the default '{token}' tool profile ({count} tools). Set \
+                 KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) for the complete {} tool \
+                 surface; accepted profiles: {}.",
+                McpToolProfile::Full.tool_count(),
+                accepted_tool_profiles()
+            ),
+            ToolProfileSource::Flag => {
+                format!("Kin MCP: serving the '{token}' tool profile ({count} tools) from --tool-profile.")
+            }
+            ToolProfileSource::Env => format!(
+                "Kin MCP: serving the '{token}' tool profile ({count} tools) from \
+                 KIN_MCP_TOOL_PROFILE."
+            ),
+        }
+    }
+}
+
+fn accepted_tool_profiles() -> String {
+    TOOL_PROFILE_TOKENS
+        .iter()
+        .map(|(token, _)| *token)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve the tool surface from an explicit flag, then the environment, then
+/// the default.
+///
+/// A value nobody recognizes never silently becomes the full surface. That was
+/// the shape of the original defect in miniature: an unnamed profile meant
+/// "serve everything", so both an unconfigured server and a typo produced the
+/// heavy surface with no signal. Now both land on the curated default and say
+/// so.
+pub(crate) fn resolve_tool_profile(flag: Option<&str>, env: Option<&str>) -> ResolvedToolProfile {
+    for (origin, requested, source) in [
+        ("--tool-profile", flag, ToolProfileSource::Flag),
+        ("KIN_MCP_TOOL_PROFILE", env, ToolProfileSource::Env),
+    ] {
+        let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let lowered = requested.to_ascii_lowercase();
+        return match TOOL_PROFILE_TOKENS
+            .iter()
+            .find(|(token, _)| *token == lowered)
+        {
+            Some((_, profile)) => ResolvedToolProfile {
+                profile: *profile,
+                source,
+            },
+            None => ResolvedToolProfile {
+                profile: McpToolProfile::AgentDefault,
+                source: ToolProfileSource::Unrecognized {
+                    origin,
+                    value: requested.to_string(),
+                },
+            },
+        };
+    }
+    ResolvedToolProfile {
+        profile: McpToolProfile::AgentDefault,
+        source: ToolProfileSource::Default,
+    }
 }
 
 /// Whether registry mode should resolve a startup repository.
@@ -437,7 +604,8 @@ mod tests {
     use super::{
         bind_daemon_for_repo_dir, bind_first_kin_repo_against, build_mcp_start_config,
         registry_should_resolve, registry_startup_choice, resolve_repo_override,
-        session_authority_notice, RegistryStartupChoice,
+        resolve_tool_profile, session_authority_notice, McpToolProfile, RegistryStartupChoice,
+        ToolProfileSource,
     };
     use kin_core::registry::{KinRegistry, RegisteredRepo};
     use kin_core::test_env::EnvVarGuard;
@@ -465,6 +633,140 @@ mod tests {
         let message = session_authority_notice();
         assert!(message.contains("daemon-centered"));
         assert!(message.contains("disabled"));
+    }
+
+    /// FIR-2025(a), both sides. An unconfigured server serves the curated belt
+    /// and the whole surface is reachable only by asking for it.
+    ///
+    /// The counts are asserted against the profile lists themselves rather than
+    /// against literals, so this stays true as tools are added; what it pins is
+    /// the relationship, which is the thing that regressed: the default must be
+    /// the small surface and `full` must be strictly larger.
+    #[test]
+    fn an_unconfigured_server_serves_the_curated_belt_and_full_is_the_opt_in() {
+        let unconfigured = resolve_tool_profile(None, None);
+        assert_eq!(unconfigured.profile, McpToolProfile::AgentDefault);
+        assert_eq!(unconfigured.source, ToolProfileSource::Default);
+        let served = unconfigured
+            .profile
+            .allowed_tool_names()
+            .expect("the default profile must filter the surface");
+        assert_eq!(served.len(), kin_mcp::agent_default_tool_names().len());
+
+        let opted_in = resolve_tool_profile(None, Some("full"));
+        assert_eq!(opted_in.profile, McpToolProfile::Full);
+        assert_eq!(
+            opted_in.profile.allowed_tool_names(),
+            None,
+            "the full surface must apply no allowlist at all"
+        );
+        assert!(
+            kin_mcp::tool_definitions().tools.len() > served.len(),
+            "the opt-in surface must be strictly larger than the default, or the default \
+             is not saving anyone anything"
+        );
+    }
+
+    /// FIR-2025(b). "What breaks if I change this" is the product's flagship
+    /// question, and the tool whose name says exactly that must be in the
+    /// profile every agent receives.
+    #[test]
+    fn the_default_profile_carries_impact_analysis() {
+        let served = resolve_tool_profile(None, None)
+            .profile
+            .allowed_tool_names()
+            .expect("the default profile must filter the surface");
+        assert!(
+            served.contains(&"impact_analysis"),
+            "impact_analysis must be in the profile an unconfigured agent gets: {served:?}"
+        );
+        // The tool has to exist to be servable; a profile naming a tool the
+        // crate does not define would filter it away silently.
+        let definitions = kin_mcp::tool_definitions();
+        let defined: std::collections::HashSet<&str> = definitions
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        for name in served {
+            assert!(
+                defined.contains(name),
+                "profile names undefined tool {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_flag_outranks_the_environment() {
+        let resolved = resolve_tool_profile(Some("full"), Some("agent-default"));
+        assert_eq!(resolved.profile, McpToolProfile::Full);
+        assert_eq!(resolved.source, ToolProfileSource::Flag);
+    }
+
+    #[test]
+    fn every_named_profile_resolves_to_its_own_surface() {
+        for (token, expected) in [
+            ("agent-default", McpToolProfile::AgentDefault),
+            ("benchmark", McpToolProfile::Benchmark),
+            ("context-bench", McpToolProfile::ContextBench),
+            ("full", McpToolProfile::Full),
+        ] {
+            let resolved = resolve_tool_profile(None, Some(token));
+            assert_eq!(resolved.profile, expected, "for token {token}");
+            assert_eq!(resolved.source, ToolProfileSource::Env);
+            assert_eq!(resolved.profile.token(), token);
+        }
+        // Case and surrounding whitespace are a client config's business, not a
+        // reason to serve a different surface than the one named.
+        assert_eq!(
+            resolve_tool_profile(None, Some("  Full ")).profile,
+            McpToolProfile::Full
+        );
+        // An empty value is nobody naming anything, not a request.
+        assert_eq!(
+            resolve_tool_profile(None, Some("   ")).source,
+            ToolProfileSource::Default
+        );
+    }
+
+    /// A typo must not silently become the heavy surface — that was the old
+    /// default's failure shape. It falls back to the curated belt and the
+    /// notice quotes back what was asked for.
+    #[test]
+    fn an_unrecognized_profile_falls_back_loudly_rather_than_serving_everything() {
+        let resolved = resolve_tool_profile(None, Some("agent_default"));
+        assert_eq!(resolved.profile, McpToolProfile::AgentDefault);
+        assert_eq!(
+            resolved.source,
+            ToolProfileSource::Unrecognized {
+                origin: "KIN_MCP_TOOL_PROFILE",
+                value: "agent_default".to_string(),
+            }
+        );
+        let notice = resolved.startup_notice();
+        assert!(notice.contains("agent_default"), "notice: {notice}");
+        assert!(notice.contains("not a profile"), "notice: {notice}");
+        assert!(
+            notice.contains("full"),
+            "notice must name the opt-in: {notice}"
+        );
+    }
+
+    /// The startup line is the only channel this change has — stdout belongs to
+    /// the protocol — so an unconfigured server must announce both what it is
+    /// serving and how to ask for the rest.
+    #[test]
+    fn the_default_startup_notice_names_the_surface_and_the_opt_in() {
+        let notice = resolve_tool_profile(None, None).startup_notice();
+        assert!(notice.contains("agent-default"), "notice: {notice}");
+        assert!(
+            notice.contains("KIN_MCP_TOOL_PROFILE=full"),
+            "notice: {notice}"
+        );
+        assert!(
+            notice.contains(&kin_mcp::agent_default_tool_names().len().to_string()),
+            "notice must state the served count: {notice}"
+        );
     }
 
     #[test]

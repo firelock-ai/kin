@@ -1223,23 +1223,34 @@ fn evaluate_mcp_client_against(
                 .get("env")
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
                 .and_then(|p| p.as_str());
-            if profile == Some("agent-default") {
-                (
+            match profile {
+                Some("agent-default") => (
                     HealthStatus::Healthy,
                     format!(
                         "{servers_key}.kin present with agent-default profile ({})",
                         path.display()
                     ),
-                )
-            } else {
-                (
-                    HealthStatus::Misconfigured,
+                ),
+                // An entry that names no profile is served the curated
+                // agent-default surface by `kin mcp start` itself, so it is
+                // correctly wired even though `kin setup` would have stated it.
+                // Calling this misconfigured would report the supported default
+                // as a fault.
+                None => (
+                    HealthStatus::Healthy,
                     format!(
-                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {} (expected agent-default) in {}",
-                        profile.unwrap_or("unset"),
+                        "{servers_key}.kin present, no KIN_MCP_TOOL_PROFILE set; the server \
+                         defaults to the agent-default profile ({})",
                         path.display()
                     ),
-                )
+                ),
+                Some(other) => (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {other} (expected agent-default, or unset to take it as the default) in {}",
+                        path.display()
+                    ),
+                ),
             }
         }
     }
@@ -2545,8 +2556,12 @@ mod tests {
         );
     }
 
+    /// An entry that states no profile is served the curated agent-default
+    /// surface by `kin mcp start` itself, so it is correctly wired. Reporting
+    /// the supported default as a fault would send every hand-wired client to
+    /// fix something that is not broken.
     #[test]
-    fn mcp_config_without_agent_default_profile_is_misconfigured() {
+    fn mcp_config_with_no_profile_is_healthy_on_the_served_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude.json");
         std::fs::write(
@@ -2564,8 +2579,42 @@ mod tests {
         )
         .unwrap();
 
-        let (status, _detail) = evaluate_mcp_client_against(&path, "claude", "kin");
-        assert!(matches!(status, HealthStatus::Misconfigured));
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "kin");
+        assert!(matches!(status, HealthStatus::Healthy), "detail: {detail}");
+        assert!(
+            detail.contains("defaults to the agent-default profile"),
+            "the reader must be told which surface an unset profile resolves to: {detail}"
+        );
+    }
+
+    /// A profile that names a different surface is still a deliberate departure
+    /// from what `kin setup` writes, and doctor still says so. Without this the
+    /// relaxation above would have turned the check into one that cannot fail.
+    #[test]
+    fn mcp_config_naming_another_profile_is_still_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "full" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client_against(&path, "claude", "kin");
+        assert!(
+            matches!(status, HealthStatus::Misconfigured),
+            "detail: {detail}"
+        );
+        assert!(detail.contains("full"), "detail: {detail}");
     }
 
     #[test]

@@ -19,6 +19,13 @@
 //! Override the auto-detected tier with the `KIN_LOCATE_PROFILE` environment
 //! variable, set to `minimal`, `standard`, or `performance` (case-insensitive);
 //! any other value falls through to auto-detection.
+//!
+//! Detection that cannot read the host says so. A probe failure used to be
+//! swallowed and replaced with a plausible number, which scored a large machine
+//! as `Minimal` and then advised its operator to obtain the hardware they were
+//! already running on. [`CapabilityDetection::misread_host`] carries that
+//! reason out to the caller so a tier chosen from a stand-in is never presented
+//! as a reading.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocateProfile {
@@ -32,25 +39,31 @@ pub enum LocateProfile {
 
 impl LocateProfile {
     pub fn detect() -> Self {
-        // Check env override first
-        if let Ok(val) = std::env::var("KIN_LOCATE_PROFILE") {
-            match val.to_lowercase().as_str() {
-                "minimal" => return Self::Minimal,
-                "standard" => return Self::Standard,
-                "performance" => return Self::Performance,
-                _ => {} // fall through to detection
-            }
-        }
+        CapabilityDetection::detect().profile
+    }
 
-        let cores = num_cpus();
-        let ram_gb = available_ram_gb();
-
+    /// Score a tier from an effective core count and RAM figure.
+    ///
+    /// Pure, so the thresholds are testable without a host to run on and
+    /// without the env override in the way.
+    fn score(cores: usize, ram_gb: f64) -> Self {
         if cores >= 8 && ram_gb >= 16.0 {
             Self::Performance
         } else if cores >= 4 && ram_gb >= 8.0 {
             Self::Standard
         } else {
             Self::Minimal
+        }
+    }
+
+    /// The tier named by `KIN_LOCATE_PROFILE`, or `None` when the value is
+    /// absent or is not one of the three tier tokens.
+    fn from_override(value: Option<&str>) -> Option<Self> {
+        match value?.trim().to_lowercase().as_str() {
+            "minimal" => Some(Self::Minimal),
+            "standard" => Some(Self::Standard),
+            "performance" => Some(Self::Performance),
+            _ => None,
         }
     }
 
@@ -139,57 +152,206 @@ fn num_cpus() -> usize {
     }
 }
 
+/// GiB assumed for a host whose memory could not be read.
+///
+/// Deliberately conservative, and deliberately never reported as a
+/// measurement: every path that scores a tier against it also carries
+/// [`HostMemory::Undetected`] so the caller can say the number was invented.
+const UNDETECTED_RAM_GB: f64 = 4.0;
+
+/// What a host-memory probe returned, or why it could not answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostMemory {
+    /// Physical RAM in GiB as read from the host.
+    Detected(f64),
+    /// The probe could not answer, with the reason it gave.
+    Undetected(String),
+}
+
+impl HostMemory {
+    /// GiB to score a tier against: the reading when there is one, otherwise
+    /// the conservative stand-in.
+    pub fn gb_or_stand_in(&self) -> f64 {
+        match self {
+            Self::Detected(gb) => *gb,
+            Self::Undetected(_) => UNDETECTED_RAM_GB,
+        }
+    }
+
+    /// Why the host could not be read, when it could not.
+    pub fn undetected_reason(&self) -> Option<&str> {
+        match self {
+            Self::Detected(_) => None,
+            Self::Undetected(reason) => Some(reason),
+        }
+    }
+}
+
+/// Physical RAM as reported by the `hw.memsize` sysctl, read through
+/// `sysctlbyname` rather than by running `/usr/sbin/sysctl`.
+///
+/// The subprocess form depended on the caller's `PATH`, and `/usr/sbin` is
+/// absent from the minimal environments that matter most here: an MCP client
+/// spawning `kin mcp start`, a launchd agent, a container entrypoint, a CI
+/// runner. There, command-not-found was swallowed and the host was scored as
+/// though it had 4 GB. The syscall cannot be defeated by the environment.
 #[cfg(target_os = "macos")]
-fn host_ram_gb() -> f64 {
-    use std::process::Command;
-    Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
-        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-        .unwrap_or(4.0)
+fn probe_host_ram() -> HostMemory {
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>() as libc::size_t;
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            std::ptr::addr_of_mut!(bytes).cast::<libc::c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return HostMemory::Undetected(format!(
+            "sysctlbyname(hw.memsize) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if size != std::mem::size_of::<u64>() as libc::size_t || bytes == 0 {
+        return HostMemory::Undetected(format!(
+            "sysctlbyname(hw.memsize) returned {size} bytes holding {bytes}"
+        ));
+    }
+    HostMemory::Detected(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 #[cfg(target_os = "linux")]
-fn host_ram_gb() -> f64 {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|contents| {
-            for line in contents.lines() {
-                if line.starts_with("MemTotal:") {
-                    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-                    return Some(kb as f64 / (1024.0 * 1024.0));
-                }
-            }
-            None
-        })
-        .unwrap_or(4.0)
+fn probe_host_ram() -> HostMemory {
+    let contents = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(contents) => contents,
+        Err(error) => return HostMemory::Undetected(format!("/proc/meminfo unreadable: {error}")),
+    };
+    match parse_meminfo_total_gb(&contents) {
+        Some(gb) => HostMemory::Detected(gb),
+        None => HostMemory::Undetected("/proc/meminfo carries no parsable MemTotal".to_string()),
+    }
+}
+
+/// `MemTotal` out of a `/proc/meminfo` body, in GiB.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_total_gb(contents: &str) -> Option<f64> {
+    contents.lines().find_map(|line| {
+        let kb: u64 = line
+            .strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kb as f64 / (1024.0 * 1024.0))
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn host_ram_gb() -> f64 {
-    // Conservative default for unsupported platforms
-    4.0
+fn probe_host_ram() -> HostMemory {
+    HostMemory::Undetected(format!(
+        "no host-memory probe for target_os {}",
+        std::env::consts::OS
+    ))
 }
 
-/// Effective available RAM in GiB: host physical RAM, capped by a container
-/// memory limit (cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`) when one
-/// is set. Without a limit this is the host figure, so bare-metal detection is
-/// unchanged.
-fn available_ram_gb() -> f64 {
-    let host = host_ram_gb();
-    match cgroup_memory_limit_bytes() {
-        Some(limit) => {
-            let limit_gb = limit as f64 / (1024.0 * 1024.0 * 1024.0);
-            host.min(limit_gb)
+/// Probe the host once per process and warn the first time it cannot answer.
+///
+/// The warning is what stops a misread host from being silent for consumers
+/// that do not carry a structured degradation ledger of their own; `kin locate`
+/// additionally reports it in-band (see
+/// [`CapabilityDetection::misread_host`]).
+fn host_memory() -> HostMemory {
+    let memory = probe_host_ram();
+    if let Some(reason) = memory.undetected_reason() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                reason,
+                stand_in_gb = UNDETECTED_RAM_GB,
+                "host memory could not be read; capability tiers on this process are scored \
+                 against a conservative stand-in, not a reading of this machine"
+            );
+        });
+    }
+    memory
+}
+
+fn host_ram_gb() -> f64 {
+    host_memory().gb_or_stand_in()
+}
+
+/// Effective available RAM: the host figure, capped by a container memory
+/// limit (cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`) when one is set.
+/// Without a limit this is the host figure, so bare-metal detection is
+/// unchanged. A cap never turns an undetected host into a detected one.
+fn available_memory(host: HostMemory) -> HostMemory {
+    let Some(limit) = cgroup_memory_limit_bytes() else {
+        return host;
+    };
+    let limit_gb = limit as f64 / (1024.0 * 1024.0 * 1024.0);
+    match host {
+        HostMemory::Detected(gb) => HostMemory::Detected(gb.min(limit_gb)),
+        HostMemory::Undetected(reason) => HostMemory::Undetected(reason),
+    }
+}
+
+/// The tier this process will run at, and the evidence it was chosen from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityDetection {
+    pub profile: LocateProfile,
+    /// The operator named the tier through `KIN_LOCATE_PROFILE`; no probe was
+    /// consulted, so a probe that would have failed is not this tier's reason.
+    pub forced_by_env: bool,
+    /// Effective schedulable cores, or `None` under a forced tier.
+    pub cores: Option<usize>,
+    /// Effective memory, or `None` under a forced tier.
+    pub memory: Option<HostMemory>,
+}
+
+impl CapabilityDetection {
+    pub fn detect() -> Self {
+        Self::resolve(
+            std::env::var("KIN_LOCATE_PROFILE").ok().as_deref(),
+            num_cpus,
+            || available_memory(host_memory()),
+        )
+    }
+
+    /// Core of [`Self::detect`] with the override string and both probes as
+    /// explicit inputs, so every branch is testable on any host.
+    fn resolve(
+        override_value: Option<&str>,
+        cores: impl FnOnce() -> usize,
+        memory: impl FnOnce() -> HostMemory,
+    ) -> Self {
+        if let Some(profile) = LocateProfile::from_override(override_value) {
+            return Self {
+                profile,
+                forced_by_env: true,
+                cores: None,
+                memory: None,
+            };
         }
-        None => host,
+        let cores = cores();
+        let memory = memory();
+        Self {
+            profile: LocateProfile::score(cores, memory.gb_or_stand_in()),
+            forced_by_env: false,
+            cores: Some(cores),
+            memory: Some(memory),
+        }
+    }
+
+    /// Why this tier is not a reading of the host, when it is not.
+    ///
+    /// A tier derived from a failed probe must never be reported as though the
+    /// numbers behind it were measured: the remediation that follows from a
+    /// real reading ("run on a bigger host") is actively wrong advice when the
+    /// host was never read.
+    pub fn misread_host(&self) -> Option<&str> {
+        self.memory.as_ref()?.undetected_reason()
     }
 }
 
@@ -452,6 +614,102 @@ mod tests {
         assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
         assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
         assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
+    }
+
+    /// The FIR-2023 shape, both ways round. An 18-core host whose memory probe
+    /// fails must not be scored `Minimal` and reported as though 4 GB had been
+    /// measured; the same host with a reading must score `Performance`.
+    #[test]
+    fn a_failed_memory_probe_is_reported_rather_than_scored_as_four_gigabytes() {
+        let misread = CapabilityDetection::resolve(
+            None,
+            || 18,
+            || HostMemory::Undetected("sysctlbyname(hw.memsize) failed: no such file".to_string()),
+        );
+        assert_eq!(misread.profile, LocateProfile::Minimal);
+        assert_eq!(
+            misread.misread_host(),
+            Some("sysctlbyname(hw.memsize) failed: no such file"),
+            "a tier scored against the stand-in must carry the probe failure out to the caller"
+        );
+
+        let read = CapabilityDetection::resolve(None, || 18, || HostMemory::Detected(128.0));
+        assert_eq!(read.profile, LocateProfile::Performance);
+        assert_eq!(
+            read.misread_host(),
+            None,
+            "a successful probe must not be reported as a detection failure"
+        );
+    }
+
+    /// A genuinely small machine still reaches `Minimal`, and does so as a
+    /// reading rather than as a failure. Without this the fix could pass by
+    /// calling every low tier a misread.
+    #[test]
+    fn a_genuinely_constrained_host_still_scores_minimal_with_nothing_to_report() {
+        let constrained = CapabilityDetection::resolve(None, || 2, || HostMemory::Detected(2.0));
+        assert_eq!(constrained.profile, LocateProfile::Minimal);
+        assert_eq!(constrained.misread_host(), None);
+        assert!(!constrained.profile.disabled_signals().is_empty());
+    }
+
+    /// An operator who names the tier is not consulting a probe, so a probe
+    /// that would have failed is not this tier's reason and must not be
+    /// reported as one.
+    #[test]
+    fn a_forced_tier_reports_no_detection_failure() {
+        let forced = CapabilityDetection::resolve(
+            Some("performance"),
+            || unreachable!("a forced tier must not probe cores"),
+            || unreachable!("a forced tier must not probe memory"),
+        );
+        assert_eq!(forced.profile, LocateProfile::Performance);
+        assert!(forced.forced_by_env);
+        assert_eq!(forced.misread_host(), None);
+    }
+
+    #[test]
+    fn override_tokens_are_case_and_whitespace_tolerant_and_otherwise_ignored() {
+        assert_eq!(
+            LocateProfile::from_override(Some("  Performance ")),
+            Some(LocateProfile::Performance)
+        );
+        assert_eq!(LocateProfile::from_override(Some("turbo")), None);
+        assert_eq!(LocateProfile::from_override(None), None);
+    }
+
+    #[test]
+    fn tier_thresholds_need_both_cores_and_memory() {
+        assert_eq!(LocateProfile::score(8, 16.0), LocateProfile::Performance);
+        assert_eq!(LocateProfile::score(8, 15.9), LocateProfile::Standard);
+        assert_eq!(LocateProfile::score(4, 8.0), LocateProfile::Standard);
+        assert_eq!(LocateProfile::score(3, 64.0), LocateProfile::Minimal);
+    }
+
+    /// The probe on the host this test runs on. It is the only assertion here
+    /// that would have caught the original defect in situ: on a developer or CI
+    /// machine, memory is readable, and any environment-shaped failure to read
+    /// it shows up as `Undetected`.
+    #[test]
+    fn this_host_reports_its_memory() {
+        let memory = probe_host_ram();
+        match &memory {
+            HostMemory::Detected(gb) => assert!(*gb > 0.0, "a detected host must report real GiB"),
+            HostMemory::Undetected(reason) => {
+                panic!("host memory probe failed on the test host: {reason}")
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn meminfo_total_is_parsed_and_a_body_without_it_is_a_miss() {
+        assert_eq!(
+            parse_meminfo_total_gb("MemFree: 100 kB\nMemTotal:       16777216 kB\n"),
+            Some(16.0)
+        );
+        assert_eq!(parse_meminfo_total_gb("MemFree: 100 kB\n"), None);
+        assert_eq!(parse_meminfo_total_gb("MemTotal:       nope kB\n"), None);
     }
 
     #[test]

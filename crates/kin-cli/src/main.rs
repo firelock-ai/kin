@@ -1600,6 +1600,12 @@ enum McpAction {
         /// any Kin repository (e.g. an umbrella workspace root).
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
+        /// Tool surface to serve: `agent-default` (the curated agent belt, and
+        /// the default), `full` (every tool, roughly 12k extra tokens of
+        /// schemas per session), `benchmark`, or `context-bench`. Overrides
+        /// KIN_MCP_TOOL_PROFILE.
+        #[arg(long = "tool-profile", value_name = "PROFILE")]
+        tool_profile: Option<String>,
     },
 }
 
@@ -2756,7 +2762,11 @@ fn main() -> Result<()> {
                     commands::blame::run(entity, reference).await
                 }
                 Command::Mcp { action } => match action {
-                    McpAction::Start { global, repo } => commands::mcp::start(global, repo).await,
+                    McpAction::Start {
+                        global,
+                        repo,
+                        tool_profile,
+                    } => commands::mcp::start(global, repo, tool_profile).await,
                 },
                 Command::Auth { action } => match action {
                     AuthAction::Login {

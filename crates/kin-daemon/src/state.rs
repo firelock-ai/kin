@@ -924,6 +924,64 @@ impl VectorCheckpointAuthorityMatch {
     }
 }
 
+/// The longest idle window an attached client may ask this daemon to hold.
+///
+/// A client stating what it needs is not a client deciding this daemon should
+/// live forever: an agent process that dies without withdrawing would otherwise
+/// pin the graph in memory indefinitely. Twenty-four hours is far beyond any
+/// real interactive session and still expires.
+pub const MAX_ATTACHED_IDLE_TIMEOUT_SECS: u64 = 86_400;
+
+/// What a request to grow the idle window did to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleTimeoutRaise {
+    /// The window now in force. `None` means the daemon never idles out.
+    pub effective: Option<Duration>,
+    /// The window this replaced, or `None` when nothing changed.
+    pub raised_from: Option<Duration>,
+}
+
+impl IdleTimeoutRaise {
+    /// The window now in force in whole seconds, with 0 meaning "never idles
+    /// out" — the shape the HTTP surface and the daemon's own env var speak in.
+    pub fn effective_secs(&self) -> u64 {
+        self.effective.map_or(0, |window| window.as_secs())
+    }
+
+    pub fn raised(&self) -> bool {
+        self.raised_from.is_some()
+    }
+}
+
+/// Resolve a requested idle floor against the window currently in force,
+/// returning the new window when one is warranted and `None` when the current
+/// window already covers the request.
+///
+/// This is the whole decision behind FIR-1886. The idle window is fixed by
+/// whichever process spawns the daemon, and on a developer machine that is
+/// almost always an ordinary CLI command taking the short CLI default. A
+/// later client with a much longer session — an MCP agent loop that goes quiet
+/// between tool calls — used to inherit that short window silently and have the
+/// daemon expire underneath it mid-session.
+///
+/// Three cases, each deliberate:
+/// - a daemon that never idles out already outlasts every finite request, so it
+///   is never given a finite window here;
+/// - a request for "never" (zero) is refused rather than honoured, because a
+///   floor of forever is not a floor;
+/// - anything above [`MAX_ATTACHED_IDLE_TIMEOUT_SECS`] is clamped to it.
+pub fn resolve_idle_timeout_floor(
+    current: Option<Duration>,
+    requested: Duration,
+) -> Option<Duration> {
+    let current = current?;
+    if requested.is_zero() {
+        return None;
+    }
+    let requested = requested.min(Duration::from_secs(MAX_ATTACHED_IDLE_TIMEOUT_SECS));
+    (requested > current).then_some(requested)
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -1104,6 +1162,19 @@ pub struct DaemonState {
     /// Last externally visible daemon activity, measured as milliseconds since
     /// `started_at`. Used by opt-in idle shutdown for CLI-autostarted daemons.
     pub last_activity_ms: AtomicU64,
+    /// The live idle window in milliseconds, or 0 when this daemon never idles
+    /// out.
+    ///
+    /// Seeded from startup configuration and readable by attached clients whose
+    /// session outlives it. It is here rather than captured by the idle monitor
+    /// because the window has to be able to grow after the process started: the
+    /// spawner fixes it at spawn time, and whoever spawns first is frequently
+    /// not who ends up depending on it.
+    ///
+    /// Milliseconds, not the seconds the env var and HTTP surface speak in, so
+    /// a sub-second window cannot round down into the sentinel and turn "expire
+    /// quickly" into "never expire".
+    idle_timeout_ms: AtomicU64,
     /// Number of API requests currently being handled.
     pub active_requests: AtomicU64,
     /// Channel for LSP enrichment messages (incremental or sweep).
@@ -1960,6 +2031,7 @@ impl DaemonState {
             active_embed_passes: AtomicU32::new(0),
             background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
+            idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             cached_repo_id,
@@ -2161,6 +2233,7 @@ impl DaemonState {
             active_embed_passes: AtomicU32::new(0),
             background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
+            idle_timeout_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             cached_repo_id: repo_id.to_string(),
@@ -4698,6 +4771,54 @@ impl DaemonState {
         Duration::from_millis(now_ms.saturating_sub(last_ms))
     }
 
+    /// The live idle window, or `None` when this daemon never idles out.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        Self::window_from_millis(self.idle_timeout_ms.load(Ordering::SeqCst))
+    }
+
+    fn window_from_millis(millis: u64) -> Option<Duration> {
+        (millis > 0).then(|| Duration::from_millis(millis))
+    }
+
+    /// Install the startup idle window. Called once by the daemon entrypoint
+    /// before the idle monitor starts.
+    pub fn install_idle_timeout(&self, timeout: Option<Duration>) {
+        let millis = timeout.map_or(0, |timeout| {
+            timeout.as_millis().min(u128::from(u64::MAX)) as u64
+        });
+        self.idle_timeout_ms.store(millis, Ordering::SeqCst);
+    }
+
+    /// Grow the idle window to cover an attached client that needs longer than
+    /// the window this daemon was started with, and report what happened.
+    ///
+    /// Only ever grows. A client stating what it needs must not be able to
+    /// shorten the window another client is relying on, and must not be able to
+    /// switch off idle shutdown for a daemon that was configured to have one.
+    pub fn raise_idle_timeout(&self, at_least: Duration) -> IdleTimeoutRaise {
+        loop {
+            let current_ms = self.idle_timeout_ms.load(Ordering::SeqCst);
+            let current = Self::window_from_millis(current_ms);
+            let Some(raised) = resolve_idle_timeout_floor(current, at_least) else {
+                return IdleTimeoutRaise {
+                    effective: current,
+                    raised_from: None,
+                };
+            };
+            let raised_ms = raised.as_millis().min(u128::from(u64::MAX)) as u64;
+            if self
+                .idle_timeout_ms
+                .compare_exchange(current_ms, raised_ms, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return IdleTimeoutRaise {
+                    effective: Some(raised),
+                    raised_from: current,
+                };
+            }
+        }
+    }
+
     /// Whether an agent/user session is currently active. The daemon's own
     /// reconcile-loop session is intentionally ignored.
     pub fn has_external_sessions(&self) -> bool {
@@ -4777,6 +4898,75 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         sync_directory_metadata(directory.path())
             .expect("directory metadata sync must not reject a valid host directory");
+    }
+
+    /// FIR-1886, both sides at the resolution layer. A client whose session
+    /// outlasts the window this daemon was spawned with grows it; a client that
+    /// already fits inside it changes nothing.
+    #[test]
+    fn an_idle_floor_grows_a_short_window_and_leaves_a_long_one_alone() {
+        let secs = Duration::from_secs;
+        // The exact case: a CLI-spawned daemon at 60s, an MCP session at 1800s.
+        assert_eq!(
+            resolve_idle_timeout_floor(Some(secs(60)), secs(1800)),
+            Some(secs(1800))
+        );
+        // The same session attaching to a daemon that already outlasts it.
+        assert_eq!(
+            resolve_idle_timeout_floor(Some(secs(3600)), secs(1800)),
+            None
+        );
+        assert_eq!(
+            resolve_idle_timeout_floor(Some(secs(1800)), secs(1800)),
+            None
+        );
+    }
+
+    /// Growth only, in both directions it could go wrong: a client must not be
+    /// able to shorten a window another client relies on, and must not be able
+    /// to switch idle shutdown off for a daemon configured to have one.
+    #[test]
+    fn an_idle_floor_can_neither_shorten_a_window_nor_abolish_one() {
+        let secs = Duration::from_secs;
+        assert_eq!(
+            resolve_idle_timeout_floor(Some(secs(1800)), secs(60)),
+            None,
+            "a shorter request must not shorten the window"
+        );
+        assert_eq!(
+            resolve_idle_timeout_floor(Some(secs(60)), Duration::ZERO),
+            None,
+            "a request for 'never' is not a floor and must be refused"
+        );
+        assert_eq!(
+            resolve_idle_timeout_floor(None, secs(1800)),
+            None,
+            "a daemon that never idles out already outlasts every finite request"
+        );
+    }
+
+    /// An attached client cannot pin the graph in memory indefinitely by asking
+    /// for an absurd window; the request is clamped and still expires.
+    #[test]
+    fn an_idle_floor_is_clamped_to_the_attached_maximum() {
+        let max = Duration::from_secs(MAX_ATTACHED_IDLE_TIMEOUT_SECS);
+        assert_eq!(
+            resolve_idle_timeout_floor(Some(Duration::from_secs(60)), Duration::MAX),
+            Some(max)
+        );
+        assert_eq!(resolve_idle_timeout_floor(Some(max), Duration::MAX), None);
+    }
+
+    /// A sub-second window is a real window, not "never idles out". Storing
+    /// whole seconds rounded one into the sentinel, which turned "expire
+    /// quickly" into "expire never" and left the monitor circling forever.
+    #[test]
+    fn a_sub_second_window_survives_the_round_trip_through_state() {
+        assert_eq!(
+            DaemonState::window_from_millis(200),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(DaemonState::window_from_millis(0), None);
     }
 
     #[cfg(feature = "embeddings")]
