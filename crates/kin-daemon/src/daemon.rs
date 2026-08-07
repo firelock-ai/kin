@@ -485,35 +485,75 @@ fn classify_control_plane(state: &DaemonState) -> ControlPlane {
     }
 }
 
-fn ready_for_idle_shutdown(
-    state: &DaemonState,
-    idle_timeout: Duration,
-    control_plane: ControlPlane,
-) -> bool {
+/// Whether outstanding embedding work would be abandoned by a shutdown.
+///
+/// `embed_pass_active` counts unconditionally: an explicit pass is running
+/// right now. A queued backlog counts only while something will actually drain
+/// it, which is what `worker_can_drain` reports. A backlog the worker has
+/// already stood down from is not work in progress, and treating it as such
+/// would make the daemon immortal rather than patient.
+fn embed_work_outstanding(embed_pass_active: bool, queued: bool, worker_can_drain: bool) -> bool {
+    embed_pass_active || (queued && worker_can_drain)
+}
+
+fn embed_work_in_flight(state: &DaemonState) -> bool {
+    embed_work_outstanding(
+        state.embed_pass_active(),
+        state.graph.pending_embeddings() > 0 || state.graph.pending_artifact_embeddings() > 0,
+        state.background_embed_worker_can_drain(),
+    )
+}
+
+/// Work a shutdown would destroy rather than merely interrupt, independent of
+/// whether any client can currently reach this daemon.
+///
+/// The idle clock advances only on API traffic (`begin_request` /
+/// `end_request`); no background task touches it. So a daemon still ingesting a
+/// repository for the first time, or draining the embedding backlog that first
+/// ingest queued, reads as perfectly idle to the monitor, and a CLI autostart,
+/// which injects a 60s timeout, kills it mid-pass. None of that work resumes:
+/// the next command starts the pass over from the beginning.
+fn work_would_be_lost_by_shutdown(state: &DaemonState) -> bool {
     if state.active_request_count() > 0 {
-        return false;
-    }
-    if control_plane == ControlPlane::EndpointLost {
-        // Rare by construction: the control-plane check earlier in this same
-        // tick repairs a lost endpoint, so reaching here means republication
-        // itself failed. Kept because that is exactly when it matters: the
-        // daemon is unreachable by new clients, so the usual initialization and
-        // session gates cannot be waiting on anything, and it should be allowed
-        // to idle out rather than linger unreachable.
-        return state.idle_duration() >= idle_timeout;
+        return true;
     }
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return false;
+        return true;
     }
     if state
         .reconciliation_status
         .load(std::sync::atomic::Ordering::Relaxed)
         != RECON_IDLE
     {
+        return true;
+    }
+    embed_work_in_flight(state)
+}
+
+fn ready_for_idle_shutdown(
+    state: &DaemonState,
+    idle_timeout: Duration,
+    control_plane: ControlPlane,
+) -> bool {
+    if work_would_be_lost_by_shutdown(state) {
         return false;
+    }
+    if control_plane == ControlPlane::EndpointLost {
+        // Rare by construction: the control-plane check earlier in this same
+        // tick repairs a lost endpoint, so reaching here means republication
+        // itself failed. Kept because that is exactly when it matters: the
+        // daemon is unreachable by new clients, so the session and event-
+        // subscriber gates below cannot be waiting on anything, and it should be
+        // allowed to idle out rather than linger unreachable.
+        //
+        // Only those client-reachability gates are skipped. The work gates
+        // above are not, because an unreachable daemon loses an in-flight first
+        // scan or embed drain exactly as a reachable one does, and an endpoint
+        // blip is transient where a discarded first ingest is not.
+        return state.idle_duration() >= idle_timeout;
     }
     if state.event_tx.receiver_count() > 0 {
         return false;
@@ -2517,10 +2557,11 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        drain_pending_flush, format_singleton_contention, next_embed_error_backoff,
-        parse_duration_secs, parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now,
-        shutdown_signalled, watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        drain_pending_flush, embed_work_outstanding, format_singleton_contention,
+        next_embed_error_backoff, parse_duration_secs, parse_owner_watch_pid,
+        should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
+        watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2717,6 +2758,85 @@ mod tests {
         assert!(!super::control_plane_demands_shutdown(&state, 4219, false));
         assert_eq!(super::classify_control_plane(&state), ControlPlane::Ours);
         assert_eq!(crate::lifecycle::read_port_file(&kin_root), Some(4219));
+    }
+
+    // ── Idle shutdown vs work in flight ───────────────────────────────────
+    //
+    // The idle clock only advances on API traffic, so background work is
+    // invisible to it. A CLI autostart injects a 60s timeout, which is shorter
+    // than a first ingest and far shorter than the embed drain that ingest
+    // queues, and the killed pass restarts from zero on the next command.
+
+    #[test]
+    fn an_embedding_backlog_counts_only_while_a_worker_will_drain_it() {
+        // An explicit pass is in flight regardless of the background worker.
+        assert!(embed_work_outstanding(true, false, false));
+        assert!(embed_work_outstanding(true, true, true));
+        // Queued work with a live worker is work in progress.
+        assert!(embed_work_outstanding(false, true, true));
+        // Queued work the worker has stood down from is not: counting it would
+        // hold a daemon open forever on a backlog nobody consumes.
+        assert!(!embed_work_outstanding(false, true, false));
+        // Nothing queued, nothing running.
+        assert!(!embed_work_outstanding(false, false, true));
+        assert!(!embed_work_outstanding(false, false, false));
+    }
+
+    #[tokio::test]
+    async fn an_embed_pass_in_flight_survives_the_idle_timeout() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        state.is_initialized.store(true, Ordering::Relaxed);
+
+        // Zero timeout: every check below is past the deadline, so the only
+        // thing that can hold the daemon open is the work itself.
+        let expired = Duration::ZERO;
+        let pass = state.begin_embed_pass();
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "an embed pass in flight must outrank an expired idle timeout"
+        );
+
+        drop(pass);
+        assert!(
+            super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
+            "a genuinely idle initialized daemon must still idle out"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_blip_cannot_shut_down_a_daemon_mid_scan() {
+        // The EndpointLost branch used to return on the idle clock alone,
+        // before the initialization and reconciliation gates, so a republication
+        // failure could end a daemon that had never finished its first scan.
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        let expired = Duration::ZERO;
+
+        state.is_initialized.store(false, Ordering::Relaxed);
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::EndpointLost),
+            "a first scan still running must outrank a lost endpoint"
+        );
+
+        state.is_initialized.store(true, Ordering::Relaxed);
+        state
+            .reconciliation_status
+            .store(crate::state::RECON_PROCESSING, Ordering::Relaxed);
+        assert!(
+            !super::ready_for_idle_shutdown(&state, expired, ControlPlane::EndpointLost),
+            "reconciliation in progress must outrank a lost endpoint"
+        );
+
+        state
+            .reconciliation_status
+            .store(RECON_IDLE, Ordering::Relaxed);
+        assert!(
+            super::ready_for_idle_shutdown(&state, expired, ControlPlane::EndpointLost),
+            "an unreachable daemon with no work left must still idle out"
+        );
     }
 
     #[test]
