@@ -368,6 +368,7 @@ that measured scope as hypotheses until they have their own reproducible proof.
 ## Learn and contribute
 
 - [Quickstart and advanced configuration](docs/quickstart.md)
+- [Store size and what drives it](docs/store-size.md)
 - [MCP tool reference](docs/mcp-tools.md)
 - [Graph-first thesis](docs/thesis.md)
 - [GitHub Discussions](https://github.com/firelock-ai/kin/discussions)

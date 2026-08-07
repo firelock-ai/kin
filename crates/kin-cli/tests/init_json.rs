@@ -94,7 +94,7 @@ fn fresh_native_init_json_reports_exact_unborn_authority() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("native init stdout should be JSON");
-    assert_eq!(payload["schema"], "kin.init-result.v5");
+    assert_eq!(payload["schema"], "kin.init-result.v6");
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "native-unborn");
     assert_eq!(payload["history"], "unborn");
@@ -131,7 +131,7 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
 
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("Git init stdout should be JSON");
-    assert_eq!(payload["schema"], "kin.init-result.v5");
+    assert_eq!(payload["schema"], "kin.init-result.v6");
     assert_eq!(payload["authority"], "repository-v6");
     assert_eq!(payload["source_boundary"], "git-exact-reachable-history");
     assert_eq!(payload["history"], "exact-reachable");
@@ -303,4 +303,223 @@ fn non_git_existing_files_fail_instead_of_becoming_implicit_authority() {
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("will not silently ignore or derive authority"));
     assert!(!repo.join(".kin").exists());
+}
+
+/// Sum the file bytes under `path`, independently of the implementation under
+/// test.
+///
+/// The point of re-walking here is that the printed ratio has to be checkable
+/// against the disk rather than against the same code that produced it. A test
+/// that asserted the CLI agrees with itself would pass on any arithmetic.
+fn tree_bytes(path: &Path) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                total += metadata.len();
+            }
+        }
+    }
+    total
+}
+
+fn printed_ratio(stdout: &str) -> f64 {
+    let line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("Store size:"))
+        .unwrap_or_else(|| panic!("no store size line in init output:\n{stdout}"));
+    let multiple = line
+        .split(", ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .unwrap_or_else(|| panic!("store size line states no multiple: {line}"));
+    multiple
+        .trim_end_matches('x')
+        .parse::<f64>()
+        .unwrap_or_else(|error| panic!("unparsable multiple {multiple:?} in {line}: {error}"))
+}
+
+/// `kin init` must state what the store cost and what it cost relative to the
+/// Git object store it was admitted from.
+///
+/// Before this, the number existed only on disk. A user learned their store
+/// size from `du` after the fact and had nothing to compare it against, which
+/// is what let a two-orders-of-magnitude expansion ship undisclosed.
+#[test]
+fn git_init_states_the_store_size_and_its_ratio_to_the_git_object_store() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("sized");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+
+    let output = kin_init(&repo, &home, &[]);
+    assert!(output.status.success(), "init failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("Store size:") && stdout.contains("under .kin/"),
+        "init must report the store size: {stdout}"
+    );
+    assert!(
+        stdout.contains("Git object store"),
+        "init must name what the ratio is against: {stdout}"
+    );
+    assert!(
+        stdout.contains("grows with history depth") && stdout.contains("docs/store-size.md"),
+        "init must say what drives store size and where the measured range lives: {stdout}"
+    );
+
+    // The printed multiple must describe the disk, not merely be present.
+    let store = tree_bytes(&repo.join(".kin"));
+    let git = tree_bytes(&repo.join(".git").join("objects"));
+    assert!(store > 0 && git > 0, "fixture measured {store} over {git}");
+    let expected = store as f64 / git as f64;
+    let printed = printed_ratio(&stdout);
+    assert!(
+        (printed - expected).abs() < 0.05 * expected.max(1.0),
+        "init printed {printed}x for a store of {store} bytes over {git} Git object bytes \
+         (expected about {expected:.2}x): {stdout}"
+    );
+}
+
+/// The two-sided case, and the falsification of the test above.
+///
+/// A repository can produce a store SMALLER than its Git object store, and the
+/// disclosure has to report that truthfully rather than describe every
+/// repository as inflated. A renderer that only ever printed a multiple above
+/// one, or that rounded a fraction to `1.0x` or to `0x`, passes the test above
+/// and fails this one.
+///
+/// The construction is a real distinction rather than a contrived one. Git's
+/// object store keeps unreachable objects until it is garbage collected; Kin
+/// admits exact REACHABLE history and never seals what no ref can reach. A
+/// repository that has reset away a large commit therefore carries megabytes in
+/// `.git/objects` that are legitimately absent from `.kin/`.
+///
+/// Note what this test does NOT claim. A short history alone does not put a
+/// store below its Git object store: a two-commit repository measures well
+/// ABOVE it, because a nearly empty store still carries fixed authority
+/// scaffolding while a nearly empty object store carries almost nothing.
+#[test]
+fn a_store_below_its_git_object_store_prints_a_fraction() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("orphaned");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+
+    // A blob that does not compress, so the object it becomes is about as large
+    // as the bytes written. Generated rather than random, so the fixture is the
+    // same size on every run.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut incompressible = Vec::with_capacity(400_000);
+    while incompressible.len() < 400_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        incompressible.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(repo.join("payload.bin"), &incompressible).expect("write payload");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "payload"]);
+    // Unreachable from here on, and still on disk.
+    run_git(&repo, &["reset", "--hard", "HEAD~1"]);
+
+    let output = kin_init(&repo, &home, &[]);
+    assert!(
+        output.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let store = tree_bytes(&repo.join(".kin"));
+    let git = tree_bytes(&repo.join(".git").join("objects"));
+    assert!(
+        store < git,
+        "the fixture did not produce a store ({store} bytes) below its Git object store \
+         ({git} bytes), so this test is not exercising the case it names"
+    );
+
+    let printed = printed_ratio(&stdout);
+    assert!(
+        printed < 1.0 && printed > 0.0,
+        "a store below its Git object store must print a fraction, not {printed}x: {stdout}"
+    );
+    let expected = store as f64 / git as f64;
+    assert!(
+        (printed - expected).abs() < 0.05 * expected.max(0.01),
+        "init printed {printed}x for {store} store bytes over {git} Git object bytes \
+         (expected about {expected:.2}x): {stdout}"
+    );
+}
+
+/// The JSON surface must carry the raw counts, so a consumer can track store
+/// growth over time instead of parsing a rendered sentence.
+#[test]
+fn init_json_carries_the_measured_store_and_git_object_bytes() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("sized-json");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+
+    let output = kin_init(&repo, &home, &["--json"]);
+    assert!(output.status.success(), "init --json failed");
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).expect("init stdout should be JSON");
+
+    let store = payload["store_footprint"]["store"]["bytes"]
+        .as_u64()
+        .expect("the payload must carry measured store bytes");
+    let git = payload["store_footprint"]["git_objects"]["bytes"]
+        .as_u64()
+        .expect("the payload must carry measured Git object bytes");
+    assert_eq!(
+        store,
+        tree_bytes(&repo.join(".kin")),
+        "the reported store bytes must be the bytes on disk"
+    );
+    assert_eq!(
+        git,
+        tree_bytes(&repo.join(".git").join("objects")),
+        "the reported Git object bytes must be the bytes on disk"
+    );
+    assert_eq!(
+        payload["store_footprint"]["store"]["unreadable_entries"], 0,
+        "a complete walk must report no unreadable entries, or the size is a floor"
+    );
+}
+
+/// A Kin-native repository has no Git object store, and must say there is
+/// nothing to compare against rather than print a ratio it cannot compute.
+#[test]
+fn native_init_reports_a_store_size_with_no_comparison() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("native-size");
+    fs::create_dir_all(&home).expect("create home");
+
+    let output = kin_init(&repo, &home, &[]);
+    assert!(output.status.success(), "native init failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Store size:") && stdout.contains("no Git object store"),
+        "a native repository must report its size and name the missing comparison: {stdout}"
+    );
 }
