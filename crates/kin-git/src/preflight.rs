@@ -687,6 +687,10 @@ fn prove_worktree(
         ignored: Vec::new(),
         executable_authority,
         symlink_materialization,
+        diagnosis: Some(CheckoutDiagnosis {
+            repo: ignore_repo,
+            index,
+        }),
     };
     let graph_only_paths = expected
         .iter()
@@ -775,6 +779,156 @@ struct WorktreeWalk<'a> {
     ignored: Vec<IgnoredLocalEntry>,
     executable_authority: ExecutableModeAuthority,
     symlink_materialization: SymlinkMaterialization,
+    /// Absent when a caller has no repository to consult, which costs only the
+    /// precision of a refusal and never changes whether one is raised.
+    diagnosis: Option<CheckoutDiagnosis<'a>>,
+}
+
+/// Read-only Git handles consulted solely to explain a refusal.
+///
+/// Nothing reached through here answers a preflight question. The lookup runs
+/// only after a byte comparison has already failed, and only to name the
+/// transformation that produced the worktree bytes, so a repository Git itself
+/// rewrites on checkout is never reported as carrying an edit its operator
+/// never made.
+#[derive(Clone, Copy)]
+struct CheckoutDiagnosis<'a> {
+    repo: &'a gix::Repository,
+    index: &'a gix::index::File,
+}
+
+/// Why one tracked blob's worktree bytes disagree with the committed tree.
+enum BlobDivergence {
+    /// Git rewrote the bytes on checkout, so the worktree holds exactly what a
+    /// clean checkout of this commit produces.
+    CheckoutTransformation(String),
+    /// Nothing Git does on checkout accounts for the bytes, so the worktree
+    /// carries a real edit.
+    UnstagedEdit,
+}
+
+/// The `.gitattributes` assignments that let Git rewrite one path on checkout.
+///
+/// Line-ending assignments are kept apart from the rest because they explain
+/// exactly one shape of difference. Treating them as a blanket excuse would
+/// reintroduce the conflation in the other direction, reporting a genuine edit
+/// to a normalized file as a filter.
+#[derive(Default)]
+struct CheckoutAttributes {
+    /// Assignments that normalize line endings and change nothing else.
+    line_ending: Vec<String>,
+    /// The first assignment that may rewrite the bytes arbitrarily.
+    rewriting: Option<String>,
+}
+
+/// Byte prefix every Git LFS pointer blob begins with.
+const LFS_POINTER_PREFIX: &[u8] = b"version https://git-lfs.github.com/spec/";
+
+/// Name the checkout transformation behind diverging bytes, or report an edit.
+///
+/// The order is deliberate. Line-ending normalization is established from the
+/// bytes themselves rather than from the attribute, so a real edit to a file
+/// marked `text` still reads as an edit. An attribute that can rewrite content
+/// arbitrarily is the only one allowed to explain a difference the bytes do not.
+fn classify_blob_divergence(
+    diagnosis: Option<CheckoutDiagnosis<'_>>,
+    path: &RepoPath,
+    worktree: &[u8],
+    committed: &[u8],
+) -> BlobDivergence {
+    if committed.starts_with(LFS_POINTER_PREFIX) && !worktree.starts_with(LFS_POINTER_PREFIX) {
+        return BlobDivergence::CheckoutTransformation(
+            "Git LFS smudges it, so the committed tree holds a pointer where the worktree \
+             holds the file's content"
+                .to_string(),
+        );
+    }
+    let attributes = diagnosis
+        .map(|diagnosis| checkout_attributes(diagnosis, path))
+        .unwrap_or_default();
+    if line_endings_only(worktree, committed) {
+        return BlobDivergence::CheckoutTransformation(if attributes.line_ending.is_empty() {
+            "Git normalizes its line endings on checkout".to_string()
+        } else {
+            format!(
+                ".gitattributes marks it {}, so Git normalizes its line endings on checkout",
+                attributes.line_ending.join(" ")
+            )
+        });
+    }
+    match attributes.rewriting {
+        Some(assignment) => BlobDivergence::CheckoutTransformation(format!(
+            ".gitattributes marks it {assignment}, so Git rewrites it on checkout"
+        )),
+        None => BlobDivergence::UnstagedEdit,
+    }
+}
+
+/// Read the checkout-rewriting attributes Git resolves for one path.
+///
+/// Attributes come from the committed index mapping, the same source the rest
+/// of this preflight trusts, so explaining a refusal never reads an ambient
+/// `.gitattributes` off the filesystem. A lookup that cannot be completed
+/// yields no attributes and the refusal falls back to what the bytes prove.
+fn checkout_attributes(diagnosis: CheckoutDiagnosis<'_>, path: &RepoPath) -> CheckoutAttributes {
+    let mut found = CheckoutAttributes::default();
+    let Ok(mut stack) = diagnosis.repo.attributes_only(
+        diagnosis.index,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+    ) else {
+        return found;
+    };
+    let Ok(platform) = stack.at_entry(
+        path.as_bytes().as_bstr(),
+        Some(gix::index::entry::Mode::FILE),
+    ) else {
+        return found;
+    };
+    let mut outcome = gix::attrs::search::Outcome::default();
+    if !platform.matching_attributes(&mut outcome) {
+        return found;
+    }
+    for matched in outcome.iter() {
+        let assignment = matched.assignment;
+        // `-text` and `!text` disable the transformation rather than request
+        // it, so only a set or valued assignment explains rewritten bytes.
+        if !matches!(
+            assignment.state,
+            gix::attrs::StateRef::Set | gix::attrs::StateRef::Value(_)
+        ) {
+            continue;
+        }
+        match assignment.name.as_str() {
+            "text" | "eol" => found.line_ending.push(assignment.to_string()),
+            "filter" | "working-tree-encoding" | "ident" => {
+                if found.rewriting.is_none() {
+                    found.rewriting = Some(assignment.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Whether two blobs carry the same content and differ only in line endings.
+fn line_endings_only(left: &[u8], right: &[u8]) -> bool {
+    without_carriage_returns(left) == without_carriage_returns(right)
+}
+
+/// Drop the carriage return of every CRLF pair, leaving lone returns in place.
+fn without_carriage_returns(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            index += 1;
+            continue;
+        }
+        normalized.push(bytes[index]);
+        index += 1;
+    }
+    normalized
 }
 
 /// Where the exact executable bit of a tracked blob is read from.
@@ -1032,9 +1186,20 @@ fn prove_tracked_entry(
                 fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
             let committed = state.blob_store.read(&hash)?;
             if actual != committed {
-                return Err(preflight_error(format!(
-                    "tracked blob {path} bytes differ from the committed tree; checkout filters, LFS, CRLF, or unstaged edits are not admissible"
-                )));
+                return Err(preflight_error(
+                    match classify_blob_divergence(state.diagnosis, path, &actual, &committed) {
+                        BlobDivergence::CheckoutTransformation(reason) => format!(
+                            "tracked blob {path} differs from the committed tree because \
+                             {reason}; Kin cannot yet admit a repository whose worktree Git \
+                             rewrites on checkout. This is not an unstaged edit"
+                        ),
+                        BlobDivergence::UnstagedEdit => format!(
+                            "tracked blob {path} has unstaged edits; its worktree bytes differ \
+                             from the committed tree and no checkout filter, LFS pointer, or \
+                             line-ending normalization explains the difference"
+                        ),
+                    },
+                ));
             }
             state.tracked_hash.u64(1);
             state.tracked_hash.bytes(hash.as_bytes());
@@ -2478,6 +2643,7 @@ mod platform_materialization_tests {
             ignored: Vec::new(),
             executable_authority,
             symlink_materialization,
+            diagnosis: None,
         };
         let metadata = fs::symlink_metadata(absolute).expect("entry metadata");
         prove_tracked_entry(absolute, &path, &metadata, expected, &mut state)
@@ -3206,13 +3372,15 @@ mod tests {
         git(&repo, &["init", "--initial-branch=main"]);
         configure_identity(&repo);
         git(&repo, &["config", "core.autocrlf", "true"]);
-        fs::write(repo.join(".gitattributes"), b"text.txt text eol=crlf\n").expect("attributes");
-        fs::write(repo.join("text.txt"), b"line one\nline two\n").expect("text");
+        // The exact shape every Gradle and Maven wrapper project carries, so
+        // the pattern this resolves is a glob rather than a literal name.
+        fs::write(repo.join(".gitattributes"), b"*.bat text eol=crlf\n").expect("attributes");
+        fs::write(repo.join("gradlew.bat"), b"line one\nline two\n").expect("text");
         git(&repo, &["add", "--all"]);
         commit(&repo, "crlf checkout");
-        fs::remove_file(repo.join("text.txt")).expect("remove text");
-        git(&repo, &["checkout", "--", "text.txt"]);
-        assert!(fs::read(repo.join("text.txt"))
+        fs::remove_file(repo.join("gradlew.bat")).expect("remove text");
+        git(&repo, &["checkout", "--", "gradlew.bat"]);
+        assert!(fs::read(repo.join("gradlew.bat"))
             .expect("text bytes")
             .windows(2)
             .any(|pair| pair == b"\r\n"));
@@ -3222,7 +3390,44 @@ mod tests {
         let (snapshot, plan) = snapshot_plan(&repo, &store);
         let error =
             preflight_git_migration(&repo, &snapshot, &plan, &store).expect_err("CRLF rejection");
-        assert!(error.to_string().contains("checkout filters, LFS, CRLF"));
+        let reported = error.to_string();
+        assert!(reported.contains("gradlew.bat"), "{reported}");
+        assert!(reported.contains("text eol=crlf"), "{reported}");
+        assert!(reported.contains("line endings"), "{reported}");
+        assert!(reported.contains("is not an unstaged edit"), "{reported}");
+        assert!(!reported.contains("has unstaged edits"), "{reported}");
+    }
+
+    /// The partner of the checkout-transformation case above.
+    ///
+    /// A tree Git rewrote on checkout and a tree its operator edited both reach
+    /// the same byte comparison, so the refusal is only useful if each names its
+    /// own cause. Asserting that neither message carries the other's sentence is
+    /// what keeps the two from collapsing back into one accusation.
+    #[test]
+    fn rejects_unstaged_edits_without_blaming_a_checkout_filter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source");
+        git(&repo, &["init", "--initial-branch=main"]);
+        configure_identity(&repo);
+        git(&repo, &["config", "core.autocrlf", "false"]);
+        fs::write(repo.join("text.txt"), b"line one\nline two\n").expect("text");
+        git(&repo, &["add", "--all"]);
+        commit(&repo, "committed text");
+        fs::write(repo.join("text.txt"), b"line one\nline three\n").expect("edit");
+        assert_ne!(git_stdout(&repo, &["status", "--porcelain"]), "");
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        let error = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect_err("unstaged edit rejection");
+        let reported = error.to_string();
+        assert!(reported.contains("text.txt"), "{reported}");
+        assert!(reported.contains("has unstaged edits"), "{reported}");
+        assert!(!reported.contains("is not an unstaged edit"), "{reported}");
+        assert!(!reported.contains(".gitattributes"), "{reported}");
+        assert!(!reported.contains("line endings"), "{reported}");
     }
 
     #[test]
