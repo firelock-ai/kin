@@ -282,7 +282,7 @@ add local vector similarity over them, and confirm coverage with
 
 ## Review an AI-written change
 
-**AI writes code. Kin proves what changed.**
+**AI writes code. Kin proves the change.**
 
 Run `kin init` on the branch you want to review so the relevant Git history is in
 the graph, then pass explicit commit SHAs to the report-only shadow gate:
