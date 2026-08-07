@@ -114,6 +114,60 @@ pub(crate) fn mcp_transactions_disk_path(layout: &KinLayout) -> std::path::PathB
     layout.root().join("mcp_transactions.json")
 }
 
+/// Wall-clock cost of each blocking phase of a daemon open.
+///
+/// The API listener does not bind until `open` returns, so this window is the
+/// one stretch of a daemon's life in which a client can observe nothing at all
+/// and can only wait. Recording the split is what lets a slow open be
+/// attributed from a persisted log, on a machine that has since stopped
+/// reproducing it, instead of requiring a profiler at the moment it happens.
+pub(crate) struct OpenPhases {
+    started: Instant,
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl OpenPhases {
+    pub(crate) fn begin() -> Self {
+        Self {
+            started: Instant::now(),
+            phases: Vec::new(),
+        }
+    }
+
+    /// Run one phase and retain what it cost. Phases are recorded in completion
+    /// order, which is also the order they block startup in.
+    pub(crate) fn record<T>(&mut self, phase: &'static str, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let outcome = work();
+        self.phases.push((phase, started.elapsed()));
+        outcome
+    }
+
+    /// Note a phase that was skipped, and why. A skip is as diagnostic as a
+    /// cost: an operator comparing two opens of the same repository needs to
+    /// see that a phase did not run, not infer it from a missing field.
+    pub(crate) fn skipped(&mut self, phase: &'static str) {
+        self.phases.push((phase, Duration::ZERO));
+    }
+
+    fn breakdown(&self) -> String {
+        self.phases
+            .iter()
+            .map(|(phase, elapsed)| format!("{phase}={}ms", elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn emit(&self, repository: &str) {
+        info!(
+            repository = repository,
+            total_ms = self.started.elapsed().as_millis() as u64,
+            phases = %self.breakdown(),
+            "daemon startup phases completed"
+        );
+    }
+}
+
 /// Load persisted in-flight MCP transactions on daemon startup. A missing file
 /// (clean start) or an unreadable/corrupt one yields an empty set — startup must
 /// never fail on transaction-state recovery — but corruption is surfaced loudly
@@ -1733,6 +1787,8 @@ impl DaemonState {
     /// the process entrypoint. Local overrides must name the manifest's exact
     /// authority; they cannot rebind one workspace to another repository.
     pub fn open_with_repo_id(layout: KinLayout, explicit_repo_id: Option<&str>) -> Result<Self> {
+        let mut phases = OpenPhases::begin();
+
         // Layout gate first. A pre-v2 `.kin/` (file/branch-authority era) must
         // be refused before any manifest or storage parsing runs: its manifest
         // may predate required fields and its storage holds no repository
@@ -1815,11 +1871,13 @@ impl DaemonState {
         // of an unpersisted generation-zero authority. Use the receipt from
         // this same recovery to refuse an intact namespace whose authority
         // record disappeared without paying for a second load or lock.
-        let (authority, _authority_payload_stats) =
-            kin_core::open_persisted_local_repository_authority(
-                repository_id.clone(),
-                Arc::clone(&local_repository_backend),
-            )
+        let (authority, _authority_payload_stats) = phases
+            .record("authority_open", || {
+                kin_core::open_persisted_local_repository_authority(
+                    repository_id.clone(),
+                    Arc::clone(&local_repository_backend),
+                )
+            })
             .map_err(DaemonError::Graph)?;
         // Startup latency on a large repository is dominated by whether this
         // open replayed the whole history or trusted a durable validation of
@@ -1880,8 +1938,10 @@ impl DaemonState {
                 }
             }
         };
-        let workspace_snapshot = lease
-            .workspace_graph_snapshot(&workspace_id)
+        let workspace_snapshot = phases
+            .record("workspace_snapshot", || {
+                lease.workspace_graph_snapshot(&workspace_id)
+            })
             .map_err(DaemonError::Graph)?
             .ok_or_else(|| {
                 DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
@@ -1895,21 +1955,25 @@ impl DaemonState {
         let loaded_snapshot = generation > 0;
         let workspace_artifact_count = workspace_snapshot.resolved_tree.len();
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
-        let hydrated_source_bodies =
-            Self::hydrate_ingest_cas(&authority, &workspace_snapshot.resolved_tree, &blobs)?;
-        let graph = if locate_only {
-            kin_db::InMemoryGraph::from_snapshot_with_text_index_read_only(
-                workspace_snapshot,
-                text_index_path.clone(),
-            )
-        } else {
-            kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                workspace_snapshot,
-                text_index_path.clone(),
-            )
-        }
-        .map(Arc::new)
-        .map_err(DaemonError::Graph)?;
+        let hydrated_source_bodies = phases.record("cas_hydrate", || {
+            Self::hydrate_ingest_cas(&authority, &workspace_snapshot.resolved_tree, &blobs)
+        })?;
+        let graph = phases
+            .record("graph_text_index", || {
+                if locate_only {
+                    kin_db::InMemoryGraph::from_snapshot_with_text_index_read_only(
+                        workspace_snapshot,
+                        text_index_path.clone(),
+                    )
+                } else {
+                    kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        workspace_snapshot,
+                        text_index_path.clone(),
+                    )
+                }
+            })
+            .map(Arc::new)
+            .map_err(DaemonError::Graph)?;
         info!(
             repository = %cached_repo_id,
             workspace = %workspace_id,
@@ -1928,12 +1992,16 @@ impl DaemonState {
         // `from_snapshot_with_text_index` restores the text index but not the
         // vector sidecar, so without this the reopened repository reports every
         // entity as unembedded and re-derives an index it already has on disk.
-        let vector_index_discarded = Self::load_validated_vector_index(&layout, graph.as_ref());
+        let vector_index_discarded = phases.record("vector_index", || {
+            Self::load_validated_vector_index(&layout, graph.as_ref())
+        });
 
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         // Seed LKG from persisted graph so the first reconcile after daemon
         // startup only reports truly changed entities, not all of them.
-        reconciler.seed_lkg_entities_from_graph(graph.as_ref());
+        phases.record("lkg_seed", || {
+            reconciler.seed_lkg_entities_from_graph(graph.as_ref())
+        });
 
         // Wire the traffic checker so reconcile mutations are gated by active
         // intents/leases. Without this, check_scopes() in the reconciler
@@ -2051,15 +2119,28 @@ impl DaemonState {
         // general-purpose read index with a partial one.
         if loaded_snapshot {
             if locate_only {
-                state.finalize_loaded_locate_generation(generation)?;
+                phases.record("read_index", || {
+                    state.finalize_loaded_locate_generation(generation)
+                })?;
+            } else if Self::durable_read_index_matches_generation(&state.layout, generation) {
+                // The durable index and marker already describe this exact
+                // generation, so rebuilding them would write the same bytes
+                // back. `persisted_entity_count` was constructed from the same
+                // graph the rebuild would have counted and
+                // `post_commit_finalization_pending` is already false, so the
+                // skip leaves state identical to a successful finalize.
+                phases.skipped("read_index");
             } else {
                 state
                     .post_commit_finalization_pending
                     .store(true, Ordering::SeqCst);
-                state.finalize_loaded_generation(generation)?;
+                phases.record("read_index", || {
+                    state.finalize_loaded_generation(generation)
+                })?;
             }
         }
         state.register_daemon_system_session();
+        phases.emit(&state.cached_repo_id);
         Ok(state)
     }
 
@@ -4461,6 +4542,28 @@ impl DaemonState {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0)
+    }
+
+    /// Whether the durable read index already describes exactly this generation.
+    ///
+    /// [`Self::finalize_generation_from_graph`] stages the new index off-path,
+    /// removes the canonical index, publishes the marker, and only then promotes
+    /// the staged file. Every crash point in that order therefore leaves the
+    /// index either absent or matching the marker beside it, never stale. A
+    /// marker naming this generation with an index present is consequently proof
+    /// the two were published together, and a crash mid-sequence leaves no index
+    /// and declines here.
+    ///
+    /// Startup is what this buys. Reopening a repository whose derived index is
+    /// already current otherwise rebuilds that index from the whole graph and
+    /// fsyncs it before the API listener binds, so the cost lands entirely
+    /// inside the window where a client cannot reach the daemon at all.
+    fn durable_read_index_matches_generation(layout: &KinLayout, generation: u64) -> bool {
+        Self::read_generation_marker(layout) == generation
+            && layout
+                .kindb_snapshot_path()
+                .with_extension("kidx")
+                .is_file()
     }
 
     /// Name the open-path hydration gap on an error that a hydrated ingestion
@@ -6950,6 +7053,135 @@ mod tests {
         assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 1);
         assert_eq!(DaemonState::read_generation_marker(&layout), 1);
         assert_eq!(kin_db::ReadIndex::load(&idx_path).unwrap().entity_count, 1);
+    }
+
+    /// The reuse predicate must answer from evidence that only a completed
+    /// publication can produce. Each arm here is a crash point of
+    /// `finalize_generation_from_graph`, and every one of them must decline.
+    #[test]
+    fn durable_read_index_is_current_only_when_marker_and_index_agree() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+
+        let state = DaemonState::open(layout.clone()).expect("an initialized repo must open");
+        let generation = state.snapshot_generation.load(Ordering::SeqCst);
+        assert!(
+            generation > 0,
+            "the reuse branch only runs for a persisted generation; this fixture must have one"
+        );
+        drop(state);
+
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        assert!(
+            index_path.is_file(),
+            "the first open must publish a read index"
+        );
+        assert!(
+            DaemonState::durable_read_index_matches_generation(&layout, generation),
+            "a marker and index published together must be reusable"
+        );
+        assert!(
+            !DaemonState::durable_read_index_matches_generation(&layout, generation + 1),
+            "a marker naming another generation is not evidence about this one"
+        );
+
+        // The crash window between publishing the marker and promoting the
+        // staged index leaves the marker current and no index behind it.
+        std::fs::remove_file(&index_path).unwrap();
+        assert!(
+            !DaemonState::durable_read_index_matches_generation(&layout, generation),
+            "a missing index must never be reported as current"
+        );
+    }
+
+    /// Two-sided: a reopen whose derived index is already current must not
+    /// rewrite it, and a reopen whose index is gone must rebuild it. Both must
+    /// serve the same graph, because reuse is only sound if it is invisible.
+    #[test]
+    fn reopen_reuses_a_current_read_index_and_rebuilds_a_missing_one() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let blobs = BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let body = b"pub fn reused() {}\n";
+        let body_hash = Hash256::from_bytes(blobs.write(body).unwrap().0);
+        let desired = ResolvedTree::from_artifacts(vec![ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("src/reused.rs").unwrap(),
+            TreeEntry::blob(body_hash, false),
+        )])
+        .unwrap();
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &init.layout,
+            )
+            .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            init.layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            ResolvedTree::default(),
+            desired,
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("read-index-reuse-test"),
+        )
+        .unwrap()
+        .expect("exact workspace admission must advance authority");
+
+        let layout = init.layout;
+        let first = DaemonState::open(layout.clone()).expect("an admitted repo must open");
+        let generation = first.snapshot_generation.load(Ordering::SeqCst);
+        let entity_count = first.graph.entity_count();
+        let artifact_count = first.graph.resolved_tree().len();
+        assert!(
+            generation > 0,
+            "the fixture must carry a persisted generation"
+        );
+        assert!(
+            artifact_count > 0,
+            "the fixture must carry admitted graph content"
+        );
+        drop(first);
+
+        let index_path = layout.kindb_snapshot_path().with_extension("kidx");
+        let published = std::fs::metadata(&index_path).unwrap().modified().unwrap();
+
+        let reopened = DaemonState::open(layout.clone()).expect("reopen must succeed");
+        assert_eq!(
+            reopened.snapshot_generation.load(Ordering::SeqCst),
+            generation
+        );
+        assert_eq!(
+            reopened.graph.resolved_tree().len(),
+            artifact_count,
+            "reusing the index must not change what the daemon serves"
+        );
+        assert_eq!(reopened.graph.entity_count(), entity_count);
+        assert_eq!(DaemonState::read_generation_marker(&layout), generation);
+        assert_eq!(
+            std::fs::metadata(&index_path).unwrap().modified().unwrap(),
+            published,
+            "a read index already describing this generation must be reused, not rewritten"
+        );
+        drop(reopened);
+
+        std::fs::remove_file(&index_path).unwrap();
+        let healed =
+            DaemonState::open(layout.clone()).expect("reopen must heal a missing read index");
+        assert_eq!(
+            healed.graph.resolved_tree().len(),
+            artifact_count,
+            "a cold restart must load the same graph"
+        );
+        assert_eq!(
+            kin_db::ReadIndex::load(&index_path).unwrap().entity_count as usize,
+            healed.graph.entity_count(),
+            "the rebuilt index must describe the loaded graph"
+        );
     }
 
     #[test]
