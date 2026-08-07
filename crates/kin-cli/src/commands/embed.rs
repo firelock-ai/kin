@@ -125,15 +125,34 @@ fn constrained_total_budget_seconds() -> Option<u64> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
     let profile = std::env::var("KIN_RESOURCE_PROFILE").unwrap_or_default();
-    resolve_total_budget(override_secs, &profile)
+    resolve_total_budget(
+        override_secs,
+        &profile,
+        !crate::resource_profile::product_selected(),
+    )
 }
 
 /// Pure budget resolution: an explicit positive override wins on any profile;
 /// otherwise a constrained profile gets the default budget and everything else
 /// gets `None` (drive to full coverage).
-fn resolve_total_budget(override_secs: Option<u64>, profile: &str) -> Option<u64> {
+///
+/// `profile_chosen_by_operator` is what keeps the cap meaning what it has always
+/// meant. `interactive` is read here as a claim about the HOST — "this is a
+/// small machine, bound the pass" — which only an operator can make. The kin
+/// binaries now select `interactive` themselves when nothing is set, and that
+/// selection says nothing about the machine, so it must not start bounding
+/// every embed on every box. An explicit `KIN_EMBED_MAX_TOTAL_SECONDS` still
+/// bounds the pass either way.
+fn resolve_total_budget(
+    override_secs: Option<u64>,
+    profile: &str,
+    profile_chosen_by_operator: bool,
+) -> Option<u64> {
     if let Some(secs) = override_secs.filter(|s| *s > 0) {
         return Some(secs);
+    }
+    if !profile_chosen_by_operator {
+        return None;
     }
     match profile.trim().to_ascii_lowercase().as_str() {
         "interactive" | "small" => Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS),
@@ -856,11 +875,11 @@ mod tests {
     fn constrained_profiles_get_a_default_total_budget() {
         // interactive / small are the small-machine selectors → auto-bounded.
         assert_eq!(
-            resolve_total_budget(None, "interactive"),
+            resolve_total_budget(None, "interactive", true),
             Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS)
         );
         assert_eq!(
-            resolve_total_budget(None, "  SMALL "),
+            resolve_total_budget(None, "  SMALL ", true),
             Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS)
         );
     }
@@ -870,21 +889,44 @@ mod tests {
         // Proof/throughput/ci/unset keep the drive-to-completion behavior.
         for profile in ["", "proof", "throughput", "ci", "unknown"] {
             assert_eq!(
-                resolve_total_budget(None, profile),
+                resolve_total_budget(None, profile, true),
                 None,
                 "profile={profile}"
             );
         }
     }
 
+    /// The product's own `interactive` selection is not a statement about the
+    /// machine, so it must not bound the pass the way an operator's is. Without
+    /// this, shipping `interactive` as the default would silently cap every
+    /// `kin embed` at ten minutes on every box.
+    #[test]
+    fn a_product_selected_profile_never_bounds_the_pass() {
+        for profile in ["interactive", "small", "proof", "throughput", "ci", ""] {
+            assert_eq!(
+                resolve_total_budget(None, profile, false),
+                None,
+                "profile={profile}"
+            );
+        }
+        // An explicit budget still bounds it, whoever chose the profile.
+        assert_eq!(
+            resolve_total_budget(Some(120), "interactive", false),
+            Some(120)
+        );
+    }
+
     #[test]
     fn explicit_total_budget_override_wins_on_any_profile() {
-        assert_eq!(resolve_total_budget(Some(120), "throughput"), Some(120));
-        assert_eq!(resolve_total_budget(Some(120), "proof"), Some(120));
-        // A zero override is ignored (falls back to profile default / none).
-        assert_eq!(resolve_total_budget(Some(0), "proof"), None);
         assert_eq!(
-            resolve_total_budget(Some(0), "interactive"),
+            resolve_total_budget(Some(120), "throughput", true),
+            Some(120)
+        );
+        assert_eq!(resolve_total_budget(Some(120), "proof", true), Some(120));
+        // A zero override is ignored (falls back to profile default / none).
+        assert_eq!(resolve_total_budget(Some(0), "proof", true), None);
+        assert_eq!(
+            resolve_total_budget(Some(0), "interactive", true),
             Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS)
         );
     }

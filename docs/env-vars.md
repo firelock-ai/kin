@@ -73,7 +73,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
 | `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
 | `KIN_REQUIRE_COMPLETE_EMBEDDINGS` | bool | false | correctness | require full embedding coverage before answering locate/search |
-| `KIN_RESOURCE_PROFILE` | enum | proof | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset resolves to proof (bit-identical), throughput may engage CPU/GPU hybrid embedding and is non-citable |
+| `KIN_RESOURCE_PROFILE` | enum | interactive | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset, the kin binaries select interactive at startup (value-preserving Metal kernels, proof's embedding budgets), while a library caller that never selects still resolves to proof; throughput additionally scales the batch budgets, may engage CPU/GPU hybrid embedding and overlaps persist with compute, and is non-citable |
 | `KIN_SCOPE_TIMING` | bool | false | diagnostic | print scope graph build timing to stderr |
 | `KIN_SEARCH_MODE` | enum | *(unset)* | correctness | search strictness; 'precise' rejects broad show-body searches |
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |

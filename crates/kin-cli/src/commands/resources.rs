@@ -82,6 +82,12 @@ pub struct ActualResources {
     /// Active `KIN_RESOURCE_PROFILE` env value, if set and non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_profile_env: Option<String>,
+    /// Whether that value was selected by the kin binary at startup because the
+    /// operator set nothing, rather than being an operator override. Both cases
+    /// leave the same env value behind, so without this an inspector cannot
+    /// tell a deliberate pin from the shipped default.
+    #[serde(default)]
+    pub resource_profile_product_selected: bool,
     /// Active `RAYON_NUM_THREADS` override, if set and non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rayon_num_threads_env: Option<String>,
@@ -102,6 +108,7 @@ impl ActualResources {
                 .map(|n| n.get())
                 .unwrap_or(0),
             resource_profile_env: non_empty_env("KIN_RESOURCE_PROFILE"),
+            resource_profile_product_selected: crate::resource_profile::product_selected(),
             rayon_num_threads_env: non_empty_env("RAYON_NUM_THREADS"),
             tokenizers_parallelism_env: non_empty_env("TOKENIZERS_PARALLELISM"),
         }
@@ -211,8 +218,12 @@ fn render_lines(
         ),
     ];
 
+    lines.push(profile_selector_line(actual));
+
+    // The profile selector is reported on its own line above, with who chose it.
+    // Listing it here too would read as an operator override even when the
+    // binary selected it for itself.
     let overrides = [
-        ("KIN_RESOURCE_PROFILE", &actual.resource_profile_env),
         ("RAYON_NUM_THREADS", &actual.rayon_num_threads_env),
         ("TOKENIZERS_PARALLELISM", &actual.tokenizers_parallelism_env),
     ]
@@ -229,6 +240,23 @@ fn render_lines(
     ));
 
     lines
+}
+
+/// How the runtime got its resource profile, as the inspected process saw it.
+///
+/// The value and its origin are reported together because they answer different
+/// questions: what is in effect, and whether anyone asked for it. A binary that
+/// selected the default writes the same env value an operator would, so the
+/// origin is the only thing that separates a deliberate pin from the ship
+/// default.
+fn profile_selector_line(actual: &ActualResources) -> String {
+    match actual.resource_profile_env.as_deref() {
+        Some(value) if actual.resource_profile_product_selected => {
+            format!("Profile selector: KIN_RESOURCE_PROFILE={value} (selected by kin; unset in the environment)")
+        }
+        Some(value) => format!("Profile selector: KIN_RESOURCE_PROFILE={value} (set by operator)"),
+        None => "Profile selector: KIN_RESOURCE_PROFILE unset".to_string(),
+    }
 }
 
 /// Build the inspect response from a detected plan plus live daemon embedding
@@ -540,6 +568,60 @@ mod tests {
         )
         .unwrap();
         assert!(response.text.contains("Env overrides: none"));
+    }
+
+    /// The selector line has to separate the two cases that leave the same env
+    /// value behind: an operator who pinned a profile, and a binary that chose
+    /// one because nobody did.
+    #[test]
+    fn profile_selector_names_who_chose_it() {
+        let operator = ActualResources {
+            resource_profile_env: Some("proof".to_string()),
+            resource_profile_product_selected: false,
+            ..ActualResources::default()
+        };
+        assert_eq!(
+            profile_selector_line(&operator),
+            "Profile selector: KIN_RESOURCE_PROFILE=proof (set by operator)"
+        );
+
+        let shipped = ActualResources {
+            resource_profile_env: Some("interactive".to_string()),
+            resource_profile_product_selected: true,
+            ..ActualResources::default()
+        };
+        assert_eq!(
+            profile_selector_line(&shipped),
+            "Profile selector: KIN_RESOURCE_PROFILE=interactive \
+             (selected by kin; unset in the environment)"
+        );
+
+        assert_eq!(
+            profile_selector_line(&ActualResources::default()),
+            "Profile selector: KIN_RESOURCE_PROFILE unset"
+        );
+    }
+
+    /// A product-selected profile is not an operator override, so it must not
+    /// be rendered in the override list — it has its own line.
+    #[test]
+    fn a_product_selected_profile_is_not_listed_as_an_override() {
+        let actual = ActualResources {
+            resource_profile_env: Some("interactive".to_string()),
+            resource_profile_product_selected: true,
+            ..ActualResources::default()
+        };
+        let response = build_command_resources_response(
+            sample_plan(Profile::Interactive),
+            EmbedRuntimeState::default(),
+            actual,
+            false,
+        )
+        .unwrap();
+        assert!(response.text.contains("Env overrides: none"));
+        assert!(response
+            .text
+            .contains("Profile selector: KIN_RESOURCE_PROFILE=interactive (selected by kin"));
     }
 
     #[test]

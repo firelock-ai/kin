@@ -2149,6 +2149,11 @@ fn parse_cli_or_report_retired_command() -> Cli {
 }
 
 fn main() -> Result<()> {
+    // Select this process's resource profile before anything reads it: the GPU
+    // kernel plan and the Metal submission depth are each resolved once per
+    // process, and mutating the environment is only safe while the process is
+    // still single-threaded. An operator's explicit KIN_RESOURCE_PROFILE wins.
+    kin_cli::resource_profile::apply_product_default();
     if kin_migrate::run_migration_process_host_if_requested()? {
         return Ok(());
     }
