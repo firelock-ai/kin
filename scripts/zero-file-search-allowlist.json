@@ -25,7 +25,7 @@
     },
     {
       "file": "crates/kin-cli/src/retrieval_profile.rs",
-      "reason": "Config/capability IO: probes the local model cache directory for reranker availability; never reads repo content and is not a semantic answer path",
+      "reason": "Config/capability IO: probes the local model cache directory for reranker availability now and for whether this install ever fetched the model; never reads repo content and is not a semantic answer path",
       "owner": "kin-cli",
       "expiration": "2026-12-31"
     },

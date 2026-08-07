@@ -1005,7 +1005,7 @@ def validator_health_report(
     }
 
 
-WINDOWS_VALIDATOR_CHECKS = {
+WINDOWS_REQUIRED_VALIDATOR_CHECKS = {
     "kin_binary": "healthy",
     "kin_daemon_binary": "healthy",
     "shell_path": "healthy",
@@ -1014,11 +1014,21 @@ WINDOWS_VALIDATOR_CHECKS = {
     "vfs_projection": "unsupported",
     "semantic_query_readiness": "unsupported",
     "daemon_running": "unsupported",
-    "repo_init": "missing",
+    "repo_init": "unsupported",
     "mcp_client_claude": "healthy",
     "mcp_client_cursor": "healthy",
     "mcp_client_gemini": "healthy",
     "mcp_client_windsurf": "healthy",
+}
+# The repo-free report carries checks the required map does not name, and
+# omitting them here is how this harness kept passing while the real Windows
+# leg threw on one of them. `retrieval_profile` is the case that did it: a
+# fresh install has selected no profile and fetched no reranker model, which is
+# a first-run state rather than a degraded serving configuration, and the leg's
+# tolerance accepts it only as `unsupported`.
+WINDOWS_VALIDATOR_CHECKS = {
+    **WINDOWS_REQUIRED_VALIDATOR_CHECKS,
+    "retrieval_profile": "unsupported",
 }
 
 
@@ -1027,7 +1037,7 @@ def windows_node_validator_fixture() -> tuple[
 ]:
     """Build a complete valid repository-free Windows proof fixture."""
 
-    report = validator_health_report(WINDOWS_VALIDATOR_CHECKS, healthy=False)
+    report = validator_health_report(WINDOWS_VALIDATOR_CHECKS, healthy=True)
     return (
         {
             "expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
@@ -1381,12 +1391,21 @@ def assert_windows_node_validator_behavior(step: str) -> None:
     # failure predicates, leaving only the required-map comparison able to
     # reject it.
     for report_path in ("kin-windows-health.json", "kin-windows-doctor.json"):
-        for check_id, expected in WINDOWS_VALIDATOR_CHECKS.items():
+        for check_id, expected in WINDOWS_REQUIRED_VALIDATOR_CHECKS.items():
             wrong = wrong_required_check_status(expected)
             reject(
                 f"{report_path} required {check_id}={wrong}",
                 fixture_with_check_status(proof, report_path, check_id, wrong),
             )
+        # A retrieval profile that is genuinely degraded, meaning levers off on
+        # a configuration this install chose rather than levers it has never
+        # had, is not tolerated by the repo-free posture. This is the arm that
+        # keeps the accepted `unsupported` above from being a blanket pass on
+        # anything this check reports.
+        reject(
+            f"{report_path} degraded retrieval profile",
+            fixture_with_check_status(proof, report_path, "retrieval_profile", "stale"),
+        )
         reject(
             f"{report_path} contradictory duplicate check",
             fixture_with_duplicate_check(
@@ -1395,7 +1414,7 @@ def assert_windows_node_validator_behavior(step: str) -> None:
         )
         reject(
             f"{report_path} inconsistent healthy aggregate",
-            fixture_with_json_value(proof, report_path, ("healthy",), True),
+            fixture_with_json_value(proof, report_path, ("healthy",), False),
         )
         reject(
             f"{report_path} unexpected hard failure",
@@ -2554,7 +2573,7 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         "meta.embeddings?.embeddings_enabled !== true",
         "meta.embeddings?.metal_enabled !== false",
         'authority.checks[0]?.state !== "unsupported"',
-        '["repo_init", "missing"]',
+        '["repo_init", "unsupported"]',
         '["daemon_running", "unsupported"]',
         '["registry_authority", "unsupported"]',
         '["vfs_projection", "unsupported"]',
@@ -7560,8 +7579,8 @@ def main() -> None:
             "if false; then",
         ),
         (
-            "the repo-free posture stops requiring a missing repository",
-            '["repo_init", "missing"]',
+            "the repo-free posture stops requiring the no-repository answer",
+            '["repo_init", "unsupported"]',
             '["repo_init", "healthy"]',
         ),
         (
@@ -7571,8 +7590,8 @@ def main() -> None:
         ),
         (
             "a repo-free posture pin is commented out in the heredoc it lives in",
-            '["repo_init", "missing"]',
-            '// ["repo_init", "missing"]',
+            '["repo_init", "unsupported"]',
+            '// ["repo_init", "unsupported"]',
         ),
     ):
         expect_assertion(
