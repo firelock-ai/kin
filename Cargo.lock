@@ -3120,7 +3120,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rpassword",
- "rustc-hash 1.1.0",
+ "rustc-hash 2.1.2",
  "rustix",
  "semver",
  "serde",
