@@ -12240,6 +12240,7 @@ fn status_label(status: &crate::commands::health::HealthStatus) -> &'static str 
         HealthStatus::Missing => "MISSING",
         HealthStatus::Stale => "STALE",
         HealthStatus::Misconfigured => "MISCONFIGURED",
+        HealthStatus::Pending => "PENDING",
         HealthStatus::Unsupported => "n/a",
     }
 }
@@ -12255,6 +12256,7 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
             HealthStatus::Healthy => style("✓").green(),
             HealthStatus::Missing | HealthStatus::Misconfigured => style("✗").red(),
             HealthStatus::Stale => style("!").yellow(),
+            HealthStatus::Pending => style("…").yellow(),
             HealthStatus::Unsupported => style("→").cyan(),
         };
         println!(

@@ -1503,14 +1503,16 @@ jobs:
           for (const [path, report] of reports) {
             const checks = validateHealthReport(report, path);
             // This capability capture runs before `kin embed`, so the daemon
-            // graph still has embeddings pending. Under graph-authoritative
-            // health that is semantic_query_readiness=stale, an intentional
-            // authority gate that flips the aggregate report.healthy to false.
-            // Accept that single transient pre-embed reason here — the
-            // post-embed embedded-health capture below still requires
-            // healthy=true with readiness=healthy — while keeping every other
-            // unhealthy reason fatal: any missing/misconfigured check, or any
-            // other check that is neither healthy nor unsupported, still fails.
+            // graph still has embeddings pending. A first fill reports
+            // semantic_query_readiness=pending and leaves report.healthy true,
+            // so this tolerance is not what carries the ordinary run. It
+            // remains for the one case that still blocks with work in flight:
+            // a store that had completed a fill and lost it, which reports
+            // stale. The post-embed embedded-health capture below still
+            // requires healthy=true with readiness=healthy, and every other
+            // unhealthy reason stays fatal here: any missing/misconfigured
+            // check, or any other check that is neither healthy nor
+            // unsupported, still fails.
             const onlyPendingEmbeddingsBlocks =
               checks.get("semantic_query_readiness")?.status === "stale" &&
               report.checks.every(
@@ -1531,7 +1533,12 @@ jobs:
               }
             }
             const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-            const allowedSemanticReadiness = ["healthy", "stale"];
+            // `pending` is what a fresh install reports while its first
+            // embedding pass is still filling, which is exactly the state this
+            // pre-embed capture is taken in. `stale` stays allowed for a store
+            // that finished a fill and lost ground; `healthy` for one whose
+            // background pass beat the capture.
+            const allowedSemanticReadiness = ["healthy", "pending", "stale"];
             if (!allowedSemanticReadiness.includes(semanticReadiness)) {
               throw new Error(
                 `${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected ${allowedSemanticReadiness.join(" or ")}`

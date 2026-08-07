@@ -1614,6 +1614,80 @@ impl DaemonState {
         self.vector_index_discarded.as_deref()
     }
 
+    /// Whether this store's embedding coverage has ever been whole.
+    ///
+    /// A first fill and a top-up after a completed fill produce the same
+    /// partial coverage counters, and only the second means the semantic
+    /// surface was ready and stopped being ready. Readiness reporting has to
+    /// tell them apart, so the daemon publishes a marker where coverage
+    /// completes and this reads it back.
+    ///
+    /// Read from disk rather than latched in memory, so a daemon that restarts
+    /// part-way through a fill still knows what earlier runs of this store
+    /// finished. The cost is one stat on a path taken once per embed interval
+    /// and once per readiness probe.
+    pub fn embedding_coverage_ever_complete(&self) -> bool {
+        self.layout.kindb_embedding_coverage_marker_path().exists()
+    }
+
+    /// Publish the has-ever-completed marker if embedding coverage is now whole.
+    ///
+    /// Called where the background embedding queue drains. The write is
+    /// idempotent, and a failure is deliberately not fatal: without the marker
+    /// a store that lost coverage reads as one still filling for the first
+    /// time, which understates a recoverable state instead of reporting a
+    /// working install as broken. The state that must stay loud — a discarded
+    /// vector index — is keyed on the discard reason rather than on this
+    /// marker, so it is unaffected either way.
+    pub fn record_embedding_coverage_complete(&self) {
+        let status = self.graph.embedding_status();
+        if !Self::coverage_is_whole(status.indexed, status.pending, status.total) {
+            return;
+        }
+        let marker = self.layout.kindb_embedding_coverage_marker_path();
+        if marker.exists() {
+            return;
+        }
+        if let Err(error) = Self::write_embedding_coverage_marker(&marker) {
+            debug!(
+                path = %marker.display(),
+                %error,
+                "could not publish the embedding-coverage marker; readiness will keep reporting a first fill"
+            );
+        }
+    }
+
+    /// Whether a coverage snapshot describes a fill that actually finished.
+    ///
+    /// An empty store is excluded deliberately: it has not finished a fill, it
+    /// has never had one to finish, and treating it as covered would let a
+    /// store claim ground it never held the moment its first entity arrives.
+    /// This is the exact complement of the whole-coverage arm readiness reports
+    /// as healthy, so the marker cannot disagree with the counters beside it.
+    fn coverage_is_whole(indexed: usize, pending: usize, total: usize) -> bool {
+        total > 0 && pending == 0 && indexed == total
+    }
+
+    fn write_embedding_coverage_marker(marker: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let parent = marker.parent().ok_or_else(|| {
+            std::io::Error::other("embedding-coverage marker path has no parent directory")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let tmp_path = marker.with_extension(format!("tmp-{}", std::process::id()));
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(b"complete\n")?;
+            file.sync_all()?;
+        }
+        if let Err(error) = std::fs::rename(&tmp_path, marker) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        sync_directory_metadata(parent)
+    }
+
     fn spine_disabled() -> bool {
         std::env::var("KIN_DISABLE_SPINE")
             .ok()
@@ -7989,6 +8063,73 @@ mod tests {
         assert!(
             pending >= 1,
             "the unembedded entity must remain pending (no embedder ran); got {pending}"
+        );
+    }
+
+    /// The publish decision, on every shape the counters can take. A store that
+    /// has not finished a fill must never claim it has, because that claim is
+    /// what turns a fresh install's ordinary progress into a reported failure.
+    #[test]
+    fn only_whole_coverage_counts_as_a_finished_fill() {
+        assert!(DaemonState::coverage_is_whole(41, 0, 41));
+        assert!(
+            !DaemonState::coverage_is_whole(0, 0, 0),
+            "an empty store has not finished a fill it never started"
+        );
+        assert!(
+            !DaemonState::coverage_is_whole(40, 1, 41),
+            "work still queued is a fill in progress"
+        );
+        assert!(
+            !DaemonState::coverage_is_whole(40, 0, 41),
+            "an entity nothing is queued for is still an entity with no vector"
+        );
+    }
+
+    /// The marker is the only thing separating a store filling for the first
+    /// time from one that lost coverage it held, so it has to be withheld until
+    /// a fill finishes and it has to outlive the daemon that published it.
+    #[test]
+    fn embedding_coverage_marker_is_withheld_until_a_fill_finishes_and_then_persists() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        state
+            .graph
+            .upsert_entity(&test_entity("embed_me", "src/lib.rs"))
+            .unwrap();
+        let status = state.graph.embedding_status();
+        assert!(
+            !DaemonState::coverage_is_whole(status.indexed, status.pending, status.total),
+            "fixture precondition: this store must not be fully covered, got \
+             {}/{} indexed, {} pending",
+            status.indexed,
+            status.total,
+            status.pending
+        );
+
+        state.record_embedding_coverage_complete();
+        assert!(
+            !state.embedding_coverage_ever_complete(),
+            "an unfinished fill must not publish the has-ever-completed marker"
+        );
+
+        DaemonState::write_embedding_coverage_marker(
+            &state.layout.kindb_embedding_coverage_marker_path(),
+        )
+        .expect("publishing the marker must succeed on a local store");
+        assert!(state.embedding_coverage_ever_complete());
+
+        // Published into the store rather than held in memory, so the next
+        // daemon to open this repository does not mistake it for a fresh one.
+        let reopened_layout = kin_core::KinLayout::discover(repo_dir.path())
+            .expect("the fixture store must be found");
+        assert!(
+            reopened_layout
+                .kindb_embedding_coverage_marker_path()
+                .exists(),
+            "the claim must live in the store, not in the process that made it"
         );
     }
 

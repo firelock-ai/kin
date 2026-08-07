@@ -2972,6 +2972,7 @@ async fn command_resources(
         hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
     };
 
     let actual = kin_cli::commands::resources::ActualResources::capture();

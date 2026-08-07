@@ -27,6 +27,10 @@ pub enum HealthStatus {
     Missing,
     Stale,
     Misconfigured,
+    /// Expected first-run work a correct install is still doing. It counts as
+    /// needing attention, because the surface is not answering at full strength
+    /// yet, but it never blocks readiness: nothing is wrong and nothing is lost.
+    Pending,
     Unsupported,
 }
 
@@ -89,6 +93,11 @@ fn is_failing(status: &HealthStatus) -> bool {
 /// but semantic readiness is an authority gate: if daemon graph coverage is
 /// stale or cannot be read, the report cannot honestly claim the semantic
 /// query surface is ready.
+///
+/// `Pending` sits deliberately outside that gate. It names work a correct
+/// install is expected to be doing on its way to ready, not ground a ready
+/// install lost, and a gate that cannot tell those apart fails every fresh
+/// install for succeeding.
 fn blocks_readiness(check: &HealthCheck) -> bool {
     is_failing(&check.status)
         || (check.id == "semantic_query_readiness" && matches!(check.status, HealthStatus::Stale))
@@ -127,9 +136,10 @@ impl HealthReport {
             match check.status {
                 HealthStatus::Healthy => summary.passed += 1,
                 HealthStatus::Unsupported => summary.skipped += 1,
-                HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Stale => {
-                    summary.attention += 1
-                }
+                HealthStatus::Missing
+                | HealthStatus::Misconfigured
+                | HealthStatus::Stale
+                | HealthStatus::Pending => summary.attention += 1,
             }
         }
         summary
@@ -1683,10 +1693,24 @@ fn semantic_query_health_from_runtime(
     // means work already paid for is being paid for again, so when the daemon
     // knows which it is, say so instead of leaving it to be inferred.
     let Some(reason) = &runtime.vector_index_discarded else {
+        // Nothing was discarded, so the remaining question is whether this
+        // store has ever finished a fill. Before it has, partial coverage is a
+        // correct fresh install doing exactly what it should in its first
+        // minutes, and gating readiness on it fails every new user for
+        // succeeding. After it has, the same counters mean a surface that was
+        // ready is not ready now, which is what the gate exists for.
+        let (status, detail) = if runtime.embedding_coverage_ever_complete {
+            (HealthStatus::Stale, detail)
+        } else {
+            (
+                HealthStatus::Pending,
+                format!("{detail}; first embedding pass still filling"),
+            )
+        };
         return HealthCheck::new(
             "semantic_query_readiness",
             "Semantic query readiness",
-            HealthStatus::Stale,
+            status,
             detail,
         )
         .with_manual_fix("allow daemon embedding to finish or run `kin embed`");
@@ -2531,10 +2555,15 @@ mod tests {
     #[cfg(feature = "vector")]
     #[test]
     fn semantic_query_readiness_reports_daemon_graph_backlog_and_failure() {
+        // A store that has finished a fill before: this backlog is coverage it
+        // already held and no longer has, so it keeps the authority gate. The
+        // same counters on a store still working through its first pass are
+        // covered by `a_first_fill_in_progress_does_not_block_readiness`.
         let pending = crate::commands::resources::EmbedRuntimeState {
             embeddings_indexed: 40,
             embeddings_total: 41,
             embeddings_pending: 1,
+            embedding_coverage_ever_complete: true,
             ..Default::default()
         };
         let stale = semantic_query_health_from_runtime("http://daemon", &pending);
@@ -2596,11 +2625,113 @@ mod tests {
         assert!(!settled.detail.contains("graph.kvec"));
     }
 
+    /// The scenario that refused v0.5.7's promotion on all five platforms: a
+    /// correct fresh install whose daemon is part-way through its first
+    /// embedding pass when health runs. Nothing is wrong with it, and the whole
+    /// install reported unhealthy.
+    ///
+    /// The falsification is the point of the second half. Pending only means
+    /// something if the identical call, on the identical fixture, goes back to
+    /// blocking the moment the runtime says coverage was lost rather than never
+    /// yet earned.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_first_fill_in_progress_does_not_block_readiness() {
+        let mid_first_fill = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 12,
+            embeddings_total: 41,
+            embeddings_pending: 29,
+            ..Default::default()
+        };
+
+        let semantic = semantic_query_health_from_runtime("http://daemon", &mid_first_fill);
+        assert!(
+            matches!(semantic.status, HealthStatus::Pending),
+            "a first fill in progress is expected first-run work, not a failure: {:?}",
+            semantic.status
+        );
+        assert!(
+            semantic
+                .detail
+                .contains("12/41 embeddings indexed, 29 pending")
+                && semantic
+                    .detail
+                    .contains("first embedding pass still filling"),
+            "the pending state must show its progress and name itself: {}",
+            semantic.detail
+        );
+        assert!(semantic.manual_fix.is_some());
+
+        let report = assemble_health_report("test".to_string(), vec![semantic]);
+        assert!(
+            report.healthy,
+            "a fresh install mid-first-fill must not report the whole install unhealthy"
+        );
+        assert_eq!(
+            report.summary().attention,
+            1,
+            "the fill is still work in progress, so it is attention rather than not-applicable"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["healthy"], true);
+        assert_eq!(json["checks"][0]["status"], "pending");
+
+        // Falsification: same call, same fixture, discard reason set. If this
+        // does not flip to blocking, the pending state is separating nothing.
+        let discarded = crate::commands::resources::EmbedRuntimeState {
+            vector_index_discarded: Some(
+                "the persisted vector index at .kin/kindb/graph.kvec could not be read".to_string(),
+            ),
+            ..mid_first_fill.clone()
+        };
+        let after_discard = semantic_query_health_from_runtime("http://daemon", &discarded);
+        assert!(
+            matches!(after_discard.status, HealthStatus::Stale),
+            "a discarded index is still the announced blocking state: {:?}",
+            after_discard.status
+        );
+        assert!(
+            !assemble_health_report("test".to_string(), vec![after_discard]).healthy,
+            "a rebuild after a discard must still block readiness"
+        );
+
+        // The other blocking direction: coverage this store already held once
+        // and no longer has, with nothing discarded at open.
+        let regressed = crate::commands::resources::EmbedRuntimeState {
+            embedding_coverage_ever_complete: true,
+            ..mid_first_fill.clone()
+        };
+        let after_regression = semantic_query_health_from_runtime("http://daemon", &regressed);
+        assert!(
+            matches!(after_regression.status, HealthStatus::Stale),
+            "a store that was complete and is not now has lost ground: {:?}",
+            after_regression.status
+        );
+        assert!(!assemble_health_report("test".to_string(), vec![after_regression]).healthy);
+
+        // A wedged worker fails outright whether or not the fill ever finished.
+        let wedged = crate::commands::resources::EmbedRuntimeState {
+            embed_worker_failed: true,
+            ..mid_first_fill
+        };
+        let after_wedge = semantic_query_health_from_runtime("http://daemon", &wedged);
+        assert!(
+            matches!(after_wedge.status, HealthStatus::Missing),
+            "a failed embedding worker is a failure at any point in a store's life: {:?}",
+            after_wedge.status
+        );
+        assert!(!assemble_health_report("test".to_string(), vec![after_wedge]).healthy);
+    }
+
     #[test]
     fn health_status_serializes_to_snake_case() {
         assert_eq!(
             serde_json::to_string(&HealthStatus::Healthy).unwrap(),
             "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HealthStatus::Pending).unwrap(),
+            "\"pending\""
         );
         assert_eq!(
             serde_json::to_string(&HealthStatus::Missing).unwrap(),
