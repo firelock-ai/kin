@@ -1730,11 +1730,17 @@ pub async fn run_loop(
         // only backlog left is a retry lane serving out its ladder, yielding would
         // return immediately into another complete exact-tree admission for a path
         // that is not eligible yet, which is the spin that burned a core for hours.
-        // Falling through instead lands on the poll sleep at the top of the next
-        // tick, so a permanently unstable path costs one poll interval rather than
-        // one core.
+        // That case waits the poll interval instead: the same cadence the loop uses
+        // when it has nothing to do, short enough that a fresh notification for any
+        // other path is still picked up promptly, and interruptible so shutdown does
+        // not wait on it.
         if !pending_events.is_empty() {
             tokio::task::yield_now().await;
+        } else if !retry_lane.is_empty() {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = cancel.changed() => {}
+            }
         }
     }
 
