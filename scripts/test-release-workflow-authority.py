@@ -1087,6 +1087,12 @@ UNIX_REQUIRED_VALIDATOR_CHECKS = {
 UNIX_VALIDATOR_CHECKS = {
     **UNIX_REQUIRED_VALIDATOR_CHECKS,
     "semantic_query_readiness": "stale",
+    # Carried for the same reason the Windows fixture carries it: the real
+    # report has it, the pre-embed tolerance reads every check rather than only
+    # the named ones, and a fixture that omits it cannot fail the way the real
+    # leg does. A fresh install has selected no profile and fetched no reranker
+    # model, which is a first-run state and reports unsupported.
+    "retrieval_profile": "unsupported",
 }
 
 
@@ -1096,8 +1102,12 @@ def unix_node_validator_fixture() -> tuple[
     """Build a complete valid Unix release-byte proof fixture."""
 
     pre_embed_report = validator_health_report(UNIX_VALIDATOR_CHECKS, healthy=False)
+    # The post-embed capture reads the aggregate rather than every check, and
+    # `unsupported` must not move it. Carrying the check here is what makes that
+    # a tested claim instead of an assumed one.
     embedded_report = validator_health_report(
-        {"semantic_query_readiness": "healthy"}, healthy=True
+        {"semantic_query_readiness": "healthy", "retrieval_profile": "unsupported"},
+        healthy=True,
     )
     fallback_report = validator_health_report(
         {"mcp_client_claude": "healthy"}, healthy=True
@@ -1793,6 +1803,15 @@ def assert_unix_node_validator_behavior(step: str) -> None:
                 f"{report_path} required {check_id}={wrong}",
                 fixture_with_check_status(proof, report_path, check_id, wrong),
             )
+        # The pre-embed tolerance accepts an aggregate held false by pending
+        # embeddings only while every OTHER check is healthy or unsupported, so
+        # a genuinely degraded retrieval profile still closes it. That is what
+        # refused v0.5.7 on this leg, and it is why the accepted `unsupported`
+        # above is a real answer rather than a hole in the fixture.
+        reject(
+            f"{report_path} degraded retrieval profile",
+            fixture_with_check_status(proof, report_path, "retrieval_profile", "stale"),
+        )
         reject(
             f"{report_path} contradictory duplicate check",
             fixture_with_duplicate_check(
