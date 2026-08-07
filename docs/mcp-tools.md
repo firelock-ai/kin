@@ -20,8 +20,7 @@ the **AI agents** intent. It writes Kin's MCP server entry into every detected c
 adds a Kin-first discovery reminder to your agent instruction files. `kin setup status`
 then verifies each client config.
 
-The wizard writes this entry (and `KIN_MCP_TOOL_PROFILE=agent-default` is what selects the
-small curated surface below instead of the full internal one):
+The wizard writes this entry, stating the profile explicitly:
 
 ```json
 {
@@ -43,6 +42,27 @@ see the quickstart's advanced configuration for its exact JSON and repository-bo
 To wire a client up by hand, or to use the canonical npm wrapper (`@kinlab/kin`, which
 can run `kin mcp start` with the same `agent-default` profile), see
 [Advanced configuration](quickstart.md#9-advanced-configuration) in the quickstart.
+
+### Tool profiles
+
+`kin mcp start` serves the curated `agent-default` profile whether or not anyone
+configures it, and prints the profile and its tool count on stderr at startup. A
+hand-written `.mcp.json`, a container entrypoint, or a CI harness therefore gets the same
+small surface the wizard writes, instead of every tool the server defines and roughly
+twelve thousand extra tokens of schemas in every session.
+
+Select a different surface with `KIN_MCP_TOOL_PROFILE`, or with `--tool-profile` on the
+command line (the flag wins):
+
+| profile | surface |
+| -- | -- |
+| `agent-default` | the curated agent belt — **the default** |
+| `full` | every tool this reference documents |
+| `benchmark` | the retrieval belt the benchmark arm drives |
+| `context-bench` | read-only graph-native retrieval, no write-side session or transaction tools |
+
+A value that is not one of these is not silently treated as "serve everything": the server
+falls back to `agent-default` and says on stderr what it was asked for and what it served.
 
 ---
 

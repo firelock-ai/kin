@@ -4050,6 +4050,94 @@ fn resolve_idle_timeout_env(
     Some(caller_override.unwrap_or_else(default_idle_timeout_secs))
 }
 
+/// The idle window a caller must carry to a daemon it did not start, in
+/// seconds, or `None` when there is nothing to carry.
+///
+/// Injecting an idle timeout only works on the path that spawns the daemon.
+/// Every attach path — a supervisor route, a live repo-local endpoint — hands
+/// back a process whose window was fixed by whoever started it, which on a
+/// developer machine is almost always an ordinary CLI command taking the short
+/// CLI default. An MCP session that attached there inherited 60 seconds and had
+/// the daemon expire underneath it between tool calls (FIR-1886). A caller with
+/// a stated need has to say so to the daemon it actually got.
+///
+/// `None` means the caller stated no need of its own and is content with
+/// whatever the daemon is running, which is the pre-existing behavior for every
+/// ordinary CLI command. A user's explicit `KIN_DAEMON_IDLE_TIMEOUT_SECS` is
+/// their decision about this host and is never overridden from here.
+fn idle_timeout_to_carry(caller_override: Option<&str>, user_env_is_set: bool) -> Option<u64> {
+    if user_env_is_set {
+        return None;
+    }
+    caller_override?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|secs| *secs > 0)
+}
+
+/// Tell a daemon this process did not start what idle window its session needs.
+///
+/// Best-effort by construction: an older daemon has no such route, and a
+/// refusal here must never turn a working attach into a failed one. What it
+/// must not do is fail silently, so a daemon that declines to grow its window
+/// says so on stderr rather than leaving the caller believing its stated need
+/// was honoured.
+async fn carry_idle_timeout_to_existing_daemon(
+    base_url: &str,
+    caller_override: Option<&'static str>,
+) {
+    let user_timeout_set = std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some();
+    let Some(at_least_secs) = idle_timeout_to_carry(caller_override, user_timeout_set) else {
+        return;
+    };
+    let mut request = daemon_health_client()
+        .post(format!("{}/idle-timeout", base_url.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "at_least_secs": at_least_secs,
+            "client": "kin mcp",
+        }));
+    if let Some(token) = resolve_daemon_auth_token() {
+        request = request.bearer_auth(token);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            let effective = response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| body.get("effective_secs")?.as_u64());
+            match effective {
+                Some(effective) if effective >= at_least_secs => {
+                    info!(
+                        requested_secs = at_least_secs,
+                        effective_secs = effective,
+                        "attached daemon idle window covers this session"
+                    );
+                }
+                Some(effective) => eprintln!(
+                    "Kin: this session needs the repo daemon to survive {at_least_secs}s idle, \
+                     but its window is {effective}s; it may exit mid-session. Set \
+                     KIN_DAEMON_IDLE_TIMEOUT_SECS={at_least_secs} and restart the daemon."
+                ),
+                None => eprintln!(
+                    "Kin: the repo daemon accepted a {at_least_secs}s idle window request but \
+                     reported no effective window; it may exit mid-session."
+                ),
+            }
+        }
+        Ok(response) => eprintln!(
+            "Kin: the repo daemon refused a {at_least_secs}s idle window request ({}); it may \
+             exit mid-session. Set KIN_DAEMON_IDLE_TIMEOUT_SECS={at_least_secs} and restart it.",
+            response.status()
+        ),
+        Err(error) => eprintln!(
+            "Kin: could not ask the repo daemon for a {at_least_secs}s idle window ({error}); it \
+             may exit mid-session."
+        ),
+    }
+}
+
 fn existing_daemon_ready_timeout_secs() -> u64 {
     std::env::var("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS")
         .ok()
@@ -6627,6 +6715,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         .await
         .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
+        carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
         return Ok(base_url);
     }
 
@@ -6635,6 +6724,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
                 .await
                 .map_err(AutoStartError::spawn)?;
+            carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -6647,6 +6737,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         .await
         .map_err(AutoStartError::spawn)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
+        carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
         return Ok(base_url);
     }
     match wait_for_existing_daemon(kin_root).await {
@@ -6654,6 +6745,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
                 .await
                 .map_err(AutoStartError::spawn)?;
+            carry_idle_timeout_to_existing_daemon(&base_url, idle_timeout_override).await;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -10543,5 +10635,47 @@ mod tests {
         // Regression guard: the MCP path must inject 1800s (30 min), not the
         // 60-second CLI default.
         assert_eq!(MCP_IDLE_TIMEOUT_SECS, "1800");
+    }
+
+    // ── idle-timeout carried to a daemon this process did not start ────────
+
+    /// FIR-1886, both sides. Injecting at spawn only helps the caller that
+    /// spawns, and an MCP session usually attaches to a daemon an ordinary CLI
+    /// command already started at the 60-second default. A caller with a stated
+    /// need must carry it; a caller with none must leave the daemon alone.
+    #[test]
+    fn an_mcp_session_carries_its_window_to_a_daemon_it_did_not_start() {
+        assert_eq!(
+            idle_timeout_to_carry(Some(MCP_IDLE_TIMEOUT_SECS), false),
+            Some(1800),
+            "an MCP attach must state its 1800s need to the daemon it got"
+        );
+        assert_eq!(
+            idle_timeout_to_carry(None, false),
+            None,
+            "an ordinary CLI attach states no need and must not touch the window"
+        );
+    }
+
+    /// A user who set `KIN_DAEMON_IDLE_TIMEOUT_SECS` decided this host's policy.
+    /// The attach path must respect that exactly as the spawn path does, or the
+    /// two would disagree about whose value wins.
+    #[test]
+    fn an_explicit_user_window_is_never_overridden_from_the_attach_path() {
+        assert_eq!(
+            idle_timeout_to_carry(Some(MCP_IDLE_TIMEOUT_SECS), true),
+            None
+        );
+        assert_eq!(idle_timeout_to_carry(None, true), None);
+    }
+
+    /// Nothing usable is carried rather than carried as a zero, which the
+    /// daemon would have to reject as "a floor of forever".
+    #[test]
+    fn an_unusable_window_value_is_not_carried_at_all() {
+        assert_eq!(idle_timeout_to_carry(Some("0"), false), None);
+        assert_eq!(idle_timeout_to_carry(Some(""), false), None);
+        assert_eq!(idle_timeout_to_carry(Some("later"), false), None);
+        assert_eq!(idle_timeout_to_carry(Some(" 900 "), false), Some(900));
     }
 }

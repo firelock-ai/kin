@@ -850,7 +850,6 @@ async fn run_idle_monitor(
             }
         }
     };
-    let check_interval = idle_check_interval(idle_timeout);
     // Start the idle window from when monitoring begins, not from process
     // construction. `last_activity_ms` is seeded to 0, so without this the
     // idle clock counts from `started_at` — which includes snapshot load and
@@ -863,6 +862,29 @@ async fn run_idle_monitor(
     );
 
     loop {
+        // Re-read the window every tick rather than closing over the startup
+        // value. An attached client whose session outlasts the window this
+        // daemon was spawned with can raise it (see
+        // `DaemonState::raise_idle_timeout`), and a monitor holding the old
+        // value would shut down underneath the client that just said so.
+        let Some(idle_timeout) = state.idle_timeout() else {
+            // Only reachable if the window were switched off mid-run, which
+            // raising cannot do. Treat it as "never idles out" rather than as
+            // "idle out now".
+            tokio::select! {
+                _ = tokio::time::sleep(CONTROL_PLANE_CHECK_INTERVAL) => {}
+                _ = cancel_rx.changed() => return,
+            }
+            if *cancel_rx.borrow() {
+                return;
+            }
+            if control_plane_demands_shutdown(&state, bound_port, *cancel_rx.borrow()) {
+                let _ = cancel_tx.send(true);
+                return;
+            }
+            continue;
+        };
+        let check_interval = idle_check_interval(idle_timeout);
         tokio::select! {
             _ = tokio::time::sleep(check_interval) => {}
             _ = cancel_rx.changed() => return,
@@ -875,6 +897,9 @@ async fn run_idle_monitor(
             let _ = cancel_tx.send(true);
             return;
         }
+        // Re-read once more before deciding: a raise that landed during the
+        // sleep above must be honoured by this tick, not the next one.
+        let idle_timeout = state.idle_timeout().unwrap_or(idle_timeout);
         let control_plane = classify_control_plane(&state);
         if ready_for_idle_shutdown(&state, idle_timeout, control_plane) {
             if state.is_dirty() {
@@ -1096,6 +1121,10 @@ pub async fn run_with_authority(
 
     info!(port = bound_port, "starting kin daemon");
 
+    // Publish the startup window into shared state before the monitor reads
+    // it, so an attached client can see and grow the window this daemon is
+    // actually running with rather than the one its spawner happened to choose.
+    state.install_idle_timeout(config.idle_timeout);
     let idle_state = Arc::clone(&state);
     let idle_timeout = config.idle_timeout;
     let idle_cancel_tx = cancel_tx.clone();
@@ -2803,6 +2832,136 @@ mod tests {
             super::ready_for_idle_shutdown(&state, expired, ControlPlane::Ours),
             "a genuinely idle initialized daemon must still idle out"
         );
+    }
+
+    /// FIR-1886 at the daemon: an attached client whose session outlasts the
+    /// window this daemon was spawned with grows it, and the grown window is
+    /// what the shutdown decision then reads.
+    ///
+    /// The two-sided part is the second half. Growing the window must not stop
+    /// the daemon idling out; it must only move when.
+    #[tokio::test]
+    async fn a_raised_idle_window_is_what_the_shutdown_decision_reads() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+        state.is_initialized.store(true, Ordering::Relaxed);
+
+        // Spawned the way a CLI autostart spawns one.
+        state.install_idle_timeout(Some(Duration::from_secs(60)));
+        assert_eq!(state.idle_timeout(), Some(Duration::from_secs(60)));
+
+        let raise = state.raise_idle_timeout(Duration::from_secs(1800));
+        assert_eq!(raise.effective, Some(Duration::from_secs(1800)));
+        assert_eq!(raise.raised_from, Some(Duration::from_secs(60)));
+        assert_eq!(
+            state.idle_timeout(),
+            Some(Duration::from_secs(1800)),
+            "the monitor reads the window through this accessor, so the raise must land here"
+        );
+
+        // The daemon is idle by every other measure, and the grown window is
+        // the only thing holding it open.
+        let window = state.idle_timeout().expect("a window is installed");
+        assert!(
+            !super::ready_for_idle_shutdown(&state, window, ControlPlane::Ours),
+            "a session that just stated a 1800s need must not be cut off immediately"
+        );
+        assert!(
+            super::ready_for_idle_shutdown(&state, Duration::ZERO, ControlPlane::Ours),
+            "growing the window must move when the daemon idles out, never whether"
+        );
+
+        // A second client that fits inside the window changes nothing.
+        let redundant = state.raise_idle_timeout(Duration::from_secs(300));
+        assert!(!redundant.raised());
+        assert_eq!(state.idle_timeout(), Some(Duration::from_secs(1800)));
+    }
+
+    /// The monitor reads the live window, not the one it was handed at start.
+    ///
+    /// This is the half of FIR-1886 that the state round-trip above cannot
+    /// reach: a monitor that closed over its startup value would keep counting
+    /// against 60 seconds however loudly an attached session said 1800, and the
+    /// state accessor would look perfectly correct while the daemon still died.
+    #[tokio::test]
+    async fn the_idle_monitor_counts_against_the_live_window_not_its_startup_one() {
+        async fn open_idle_state() -> (tempfile::TempDir, Arc<DaemonState>) {
+            let repo = tempfile::tempdir().unwrap();
+            let initialized = kin_core::init(repo.path()).unwrap();
+            let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+            state.is_initialized.store(true, Ordering::Relaxed);
+            (repo, state)
+        }
+        let short = Duration::from_millis(200);
+
+        // Control. Without it the second half could pass because the monitor
+        // never reaches a shutdown decision at all, which is exactly the shape
+        // of guard that cannot fail.
+        let (_expiring_repo, expiring) = open_idle_state().await;
+        expiring.install_idle_timeout(Some(short));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&expiring),
+            Some(short),
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(30), monitor)
+            .await
+            .expect("an idle daemon on a 200ms window must reach idle shutdown")
+            .expect("the idle monitor must not panic");
+        assert!(
+            *cancel_tx.borrow(),
+            "the control monitor must have requested shutdown"
+        );
+
+        // The same startup window, raised by an attached client before the
+        // monitor's first decision. Counting against the startup value would
+        // shut this daemon down inside the wait below.
+        let (_raised_repo, raised) = open_idle_state().await;
+        raised.install_idle_timeout(Some(short));
+        raised.raise_idle_timeout(Duration::from_secs(3600));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(super::run_idle_monitor(
+            Arc::clone(&raised),
+            Some(short),
+            4219,
+            cancel_tx.clone(),
+            cancel_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !*cancel_tx.borrow(),
+            "a session that raised the window to 3600s must not be shut down after 1.5s"
+        );
+        assert!(
+            !monitor.is_finished(),
+            "the monitor must still be watching, not have exited"
+        );
+        cancel_tx
+            .send(true)
+            .expect("the monitor still holds a receiver");
+        monitor.await.expect("the idle monitor must not panic");
+    }
+
+    /// A daemon configured never to idle out stays that way. Nothing an
+    /// attached client says may give it a finite lifetime it did not have.
+    #[tokio::test]
+    async fn a_daemon_that_never_idles_out_cannot_be_given_a_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        state.install_idle_timeout(None);
+        assert_eq!(state.idle_timeout(), None);
+
+        let raise = state.raise_idle_timeout(Duration::from_secs(1800));
+        assert_eq!(raise.effective, None);
+        assert_eq!(raise.effective_secs(), 0);
+        assert!(!raise.raised());
+        assert_eq!(state.idle_timeout(), None);
     }
 
     #[tokio::test]
