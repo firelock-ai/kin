@@ -410,6 +410,68 @@ fn should_flush_now(
     since_save >= periodic_flush || since_mutation >= idle_flush
 }
 
+/// Operator opt-out for the background embedding pass the daemon starts on its
+/// own after the first reconciliation cycle.
+pub(crate) const AUTO_EMBED_ENV: &str = "KIN_DAEMON_AUTO_EMBED";
+
+/// Whether the daemon may queue and drain the embedding backlog without being
+/// asked. Default ON: unset, or any value other than the documented falsy set,
+/// keeps today's behavior exactly. A falsy value defers the pass until an
+/// explicit embed request, which is the opt-out for an operator who does not
+/// want a bulk accelerator pass starting because a store was opened.
+///
+/// The falsy set matches `KIN_DAEMON_REQUIRE_TOKEN`, the sibling boolean knob,
+/// so one spelling works across the daemon's env surface.
+pub(crate) fn auto_embed_enabled() -> bool {
+    std::env::var(AUTO_EMBED_ENV)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// Build the background embedding backlog and announce it, or defer the whole
+/// pass because an operator opted out. Returns whether the backlog was queued.
+///
+/// Announcing matters because nothing the user ran asks for this work. Opening
+/// a store whose index has not caught up is enough to start it, so the pass is
+/// a property of the store's state rather than of the command issued, and on an
+/// accelerator it is a bulk run writing a sidecar nobody requested. A worker
+/// that starts silently leaves an operator inferring it from machine load.
+///
+/// Deferring pauses rather than disables. The queue is left unbuilt and the
+/// worker stood down, so an explicit embed request still runs the pass on
+/// demand (`/embed` resumes the worker). Pausing is also what keeps a deferred
+/// daemon eligible for idle shutdown: a backlog no worker will drain must not
+/// read as work in flight.
+fn start_or_defer_background_embed(state: &DaemonState) -> bool {
+    if !auto_embed_enabled() {
+        state.pause_background_embed();
+        warn!(
+            trigger = AUTO_EMBED_ENV,
+            "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
+        );
+        return false;
+    }
+    // Re-queue every object the persisted index still lacks a vector for, so the
+    // worker resumes after a restart drained the in-memory queue (the queue is
+    // not persisted; coverage is, via graph-vs-index truth). Idempotent (HashSet
+    // queues) — a fresh start that already enqueued via reconcile is unaffected.
+    #[cfg(feature = "embeddings")]
+    state.graph.queue_missing_for_embedding();
+    state.graph.queue_missing_artifacts_for_embedding();
+    info!(
+        queued_entities = state.graph.pending_embeddings(),
+        queued_artifacts = state.graph.pending_artifact_embeddings(),
+        opt_out = AUTO_EMBED_ENV,
+        "background embedding started: generating vectors for everything the index is missing"
+    );
+    true
+}
+
 /// Grace period the escalation watchdog waits after shutdown is signalled before
 /// force-exiting. Configurable via `KIN_DAEMON_SHUTDOWN_GRACE_SECS` (0 escalates
 /// immediately once the signal fires — used by tests).
@@ -1508,14 +1570,7 @@ pub async fn run_with_authority(
             }
         }
         info!("embedding worker started");
-        // Re-queue every object the persisted index still lacks a vector
-        // for, so the worker resumes after a restart drained the in-memory queue
-        // (the queue is not persisted; coverage is, via graph-vs-index truth).
-        // Idempotent (HashSet queues) — a fresh start that already enqueued via
-        // reconcile is unaffected.
-        #[cfg(feature = "embeddings")]
-        embed_state.graph.queue_missing_for_embedding();
-        embed_state.graph.queue_missing_artifacts_for_embedding();
+        start_or_defer_background_embed(&embed_state);
         let mut consecutive_panics: u32 = 0;
         const MAX_CONSECUTIVE_PANICS: u32 = 3;
         // Recovery + backoff state for vector-index errors (e.g. a stale on-disk
@@ -2836,6 +2891,75 @@ mod tests {
         assert!(
             super::ready_for_idle_shutdown(&state, expired, ControlPlane::EndpointLost),
             "an unreachable daemon with no work left must still idle out"
+        );
+    }
+
+    // ── Background auto-embed: announced, and opt-out-able ────────────────
+    //
+    // The pass starts because a store was opened, not because anyone asked for
+    // it, so it needs both a line that says it started and a way to say no.
+    // The default is unchanged: auto-embed stays on.
+
+    /// Read `auto_embed_enabled` with `KIN_DAEMON_AUTO_EMBED` held at `value`
+    /// (`None` removes it) for the duration of the read. The guard restores what
+    /// the process had and serializes against every other env-mutating test.
+    fn auto_embed_enabled_with(value: Option<&str>) -> bool {
+        let _env = match value {
+            Some(value) => kin_core::test_env::EnvVarGuard::set(super::AUTO_EMBED_ENV, value),
+            None => kin_core::test_env::EnvVarGuard::unset(super::AUTO_EMBED_ENV),
+        };
+        super::auto_embed_enabled()
+    }
+
+    #[test]
+    fn auto_embed_is_on_unless_an_operator_spells_out_otherwise() {
+        // Absent is the shipped default and stays on.
+        assert!(auto_embed_enabled_with(None));
+        assert!(auto_embed_enabled_with(Some("1")));
+        assert!(auto_embed_enabled_with(Some("true")));
+        // The falsy set matches KIN_DAEMON_REQUIRE_TOKEN, whitespace and case
+        // included, so one spelling works across the daemon's env surface.
+        assert!(!auto_embed_enabled_with(Some("0")));
+        assert!(!auto_embed_enabled_with(Some("false")));
+        assert!(!auto_embed_enabled_with(Some("no")));
+        assert!(!auto_embed_enabled_with(Some("off")));
+        assert!(!auto_embed_enabled_with(Some("  OFF  ")));
+        // An unparseable value is not silently read as an opt-out: the default
+        // is on, and a typo must not disable embedding behind the operator.
+        assert!(auto_embed_enabled_with(Some("maybe")));
+        assert!(auto_embed_enabled_with(Some("")));
+    }
+
+    #[tokio::test]
+    async fn background_embed_queues_by_default_and_defers_on_opt_out() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = DaemonState::open(initialized.layout).unwrap();
+
+        {
+            let _env = kin_core::test_env::EnvVarGuard::unset(super::AUTO_EMBED_ENV);
+            assert!(
+                super::start_or_defer_background_embed(&state),
+                "the default must still build the backlog and start the pass"
+            );
+        }
+        assert!(
+            !state.background_embed_paused(),
+            "the default must leave the worker running"
+        );
+
+        state.resume_background_embed();
+        {
+            let _env = kin_core::test_env::EnvVarGuard::set(super::AUTO_EMBED_ENV, "0");
+            assert!(
+                !super::start_or_defer_background_embed(&state),
+                "an opt-out must defer the pass rather than queue it"
+            );
+        }
+        assert!(
+            state.background_embed_paused(),
+            "a deferred pass must stand the worker down, so a daemon holding no \
+             drainable backlog can still idle out"
         );
     }
 
