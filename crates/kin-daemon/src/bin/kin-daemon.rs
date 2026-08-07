@@ -554,14 +554,17 @@ async fn async_main() -> i32 {
         .map_err(|error| error.to_string())
     })
     .await;
+    let opened = opened
+        .map_err(|error| format!("daemon startup task failed: {error}"))
+        .and_then(|inner| {
+            inner.map_err(|error| {
+                format!("failed to acquire daemon authority or open state: {error}")
+            })
+        });
     let ((state, api_listener, bound_port, ready_tx), authority) = match opened {
-        Ok(Ok(opened)) => opened,
-        Ok(Err(error)) => {
-            eprintln!("kin-daemon: failed to acquire daemon authority or open state: {error}");
-            process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("kin-daemon: daemon startup task failed: {error}");
+        Ok(opened) => opened,
+        Err(message) => {
+            eprintln!("kin-daemon: {message}");
             process::exit(1);
         }
     };
