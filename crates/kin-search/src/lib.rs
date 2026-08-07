@@ -493,6 +493,38 @@ fn archive_corrupt_index(storage_path: &Path) -> Option<PathBuf> {
 /// When `archive` is true, moves the corrupt file aside first so the bytes
 /// are preserved as evidence and a clean reopen is possible. Pass `false` when
 /// opening in read-only mode — the caller must not rename files on disk.
+/// Test-only record of where segment decoding actually ran.
+///
+/// Segment loading is dispatched through rayon, so every decode executes on a
+/// pool worker. A caller that is not itself a worker — an ordinary test thread —
+/// therefore never appears here, which is what distinguishes a fanned-out load
+/// from a sequential one that would run every decode inline.
+#[cfg(test)]
+pub(crate) mod segment_decode_observer {
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    /// One entry per decoded segment: the thread it ran on, and whether that
+    /// thread was a rayon pool worker.
+    static OBSERVED: Mutex<Vec<(ThreadId, bool)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record() {
+        let entry = (
+            std::thread::current().id(),
+            rayon::current_thread_index().is_some(),
+        );
+        OBSERVED
+            .lock()
+            .expect("segment decode observer")
+            .push(entry);
+    }
+
+    /// Drain what has been observed so far.
+    pub(crate) fn take() -> Vec<(ThreadId, bool)> {
+        std::mem::take(&mut *OBSERVED.lock().expect("segment decode observer"))
+    }
+}
+
 fn corrupt_index_error(storage_path: &Path, reason: String, archive: bool) -> SearchError {
     let archived = if archive {
         archive_corrupt_index(storage_path)
@@ -2049,25 +2081,47 @@ where
         let mut doc_count = 0usize;
         let mut total_doc_length = 0usize;
 
-        for (s, gen_opt) in manifest.segment_gens.iter().enumerate() {
-            let Some(gen) = gen_opt else {
-                continue;
+        // Read and decode every present segment in parallel. Each segment is a
+        // distinct file — `segment_path` keys the name by segment index and gen
+        // — and decoding is pure, so the reads and the deserializes are
+        // independent. Only the merge below touches shared state.
+        //
+        // Failures come back as plain reasons rather than typed errors on
+        // purpose. `corrupt_index_error` archives the index as a side effect, so
+        // building one per failing segment here would archive several times, and
+        // would archive for segments the sequential loader never reached. The
+        // ordered scan below turns the first bad segment in index order into
+        // exactly one archived error, which is what the sequential loader did.
+        let decoded: Vec<Result<Option<SegmentData<Id>>, String>> = manifest
+            .segment_gens
+            .par_iter()
+            .enumerate()
+            .map(|(s, gen_opt)| {
+                let Some(gen) = gen_opt else {
+                    return Ok(None);
+                };
+                #[cfg(test)]
+                segment_decode_observer::record();
+                let seg_file = segment_path(storage_path, s, *gen);
+                let seg_bytes = std::fs::read(&seg_file)
+                    .map_err(|err| format!("missing/unreadable segment {s} gen {gen}: {err}"))?;
+                let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes)
+                    .map_err(|err| format!("undecodable segment {s} gen {gen}: {err}"))?;
+                Ok(Some(seg_data))
+            })
+            .collect();
+
+        // Merge in segment order. Rayon's indexed collect preserves position, so
+        // this sees the same segments in the same order the sequential loader
+        // did, and reports the same first failure.
+        for (s, decoded_segment) in decoded.into_iter().enumerate() {
+            let seg_data = match decoded_segment {
+                Ok(Some(seg_data)) => seg_data,
+                Ok(None) => continue,
+                Err(reason) => {
+                    return Err(corrupt_index_error(&m_path, reason, archive_corrupt));
+                }
             };
-            let seg_file = segment_path(storage_path, s, *gen);
-            let seg_bytes = std::fs::read(&seg_file).map_err(|err| {
-                corrupt_index_error(
-                    &m_path,
-                    format!("missing/unreadable segment {s} gen {gen}: {err}"),
-                    archive_corrupt,
-                )
-            })?;
-            let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes).map_err(|err| {
-                corrupt_index_error(
-                    &m_path,
-                    format!("undecodable segment {s} gen {gen}: {err}"),
-                    archive_corrupt,
-                )
-            })?;
 
             // Merge this segment's postings. Doc sets are disjoint across
             // segments, so this is a pure union; a collision means the on-disk
@@ -3290,6 +3344,89 @@ mod tests {
         // Self-heals: the next reopen is clean (empty, ready to rebuild).
         let healed = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         assert_eq!(healed.live_document_count(), 0);
+    }
+
+    /// Segment decoding fans out across the rayon pool rather than running
+    /// inline on the caller.
+    ///
+    /// The assertion is a property rather than a thread count, because a work
+    /// stealing pool gives no guarantee about how many workers pick up a given
+    /// batch — asserting "more than one thread" would be flaky on a quiet or
+    /// single-core machine. What IS guaranteed is where the work runs: rayon
+    /// executes `par_iter` closures on pool workers, so a sequential loader
+    /// running inline on this test's thread fails both assertions below.
+    #[test]
+    fn segment_decode_runs_on_the_rayon_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let _idx = build_into(&dir, true);
+
+        let _ = segment_decode_observer::take();
+        let reloaded = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert!(reloaded.live_document_count() > 0, "fixture must load");
+        let observed = segment_decode_observer::take();
+
+        assert!(
+            !observed.is_empty(),
+            "reloading a segmented index must decode at least one segment"
+        );
+        // Properties that hold per decode, so a concurrently running test's own
+        // load cannot make this pass or fail spuriously.
+        assert!(
+            observed.iter().all(|&(_, on_pool)| on_pool),
+            "every segment decode must run on a rayon worker, saw {observed:?}"
+        );
+        let caller = std::thread::current().id();
+        assert!(
+            observed.iter().all(|&(thread, _)| thread != caller),
+            "a fanned-out load must not decode inline on the caller thread"
+        );
+    }
+
+    /// Parallel decoding must not change which corruption is reported, or how
+    /// many times the index is archived.
+    ///
+    /// The sequential loader stopped at the first bad segment in index order and
+    /// archived once. Decoding concurrently means several segments can fail at
+    /// the same time, so the failure is only turned into a typed error during the
+    /// ordered merge — otherwise the reported segment would be whichever thread
+    /// lost the race, and the index could be archived once per bad segment.
+    #[test]
+    fn multiple_corrupt_segments_report_the_first_in_index_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let _idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+
+        let gens = read_manifest_gens(&storage);
+        let present: Vec<usize> = gens
+            .iter()
+            .enumerate()
+            .filter_map(|(s, gen)| gen.map(|_| s))
+            .collect();
+        assert!(
+            present.len() >= 2,
+            "fixture needs at least two present segments, got {present:?}"
+        );
+        // Corrupt every present segment, so a racing reporter would have many
+        // equally-available answers and only ordering can decide.
+        for &s in &present {
+            std::fs::remove_file(segment_path(&storage, s, gens[s].unwrap())).unwrap();
+        }
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        let SearchError::CorruptIndex { reason, .. } = &err else {
+            panic!("expected CorruptIndex, got {err:?}");
+        };
+        assert!(
+            reason.contains(&format!("segment {}", present[0])),
+            "must report the first bad segment in index order ({}), got {reason}",
+            present[0]
+        );
+        assert!(
+            !manifest_path(&storage).exists(),
+            "corrupt manifest must be archived off the canonical path"
+        );
     }
 
     /// A manifest referencing a segment file that no longer exists is corrupt.
