@@ -50,7 +50,7 @@ hex = "0.4"
 libc = { workspace = true }
 bincode = "1"
 rmp-serde = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 gix-ignore = "0.21"
 bstr = "1"
 memmap2 = "0.9"
