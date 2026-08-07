@@ -706,6 +706,7 @@ mod tests {
             sample_plan(Profile::Interactive),
             EmbedRuntimeState::default(),
             actual,
+            DaemonWorkState::default(),
             false,
         )
         .unwrap();
