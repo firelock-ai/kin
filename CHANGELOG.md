@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Copy a captured Git repository under one source authority envelope (#674)
 - Stop rebuilding the semantic universe by value on every commit of history (#676)
 - Stop a trace walk when the requester stops waiting for it (#678)
+- Drop the buzzword from the README hero and say what impact actually returns (#687)
 
 
 ## [0.5.6] - 2026-08-06
