@@ -6,10 +6,10 @@
 //! Kin's thesis is that the graph is the canonical substrate, so a receipt
 //! field that names admitted content has to be a function of that content. If
 //! two people admit the same commit of the same repository and get different
-//! change ids and a different history root, nothing downstream — cross-repo
-//! dedup, "is this the same tree?", a before/after equivalence check that can
-//! tell a content regression apart from run-to-run drift — can be answered by
-//! comparing hashes.
+//! change ids and a different history root, then nothing downstream can be
+//! answered by comparing hashes: not cross-repo dedup, not "is this the same
+//! tree?", not a before/after equivalence check that can tell a content
+//! regression apart from run-to-run drift.
 //!
 //! The two admissions here read byte-identical Git object stores: the fixture
 //! is built once and copied, so both runs see the same commit ids rather than
