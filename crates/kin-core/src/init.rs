@@ -147,6 +147,27 @@ impl PublishedRepository<'_> {
     }
 }
 
+/// One staging-store write session, scoped to the repository that opened it.
+///
+/// A save publishes the body under its content identity with the same
+/// validation and no-clobber rules a single
+/// [`PreparedRepositoryInit::save_source_blob`] applies. Durability arrives
+/// when the enclosing
+/// [`with_source_blob_batch`](PreparedRepositoryInit::with_source_blob_batch)
+/// returns, not per body.
+pub struct StagedSourceBlobBatch<'a> {
+    inner: &'a dyn kin_db::SourceBlobWriteBatch,
+}
+
+impl StagedSourceBlobBatch<'_> {
+    /// Stage exact bytes under their content identity.
+    pub fn save(&self, digest: Hash256, data: &[u8]) -> Result<()> {
+        self.inner
+            .save(*digest.as_bytes(), data)
+            .map_err(graph_error)
+    }
+}
+
 /// A complete `.kin` repository assembled outside the final namespace.
 ///
 /// The staging directory is private to this object and is removed on drop
@@ -223,6 +244,40 @@ impl PreparedRepositoryInit {
         self.authority()?
             .save_source_blob(digest, data)
             .map_err(graph_error)
+    }
+
+    /// Persist many immutable source bodies under one authority envelope.
+    ///
+    /// This is the bulk form of [`Self::save_source_blob`] and it stages
+    /// exactly the same bodies. It grants no authority either: a later
+    /// bootstrap transaction still has to reference every digest through
+    /// exact tree and history authority before publication. The bodies are
+    /// durable when this call returns, which is what lets a whole capture
+    /// copy run as one session and cross into bootstrap afterwards.
+    pub fn with_source_blob_batch(
+        &self,
+        operation: &mut dyn FnMut(&StagedSourceBlobBatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let authority = self.authority()?;
+        // The batch boundary speaks kin-db's error type. Carry the caller's
+        // own failure out beside it so a Git or manifest boundary error is
+        // reported as itself rather than as a storage error.
+        let mut interrupted: Option<KinError> = None;
+        let outcome = authority.with_source_blob_write_batch(&mut |inner| match operation(
+            &StagedSourceBlobBatch { inner },
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                interrupted = Some(error);
+                Err(kin_db::KinDbError::StorageError(
+                    "staged source ingest stopped before its batch completed".to_string(),
+                ))
+            }
+        });
+        if let Some(error) = interrupted {
+            return Err(error);
+        }
+        outcome.map_err(graph_error)
     }
 
     /// Read immutable source bytes back out of the unpublished staging store.
@@ -3040,6 +3095,68 @@ mod tests {
             .to_string()
             .contains("repository and workspace manifest identities must be distinct"));
         assert!(!staging_root.exists());
+    }
+
+    #[test]
+    fn staged_source_batch_stages_the_same_bodies_as_repeated_single_writes() {
+        let batched_dir = tempfile::tempdir().unwrap();
+        let (batched, _) = prepare_unborn(batched_dir.path(), "batched");
+        let single_dir = tempfile::tempdir().unwrap();
+        let (single, _) = prepare_unborn(single_dir.path(), "single");
+
+        let bodies: Vec<Vec<u8>> = (0..16)
+            .map(|index| format!("staged body {index}\n\0\u{feff}").into_bytes())
+            .collect();
+        let digests: Vec<Hash256> = bodies
+            .iter()
+            .map(|body| Hash256::from_bytes(Sha256::digest(body).into()))
+            .collect();
+
+        batched
+            .with_source_blob_batch(&mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .expect("one session stages every body");
+        for (digest, body) in digests.iter().zip(&bodies) {
+            single.save_source_blob(*digest, body).unwrap();
+        }
+
+        for (digest, body) in digests.iter().zip(&bodies) {
+            assert_eq!(
+                batched.load_source_blob(*digest).unwrap().as_ref(),
+                Some(body),
+                "a batched body must be readable at its content identity"
+            );
+            assert_eq!(
+                batched.load_source_blob(*digest).unwrap(),
+                single.load_source_blob(*digest).unwrap(),
+                "both paths must stage the same bytes at the same identity"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_source_batch_reports_the_callers_own_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let (prepared, _) = prepare_unborn(directory.path(), "interrupted");
+        let body = b"a body staged before the caller stops";
+        let digest = Hash256::from_bytes(Sha256::digest(body).into());
+
+        let error = prepared
+            .with_source_blob_batch(&mut |batch| {
+                batch.save(digest, body)?;
+                Err(KinError::Other("git capture boundary failed".to_string()))
+            })
+            .expect_err("a session that stops must not report success");
+        // The caller's own error survives the kin-db batch boundary instead of
+        // arriving as a storage error about a batch the caller never saw.
+        assert!(
+            matches!(&error, KinError::Other(message) if message == "git capture boundary failed"),
+            "{error}"
+        );
     }
 
     #[test]
