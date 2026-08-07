@@ -1623,21 +1623,16 @@ async fn check_semantic_query_readiness() -> HealthCheck {
     .with_platform_note("this platform ships the supported vector-free Kin runtime")
 }
 
-/// Semantic readiness when no daemon is running to ask.
-///
-/// This is where every repository sits until its first command needs a daemon,
-/// so it is an unread state rather than a failed one, and reporting it as a
-/// failure is what makes an install that did everything right end on a red
-/// summary. The authority gate is unchanged for every state that *can* be read:
-/// a reachable daemon whose graph coverage is incomplete or unreadable is still
-/// Stale, and Stale on this check still blocks readiness.
-#[cfg(feature = "vector")]
 /// Render the daemon's background-work disclosure as a health check.
 ///
 /// Split from its fetch so the reporting rule is testable without a daemon.
 /// Healthy is the answer whenever nothing was stopped, including while passes
 /// are working hard: this check reports faults, and the ordinary account of what
 /// the daemon is spending lives in `kin resources`.
+///
+/// Deliberately not gated on `vector`: background work is every pass the daemon
+/// runs, and a build without the vector feature still runs a reconcile loop that
+/// can wedge.
 pub fn background_work_health_from_state(
     work: &crate::commands::resources::DaemonWorkState,
 ) -> HealthCheck {
@@ -1736,6 +1731,15 @@ async fn check_background_work() -> HealthCheck {
     }
 }
 
+/// Semantic readiness when no daemon is running to ask.
+///
+/// This is where every repository sits until its first command needs a daemon,
+/// so it is an unread state rather than a failed one, and reporting it as a
+/// failure is what makes an install that did everything right end on a red
+/// summary. The authority gate is unchanged for every state that *can* be read:
+/// a reachable daemon whose graph coverage is incomplete or unreadable is still
+/// Stale, and Stale on this check still blocks readiness.
+#[cfg(feature = "vector")]
 fn semantic_query_readiness_without_a_daemon() -> HealthCheck {
     HealthCheck::new(
         "semantic_query_readiness",
