@@ -2651,9 +2651,13 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
-    let response =
-        kin_cli::commands::status::build_command_status_response(report, request.json, Some(build))
-            .map_err(internal_error)?;
+    let response = kin_cli::commands::status::build_command_status_response(
+        report,
+        request.json,
+        Some(build),
+        Some(&kin_cli::commands::store_footprint::StoreFootprint::measure(&state.layout)),
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 

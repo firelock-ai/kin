@@ -625,17 +625,6 @@ pub struct StatusReport {
     /// open recovered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_payload: Option<AuthorityPayloadReceipt>,
-    /// What this store costs on disk, next to the Git object store it was
-    /// admitted from.
-    ///
-    /// Deliberately NOT part of the authority read and deliberately not
-    /// deserialized from a daemon's answer: it is a fact about the filesystem
-    /// this process is standing on, so [`read_status_once`] measures it locally
-    /// and overwrites whatever arrived over the wire. A daemon serving a store
-    /// on another disk would otherwise report that disk's number under this
-    /// process's repository path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub store_footprint: Option<StoreFootprint>,
 }
 
 #[derive(Deserialize)]
@@ -652,12 +641,6 @@ struct StatusReportWire {
     embedding_coverage: EmbeddingCoverage,
     #[serde(default)]
     authority_payload: Option<AuthorityPayloadReceipt>,
-    /// Accepted on the wire so a daemon's report parses, then discarded: the
-    /// reader measures its own disk. Dropping the field from the wire struct
-    /// instead would make `deny_unknown_fields` reject every report a newer
-    /// peer sends.
-    #[serde(default)]
-    store_footprint: Option<StoreFootprint>,
 }
 
 impl<'de> Deserialize<'de> for StatusReport {
@@ -675,7 +658,6 @@ impl<'de> Deserialize<'de> for StatusReport {
             semantic_enrichment: wire.semantic_enrichment,
             embedding_coverage: wire.embedding_coverage,
             authority_payload: wire.authority_payload,
-            store_footprint: wire.store_footprint,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)
@@ -832,7 +814,6 @@ pub fn inspect(
         semantic_enrichment,
         embedding_coverage,
         authority_payload,
-        store_footprint: Some(StoreFootprint::measure(layout)),
     };
     // Validate on the way out, not only on the way in. The reader already
     // refuses an illegal report; running the same check here means a future
@@ -906,20 +887,13 @@ async fn live_status_from_running_daemon(
 /// One complete status reading: the live daemon's when it answers, and this
 /// process's own authority read naming why it did not otherwise.
 async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReport> {
-    let mut report = match live_status_from_running_daemon(layout).await {
-        Ok(report) => report,
+    match live_status_from_running_daemon(layout).await {
+        Ok(report) => Ok(report),
         Err(reason) => {
             let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
-            inspect(layout, &binding, EmbeddingCoverage::unobserved(reason))?
+            inspect(layout, &binding, EmbeddingCoverage::unobserved(reason))
         }
-    };
-    // Overwrite whatever the daemon reported. Store size is a fact about the
-    // filesystem THIS process is standing on, and a daemon serving a store on
-    // another disk would otherwise have its number printed under this command's
-    // repository path. Everything else in the report comes from authority, which
-    // both processes read identically; this one field does not.
-    report.store_footprint = Some(StoreFootprint::measure(layout));
-    Ok(report)
+    }
 }
 
 /// Re-read until embedding coverage stops being momentarily unobservable, or
@@ -977,7 +951,8 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", render_text(&report, None));
+        let footprint = StoreFootprint::measure(&layout);
+        print!("{}", render_text(&report, None, Some(&footprint)));
     }
     Ok(())
 }
@@ -986,8 +961,9 @@ pub fn build_command_status_response(
     report: StatusReport,
     json: bool,
     build: Option<BuildStatus>,
+    footprint: Option<&StoreFootprint>,
 ) -> Result<CommandStatusResponse> {
-    let text = render_text(&report, build.as_ref());
+    let text = render_text(&report, build.as_ref(), footprint);
     let json = json
         .then(|| serde_json::to_string(&report))
         .transpose()
@@ -1000,7 +976,21 @@ pub fn build_command_status_response(
     })
 }
 
-fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
+/// Render the report, plus the two observations that are deliberately NOT in it.
+///
+/// `build` and `footprint` are separate arguments for the same reason. A
+/// [`StatusReport`] is derived from one immutable authority lease and must be
+/// byte-identical across any amount of checkout or Git drift, which is a
+/// property this repository tests directly. Store size is the opposite kind of
+/// fact: it is a measurement of the disk this command is standing on, and it
+/// moves whenever the working tree does. Carrying it inside the report would
+/// have made authority status vary with the filesystem, so it rides alongside
+/// the report on the text surface instead, exactly as the build stamp does.
+fn render_text(
+    report: &StatusReport,
+    build: Option<&BuildStatus>,
+    footprint: Option<&StoreFootprint>,
+) -> String {
     let workspace_state = if report.workspace.dirty {
         "dirty"
     } else {
@@ -1048,10 +1038,6 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
             render_embedding_coverage(&report.embedding_coverage)
         ),
         "Source CAS: verified".to_string(),
-        match report.store_footprint.as_ref() {
-            Some(footprint) => format!("Store size: {}", footprint.render()),
-            None => "Store size: not measured (this report carried no measurement)".to_string(),
-        },
         match report.authority_payload.as_ref() {
             Some(payload) => format!(
                 "Authority payload read: {} bytes ({} snapshot bytes at generation {}, {} acknowledged deltas totalling {} bytes to generation {})",
@@ -1065,6 +1051,9 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
             None => "Authority payload read: none (generation zero built in memory)".to_string(),
         },
     ];
+    if let Some(footprint) = footprint {
+        lines.push(format!("Store size: {}", footprint.render()));
+    }
     if let Some(build) = build {
         lines.push(format!(
             "Build: CLI {} / daemon {}",
@@ -1202,7 +1191,7 @@ mod tests {
             payload.snapshot_bytes + payload.acknowledged_delta_bytes
         );
         assert!(
-            render_text(&report, None).contains("Authority payload read: "),
+            render_text(&report, None, None).contains("Authority payload read: "),
             "text status must state the payload the open read"
         );
 
@@ -1503,7 +1492,7 @@ mod tests {
             EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoVectorIndexAttached),
         )
         .unwrap();
-        let rendered = render_text(&unobserved, None);
+        let rendered = render_text(&unobserved, None, None);
         assert!(
             rendered.contains(
                 "Live embedding coverage: not observed (the live graph carries no vector index)"
@@ -1527,10 +1516,45 @@ mod tests {
         )
         .unwrap();
         assert!(
-            render_text(&observed, None)
+            render_text(&observed, None, None)
                 .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
             "{}",
-            render_text(&observed, None)
+            render_text(&observed, None, None)
+        );
+    }
+
+    /// Store size rides alongside the report, never inside it.
+    ///
+    /// Both halves matter. A caller that measured the disk must see the line,
+    /// or `kin status` stops disclosing the number this exists to disclose. A
+    /// caller that did not must see NO line, because the alternative is a
+    /// fabricated zero or a "not measured" that nobody asked for. The report
+    /// itself carries no store size in either case, which is what keeps
+    /// authority status byte-identical across checkout drift.
+    #[test]
+    fn store_size_renders_from_the_measurement_and_not_from_the_report() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+
+        let without = render_text(&report, None, None);
+        assert!(
+            !without.contains("Store size"),
+            "an unmeasured status must print no store line at all: {without}"
+        );
+
+        let footprint = StoreFootprint::measure(&init.layout);
+        let with = render_text(&report, None, Some(&footprint));
+        assert!(
+            with.contains("Store size: ") && with.contains("under .kin/"),
+            "a measured status must print the store line: {with}"
+        );
+
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(
+            encoded.get("store_footprint").is_none(),
+            "the authority report must carry no filesystem measurement: {encoded}"
         );
     }
 

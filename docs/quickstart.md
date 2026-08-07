@@ -213,7 +213,7 @@ reports the same line afterwards:
   Store size: 71.9 MiB under .kin/, 2.6x the 28.0 MiB Git object store
 ```
 
-`kin status --json` carries the raw byte counts under `store_footprint`.
+`kin init --json` carries the raw byte counts under `store_footprint`.
 [Store size](./store-size.md) explains what drives the number and records what
 has been measured. Kin does not cap store size or refuse a repository for being
 large, so plan disk against your history rather than against your checkout.

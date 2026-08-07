@@ -27,22 +27,29 @@ store.
 
 ## What drives it
 
-The store is not a copy of the packfile, so it is not bounded by one.
+The store is not a copy of the packfile, so it is not bounded by one, and the
+gap is much larger than the semantic layer alone accounts for.
 
-Git stores compressed object bytes. Kin admits complete reachable history and
-then derives a semantic entity and relation layer over every revision in it, so
-the store carries a parsed representation of source that Git only ever carried
-as bytes. That derived layer is what grows, and it grows with **history depth**
-and with **how much of the history is in a language Kin parses**, not with the
-size of your checkout.
+The larger driver is the import itself. Git keeps history as zlib-compressed
+objects packed with deltas, so one packfile holds every revision of a file as a
+base plus a chain of differences. Kin admits that same reachable history into a
+content-addressed store that writes each body verbatim, one file per body, with
+no compression and no deltas between revisions. Everything Git had folded
+together is unfolded. That cost is paid on a repository Kin parses nothing in:
+a 27-file shell repository with zero entities extracted still produced a store
+many times its pack.
 
-Two consequences follow, and they are why the ratio moves so much between
-repositories.
+On top of that, Kin derives a semantic entity and relation layer over every
+revision, which adds a second, smaller amount that does scale with how much of
+the history is in a language Kin parses. `kin languages` lists them.
 
-A repository with a long history in a supported language expands the most,
-because every revision that changes a file contributes entities. A repository
-whose files Kin has no adapter for expands the least, because there is nothing
-to derive; `kin languages` lists the ones it parses.
+Both terms scale with **history depth** rather than with the size of your
+checkout, which is why a repository with a small working tree and thousands of
+commits can still produce a large store.
+
+The ratio is not a constant and it is not currently explained. It varies by
+more than 3x across repositories of similar size in different languages, and
+why is an open question rather than a documented property.
 
 A store can also land **below** its Git object store, but not for the reason it
 is tempting to assume. A short history does not do it: a two-commit repository
@@ -81,6 +88,12 @@ reporting, and the numbers `kin status` prints are what to report.
 
 ## Where to see it
 
-`kin init` prints the size and ratio when it completes. `kin status` prints the
-same line for an existing repository, and `kin status --json` carries the raw
-byte counts under `store_footprint` so you can track them over time.
+`kin init` prints the size and ratio when it completes, and `kin init --json`
+carries the raw byte counts under `store_footprint` so you can record them.
+`kin status` prints the same line for an existing repository.
+
+`kin status --json` deliberately does NOT carry it. That payload is derived from
+one immutable authority lease and is byte-identical no matter what the checkout
+does, which is a property Kin tests directly. A store size is the opposite kind
+of fact, since it moves whenever the working tree does, so it rides alongside the
+report on the text surface rather than inside it.
