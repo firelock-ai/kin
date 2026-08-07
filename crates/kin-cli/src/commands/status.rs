@@ -42,6 +42,7 @@ use kin_model::{
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::repository_authority::ActiveRepositoryAuthority;
+use super::store_footprint::StoreFootprint;
 
 /// First status contract carrying embedding coverage alongside enrichment
 /// counts that name their durable view and exact authority/workspace
@@ -624,6 +625,17 @@ pub struct StatusReport {
     /// open recovered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_payload: Option<AuthorityPayloadReceipt>,
+    /// What this store costs on disk, next to the Git object store it was
+    /// admitted from.
+    ///
+    /// Deliberately NOT part of the authority read and deliberately not
+    /// deserialized from a daemon's answer: it is a fact about the filesystem
+    /// this process is standing on, so [`read_status_once`] measures it locally
+    /// and overwrites whatever arrived over the wire. A daemon serving a store
+    /// on another disk would otherwise report that disk's number under this
+    /// process's repository path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_footprint: Option<StoreFootprint>,
 }
 
 #[derive(Deserialize)]
@@ -640,6 +652,12 @@ struct StatusReportWire {
     embedding_coverage: EmbeddingCoverage,
     #[serde(default)]
     authority_payload: Option<AuthorityPayloadReceipt>,
+    /// Accepted on the wire so a daemon's report parses, then discarded: the
+    /// reader measures its own disk. Dropping the field from the wire struct
+    /// instead would make `deny_unknown_fields` reject every report a newer
+    /// peer sends.
+    #[serde(default)]
+    store_footprint: Option<StoreFootprint>,
 }
 
 impl<'de> Deserialize<'de> for StatusReport {
@@ -657,6 +675,7 @@ impl<'de> Deserialize<'de> for StatusReport {
             semantic_enrichment: wire.semantic_enrichment,
             embedding_coverage: wire.embedding_coverage,
             authority_payload: wire.authority_payload,
+            store_footprint: wire.store_footprint,
         };
         report.validate().map_err(serde::de::Error::custom)?;
         Ok(report)
@@ -813,6 +832,7 @@ pub fn inspect(
         semantic_enrichment,
         embedding_coverage,
         authority_payload,
+        store_footprint: Some(StoreFootprint::measure(layout)),
     };
     // Validate on the way out, not only on the way in. The reader already
     // refuses an illegal report; running the same check here means a future
@@ -886,13 +906,20 @@ async fn live_status_from_running_daemon(
 /// One complete status reading: the live daemon's when it answers, and this
 /// process's own authority read naming why it did not otherwise.
 async fn read_status_once(layout: &kin_core::KinLayout) -> Result<StatusReport> {
-    match live_status_from_running_daemon(layout).await {
-        Ok(report) => Ok(report),
+    let mut report = match live_status_from_running_daemon(layout).await {
+        Ok(report) => report,
         Err(reason) => {
             let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
-            inspect(layout, &binding, EmbeddingCoverage::unobserved(reason))
+            inspect(layout, &binding, EmbeddingCoverage::unobserved(reason))?
         }
-    }
+    };
+    // Overwrite whatever the daemon reported. Store size is a fact about the
+    // filesystem THIS process is standing on, and a daemon serving a store on
+    // another disk would otherwise have its number printed under this command's
+    // repository path. Everything else in the report comes from authority, which
+    // both processes read identically; this one field does not.
+    report.store_footprint = Some(StoreFootprint::measure(layout));
+    Ok(report)
 }
 
 /// Re-read until embedding coverage stops being momentarily unobservable, or
@@ -1021,6 +1048,10 @@ fn render_text(report: &StatusReport, build: Option<&BuildStatus>) -> String {
             render_embedding_coverage(&report.embedding_coverage)
         ),
         "Source CAS: verified".to_string(),
+        match report.store_footprint.as_ref() {
+            Some(footprint) => format!("Store size: {}", footprint.render()),
+            None => "Store size: not measured (this report carried no measurement)".to_string(),
+        },
         match report.authority_payload.as_ref() {
             Some(payload) => format!(
                 "Authority payload read: {} bytes ({} snapshot bytes at generation {}, {} acknowledged deltas totalling {} bytes to generation {})",

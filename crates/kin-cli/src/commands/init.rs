@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::status::{SemanticEnrichmentPresence, SemanticEnrichmentStatus};
+use super::store_footprint::{store_size_notice, StoreFootprint};
 
 /// Invalidates prepared state when the repository bootstrap authority changes.
 pub(crate) const GRAPH_BUILD_PIPELINE_EPOCH: &str =
@@ -70,6 +71,10 @@ struct InitResultPayload<'a> {
     roots: &'a kin_model::RootBundle,
     initial_change_id: Option<&'a kin_model::SemanticChangeId>,
     exact_reachable_git_history: bool,
+    /// What the store this command just wrote costs on disk, and what the Git
+    /// object store it was admitted from costs. Measured after publication, so
+    /// it describes the store the caller now has rather than a projection of it.
+    store_footprint: StoreFootprint,
 }
 
 pub async fn run(path: Option<String>, json: bool) -> Result<()> {
@@ -164,7 +169,7 @@ fn print_json_result(
     let workspace = &result.authority.workspace;
     let default_ref = initialized_default_ref(result);
     let payload = InitResultPayload {
-        schema: "kin.init-result.v5",
+        schema: "kin.init-result.v6",
         authority: "repository-v6",
         source_boundary: boundary.source_boundary(),
         history: boundary.history(),
@@ -184,6 +189,7 @@ fn print_json_result(
         roots: &result.authority.receipt.roots_after,
         initial_change_id: result.authority.initial_change_id.as_ref(),
         exact_reachable_git_history: boundary == InitBoundary::ExactGit,
+        store_footprint: StoreFootprint::measure(&result.layout),
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
@@ -236,6 +242,11 @@ fn print_human_result(
     if let Some(notice) = semantic_absence_notice(semantic_enrichment) {
         println!("{notice}");
     }
+    println!(
+        "  Store size: {}",
+        StoreFootprint::measure(&result.layout).render()
+    );
+    println!("  {}", store_size_notice());
     Ok(())
 }
 

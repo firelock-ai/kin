@@ -275,7 +275,7 @@ fn log_peels_detached_annotated_tag_only_through_admitted_cas() {
     );
     let init_payload: Value =
         serde_json::from_slice(&init.stdout).expect("detached tag init stdout should be JSON");
-    assert_eq!(init_payload["schema"], "kin.init-result.v5");
+    assert_eq!(init_payload["schema"], "kin.init-result.v6");
     assert!(init_payload["default_ref"].is_null());
     assert_eq!(init_payload["raw_git_head"]["type"], "direct");
     assert_eq!(

@@ -194,6 +194,30 @@ The long phases report their own progress while they run, so a phase that is
 walking history shows how far it has gone. Stdout stays clean, so
 `kin init --json` is still safe to pipe.
 
+### How much disk the store takes
+
+Disk scales the same way time does, with history depth rather than checkout
+size, and for the same reason. Kin derives a semantic layer over every reachable
+revision, so the store carries a parsed representation of source that Git only
+ever carried as compressed bytes.
+
+That means `.kin/` is not bounded by the packfile it was admitted from, and the
+ratio between them varies widely between repositories. A repository with a long
+history in a language Kin parses expands the most. A repository with almost no
+history can finish smaller than its Git object store.
+
+`kin init` reports both sizes and the ratio when it finishes, and `kin status`
+reports the same line afterwards:
+
+```
+  Store size: 71.9 MiB under .kin/, 2.6x the 28.0 MiB Git object store
+```
+
+`kin status --json` carries the raw byte counts under `store_footprint`.
+[Store size](./store-size.md) explains what drives the number and records what
+has been measured. Kin does not cap store size or refuse a repository for being
+large, so plan disk against your history rather than against your checkout.
+
 ### Profiling a slow command
 
 Every `kin` command can profile itself. No rebuild, no external profiler, and

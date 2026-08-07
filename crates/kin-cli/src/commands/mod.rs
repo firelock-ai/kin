@@ -79,6 +79,7 @@ pub mod setup_ledger;
 pub mod spec;
 pub mod stash;
 pub mod status;
+pub mod store_footprint;
 pub mod support;
 pub mod tag;
 pub mod telemetry;
