@@ -123,7 +123,12 @@ pub enum GitError {
     #[error("no commits in repository")]
     EmptyRepository,
 
-    #[error("shallow Git repositories cannot be imported losslessly")]
+    /// The refusal is correct: Kin's ingest contract is lossless capture of
+    /// everything reachable, and a shallow clone is genuinely un-capturable
+    /// under it. What the message has to add is the way out, because
+    /// `actions/checkout` clones at depth 1 by default and this is therefore the
+    /// first thing Kin says to anyone trying it inside CI.
+    #[error("shallow Git repositories cannot be imported losslessly; run 'git fetch --unshallow' first (in CI, actions/checkout needs fetch-depth: 0)")]
     ShallowRepository,
 
     #[error("Git object {oid} is missing while traversing {context}")]

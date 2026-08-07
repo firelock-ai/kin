@@ -1408,9 +1408,28 @@ fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts>
                 })?;
             }
             "core" => reject_transfer_core_keys(section)?,
+            // Split out of the arm below because it is the one section here a
+            // user reaches without ever configuring transport: `git submodule
+            // add` writes it for them.
+            "submodule" => {
+                return Err(unsafe_submodule_config(
+                    section
+                        .header()
+                        .subsection_name()
+                        .and_then(|name| name.to_str().ok()),
+                ));
+            }
             "credential" | "http" | "https" | "url" | "protocol" | "transport" | "transfer"
-            | "fetch" | "receive" | "uploadpack" | "ssh" | "submodule" | "lfs" => {
-                return Err(unsafe_git_config("unsupported transfer-affecting section"));
+            | "fetch" | "receive" | "uploadpack" | "ssh" | "lfs" => {
+                // Twelve sections share this refusal, so naming the one that
+                // matched is the difference between a reader knowing what to
+                // look for and reading a category. The section name is one of
+                // these literals and is always safe to print; the subsection
+                // name is not, because for `url`, `http`, and `credential` it is
+                // itself a URL that can carry `user:password@`.
+                return Err(unsafe_git_config(format!(
+                    "unsupported transfer-affecting section [{section_name}]"
+                )));
             }
             _ => {}
         }
@@ -1670,6 +1689,30 @@ fn validate_remote_relationships(
         }
     }
     Ok(())
+}
+
+/// The refusal a repository carrying a submodule gets.
+///
+/// Kin does not model submodules yet, so refusing is correct. What the generic
+/// transport wording could not do is get the reader from the failure to an
+/// action: it named neither the submodule, nor the file the entry lives in, nor
+/// whether anything could be done about it.
+///
+/// The subsection name is the submodule's path. Its URL lives in a key inside
+/// the section and never in the header, so naming the path cannot disclose a
+/// credential the way naming a `url` subsection would. A path that is not valid
+/// UTF-8 has no spelling worth printing and is left out rather than turning a
+/// refusal about submodules into one about encoding.
+fn unsafe_submodule_config(path: Option<&str>) -> GitError {
+    let subject = match path {
+        Some(path) => format!("unsupported submodule section for '{path}'"),
+        None => "unsupported submodule section".to_string(),
+    };
+    unsafe_git_config(format!(
+        "{subject}; Kin cannot yet import a repository that carries submodules. Remove them with \
+         'git submodule deinit --all' and drop the matching .gitmodules entries, or run kin init \
+         inside the submodule's own repository"
+    ))
 }
 
 fn unsafe_git_config(reason: impl Into<String>) -> GitError {
@@ -3538,6 +3581,138 @@ mod tests {
         let error = remote_mapping_facts(&open_repo(&repo).expect("open include fixture"))
             .expect_err("local include must reject");
         assert!(error.to_string().contains("safe exact subset"));
+    }
+
+    /// A submodule is the one transfer-affecting section a user reaches without
+    /// ever configuring transport: `git submodule add` writes it for them. The
+    /// refusal is correct until submodule modeling lands, so the message is what
+    /// has to carry the user from the failure to an action.
+    #[test]
+    fn submodule_rejection_names_the_submodule_its_path_and_the_workaround() {
+        let (_temp, repo) = config_only_repository();
+        git(
+            &repo,
+            &[
+                "config",
+                "submodule.vendor/anyhow.url",
+                "https://example.invalid/anyhow.git",
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open submodule fixture"))
+            .expect_err("submodule config must reject");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("safe exact subset"),
+            "the refusal itself is unchanged: {message}"
+        );
+        assert!(
+            message.contains("submodule"),
+            "must name the cause the user can recognize: {message}"
+        );
+        assert!(
+            message.contains("vendor/anyhow"),
+            "must name which submodule: {message}"
+        );
+        assert!(
+            message.contains(".gitmodules"),
+            "must name the file the entry lives in: {message}"
+        );
+        assert!(
+            message.contains("git submodule deinit"),
+            "must state the workaround: {message}"
+        );
+    }
+
+    /// Every transfer-affecting section shares one message, so naming the cause
+    /// means naming the section that actually matched rather than guessing.
+    #[test]
+    fn transfer_affecting_sections_name_the_section_that_matched() {
+        for (key, value, expected) in [
+            ("http.postBuffer", "1048576", "http"),
+            ("credential.helper", "cache", "credential"),
+            ("lfs.url", "https://example.invalid/lfs", "lfs"),
+        ] {
+            let (temp, repo) = config_only_repository();
+            git(&repo, &["config", key, value]);
+            let error = remote_mapping_facts(&open_repo(&repo).expect("open section fixture"))
+                .expect_err("transfer-affecting section must reject");
+            let message = error.to_string();
+            assert!(message.contains("safe exact subset"), "{message}");
+            assert!(
+                message.contains(expected),
+                "must name the [{expected}] section: {message}"
+            );
+            drop(temp);
+        }
+    }
+
+    /// The falsification for naming things. A section name is one of a fixed set
+    /// of literals and is always safe to print; a subsection name is arbitrary
+    /// user bytes, and for `url`, `http`, and `credential` it IS a URL that can
+    /// carry `user:password@`. Naming the cause must never turn an error message
+    /// into a credential disclosure.
+    #[test]
+    fn naming_the_section_never_echoes_a_credential_bearing_subsection() {
+        let (temp, repo) = config_only_repository();
+        git(
+            &repo,
+            &[
+                "config",
+                "url.https://kin:hunter2@example.invalid/.insteadOf",
+                "https://example.invalid/",
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open rewrite fixture"))
+            .expect_err("URL rewrite must reject");
+        let message = error.to_string();
+        assert!(
+            message.contains("url"),
+            "must still name the section: {message}"
+        );
+        assert!(
+            !message.contains("hunter2"),
+            "credential leaked into the refusal: {message}"
+        );
+        drop(temp);
+
+        // A submodule's own URL lives in a key inside the section, never in the
+        // subsection name, so naming the path cannot disclose it.
+        let (_temp, repo) = config_only_repository();
+        git(
+            &repo,
+            &[
+                "config",
+                "submodule.vendor/dep.url",
+                "https://kin:hunter2@example.invalid/dep.git",
+            ],
+        );
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open submodule url fixture"))
+            .expect_err("submodule config must reject");
+        let message = error.to_string();
+        assert!(message.contains("vendor/dep"), "{message}");
+        assert!(
+            !message.contains("hunter2"),
+            "credential leaked into the refusal: {message}"
+        );
+    }
+
+    /// A submodule path that is not valid UTF-8 has no spelling the message can
+    /// safely carry, so the section is still named and the path is simply
+    /// omitted. The refusal must not become an error about printing.
+    #[test]
+    fn a_non_utf8_submodule_path_still_refuses_and_still_names_the_section() {
+        let (_temp, repo) = config_only_repository();
+        let config = repo.join(".git/config");
+        let mut bytes = fs::read(&config).expect("read config");
+        bytes.extend_from_slice(b"[submodule \"vendor/\xff\"]\n\turl = https://example.invalid/\n");
+        fs::write(&config, bytes).expect("write config");
+
+        let error = remote_mapping_facts(&open_repo(&repo).expect("open non-utf8 fixture"))
+            .expect_err("submodule config must reject");
+        let message = error.to_string();
+        assert!(message.contains("safe exact subset"), "{message}");
+        assert!(message.contains("submodule"), "{message}");
     }
 
     #[test]
