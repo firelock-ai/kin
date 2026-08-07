@@ -35,6 +35,11 @@ pub struct EmbedRuntimeState {
     /// distinguish that from a first run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_index_discarded: Option<String>,
+    /// Whether this store's embedding coverage has ever been whole, as recorded
+    /// by the daemon where the embedding queue drained. Partial coverage means
+    /// something different before this has ever been true than after it.
+    #[serde(default)]
+    pub embedding_coverage_ever_complete: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

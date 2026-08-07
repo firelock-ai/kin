@@ -129,6 +129,16 @@ impl KinLayout {
         self.kindb_snapshot_path().with_extension("kvec")
     }
 
+    /// `.kin/kindb/embedding-coverage-complete` — daemon-published marker that
+    /// this store's embedding coverage has been whole at least once.
+    ///
+    /// Partial coverage on its own cannot say whether a store is filling for
+    /// the first time or lost ground it already held, and only the second is
+    /// something to act on. The marker is what separates them.
+    pub fn kindb_embedding_coverage_marker_path(&self) -> PathBuf {
+        self.kindb_dir().join("embedding-coverage-complete")
+    }
+
     /// `.kin/kindb/text-index/` — Persistent tantivy text index directory.
     pub fn text_index_dir(&self) -> PathBuf {
         self.kindb_dir().join("text-index")

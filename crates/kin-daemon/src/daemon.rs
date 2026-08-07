@@ -1711,6 +1711,11 @@ pub async fn run_with_authority(
                 let pending = embed_state.graph.pending_embeddings();
                 let pending_artifacts = embed_state.graph.pending_artifact_embeddings();
                 if pending == 0 && pending_artifacts == 0 {
+                    // The queue is drained: this is where coverage becomes
+                    // whole, so it is where the has-ever-completed marker is
+                    // published. Recording it here rather than from a reader
+                    // keeps the claim on the side that actually did the work.
+                    embed_state.record_embedding_coverage_complete();
                     break;
                 }
                 // From here to the next `idle` this worker is spending the
