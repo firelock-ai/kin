@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kin_index::{
     FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
@@ -869,13 +869,38 @@ pub async fn run_loop(
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
 
+    // Register with the self-limit supervisor. Registered here rather than at
+    // daemon start so a repository that never runs this loop — filesystem
+    // reconcile disabled, a bare checkout — reports no reconcile pass instead of
+    // one that claims to be idle forever.
+    let pass = state
+        .background_work
+        .pass(crate::background_work::PASS_RECONCILE);
+
     loop {
         // Check for shutdown signal.
         if *cancel.borrow() {
             state
                 .reconciliation_status
                 .store(RECON_IDLE, Ordering::Relaxed);
+            pass.idle();
             info!("reconciliation loop shutting down");
+            break;
+        }
+
+        // The supervisor stopped this loop for spending the machine without
+        // admitting anything. Enforced at this checkpoint, before any lock is
+        // taken, so nothing is abandoned mid-transaction. Graph truth is
+        // untouched and the daemon keeps serving it; what stops is the automatic
+        // tracking of working-copy edits, which the announced reason says.
+        if pass.halted() {
+            state
+                .reconciliation_status
+                .store(RECON_IDLE, Ordering::Relaxed);
+            error!(
+                reason = pass.halt_reason().unwrap_or_default(),
+                "reconciliation loop stopped by the background-work supervisor"
+            );
             break;
         }
 
@@ -954,6 +979,11 @@ pub async fn run_loop(
         enqueue_file_events(&mut pending_events, incoming_events);
 
         if pending_events.is_empty() {
+            // Nothing observed, so this loop is genuinely doing nothing and its
+            // working stretch ends. This is the only path that clears it: a tick
+            // that keeps retrying the same unadmittable paths never arrives
+            // here, which is what makes that spin observable.
+            pass.idle();
             // No events — sleep briefly then check again.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -969,6 +999,7 @@ pub async fn run_loop(
         state
             .reconciliation_status
             .store(RECON_PROCESSING, Ordering::Relaxed);
+        pass.working(Instant::now());
 
         // Backpressure stays bounded. A large burst remains in `pending_events` and is
         // consumed over multiple iterations; processing the entire queue under the write
@@ -1006,6 +1037,12 @@ pub async fn run_loop(
         // staging view; there is no second mutable overlay authority.
         let mut reconciler = state.reconciler.write().await;
         let mut graph_changed = false;
+        // Events this tick admitted without deferring them back to the retry
+        // queue. This is the reconcile pass's persisted-progress counter: a tick
+        // that re-observes the same paths and defers every one of them scores
+        // zero however much work it did, which is the honest account of a loop
+        // that is spending the machine and moving nothing.
+        let mut admitted_events: u64 = 0;
         let mut projection_changed = ProjectionChangedSet::default();
 
         let mut lsp_changed: Vec<(kin_model::FilePathId, Vec<kin_model::EntityId>)> = Vec::new();
@@ -1109,6 +1146,7 @@ pub async fn run_loop(
                     continue;
                 }
             }
+            admitted_events += 1;
 
             let (semantic_event, semantic_repo_path) = match admitted {
                 AdmittedFileEvent::Regular {
@@ -1471,6 +1509,8 @@ pub async fn run_loop(
                 error!(error = %e, "failed to refresh projection after reconciliation");
             }
         }
+
+        pass.advanced(admitted_events, Instant::now());
 
         let backlog_remains = !pending_events.is_empty() || !retry_queue.is_empty();
         if !backlog_remains {

@@ -305,17 +305,43 @@ async fn wait_for_lsp_index(server: &kin_lsp::lifecycle::LspServer, max: Duratio
 /// never interleave and the persisted generation cursor advances monotonically.
 /// Returns once the handle is cleared so callers can use this both to overlap a
 /// flush with the next batch's prep and to drain the tail at every loop exit.
-async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result<usize>>>) {
-    if let Some(handle) = pending.take() {
-        match handle.await {
-            Ok(Ok(_pending)) => {}
-            Ok(Err(e)) => {
-                error!(error = %e, "failed to flush embed progress");
-            }
-            Err(e) => {
-                error!(error = %e, "embed progress flush task panicked");
-            }
+///
+/// The returned flag says whether a flush actually reached disk, which is what
+/// lets a caller credit persisted progress without crediting a failed persist.
+/// Nothing in flight is reported as nothing persisted.
+async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result<usize>>>) -> bool {
+    let Some(handle) = pending.take() else {
+        return false;
+    };
+    match handle.await {
+        Ok(Ok(_pending)) => true,
+        Ok(Err(e)) => {
+            error!(error = %e, "failed to flush embed progress");
+            false
         }
+        Err(e) => {
+            error!(error = %e, "embed progress flush task panicked");
+            false
+        }
+    }
+}
+
+/// Drain the in-flight flush and credit what it persisted to the embedding pass.
+///
+/// Progress is credited here rather than when a batch finishes embedding,
+/// because the counter the supervisor judges liveness on has to mean work that
+/// survived to disk. A batch whose flush failed produced nothing durable, and
+/// crediting it anyway would let a worker that can never persist keep vouching
+/// for itself indefinitely — the exact silence this supervisor exists to end.
+async fn drain_embed_flush(
+    pending: &mut Option<tokio::task::JoinHandle<Result<usize>>>,
+    embedded: &mut u64,
+    pass: &crate::background_work::BackgroundPass,
+) {
+    let persisted = drain_pending_flush(pending).await;
+    let credited = std::mem::take(embedded);
+    if persisted {
+        pass.advanced(credited, Instant::now());
     }
 }
 
@@ -1600,6 +1626,14 @@ pub async fn run_with_authority(
         }
         info!("embedding worker started");
         start_or_defer_background_embed(&embed_state);
+        // Register with the self-limit supervisor. Registration is what makes
+        // this worker's CPU accountable: from here it declares when it is
+        // working, credits what it persists, and is stopped and announced if
+        // those two ever come apart.
+        let embed_pass = embed_state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let embed_retry_budget = crate::background_work::configured_retry_budget();
         let mut consecutive_panics: u32 = 0;
         const MAX_CONSECUTIVE_PANICS: u32 = 3;
         // Recovery + backoff state for vector-index errors (e.g. a stale on-disk
@@ -1611,6 +1645,11 @@ pub async fn run_with_authority(
         let mut error_backoff: Option<Duration> = None;
         const EMBED_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(60);
         'wake: loop {
+            // Between wakes this worker is genuinely doing nothing, so the
+            // working stretch ends here. A wedged drain never reaches this
+            // point, which is precisely why the stretch it started keeps
+            // accumulating and becomes observable.
+            embed_pass.idle();
             // While an embed/index error is being retried, sleep for the current
             // backoff instead of the normal idle interval (no tight-spin).
             let idle = error_backoff.unwrap_or(embed_interval);
@@ -1622,6 +1661,9 @@ pub async fn run_with_authority(
                 }
             }
             if *embed_cancel.borrow() {
+                break;
+            }
+            if embed_pass.halted() {
                 break;
             }
 
@@ -1641,9 +1683,21 @@ pub async fn run_with_authority(
             // every loop exit so two flushes never interleave and the tail is
             // always awaited.
             let mut pending_flush: Option<tokio::task::JoinHandle<Result<usize>>> = None;
+            // Entities embedded by batches whose flush has not been awaited yet.
+            // Credited to the pass only once that flush reports it reached disk.
+            let mut embedded_since_flush: u64 = 0;
             loop {
                 if *embed_cancel.borrow() {
-                    drain_pending_flush(&mut pending_flush).await;
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
+                    break 'wake;
+                }
+                // The supervisor's verdict is enforced here, at the worker's own
+                // checkpoint, so an in-flight batch and its flush finish rather
+                // than being torn out from under the vector sidecar.
+                if embed_pass.halted() {
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
                     break 'wake;
                 }
                 if embed_state.background_embed_paused() {
@@ -1659,6 +1713,10 @@ pub async fn run_with_authority(
                 if pending == 0 && pending_artifacts == 0 {
                     break;
                 }
+                // From here to the next `idle` this worker is spending the
+                // machine. Latched, so a drain that never finishes keeps one
+                // stretch rather than restarting it every batch.
+                embed_pass.working(Instant::now());
                 let batch = embed_batch_size;
                 let state_for_embed = Arc::clone(&embed_state);
                 let is_artifact = pending == 0;
@@ -1696,6 +1754,7 @@ pub async fn run_with_authority(
                         // embedder — clear any error backoff / reset latch.
                         index_reset_triggered = false;
                         error_backoff = None;
+                        embed_pass.reset_retries();
                         info!(count, remaining = remaining.saturating_sub(count), label);
                         // Serialize successive flushes: the previous batch's
                         // flush — which may still be running concurrently with
@@ -1704,7 +1763,13 @@ pub async fn run_with_authority(
                         // This guarantees at most one persist runs at a time, so
                         // two flushes never interleave and the persisted
                         // generation cursor advances monotonically.
-                        drain_pending_flush(&mut pending_flush).await;
+                        drain_embed_flush(
+                            &mut pending_flush,
+                            &mut embedded_since_flush,
+                            &embed_pass,
+                        )
+                        .await;
+                        embedded_since_flush = count as u64;
                         // Persist the vector index under the shared persist lock so
                         // this kvec write can never interleave with a snapshot save
                         // running in the persistence loop or idle-shutdown flush.
@@ -1726,7 +1791,12 @@ pub async fn run_with_authority(
                         // runs; proof/serial blocks on it now so the persisted
                         // order is fully deterministic.
                         if !embed_pipeline_overlap {
-                            drain_pending_flush(&mut pending_flush).await;
+                            drain_embed_flush(
+                                &mut pending_flush,
+                                &mut embedded_since_flush,
+                                &embed_pass,
+                            )
+                            .await;
                         }
                     }
                     Ok(BackgroundEmbeddingBatchOutcome::Completed(_)) => {
@@ -1736,6 +1806,7 @@ pub async fn run_with_authority(
                         consecutive_panics = 0;
                         index_reset_triggered = false;
                         error_backoff = None;
+                        embed_pass.reset_retries();
                         break;
                     }
                     Ok(BackgroundEmbeddingBatchOutcome::ResetAfterIndexError(e)) => {
@@ -1774,6 +1845,22 @@ pub async fn run_with_authority(
                             backoff_s = next.as_secs(),
                             "embedding worker error — backing off"
                         );
+                        // Backoff bounds how fast this ladder retries and not how
+                        // long it retries for, so a failure that never clears
+                        // retries at the ceiling until the process dies. Charging
+                        // each delay against a cumulative budget puts an end on
+                        // it: the work parks with a reason a user can read
+                        // instead of retrying out of sight forever.
+                        if !embed_pass.charge_retry(
+                            next,
+                            embed_retry_budget,
+                            "the background embedding worker",
+                        ) {
+                            error!(
+                                budget_s = embed_retry_budget.as_secs(),
+                                "embedding worker parked — cumulative retry budget exhausted (see /health background_passes)"
+                            );
+                        }
                         break;
                     }
                     Err(e) => {
@@ -1787,12 +1874,25 @@ pub async fn run_with_authority(
                             embed_state
                                 .embed_worker_failed
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Say it on the pass surface too. A reader looking at
+                            // background passes must not see this worker sitting
+                            // at `idle` when it is never coming back.
+                            embed_pass.halt(format!(
+                                "the embedding worker panicked {consecutive_panics} times in a row \
+                                 and stopped; the vector index will not advance until the daemon \
+                                 restarts and the daemon keeps serving graph, locate and reconcile"
+                            ));
                             error!(
                                 error = %e,
                                 consecutive_panics,
                                 "embedding worker permanently failed — vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
                             );
-                            drain_pending_flush(&mut pending_flush).await;
+                            drain_embed_flush(
+                                &mut pending_flush,
+                                &mut embedded_since_flush,
+                                &embed_pass,
+                            )
+                            .await;
                             break 'wake;
                         }
                         error!(
@@ -1812,7 +1912,8 @@ pub async fn run_with_authority(
                 // signal) is left for the bounded teardown to handle.
                 if *embed_cancel.borrow() {
                     info!("embedding worker stopping mid-drain on shutdown");
-                    drain_pending_flush(&mut pending_flush).await;
+                    drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass)
+                        .await;
                     break 'wake;
                 }
 
@@ -1827,9 +1928,26 @@ pub async fn run_with_authority(
             // transient error, or panic respawn) so a persist started under the
             // throughput profile is always awaited before the worker idles or
             // re-enters the next wake — no flush outlives the loop unobserved.
-            drain_pending_flush(&mut pending_flush).await;
+            drain_embed_flush(&mut pending_flush, &mut embedded_since_flush, &embed_pass).await;
         }
+        embed_pass.idle();
     });
+
+    // Spawn the background-work supervisor.
+    //
+    // The daemon is the only Kin process on a user's machine, so no watchdog
+    // outside it will ever notice a pass that has wedged. This one keys on the
+    // persisted-progress delta rather than on CPU utilization — a busy-spin pegs
+    // a core while achieving nothing, so utilization cannot tell working from
+    // stuck — and stops a pass that spends the machine without advancing,
+    // announcing the stop through `/health` and `kin resources` rather than
+    // leaving a warm fan as the only evidence.
+    let supervisor_work = Arc::clone(&state.background_work);
+    let supervisor_work_cancel = cancel_rx.clone();
+    tokio::spawn(crate::background_work::run_background_work_supervisor(
+        supervisor_work,
+        supervisor_work_cancel,
+    ));
 
     // Spawn the LSP enrichment worker (channel was set up before Arc::new).
     if let Some(mut lsp_rx) = lsp_rx {

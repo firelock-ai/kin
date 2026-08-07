@@ -619,6 +619,18 @@ pub struct HealthResponse {
     /// the signal that distinguishes "busy" from "dead".
     #[serde(default)]
     pub spine_warming: bool,
+    /// Cumulative CPU seconds this daemon process has consumed. The answer to
+    /// "why is my fan on" belongs in the product rather than in Activity
+    /// Monitor. Absent before the background-work supervisor's first sample,
+    /// which is not the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_cpu_seconds: Option<f64>,
+    /// Every background pass this daemon has actually started, with how long
+    /// each has been working and how long since it last recorded persisted
+    /// progress. A pass carrying a `stopped_reason` was stopped for spending the
+    /// machine without advancing, and drives `status: "attention"`.
+    #[serde(default)]
+    pub background_passes: Vec<kin_cli::commands::resources::BackgroundPassReport>,
     pub build: BuildResponse,
 }
 
@@ -2347,18 +2359,23 @@ async fn health(
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
+    let background_passes = state.background_work.reports(std::time::Instant::now());
+    let background_pass_stopped = state.background_work.any_stopped();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
     // permanently stopped (embed-degraded), OR the configured storage backend
     // cannot durably persist vector progress, OR the persisted vector index was
     // discarded at open and is being re-derived, OR coordination evidence could
-    // not be persisted. The graph itself stays intact and served in all cases.
+    // not be persisted, OR a background pass was stopped for spending the
+    // machine without advancing. The graph itself stays intact and served in all
+    // cases.
     let status = if mass_deletion_blocked
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
         || coordination_event_persist_failures > 0
+        || background_pass_stopped
     {
         "attention"
     } else {
@@ -2404,6 +2421,8 @@ async fn health(
         ),
         coordination_event_persist_failures: Some(coordination_event_persist_failures),
         spine_warming: state.spine_warming(),
+        daemon_cpu_seconds: state.background_work.daemon_cpu_seconds(),
+        background_passes,
         build: current_build_response(),
     }))
 }
@@ -2975,10 +2994,12 @@ async fn command_resources(
     };
 
     let actual = kin_cli::commands::resources::ActualResources::capture();
+    let daemon_work = state.background_work.work_state(std::time::Instant::now());
     let response = kin_cli::commands::resources::build_command_resources_response(
         plan,
         embed_runtime,
         actual,
+        daemon_work,
         request.json,
     )
     .map_err(internal_error)?;
@@ -16371,6 +16392,150 @@ mod tests {
         let legacy: HealthResponse = serde_json::from_value(legacy).unwrap();
         assert!(legacy.coordination.is_none());
         assert!(legacy.coordination_event_persist_failures.is_none());
+    }
+
+    async fn health_json(state: Arc<DaemonState>) -> HealthResponse {
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The whole point of the supervisor, end to end on the surface a user or
+    /// agent actually reads.
+    ///
+    /// A pass that declares itself working and never records anything is exactly
+    /// the shape of a daemon spending a machine with no signal, and the daemon
+    /// must stop it and say so. Time is supplied rather than slept: the sweep
+    /// takes the instant it judges against, so the real production threshold is
+    /// exercised without the test waiting ten minutes for it.
+    #[tokio::test]
+    async fn a_wedged_background_pass_is_stopped_and_its_reason_reaches_health() {
+        let state = test_state();
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let base = std::time::Instant::now();
+        pass.working(base);
+
+        assert!(
+            health_json(Arc::clone(&state)).await.status == "ok",
+            "a pass that has only just started working is not yet a fault"
+        );
+
+        let past_threshold =
+            base + crate::background_work::DEFAULT_STALL_THRESHOLD + Duration::from_secs(1);
+        assert_eq!(state.background_work.sweep(past_threshold).len(), 1);
+
+        let json = health_json(state).await;
+        assert_eq!(
+            json.status, "attention",
+            "a stopped background pass must not leave health reporting ok"
+        );
+        let report = json
+            .background_passes
+            .iter()
+            .find(|report| report.name == crate::background_work::PASS_EMBED)
+            .expect("the stopped pass must appear in health");
+        assert_eq!(report.state, "stopped");
+        let reason = report
+            .stopped_reason
+            .as_deref()
+            .expect("a stopped pass must carry a reason");
+        assert!(
+            reason.contains("without recording any progress"),
+            "the reason must say why the pass was stopped: {reason}"
+        );
+        assert!(
+            reason.contains("the daemon keeps serving"),
+            "the reason must say what still works: {reason}"
+        );
+    }
+
+    /// The falsification for the test above, and the property that makes the
+    /// mechanism safe to ship.
+    ///
+    /// Same pass, same working stretch, same sweep instant — the ONLY difference
+    /// is that this one reports progress. A supervisor that stopped long-running
+    /// work rather than stalled work would pass the test above and fail here.
+    #[tokio::test]
+    async fn a_long_pass_that_reports_progress_is_never_stopped() {
+        let state = test_state();
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let base = std::time::Instant::now();
+        pass.working(base);
+
+        let threshold = crate::background_work::DEFAULT_STALL_THRESHOLD;
+        // Work for ten times the threshold, recording progress throughout.
+        for step in 1..=20u32 {
+            let now = base + threshold.mul_f64(f64::from(step) / 2.0);
+            pass.advanced(32, now);
+            assert!(
+                state.background_work.sweep(now).is_empty(),
+                "a pass recording progress must never be stopped"
+            );
+        }
+
+        let json = health_json(state).await;
+        assert_eq!(json.status, "ok");
+        let report = json
+            .background_passes
+            .iter()
+            .find(|report| report.name == crate::background_work::PASS_EMBED)
+            .expect("a healthy pass is still disclosed");
+        assert_eq!(report.state, "working");
+        assert_eq!(report.progress, 32 * 20);
+        assert!(report.stopped_reason.is_none());
+    }
+
+    /// Exhausting a retry ladder's cumulative budget parks the work with a
+    /// reason on the same surface, rather than retrying at the backoff ceiling
+    /// for as long as the process lives.
+    #[tokio::test]
+    async fn retry_budget_exhaustion_parks_the_pass_with_a_reason_in_health() {
+        let state = test_state();
+        let pass = state
+            .background_work
+            .pass(crate::background_work::PASS_EMBED);
+        let budget = Duration::from_secs(120);
+
+        assert!(pass.charge_retry(Duration::from_secs(60), budget, "the embedding worker"));
+        assert_eq!(health_json(Arc::clone(&state)).await.status, "ok");
+
+        assert!(!pass.charge_retry(Duration::from_secs(60), budget, "the embedding worker"));
+
+        let json = health_json(state).await;
+        assert_eq!(json.status, "attention");
+        let reason = json
+            .background_passes
+            .iter()
+            .find(|report| report.name == crate::background_work::PASS_EMBED)
+            .and_then(|report| report.stopped_reason.clone())
+            .expect("a parked pass must carry a reason");
+        assert!(
+            reason.contains("cumulative retry backoff"),
+            "the reason must name the budget that was spent: {reason}"
+        );
+    }
+
+    /// A daemon that has started no background pass discloses that honestly,
+    /// and does not invent a cumulative CPU figure it has not measured.
+    #[tokio::test]
+    async fn health_discloses_no_passes_and_no_cpu_before_anything_runs() {
+        let json = health_json(test_state()).await;
+        assert_eq!(json.status, "ok");
+        assert!(json.background_passes.is_empty());
+        assert!(
+            json.daemon_cpu_seconds.is_none(),
+            "an unsampled CPU total must be absent rather than reported as zero"
+        );
     }
 
     async fn advertised_repo_id(state: Arc<DaemonState>) -> String {

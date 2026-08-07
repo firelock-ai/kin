@@ -124,12 +124,56 @@ fn non_empty_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// What one background pass the daemon runs on its own initiative is doing.
+///
+/// A user asking why the fan is on gets the answer from the product rather than
+/// from Activity Monitor: which pass is working, how long it has been working,
+/// and how long since it last recorded anything durable. Sourced entirely from
+/// daemon-owned state and never recomputed here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundPassReport {
+    /// Stable pass name, e.g. `embed` or `reconcile`.
+    pub name: String,
+    /// `idle`, `working`, or `stopped`.
+    pub state: String,
+    /// Units of work this pass has durably recorded since the daemon started.
+    /// Monotonic, so a delta across two reads is meaningful.
+    pub progress: u64,
+    /// Seconds since `progress` last advanced; absent when it never has. A
+    /// working pass whose progress age keeps climbing is the shape the daemon
+    /// stops on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_age_seconds: Option<u64>,
+    /// Seconds this pass has been working without an idle stretch in between;
+    /// absent while idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_seconds: Option<u64>,
+    /// Why this pass was stopped, once it has been. A value drives
+    /// `status: "attention"` on `/health`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<String>,
+}
+
+/// What the daemon is spending on work nobody asked for interactively.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DaemonWorkState {
+    /// Cumulative CPU seconds this daemon process has consumed. Absent before
+    /// the supervisor's first sample, which is not the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_cpu_seconds: Option<f64>,
+    /// Every background pass this daemon has actually started.
+    #[serde(default)]
+    pub passes: Vec<BackgroundPassReport>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResourcesResponse {
     pub plan: ResourcePlan,
     pub embed_runtime: EmbedRuntimeState,
     #[serde(default)]
     pub actual: ActualResources,
+    #[serde(default)]
+    pub daemon_work: DaemonWorkState,
     #[serde(default)]
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +189,7 @@ struct ResourcesJson<'a> {
     plan: &'a ResourcePlan,
     embed_runtime: &'a EmbedRuntimeState,
     actual: &'a ActualResources,
+    daemon_work: &'a DaemonWorkState,
 }
 
 /// Parse a CLI/request profile name. Absent input defaults to `Interactive`;
@@ -173,10 +218,46 @@ fn profile_label(profile: Profile) -> &'static str {
     }
 }
 
+/// One line per background pass, plus the daemon's cumulative CPU.
+///
+/// Rendered even when every pass is healthy. The question this answers — what is
+/// this process spending my machine on — is one a user asks while nothing is
+/// visibly wrong, so a surface that only appears on a fault does not answer it.
+fn render_daemon_work_lines(work: &DaemonWorkState) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Daemon CPU: {}",
+        match work.daemon_cpu_seconds {
+            Some(seconds) => format!("{seconds:.1}s cumulative"),
+            None => "not sampled yet".to_string(),
+        }
+    )];
+    if work.passes.is_empty() {
+        lines.push("Background passes: none started".to_string());
+        return lines;
+    }
+    for pass in &work.passes {
+        let detail = match (&pass.stopped_reason, pass.working_seconds) {
+            (Some(reason), _) => format!("stopped — {reason}"),
+            (None, Some(working)) => format!("working {working}s"),
+            (None, None) => "idle".to_string(),
+        };
+        let progress_age = match pass.progress_age_seconds {
+            Some(age) => format!("last advanced {age}s ago"),
+            None => "no progress yet".to_string(),
+        };
+        lines.push(format!(
+            "Background pass {}: {detail}, {} units, {progress_age}",
+            pass.name, pass.progress
+        ));
+    }
+    lines
+}
+
 fn render_lines(
     plan: &ResourcePlan,
     embed: &EmbedRuntimeState,
     actual: &ActualResources,
+    daemon_work: &DaemonWorkState,
 ) -> Vec<String> {
     let accel = format!("{:?}", plan.accelerator.backend).to_ascii_lowercase();
     let mut lines = vec![
@@ -219,6 +300,7 @@ fn render_lines(
     ];
 
     lines.push(profile_selector_line(actual));
+    lines.extend(render_daemon_work_lines(daemon_work));
 
     // The profile selector is reported on its own line above, with who chose it.
     // Listing it here too would read as an operator override even when the
@@ -265,9 +347,10 @@ pub fn build_command_resources_response(
     plan: ResourcePlan,
     embed_runtime: EmbedRuntimeState,
     actual: ActualResources,
+    daemon_work: DaemonWorkState,
     json: bool,
 ) -> Result<CommandResourcesResponse> {
-    let text = render_lines(&plan, &embed_runtime, &actual)
+    let text = render_lines(&plan, &embed_runtime, &actual, &daemon_work)
         .into_iter()
         .map(|line| format!("{line}\n"))
         .collect::<String>();
@@ -276,6 +359,7 @@ pub fn build_command_resources_response(
             plan: &plan,
             embed_runtime: &embed_runtime,
             actual: &actual,
+            daemon_work: &daemon_work,
         })?)
     } else {
         None
@@ -284,6 +368,7 @@ pub fn build_command_resources_response(
         plan,
         embed_runtime,
         actual,
+        daemon_work,
         text,
         json,
     })
@@ -419,6 +504,7 @@ mod tests {
             sample_plan(Profile::Interactive),
             embed,
             actual,
+            DaemonWorkState::default(),
             true,
         )
         .unwrap();
@@ -460,6 +546,7 @@ mod tests {
             sample_plan(Profile::Throughput),
             embed,
             ActualResources::default(),
+            DaemonWorkState::default(),
             true,
         )
         .unwrap();
@@ -498,6 +585,7 @@ mod tests {
             sample_plan(Profile::Throughput),
             embed,
             ActualResources::default(),
+            DaemonWorkState::default(),
             true,
         )
         .unwrap();
@@ -521,6 +609,7 @@ mod tests {
             sample_plan(Profile::Proof),
             EmbedRuntimeState::default(),
             ActualResources::default(),
+            DaemonWorkState::default(),
             false,
         )
         .unwrap();
@@ -542,6 +631,7 @@ mod tests {
             sample_plan(Profile::Interactive),
             EmbedRuntimeState::default(),
             actual,
+            DaemonWorkState::default(),
             false,
         )
         .unwrap();
@@ -564,6 +654,7 @@ mod tests {
             sample_plan(Profile::Interactive),
             EmbedRuntimeState::default(),
             ActualResources::default(),
+            DaemonWorkState::default(),
             false,
         )
         .unwrap();
@@ -615,6 +706,7 @@ mod tests {
             sample_plan(Profile::Interactive),
             EmbedRuntimeState::default(),
             actual,
+            DaemonWorkState::default(),
             false,
         )
         .unwrap();
