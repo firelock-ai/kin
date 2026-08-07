@@ -11,3 +11,13 @@
 # when the workspace moves off the bound repository. The variable is the
 # published interface the MCP daemon delegate reads, so the write is the feature.
 crates/kin-cli/src/commands/mcp.rs
+
+# `kin` and `kin-daemon` select their resource profile at startup when the
+# operator set none. KIN_RESOURCE_PROFILE is the published interface kin-infer
+# and kin-db read for the kernel plan, submission depth and embedding budgets, so
+# writing it IS how a binary states its choice — there is no argument to pass it
+# by across a registry dependency. The write happens in the first statement of
+# each `main`, while the process is still single-threaded and before any reader
+# caches its answer, and the precedence rule itself is a pure function
+# (`product_default_for`) that tests exercise without touching the environment.
+crates/kin-cli/src/resource_profile.rs

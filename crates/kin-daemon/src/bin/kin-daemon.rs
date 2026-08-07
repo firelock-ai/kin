@@ -327,6 +327,13 @@ fn main() {
     }
 
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
+    // Select this process's resource profile before the runtime exists: the
+    // environment is mutated while the process is still single-threaded, and
+    // ahead of the reads below that derive the embed worker's batch size and
+    // overlap from it. The CLI applies the SAME default, so the behavior-env
+    // comparison `kin embed` and `kin resources inspect` run against this
+    // daemon still matches. An operator's explicit KIN_RESOURCE_PROFILE wins.
+    kin_cli::resource_profile::apply_product_default();
     // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
     // we own its teardown. The embedding worker dispatches batches onto the
     // blocking pool doing synchronous GPU compute that cannot observe the

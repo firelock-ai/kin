@@ -9,6 +9,7 @@ pub mod output_style;
 pub mod profile;
 pub mod progress;
 pub mod provenance;
+pub mod resource_profile;
 pub mod retrieval_profile;
 
 #[cfg(all(test, unix))]
