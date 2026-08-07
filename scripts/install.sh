@@ -364,7 +364,7 @@ if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
         info "Filesystem projection is unavailable on this platform; core CLI and daemon are fully functional without it."
     fi
 else
-    info "Filesystem projection (kin-vfs) not bundled in this archive — core CLI and daemon are fully functional without it."
+    info "Filesystem projection (kin-vfs) not bundled in this archive. The core CLI and daemon are fully functional without it."
 fi
 
 # ── PATH setup ──────────────────────────────────────────────────────────
@@ -412,7 +412,7 @@ if has_cmd "$KIN_BIN/kin"; then
         ok "kin ${INSTALLED_VERSION:-installed}"
     fi
 else
-    err "Installation failed — kin binary not found"
+    err "Installation failed: kin binary not found"
     exit 1
 fi
 

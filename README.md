@@ -43,8 +43,9 @@ those callers pull in behind them.
 Recorded against a prepared graph at ripgrep commit
 `e89fff89ac9af12e8d4ce9d5fd07beb408ca730f`. 13 impacted entities within 3 hops,
 including 3 direct callers of the changed signature. The graph was built
-beforehand. No compiler ran. Exact commands and raw traces:
-[kinlab.ai/proof](https://kinlab.ai/proof).
+beforehand. No compiler ran. Exact commands:
+[kinlab.ai/proof](https://kinlab.ai/proof). The raw run directory is not
+public yet, so this is a recipe you can re-run, not a trace you can audit.
 
 Kin surfaces what the change touches. Whether the change is correct stays with
 your compiler, tests, and review. The graph is built beforehand by `kin init`,
