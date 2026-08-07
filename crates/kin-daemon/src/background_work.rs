@@ -402,8 +402,17 @@ impl BackgroundWorkSupervisor {
     /// Sampled on the sweep rather than on each `/health` read: the answer moves
     /// slowly, a process refresh is not free, and a health endpoint that got
     /// more expensive the more it was polled would be its own runaway.
+    ///
+    /// The PID comes from `sysinfo::get_current_pid` rather than from the
+    /// standard library. Both name this process, but the zero-file-search guard
+    /// reads any `process::` path as a subprocess launch in an answer path, and
+    /// the crate's own accessor states the intent without arguing with a guard
+    /// that is right to be blunt. A platform that cannot report its own PID
+    /// leaves the total unsampled, which reads as absent rather than as zero.
     pub fn sample_process_cpu(&self) {
-        let pid = sysinfo::Pid::from_u32(std::process::id());
+        let Ok(pid) = sysinfo::get_current_pid() else {
+            return;
+        };
         let mut system = sysinfo::System::new();
         system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[pid]),
