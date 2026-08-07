@@ -462,8 +462,11 @@ fn a_store_below_its_git_object_store_prints_a_fraction() {
         "a store below its Git object store must print a fraction, not {printed}x: {stdout}"
     );
     let expected = store as f64 / git as f64;
+    // 0.005 is half the quantum of the two-decimal print; for small ratios the
+    // 5% band alone is narrower than print rounding, which makes the assertion
+    // fail on formatting rather than on the measured ratio.
     assert!(
-        (printed - expected).abs() < 0.05 * expected.max(0.01),
+        (printed - expected).abs() < 0.005 + 0.05 * expected.max(0.01),
         "init printed {printed}x for {store} store bytes over {git} Git object bytes \
          (expected about {expected:.2}x): {stdout}"
     );

@@ -49,6 +49,13 @@
       "reason": "The provenance aggregator frozen at this tag requires every per-artifact manifest to carry the same run_attempt as the publishing job. The five platform builds succeeded on the first attempt and were never re-run, so their manifests record attempt 1, while a runner outage failed the daemon-image job on that same attempt and pushed the aggregator to attempt 3, where Publish Release is refused with 'kin-linux-x86_64.provenance.json run attempt does not match this run'. Automatic release recovery cannot remedy this and made it worse on each pass, because rerunning failed jobs is its only remedy and every retry moves the publishing attempt further from the attempt the manifests record. The repair for FIR-1571 landed on main only after the tag, and the release workflow resolves from the tag, so no later change to main can reach the failing step. All three attempts of the cited run failed, no GitHub Release object was ever created for this tag, and no channel published it.",
       "superseded_by": "v0.5.7",
       "failed_release_run_id": "31114407438"
+    },
+    {
+      "tag": "v0.5.7",
+      "sha": "6321ecc936b340710451d5e1de7d8b747716074b",
+      "reason": "The Public Install Proof frozen at this tag fails on all five platforms because the tagged binary reports semantic_query_readiness=stale while a fresh install's first embedding fill is still in progress, and the health rollup at the tag treats that state as blocking; the same report also scores an unconfigured retrieval profile as stale on Windows. The discriminators that tell a first fill apart from lost coverage and an unconfigured install apart from a degraded one landed on main only after the tag, and both the proof workflow and the binary resolve from the tag, so no later change to main can reach the failing checks. Both attempts of the cited run failed with the same signature on all five legs, the only GitHub Release object for this tag is the unpromoted prerelease the workflow publishes before proof, npm and Homebrew were verified untouched, and the tag never became the finalized Latest release.",
+      "superseded_by": "v0.5.8",
+      "failed_release_run_id": "31193919695"
     }
   ]
 }

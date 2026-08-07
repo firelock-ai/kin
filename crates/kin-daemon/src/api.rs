@@ -10633,11 +10633,14 @@ pub fn bind_api_listener_pair(
     let bind_host = bind_host_from_env();
     let auth_present = resolve_serve_auth_token(layout).is_some();
     let bound = bind_std_listener(&bind_host, port, auth_present)?;
-    // `try_clone` duplicates the descriptor rather than the socket, so both
-    // handles share one listen queue and one set of status flags -- including
-    // the non-blocking mode Tokio requires, which is why the clone needs no
-    // further configuration.
+    // Both handles share one bound socket and one listen queue, but only on
+    // Unix does the dup share status flags. On Windows, WSA socket duplication
+    // does not carry FIONBIO, so the clone comes back blocking and an accept
+    // loop handed to Tokio parks a worker thread on the syscall: the daemon
+    // reports listening while never accepting. The mode must be set on the
+    // duplicate explicitly.
     let duplicate = bound.try_clone()?;
+    duplicate.set_nonblocking(true)?;
     let bound_port = bound.local_addr()?.port();
     Ok((
         tokio::net::TcpListener::from_std(bound)?,
