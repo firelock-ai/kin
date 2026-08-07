@@ -753,6 +753,91 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The README states how many languages Kin parses in its
+      # "Language | Extensions" table, and kin-parser's AdapterRegistry::new()
+      # decides it. Nothing else holds the two together, so an adapter added or
+      # removed without the table edited to match publishes a stale number.
+      # This job is the one that sees every adapter change: a diff touching
+      # crates/ is never classified documentation-only, so it never takes the
+      # inert fast path.
+      - name: Check the README language count against the adapter registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readme="README.md"
+          registry="crates/kin-parser/src/languages/mod.rs"
+
+          # The adapter registry is the real count. It is the set the README
+          # itself points at, and unlike the tree-sitter Cargo dependencies it
+          # cannot be inflated by a grammar-adjacent crate that is no adapter.
+          derived="$(awk '
+            /adapters: vec!\[/           { inblock = 1; next }
+            inblock && /^[[:space:]]*\]/ { inblock = 0; next }
+            inblock && /Box::new\(/      { n++ }
+            END                          { print n + 0 }
+          ' "$registry")"
+
+          if [ "$derived" -lt 1 ]; then
+            echo "::error::language count: no adapters found in $registry"
+            echo "The AdapterRegistry::new() 'adapters: vec![...]' block moved or changed" >&2
+            echo "shape, so the real language count can no longer be derived and the" >&2
+            echo "README number is now unchecked. Teach this step in" >&2
+            echo ".github/workflows/ci.yml to read the registry's new form." >&2
+            exit 1
+          fi
+
+          documented="$(awk '
+            /^\|[[:space:]]*Language[[:space:]]*\|[[:space:]]*Extensions[[:space:]]*\|/ {
+              found = 1; intable = 1; next
+            }
+            intable && /^\|[[:space:]]*-+[[:space:]]*\|/ { next }
+            intable && /^\|/                             { n++; next }
+            intable                                      { intable = 0 }
+            END { if (found) print n + 0; else print "MISSING" }
+          ' "$readme")"
+
+          if [ "$documented" = "MISSING" ]; then
+            echo "::error::language count: the '| Language | Extensions |' table is gone from $readme"
+            echo "That table is where $readme states how many languages Kin parses, and" >&2
+            echo "this step reads it to keep the number honest. It was reworded, moved, or" >&2
+            echo "removed, so the count is now unchecked. Point this step in" >&2
+            echo ".github/workflows/ci.yml at wherever the README now states the count." >&2
+            exit 1
+          fi
+
+          if [ "$documented" -ne "$derived" ]; then
+            echo "::error::language count: $readme says $documented, the adapter registry says $derived"
+            echo "  $readme, the 'Language | Extensions' table: $documented languages" >&2
+            echo "  $registry, AdapterRegistry::new(): $derived adapters" >&2
+            echo "Whichever is wrong, fix it so both state the same number." >&2
+            exit 1
+          fi
+
+          # A prose count is optional, because the table above is the anchor
+          # that always runs. When a sentence does claim a number it has to
+          # agree with the registry too.
+          prose_stale=0
+          while IFS= read -r phrase; do
+            [ -n "$phrase" ] || continue
+            stated="$(printf '%s' "$phrase" | tr -dc '0-9')"
+            if [ "$stated" -ne "$derived" ]; then
+              echo "::error::language count: $readme prose says $stated, the adapter registry says $derived"
+              echo "  $readme says: \"$phrase\"" >&2
+              echo "  $registry, AdapterRegistry::new(): $derived adapters" >&2
+              prose_stale=1
+            fi
+          done <<EOF
+          $(grep -Eio '(covering|covers|support|supports|supporting|spanning|across)[[:space:]]+[0-9]+([[:space:]]+[a-z]+)?[[:space:]]+languages?' "$readme" || true)
+          EOF
+
+          if [ "$prose_stale" -ne 0 ]; then
+            echo "Whichever is wrong, fix it so both state the same number." >&2
+            exit 1
+          fi
+
+          echo "README and the adapter registry agree on $derived languages."
+
       - name: Install runtime guard tools
         shell: bash
         run: |
