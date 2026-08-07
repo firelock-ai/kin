@@ -66,15 +66,17 @@ pub(crate) struct ExactTreeSelection {
 }
 
 fn require_repository_authority(
-    binding: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
-) -> Result<super::repository_authority::ActiveRepositoryAuthority> {
-    super::repository_authority::ActiveRepositoryAuthority::open(binding.ok_or_else(|| {
-        McpError::Context(
-            "graph authority gap: this MCP runtime has no startup-pinned local repository \
-             authority binding"
-                .to_string(),
-        )
-    })?)
+    binding: Option<&super::repository_authority::RequestRepositoryAuthority>,
+) -> Result<std::sync::Arc<super::repository_authority::ActiveRepositoryAuthority>> {
+    binding
+        .ok_or_else(|| {
+            McpError::Context(
+                "graph authority gap: this MCP runtime has no startup-pinned local repository \
+                 authority binding"
+                    .to_string(),
+            )
+        })?
+        .open()
 }
 
 fn explicit_source_change_id(
@@ -93,7 +95,7 @@ fn explicit_source_change_id(
 pub(crate) fn resolve_tree_selection<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&super::repository_authority::RequestRepositoryAuthority>,
 ) -> Result<ExactTreeSelection> {
     let explicit = explicit_source_change_id(args)?;
     let (source_change_id, tree) = match explicit {
@@ -176,7 +178,7 @@ fn select_artifact<'a>(
 pub fn handle_artifact_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&super::repository_authority::RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let selection = resolve_tree_selection(args, store, repository_authority)?;
     let offset = args
@@ -213,7 +215,7 @@ pub fn handle_artifact_list<G: GraphStore>(
 pub fn handle_artifact_read<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&super::repository_authority::LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&super::repository_authority::RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let selection = resolve_tree_selection(args, store, repository_authority)?;
     let artifact = select_artifact(args, &selection.tree)?;

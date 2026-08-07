@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use kin_core::LocalRepositoryAuthorityBinding;
+use super::repository_authority::RequestRepositoryAuthority;
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
 use kin_review::{format_review, SemanticReview};
@@ -276,7 +276,7 @@ change before merge, or to feed a merge-gate dashboard.";
 fn resolve_shadow_ref<G: GraphStore>(
     store: &G,
     reference: &str,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<SemanticChangeId> {
     if let Some(branch_name) = reference.strip_prefix("branch:") {
         return resolve_shadow_branch(store, branch_name, repository_authority);
@@ -307,17 +307,17 @@ fn resolve_shadow_ref<G: GraphStore>(
 fn resolve_shadow_branch<G: GraphStore>(
     store: &G,
     branch_name: &str,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<SemanticChangeId> {
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
-        repository_authority.ok_or_else(|| {
+    let authority = repository_authority
+        .ok_or_else(|| {
             McpError::Context(
                 "graph authority gap: shadow ref resolution requires a startup-pinned local \
                  repository authority binding"
                     .to_string(),
             )
-        })?,
-    )?;
+        })?
+        .open()?;
     let ref_name = super::repository_authority::parse_branch_ref(branch_name)?;
     let change_id = authority.resolve_named_ref(&ref_name)?;
     ensure_shadow_change(store, change_id, branch_name)
@@ -345,18 +345,18 @@ fn ensure_shadow_change<G: GraphStore>(
 fn resolve_shadow_git<G: GraphStore>(
     store: &G,
     git_oid: &str,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<SemanticChangeId> {
     let oid = super::repository_authority::parse_git_object_id(git_oid)?;
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(
-        repository_authority.ok_or_else(|| {
+    let authority = repository_authority
+        .ok_or_else(|| {
             McpError::Context(
                 "graph authority gap: Git alias resolution requires a startup-pinned local \
                  repository authority binding"
                     .to_string(),
             )
-        })?,
-    )?;
+        })?
+        .open()?;
     let change_id = authority.resolve_git_oid(oid)?;
     ensure_shadow_change(store, change_id, git_oid)
 }
@@ -364,7 +364,7 @@ fn resolve_shadow_git<G: GraphStore>(
 pub fn handle_shadow_gate_report<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
-    repository_authority: Option<&LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
     let base_ref = get_string_param(args, "base")?;
     let head_ref = get_string_param(args, "head")?;

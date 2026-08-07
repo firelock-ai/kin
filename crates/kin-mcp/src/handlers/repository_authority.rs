@@ -11,7 +11,9 @@
 //! and let one daemon silently change which repository it serves.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use kin_db::{
     LocalFileBackend, PersistedRepositoryAuthority, RepositoryAuthorityManager,
@@ -52,7 +54,7 @@ impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
 /// A process launched outside a Kin repository has no binding; handlers that
 /// require exact repository authority will then fail loudly. An invalid
 /// repository that *is* discovered remains a startup error.
-pub(crate) fn discover_for_process() -> Result<Option<LocalRepositoryAuthorityBinding>> {
+pub(crate) fn discover_for_process() -> Result<Option<RequestRepositoryAuthority>> {
     let start = std::env::var_os("KIN_SOURCE_ROOT")
         .map(PathBuf::from)
         .map(Ok)
@@ -61,14 +63,128 @@ pub(crate) fn discover_for_process() -> Result<Option<LocalRepositoryAuthorityBi
         return Ok(None);
     };
     LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .map(RequestRepositoryAuthority::pinned)
         .map(Some)
         .map_err(|error| McpError::Context(format!("graph authority gap: {error}")))
 }
 
-pub(crate) struct ActiveRepositoryAuthority {
+pub struct ActiveRepositoryAuthority {
     manager: RepositoryAuthorityManager<LocalFileBackend>,
     pub repository_id: RepositoryId,
     pub workspace_id: WorkspaceId,
+}
+
+/// The repository authority one request reads at, and when it was opened.
+///
+/// Opening authority re-verifies every persisted body against its content
+/// address, so it costs whatever the whole store is worth rather than whatever
+/// the request asked for. A one-shot process has no one to share that with and
+/// opens for itself, which is what every handler did before this type existed.
+/// A long-lived server does: it resolves one open per durable publication and
+/// hands the same authority to every request that reads at that publication.
+///
+/// Both arms answer from an open that passed KinDB's complete open-time
+/// validation. There is no third arm, no flag, and no path through this type
+/// that produces authority which skipped validation -- reuse can only hand back
+/// the result of a full validation that already ran over these exact durable
+/// bytes. What a server has to get right is not WHETHER the authority it shares
+/// was validated but WHICH publication it was validated at; see
+/// [`Self::shared`].
+#[derive(Clone)]
+pub struct RequestRepositoryAuthority {
+    binding: LocalRepositoryAuthorityBinding,
+    shared: Option<SharedAuthorityResolver>,
+}
+
+/// A server's promise to produce authority for the publication a request reads
+/// at, run only if the request turns out to need source at all.
+///
+/// Deferred rather than resolved up front because most of what an MCP dispatch
+/// carries never reads a body: resolving eagerly would charge a session or
+/// transaction call for the first full open of a publication it does not touch.
+pub type SharedAuthorityResolver =
+    Arc<dyn Fn() -> Result<Arc<ActiveRepositoryAuthority>> + Send + Sync>;
+
+impl RequestRepositoryAuthority {
+    /// Authority this request opens for itself, once, on first use.
+    pub fn pinned(binding: LocalRepositoryAuthorityBinding) -> Self {
+        Self {
+            binding,
+            shared: None,
+        }
+    }
+
+    /// Authority a server resolves for the publication this request reads at.
+    ///
+    /// The server owns the freshness argument, and it is the whole of what this
+    /// type cannot check for itself. Each call to `resolve` must return an
+    /// authority opened at a durable publication the server confirmed is still
+    /// the one local storage holds, with that confirmation read BEFORE the open
+    /// it labels rather than after. A label taken afterwards can name a
+    /// publication that landed during the load, which marks older bytes as
+    /// current and serves them past the commit that replaced them.
+    pub fn shared(
+        binding: LocalRepositoryAuthorityBinding,
+        resolve: SharedAuthorityResolver,
+    ) -> Self {
+        Self {
+            binding,
+            shared: Some(resolve),
+        }
+    }
+
+    /// Authority a server already resolved for the publication this request
+    /// reads at.
+    ///
+    /// The eager form of [`Self::shared`], for a caller that decided the
+    /// request reads source before starting it. The same freshness obligation
+    /// applies, at the instant the caller resolved.
+    pub fn already_open(
+        binding: LocalRepositoryAuthorityBinding,
+        authority: Arc<ActiveRepositoryAuthority>,
+    ) -> Self {
+        Self::shared(binding, Arc::new(move || Ok(Arc::clone(&authority))))
+    }
+
+    /// The startup-pinned identity and storage capability behind this
+    /// authority, for the surfaces that still take a binding.
+    pub fn binding(&self) -> &LocalRepositoryAuthorityBinding {
+        &self.binding
+    }
+
+    /// The open authority to read this request from.
+    ///
+    /// Reuses the caller's open when there is one, and otherwise performs the
+    /// full validating open. Handlers call this rather than
+    /// [`ActiveRepositoryAuthority::open`] so a server's shared open is not
+    /// silently bypassed by one read path.
+    pub(crate) fn open(&self) -> Result<Arc<ActiveRepositoryAuthority>> {
+        match &self.shared {
+            Some(resolve) => resolve(),
+            None => self.open_fresh(),
+        }
+    }
+
+    /// Open authority from durable storage, ignoring any open handed in.
+    ///
+    /// For the paths whose answer is "has this moved?". A shared open describes
+    /// the publication its owner sampled, so re-reading it can only ever return
+    /// what the caller already saw -- correct for a read, useless for a
+    /// re-check. Loading again is the only way to observe a commit that landed
+    /// under a separate process since.
+    pub(crate) fn open_fresh(&self) -> Result<Arc<ActiveRepositoryAuthority>> {
+        ActiveRepositoryAuthority::open(&self.binding).map(Arc::new)
+    }
+}
+
+impl fmt::Debug for RequestRepositoryAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestRepositoryAuthority")
+            .field("binding", &self.binding)
+            .field("shared", &self.shared.is_some())
+            .finish()
+    }
 }
 
 /// One instant of workspace authority: the exact graph-owned tree, its identity
@@ -98,6 +214,13 @@ pub(crate) struct WorkspaceReadSample {
 /// once per request stays O(1) here no matter how large the store gets, and one
 /// that opens per candidate does not. Public because the surfaces that must hold
 /// that bound (`semantic_locate`, `kin locate --snippets`) live in other crates.
+///
+/// It counts LOADS, not requests: serving a request from an authority a server
+/// already opened for the same durable publication performs no recovery and is
+/// not counted. That is what makes this counter the acceptance instrument for
+/// sharing one open across a publication -- it climbs with publications rather
+/// than with request volume, and a path that quietly reverted to opening per
+/// request would climb with volume again.
 pub static REPOSITORY_AUTHORITY_OPEN_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -126,7 +249,13 @@ pub fn repository_authority_opens_on_this_thread() -> u64 {
 }
 
 impl ActiveRepositoryAuthority {
-    pub(crate) fn open(binding: &LocalRepositoryAuthorityBinding) -> Result<Self> {
+    /// Perform one full validating open.
+    ///
+    /// Public so a server can pay for one open per durable publication and hand
+    /// the result to [`RequestRepositoryAuthority::already_open`]. Read paths
+    /// inside a request go through [`RequestRepositoryAuthority::open`]
+    /// instead, so a shared open is never bypassed by one of them.
+    pub fn open(binding: &LocalRepositoryAuthorityBinding) -> Result<Self> {
         REPOSITORY_AUTHORITY_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| opens.set(opens.get() + 1));
         let manager = binding.open_manager().map_err(|error| {

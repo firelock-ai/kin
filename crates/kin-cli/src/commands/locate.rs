@@ -1780,7 +1780,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     extra_priority_files: Vec<(String, f32)>,
     vector_source: Option<&kin_db::InMemoryGraph>,
     snippet_opts: SnippetOptions,
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<LocateResult> {
     run_with_graph_capture_budgeted(
@@ -1848,7 +1848,7 @@ fn run_with_graph_capture_budgeted(
     extra_priority_files: Vec<(String, f32)>,
     vector_source: Option<&kin_db::InMemoryGraph>,
     snippet_opts: SnippetOptions,
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
     mut budget: LocateBudget,
 ) -> Result<LocateResult> {
@@ -3978,8 +3978,11 @@ pub fn run_with_graph_capture_at_ref(
 ) -> Result<LocateResult> {
     let authority =
         crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?;
+    // A one-shot CLI process has no earlier request to share an open with, so
+    // the source session holds the pinned arm and opens for itself.
+    let source_authority = kin_mcp::handlers::RequestRepositoryAuthority::pinned(binding.clone());
     run_with_repository_authority_capture_at_ref(
-        Some(binding),
+        Some(&source_authority),
         authority.manager(),
         vector_source,
         head,
@@ -3994,7 +3997,7 @@ pub fn run_with_graph_capture_at_ref(
 }
 
 fn run_with_repository_authority_capture_at_ref<B>(
-    repository_authority: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     authority: &kin_db::RepositoryAuthorityManager<B>,
     vector_source: &kin_db::InMemoryGraph,
     head: &SemanticChangeId,

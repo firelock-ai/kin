@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::daemon_delegate;
 use crate::envelope::{self, Envelope};
 use crate::error::{McpError, Result};
-use crate::handlers::{handle_tool_call, LocalRepositoryAuthorityBinding};
+use crate::handlers::{handle_tool_call, RequestRepositoryAuthority};
 use crate::session::SessionRegistry;
 use crate::tools::tool_definitions;
 use crate::types::*;
@@ -32,7 +32,7 @@ pub struct McpServerConfig {
     ///
     /// Product daemon mode dispatches inside the daemon and supplies its own
     /// retained binding; it never populates this stdio-side field.
-    pub repository_authority: Option<LocalRepositoryAuthorityBinding>,
+    pub repository_authority: Option<RequestRepositoryAuthority>,
 }
 
 /// How the stdio server should present session authority.

@@ -2463,7 +2463,9 @@ mod tests {
 
         // The exact bytes `get_entity` returns, then straight back in as the
         // payload, which is the round trip nothing else in the workspace walks.
-        let binding = state.local_repository_authority_binding().unwrap();
+        let binding = kin_mcp::handlers::RequestRepositoryAuthority::pinned(
+            state.local_repository_authority_binding().unwrap(),
+        );
         let response = kin_mcp::handlers::common::entity_response_json(
             state.graph.as_ref(),
             &entity,

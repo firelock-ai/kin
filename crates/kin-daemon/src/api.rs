@@ -68,10 +68,7 @@ impl ActiveApiRepositoryAuthority {
             .local_repository_authority_binding()
             .map_err(repository_authority_error)?;
         let manager = binding.open_manager().map_err(repository_authority_error)?;
-        state
-            .projection_authority
-            .loads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.projection_authority.record_load();
         Ok(Self {
             manager: Arc::new(manager),
             repository_id: binding.repository_id().clone(),
@@ -195,16 +192,28 @@ fn read_local_publication_identity(
     ))
 }
 
-/// One repository-v6 authority shared across the daemon's projection routes.
+/// One repository-v6 authority per durable publication, shared across the
+/// daemon's readers.
 ///
 /// Opening authority is a full snapshot read, SHA-256, and deserialize under an
-/// exclusive repository lock. Paying that per projected read makes every VFS
-/// request proportional to whole-repository size. Holding one open authority
-/// and revalidating it against the durable publication record keeps the answer
+/// exclusive repository lock, and it re-verifies every persisted body against
+/// its content address. Paying that per request makes every request
+/// proportional to whole-repository size. Holding one open authority and
+/// revalidating it against the durable publication record keeps the answer
 /// exactly as fresh while making the common request a small metadata read.
+///
+/// Two readers hold slots here, because they read through different crates'
+/// authority wrappers: the projection routes (`ActiveApiRepositoryAuthority`,
+/// for workspace tree state) and the MCP query tools (kin-mcp's
+/// `ActiveRepositoryAuthority`, for source projection). Both slots key on the
+/// same [`LocalPublicationIdentity`] under the same load gate and count into
+/// the same [`Self::loads`], so the contract is one contract; only the wrapper
+/// differs. The name predates the second reader and is kept because the field
+/// it fills is declared elsewhere.
 #[derive(Default)]
 pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
+    query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -223,14 +232,30 @@ struct HeldProjectionAuthority {
     authority: ActiveApiRepositoryAuthority,
 }
 
+#[derive(Clone)]
+struct HeldQueryAuthority {
+    /// Read strictly before the authority it labels was loaded, exactly as for
+    /// [`HeldProjectionAuthority::published`] and for the same reason.
+    published: LocalPublicationIdentity,
+    authority: Arc<kin_mcp::handlers::ActiveRepositoryAuthority>,
+}
+
 impl ProjectionAuthorityCache {
     /// Complete durable-authority loads this daemon state has paid for.
     ///
-    /// Every [`ActiveApiRepositoryAuthority::open`] counts, whichever route
-    /// asked for it. One load per publication rather than one per request is
-    /// the property this cache exists to make true.
+    /// Every full open counts, whichever route asked for it and whichever
+    /// wrapper it produced. One load per publication rather than one per
+    /// request is the property this cache exists to make true, and this counter
+    /// is how a test states it: it climbs with publications, never with request
+    /// volume, and a path that reverted to opening per request climbs with
+    /// volume again.
     pub(crate) fn loads(&self) -> u64 {
         self.loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_load(&self) {
+        self.loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn reuse(&self, published: &LocalPublicationIdentity) -> Option<ActiveApiRepositoryAuthority> {
@@ -251,8 +276,30 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_query(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<kin_mcp::handlers::ActiveRepositoryAuthority>> {
+        lock_recover(&self.query)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.authority))
+    }
+
+    fn install_query(
+        &self,
+        published: LocalPublicationIdentity,
+        authority: Arc<kin_mcp::handlers::ActiveRepositoryAuthority>,
+    ) {
+        *lock_recover(&self.query) = Some(HeldQueryAuthority {
+            published,
+            authority,
+        });
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
+        *lock_recover(&self.query) = None;
     }
 }
 
@@ -321,6 +368,80 @@ fn projection_repository_authority(
         repository = %authority.repository_id,
         loads = state.projection_authority.loads(),
         "projection repository authority loaded"
+    );
+    Ok(authority)
+}
+
+/// Resolve the repository-v6 authority the MCP query tools read source from.
+///
+/// The same contract as [`projection_repository_authority`], for the other
+/// wrapper: probe the pinned namespace, read which publication local storage
+/// holds, reuse the authority already loaded at that publication, and otherwise
+/// perform one full validating open behind the shared load gate.
+///
+/// STALENESS, EXACTLY. A query served from a reused authority answers from the
+/// durable publication whose record this function read just before handing the
+/// authority over. That is the publication a fresh open at that same instant
+/// would have loaded, and both would decode the same content-addressed bytes
+/// under the same validation, so the reused answer IS the fresh answer -- a
+/// reused open is not an approximation of one. What such a query cannot observe
+/// is a commit that lands after its publication read; neither can a fresh open,
+/// which also samples storage once and then answers from what it sampled. Every
+/// call reads the record again, so a publication that lands between two calls
+/// is observed by the second, including one committed by a separate process
+/// such as a CLI ingest running beside the daemon. The record digest errs in
+/// the safe direction: identical record bytes mean identical durable state, and
+/// a rewrite that is not a new publication costs one extra full load rather
+/// than a stale serve.
+///
+/// Reuse never weakens what an open proves. KinDB re-verifies every persisted
+/// body against its content address on every open, and this function cannot
+/// reach past that: it either hands back the result of one that already ran for
+/// these exact durable bytes, or it performs one.
+///
+/// Blocking: reads storage metadata and, on a publication change, loads the
+/// complete durable authority.
+fn query_repository_authority(
+    state: &DaemonState,
+) -> Result<Arc<kin_mcp::handlers::ActiveRepositoryAuthority>, (StatusCode, String)> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let repository_id = binding.repository_id().clone();
+
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse_query(&published) {
+        return Ok(authority);
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    // Re-read under the gate: the publication may have moved while this request
+    // waited, and the label installed below must be the one taken before the
+    // load it describes.
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(authority) = state.projection_authority.reuse_query(&published) {
+        return Ok(authority);
+    }
+    let authority = Arc::new(
+        kin_mcp::handlers::ActiveRepositoryAuthority::open(&binding)
+            .map_err(repository_authority_error)?,
+    );
+    state.projection_authority.record_load();
+    state
+        .projection_authority
+        .install_query(published, Arc::clone(&authority));
+    tracing::debug!(
+        repository = %repository_id,
+        loads = state.projection_authority.loads(),
+        "query repository authority loaded"
     );
     Ok(authority)
 }
@@ -1944,7 +2065,7 @@ where
 }
 
 async fn mcp_find_references_with_stable_authority<F>(
-    state: &DaemonState,
+    state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     selected_graph: Arc<kin_db::InMemoryGraph>,
     authority: RequestGraphAuthority,
@@ -1955,7 +2076,7 @@ where
     F: FnMut(usize),
 {
     let spine = state.ensure_spine();
-    let repository_authority = mcp_repository_authority_binding(state)?;
+    let repository_authority = mcp_repository_authority_source(state)?;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             continue;
@@ -1987,7 +2108,7 @@ where
     ))
 }
 
-fn mcp_repository_authority_binding(
+fn mcp_local_repository_binding(
     state: &DaemonState,
 ) -> kin_mcp::Result<Option<kin_core::LocalRepositoryAuthorityBinding>> {
     if state.storage_backend.is_some() {
@@ -2003,10 +2124,67 @@ fn mcp_repository_authority_binding(
         })
 }
 
+fn mcp_authority_gap(message: impl std::fmt::Display) -> kin_mcp::McpError {
+    kin_mcp::McpError::Context(format!("graph authority gap: {message}"))
+}
+
+/// The authority source the daemon's MCP dispatch hands one tool call.
+///
+/// Resolution is deferred to the first source read rather than performed here.
+/// Most of what reaches this dispatch never reads a body -- session,
+/// transaction, and pure-graph tools -- and resolving up front would charge the
+/// first such call for a full open of a publication it does not touch. The
+/// resolver runs at most once per request, when a handler actually needs
+/// authority, and answers from the shared per-publication load.
+fn mcp_repository_authority_source(
+    state: &Arc<DaemonState>,
+) -> kin_mcp::Result<Option<kin_mcp::handlers::RequestRepositoryAuthority>> {
+    Ok(mcp_local_repository_binding(state)?.map(|binding| shared_authority_source(state, binding)))
+}
+
+/// Bind a request's authority to this daemon's shared per-publication load.
+///
+/// The resolver runs at most once per request, and only if a handler reaches a
+/// read that needs authority.
+fn shared_authority_source(
+    state: &Arc<DaemonState>,
+    binding: kin_core::LocalRepositoryAuthorityBinding,
+) -> kin_mcp::handlers::RequestRepositoryAuthority {
+    let resolver_state = Arc::clone(state);
+    kin_mcp::handlers::RequestRepositoryAuthority::shared(
+        binding,
+        Arc::new(move || {
+            query_repository_authority(&resolver_state)
+                .map_err(|(_, message)| mcp_authority_gap(message))
+        }),
+    )
+}
+
+/// The authority source for a route that has already decided it reads source.
+///
+/// Resolves through the shared per-publication load immediately, because the
+/// caller only reaches this after establishing that the request projects
+/// bodies.
 fn require_mcp_local_repository_authority(
     state: &DaemonState,
+) -> kin_mcp::Result<kin_mcp::handlers::RequestRepositoryAuthority> {
+    let binding = require_mcp_local_repository_binding(state)?;
+    let authority =
+        query_repository_authority(state).map_err(|(_, message)| mcp_authority_gap(message))?;
+    Ok(kin_mcp::handlers::RequestRepositoryAuthority::already_open(
+        binding, authority,
+    ))
+}
+
+/// The startup-pinned binding alone, for routes that hand it to a command
+/// helper which opens authority through its own crate's wrapper.
+///
+/// These do not read through this daemon's shared open, so resolving one here
+/// would load a publication the route never consults.
+fn require_mcp_local_repository_binding(
+    state: &DaemonState,
 ) -> kin_mcp::Result<kin_core::LocalRepositoryAuthorityBinding> {
-    mcp_repository_authority_binding(state)?.ok_or_else(|| {
+    mcp_local_repository_binding(state)?.ok_or_else(|| {
         kin_mcp::McpError::Context(
             "graph authority gap: this MCP operation requires startup-pinned local repository \
              authority, but the daemon is serving hosted snapshot authority"
@@ -4740,9 +4918,15 @@ async fn run_fused_locate_for_state(
     max_files_explicit: bool,
     snippet_opts: kin_cli::commands::locate::SnippetOptions,
 ) -> Result<kin_cli::commands::locate::LocateResult, String> {
-    let repository_authority = state
-        .local_repository_authority_binding()
-        .map_err(|error| error.to_string())?;
+    // Bound to this daemon's shared per-publication load, and resolved only if
+    // the page actually projects a body: a locate that returns no snippets
+    // never opens authority at all.
+    let repository_authority = shared_authority_source(
+        state,
+        state
+            .local_repository_authority_binding()
+            .map_err(|error| error.to_string())?,
+    );
     // When a session scope is active, discover historical test artifact
     // priority files to match the ref-scoped path's behavior.
     let session_scope = if let Some(sid) = session_id {
@@ -6870,7 +7054,7 @@ async fn mcp_tools_call(
                 "missing required parameter: entity_id".to_string(),
             )));
         };
-        let repository_authority = match require_mcp_local_repository_authority(&state) {
+        let repository_authority = match require_mcp_local_repository_binding(&state) {
             Ok(binding) => binding,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
@@ -6893,7 +7077,7 @@ async fn mcp_tools_call(
             Ok(parsed) => parsed,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
-        let repository_authority = match require_mcp_local_repository_authority(&state) {
+        let repository_authority = match require_mcp_local_repository_binding(&state) {
             Ok(binding) => binding,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
@@ -6960,7 +7144,7 @@ async fn mcp_tools_call(
             direction: parsed_direction,
             limit_per_step,
         };
-        let repository_authority = match require_mcp_local_repository_authority(&state) {
+        let repository_authority = match require_mcp_local_repository_binding(&state) {
             Ok(binding) => binding,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
         };
@@ -7236,7 +7420,7 @@ async fn mcp_tools_call(
             "coordination enforcement rejected transaction before repository publication: {evidence}"
         ))
     } else {
-        let repository_authority = mcp_repository_authority_binding(&state);
+        let repository_authority = mcp_repository_authority_source(&state);
         let handled = if request.name == "find_references" {
             mcp_find_references_with_stable_authority(
                 &state,
@@ -25015,12 +25199,21 @@ mod tests {
     /// Call `semantic_locate` over the MCP dispatch route and return the
     /// parsed JSON payload (must not be a tool error).
     async fn call_semantic_locate(app: Router, arguments: serde_json::Value) -> serde_json::Value {
+        call_mcp_tool(app, "semantic_locate", arguments).await
+    }
+
+    /// Run one MCP tool through the real dispatch route and parse its JSON.
+    async fn call_mcp_tool(
+        app: Router,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
         let response = app
             .oneshot(
                 Request::post("/mcp/tools/call")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({ "name": "semantic_locate", "arguments": arguments }).to_string(),
+                        json!({ "name": name, "arguments": arguments }).to_string(),
                     ))
                     .unwrap(),
             )
@@ -25031,7 +25224,7 @@ mod tests {
             .await
             .unwrap();
         let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
-        assert_ne!(result.is_error, Some(true), "tool call errored: {result:?}");
+        assert_ne!(result.is_error, Some(true), "{name} errored: {result:?}");
         let text = match result.content.first().unwrap() {
             kin_mcp::ContentBlock::Text { text } => text,
         };
@@ -25271,36 +25464,209 @@ mod tests {
     /// `install_repository_file` is its own change, so the entities are
     /// introduced by different changes. That is the shape a real retrieval page
     /// has, and it is the one where a per-result authority open multiplies.
-    fn install_locate_page(state: &Arc<DaemonState>, page: usize) {
-        for index in 0..page {
-            let path = format!("src/config{index}.py");
-            let source =
-                format!("def parse_config{index}(path):\n    return {{\"which\": {index}}}\n");
-            install_repository_file(state, &path, source.as_bytes());
-            install_working_copy_file(state, &path, source.as_bytes(), false);
-            let mut entity = test_entity(&format!("parse_config{index}"), &path);
-            entity.span = Some(SourceSpan {
-                file: kin_model::FilePathId::new(&path),
-                start_byte: 0,
-                end_byte: source.len(),
-                start_line: 0,
-                start_col: 0,
-                end_line: 1,
-                end_col: 24,
-            });
-            // The fused ranker reads this preview to decide an entity is a
-            // definition rather than a bare reference, and only definitions get
-            // bodies. Without it this fixture would exercise the reference path,
-            // which projects nothing and would make the bound below vacuous.
-            entity.metadata.extra.insert(
-                "embedding_body_preview".to_string(),
-                json!(source.lines().next().unwrap()),
-            );
-            state.graph.upsert_entity(&entity).unwrap();
-        }
+    /// Distinct query tools at ONE publication share ONE authority load.
+    ///
+    /// FIR-2079. Every MCP query request used to open repository authority for
+    /// itself, and an open decodes the whole persisted snapshot and re-verifies
+    /// every persisted body against its content address, so the query floor was
+    /// whole-repository work per REQUEST rather than per publication.
+    ///
+    /// The bound is a COUNT, never elapsed time. What an open costs is a
+    /// property of the store, so a timing assertion on a four-file fixture
+    /// would pass just as readily with the defect present; a count does not
+    /// move with the host and does not move with store size either.
+    ///
+    /// It reads this daemon state's own counter rather than the process-wide
+    /// open count, so a sibling test opening authority in parallel cannot enter
+    /// it. The only path that increments it is one that performed a full
+    /// validating open, which is why the same counter is also the evidence
+    /// below that a publication boundary re-validated.
+    #[tokio::test]
+    async fn distinct_query_tools_share_one_authority_load_per_publication() {
+        const PAGE: usize = 3;
+        // Same reason as the FIR-1897 test above: a phase budget exhausted by a
+        // stalled host makes locate return early with nothing projected, which
+        // reads at these assertions exactly like the regression they catch.
+        let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", "0")
+            .with("KIN_LOCATE_PHASE_MULTIHOP_SECS", "0")
+            .with("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SCORING_SECS", "0");
+        let state = test_state();
+        let entities = install_locate_page(&state, PAGE);
+        let app = router(Arc::clone(&state));
+
+        let before = state.projection_authority.loads();
+        let located = call_semantic_locate(
+            app.clone(),
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused",
+                "include_snippet": true
+            }),
+        )
+        .await;
+        let entity = call_mcp_tool(
+            app.clone(),
+            "get_entity",
+            json!({ "entity_id": entities[0].to_string() }),
+        )
+        .await;
+        let pack = call_mcp_tool(
+            app.clone(),
+            "get_context_pack",
+            json!({ "entity_id": entities[1].to_string() }),
+        )
+        .await;
+
+        // Non-vacuity: each call must actually have projected graph-owned
+        // source. A tool that returned without reading a body needs no
+        // authority at all, and three such calls would hold the count at one
+        // while proving nothing about sharing.
+        assert!(
+            bodies_projected(&located) >= 2,
+            "the located page must project bodies for the bound to mean anything: {located}"
+        );
+        assert!(
+            entity["source_excerpt"]
+                .as_str()
+                .is_some_and(|body| body.contains("parse_config0")),
+            "get_entity must serve its graph-owned body: {entity}"
+        );
+        assert!(
+            pack["focal_entity"]["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("parse_config1")),
+            "get_context_pack must serve its focal body: {pack}"
+        );
+
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            1,
+            "three distinct query tools reading source at one publication must load repository \
+             authority exactly once; a count that climbs with request volume is the per-request \
+             open this shares"
+        );
+    }
+
+    /// A publication boundary forces a fresh, fully validating load.
+    ///
+    /// The other half of the bound above, and the one that keeps it honest: a
+    /// count held at one by never reloading would be a cache that serves
+    /// authority the store has moved past. The commit here goes through the
+    /// ordinary repository write path, exactly as a CLI ingest running beside
+    /// the daemon does.
+    ///
+    /// Freshness is asserted on the ANSWER, not only on the counter. The entity
+    /// installed after the boundary lives on a path the previous publication's
+    /// workspace tree does not carry, so an authority reused across the
+    /// boundary could not serve its body at all.
+    #[tokio::test]
+    async fn a_publication_boundary_costs_exactly_one_more_authority_load() {
+        const AFTER: &str = "def parse_after(path):\n    return {\"which\": \"after\"}\n";
+        let state = test_state();
+        let entities = install_locate_page(&state, 1);
+        let app = router(Arc::clone(&state));
+
+        let before = state.projection_authority.loads();
+        let first = call_mcp_tool(
+            app.clone(),
+            "get_entity",
+            json!({ "entity_id": entities[0].to_string() }),
+        )
+        .await;
+        assert!(
+            first["source_excerpt"].as_str().is_some(),
+            "the first read must project a body, or it loaded no authority: {first}"
+        );
+        let at_first_publication = state.projection_authority.loads() - before;
+        assert_eq!(at_first_publication, 1, "the first read must load once");
+
+        let after = install_source_entity(&state, "parse_after", "src/after.py", AFTER);
+
+        let served = call_mcp_tool(
+            app.clone(),
+            "get_entity",
+            json!({ "entity_id": after.to_string() }),
+        )
+        .await;
+        assert!(
+            served["source_excerpt"]
+                .as_str()
+                .is_some_and(|body| body.contains("parse_after")),
+            "a read after the boundary must serve the publication that replaced the one the \
+             previous read loaded: {served}"
+        );
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            2,
+            "crossing one publication boundary must cost exactly one more full validating load: \
+             fewer means authority was reused past the commit that replaced it, more means the \
+             reuse stopped holding within a publication"
+        );
+
+        // And the new publication is then shared in turn, rather than reloaded
+        // per request from here on.
+        let repeat =
+            call_mcp_tool(app, "get_entity", json!({ "entity_id": after.to_string() })).await;
+        assert!(repeat["source_excerpt"].as_str().is_some());
+        assert_eq!(
+            state.projection_authority.loads() - before,
+            2,
+            "a second read at the new publication must reuse the load the first one paid for"
+        );
+    }
+
+    /// Publish one source file and the graph entity whose span covers it.
+    ///
+    /// Returns the entity id, so a test can aim a tool at a known entity by ID
+    /// rather than at whatever a ranker happens to surface.
+    fn install_source_entity(
+        state: &Arc<DaemonState>,
+        name: &str,
+        path: &str,
+        source: &str,
+    ) -> EntityId {
+        install_repository_file(state, path, source.as_bytes());
+        install_working_copy_file(state, path, source.as_bytes(), false);
+        let mut entity = test_entity(name, path);
+        entity.span = Some(SourceSpan {
+            file: kin_model::FilePathId::new(path),
+            start_byte: 0,
+            end_byte: source.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 24,
+        });
+        // The fused ranker reads this preview to decide an entity is a
+        // definition rather than a bare reference, and only definitions get
+        // bodies. Without it this fixture would exercise the reference path,
+        // which projects nothing and would make the bound below vacuous.
+        entity.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            json!(source.lines().next().unwrap()),
+        );
+        state.graph.upsert_entity(&entity).unwrap();
+        entity.id
+    }
+
+    fn install_locate_page(state: &Arc<DaemonState>, page: usize) -> Vec<EntityId> {
+        let ids = (0..page)
+            .map(|index| {
+                let path = format!("src/config{index}.py");
+                let source =
+                    format!("def parse_config{index}(path):\n    return {{\"which\": {index}}}\n");
+                install_source_entity(state, &format!("parse_config{index}"), &path, &source)
+            })
+            .collect();
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        ids
     }
 
     /// Bodies projected on a `semantic_locate` page, by whichever key the arm
