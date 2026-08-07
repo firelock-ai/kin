@@ -862,7 +862,24 @@ fn resolve_source_entity(
 
 fn graph_source_record(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
-    graph: &kin_db::InMemoryGraph,
+    _graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> Result<GraphSourceRecord> {
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(binding)?;
+    let workspace = authority.workspace()?;
+    graph_source_record_from(&authority, &workspace, entity)
+}
+
+/// Build an entity's source record through an authority the caller already
+/// holds open.
+///
+/// Opening authority verifies every stored body once, linear in store size, so
+/// a caller that needs records for many entities must pay that once for the set
+/// rather than once per entity. `graph_source_record` above is the single-record
+/// convenience wrapper; batch callers own the open and pass it here.
+pub(crate) fn graph_source_record_from(
+    authority: &super::repository_authority::ActiveRepositoryAuthority,
+    workspace: &kin_model::WorkspaceState,
     entity: &Entity,
 ) -> Result<GraphSourceRecord> {
     let file_origin = entity
@@ -873,7 +890,7 @@ fn graph_source_record(
         .span
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("entity '{}' has no source span", entity.name))?;
-    let (bytes, blob) = read_entity_file_bytes_with_digest(binding, graph, entity)?;
+    let (bytes, blob) = read_entity_file_bytes_with_digest_from(authority, workspace, entity)?;
     // Bind the span to the bytes it is about to cut, through the SAME rule the MCP
     // resolver uses.
     //
@@ -949,6 +966,24 @@ pub(crate) fn read_entity_file_bytes_with_digest(
     _graph: &impl GraphStore,
     entity: &Entity,
 ) -> Result<(Vec<u8>, kin_model::Hash256)> {
+    let authority = super::repository_authority::ActiveRepositoryAuthority::open(binding)?;
+    let workspace = authority.workspace()?;
+    read_entity_file_bytes_with_digest_from(&authority, &workspace, entity)
+}
+
+/// The same read against an authority and workspace the caller already holds.
+///
+/// Split from [`read_entity_file_bytes_with_digest`] so a caller reading many
+/// entities pays one authority open for the whole set. The workspace is passed
+/// alongside rather than re-derived per entity so every read in a set resolves
+/// against one coherent generation: re-deriving it per entity would let a
+/// publication landing mid-walk serve some entities from the tree that replaced
+/// the one the others came from.
+pub(crate) fn read_entity_file_bytes_with_digest_from(
+    authority: &super::repository_authority::ActiveRepositoryAuthority,
+    workspace: &kin_model::WorkspaceState,
+    entity: &Entity,
+) -> Result<(Vec<u8>, kin_model::Hash256)> {
     let file_id = entity
         .file_origin
         .as_ref()
@@ -959,8 +994,6 @@ pub(crate) fn read_entity_file_bytes_with_digest(
             file_id.0
         )
     })?;
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(binding)?;
-    let workspace = authority.workspace()?;
     let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
         anyhow::anyhow!(
             "entity source '{}' is absent from repository-v6 workspace {} at generation {}",

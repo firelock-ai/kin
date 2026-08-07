@@ -19,14 +19,151 @@ use anyhow::{Context, Result};
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, RelationKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
-use crate::commands::graph::{build_graph_source_response, GraphSourceRecord};
+use crate::commands::graph::{graph_source_record_from, GraphSourceRecord};
+use crate::commands::locate::{record_degradation, RetrievalDegradation};
+use crate::commands::repository_authority::ActiveRepositoryAuthority;
 
 const DEFAULT_DEPTH: usize = 3;
 const MAX_DEPTH: usize = 8;
 const DEFAULT_LIMIT_PER_STEP: usize = 5;
 const MAX_LIMIT_PER_STEP: usize = 25;
 const MAX_TOTAL_STEPS: usize = 200;
+
+/// Wall-clock ceiling for one trace walk.
+///
+/// Every bound above this one is structural — depth, per-step fan-out, total
+/// steps — and structural bounds say nothing about elapsed time. A walk of 200
+/// steps is small by every one of them while still running for minutes, because
+/// what each step costs depends on the store rather than on the shape of the
+/// chain. This is the only bound that holds when a step turns out to be
+/// expensive, so it is the one that keeps a trace answerable.
+const DEFAULT_TIME_BUDGET: Duration = Duration::from_secs(20);
+
+/// Relations examined before the walk stops regardless of the clock.
+///
+/// A time budget alone leaves the response time-dependent: the same query
+/// against the same store returns a different chain on a loaded machine than on
+/// an idle one. This bound is deterministic, so a pathological fan-in is cut at
+/// the same place every run and a trace stays reproducible.
+const DEFAULT_MAX_EDGES_SCANNED: usize = 250_000;
+
+/// Hard ceilings applied to one trace walk, independent of the request's own
+/// depth / fan-out parameters.
+///
+/// Those parameters bound the SHAPE of the answer and are the caller's to
+/// choose. These bound the WORK, and are not: a caller cannot ask for an
+/// unbounded walk, because the daemon serving it has other callers.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceBudget {
+    pub time_budget: Duration,
+    pub max_edges_scanned: usize,
+}
+
+impl Default for TraceBudget {
+    fn default() -> Self {
+        Self {
+            time_budget: DEFAULT_TIME_BUDGET,
+            max_edges_scanned: DEFAULT_MAX_EDGES_SCANNED,
+        }
+    }
+}
+
+/// Why a walk stopped expanding.
+///
+/// `Exhausted` is the healthy end: the frontier ran out within every bound.
+/// The rest are refusals to keep working, and each one is reported to the
+/// caller as a degradation rather than silently shortening the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceStop {
+    Exhausted,
+    TimeBudget,
+    EdgeBudget,
+}
+
+/// Running cost of one walk, checked at each frontier node and each relation.
+struct TraceMeter {
+    budget: TraceBudget,
+    started: Instant,
+    edges_scanned: usize,
+}
+
+impl TraceMeter {
+    fn new(budget: TraceBudget) -> Self {
+        Self {
+            budget,
+            started: Instant::now(),
+            edges_scanned: 0,
+        }
+    }
+
+    /// Charge one examined relation and report whether the walk may continue.
+    fn charge_edge(&mut self) -> Option<TraceStop> {
+        self.edges_scanned = self.edges_scanned.saturating_add(1);
+        if self.edges_scanned >= self.budget.max_edges_scanned {
+            return Some(TraceStop::EdgeBudget);
+        }
+        self.exceeded_time()
+    }
+
+    fn exceeded_time(&self) -> Option<TraceStop> {
+        (self.started.elapsed() >= self.budget.time_budget).then_some(TraceStop::TimeBudget)
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+/// Translate a stop reason into the caller-facing degradation record.
+///
+/// `Exhausted` produces nothing: a walk that finished inside every bound has
+/// nothing to disclose, which is what keeps an unaffected trace byte-identical
+/// to the one this bound was added to.
+fn record_trace_stop(
+    sink: &mut Vec<RetrievalDegradation>,
+    stop: TraceStop,
+    meter: &TraceMeter,
+    steps: usize,
+) {
+    let (reason, detail) = match stop {
+        TraceStop::Exhausted => return,
+        TraceStop::TimeBudget => (
+            "time_budget_exceeded",
+            format!(
+                "trace walk stopped after {:.1}s (budget {:.0}s) with {} steps and {} relations \
+                 examined; the chain below is the part that was reached",
+                meter.elapsed().as_secs_f64(),
+                meter.budget.time_budget.as_secs_f64(),
+                steps,
+                meter.edges_scanned,
+            ),
+        ),
+        TraceStop::EdgeBudget => (
+            "edge_budget_exceeded",
+            format!(
+                "trace walk examined {} relations (budget {}) in {:.1}s and stopped with {} \
+                 steps; the chain below is the part that was reached",
+                meter.edges_scanned,
+                meter.budget.max_edges_scanned,
+                meter.elapsed().as_secs_f64(),
+                steps,
+            ),
+        ),
+    };
+    record_degradation(
+        sink,
+        RetrievalDegradation {
+            component: "trace_walk".to_string(),
+            reason: reason.to_string(),
+            detail,
+            remediation: "narrow the trace with a smaller --depth or --limit-per-step, or start \
+                          from a more specific focal entity"
+                .to_string(),
+        },
+    );
+}
 
 /// Direction of traversal from the focal entity.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +272,12 @@ pub struct TraceDataFlowResponse {
     /// True when the traversal was cut off because per-step or total caps
     /// were hit. Lets callers detect when they need to widen the limit.
     pub truncated: bool,
+    /// Every work bound that cut this walk short, in the same machine-readable
+    /// shape `semantic_locate` reports retrieval degradation in. Empty — and
+    /// omitted from the payload — for a walk that finished inside every bound,
+    /// so a trace unaffected by these ceilings is unchanged by them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<RetrievalDegradation>,
 }
 
 /// CLI entry: `kin trace-data-flow --focal <e> [--depth N] [--direction D]
@@ -191,6 +334,20 @@ pub fn build_trace_data_flow_response(
     graph: &kin_db::InMemoryGraph,
     request: &TraceDataFlowRequest,
 ) -> Result<TraceDataFlowResponse> {
+    build_trace_data_flow_response_within(binding, graph, request, TraceBudget::default())
+}
+
+/// The same walk under caller-supplied work ceilings.
+///
+/// Split out so the bounds are testable at a scale a test can actually reach:
+/// the shipped budget is measured in seconds and hundreds of thousands of
+/// edges, and a test that had to exhaust it would be as slow as the defect.
+pub fn build_trace_data_flow_response_within(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    request: &TraceDataFlowRequest,
+    budget: TraceBudget,
+) -> Result<TraceDataFlowResponse> {
     let trimmed = request.focal.trim();
     if trimmed.is_empty() {
         anyhow::bail!("trace_data_flow requires a non-empty focal");
@@ -207,9 +364,46 @@ pub fn build_trace_data_flow_response(
         None => anyhow::bail!("no entity found matching '{}'", trimmed),
     };
 
+    let mut meter = TraceMeter::new(budget);
+    let mut degradations: Vec<RetrievalDegradation> = Vec::new();
+
+    // One authority open for the whole chain, not one per step.
+    //
+    // Opening authority verifies every stored body, linear in store size. The
+    // per-step body projection used to open its own, so a chain of N steps paid
+    // N+1 full-store verifications and a structurally tiny trace ran for
+    // minutes on a large store (FIR-1937, FIR-1909). Holding one open also
+    // makes the chain coherent: every step is now read from the same
+    // generation, where per-step opens could straddle a publication.
+    //
+    // A store with no readable authority still gets its chain. Bodies were
+    // always optional per step, and hoisting the open must not turn a payload
+    // that used to arrive body-less into a failed call — so the failure is
+    // disclosed and the walk continues on identity alone.
+    let projection = match open_body_projection(binding) {
+        Ok(projection) => Some(projection),
+        Err(error) => {
+            record_degradation(
+                &mut degradations,
+                RetrievalDegradation {
+                    component: "entity_bodies".to_string(),
+                    reason: "authority_unavailable".to_string(),
+                    detail: format!(
+                        "repository authority could not be opened, so no step carries an inlined \
+                         body: {error:#}"
+                    ),
+                    remediation: "run 'kin status' to check the repository store, and 'kin init' \
+                                  if it has not been initialized"
+                        .to_string(),
+                },
+            );
+            None
+        }
+    };
+
     // Try to load the focal source record. Failures (missing span, OOB blob)
     // degrade gracefully to the identity-only payload — the chain still works.
-    let focal_record = source_record_or_none(binding, graph, &focal_entity);
+    let focal_record = source_record_or_none(projection.as_ref(), &focal_entity);
 
     let reference_kinds = [
         RelationKind::Calls,
@@ -222,17 +416,27 @@ pub fn build_trace_data_flow_response(
     let mut visited: HashSet<EntityId> = HashSet::new();
     visited.insert(focal_entity.id);
     let mut truncated = false;
+    let mut stop = TraceStop::Exhausted;
 
     // Frontier: (parent_step, parent_entity, parent_depth).
     let mut frontier: Vec<(usize, EntityId, usize)> = vec![(0, focal_entity.id, 0)];
     let mut next_frontier: Vec<(usize, EntityId, usize)>;
 
-    while !frontier.is_empty() {
+    'walk: while !frontier.is_empty() {
         next_frontier = Vec::new();
 
         for (parent_step, parent_id, parent_depth) in frontier.drain(..) {
             if parent_depth >= depth {
                 continue;
+            }
+
+            // Checked before the relation read rather than only inside the
+            // relation loop: reading one node's relations is itself unbounded
+            // work on a high-fan-in entity, so a walk that has already spent
+            // its budget must not start another one.
+            if let Some(reason) = meter.exceeded_time() {
+                stop = reason;
+                break 'walk;
             }
 
             let relations = graph
@@ -249,6 +453,10 @@ pub fn build_trace_data_flow_response(
             let mut callee_count = 0usize;
             let mut caller_count = 0usize;
             for rel in &relations {
+                if let Some(reason) = meter.charge_edge() {
+                    stop = reason;
+                    break 'walk;
+                }
                 if !allowed.contains(&rel.kind) {
                     continue;
                 }
@@ -311,7 +519,7 @@ pub fn build_trace_data_flow_response(
                     Some(entity) => entity,
                     None => continue,
                 };
-                let next_record = source_record_or_none(binding, graph, &next_entity);
+                let next_record = source_record_or_none(projection.as_ref(), &next_entity);
                 let next_depth = parent_depth + 1;
                 let step_index = chain.len() + 1;
 
@@ -347,6 +555,14 @@ pub fn build_trace_data_flow_response(
         frontier = next_frontier;
     }
 
+    // A walk stopped by a work ceiling is truncated in exactly the sense the
+    // existing flag already means, so it sets that flag too; the degradation
+    // adds which ceiling and what it cost, which the flag alone cannot say.
+    if stop != TraceStop::Exhausted {
+        truncated = true;
+        record_trace_stop(&mut degradations, stop, &meter, chain.len());
+    }
+
     Ok(TraceDataFlowResponse {
         focal: focal_record,
         focal_id: focal_entity.id.to_string(),
@@ -358,6 +574,7 @@ pub fn build_trace_data_flow_response(
         total_steps: chain.len(),
         chain,
         truncated,
+        degradations,
     })
 }
 
@@ -377,15 +594,43 @@ fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Opt
     Ok(matches.into_iter().next())
 }
 
+/// The open authority a walk reads every step's body through.
+///
+/// Held for the whole walk so the repeated per-step open is structurally
+/// impossible rather than merely avoided at the current call sites.
+struct BodyProjection {
+    authority: ActiveRepositoryAuthority,
+    workspace: kin_model::WorkspaceState,
+}
+
+fn open_body_projection(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+) -> Result<BodyProjection> {
+    let authority = ActiveRepositoryAuthority::open(binding)
+        .context("open repository authority for trace-data-flow")?;
+    let workspace = authority
+        .workspace()
+        .context("resolve workspace for trace-data-flow")?;
+    Ok(BodyProjection {
+        authority,
+        workspace,
+    })
+}
+
 /// Try to read an entity's source record; fall back to None for entities
 /// without a readable span / blob so the chain still includes their identity.
+///
+/// Takes the already-open projection rather than the binding. The entity is
+/// also passed directly instead of being re-resolved from its own id string,
+/// which is what the previous route through `build_graph_source_response` did:
+/// that wrapper exists to answer a text query, and the walk already holds the
+/// entity the query would resolve back to.
 fn source_record_or_none(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
-    graph: &kin_db::InMemoryGraph,
+    projection: Option<&BodyProjection>,
     entity: &Entity,
 ) -> Option<GraphSourceRecord> {
-    let response = build_graph_source_response(binding, graph, &entity.id.to_string()).ok()?;
-    response.source
+    let projection = projection?;
+    graph_source_record_from(&projection.authority, &projection.workspace, entity).ok()
 }
 
 #[cfg(test)]
@@ -641,6 +886,163 @@ mod tests {
 
         assert_eq!(response.total_steps, 3, "limit_per_step caps the fan-out");
         assert!(response.truncated, "truncated flag must be set when capped");
+    }
+
+    /// A hub whose fan-out is far wider than any per-step limit, so a walk over
+    /// it examines many more relations than it can ever turn into steps.
+    fn hub_graph(fan_out: usize) -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("hub", "src/hub.rs");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+        for i in 0..fan_out {
+            let callee = make_entity(&format!("callee_{i}"), &format!("src/c_{i}.rs"));
+            let callee_id = callee.id;
+            graph.upsert_entity(&callee).unwrap();
+            graph
+                .upsert_relation(&make_relation(focal_id, callee_id, RelationKind::Calls))
+                .unwrap();
+        }
+        (graph, focal_id)
+    }
+
+    fn hub_request(focal_id: EntityId) -> TraceDataFlowRequest {
+        TraceDataFlowRequest {
+            focal: focal_id.to_string(),
+            depth: Some(2),
+            direction: Some(TraceDirection::Calls),
+            limit_per_step: Some(5),
+        }
+    }
+
+    #[test]
+    fn edge_budget_bounds_the_walk_and_says_so() {
+        let (graph, focal_id) = hub_graph(200);
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &hub_request(focal_id),
+            TraceBudget {
+                max_edges_scanned: 10,
+                ..TraceBudget::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            response.truncated,
+            "a walk stopped by the edge budget is truncated"
+        );
+        let stop = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "trace_walk")
+            .expect("the edge budget must be disclosed, not silently applied");
+        assert_eq!(stop.reason, "edge_budget_exceeded");
+        assert!(
+            !stop.remediation.is_empty(),
+            "a degradation must say what restores full capability"
+        );
+        // The bound is what stopped it: fewer steps than the per-step limit
+        // would otherwise have produced from a 200-wide hub.
+        assert!(
+            response.total_steps < 10,
+            "edge budget must cut the chain short, got {} steps",
+            response.total_steps
+        );
+    }
+
+    #[test]
+    fn time_budget_bounds_the_walk_and_says_so() {
+        let (graph, focal_id) = hub_graph(200);
+        let (_t, binding) = empty_binding();
+
+        // A zero budget is already spent at the first check, so this asserts
+        // the bound without making the test wait for a real one to elapse.
+        let response = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &hub_request(focal_id),
+            TraceBudget {
+                time_budget: Duration::ZERO,
+                ..TraceBudget::default()
+            },
+        )
+        .unwrap();
+
+        assert!(response.truncated, "a timed-out walk is truncated");
+        let stop = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "trace_walk")
+            .expect("the time budget must be disclosed");
+        assert_eq!(stop.reason, "time_budget_exceeded");
+        assert_eq!(
+            response.total_steps, 0,
+            "a budget spent before the first expansion yields no steps"
+        );
+        // Still a well-formed answer about the right entity rather than an
+        // error: the caller learns what was asked and why it stopped.
+        assert_eq!(response.focal_id, focal_id.to_string());
+    }
+
+    #[test]
+    fn a_walk_inside_every_bound_reports_no_work_degradation() {
+        let (graph, focal_id) = hub_graph(3);
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &hub_request(focal_id),
+            TraceBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(response.total_steps, 3, "the whole hub fits inside limits");
+        assert!(!response.truncated, "nothing was cut off");
+        assert!(
+            !response
+                .degradations
+                .iter()
+                .any(|d| d.component == "trace_walk"),
+            "an unaffected walk must carry no work degradation: {:?}",
+            response.degradations
+        );
+    }
+
+    #[test]
+    fn an_unopenable_authority_still_returns_the_chain() {
+        // The walk holds one authority open for every step's body. This asserts
+        // that hoisting the open did not turn a store whose bodies were already
+        // unreadable into a failed call: the chain still arrives, identity
+        // only, and the missing bodies are disclosed rather than unexplained.
+        let (graph, focal_id) = hub_graph(3);
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &hub_request(focal_id),
+            TraceBudget::default(),
+        )
+        .unwrap();
+
+        assert_eq!(response.total_steps, 3);
+        assert!(
+            response.chain.iter().all(|step| step.entity.is_none()),
+            "no body is readable through an absent authority"
+        );
+        assert!(
+            response
+                .degradations
+                .iter()
+                .any(|d| d.component == "entity_bodies" && d.reason == "authority_unavailable"),
+            "absent bodies must be explained: {:?}",
+            response.degradations
+        );
     }
 
     #[test]
