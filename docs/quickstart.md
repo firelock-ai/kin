@@ -4,7 +4,7 @@ This is the recommended first-run path for Kin. One flow works on macOS, Linux, 
 Windows (via WSL2):
 
 1. **Install** the binaries with the one-line installer.
-2. **`kin setup`** — answer a couple of questions; the guided wizard configures your
+2. **`kin setup`** asks a couple of questions, and the guided wizard configures your
    shell, PATH, daemon, and AI clients.
 3. **`kin init`** admits repository authority atomically and derives the semantic
    entity layer for supported sources; embeddings are a separate graph-native stage.
@@ -26,11 +26,12 @@ curl -fsSL https://get.kinlab.dev/install | sh
 
 The installer downloads the latest release from GitHub, **verifies its SHA-256 checksum**
 (and refuses to install an unverified or tampered download), installs the `kin` and
-`kin-daemon` binaries — plus the optional `kin-vfs` projection client and shim where the
-archive bundles them — into `~/.kin/bin` (and `~/.kin/lib`), updates your shell profile
-(`.zshrc` / `.bashrc`), and then runs the `kin setup` wizard. `kin-daemon` is mandatory;
-the installer aborts cleanly rather than leaving a daemon-less install. Re-running the
-installer upgrades an existing install in place and reports the version change.
+`kin-daemon` binaries into `~/.kin/bin` (and `~/.kin/lib`), updates your shell profile
+(`.zshrc` / `.bashrc`), and then runs the `kin setup` wizard. Where the archive bundles
+them, the optional `kin-vfs` projection client and shim are installed alongside.
+`kin-daemon` is mandatory; the installer aborts cleanly rather than leaving a daemon-less
+install. Re-running the installer upgrades an existing install in place and reports the
+version change.
 
 ### npm / npx
 
@@ -173,7 +174,7 @@ publication.
 
 Admission is a one-time cost that scales with the size of your history rather
 than the size of your checkout, because every reachable commit's tree is
-observed and proven. On a small repository it takes seconds. On a repository
+observed and recorded. On a small repository it takes seconds. On a repository
 with thousands of commits it takes minutes and can hold several gigabytes of
 memory while it runs.
 
@@ -303,7 +304,7 @@ kin diff
 
 ### Run your normal tools
 
-Ordinary project commands run through a graph-backed **session workspace** — the
+Ordinary project commands run through a graph-backed **session workspace**, the
 venv-like execution contract, so you never need to know which files are
 materialized before running the repo:
 
@@ -363,7 +364,7 @@ kin locate "users can't reset their password" --explain
 If you chose the **AI agents** intent in step 2, `kin setup` already wrote Kin's MCP
 server entry into every detected AI client (Claude Code, Cursor, Codex CLI, Gemini CLI,
 Windsurf) and added a Kin-first discovery reminder to your agent instruction files. There
-is **nothing else to configure** — open your agent in a Kin repository and ask it to use
+is **nothing else to configure**. Open your agent in a Kin repository and ask it to use
 the semantic tools:
 
 ```
@@ -393,7 +394,7 @@ processes that do not inherit your `PATH`.)
 
 > Vector-backed MCP retrieval (`semantic_locate`) and the stateful session / transaction /
 > work / review tools operate against the repo's running Kin daemon. Daemon auto-start is
-> on by default, so these tools have a live graph to query — `semantic_locate` returns an
+> on by default, so these tools have a live graph to query. `semantic_locate` returns an
 > explicit error in offline / no-daemon mode.
 
 For the full tool surface, see the [MCP Tools Reference](mcp-tools.md). To wire up a
@@ -404,8 +405,8 @@ client by hand (or use the npm wrapper), see
 
 ## 8. Verify your setup (`kin setup status`)
 
-Run the health checklist at any time. It probes real filesystem, daemon, and agent state —
-nothing is assumed healthy:
+Run the health checklist at any time. It probes real filesystem, daemon, and agent state,
+so nothing is assumed healthy:
 
 ```sh
 kin setup status          # human-readable table
@@ -414,11 +415,11 @@ kin setup status --json   # machine-readable report
 
 Each line shows a status mark:
 
-- `✓` **ok** — healthy.
-- `✗` **MISSING** / **MISCONFIGURED** — failing; these are the only states that make the
-  overall report unhealthy.
-- `!` **STALE** — present but not fully ready (e.g. embeddings pending).
-- `→` **n/a** — unsupported / not applicable on this platform or context.
+- `✓` **ok** means healthy.
+- `✗` **MISSING** / **MISCONFIGURED** means failing, and these are the only states that
+  make the overall report unhealthy.
+- `!` **STALE** means present but not fully ready (e.g. embeddings pending).
+- `→` **n/a** means unsupported / not applicable on this platform or context.
 
 The checks (IDs as emitted in `--json`):
 
@@ -460,15 +461,15 @@ kin doctor --fix    # apply safe repairs, then re-check
 
 ## 9. Advanced configuration
 
-You do not need anything here for a normal first run — the guided wizard covers it. This
-section is for manual wiring, troubleshooting, and non-standard environments.
+You do not need anything here for a normal first run, because the guided wizard covers
+it. This section is for manual wiring, troubleshooting, and non-standard environments.
 
 ### Manual MCP client configuration
 
 If you skipped the wizard's agent step, or your client wasn't auto-detected, add Kin's MCP
 server to your client's config by hand. Use `$KIN_HOME/bin/kin` (normally `~/.kin/bin/kin`)
 when that managed launcher exists; otherwise run `command -v kin`. Substitute that exact
-absolute path for `/absolute/path/to/kin` below. Match the wizard exactly — including the
+absolute path for `/absolute/path/to/kin` below. Match the wizard exactly, including the
 `agent-default` profile:
 
 ```json
@@ -489,7 +490,7 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | --- | --- |
 | Claude Code | `~/.claude.json` (falls back to `~/.claude/config.json`) |
 | Cursor | `~/.cursor/mcp.json` |
-| Codex CLI | `~/.codex/config.toml` (TOML — see below) |
+| Codex CLI | `~/.codex/config.toml` (TOML, see below) |
 | Gemini CLI | `~/.gemini/settings.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
@@ -503,11 +504,11 @@ args = ["mcp", "start", "--repo", "/absolute/path/to/repository"]
 env = { KIN_MCP_TOOL_PROFILE = "agent-default" }
 ```
 
-`kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand —
-your AI client launches it as a subprocess via the config above. The server binds
+`kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand,
+because your AI client launches it as a subprocess via the config above. The server binds
 per invocation: it uses `KIN_DAEMON_URL` when set (agent sessions launched with
 `kin with` pin it), and otherwise resolves the repository by walking up
-from the working directory — so each agent session talks to the daemon of the
+from the working directory, so each agent session talks to the daemon of the
 repository it is actually working in.
 
 ### npm wrapper (`@kinlab/kin`)
@@ -552,14 +553,14 @@ normal use. The escape hatches:
   `KIN_DAEMON_URL`).
 - `KIN_DAEMON_URL`: point the CLI at an explicit daemon endpoint.
 - `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN=1`: offline/admin escape hatch that lets the read-only
-  in-process commands fall back to reading the local `.kin` snapshot directly. Never used
-  for writes — all graph mutations still route through the daemon.
+  in-process commands fall back to reading the local `.kin` snapshot directly. It is never
+  used for writes, and all graph mutations still route through the daemon.
 
 ---
 
 ## 10. Removing Kin
 
-Kin is ejectable — there is no data lock-in. Eject remains graph-first all the
+Kin is ejectable, with no data lock-in. Eject remains graph-first all the
 way through the exit:
 
 ```sh

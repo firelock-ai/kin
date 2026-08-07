@@ -42,8 +42,8 @@ projection and the same behavior the project tests and benchmarks against.
    Reboot if prompted, then open the **Ubuntu** shell to finish first-time
    user setup.
 
-2. Inside the WSL2 Linux shell, install Kin the same way you would on Linux —
-   this is the **same one-path flow** documented in the
+2. Inside the WSL2 Linux shell, install Kin the same way you would on Linux.
+   This is the **same one-path flow** documented in the
    [quickstart](./quickstart.md):
 
    ```sh
@@ -52,7 +52,7 @@ projection and the same behavior the project tests and benchmarks against.
 
    The installer launches the `kin setup` guided wizard for you. Answer its
    "What do you want Kin for?" prompt (the **AI agents** intent is the default),
-   then verify with `kin setup status` — inside WSL2 the VFS projection check is
+   then verify with `kin setup status`. Inside WSL2 the VFS projection check is
    supported, unlike native Windows.
 
 3. Work on your repositories from inside the WSL2 filesystem (e.g.
