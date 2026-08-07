@@ -3046,14 +3046,14 @@ dependencies = [
 
 [[package]]
 name = "kin-blobs"
-version = "0.1.4"
+version = "0.1.5"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "83136143d2f8b72f835ca7d9e3d7793e415bd072445a648713d5d797e9e6bc9e"
+checksum = "bde2186360c16ff9fda080b4b9f6489e7aee8cb0cb30f803e8bd22b1ed4af609"
 dependencies = [
  "hex",
  "schemars",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tracing",
  "windows-sys 0.61.2",
@@ -6624,7 +6624,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
