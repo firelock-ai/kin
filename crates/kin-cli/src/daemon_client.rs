@@ -6066,6 +6066,15 @@ async fn follow_preserved_daemon_endpoint(
 /// deleted this daemon's endpoint files and spawned a replacement, which lost
 /// the singleton flock and left the repo unusable until the first daemon
 /// exited — with nothing in the output pointing at the daemon still running.
+///
+/// It also names what the wait is for. A silent daemon is not idle: it is
+/// running the blocking load that `DaemonState::open` performs before any
+/// listener binds, so there is no endpoint to ask and the only honest account
+/// of the delay is what that load consists of. Reporting the elapsed timeout
+/// alone told a waiting user the one number that does not explain the wait,
+/// because the cost tracks repository size rather than the budget. The daemon
+/// records each phase's real cost for this repository once it is up, which is
+/// a truthful per-repository number where a hardcoded typical would not be.
 fn live_daemon_not_ready_message(
     pid: u32,
     port: u16,
@@ -6080,8 +6089,12 @@ fn live_daemon_not_ready_message(
     };
     format!(
         "kin daemon (pid {pid}, port {port}) owns this repo and {state} after {waited_secs}s: \
-         {detail}. It is running, so kin will not replace it. Wait for it to finish, or stop it \
-         with `kin daemon stop`; raise KIN_DAEMON_READY_TIMEOUT_SECS if this repo needs longer."
+         {detail}. Startup loads this repository before it binds a port: it opens the repository \
+         authority, materializes the workspace graph, then restores the text and vector indexes. \
+         That cost scales with repository size rather than with this timeout, and \
+         `.kin/daemon.log` records what each phase took. It is running, so kin will not replace \
+         it. Wait for it to finish, or stop it with `kin daemon stop`; raise \
+         KIN_DAEMON_READY_TIMEOUT_SECS if this repo needs longer."
     )
 }
 
