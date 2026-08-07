@@ -688,10 +688,6 @@ fn normalized_parent(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// A sibling creating the same ancestor chain publishes each directory before
-/// its mode settles, so traversal can be refused by the kernel for as long as
-/// that thread stays descheduled. Only a kernel `EACCES` is transient; a policy
-/// refusal carries no OS error and stays terminal.
 #[cfg(unix)]
 const REGISTRY_CREATE_RACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
