@@ -241,7 +241,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_PASS_SECONDS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "per-pass wall-clock budget for an embed run" },
     EnvVarSpec { name: "KIN_EMBED_MAX_TOTAL_SECONDS", kind: Kind::Secs, default: "600", sensitivity: Sensitivity::Operational, summary: "total wall-clock budget for a single `kin embed` under the interactive/small resource profiles; the run stops at the budget with a resumable partial index; unconstrained profiles ignore it" },
     EnvVarSpec { name: "KIN_EMBED_HTTP_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "HTTP timeout for the embedding service client" },
-    EnvVarSpec { name: "KIN_DAEMON_HTTP_TIMEOUT_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300 — long-running requests (large-repo review) need a higher value" },
+    EnvVarSpec { name: "KIN_DAEMON_HTTP_TIMEOUT_SECS", kind: Kind::Secs, default: "300", sensitivity: Sensitivity::Operational, summary: "per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300, and long-running requests (large-repo review) need a higher value" },
     EnvVarSpec { name: "KIN_RESOURCE_PROFILE", kind: Kind::OneOf(&["proof", "interactive", "throughput", "ci"]), default: "interactive", sensitivity: Sensitivity::Correctness, summary: "runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset, the kin binaries select interactive at startup (value-preserving Metal kernels, proof's embedding budgets), while a library caller that never selects still resolves to proof; throughput additionally scales the batch budgets, may engage CPU/GPU hybrid embedding and overlaps persist with compute, and is non-citable" },
     EnvVarSpec { name: "KIN_INFER_METAL_PROFILE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "Metal inference profile selection" },
     EnvVarSpec { name: "KIN_REGISTRY_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "kin registry base URL" },
@@ -329,7 +329,7 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_HYBRID_GPU_TPUT_RATIO", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db hybrid split ratio: pins the GPU:CPU throughput ratio for the balanced split; unset (or <= 0) measures it adaptively per batch" },
     // ---- kin-db: embedding cache (perf/lifecycle, identical vectors) ----------
     EnvVarSpec { name: "KIN_EMBED_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on" },
-    EnvVarSpec { name: "KIN_EMBED_CACHE_BUDGET_GB", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing — the cache is pruned only by an explicit budget or command" },
+    EnvVarSpec { name: "KIN_EMBED_CACHE_BUDGET_GB", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing, so the cache is pruned only by an explicit budget or command" },
     EnvVarSpec { name: "KIN_EMBED_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings" },
     // ---- kin-vfs shim: projection authority -----------------------------------
     EnvVarSpec { name: "KIN_NO_VFS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off" },
@@ -869,7 +869,7 @@ pub fn render_reference_markdown() -> String {
         "At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, \
          default `warn`):\n\n",
     );
-    out.push_str("- an unrecognized `KIN_*` name is warned (a likely typo — it has no effect);\n");
+    out.push_str("- an unrecognized `KIN_*` name is warned as a likely typo, because setting it has no effect;\n");
     out.push_str("- an invalid value is a hard startup error for a **correctness** variable, otherwise a warning;\n");
     out.push_str("- a correctness variable set away from its default is logged, so behavior drift is never silent.\n\n");
     out.push_str(
@@ -878,7 +878,7 @@ pub fn render_reference_markdown() -> String {
     );
     out.push_str(
         "**Zero-bound rule.** For a `*_TIMEOUT_MS`, `*_BUDGET_MS`, or bounded `*_TIMEOUT_SECS` \
-         knob, `0` means **disabled / unbounded** — the bound never fires. It is never an \
+         knob, `0` means **disabled / unbounded**, so the bound never fires. It is never an \
          instant zero-length timeout.\n\n",
     );
     out.push_str(
