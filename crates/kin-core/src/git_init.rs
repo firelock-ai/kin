@@ -634,34 +634,42 @@ fn copy_captured_authority(
 ) -> Result<()> {
     let total_objects = snapshot.objects.len();
     let report_every = progress_interval(total_objects);
-    for (copied, record) in snapshot.objects.iter().enumerate() {
-        if copied.is_multiple_of(report_every) {
-            progress.detail(format_args!("{copied}/{total_objects} objects"));
+    // One session for the whole copy. Every body here lands in a staging store
+    // that holds no authority yet, and a crash before
+    // `commit_repository_bootstrap` discards the store whole, so the batch
+    // boundary and the durability boundary this phase actually needs are the
+    // same boundary.
+    prepared.with_source_blob_batch(&mut |batch| {
+        for (copied, record) in snapshot.objects.iter().enumerate() {
+            if copied.is_multiple_of(report_every) {
+                progress.detail(format_args!("{copied}/{total_objects} objects"));
+            }
+            let capture_hash = kin_blobs::Hash256::from_bytes(*record.body_hash.as_bytes());
+            let body = capture_store.read(&capture_hash).map_err(|error| {
+                git_boundary_error(
+                    format!("read captured Git object {}", record.object.oid),
+                    error,
+                )
+            })?;
+            if staged_body_is_withheld(record.body_hash) {
+                continue;
+            }
+            batch.save(record.body_hash, &body)?;
         }
-        let capture_hash = kin_blobs::Hash256::from_bytes(*record.body_hash.as_bytes());
-        let body = capture_store.read(&capture_hash).map_err(|error| {
-            git_boundary_error(
-                format!("read captured Git object {}", record.object.oid),
-                error,
-            )
-        })?;
-        if staged_body_is_withheld(record.body_hash) {
-            continue;
+        for input in &proof.ignored_local.inputs {
+            let observed_len = u64::try_from(input.body.len()).map_err(|_| {
+                KinError::Other("local Git ignore input exceeds u64 byte length".to_string())
+            })?;
+            let observed_hash = Hash256::from_bytes(kin_blobs::digest_bytes(&input.body));
+            if observed_len != input.body_len || observed_hash != input.body_hash {
+                return Err(KinError::Other(
+                    "local Git ignore input no longer matches its preflight identity".to_string(),
+                ));
+            }
+            batch.save(input.body_hash, &input.body)?;
         }
-        prepared.save_source_blob(record.body_hash, &body)?;
-    }
-    for input in &proof.ignored_local.inputs {
-        let observed_len = u64::try_from(input.body.len()).map_err(|_| {
-            KinError::Other("local Git ignore input exceeds u64 byte length".to_string())
-        })?;
-        let observed_hash = Hash256::from_bytes(kin_blobs::digest_bytes(&input.body));
-        if observed_len != input.body_len || observed_hash != input.body_hash {
-            return Err(KinError::Other(
-                "local Git ignore input no longer matches its preflight identity".to_string(),
-            ));
-        }
-        prepared.save_source_blob(input.body_hash, &input.body)?;
-    }
+        Ok(())
+    })?;
     progress.detail(format_args!("{total_objects}/{total_objects} objects"));
     Ok(())
 }
