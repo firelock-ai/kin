@@ -2861,6 +2861,28 @@ fn process_liveness(pid: u32) -> Liveness {
     }
 }
 
+/// Whether the daemon recorded for `kin_root` is provably still running.
+///
+/// [`startup_disposition`] answers this with `Child::try_wait`, which only the
+/// process that spawned the daemon can call. A client that *attached* to a
+/// daemon it did not start asks the same question and holds none of that
+/// evidence, so it reads the record the daemon publishes about itself.
+///
+/// Deliberately one-directional: `true` is positive proof of life, and every
+/// other outcome — no record, an unreadable record, a PID the OS will not
+/// classify — is merely the absence of proof, never proof of death. Callers use
+/// it to withhold destruction, never to authorize it, which is the same
+/// direction [`StartupDisposition::authorizes_termination`] runs in.
+pub fn recorded_owner_is_alive(kin_root: &Path) -> bool {
+    let Some(pid) = std::fs::read_to_string(kin_root.join(PID_FILE_NAME))
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    matches!(process_liveness(pid), Liveness::Alive)
+}
+
 // ── Stale endpoint records ──────────────────────────────────────────────
 
 /// Whether a port record is orphaned: a port with no PID owner beside it.

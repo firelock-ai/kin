@@ -39,3 +39,7 @@ libc = "0.2"
 kin-core = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
+# Paused time, so the daemon-patience ladder can be asserted against its real
+# 60 s and 300 s budgets instead of a scaled-down stand-in that would prove
+# something other than what ships.
+tokio = { workspace = true, features = ["full", "test-util"] }

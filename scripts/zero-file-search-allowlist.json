@@ -146,7 +146,7 @@
     },
     {
       "file": "crates/kin-daemon-spawn/src/lib.rs",
-      "reason": "Daemon process lifecycle boundary with zero answer-authority surface. The exact expression pins cover process construction, readiness records, port records, and Linux process-table inspection; each reaches or supervises the daemon that owns graph truth and never derives a semantic answer. ManagedInstallSpawnFence::acquire is separately function-pinned because it is an install-mutation boundary: it binds the configured executable and update lock, rejects replaced or retired install roots, and serializes daemon spawn against uninstall. It reads only install/process identity metadata and cannot answer locate, search, context, trace, review, xref, or rename. The rest of this single-module crate remains scanned, and exact pin counts make any added occurrence fail closed.",
+      "reason": "Daemon process lifecycle boundary with zero answer-authority surface. The exact expression pins cover process construction, readiness records, port records, PID records, and Linux process-table inspection; each reaches or supervises the daemon that owns graph truth and never derives a semantic answer. The PID record is read to establish that a daemon is still running, which is a liveness question about a process rather than a question about repository content: it can only withhold a restart, never produce or repair an answer. ManagedInstallSpawnFence::acquire is separately function-pinned because it is an install-mutation boundary: it binds the configured executable and update lock, rejects replaced or retired install roots, and serializes daemon spawn against uninstall. It reads only install/process identity metadata and cannot answer locate, search, context, trace, review, xref, or rename. The rest of this single-module crate remains scanned, and exact pin counts make any added occurrence fail closed.",
       "owner": "kin-daemon-spawn",
       "expiration": "2026-12-31",
       "allow_fn": [
@@ -181,6 +181,7 @@
         "std::fs::remove_file(kin_root.join(OWNER_FILE_NAME))",
         "std::fs::remove_file(kin_root.join(PORT_FILE_NAME))",
         "std::fs::read_to_string(kin_root.join(PORT_FILE_NAME))",
+        "std::fs::read_to_string(kin_root.join(PID_FILE_NAME))",
         "std::fs::read_dir(\"/proc\")",
         "std::fs::read_to_string(entry.path().join(\"stat\"))",
         "std::fs::read_to_string(format!(\"/proc/{pid}/stat\"))",

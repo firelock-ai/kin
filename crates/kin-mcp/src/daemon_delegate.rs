@@ -488,10 +488,25 @@ fn scope_strings(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String
 /// Error returned by [`DaemonCallSeam::call_tool`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DaemonCallError {
-    /// Transport-level failure (connection refused, timeout, TCP reset) —
-    /// the daemon may have exited.  The revival path will attempt exactly one
-    /// restart before surfacing an error.
+    /// Transport-level failure that reached no listener (connection refused,
+    /// TCP reset, connect timeout) — the daemon may have exited. The revival
+    /// path will attempt exactly one restart before surfacing an error, and
+    /// only when nothing proves the recorded daemon is still alive.
     ConnectionLost(String),
+    /// The request was sent and no answer arrived inside this attempt's budget.
+    ///
+    /// Kept apart from [`Self::ConnectionLost`] on purpose. A deadline measures
+    /// this caller's patience, not the daemon's health: the connection was
+    /// established, so something is listening, and a large graph load or a long
+    /// enrichment pass is the ordinary reason an answer is late. Folding it into
+    /// connection loss is what turned slow daemons into dead ones.
+    Timeout(String),
+    /// The daemon answered that it is still opening its state.
+    ///
+    /// Positive evidence of life, and the strongest kind: the daemon described
+    /// its own condition. Never a reason to revive — the process that would be
+    /// replaced is the one holding the repository lock the replacement needs.
+    Warming(String),
     /// HTTP-level or protocol failure — the daemon responded but signalled an
     /// error.  Revival is not attempted; the error is surfaced immediately.
     DaemonError(String),
@@ -499,12 +514,17 @@ pub(crate) enum DaemonCallError {
 
 /// Classify a `reqwest` send failure.
 ///
-/// Connect/timeout failures mean the request never reached a live daemon and
-/// warrant the retry-then-revive path; everything else is a protocol-level
-/// failure from a daemon that did respond.
+/// The order matters. reqwest reports a connect timeout as both `is_connect`
+/// and `is_timeout`, so connect-class is tested first: failing to establish a
+/// loopback connection at all is evidence about the *endpoint*, while a
+/// request-class timeout on an established connection is evidence only about
+/// how long this caller waited. Everything else is a protocol-level failure
+/// from a daemon that did respond.
 fn classify_send_error(operation: &str, error: reqwest::Error) -> DaemonCallError {
-    if error.is_connect() || error.is_timeout() {
+    if error.is_connect() {
         DaemonCallError::ConnectionLost(error.to_string())
+    } else if error.is_timeout() {
+        DaemonCallError::Timeout(error.to_string())
     } else {
         DaemonCallError::DaemonError(format!("daemon {operation} failed: {error}"))
     }
@@ -519,6 +539,17 @@ fn classify_send_error(operation: &str, error: reqwest::Error) -> DaemonCallErro
 pub(crate) trait DaemonReviver: Sync {
     /// Attempt to revive a dead daemon and return its new base URL.
     async fn revive(&self) -> Result<String, String>;
+
+    /// Positive evidence that the daemon at `base` is alive, consulted before
+    /// [`Self::revive`] is allowed to run.
+    ///
+    /// Part of the revival policy rather than a free function so the veto is
+    /// reachable in tests: proving that a live daemon is spared needs a witness
+    /// that reports life, and no single loopback port can both refuse
+    /// connections and answer a probe.
+    async fn is_provably_alive(&self, base: &str) -> bool {
+        daemon_is_provably_alive(base).await
+    }
 }
 
 /// Abstraction over daemon communication and revival used by
@@ -529,18 +560,27 @@ pub(crate) trait DaemonReviver: Sync {
 /// inject a controlled stub to exercise the revival state machine without
 /// touching the network or spawning any processes.
 pub(crate) trait DaemonCallSeam: DaemonReviver {
-    /// Attempt a single MCP tool call against the daemon at `base`.
+    /// Attempt a single MCP tool call against the daemon at `base`, waiting at
+    /// most `patience` for an answer.
+    ///
+    /// The budget is per attempt rather than per client so the ladder can widen
+    /// it once liveness is established, instead of one flat deadline deciding
+    /// both how long a healthy call may take and when a daemon is presumed
+    /// dead.
     ///
     /// Returns:
     /// - `Ok(Some(result))` on success.
     /// - `Ok(None)` when no HTTP client can be built at all (graceful no-op).
     /// - `Err(ConnectionLost(_))` for transport failures — warrants revival.
+    /// - `Err(Timeout(_))` when the budget ran out — warrants patience.
+    /// - `Err(Warming(_))` when the daemon is still opening — warrants waiting.
     /// - `Err(DaemonError(_))` for HTTP/protocol failures — no revival.
     async fn call_tool(
         &self,
         base: &str,
         name: &str,
         args: &HashMap<String, serde_json::Value>,
+        patience: Duration,
     ) -> Result<Option<ToolCallResult>, DaemonCallError>;
 }
 
@@ -559,12 +599,14 @@ impl DaemonCallSeam for RealDaemonSeam {
         base: &str,
         name: &str,
         args: &HashMap<String, serde_json::Value>,
+        patience: Duration,
     ) -> Result<Option<ToolCallResult>, DaemonCallError> {
         let Some(client) = daemon_client().await else {
             return Ok(None);
         };
         let request = client
             .post(format!("{}/mcp/tools/call", base))
+            .timeout(patience)
             .json(&serde_json::json!({ "name": name, "arguments": args }));
         let request = with_session_header(with_auth(request), args);
         let resp = request
@@ -781,29 +823,154 @@ async fn revive_mcp_daemon() -> Result<String, String> {
 
 // ── Seam-based MCP tool dispatch ────────────────────────────────────────
 
-/// Run one daemon request with one-shot revival, shared by every forwarded
-/// call.
+/// How long one attempt waits before the ladder asks whether the daemon is
+/// alive. Override with `KIN_MCP_DAEMON_TIMEOUT_SECS`.
 ///
-/// On a connection-class failure ([`DaemonCallError::ConnectionLost`]) the
-/// request is retried once against the **same** URL before revival is
-/// considered: a transport error is just as often a stale kept-alive socket or
-/// a request landing inside the daemon's post-boot stall as it is a dead
-/// daemon, and revival against a live daemon cannot succeed (the repo lock is
-/// held), so misclassifying costs the whole call. Only when the same-URL retry
-/// also fails is `revive` called **exactly once**. If revival succeeds the
-/// request is retried against the new URL.  Non-connection failures bypass
-/// retry and revival entirely.
+/// This is the budget every call used to run under as a flat client-wide
+/// deadline, kept at the same default so nothing that answers today starts
+/// costing a second attempt. What changed is what happens when it runs out:
+/// exhausting it is now a question, not a verdict.
+fn fast_path_patience() -> Duration {
+    env_secs("KIN_MCP_DAEMON_TIMEOUT_SECS", 60)
+}
+
+/// Total patience for one forwarded call once the daemon has shown it is alive.
+/// Override with `KIN_MCP_DAEMON_PATIENCE_SECS`.
 ///
-/// `attempt` receives the base URL to use, so the post-revival retry addresses
-/// the new daemon rather than the dead one.
+/// Matches the CLI's `KIN_DAEMON_READY_TIMEOUT_SECS` default deliberately: both
+/// bound how long a caller waits on a *live* daemon still doing startup work,
+/// and a repository large enough to need five minutes over one transport needs
+/// it over the other.
+fn escalated_patience() -> Duration {
+    env_secs("KIN_MCP_DAEMON_PATIENCE_SECS", 300)
+}
+
+fn env_secs(key: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default),
+    )
+}
+
+/// Gap between polls while the daemon reports it is still opening its state.
+const WARMING_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Run one attempt, absorbing a warming refusal by waiting for the daemon to
+/// finish opening rather than treating its own report of life as a failure.
+///
+/// A warming answer costs nothing to produce and nothing to poll — the daemon
+/// refuses immediately — so this loops on the wall-clock deadline rather than
+/// on an attempt count. It never revives: replacing the process that is holding
+/// the repository lock is precisely the move that cannot succeed.
+async fn attempt_through_warmup<T, A, Fut>(
+    attempt: &A,
+    url: &str,
+    budget: Duration,
+    deadline: tokio::time::Instant,
+) -> Result<T, DaemonCallError>
+where
+    A: Fn(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
+{
+    let mut warming_detail: Option<String> = None;
+    loop {
+        let budget = match warming_detail {
+            None => budget,
+            // Later passes inherit whatever is left, so a daemon that warms for
+            // longer than one budget is still answered inside one call.
+            Some(_) => budget.min(remaining_until(deadline)),
+        };
+        match attempt(url.to_string(), budget).await {
+            Err(DaemonCallError::Warming(detail)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(DaemonCallError::Timeout(format!(
+                        "daemon is still opening its state ({detail})"
+                    )));
+                }
+                warming_detail = Some(detail);
+                tokio::time::sleep(WARMING_POLL_INTERVAL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn remaining_until(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+/// Positive evidence that a daemon at `base` is alive, gathered without
+/// spawning or killing anything.
+///
+/// Two independent witnesses, either of which is enough:
+///
+/// - The endpoint answers HTTP at all. Any status counts, including a refusal:
+///   a process that writes a response line is running. This mirrors the CLI's
+///   rule that a non-2xx `/health` is silence about *identity*, never a report
+///   of death.
+/// - The daemon's own PID record, but only when the recorded port is the port
+///   being called, so the record provably describes this endpoint rather than
+///   some other repository's daemon.
+///
+/// One-directional by construction. `false` means no proof of life was found,
+/// never proof of death, and callers only ever use `true` to withhold revival.
+async fn daemon_is_provably_alive(base: &str) -> bool {
+    if let Some(kin_root) = discover_kin_dir() {
+        if kin_daemon_spawn::read_reported_port(&kin_root)
+            .map(|port| format!(":{port}"))
+            .is_some_and(|suffix| base.ends_with(&suffix))
+            && kin_daemon_spawn::recorded_owner_is_alive(&kin_root)
+        {
+            return true;
+        }
+    }
+    let Ok(probe) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    probe.get(format!("{base}/health")).send().await.is_ok()
+}
+
+/// Run one daemon request with escalating patience and one-shot revival, shared
+/// by every forwarded call.
+///
+/// The question every attempt ends on is the one the CLI transport already
+/// answers correctly: is this daemon slow, or is it dead? Each failure class
+/// answers it differently, and only one of them authorizes a restart.
+///
+/// - **Warming.** The daemon says it is still opening its state. Waited out,
+///   never revived, and never charged against the attempt budget.
+/// - **Timeout.** The deadline measures this caller's patience, not the
+///   daemon's health — the connection was established, so something is
+///   listening. Costs exactly one escalated re-attempt on the remaining
+///   patience, and never a revival. Killing on a deadline is the mistake
+///   `daemon_client.rs` recorded a post-mortem for: a daemon still loading a
+///   large graph was destroyed for being slow, and its replacement started from
+///   cold and hit the same deadline.
+/// - **Connection loss.** Retried once against the **same** URL first: a
+///   transport error is just as often a stale kept-alive socket or a request
+///   landing inside the daemon's post-boot stall as it is a dead daemon. Only
+///   when that retry also fails, and nothing proves the daemon is still alive,
+///   is `revive` called **exactly once**.
+/// - **Daemon error.** Surfaced immediately; retry and revival are bypassed.
+///
+/// `attempt` receives the base URL and the budget for that attempt, so the
+/// post-revival retry addresses the new daemon rather than the dead one and
+/// each rung can widen its own deadline.
 ///
 /// Invariants:
 /// - `revive` is called at most once per invocation.
-/// - `attempt` is called at most three times (attempt, same-URL retry,
-///   post-revival retry).
+/// - `revive` is never called while [`daemon_is_provably_alive`] holds.
+/// - A timeout never reaches `revive`.
 /// - Non-connection errors are never silently discarded.
 /// - Every failure that ends with no reachable daemon is tagged
-///   [`DAEMON_EXITED_RESTART_REQUIRED`].
+///   [`DAEMON_EXITED_RESTART_REQUIRED`]; a failure that ends with a daemon
+///   proven alive deliberately is not.
 async fn attempt_with_revival<T, A, Fut>(
     operation: &str,
     daemon_url: &str,
@@ -811,49 +978,143 @@ async fn attempt_with_revival<T, A, Fut>(
     attempt: A,
 ) -> Result<T, String>
 where
-    A: Fn(String) -> Fut,
+    A: Fn(String, Duration) -> Fut,
     Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
 {
-    let first_err = match attempt(daemon_url.to_string()).await {
+    attempt_with_revival_within(
+        operation,
+        daemon_url,
+        reviver,
+        attempt,
+        fast_path_patience(),
+        escalated_patience(),
+    )
+    .await
+}
+
+/// [`attempt_with_revival`] with both budgets supplied rather than resolved from
+/// the environment.
+///
+/// Split so tests drive the ladder at whatever scale makes the behavior
+/// observable, the way `daemon_client.rs` splits `wait_for_existing_daemon` from
+/// `wait_for_existing_daemon_within`. Production resolves the budgets once, in
+/// the wrapper.
+async fn attempt_with_revival_within<T, A, Fut>(
+    operation: &str,
+    daemon_url: &str,
+    reviver: &impl DaemonReviver,
+    attempt: A,
+    fast: Duration,
+    patience: Duration,
+) -> Result<T, String>
+where
+    A: Fn(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
+{
+    let deadline = tokio::time::Instant::now() + patience;
+
+    let first_err = match attempt_through_warmup(&attempt, daemon_url, fast, deadline).await {
         Ok(result) => return Ok(result),
         Err(DaemonCallError::DaemonError(e)) => return Err(e),
+        // `attempt_through_warmup` resolves every warming answer, so this arm
+        // exists to make the class impossible to lose rather than because it is
+        // reachable today: a warming report is evidence of life, and grouping
+        // it with the timeout keeps it on the patience path if some future
+        // attempt path ever surfaces one directly.
+        Err(DaemonCallError::Timeout(e)) | Err(DaemonCallError::Warming(e)) => {
+            return escalate_after_timeout(operation, daemon_url, &attempt, deadline, patience, e)
+                .await;
+        }
         Err(DaemonCallError::ConnectionLost(e)) => e,
     };
     tokio::time::sleep(Duration::from_millis(250)).await;
-    match attempt(daemon_url.to_string()).await {
-        Ok(result) => Ok(result),
-        Err(DaemonCallError::DaemonError(e)) => Err(e),
-        Err(DaemonCallError::ConnectionLost(retry_err)) => {
-            // Two transport failures in a row on a fresh connection: now the
-            // dead-daemon read is earned. Single revival attempt before
-            // giving up.
-            let first_err = format!("{first_err}; retry: {retry_err}");
-            match reviver.revive().await {
-                Err(revive_err) => Err(format!(
-                    "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} \
-                     is not responding ({first_err}); revival failed: {revive_err}. \
-                     Restart `kin mcp start` to recover."
-                )),
-                Ok(new_url) => {
-                    // Retry exactly once on the post-revival URL.
-                    match attempt(new_url.clone()).await {
-                        Ok(result) => Ok(result),
-                        Err(e) => {
-                            let detail = match e {
-                                DaemonCallError::ConnectionLost(s)
-                                | DaemonCallError::DaemonError(s) => s,
-                            };
-                            Err(format!(
-                                "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon was \
-                                 revived at {new_url} but the retry still failed: {detail}. \
-                                 Check `kin daemon status`."
-                            ))
-                        }
-                    }
+    let retry_err = match attempt_through_warmup(&attempt, daemon_url, fast, deadline).await {
+        Ok(result) => return Ok(result),
+        Err(DaemonCallError::DaemonError(e)) => return Err(e),
+        // The endpoint went from refusing connections to accepting one and
+        // taking its time: it is coming up, not going down.
+        Err(DaemonCallError::Timeout(e)) | Err(DaemonCallError::Warming(e)) => {
+            return escalate_after_timeout(operation, daemon_url, &attempt, deadline, patience, e)
+                .await;
+        }
+        Err(DaemonCallError::ConnectionLost(e)) => e,
+    };
+
+    // Two transport failures in a row on fresh connections. That is evidence
+    // about the endpoint, but not yet a verdict: if the recorded daemon is
+    // demonstrably running, a replacement would only lose the race for the
+    // repository lock this one already holds, and the caller would be told a
+    // live daemon had exited.
+    let first_err = format!("{first_err}; retry: {retry_err}");
+    if reviver.is_provably_alive(daemon_url).await {
+        return Err(format!(
+            "{operation}: daemon at {daemon_url} is alive but did not answer this request \
+             ({first_err}); it was left running rather than restarted. Retry, or inspect it \
+             with `kin daemon status`."
+        ));
+    }
+    match reviver.revive().await {
+        Err(revive_err) => Err(format!(
+            "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} \
+             is not responding ({first_err}); revival failed: {revive_err}. \
+             Restart `kin mcp start` to recover."
+        )),
+        Ok(new_url) => {
+            // Retry exactly once on the post-revival URL. A daemon this call
+            // just started is the likeliest of all to answer warming, so the
+            // retry goes through the same warm-up wait.
+            match attempt_through_warmup(&attempt, &new_url, fast, deadline).await {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    let detail = match e {
+                        DaemonCallError::ConnectionLost(s)
+                        | DaemonCallError::Timeout(s)
+                        | DaemonCallError::Warming(s)
+                        | DaemonCallError::DaemonError(s) => s,
+                    };
+                    Err(format!(
+                        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon was \
+                         revived at {new_url} but the retry still failed: {detail}. \
+                         Check `kin daemon status`."
+                    ))
                 }
             }
         }
     }
+}
+
+/// Spend the rest of this call's patience on a daemon that answered late.
+///
+/// Exactly one further attempt, on whatever budget remains, and no revival on
+/// any outcome. A request-class timeout means the connection was established
+/// and the answer was slow; the endpoint is serving somebody, and restarting it
+/// would throw away the warm-up work that is the reason the answer is slow.
+async fn escalate_after_timeout<T, A, Fut>(
+    operation: &str,
+    daemon_url: &str,
+    attempt: &A,
+    deadline: tokio::time::Instant,
+    patience: Duration,
+    first_err: String,
+) -> Result<T, String>
+where
+    A: Fn(String, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DaemonCallError>>,
+{
+    let remaining = remaining_until(deadline);
+    if !remaining.is_zero() {
+        match attempt_through_warmup(attempt, daemon_url, remaining, deadline).await {
+            Ok(result) => return Ok(result),
+            Err(DaemonCallError::DaemonError(e)) => return Err(e),
+            Err(_) => {}
+        }
+    }
+    Err(format!(
+        "{operation}: daemon at {daemon_url} did not answer within {}s ({first_err}); it was \
+         left running rather than restarted for being slow. Wait for it, raise \
+         KIN_MCP_DAEMON_PATIENCE_SECS, or stop it with `kin daemon stop`.",
+        patience.as_secs()
+    ))
 }
 
 /// Core MCP-tool-call dispatch, layered on [`attempt_with_revival`].
@@ -867,7 +1128,7 @@ async fn forward_mcp_with_seam(
         &format!("tool {name}"),
         daemon_url,
         seam,
-        |base| async move { seam.call_tool(&base, name, args).await },
+        |base, patience| async move { seam.call_tool(&base, name, args, patience).await },
     )
     .await
 }
@@ -901,7 +1162,7 @@ async fn daemon_json_request<B>(
 where
     B: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
 {
-    attempt_with_revival(operation, base, &RealDaemonSeam, |url| {
+    attempt_with_revival(operation, base, &RealDaemonSeam, |url, patience| {
         let build = &build;
         async move {
             let Some(client) = daemon_client().await else {
@@ -909,7 +1170,7 @@ where
                     "daemon {operation} failed: could not build an HTTP client"
                 )));
             };
-            send_daemon_json(operation, build(&client, &url)).await
+            send_daemon_json(operation, build(&client, &url).timeout(patience)).await
         }
     })
     .await
@@ -968,6 +1229,9 @@ async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> 
     let detail = String::from_utf8_lossy(&body);
     let detail = detail.trim();
     let truncation = if truncated { " … [truncated]" } else { "" };
+    if is_warming_refusal(status, detail) {
+        return DaemonCallError::Warming(format!("HTTP {status}: {detail}{truncation}"));
+    }
     if detail.is_empty() {
         DaemonCallError::DaemonError(format!("daemon {operation} failed: HTTP {status}"))
     } else {
@@ -975,6 +1239,24 @@ async fn daemon_http_error(operation: &str, mut response: reqwest::Response) -> 
             "daemon {operation} failed: HTTP {status}: {detail}{truncation}"
         ))
     }
+}
+
+/// Whether a refusal is the daemon reporting that it is still opening its
+/// state, rather than a failure.
+///
+/// The daemon answers every route with `503` while it opens, carrying
+/// `{"error":"daemon_opening","ready":false,"warming":true}`. Both markers are
+/// required alongside the status so an ordinary `503` — a real dependency
+/// outage, a proxy in front of the loopback port — keeps reading as the error
+/// it is. Recognising it is what lets a client attach to a daemon that has
+/// published its endpoint before it can serve, which is the whole point of
+/// binding the socket early.
+fn is_warming_refusal(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+            value.get("warming").and_then(serde_json::Value::as_bool) == Some(true)
+                || value.get("error").and_then(serde_json::Value::as_str) == Some("daemon_opening")
+        })
 }
 
 /// Send one already-built daemon request and read its JSON body.
@@ -1204,7 +1486,15 @@ fn unavailable_tool_result_for(name: &str, kin_dir: Option<&Path>) -> ToolCallRe
 pub async fn fetch_health_snapshot() -> Option<serde_json::Value> {
     let client = daemon_client().await?;
     let base = daemon_base_url()?;
-    let resp = client.get(format!("{}/health", base)).send().await.ok()?;
+    // Its own deadline, not the client backstop: this is an envelope-decorating
+    // probe whose answer is optional, so it must never inherit the patience a
+    // forwarded tool call is entitled to.
+    let resp = client
+        .get(format!("{}/health", base))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -1238,7 +1528,12 @@ pub async fn daemon_client() -> Option<reqwest::Client> {
         // still detected fast by the connect timeout below; busy ones get to
         // finish. The MCP client above this has its own per-tool deadline and
         // remains the effective ceiling.
-        .timeout(Duration::from_secs(60))
+        //
+        // This is only the backstop for a request that sets no deadline of its
+        // own. Every call that runs through [`attempt_with_revival`] overrides
+        // it per attempt, because one flat client-wide deadline cannot both
+        // bound a healthy call and decide when a daemon is presumed dead.
+        .timeout(escalated_patience())
         .connect_timeout(Duration::from_millis(500))
         // No pooled keepalive sockets. This client is cached for the process
         // lifetime while agent loops pause arbitrarily long between calls, and
@@ -1473,6 +1768,7 @@ mod tests {
             _base: &str,
             _name: &str,
             _args: &HashMap<String, serde_json::Value>,
+            _patience: Duration,
         ) -> Result<Option<ToolCallResult>, DaemonCallError> {
             self.call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1497,6 +1793,10 @@ mod tests {
     struct FakeReviver {
         result: Result<String, String>,
         count: std::sync::atomic::AtomicUsize,
+        /// Stands in for the liveness witness the ladder consults before it is
+        /// allowed to revive. `None` means "no proof either way", which is what
+        /// a closed loopback port really offers.
+        alive: Option<bool>,
     }
 
     impl FakeReviver {
@@ -1504,6 +1804,15 @@ mod tests {
             Self {
                 result,
                 count: std::sync::atomic::AtomicUsize::new(0),
+                alive: None,
+            }
+        }
+
+        /// A reviver whose daemon is demonstrably still running.
+        fn with_a_live_daemon(result: Result<String, String>) -> Self {
+            Self {
+                alive: Some(true),
+                ..Self::new(result)
             }
         }
 
@@ -1516,6 +1825,13 @@ mod tests {
         async fn revive(&self) -> Result<String, String> {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.result.clone()
+        }
+
+        async fn is_provably_alive(&self, base: &str) -> bool {
+            match self.alive {
+                Some(alive) => alive,
+                None => daemon_is_provably_alive(base).await,
+            }
         }
     }
 
@@ -1816,23 +2132,22 @@ mod tests {
             .unwrap()
     }
 
-    /// One `POST {base}/session` attempt, classified the way the real session
-    /// forward classifies it.
+    /// One `POST {base}/session` attempt, classified and budgeted the way the
+    /// real session forward classifies and budgets it.
     async fn post_session(
         client: &reqwest::Client,
         base: &str,
+        patience: Duration,
     ) -> Result<serde_json::Value, DaemonCallError> {
         let resp = client
             .post(format!("{base}/session"))
+            .timeout(patience)
             .json(&serde_json::json!({ "vendor": "test" }))
             .send()
             .await
             .map_err(|e| classify_send_error("session start", e))?;
         if !resp.status().is_success() {
-            return Err(DaemonCallError::DaemonError(format!(
-                "daemon session start failed: HTTP {}",
-                resp.status()
-            )));
+            return Err(daemon_http_error("session start", resp).await);
         }
         resp.json().await.map_err(|e| {
             DaemonCallError::DaemonError(format!("daemon session start response parse failed: {e}"))
@@ -1850,9 +2165,9 @@ mod tests {
         let client = probe_client();
 
         let value: serde_json::Value =
-            attempt_with_revival("session start", &dead, &reviver, |base| {
+            attempt_with_revival("session start", &dead, &reviver, |base, patience| {
                 let client = client.clone();
-                async move { post_session(&client, &base).await }
+                async move { post_session(&client, &base, patience).await }
             })
             .await
             .expect("session start must recover through revival");
@@ -1873,9 +2188,9 @@ mod tests {
         let client = probe_client();
 
         let value: serde_json::Value =
-            attempt_with_revival("session start", &live, &reviver, |base| {
+            attempt_with_revival("session start", &live, &reviver, |base, patience| {
                 let client = client.clone();
-                async move { post_session(&client, &base).await }
+                async move { post_session(&client, &base, patience).await }
             })
             .await
             .expect("healthy daemon must answer directly");
@@ -1893,9 +2208,9 @@ mod tests {
         let reviver = FakeReviver::new(Err("kin-daemon binary not found".to_string()));
         let client = probe_client();
 
-        let err = attempt_with_revival("session start", &dead, &reviver, |base| {
+        let err = attempt_with_revival("session start", &dead, &reviver, |base, patience| {
             let client = client.clone();
-            async move { post_session(&client, &base).await }
+            async move { post_session(&client, &base, patience).await }
         })
         .await
         .expect_err("a dead daemon that cannot be revived must fail");
@@ -2494,5 +2809,489 @@ mod tests {
             !text.contains("not inside a kin repository"),
             "a bound repo must not report itself as unbound, got: {text}"
         );
+    }
+
+    // ── Slow is not dead: the escalating-patience ladder ───────────────────
+    //
+    // The asymmetry these cover: both transports face "is this daemon slow or
+    // dead?", and this one used to answer it with a flat deadline. Every test
+    // here pins one direction of that question, and the two named
+    // `a_proven_dead_daemon_*` / `a_slow_daemon_*` are the paired falsification
+    // — a real death must still be recovered, and a slow start must never be.
+
+    /// An attempt closure that replays a fixed sequence, counting calls and the
+    /// budget each one was handed. No sockets, no daemon, no wall clock.
+    struct ScriptedAttempts {
+        script: std::sync::Mutex<std::collections::VecDeque<DaemonCallError>>,
+        budgets: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl ScriptedAttempts {
+        /// `errors` are replayed in order; every later call succeeds.
+        fn new(errors: Vec<DaemonCallError>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(errors.into()),
+                budgets: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn attempt(&self, _url: String, budget: Duration) -> Result<u32, DaemonCallError> {
+            self.budgets.lock().unwrap().push(budget);
+            match self.script.lock().unwrap().pop_front() {
+                Some(error) => Err(error),
+                None => Ok(7),
+            }
+        }
+
+        fn budgets(&self) -> Vec<Duration> {
+            self.budgets.lock().unwrap().clone()
+        }
+    }
+
+    fn warming() -> DaemonCallError {
+        DaemonCallError::Warming(
+            r#"HTTP 503: {"error":"daemon_opening","ready":false,"warming":true}"#.to_string(),
+        )
+    }
+
+    fn timed_out() -> DaemonCallError {
+        DaemonCallError::Timeout("operation timed out".to_string())
+    }
+
+    /// FALSIFICATION, "a slow daemon is never destroyed" direction.
+    ///
+    /// The daemon reports itself warming for well past the 60 s fast-path
+    /// budget — 4 minutes of it, at the real production budgets — and then
+    /// answers. Revival must never run, and the call must succeed. Time is
+    /// paused, so the four simulated minutes cost no wall clock; what is under
+    /// test is the ladder's arithmetic, and pausing is the only way to assert
+    /// on the real 60/300 constants instead of a scaled-down stand-in.
+    ///
+    /// Before this change the same daemon was declared `ConnectionLost` at 60 s
+    /// and put through a revival that cannot win the repo lock it is holding.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_daemon_warming_past_the_fast_path_is_never_revived() {
+        // 4 minutes of warming at the 250 ms poll interval.
+        let warm_polls = 4 * 60 * 4;
+        let attempts = ScriptedAttempts::new((0..warm_polls).map(|_| warming()).collect());
+        let reviver = FakeReviver::new(Err("revival must not run".to_string()));
+        let started = tokio::time::Instant::now();
+
+        let value = attempt_with_revival_within(
+            "tool semantic_locate",
+            "http://127.0.0.1:1",
+            &reviver,
+            |url, budget| attempts.attempt(url, budget),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("a daemon that finished warming must answer the call that waited for it");
+
+        assert_eq!(value, 7, "the answer must be the warmed daemon's");
+        assert_eq!(
+            reviver.revives(),
+            0,
+            "a daemon reporting that it is alive and opening must never be revived"
+        );
+        let waited = tokio::time::Instant::now() - started;
+        assert!(
+            waited > Duration::from_secs(60),
+            "the wait must have run past the fast-path budget for this to prove anything, \
+             waited {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(300),
+            "and must stay inside the patience deadline, waited {waited:?}"
+        );
+    }
+
+    /// A timeout is the caller's patience running out, not a death certificate.
+    /// It buys exactly one escalated attempt on the remaining budget, and never
+    /// a revival.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_escalates_the_budget_and_never_revives() {
+        let attempts = ScriptedAttempts::new(vec![timed_out()]);
+        let reviver = FakeReviver::new(Err("revival must not run".to_string()));
+
+        let value = attempt_with_revival_within(
+            "tool trace_data_flow",
+            "http://127.0.0.1:1",
+            &reviver,
+            |url, budget| attempts.attempt(url, budget),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("the escalated attempt must be allowed to answer");
+
+        assert_eq!(value, 7);
+        assert_eq!(reviver.revives(), 0, "a timeout must never reach revival");
+        let budgets = attempts.budgets();
+        assert_eq!(budgets.len(), 2, "exactly one escalation: {budgets:?}");
+        assert_eq!(
+            budgets[0],
+            Duration::from_secs(60),
+            "first attempt is the fast path"
+        );
+        assert!(
+            budgets[1] > Duration::from_secs(200),
+            "the escalated attempt must inherit the remaining patience, got {:?}",
+            budgets[1]
+        );
+    }
+
+    /// And when the escalated attempt also runs out, the daemon is still left
+    /// alone. The message has to say so, because the whole failure mode being
+    /// fixed is a user being told a running daemon exited.
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_patience_reports_a_daemon_left_running() {
+        let attempts = ScriptedAttempts::new(vec![timed_out(), timed_out()]);
+        let reviver = FakeReviver::new(Err("revival must not run".to_string()));
+
+        let err = attempt_with_revival_within::<u32, _, _>(
+            "tool semantic_locate",
+            "http://127.0.0.1:1",
+            &reviver,
+            |url, budget| attempts.attempt(url, budget),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        )
+        .await
+        .expect_err("two exhausted budgets must fail the call");
+
+        assert_eq!(reviver.revives(), 0);
+        assert!(
+            err.contains("left running rather than restarted for being slow"),
+            "the error must say the daemon was spared, got: {err}"
+        );
+        assert!(
+            !err.contains(DAEMON_EXITED_RESTART_REQUIRED),
+            "a daemon that never proved dead must not be reported as exited, got: {err}"
+        );
+    }
+
+    /// FALSIFICATION, "a dead daemon is still recovered" direction.
+    ///
+    /// A real daemon is killed — its listener is dropped, so the port refuses
+    /// connections exactly as an exited daemon's does — and the very next
+    /// forward must revive and succeed. Patience must not have cost the client
+    /// its recovery.
+    #[tokio::test]
+    async fn a_proven_dead_daemon_is_still_revived_after_the_patience_change() {
+        let (dying, dying_handle) = stub_daemon(r#"{"session_id":"s-doomed"}"#).await;
+        let client = probe_client();
+        post_session(&client, &dying, Duration::from_secs(3))
+            .await
+            .expect("the daemon must be genuinely alive before it is killed");
+        dying_handle.abort();
+        await_refused(&dying).await;
+
+        let (revived, revived_handle) = stub_daemon(r#"{"session_id":"s-revived"}"#).await;
+        let reviver = FakeReviver::new(Ok(revived.clone()));
+
+        let value: serde_json::Value = attempt_with_revival_within(
+            "session start",
+            &dying,
+            &reviver,
+            |base, patience| {
+                let client = client.clone();
+                async move { post_session(&client, &base, patience).await }
+            },
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("a genuinely dead daemon must still be revived");
+
+        assert_eq!(
+            value["session_id"], "s-revived",
+            "the answer must come from the revived daemon"
+        );
+        assert_eq!(reviver.revives(), 1, "revival must run exactly once");
+        revived_handle.abort();
+    }
+
+    /// Two transport failures are evidence about the endpoint, not a verdict on
+    /// the process. A daemon that is demonstrably running keeps the repository
+    /// lock a replacement would need, so revival is withheld and the caller is
+    /// told what is actually true rather than that the daemon exited.
+    #[tokio::test]
+    async fn a_daemon_proven_alive_is_never_replaced_by_a_doomed_respawn() {
+        let unreachable = exited_daemon_url().await;
+        let reviver = FakeReviver::with_a_live_daemon(Ok("http://127.0.0.1:1".to_string()));
+        let client = probe_client();
+
+        let err = attempt_with_revival_within::<serde_json::Value, _, _>(
+            "session start",
+            &unreachable,
+            &reviver,
+            |base, patience| {
+                let client = client.clone();
+                async move { post_session(&client, &base, patience).await }
+            },
+            Duration::from_secs(3),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("an unreachable endpoint must still fail the call");
+
+        assert_eq!(
+            reviver.revives(),
+            0,
+            "a daemon proven alive must not be replaced by a respawn that cannot take its lock"
+        );
+        assert!(
+            err.contains("alive but did not answer"),
+            "the caller must be told the daemon is alive, got: {err}"
+        );
+        assert!(
+            !err.contains(DAEMON_EXITED_RESTART_REQUIRED),
+            "a live daemon must never be reported as exited, got: {err}"
+        );
+    }
+
+    /// The wire shape, end to end over a real socket: a daemon that publishes
+    /// its endpoint before it can serve answers `503 daemon_opening`, and the
+    /// delegate must read that as alive-and-warming rather than as a failed
+    /// command. This is the client behavior early endpoint publication depends
+    /// on.
+    #[tokio::test]
+    async fn a_warming_503_over_a_real_socket_is_waited_out_not_revived() {
+        let (base, handle) = stub_daemon_warming_then_ok(3, r#"{"session_id":"s-warm"}"#).await;
+        let reviver = FakeReviver::new(Err("revival must not run".to_string()));
+        let client = probe_client();
+
+        let value: serde_json::Value = attempt_with_revival_within(
+            "session start",
+            &base,
+            &reviver,
+            |base, patience| {
+                let client = client.clone();
+                async move { post_session(&client, &base, patience).await }
+            },
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a warming daemon must be waited for, not replaced");
+
+        assert_eq!(value["session_id"], "s-warm");
+        assert_eq!(
+            reviver.revives(),
+            0,
+            "a daemon that answered 503 daemon_opening is listening, so it is alive"
+        );
+        handle.abort();
+    }
+
+    /// Block until nothing is listening at `base`, so a test that killed a stub
+    /// is asserting against a genuinely closed port rather than racing the
+    /// listener's teardown.
+    async fn await_refused(base: &str) {
+        let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the killed stub daemon never stopped accepting connections on {base}");
+    }
+
+    /// Serves `warming` warming refusals, then `body` with 200, per connection
+    /// accepted. The delegate opens a fresh connection per attempt
+    /// (`pool_max_idle_per_host(0)`), so the count is a count of attempts.
+    async fn stub_daemon_warming_then_ok(
+        warming: usize,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let warming_now = served < warming;
+                served += 1;
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    let (status, reason, payload) = if warming_now {
+                        (
+                            503,
+                            "Service Unavailable",
+                            r#"{"error":"daemon_opening","ready":false,"warming":true}"#,
+                        )
+                    } else {
+                        (200, "OK", body)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// The warming guard has to be able to say no. A refusal that is not the
+    /// daemon reporting its own startup must keep reading as the error it is,
+    /// or a real outage would be politely waited out until the patience
+    /// deadline.
+    #[test]
+    fn the_warming_guard_distinguishes_a_startup_from_an_outage() {
+        let opening = r#"{"error":"daemon_opening","ready":false,"warming":true}"#;
+        assert!(is_warming_refusal(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            opening
+        ));
+        assert!(is_warming_refusal(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"ready":false,"warming":true}"#
+        ));
+
+        for (status, body, why) in [
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"embedder_unavailable"}"#,
+                "a real dependency outage is not a startup",
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"warming":false}"#,
+                "a daemon that says it is not warming is not warming",
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "<html>502 from a proxy</html>",
+                "a non-JSON refusal carries no daemon report at all",
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "",
+                "an empty refusal carries no daemon report at all",
+            ),
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                opening,
+                "the status is part of the contract, not decoration",
+            ),
+            (
+                reqwest::StatusCode::OK,
+                opening,
+                "a 200 is an answer, and must not be waited out",
+            ),
+        ] {
+            assert!(
+                !is_warming_refusal(status, body),
+                "{why}: HTTP {status} {body}"
+            );
+        }
+    }
+
+    /// A request that is sent and not answered must not classify as the same
+    /// thing as a port that refuses connections. Driven over real sockets so
+    /// reqwest's own classification is exercised rather than assumed.
+    #[tokio::test]
+    async fn a_slow_answer_and_a_closed_port_classify_differently() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            // Accept and never answer: the connection succeeds, the reply does
+            // not come. Held open, because closing would surface as a reset —
+            // the very class this test exists to keep separate.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let client = probe_client();
+
+        let slow = post_session(
+            &client,
+            &format!("http://127.0.0.1:{silent_port}"),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a silent daemon must not answer");
+        assert!(
+            matches!(slow, DaemonCallError::Timeout(_)),
+            "an established connection with no reply is a timeout, got {slow:?}"
+        );
+
+        let closed = post_session(&client, &exited_daemon_url().await, Duration::from_secs(3))
+            .await
+            .expect_err("a closed port must not answer");
+        assert!(
+            matches!(closed, DaemonCallError::ConnectionLost(_)),
+            "a refused connection is connection loss, got {closed:?}"
+        );
+        silent.abort();
+    }
+
+    /// Any HTTP answer proves a process is running, including a refusal. This
+    /// is the veto that keeps a live daemon from being replaced by one that
+    /// cannot take the repository lock it still holds.
+    #[tokio::test]
+    async fn a_refusing_daemon_still_counts_as_proof_of_life() {
+        let (refusing, handle) = stub_daemon_raw(503, "Service Unavailable", r#"{"e":1}"#).await;
+        assert!(
+            daemon_is_provably_alive(&refusing).await,
+            "a process that writes a response line is running"
+        );
+        handle.abort();
+
+        assert!(
+            !daemon_is_provably_alive(&exited_daemon_url().await).await,
+            "a closed port offers no proof of life"
+        );
+    }
+
+    /// A PID record proves life only for the endpoint it actually describes.
+    #[test]
+    fn the_recorded_owner_proves_life_only_for_its_own_process() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !kin_daemon_spawn::recorded_owner_is_alive(dir.path()),
+            "no record is not proof of life"
+        );
+
+        std::fs::write(
+            dir.path().join(kin_daemon_spawn::PID_FILE_NAME),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(
+            kin_daemon_spawn::recorded_owner_is_alive(dir.path()),
+            "this test process is unambiguously running"
+        );
+
+        std::fs::write(
+            dir.path().join(kin_daemon_spawn::PID_FILE_NAME),
+            "not-a-pid",
+        )
+        .unwrap();
+        assert!(
+            !kin_daemon_spawn::recorded_owner_is_alive(dir.path()),
+            "an unreadable record is not proof of life"
+        );
+    }
+
+    /// The budgets the wrapper resolves are the ones the ladder is documented
+    /// against, and the fast path is unchanged from the flat deadline it
+    /// replaced, so nothing that answers today starts costing a second attempt.
+    #[test]
+    fn the_default_budgets_are_the_documented_ones() {
+        assert_eq!(fast_path_patience(), Duration::from_secs(60));
+        assert_eq!(escalated_patience(), Duration::from_secs(300));
+        assert!(escalated_patience() > fast_path_patience());
     }
 }
