@@ -495,6 +495,9 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/notify-approver.yml": {
         "notify": None,
     },
+    ".github/workflows/pr-text-hygiene.yml": {
+        "pr_text": "PR text hygiene",
+    },
     ".github/workflows/publish-release-installers.yml": {
         "dispatch": None,
     },

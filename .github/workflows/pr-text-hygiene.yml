@@ -20,6 +20,13 @@ name: PR Text Hygiene
 # to the shared workflow once a kin-actions release carries that input.
 on:
   pull_request:
+    # `edited` is the one that cannot be left out. The default trigger set is
+    # opened/synchronize/reopened, none of which fires when someone changes the
+    # title or body of an open pull request -- which is the text the queue
+    # mints, and the one edit that needs no push. Without `edited` the gate
+    # would inspect the text a pull request opened with and then let any later
+    # rewrite of it through unread.
+    types: [opened, reopened, synchronize, edited]
   # A required context must also report on the queue's speculative merge
   # commits, or the queue waits forever for a check that never runs.
   merge_group:
