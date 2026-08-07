@@ -3063,12 +3063,14 @@ fn terminate_spawned_process(
     }
 }
 
-/// The build identity this test binary carries, in the exact form the daemon
-/// stamps persisted vector sidecars with.
+/// The build identity this test binary carries, joined the way
+/// `kin_buildinfo::sha_with_dirty` joins it.
 ///
-/// A test that seeds prepared state writes this stamp; the daemon that later
-/// reopens the repository demands its own. The two only agree when both
-/// binaries came out of one build of `kin-buildinfo`.
+/// This is a harness-local identity for pairing a test binary with a daemon
+/// built beside it. It is deliberately NOT what the daemon stamps persisted
+/// vector sidecars with: keying index reuse on a build SHA is what made every
+/// Kin upgrade discard the user's whole index, and the sidecar now carries the
+/// embedding runtime's own identity instead.
 pub fn expected_build_stamp() -> String {
     kin_buildinfo::sha_with_dirty(kin_buildinfo::get())
 }
@@ -3077,10 +3079,9 @@ pub fn expected_build_stamp() -> String {
 /// `kin_buildinfo::sha_with_dirty` would produce for the same build.
 ///
 /// The daemon reports the two fields separately, so the harness has to join
-/// them the way the authority does rather than comparing the pair directly:
-/// when the commit is unknown the dirty flag is not part of the identity, and
-/// a raw pair comparison would reject a daemon whose embedder identity
-/// actually matches.
+/// them the same way rather than comparing the pair directly: when the commit
+/// is unknown the dirty flag is not part of the identity, and a raw pair
+/// comparison would reject a daemon that actually matches.
 fn build_stamp(sha: &str, dirty: bool) -> String {
     if dirty && sha != "unknown" {
         format!("{sha}-dirty")
@@ -3092,14 +3093,19 @@ fn build_stamp(sha: &str, dirty: bool) -> String {
 /// Why a candidate `kin-daemon` may not be reused by this test binary, or
 /// `None` when it may be.
 ///
-/// Two independent reasons, and the second is the one that used to be missed.
-/// A daemon whose graph snapshot version differs cannot read the repository at
-/// all. A daemon that is merely built from a *different commit or working
-/// tree* reads it fine, but stamps and demands a different embedder identity —
-/// so a sidecar seeded by this test binary is rejected on load,
-/// `indexed_embedding_count` reads 0, and the suite reports a product defect
-/// that only exists because two binaries in one target directory were built at
-/// different times.
+/// Two independent reasons. A daemon whose graph snapshot version differs
+/// cannot read the repository at all. A daemon built from a *different commit
+/// or working tree* reads it fine, but the CLI/daemon HTTP surface between them
+/// is versioned by nothing except being built together, so a mixed pair out of
+/// one target directory is not a configuration any release ships and not one a
+/// failure should be attributed to.
+///
+/// It is no longer true that such a pair disagrees about persisted vector
+/// sidecars. That WAS this gate's second reason, and it was the product defect
+/// showing through the harness: a differently-built daemon rejected a seeded
+/// sidecar, `indexed_embedding_count` read 0, and the suite reported a defect
+/// the harness then worked around. Index reuse no longer keys on a build SHA,
+/// so a mixed pair reuses the index just as a user's upgrade now does.
 pub fn daemon_compat_mismatch(
     payload: &Value,
     expected_snapshot_version: u64,
@@ -3253,11 +3259,10 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         panic!(
             "kin-daemon at {} is unusable after rebuild: {reason}.\n\
              This test binary carries build identity {}. A daemon built from a \
-             different commit or working tree stamps persisted vector sidecars \
-             with a different embedder identity, so state this suite seeds is \
-             rejected on reopen and indexed_embedding_count reads 0 — a harness \
-             fault that reads as a product defect. Build both from one tree: \
-             cargo build --all-targets",
+             different commit or working tree pairs with this binary over an \
+             HTTP surface that nothing versions except having been built \
+             together, so failures under a mixed pair are not attributable to \
+             either side. Build both from one tree: cargo build --all-targets",
             daemon_bin.display(),
             expected_build_stamp()
         );

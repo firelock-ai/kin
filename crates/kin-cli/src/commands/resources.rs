@@ -29,6 +29,12 @@ pub struct EmbedRuntimeState {
     pub hybrid_metrics: HybridMetricsRuntime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metal_profile: Option<MetalProfileRuntime>,
+    /// Why the daemon did not install the vector index it found on disk when it
+    /// opened, when it found one and did not. Without it, a repository that had
+    /// full coverage yesterday reports partial coverage today with nothing to
+    /// distinguish that from a first run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_index_discarded: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

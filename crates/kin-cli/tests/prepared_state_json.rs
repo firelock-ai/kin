@@ -165,14 +165,14 @@ fn seed_local_vectors(kin_dir: &Path) {
         graph.load_vector_index_compatible(&vector_path, &descriptor),
         kin_db::VectorIndexLoad::Loaded(_)
     ));
-    // Stamp the same embedder identity the daemon writes and demands on load,
-    // so a reopened repo accepts this sidecar instead of treating it as one
-    // produced by a different build.
-    let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+    // Stamped and validated with no producer pin, exactly as the daemon writes
+    // and reads it. Pinning a build SHA here would make the fixture describe a
+    // rule the product no longer has, and would hide the case this seeds for:
+    // a sidecar written by one build being reopened by another.
     kin_db::SnapshotManager::save_vector_index_for_graph(
         layout.kindb_snapshot_path(),
         &graph,
-        Some(embedder_identity.as_str()),
+        None,
     )
     .expect("persist seeded vector sidecar");
     fs::remove_file(vector_path).expect("remove temp vector file");
@@ -180,7 +180,7 @@ fn seed_local_vectors(kin_dir: &Path) {
         kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
             &graph,
             &layout.kindb_snapshot_path(),
-            Some(embedder_identity.as_str()),
+            None,
         )
         .expect("validate seeded vector sidecar"),
         "seeded sidecar must validate against the repository graph it was built from"
