@@ -102,14 +102,46 @@ pub fn digest_bytes(data: &[u8]) -> [u8; 32] {
 /// across a shard directory, and is issued by [`sync`](Self::sync), by the
 /// [`Drop`] drain, or by `write` itself once enough renames accumulate. See
 /// [`write`](Self::write) for the crash states this does and does not admit.
+///
+/// A store built with [`new_ephemeral`](Self::new_ephemeral) issues no device
+/// barriers at all and therefore makes none of those guarantees across a crash.
+/// Every other behavior — layout, content addressing, dedup, read-side
+/// verification — is identical.
 pub struct BlobStore {
     root: PathBuf,
+    /// Whether this store's writes are barriered to the device. Fixed at
+    /// construction, because the two modes make incompatible promises about
+    /// what survives a crash and a store cannot make both at once.
+    durability: Durability,
     pending: Mutex<PendingDirSyncs>,
     /// Renames after which [`BlobStore::write`] drains on its own. Always
     /// [`PENDING_RENAME_DRAIN_THRESHOLD`] outside this crate's own tests, which
     /// lower it so the drain path is exercised without writing thousands of
     /// blobs.
     drain_threshold: usize,
+    /// Device barriers this store has issued, counted where each one is taken.
+    ///
+    /// Load-independent evidence for the durability mode: a barrier is a device
+    /// cache flush whose cost does not show up reliably in a wall clock under
+    /// concurrent load, but its count is exact. Incremented only after the
+    /// barrier returns successfully, so it never claims one that failed.
+    barriers: AtomicU64,
+}
+
+/// Whether a store's writes are barriered to the device.
+///
+/// Selected by which constructor built the store — [`BlobStore::new`] or
+/// [`BlobStore::new_ephemeral`] — rather than by a parameter, so the choice to
+/// give up durability is a word at the call site and cannot be made by passing
+/// the wrong boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// Barrier a blob's bytes before its name is published, and barrier the
+    /// directories that hold those names. The store survives a crash.
+    Barriered,
+    /// Issue no barrier on any path. The store does not survive a crash, and
+    /// nothing that does may reference it.
+    Ephemeral,
 }
 
 /// Directory entries this store has created but not yet made durable.
@@ -182,17 +214,55 @@ pub struct GcReport {
 impl BlobStore {
     /// Create or open a blob store at the given root directory.
     ///
-    /// Creates the root directory if it does not exist.
+    /// Creates the root directory if it does not exist. Writes are barriered:
+    /// see the durability model on [`BlobStore`] and on [`write`](Self::write).
     pub fn new(root: PathBuf) -> Result<Self> {
         Self::with_drain_threshold(root, PENDING_RENAME_DRAIN_THRESHOLD)
     }
 
+    /// Create or open a blob store that issues no device barriers.
+    ///
+    /// Layout, content addressing, dedup, and read-side verification are
+    /// exactly [`new`](Self::new)'s. The single difference is that no `fsync`
+    /// is ever issued: not the per-blob content barrier that precedes the
+    /// rename publishing a name, and not the deferred directory barriers that
+    /// make those names durable. [`sync`](Self::sync) and the [`Drop`] drain
+    /// have nothing to issue and do nothing.
+    ///
+    /// # Crash window
+    ///
+    /// After a machine crash or power loss an ephemeral store may hold blobs
+    /// that are absent, and blobs that are present but torn — bytes that do not
+    /// hash to the address they are stored under. The ordering that gives
+    /// [`write`](Self::write) its "absent, never present-but-corrupt" property
+    /// is the barrier, so that property is gone here too. Nothing changes
+    /// inside a live process: a rename is visible to every later read the
+    /// moment it returns, and [`read`](Self::read) still re-hashes every body
+    /// and quarantines a mismatch, so a torn body is never served silently.
+    ///
+    /// That admits exactly one shape of store: one whose root is discarded by
+    /// the same process that created it and is never opened again by path. A
+    /// crash that could tear these bytes destroys the only thing that was ever
+    /// going to read them, so the torn state is unobservable — it is reachable
+    /// only through a root no surviving reference names. Use [`new`](Self::new)
+    /// for anything else, including a store a later run might find on disk and
+    /// reuse.
+    pub fn new_ephemeral(root: PathBuf) -> Result<Self> {
+        Self::open(root, Durability::Ephemeral, PENDING_RENAME_DRAIN_THRESHOLD)
+    }
+
     fn with_drain_threshold(root: PathBuf, drain_threshold: usize) -> Result<Self> {
+        Self::open(root, Durability::Barriered, drain_threshold)
+    }
+
+    fn open(root: PathBuf, durability: Durability, drain_threshold: usize) -> Result<Self> {
         fs::create_dir_all(&root).map_err(|e| BlobError::io(&root, e))?;
         Ok(Self {
             root,
+            durability,
             pending: Mutex::new(PendingDirSyncs::default()),
             drain_threshold,
+            barriers: AtomicU64::new(0),
         })
     }
 
@@ -243,6 +313,13 @@ impl BlobStore {
     /// The safe pattern for resilient importers is to `write` then immediately
     /// `read`-verify, or to call [`read`](Self::read) instead of relying on dedup
     /// to detect prior corruption.
+    ///
+    /// # Ephemeral stores
+    ///
+    /// Every crash state described above is a property of the barriers, so none
+    /// of it holds for a store built by
+    /// [`new_ephemeral`](Self::new_ephemeral), which issues none. Its crash
+    /// window is stated there.
     pub fn write(&self, data: &[u8]) -> Result<Hash256> {
         let _span = tracing::info_span!("kin_blobs.write", bytes = data.len()).entered();
         let hash = digest(data);
@@ -261,16 +338,33 @@ impl BlobStore {
 
         // Atomic-durable write: write to a unique temp file in the shard dir,
         // fsync its contents, then rename into place. The shard directory's own
-        // barrier is deferred to `sync`.
+        // barrier is deferred to `sync`. An ephemeral store skips both.
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_path = shard_dir.join(format!(".tmp-{}-{}-{}", hash, std::process::id(), seq));
-        write_file_durably(&temp_path, data).map_err(|e| BlobError::io(&temp_path, e))?;
+        self.write_body(&temp_path, data)
+            .map_err(|e| BlobError::io(&temp_path, e))?;
         fs::rename(&temp_path, &blob_path).map_err(|e| {
-            // Don't leave the fsynced temp file behind on a failed rename.
+            // Don't leave the written temp file behind on a failed rename.
             let _ = fs::remove_file(&temp_path);
             BlobError::io(&blob_path, e)
         })?;
 
+        self.record_rename(shard_name, created_shard_dir);
+
+        debug!(hash = %hash, bytes = data.len(), "wrote blob");
+        Ok(hash)
+    }
+
+    /// Record one rename as owing a directory barrier, draining if enough have
+    /// accumulated.
+    ///
+    /// An ephemeral store records nothing: it owes no barrier, and pending
+    /// state a barrier-free [`sync`](Self::sync) never drains would only grow
+    /// until the threshold fired a drain with nothing to do.
+    fn record_rename(&self, shard_name: &str, created_shard_dir: bool) {
+        if self.durability == Durability::Ephemeral {
+            return;
+        }
         // Bound the guard to a `let` so it is unmistakably released before the
         // drain below reacquires it.
         let drain_now =
@@ -291,9 +385,6 @@ impl BlobStore {
                 );
             }
         }
-
-        debug!(hash = %hash, bytes = data.len(), "wrote blob");
-        Ok(hash)
     }
 
     /// Issue the deferred directory barriers, making every rename and shard
@@ -319,7 +410,14 @@ impl BlobStore {
     /// against them, so a later `sync` or the `drop` drain retries them and the
     /// self-drain bound keeps counting the renames that are genuinely still
     /// awaiting a barrier.
+    ///
+    /// A store built by [`new_ephemeral`](Self::new_ephemeral) has no barrier
+    /// to issue and no commit point to be: this returns `Ok(())` having done
+    /// nothing.
     pub fn sync(&self) -> Result<()> {
+        if self.durability == Durability::Ephemeral {
+            return Ok(());
+        }
         let (shards, root) = {
             let mut pending = self.lock_pending();
             pending.renames = 0;
@@ -338,7 +436,7 @@ impl BlobStore {
         let mut root_unsynced = false;
 
         if root {
-            match sync_dir(&self.root) {
+            match self.barrier_dir(&self.root) {
                 Ok(()) => {}
                 // A removed root has no entry left to make durable.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -350,7 +448,7 @@ impl BlobStore {
         }
         for (shard, renames) in shards {
             let shard_dir = self.root.join(&shard);
-            match sync_dir(&shard_dir) {
+            match self.barrier_dir(&shard_dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && !root_unsynced => {
                     // Pruned by compaction, or removed with the store root. On
@@ -715,6 +813,33 @@ impl BlobStore {
         self.root.join(&hex[..2]).join(&hex[2..])
     }
 
+    /// Write one blob body to `path`, issuing the content barrier this store's
+    /// durability calls for.
+    ///
+    /// The counter is incremented on the line after the barrier returns, so
+    /// what it reports is barriers actually taken rather than barriers a caller
+    /// inferred from the mode.
+    fn write_body(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        file.write_all(data)?;
+        if self.durability == Durability::Ephemeral {
+            return Ok(());
+        }
+        file.sync_all()?;
+        self.barriers.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Issue one directory barrier, counting it once it succeeds.
+    ///
+    /// Only ever reached from [`sync`](Self::sync), which returns before this
+    /// on an ephemeral store.
+    fn barrier_dir(&self, dir: &Path) -> std::io::Result<()> {
+        sync_dir(dir)?;
+        self.barriers.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Directory barriers this store still owes: `(shards, root, renames)`.
     ///
     /// Test-only window onto the deferral itself, so the amortization can be
@@ -724,17 +849,29 @@ impl BlobStore {
         let pending = self.lock_pending();
         (pending.shards.len(), pending.root, pending.renames)
     }
+
+    /// Device barriers this store has issued since it was constructed.
+    ///
+    /// Test-only window onto the durability mode. A barrier's cost is a device
+    /// cache flush, which a wall clock reports differently on every machine and
+    /// under every load; its count is exact and moves only when the code does.
+    #[cfg(test)]
+    fn barriers_issued(&self) -> u64 {
+        self.barriers.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for BlobStore {
     /// Drain any deferred directory barriers.
     ///
     /// Dropping the handle is the last commit point a caller that never called
-    /// [`sync`](BlobStore::sync) will get. Failures cannot be returned because
-    /// `drop` has nowhere to report them, which matches the best-effort
-    /// directory barrier policy this store has always had. They are logged at
-    /// `warn` regardless, because this drain has no later retry behind it and a
-    /// silent failure here is a rename that never became durable at all.
+    /// [`sync`](BlobStore::sync) will get, and no commit point at all for an
+    /// ephemeral store, whose `sync` returns without issuing anything.
+    /// Failures cannot be returned because `drop` has nowhere to report them,
+    /// which matches the best-effort directory barrier policy this store has
+    /// always had. They are logged at `warn` regardless, because this drain has
+    /// no later retry behind it and a silent failure here is a rename that
+    /// never became durable at all.
     fn drop(&mut self) {
         if let Err(e) = self.sync() {
             warn!(
@@ -753,15 +890,6 @@ impl Drop for BlobStore {
 /// reject stray entries (`.corrupt`, `.tmp-*`, etc.) without erroring.
 fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// Write `data` to `path` and `fsync` the file so its bytes are durable on disk
-/// before the caller renames it into its final content-addressed location.
-fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    Ok(())
 }
 
 /// Verify that `dir` currently resolves to a directory without issuing a
@@ -1996,6 +2124,135 @@ mod tests {
             "restored renames add to the one recorded meanwhile"
         );
         assert_eq!(pending.shards.get("ab").copied(), Some(3));
+    }
+
+    // -----------------------------------------------------------------------
+    // Durability-mode tests
+    // -----------------------------------------------------------------------
+
+    /// Every stored file under `root`, as sorted `(path relative to root,
+    /// content hash)` pairs.
+    ///
+    /// Walks the filesystem rather than the store's own enumeration, so a
+    /// difference in layout or in stored bytes shows up instead of being
+    /// normalized away by the reader that produced it.
+    fn on_disk_tree(root: &Path) -> Vec<(String, Hash256)> {
+        let mut entries = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                entries.push((relative, digest(&fs::read(&path).unwrap())));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// The positive control for the ephemeral counts below: a barriered store
+    /// takes exactly one device barrier per body it writes, and one per
+    /// directory the drain makes durable.
+    #[test]
+    fn a_barriered_store_counts_one_barrier_per_body_and_directory() {
+        let (_dir, store) = make_store();
+        let payloads = payloads_in_one_shard(8);
+        for payload in &payloads {
+            store.write(payload).unwrap();
+        }
+        let bodies = payloads.len() as u64;
+        assert_eq!(
+            store.barriers_issued(),
+            bodies,
+            "each written body barriers its own bytes before the rename"
+        );
+
+        // A dedup hit writes no bytes, so it barriers none either.
+        store.write(&payloads[0]).unwrap();
+        assert_eq!(store.barriers_issued(), bodies);
+
+        let (shards, root, _) = store.pending_snapshot();
+        store.sync().unwrap();
+        assert_eq!(
+            store.barriers_issued() - bodies,
+            shards as u64 + u64::from(root),
+            "the drain barriers one directory per pending shard, plus the root"
+        );
+    }
+
+    /// The ephemeral mode's whole claim: not one device barrier, on any path.
+    ///
+    /// `renames` staying at zero is what proves the write-drain backstop can
+    /// never fire either — it triggers on that counter — without writing
+    /// [`PENDING_RENAME_DRAIN_THRESHOLD`] bodies to watch it not happen.
+    #[test]
+    fn an_ephemeral_store_issues_no_barrier_on_any_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new_ephemeral(dir.path().join("objects")).unwrap();
+
+        let mut written = Vec::new();
+        for i in 0..128 {
+            let data = format!("ephemeral body {i}").into_bytes();
+            written.push((store.write(&data).unwrap(), data));
+        }
+
+        assert_eq!(
+            store.pending_snapshot(),
+            (0, false, 0),
+            "an ephemeral store records no barrier debt, so no drain can fire"
+        );
+        assert_eq!(store.barriers_issued(), 0, "writes barrier nothing");
+        store.sync().unwrap();
+        assert_eq!(store.barriers_issued(), 0, "sync barriers nothing");
+
+        // The bodies are still there and still verify: dropping the barriers
+        // drops durability, not the write.
+        for (hash, data) in &written {
+            assert_eq!(&store.read(hash).unwrap(), data);
+        }
+        assert_eq!(store.list_hashes().unwrap().len(), written.len());
+    }
+
+    /// Content parity across the modes: the same bodies produce the same
+    /// addresses, at the same paths, holding the same bytes.
+    #[test]
+    fn an_ephemeral_store_holds_the_same_tree_as_a_barriered_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let barriered_root = dir.path().join("barriered");
+        let ephemeral_root = dir.path().join("ephemeral");
+        let barriered = BlobStore::new(barriered_root.clone()).unwrap();
+        let ephemeral = BlobStore::new_ephemeral(ephemeral_root.clone()).unwrap();
+
+        for i in 0..128 {
+            let data = format!("parity body {i}").into_bytes();
+            assert_eq!(
+                barriered.write(&data).unwrap(),
+                ephemeral.write(&data).unwrap(),
+                "the same bytes address the same way in either mode"
+            );
+        }
+        barriered.sync().unwrap();
+
+        let expected = on_disk_tree(&barriered_root);
+        assert_eq!(expected.len(), 128, "the walk found every body");
+        assert_eq!(
+            on_disk_tree(&ephemeral_root),
+            expected,
+            "same file set, same paths, same content"
+        );
+        assert!(
+            barriered.barriers_issued() > 0,
+            "the control arm must actually have barriered"
+        );
+        assert_eq!(ephemeral.barriers_issued(), 0);
     }
 
     // -----------------------------------------------------------------------
