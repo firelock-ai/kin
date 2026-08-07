@@ -141,11 +141,26 @@ fn require_empty_native_boundary(dir: &Path) -> Result<()> {
         anyhow::bail!(
             "non-Git repository admission currently requires an empty directory: {}; Kin will \
              not silently ignore or derive authority from existing filesystem contents. Commit \
-             the exact files to Git and retry, or initialize an empty Kin-native repository.",
-            dir.display()
+             the exact files to Git and retry, or initialize an empty Kin-native repository.{}",
+            dir.display(),
+            git_prerequisite_note(which::which("git").is_ok())
         );
     }
     Ok(())
+}
+
+/// The suffix naming Git as a prerequisite of the remedy above.
+///
+/// Kin reads a repository's history through `gix` and never needs the host
+/// binary to admit one, so this error is reachable on a host with no Git at
+/// all — and the first remedy it offers is a `git commit`. Say that the tool
+/// is missing rather than sending the reader to a command they do not have.
+fn git_prerequisite_note(git_on_path: bool) -> &'static str {
+    if git_on_path {
+        ""
+    } else {
+        " Git is not installed on this host, so committing to Git needs `git` installed first."
+    }
 }
 
 fn path_exists(path: &Path) -> Result<bool> {
@@ -319,6 +334,25 @@ mod tests {
             semantic_change_count: 0,
             completion_attested: false,
         }
+    }
+
+    /// The non-empty-directory refusal offers "commit the exact files to Git"
+    /// as its first remedy. Measured on a fresh ubuntu:24.04 curl install, that
+    /// host has no git at all, so the remedy names a command the reader does
+    /// not have and the error dead-ends.
+    #[test]
+    fn the_non_git_refusal_names_git_as_a_prerequisite_only_when_it_is_absent() {
+        assert_eq!(
+            git_prerequisite_note(true),
+            "",
+            "a host that has git needs no extra instruction"
+        );
+
+        let absent = git_prerequisite_note(false);
+        assert!(
+            absent.contains("not installed") && absent.contains("git"),
+            "a host without git must be told before being sent to a git commit: {absent}"
+        );
     }
 
     /// A repository Kin could not extract anything from must SAY so and name the
