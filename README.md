@@ -31,10 +31,10 @@ critical workflow.
 
 ## See it on a real repository
 
-A one-line signature change in ripgrep looks harmless in the diff. Asked
-before any compiler runs, on a graph that was already built, `kin impact`
-names the entities the edit affects, from the direct callers of the changed
-signature out through the wider blast radius.
+A one-line signature change in ripgrep looks harmless in the diff. Ask
+`kin impact` about it, before any compiler runs, and it names what the edit
+reaches. The callers of the changed signature come first, then everything
+those callers pull in behind them.
 
 <p align="center">
   <img src="docs/assets/kin-impact-ripgrep.png" alt="kin impact on ripgrep listing 13 impacted entities within 3 hops of a one-line signature change" width="100%" />
@@ -291,10 +291,11 @@ the graph, then pass explicit commit SHAs to the report-only shadow gate:
 kin review shadow "$(git rev-parse main)..$(git rev-parse HEAD)"
 ```
 
-The result is `PASS`, `NEEDS ATTENTION`, or `WOULD BLOCK`, with graph-derived
-blast radius, repair context, and recorded evidence. Authorship is declared,
-not verified. The command does not block a merge or mutate graph state. It
-produces evidence for a human or CI policy to act on.
+The result is `PASS`, `NEEDS ATTENTION`, or `WOULD BLOCK`, and it comes with the
+impact Kin derived from the graph, the context needed to repair it, and the
+evidence behind both. Authorship is declared, not verified. The command will not
+block your merge or change graph state. It hands evidence to a human or a CI
+policy and stops there.
 
 ## How Kin relates to Git
 
