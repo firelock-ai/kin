@@ -12,7 +12,7 @@
     {
       "file": "crates/kin-index/src/history.rs",
       "function": "semantic_state_for_tree",
-      "digest": "sha256:0340e3ab07f9168d00307ac4514718a00abc2115a22bb58dd805ccbb7f68e794",
+      "digest": "sha256:74a537ed84687ee2c2cfbacafa3e5121374cc960985999b27b8dc8975a89adf6",
       "reason": "Turns one exact resolved tree plus CAS bodies into the entity/relation state a change is diffed from and to. Its classification, parse, and cross-file linking order decide what the past is said to contain.",
       "owner": "kin-index"
     },

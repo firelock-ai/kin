@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use kin_blobs::BlobStore;
 use kin_model::{
@@ -23,8 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
 use crate::linker::{
-    is_external_import_placeholder, link_cross_file_with_completeness, ArtifactIdentityMap,
-    FileParseCompletenessMap, FileParseData,
+    is_external_import_placeholder, link_cross_file_borrowed_with_completeness,
+    ArtifactIdentityMap, FileParseCompletenessMap, FileParseData,
 };
 use crate::pipeline::IndexPipeline;
 
@@ -67,15 +68,20 @@ struct ParsedFile {
     imports: Vec<kin_parser::FileImport>,
 }
 
+/// One file's parsed semantics, carried forward across commits by reference.
+///
+/// A commit that touches one file leaves every other file in the tree
+/// byte-identical to its parent's, and the fold reuses those parsed results
+/// rather than reparsing. Holding the parsed payload behind [`Arc`] makes that
+/// reuse a reference count instead of a deep copy of every entity, relation,
+/// and import the file declares, which the fold otherwise paid for every
+/// unchanged file on every commit in history.
 #[derive(Clone)]
 struct SemanticFileState {
     artifact_id: ArtifactId,
-    path: String,
     entry: TreeEntry,
-    completeness: ParseCompleteness,
-    entities: Vec<Entity>,
-    relations: Vec<kin_parser::ExtractedRelation>,
-    imports: Vec<kin_parser::FileImport>,
+    completeness: Arc<ParseCompleteness>,
+    parse_data: Arc<FileParseData>,
 }
 
 #[derive(Clone, Default)]
@@ -233,7 +239,7 @@ fn semantic_state_for_tree(
             parent
                 .files
                 .get(&artifact.artifact_id)
-                .filter(|file| file.path == path && file.entry == artifact.entry)
+                .filter(|file| file.parse_data.file_path == path && file.entry == artifact.entry)
         }) {
             if files
                 .insert(artifact.artifact_id, existing.clone())
@@ -272,18 +278,20 @@ fn semantic_state_for_tree(
         let old_entities = parents
             .iter()
             .filter_map(|parent| parent.files.get(&artifact.artifact_id))
-            .flat_map(|file| file.entities.iter())
+            .flat_map(|file| file.parse_data.entities.iter())
             .collect::<Vec<_>>();
         let entities =
             stabilize_historical_entities(artifact.artifact_id, old_entities, &parsed.entities);
         let state = SemanticFileState {
             artifact_id: artifact.artifact_id,
-            path: path.to_string(),
             entry: artifact.entry,
-            completeness: parsed.completeness,
-            entities,
-            relations: parsed.relations,
-            imports: parsed.imports,
+            completeness: Arc::new(parsed.completeness),
+            parse_data: Arc::new(FileParseData {
+                file_path: path.to_string(),
+                entities,
+                relations: parsed.relations,
+                imports: parsed.imports,
+            }),
         };
         if files.insert(artifact.artifact_id, state).is_some() {
             return Err(invalid(format!(
@@ -293,22 +301,27 @@ fn semantic_state_for_tree(
         }
     }
 
-    let mut parse_data = Vec::with_capacity(files.len());
+    // The linker input borrows each file's parsed result rather than copying it.
+    // Every entry here is either freshly parsed above or carried forward from a
+    // parent, and this runs once per commit over the whole tree, so materializing
+    // it would re-copy every entity, relation, and import in the repository for
+    // every commit in history.
+    let mut parse_data: Vec<&FileParseData> = Vec::with_capacity(files.len());
     let mut completeness = FileParseCompletenessMap::new();
     let mut artifact_ids = ArtifactIdentityMap::new();
     let mut entities = BTreeMap::new();
     for file in files.values() {
+        let path = file.parse_data.file_path.as_str();
         if artifact_ids
-            .insert(file.path.clone(), file.artifact_id)
+            .insert(path.to_string(), file.artifact_id)
             .is_some()
         {
             return Err(invalid(format!(
-                "tree contains more than one semantic artifact at {}",
-                file.path
+                "tree contains more than one semantic artifact at {path}"
             )));
         }
-        completeness.insert(file.path.clone(), file.completeness.clone());
-        for entity in &file.entities {
+        completeness.insert(path.to_string(), (*file.completeness).clone());
+        for entity in &file.parse_data.entities {
             if let Some(previous) = entities.insert(entity.id, entity.clone()) {
                 return Err(invalid(format!(
                     "semantic entity identity {} is duplicated in one tree: {} {:?} from {:?} and {} {:?} from {}",
@@ -318,20 +331,16 @@ fn semantic_state_for_tree(
                     previous.file_origin,
                     entity.name,
                     entity.kind,
-                    file.path
+                    path
                 )));
             }
         }
-        parse_data.push(FileParseData {
-            file_path: file.path.clone(),
-            entities: file.entities.clone(),
-            relations: file.relations.clone(),
-            imports: file.imports.clone(),
-        });
+        parse_data.push(&file.parse_data);
     }
     parse_data.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
-    let linked = link_cross_file_with_completeness(&parse_data, &artifact_ids, &completeness)?;
+    let linked =
+        link_cross_file_borrowed_with_completeness(&parse_data, &artifact_ids, &completeness)?;
     entities.extend(external_reference_targets(
         &linked,
         &entities,

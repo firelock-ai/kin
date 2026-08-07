@@ -177,7 +177,8 @@ pub fn link_cross_file(
     files: &[FileParseData],
     artifact_ids: &ArtifactIdentityMap,
 ) -> IndexResult<Vec<Relation>> {
-    link_cross_file_internal(files, artifact_ids, None)
+    let files: Vec<&FileParseData> = files.iter().collect();
+    link_cross_file_internal(&files, artifact_ids, None)
 }
 
 /// Resolve cross-file relations with explicit parser completeness.
@@ -190,20 +191,39 @@ pub fn link_cross_file_with_completeness(
     artifact_ids: &ArtifactIdentityMap,
     completeness: &FileParseCompletenessMap,
 ) -> IndexResult<Vec<Relation>> {
+    let files: Vec<&FileParseData> = files.iter().collect();
+    link_cross_file_internal(&files, artifact_ids, Some(completeness))
+}
+
+/// Resolve cross-file relations for files the caller already holds by reference.
+///
+/// Replaying history reuses one parsed result per artifact across every commit
+/// that leaves the file untouched, so it holds borrowed files and owns no
+/// contiguous slice to hand over. Linking from references lets it link a tree
+/// without copying every entity, relation, and import in the repository, which
+/// it would otherwise repeat once per commit for the whole of history.
+pub fn link_cross_file_borrowed_with_completeness(
+    files: &[&FileParseData],
+    artifact_ids: &ArtifactIdentityMap,
+    completeness: &FileParseCompletenessMap,
+) -> IndexResult<Vec<Relation>> {
     link_cross_file_internal(files, artifact_ids, Some(completeness))
 }
 
 fn link_cross_file_internal(
-    files: &[FileParseData],
+    files: &[&FileParseData],
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> IndexResult<Vec<Relation>> {
     let _span = tracing::info_span!("kin.index.link_cross_file", files = files.len()).entered();
-    let universe_entities: Vec<Entity> = files
-        .iter()
-        .flat_map(|file| file.entities.iter().cloned())
-        .collect();
-    link_cross_file_against_entities_internal(files, &universe_entities, artifact_ids, completeness)
+    // The universe is exactly the entities `files` already own, and linking only
+    // ever reads it: `build_link_context` reduces it to references before doing
+    // anything else. Borrowing them in place rather than copying the whole
+    // semantic universe matters because the historical fold links once per
+    // commit, so this ran once per commit over every entity in the repository.
+    let universe_entities: Vec<&Entity> =
+        files.iter().flat_map(|file| file.entities.iter()).collect();
+    link_cross_file_against_entity_refs(files, &universe_entities, artifact_ids, completeness)
 }
 
 /// Resolve cross-file relations while carrying parser-emitted tests alongside the input.
@@ -309,6 +329,21 @@ pub fn link_cross_file_against_entities_with_completeness(
 fn link_cross_file_against_entities_internal(
     files: &[FileParseData],
     universe_entities: &[Entity],
+    artifact_ids: &ArtifactIdentityMap,
+    completeness: Option<&FileParseCompletenessMap>,
+) -> IndexResult<Vec<Relation>> {
+    let files: Vec<&FileParseData> = files.iter().collect();
+    let universe_entities: Vec<&Entity> = universe_entities.iter().collect();
+    link_cross_file_against_entity_refs(&files, &universe_entities, artifact_ids, completeness)
+}
+
+/// Resolve cross-file relations against files and a universe the caller holds.
+///
+/// Every entry point funnels here holding both by reference, so no path copies
+/// parsed files or the entity universe to satisfy this signature.
+fn link_cross_file_against_entity_refs(
+    files: &[&FileParseData],
+    universe_entities: &[&Entity],
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> IndexResult<Vec<Relation>> {
@@ -463,12 +498,12 @@ fn blind_inference_target_allowed(
 }
 
 fn build_link_context<'a>(
-    files: &'a [FileParseData],
-    universe_entities: &'a [Entity],
+    files: &[&'a FileParseData],
+    universe_entities: &[&'a Entity],
 ) -> LinkContext<'a> {
     // Sort for deterministic relation materialization.
-    let sorted_universe: Vec<&Entity> = {
-        let mut sorted: Vec<&Entity> = universe_entities.iter().collect();
+    let sorted_universe: Vec<&'a Entity> = {
+        let mut sorted: Vec<&'a Entity> = universe_entities.to_vec();
         sorted.sort_by(|a, b| entity_link_order(a, b));
         sorted
     };
@@ -1073,7 +1108,7 @@ fn resolve_one_file(
 /// a single serial pass), then append artifact-level import/include edges.
 fn merge_resolved(
     per_file_relations: Vec<Vec<Relation>>,
-    files: &[FileParseData],
+    files: &[&FileParseData],
     ctx: &LinkContext<'_>,
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
@@ -1142,12 +1177,14 @@ fn link_cross_file_against_entities_serial(
     universe_entities: &[Entity],
     artifact_ids: &ArtifactIdentityMap,
 ) -> Vec<Relation> {
-    let ctx = build_link_context(files, universe_entities);
+    let universe_entities: Vec<&Entity> = universe_entities.iter().collect();
+    let files: Vec<&FileParseData> = files.iter().collect();
+    let ctx = build_link_context(&files, &universe_entities);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
         .map(|file| resolve_one_file(file, &ctx, None))
         .collect();
-    merge_resolved(per_file_relations, files, &ctx, artifact_ids, None)
+    merge_resolved(per_file_relations, &files, &ctx, artifact_ids, None)
 }
 
 /// Serial counterpart of [`build_include_graph`], retained as the byte-identical
@@ -1243,7 +1280,7 @@ where
 }
 
 fn build_include_graph<S>(
-    files: &[FileParseData],
+    files: &[&FileParseData],
     known_files: &HashSet<S>,
 ) -> HashMap<String, Vec<String>>
 where
@@ -2902,7 +2939,7 @@ fn make_parse_coverage_relation(
 
 fn append_parse_coverage_relations(
     resolved: &mut Vec<Relation>,
-    files: &[FileParseData],
+    files: &[&FileParseData],
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
 ) {
@@ -4506,7 +4543,8 @@ fn build_incremental_link_overlays<'a>(
         for file in files {
             merged.remove(&file.file_path);
         }
-        for (file_path, targets) in build_include_graph(files, &linker.known_files) {
+        let file_refs: Vec<&FileParseData> = files.iter().collect();
+        for (file_path, targets) in build_include_graph(&file_refs, &linker.known_files) {
             merged.insert(file_path, targets);
         }
         merged
@@ -4576,7 +4614,13 @@ fn merge_incremental_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, &linker.artifact_ids, completeness);
+    let file_refs: Vec<&FileParseData> = files.iter().collect();
+    append_parse_coverage_relations(
+        &mut resolved,
+        &file_refs,
+        &linker.artifact_ids,
+        completeness,
+    );
 
     resolved
 }
@@ -5788,7 +5832,8 @@ mod tests {
 
         let known_files: HashSet<&str> = files.iter().map(|f| f.file_path.as_str()).collect();
 
-        let parallel = build_include_graph(&files, &known_files);
+        let file_refs: Vec<&FileParseData> = files.iter().collect();
+        let parallel = build_include_graph(&file_refs, &known_files);
         let serial = build_include_graph_serial(&files, &known_files);
         assert_eq!(
             parallel, serial,
@@ -5848,7 +5893,9 @@ mod tests {
             .iter()
             .flat_map(|f| f.entities.iter().cloned())
             .collect();
-        let ctx = build_link_context(&files, &universe);
+        let universe_refs: Vec<&Entity> = universe.iter().collect();
+        let file_refs: Vec<&FileParseData> = files.iter().collect();
+        let ctx = build_link_context(&file_refs, &universe_refs);
         let artifact_ids = artifact_ids_for(&files, &universe);
 
         // resolve_one_file is deterministic, so building the per-file relations
@@ -5862,7 +5909,8 @@ mod tests {
             .map(|f| resolve_one_file(f, &ctx, None))
             .collect();
 
-        let parallel = merge_resolved(pfr_parallel, &files, &ctx, &artifact_ids, None);
+        let file_refs: Vec<&FileParseData> = files.iter().collect();
+        let parallel = merge_resolved(pfr_parallel, &file_refs, &ctx, &artifact_ids, None);
         let serial = merge_resolved_serial(pfr_serial, &files, &ctx, &artifact_ids);
 
         assert_eq!(
@@ -7934,6 +7982,72 @@ void f();
             calls_order(&forward),
             calls_order(&backward),
             "fan-out order must not depend on universe entity order"
+        );
+    }
+
+    #[test]
+    fn borrowed_and_owned_linker_inputs_resolve_identically() {
+        // Replaying history links from borrowed parsed files so it does not copy
+        // every entity, relation, and import in the repository once per commit.
+        // That is only sound if presenting the same files by reference resolves
+        // to exactly what presenting them by value did.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let target = rust_fn("run", "src/target.rs");
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("caller", "run")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/target.rs".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+        let universe = vec![caller, target];
+        let artifact_ids = artifact_ids_for(&files, &universe);
+        let completeness = FileParseCompletenessMap::new();
+
+        let render = |relations: &[Relation]| {
+            let mut rendered: Vec<String> =
+                relations.iter().map(|rel| format!("{rel:?}")).collect();
+            rendered.sort();
+            rendered
+        };
+
+        let owned =
+            super::link_cross_file_with_completeness(&files, &artifact_ids, &completeness).unwrap();
+        let borrowed_input: Vec<&FileParseData> = files.iter().collect();
+        let borrowed = super::link_cross_file_borrowed_with_completeness(
+            &borrowed_input,
+            &artifact_ids,
+            &completeness,
+        )
+        .unwrap();
+
+        assert!(
+            !owned.is_empty(),
+            "fixture must resolve at least one relation or the comparison proves nothing"
+        );
+        assert_eq!(render(&owned), render(&borrowed));
+
+        // The equality above must be able to fail. Linking only the caller drops
+        // the file that defines its callee, so a comparison that still matched
+        // here would be comparing nothing.
+        let caller_only: Vec<&FileParseData> = files.iter().take(1).collect();
+        let reduced = super::link_cross_file_borrowed_with_completeness(
+            &caller_only,
+            &artifact_ids,
+            &completeness,
+        )
+        .unwrap();
+        assert_ne!(
+            render(&owned),
+            render(&reduced),
+            "the borrowed path must react to its input, not return a constant"
         );
     }
 
