@@ -2570,7 +2570,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     };
     let mut incremental_delta = mutation.semantic_delta.transaction_delta();
     incremental_delta.tree_deltas = mutation.tree_deltas.clone();
-    let desired_graph = InMemoryGraph::from_snapshot(current_graph)?;
+    let desired_graph = InMemoryGraph::from_snapshot_without_text_index(current_graph)?;
     desired_graph.apply_transaction_delta(&incremental_delta)?;
     let desired = desired_graph.to_snapshot();
 
@@ -3053,7 +3053,7 @@ fn resolve_change_tree(
 ) -> Result<ResolvedTree, KinDbError> {
     let mut replay = snapshot.clone();
     replay.repository_authority = None;
-    let graph = InMemoryGraph::from_snapshot(replay)?;
+    let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
     graph.resolve_tree_at(&change_id)
 }
 
@@ -3100,10 +3100,12 @@ fn validate_history_replay(
     // Decoding the snapshot into a coherent graph is part of the proof rather
     // than a convenience: it revalidates storage admission over the
     // authority-free payload and derives every entity revision timeline, both
-    // of which fail closed. It is one pass over the snapshot, not per change.
+    // of which fail closed. It is one pass over the snapshot, not per change,
+    // and it proves graph truth rather than serving queries, so it needs no
+    // text index.
     let mut replay_snapshot = snapshot.clone();
     replay_snapshot.repository_authority = None;
-    InMemoryGraph::from_snapshot(replay_snapshot)?;
+    InMemoryGraph::from_snapshot_without_text_index(replay_snapshot)?;
 
     // New transactions validate every admitted tip directly. Reopen has no
     // trusted prior process state, so replay every DAG leaf; together their
@@ -3312,7 +3314,10 @@ fn materialize_workspace_graph_snapshot(
     let base_tree = base.resolved_tree.clone();
     let mut delta = workspace.semantic_overlay.transaction_delta();
     delta.tree_deltas = exact_tree_transition(&base_tree, &workspace.tree);
-    let graph = InMemoryGraph::from_snapshot(base)?;
+    // Materialization consumes this graph as a snapshot and drops it. Building a
+    // text index for it would index every entity to answer no query: the caller
+    // holding the workspace open builds its own against the persistent index.
+    let graph = InMemoryGraph::from_snapshot_without_text_index(base)?;
     graph.apply_transaction_delta(&delta)?;
     let materialized = graph.to_snapshot();
     if materialized.resolved_tree != workspace.tree {
@@ -3861,7 +3866,7 @@ fn resolve_target_tree_hash(
     let change_id = target_change_id(metadata, target)?;
     let mut replay = snapshot.clone();
     replay.repository_authority = None;
-    let graph = InMemoryGraph::from_snapshot(replay)?;
+    let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
     let tree = graph.resolve_tree_at(&change_id)?;
     kin_model::compute_resolved_tree_hash(&tree).map_err(Into::into)
 }

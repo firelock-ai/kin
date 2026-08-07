@@ -18,9 +18,8 @@ use crate::search::{
 use crate::storage::change_validation::validate_semantic_change;
 use crate::storage::format::LocateGraphSnapshot;
 use crate::storage::merkle::{
-    compute_graph_root_hash, compute_live_retrieval_authority_hash,
-    compute_locate_retrieval_authority_hash, compute_retrieval_authority_hash,
-    compute_root_hash_generic, GraphHashSource, MerkleCache,
+    compute_live_retrieval_authority_hash, compute_locate_retrieval_authority_hash,
+    compute_retrieval_authority_hash, compute_root_hash_generic, GraphHashSource, MerkleCache,
 };
 use crate::storage::{CollectionDelta, Generation, GraphSnapshot, GraphSnapshotDelta, VecDelta};
 use crate::store::{
@@ -2047,29 +2046,49 @@ impl InMemoryGraph {
     }
 
     /// Restore a graph from a snapshot (RAM-only text index).
+    ///
+    /// A RAM-only index starts empty, so this always rebuilds it over every
+    /// entity. Callers that never search the restored graph want
+    /// [`Self::from_snapshot_without_text_index`] instead.
     pub fn from_snapshot(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
-        let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
+        Self::from_snapshot_inner(snapshot, None, false, false)
     }
 
-    /// Restore a graph from a snapshot (RAM-only text index) with a precomputed
-    /// graph root hash.
+    /// Restore a graph from a snapshot (RAM-only text index).
+    ///
+    /// The graph root hash argument is accepted and ignored: text index
+    /// currency is decided by the retrieval authority hash instead. Retained so
+    /// callers already holding a root hash need not change.
     pub fn from_snapshot_with_root_hash(
         snapshot: GraphSnapshot,
-        expected_root_hash: [u8; 32],
+        _expected_root_hash: [u8; 32],
     ) -> Result<Self, KinDbError> {
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, false)
+        Self::from_snapshot(snapshot)
     }
 
     /// Restore a graph from a snapshot without constructing any text index.
     ///
-    /// This is intended for graph-only workflows such as warm-cache diffing
-    /// where entity/file truth is needed but lexical retrieval is not.
+    /// This is intended for graph-only workflows such as warm-cache diffing or
+    /// workspace materialization, where entity/file truth is needed but lexical
+    /// retrieval is not. Those callers otherwise pay for a full text index
+    /// rebuild over every entity and then drop it with the graph.
+    ///
+    /// Graph truth is unaffected: the text index is a derived retrieval surface,
+    /// it is not part of a `GraphSnapshot`, and no snapshot, tree, or validation
+    /// result depends on whether one was built.
+    pub fn from_snapshot_without_text_index(snapshot: GraphSnapshot) -> Result<Self, KinDbError> {
+        Self::from_snapshot_inner(snapshot, None, false, true)
+    }
+
+    /// Restore a graph from a snapshot without constructing any text index.
+    ///
+    /// The graph root hash argument is accepted and ignored: text index
+    /// currency is decided by the retrieval authority hash instead.
     pub fn from_snapshot_without_text_index_with_root_hash(
         snapshot: GraphSnapshot,
-        expected_root_hash: [u8; 32],
+        _expected_root_hash: [u8; 32],
     ) -> Result<Self, KinDbError> {
-        Self::from_snapshot_inner(snapshot, None, expected_root_hash, false, true)
+        Self::from_snapshot_without_text_index(snapshot)
     }
 
     /// Restore a graph from a snapshot with a persistent text index at the
@@ -2078,14 +2097,7 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Result<Self, KinDbError> {
-        let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(
-            snapshot,
-            Some(text_index_path),
-            expected_root_hash,
-            false,
-            false,
-        )
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), false, false)
     }
 
     /// Restore a graph from a snapshot with a persistent text index loaded in
@@ -2094,46 +2106,32 @@ impl InMemoryGraph {
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
     ) -> Result<Self, KinDbError> {
-        let expected_root_hash = compute_graph_root_hash(&snapshot);
-        Self::from_snapshot_inner(
-            snapshot,
-            Some(text_index_path),
-            expected_root_hash,
-            true,
-            false,
-        )
+        Self::from_snapshot_inner(snapshot, Some(text_index_path), true, false)
     }
 
-    /// Restore a graph from a snapshot with a persistent text index and a
-    /// precomputed graph root hash.
+    /// Restore a graph from a snapshot with a persistent text index.
+    ///
+    /// The graph root hash argument is accepted and ignored: text index
+    /// currency is decided by the retrieval authority hash instead.
     pub fn from_snapshot_with_text_index_and_root_hash(
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
-        expected_root_hash: [u8; 32],
+        _expected_root_hash: [u8; 32],
     ) -> Result<Self, KinDbError> {
-        Self::from_snapshot_inner(
-            snapshot,
-            Some(text_index_path),
-            expected_root_hash,
-            false,
-            false,
-        )
+        Self::from_snapshot_with_text_index(snapshot, text_index_path)
     }
 
     /// Restore a graph from a snapshot with a persistent text index loaded in
-    /// read-only mode and a precomputed graph root hash.
+    /// read-only mode.
+    ///
+    /// The graph root hash argument is accepted and ignored: text index
+    /// currency is decided by the retrieval authority hash instead.
     pub fn from_snapshot_with_text_index_and_root_hash_read_only(
         snapshot: GraphSnapshot,
         text_index_path: PathBuf,
-        expected_root_hash: [u8; 32],
+        _expected_root_hash: [u8; 32],
     ) -> Result<Self, KinDbError> {
-        Self::from_snapshot_inner(
-            snapshot,
-            Some(text_index_path),
-            expected_root_hash,
-            true,
-            false,
-        )
+        Self::from_snapshot_with_text_index_read_only(snapshot, text_index_path)
     }
 
     /// Restore a read-only graph from a lightweight locate snapshot.
@@ -2149,10 +2147,24 @@ impl InMemoryGraph {
         Self::from_locate_snapshot_inner(snapshot, text_index_path, expected_root_hash, true)
     }
 
+    /// Restore a graph from a snapshot.
+    ///
+    /// This takes no expected graph root hash. It used to, and the value was
+    /// what decided whether the persisted text index was still current. That
+    /// job now belongs to the retrieval authority hash, which binds the
+    /// repository tree and artifact enrichment domains the bare graph root does
+    /// not cover, and which is computed below from the snapshot itself. Callers
+    /// that hand one in are handing in a weaker identity for a decision that no
+    /// longer uses it.
+    ///
+    /// So a root hash computed purely to reach this function is discarded work.
+    /// It is also not safe to revive as a precomputed input: at least one caller
+    /// supplies the *text index's own* recorded hash rather than the snapshot's
+    /// root, which is harmless while the value is ignored and would let a stale
+    /// index certify itself current if it were not.
     fn from_snapshot_inner(
         snapshot: GraphSnapshot,
         text_index_path: Option<PathBuf>,
-        _expected_root_hash: [u8; 32],
         read_only: bool,
         skip_text_index: bool,
     ) -> Result<Self, KinDbError> {
@@ -2660,6 +2672,8 @@ impl InMemoryGraph {
         source: &InMemoryGraph,
         root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
+        #[cfg(test)]
+        text_index_rebuilds::record();
         let _span = tracing::info_span!("kindb.graph.rebuild_text_index_with_root_hash").entered();
         let docs = {
             let ent = source.entities.read();
@@ -9615,9 +9629,128 @@ impl RetrievalKeyFileResolver for InMemoryGraph {
     }
 }
 
+/// Test-only census of full text index rebuilds.
+///
+/// A rebuild collects indexable text for every entity in the graph, so a
+/// restore that builds an index nobody searches does that work for nothing.
+/// Thread-local for the same reason as [`root_hash_passes`]: the test binary
+/// runs tests in parallel.
+#[cfg(test)]
+pub(crate) mod text_index_rebuilds {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REBUILDS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn record() {
+        REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get() + 1));
+    }
+
+    /// Start counting from zero on this thread.
+    pub(crate) fn reset() {
+        REBUILDS.with(|rebuilds| rebuilds.set(0));
+    }
+
+    /// Rebuilds taken on this thread since the last [`reset`].
+    pub(crate) fn count() -> u64 {
+        REBUILDS.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::merkle::{compute_graph_root_hash, root_hash_passes};
+
+    /// Restoring a graph takes exactly one whole-graph Merkle root pass.
+    ///
+    /// The pass is inside the retrieval authority hash, which is what decides
+    /// text index currency. A second one used to run in the caller to produce an
+    /// argument this path discarded, so the count is the evidence that the
+    /// discarded pass is gone. Counting passes rather than timing them keeps the
+    /// claim true on any store and any machine.
+    #[test]
+    fn snapshot_restore_takes_one_graph_root_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshot = GraphSnapshot::empty();
+        for name in ["parseRegistry", "renderRegistry", "flushRegistry"] {
+            let entity = test_entity(name, "src/registry.rs");
+            snapshot.entities.insert(entity.id, entity);
+        }
+
+        root_hash_passes::reset();
+        let graph =
+            InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"))
+                .unwrap();
+        assert_eq!(
+            root_hash_passes::count(),
+            1,
+            "restoring a graph should compute the graph root once, not once per caller"
+        );
+
+        // The pass that remains is the one whose result is actually used: the
+        // retrieval authority hash the restored graph reports.
+        root_hash_passes::reset();
+        let expected = compute_retrieval_authority_hash(&graph.to_snapshot());
+        assert_eq!(graph.retrieval_authority_hash(), expected);
+        assert_eq!(root_hash_passes::count(), 1);
+    }
+
+    /// Workspace materialization restores a graph, applies one delta, hands the
+    /// snapshot back out and drops the graph. It never searches it, so the text
+    /// index it used to build was indexed over every entity and then discarded.
+    ///
+    /// Both halves are asserted: the rebuild is gone, and the snapshot that
+    /// materialization actually returns is unchanged by its absence.
+    #[test]
+    fn materialization_skips_the_text_index_it_would_discard() {
+        let mut snapshot = GraphSnapshot::empty();
+        for name in ["parseRegistry", "renderRegistry", "flushRegistry"] {
+            let entity = test_entity(name, "src/registry.rs");
+            snapshot.entities.insert(entity.id, entity);
+        }
+        // One delta, applied to both graphs, so the two runs differ only in
+        // whether a text index existed. Minting the artifact id per graph would
+        // make them differ for an unrelated reason.
+        let delta = TransactionDelta {
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8("src/registry.rs").unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([4; 32]), false),
+                ),
+            }],
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+
+        text_index_rebuilds::reset();
+        let indexed = InMemoryGraph::from_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(
+            text_index_rebuilds::count(),
+            1,
+            "a RAM-only text index starts empty, so restoring one always rebuilds it"
+        );
+        indexed.apply_transaction_delta(&delta).unwrap();
+
+        text_index_rebuilds::reset();
+        let bare = InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+        assert_eq!(
+            text_index_rebuilds::count(),
+            0,
+            "materialization must not build a text index it discards"
+        );
+        bare.apply_transaction_delta(&delta).unwrap();
+
+        assert_eq!(
+            compute_retrieval_authority_hash(&indexed.to_snapshot()),
+            compute_retrieval_authority_hash(&bare.to_snapshot()),
+            "skipping a derived retrieval surface must not change graph truth"
+        );
+    }
 
     /// The in-run vector-sidecar flush policy: the first checkpoint of a run is
     /// always due; afterwards a checkpoint is due once EITHER the time interval

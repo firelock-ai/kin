@@ -642,7 +642,42 @@ pub fn compute_subgraph_hash_generic(
 /// The root hash is the SHA-256 of all entity sub-graph hashes sorted lexicographically.
 /// This means the root is deterministic regardless of entity insertion order.
 pub fn compute_graph_root_hash(snapshot: &GraphSnapshot) -> MerkleHash {
+    #[cfg(test)]
+    root_hash_passes::record();
     compute_root_hash_generic(snapshot, None)
+}
+
+/// Test-only census of whole-graph Merkle root passes.
+///
+/// A root pass walks every entity in the snapshot, so an open path that takes
+/// two of them does twice the work it needs to. The count is the load-independent
+/// evidence for that: it holds whatever the store size or the machine is.
+///
+/// The counter is thread-local because the test binary runs tests in parallel and
+/// a shared counter would make any assertion on it a race. Every pass counted here
+/// runs on the thread that called it — [`compute_root_hash_generic`] walks entities
+/// serially — so a test observes exactly the passes it caused.
+#[cfg(test)]
+pub(crate) mod root_hash_passes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PASSES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn record() {
+        PASSES.with(|passes| passes.set(passes.get() + 1));
+    }
+
+    /// Start counting from zero on this thread.
+    pub(crate) fn reset() {
+        PASSES.with(|passes| passes.set(0));
+    }
+
+    /// Passes taken on this thread since the last [`reset`].
+    pub(crate) fn count() -> u64 {
+        PASSES.with(Cell::get)
+    }
 }
 
 /// Versioned authority for every graph domain that can change locate, lexical,
