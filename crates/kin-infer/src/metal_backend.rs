@@ -2289,11 +2289,6 @@ const C7_FLASH_ATTENTION_KERNEL_NAMES: &[&str] = &["c7_flash_attention_batched"]
 // resident intermediate memory at ~cap× a layer's working set regardless of repo
 // size.
 
-/// Default committed-but-incomplete command-buffer depth when nothing raises it.
-/// 2–3 is the conservative sweet spot: low enough to bound resident memory, high
-/// enough to overlap host encoding with GPU execution.
-const DEFAULT_MAX_INFLIGHT: u32 = 3;
-
 /// Resolve the bounded in-flight command-buffer depth for this process.
 ///
 /// Priority:
@@ -2301,8 +2296,15 @@ const DEFAULT_MAX_INFLIGHT: u32 = 3;
 ///    ceiling probing (any value ≥ 1).
 /// 2. The active resource profile's `max_inflight_command_buffers`, selected by
 ///    `KIN_RESOURCE_PROFILE` (the same switch kin-db's BatchBudget reads), so the
-///    hardware-scaled throughput depth takes effect instead of a fixed constant.
-/// 3. [`DEFAULT_MAX_INFLIGHT`].
+///    hardware-scaled depth takes effect instead of a fixed constant.
+///
+/// There is no third fallback: the profile is resolved through the canonical
+/// [`crate::resource::Profile::from_value`], so an unset or unrecognized
+/// selector lands on proof's depth exactly as it already lands on proof's kernel
+/// plan and proof's budgets. Holding a separate constant for the unset case is
+/// what made `unset` and `KIN_RESOURCE_PROFILE=proof` two different
+/// configurations — the same kernels and budgets, a different submission depth —
+/// so anyone A/B-ing one against the other was comparing two runtimes.
 fn resolve_max_inflight() -> u32 {
     resolve_max_inflight_inner(
         std::env::var("KIN_INFER_MAX_INFLIGHT").ok().as_deref(),
@@ -2310,8 +2312,8 @@ fn resolve_max_inflight() -> u32 {
     )
 }
 
-/// Pure core of [`resolve_max_inflight`]: explicit override (≥ 1) wins, else the
-/// named profile's accelerator depth, else [`DEFAULT_MAX_INFLIGHT`].
+/// Pure core of [`resolve_max_inflight`]: an explicit override (≥ 1) wins, else
+/// the resolved profile's accelerator depth (never below 1).
 fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&str>) -> u32 {
     if let Some(n) = override_raw
         .and_then(|raw| raw.trim().parse::<u32>().ok())
@@ -2319,20 +2321,10 @@ fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&s
     {
         return n;
     }
-    let profile = profile_raw.and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-        "proof" => Some(crate::resource::Profile::Proof),
-        "interactive" => Some(crate::resource::Profile::Interactive),
-        "throughput" => Some(crate::resource::Profile::Throughput),
-        "ci" => Some(crate::resource::Profile::Ci),
-        _ => None,
-    });
-    match profile {
-        Some(p) => (crate::resource::ResourcePlan::detect(p)
-            .accelerator
-            .max_inflight_command_buffers as u32)
-            .max(1),
-        None => DEFAULT_MAX_INFLIGHT,
-    }
+    (crate::resource::ResourcePlan::detect(crate::resource::Profile::from_value(profile_raw))
+        .accelerator
+        .max_inflight_command_buffers as u32)
+        .max(1)
 }
 
 /// Shared in-flight depth counter + condvar. The submitter increments on commit
@@ -8918,27 +8910,41 @@ mod tests {
     }
 
     #[test]
-    fn resolve_max_inflight_prefers_override_then_profile_then_default() {
+    fn resolve_max_inflight_prefers_override_then_profile() {
         // Explicit override (≥ 1) wins regardless of profile.
         assert_eq!(resolve_max_inflight_inner(Some("6"), Some("proof")), 6);
-        assert_eq!(resolve_max_inflight_inner(Some(" 2 "), None), 2);
-        // Invalid/zero override is ignored; no profile -> default.
-        assert_eq!(
-            resolve_max_inflight_inner(Some("0"), None),
-            DEFAULT_MAX_INFLIGHT
-        );
-        assert_eq!(
-            resolve_max_inflight_inner(Some("nope"), None),
-            DEFAULT_MAX_INFLIGHT
-        );
-        assert_eq!(resolve_max_inflight_inner(None, None), DEFAULT_MAX_INFLIGHT);
-        assert_eq!(
-            resolve_max_inflight_inner(None, Some("bogus")),
-            DEFAULT_MAX_INFLIGHT
-        );
+        assert_eq!(resolve_max_inflight_inner(Some(" 2 "), Some("proof")), 2);
+        assert_eq!(resolve_max_inflight_inner(Some("6"), None), 6);
+        // An invalid or zero override is ignored and the profile decides.
+        let proof = resolve_max_inflight_inner(None, Some("proof"));
+        assert_eq!(resolve_max_inflight_inner(Some("0"), None), proof);
+        assert_eq!(resolve_max_inflight_inner(Some("nope"), None), proof);
+        // Proof pins depth 1 on every host, so this is exact rather than
+        // machine-dependent: the profile's own declared depth is the authority.
+        assert_eq!(proof, 1);
         // A known profile resolves to its plan depth (machine-dependent but valid).
         assert!(resolve_max_inflight_inner(None, Some("throughput")) >= 1);
-        assert!(resolve_max_inflight_inner(None, Some("proof")) >= 1);
+        assert_eq!(resolve_max_inflight_inner(None, Some("interactive")), 2);
+    }
+
+    /// The whole point of the inflight fix: with no override, an unset or
+    /// unrecognized `KIN_RESOURCE_PROFILE` must resolve to the SAME submission
+    /// depth as an explicit `proof`, because it already resolves to proof's
+    /// kernel plan and proof's budgets. Previously unset returned a separate
+    /// constant, so "unset resolves to proof" was true of the kernels and false
+    /// of the pipelining depth.
+    #[test]
+    fn resolve_max_inflight_unset_matches_explicit_proof() {
+        let proof = resolve_max_inflight_inner(None, Some("proof"));
+        assert_eq!(resolve_max_inflight_inner(None, None), proof);
+        assert_eq!(resolve_max_inflight_inner(None, Some("")), proof);
+        assert_eq!(resolve_max_inflight_inner(None, Some("   ")), proof);
+        assert_eq!(resolve_max_inflight_inner(None, Some("bogus")), proof);
+        // Case and surrounding whitespace do not change which profile is named.
+        assert_eq!(
+            resolve_max_inflight_inner(None, Some(" INTERACTIVE ")),
+            resolve_max_inflight_inner(None, Some("interactive"))
+        );
     }
 
     #[test]

@@ -58,15 +58,32 @@ impl Profile {
     /// selector (the same selector the embedding budgets key off). An unset or
     /// unrecognized value resolves to [`Profile::Proof`] — the safe, bit-identical
     /// default, so nothing turns on a throughput-only fast path by accident.
+    ///
+    /// This is the LIBRARY fallback for a caller that never chose. A product
+    /// binary is expected to select its profile explicitly at startup rather
+    /// than inherit this one.
     pub fn from_env() -> Profile {
-        match std::env::var("KIN_RESOURCE_PROFILE") {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "throughput" => Profile::Throughput,
-                "interactive" => Profile::Interactive,
-                "ci" => Profile::Ci,
-                _ => Profile::Proof,
-            },
-            Err(_) => Profile::Proof,
+        Profile::from_value(std::env::var("KIN_RESOURCE_PROFILE").ok().as_deref())
+    }
+
+    /// Canonical parse of a `KIN_RESOURCE_PROFILE` value: case- and
+    /// whitespace-insensitive, with `None` (unset) and any unrecognized name
+    /// both resolving to [`Profile::Proof`].
+    ///
+    /// Every reader of the selector resolves through here so "unset resolves to
+    /// proof" holds identically for the kernel plan, the embedding budgets and
+    /// the Metal submission depth. Each call site deriving its own fallback is
+    /// what let `unset` and `KIN_RESOURCE_PROFILE=proof` drift into two
+    /// different configurations.
+    pub fn from_value(raw: Option<&str>) -> Profile {
+        match raw
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("throughput") => Profile::Throughput,
+            Some("interactive") => Profile::Interactive,
+            Some("ci") => Profile::Ci,
+            _ => Profile::Proof,
         }
     }
 }
@@ -255,10 +272,11 @@ pub struct EmbeddingPlan {
 /// backend resolves these into its per-process kernel gates; a `KIN_INFER_*` env
 /// override still wins per lever so each can be A/B-measured in isolation.
 /// `flash_attention` selects the optional C7 fused-attention family when the
-/// backend has compiled it; it remains default-off until parity and throughput
-/// are proven on the same corpus.
-/// `pooled_output` also remains default-off until runtime support exists, is
-/// parity-cleared, and measures as a win.
+/// backend has compiled it; it remains off in every profile until parity and
+/// throughput are proven on the same corpus.
+/// `pooled_output` is on for the serving profiles on Metal: it changes only what
+/// the device reads back, and its pooling kernel reproduces the host reduction
+/// order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GpuKernelPlan {
     /// fp16-operand MMA GEMM (`KIN_INFER_GEMM_FP16`).
@@ -283,11 +301,25 @@ pub struct GpuKernelPlan {
 
 impl GpuKernelPlan {
     /// Kernel selection for `profile` on `backend`. Proof stays on the
-    /// historical bit-identical path. Throughput may use parity-cleared kernels
-    /// that improve scheduling/readback without changing embedding values.
+    /// historical bit-identical path. The serving profiles may use
+    /// parity-cleared kernels that improve scheduling/readback without changing
+    /// embedding values.
+    ///
+    /// Interactive selects the same Metal kernels as Throughput. Both levers
+    /// preserve embedding values by construction — `steel` is an fp32-accumulate
+    /// double-buffered K-loop over the same 32x32 MMA (only the staging of the
+    /// next K-tile's global load differs), and the pooled readback's `pool_rows`
+    /// kernel accumulates real tokens in row order and divides by the token
+    /// count exactly as the host `mean_pool` does. So there is nothing about
+    /// either lever a foreground profile should decline: the profiles differ in
+    /// budgets and parallelism, not in which kernels are numerically
+    /// trustworthy. Ci keeps the empty plan so shared runners stay on one small,
+    /// uniform configuration.
     pub fn resolve(profile: Profile, backend: AcceleratorBackend) -> GpuKernelPlan {
         let mut plan = GpuKernelPlan::default();
-        if matches!(profile, Profile::Throughput) && matches!(backend, AcceleratorBackend::Metal) {
+        if matches!(profile, Profile::Throughput | Profile::Interactive)
+            && matches!(backend, AcceleratorBackend::Metal)
+        {
             plan.pooled_output = true;
             plan.steel = true;
             // `mma_wide` (the wider 64x64 MMA register tile) stays off. It is
@@ -1304,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_kernel_plan_enables_throughput_metal_kernels() {
+    fn gpu_kernel_plan_enables_serving_metal_kernels() {
         for profile in [
             Profile::Proof,
             Profile::Interactive,
@@ -1315,8 +1347,9 @@ mod tests {
                 AcceleratorBackend::Metal,
                 AcceleratorBackend::Cuda,
                 AcceleratorBackend::Cpu,
+                AcceleratorBackend::Auto,
             ] {
-                let expected = if matches!(profile, Profile::Throughput)
+                let expected = if matches!(profile, Profile::Throughput | Profile::Interactive)
                     && matches!(backend, AcceleratorBackend::Metal)
                 {
                     GpuKernelPlan {
@@ -1330,6 +1363,67 @@ mod tests {
                 assert_eq!(GpuKernelPlan::resolve(profile, backend), expected);
             }
         }
+    }
+
+    /// Interactive is the profile a foreground product path selects, so its
+    /// plan is asserted lever by lever rather than only as a whole: the two
+    /// value-preserving levers are on, and the three that change values or
+    /// regress occupancy stay opt-in through their own `KIN_INFER_*` overrides.
+    #[test]
+    fn interactive_metal_plan_takes_only_the_value_preserving_levers() {
+        let plan = GpuKernelPlan::resolve(Profile::Interactive, AcceleratorBackend::Metal);
+
+        assert!(
+            plan.steel,
+            "steel is fp32-identical to the single-buffer MMA"
+        );
+        assert!(
+            plan.pooled_output,
+            "pooled readback reproduces the host pooling order"
+        );
+        assert!(
+            !plan.mma_wide,
+            "the wider register tile regresses occupancy; opt-in only"
+        );
+        assert!(
+            !plan.flash_attention,
+            "fused attention is tolerance-parity, not bit-identical; opt-in only"
+        );
+        assert!(!plan.gemm_fp16, "fp16 operands change values; opt-in only");
+        assert!(!plan.reshape_gpu);
+        // Interactive and Throughput agree on kernels; they differ in budgets.
+        assert_eq!(
+            plan,
+            GpuKernelPlan::resolve(Profile::Throughput, AcceleratorBackend::Metal)
+        );
+        // Proof keeps the historical empty plan on the same backend.
+        assert_eq!(
+            GpuKernelPlan::resolve(Profile::Proof, AcceleratorBackend::Metal),
+            GpuKernelPlan::default()
+        );
+    }
+
+    #[test]
+    fn profile_from_value_resolves_unset_and_unknown_to_proof() {
+        assert_eq!(Profile::from_value(None), Profile::Proof);
+        assert_eq!(Profile::from_value(Some("")), Profile::Proof);
+        assert_eq!(Profile::from_value(Some("   ")), Profile::Proof);
+        assert_eq!(Profile::from_value(Some("bogus")), Profile::Proof);
+        assert_eq!(Profile::from_value(Some("proof")), Profile::Proof);
+
+        assert_eq!(
+            Profile::from_value(Some("interactive")),
+            Profile::Interactive
+        );
+        assert_eq!(Profile::from_value(Some("throughput")), Profile::Throughput);
+        assert_eq!(Profile::from_value(Some("ci")), Profile::Ci);
+
+        // Case and surrounding whitespace do not change the selection.
+        assert_eq!(
+            Profile::from_value(Some("  ThRoughPut ")),
+            Profile::Throughput
+        );
+        assert_eq!(Profile::from_value(Some("\tCI\n")), Profile::Ci);
     }
 
     #[test]
