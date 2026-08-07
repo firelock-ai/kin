@@ -1376,8 +1376,27 @@ jobs:
               `${manifestPath} repository identity does not match this run`);
             fail(manifest.workflow?.run_id === process.env.GITHUB_RUN_ID,
               `${manifestPath} run ID does not match this run`);
-            fail(manifest.workflow?.run_attempt === process.env.GITHUB_RUN_ATTEMPT,
-              `${manifestPath} run attempt does not match this run`);
+            // Binding the artifact set to this run is what run_id proves, and it
+            // is the whole integrity claim available here: artifacts are scoped
+            // to a run, so a manifest carrying this run's id was produced by a
+            // job of this run. Requiring the ATTEMPT to match as well proved
+            // something else entirely, that no partial re-run had happened,
+            // which is a liveness condition rather than an integrity one.
+            // Re-running failed jobs re-executes only what failed: a build that
+            // already succeeded keeps the artifact and manifest it uploaded on
+            // its original attempt while this job runs under a later number, so
+            // attempt equality refused every release that reached publication
+            // through a recovery, and refused it harder on each further retry.
+            // A manifest must still name a real attempt of this run, so an
+            // artifact cannot claim one that has not happened yet.
+            const manifestAttempt = Number(manifest.workflow?.run_attempt);
+            const currentAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+            fail(
+              Number.isInteger(manifestAttempt) &&
+                Number.isInteger(currentAttempt) &&
+                manifestAttempt >= 1 &&
+                manifestAttempt <= currentAttempt,
+              `${manifestPath} run attempt ${manifest.workflow?.run_attempt} is not an attempt of this run (current attempt ${process.env.GITHUB_RUN_ATTEMPT})`);
 
             // Judge the archive's declared member paths before extracting it. A
             // member that escapes the extraction root has already been written
