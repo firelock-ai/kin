@@ -12,8 +12,8 @@
 # Dispatch only, deliberately. Recovery reconciles whatever version main carries
 # at the moment it runs, so a schedule would silently retarget after a bump.
 #
-# The reusable workflow is pinned by commit sha because no kin-actions release
-# tag contains this controller yet. Repin to that tag once it is minted.
+# The reusable workflow is pinned to the release tag that first contains this
+# controller. The consumer pin wave keeps that version current from here on.
 
 name: Release Recovery
 
@@ -26,7 +26,7 @@ jobs:
       actions: write
       contents: read
       issues: write
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-release-recovery.yml@d2d03399307cb39b6cd34df1c9f0e672d63177d8
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-release-recovery.yml@v0.1.23
     with:
       package: kin-model
       manifest: Cargo.toml
