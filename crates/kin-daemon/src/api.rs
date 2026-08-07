@@ -16530,6 +16530,49 @@ mod tests {
         );
     }
 
+    /// The counter reaches the surface a reader actually queries.
+    ///
+    /// Everything either side of this is covered elsewhere — the cache counts in
+    /// its own tests, the renderer is covered in kin-cli — so without this the
+    /// one line joining them would be compile-checked and nothing more, and
+    /// deleting it would leave every test green while the number vanished from
+    /// the product.
+    #[tokio::test]
+    async fn resources_report_the_authority_loads_this_daemon_has_paid_for() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let response = router(state)
+            .oneshot(
+                Request::post("/commands/resources")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "json": false }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap();
+        let resources: kin_cli::commands::resources::CommandResourcesResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        // Zero, not absent: this daemon has opened no durable authority yet, and
+        // that is an answer. Absent would mean the daemon never reported one.
+        assert_eq!(
+            resources.daemon_work.authority_loads,
+            Some(0),
+            "a daemon that has loaded nothing must say zero, not say nothing"
+        );
+        assert!(
+            resources.text.contains("Authority loads: 0"),
+            "the count must reach the text surface, not only the JSON: {}",
+            resources.text
+        );
+    }
+
     /// A daemon that has started no background pass discloses that honestly,
     /// and does not invent a cumulative CPU figure it has not measured.
     #[tokio::test]
