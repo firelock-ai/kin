@@ -209,13 +209,39 @@ pub fn cosine_to_relevance(cosine: f32) -> f32 {
 /// dependency; a false negative merely means the reranker stays off by
 /// default until the model is fetched explicitly.
 pub fn cross_encoder_model_cached(model_id: &str) -> bool {
-    let base = hf_cache_base(
+    cached_under_base(resolved_hf_cache_base().as_deref(), model_id)
+}
+
+/// True when this install has ever fetched `model_id` into the local Hugging
+/// Face hub cache, whether or not a usable snapshot is there now.
+///
+/// `hf-hub` creates `hub/models--{org}--{name}` the first time it downloads a
+/// model and leaves that directory behind (with its `blobs`, `refs`, and
+/// `snapshots` children) when a snapshot is pruned or a download is
+/// interrupted. So its existence is the coarser fact that this machine has
+/// fetched the model at some point, and [`cross_encoder_model_cached`] is the
+/// finer one that a resolved snapshot is usable right now. The pair separates
+/// a lever that has never been available here from one that was and is not.
+///
+/// A cache root deleted wholesale reads as never fetched. That is the side to
+/// err on: it treats the install as one nobody has configured yet rather than
+/// one that lost a capability, which understates rather than invents.
+pub fn cross_encoder_model_ever_fetched(model_id: &str) -> bool {
+    let Some(base) = resolved_hf_cache_base() else {
+        return false;
+    };
+    model_cache_dir(&base, model_id).is_dir()
+}
+
+/// The cache root for this process, with the platform and home resolvers the
+/// two probes above both need bound once.
+fn resolved_hf_cache_base() -> Option<PathBuf> {
+    hf_cache_base(
         cfg!(windows),
         |key| std::env::var_os(key),
         || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
         || directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
-    );
-    cached_under_base(base.as_deref(), model_id)
+    )
 }
 
 /// The root `hf-hub` would resolve its cache under, given the platform and the
@@ -270,15 +296,20 @@ fn cached_under_base(base: Option<&Path>, model_id: &str) -> bool {
     let Some(base) = base else {
         return false;
     };
-    let model_dir = base
-        .join("hub")
-        .join(format!("models--{}", model_id.replace('/', "--")));
     // A usable cache entry has at least one resolved snapshot directory.
-    let snapshots = model_dir.join("snapshots");
+    let snapshots = model_cache_dir(base, model_id).join("snapshots");
     match std::fs::read_dir(&snapshots) {
         Ok(mut entries) => entries.any(|entry| entry.is_ok()),
         Err(_) => false,
     }
+}
+
+/// Where `hf-hub` keeps everything it has fetched for `model_id`. Expressed
+/// once so the has-ever-been-fetched and is-usable-now probes cannot drift onto
+/// different layouts.
+fn model_cache_dir(base: &Path, model_id: &str) -> PathBuf {
+    base.join("hub")
+        .join(format!("models--{}", model_id.replace('/', "--")))
 }
 
 #[cfg(test)]
@@ -466,6 +497,41 @@ mod tests {
         assert!(
             !cached_under_base(base.as_deref(), CE_MODEL),
             "an empty cache must report absent"
+        );
+    }
+
+    /// A model directory left behind with no resolved snapshot is what a pruned
+    /// cache or an interrupted download leaves. The two probes have to disagree
+    /// there: that disagreement is the whole of what separates a lever this
+    /// install has never had from one it had and lost. Walked as three states
+    /// on one fixture, so each assertion falsifies the one before it.
+    #[test]
+    #[serial_test::serial]
+    fn a_pruned_model_reads_as_fetched_but_not_cached() {
+        let temp = tempfile::tempdir().unwrap();
+        let _hf = kin_core::test_env::EnvVarGuard::set("HF_HOME", temp.path());
+        let model_dir = model_cache_dir(temp.path(), CE_MODEL);
+
+        assert!(
+            !cross_encoder_model_ever_fetched(CE_MODEL),
+            "an untouched cache root must read as never fetched"
+        );
+        assert!(!cross_encoder_model_cached(CE_MODEL));
+
+        std::fs::create_dir_all(model_dir.join("blobs")).unwrap();
+        assert!(
+            cross_encoder_model_ever_fetched(CE_MODEL),
+            "a model directory left behind means this install fetched the model once"
+        );
+        assert!(
+            !cross_encoder_model_cached(CE_MODEL),
+            "with no resolved snapshot the model is not usable now"
+        );
+
+        std::fs::create_dir_all(model_dir.join("snapshots").join("0123456789abcdef")).unwrap();
+        assert!(
+            cross_encoder_model_ever_fetched(CE_MODEL) && cross_encoder_model_cached(CE_MODEL),
+            "a resolved snapshot is both fetched and usable"
         );
     }
 

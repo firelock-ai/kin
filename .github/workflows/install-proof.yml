@@ -599,12 +599,17 @@ jobs:
             }
             return checks;
           };
-          // The repo-free Windows posture, pinned by name. `repo_init` is
-          // missing because there is no repository here, and `daemon_running`
-          // is unsupported because the daemon is repo-scoped. Both are the
-          // product's own documented no-repository answers, so both are
-          // required rather than tolerated: a change that turns either into
-          // something else has to come here and say so.
+          // The repo-free Windows posture, pinned by name. `repo_init` and
+          // `daemon_running` are both unsupported here: there is no repository,
+          // and the daemon is repo-scoped. Those are the product's own
+          // documented no-repository answers, so both are required rather than
+          // tolerated: a change that turns either into something else has to
+          // come here and say so. `repo_init` says so now. It was pinned to
+          // `missing`, and "not inside a Kin repository yet" became an expected
+          // first-run state rather than a failure when the four checks beside
+          // it were reclassified. The `hardFailures` sweep below still exempts
+          // it, so this pin is the only thing that was left describing the old
+          // answer.
           const required = new Map([
             ["kin_binary", "healthy"],
             ["kin_daemon_binary", "healthy"],
@@ -614,7 +619,7 @@ jobs:
             ["vfs_projection", "unsupported"],
             ["semantic_query_readiness", "unsupported"],
             ["daemon_running", "unsupported"],
-            ["repo_init", "missing"],
+            ["repo_init", "unsupported"],
             ["mcp_client_claude", "healthy"],
             ["mcp_client_cursor", "healthy"],
             ["mcp_client_gemini", "healthy"],
