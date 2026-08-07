@@ -3038,15 +3038,38 @@ async fn run_trace_data_flow_off_runtime(
     graph: Arc<kin_db::InMemoryGraph>,
     request: kin_cli::commands::trace_data_flow::TraceDataFlowRequest,
 ) -> anyhow::Result<kin_cli::commands::trace_data_flow::TraceDataFlowResponse> {
+    let cancel = kin_cli::commands::trace_data_flow::TraceCancel::new();
+    // Dropping a `spawn_blocking` handle does not stop the thread, so the guard
+    // rather than the handle is what carries the client's departure across the
+    // seam. Axum drops this future when the connection goes away, which drops
+    // the guard, which the walk observes at its next checkpoint.
+    let _abandon = CancelOnDrop(cancel.clone());
+    let budget = kin_cli::commands::trace_data_flow::TraceBudget::cancellable(cancel);
     tokio::task::spawn_blocking(move || {
-        kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
+        kin_cli::commands::trace_data_flow::build_trace_data_flow_response_within(
             &repository_authority,
             graph.as_ref(),
             &request,
+            budget,
         )
     })
     .await
     .map_err(|error| anyhow::anyhow!("trace-data-flow worker failed: {error}"))?
+}
+
+/// Cancels its token when dropped.
+///
+/// Held by a request future so that abandoning the request — a client
+/// disconnect, a timeout, a cancelled task — stops the server-side work rather
+/// than merely stopping anyone from reading its result. Without this, a query
+/// whose caller had gone kept burning CPU to completion, and a repository could
+/// be held out of service by work nobody was waiting for (FIR-1898).
+struct CancelOnDrop(kin_cli::commands::trace_data_flow::TraceCancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// POST /commands/refs — render incoming references from daemon-owned graph state.
@@ -20349,6 +20372,28 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Context pack for 'handler'")),
             "context response should identify the daemon graph entity"
+        );
+    }
+
+    /// The daemon half of the cancellation chain.
+    ///
+    /// The walk half — that a cancelled token stops the traversal — is asserted
+    /// in `kin_cli::commands::trace_data_flow`. This asserts the part that lives
+    /// here: abandoning the request sets that token. Two-sided, because a guard
+    /// that cancelled eagerly would stop every trace rather than the abandoned
+    /// ones, and that failure would be invisible in a one-sided test.
+    #[test]
+    fn abandoning_a_trace_request_cancels_its_walk() {
+        let cancel = kin_cli::commands::trace_data_flow::TraceCancel::new();
+        let guard = CancelOnDrop(cancel.clone());
+        assert!(
+            !cancel.is_cancelled(),
+            "a live request must not cancel its own walk"
+        );
+        drop(guard);
+        assert!(
+            cancel.is_cancelled(),
+            "dropping the request must stop the walk it started"
         );
     }
 

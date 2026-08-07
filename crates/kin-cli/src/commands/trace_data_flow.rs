@@ -49,23 +49,68 @@ const DEFAULT_TIME_BUDGET: Duration = Duration::from_secs(20);
 /// the same place every run and a trace stays reproducible.
 const DEFAULT_MAX_EDGES_SCANNED: usize = 250_000;
 
+/// A caller's standing answer to "does anyone still want this result?".
+///
+/// Set by whoever owns the request once nobody is waiting on it. The walk reads
+/// it at the same points it charges its budget, so abandonment costs at most one
+/// more relation rather than the rest of the traversal.
+#[derive(Debug, Clone, Default)]
+pub struct TraceCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl TraceCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the walk at its next checkpoint.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Hard ceilings applied to one trace walk, independent of the request's own
 /// depth / fan-out parameters.
 ///
 /// Those parameters bound the SHAPE of the answer and are the caller's to
 /// choose. These bound the WORK, and are not: a caller cannot ask for an
 /// unbounded walk, because the daemon serving it has other callers.
-#[derive(Debug, Clone, Copy)]
+/// NOT `#[derive(Default)]`. A derived default is a zero budget, which reads as
+/// "no limits" and behaves as "stop before the first step", and every caller
+/// here reaches the default through struct-update syntax where that mistake
+/// would be invisible.
+#[derive(Debug, Clone)]
 pub struct TraceBudget {
     pub time_budget: Duration,
     pub max_edges_scanned: usize,
+    /// Absent for a walk nobody can abandon, such as the CLI's own in-process
+    /// call, where the process waiting for the answer is the one running it.
+    pub cancel: Option<TraceCancel>,
 }
 
 impl Default for TraceBudget {
     fn default() -> Self {
+        Self::bounded()
+    }
+}
+
+impl TraceBudget {
+    pub fn bounded() -> Self {
         Self {
             time_budget: DEFAULT_TIME_BUDGET,
             max_edges_scanned: DEFAULT_MAX_EDGES_SCANNED,
+            cancel: None,
+        }
+    }
+
+    /// The shipped budget, stopped early when `cancel` fires.
+    pub fn cancellable(cancel: TraceCancel) -> Self {
+        Self {
+            cancel: Some(cancel),
+            ..Self::bounded()
         }
     }
 }
@@ -80,6 +125,7 @@ enum TraceStop {
     Exhausted,
     TimeBudget,
     EdgeBudget,
+    Cancelled,
 }
 
 /// Running cost of one walk, checked at each frontier node and each relation.
@@ -104,10 +150,20 @@ impl TraceMeter {
         if self.edges_scanned >= self.budget.max_edges_scanned {
             return Some(TraceStop::EdgeBudget);
         }
-        self.exceeded_time()
+        self.should_stop()
     }
 
-    fn exceeded_time(&self) -> Option<TraceStop> {
+    /// Cancellation is checked first. A walk nobody is waiting for should stop
+    /// for that reason rather than be reported as having run out of time.
+    fn should_stop(&self) -> Option<TraceStop> {
+        if self
+            .budget
+            .cancel
+            .as_ref()
+            .is_some_and(TraceCancel::is_cancelled)
+        {
+            return Some(TraceStop::Cancelled);
+        }
         (self.started.elapsed() >= self.budget.time_budget).then_some(TraceStop::TimeBudget)
     }
 
@@ -149,6 +205,20 @@ fn record_trace_stop(
                 meter.budget.max_edges_scanned,
                 meter.elapsed().as_secs_f64(),
                 steps,
+            ),
+        ),
+        // Recorded even though the caller who would read it has, by definition,
+        // stopped listening. The walk still returns rather than being discarded
+        // silently, so anything that does observe the result — a log, a cache, a
+        // test — can tell an abandoned walk from a complete one.
+        TraceStop::Cancelled => (
+            "cancelled",
+            format!(
+                "trace walk was cancelled after {:.1}s with {} steps and {} relations examined; \
+                 the requester stopped waiting for this result",
+                meter.elapsed().as_secs_f64(),
+                steps,
+                meter.edges_scanned,
             ),
         ),
     };
@@ -434,7 +504,7 @@ pub fn build_trace_data_flow_response_within(
             // relation loop: reading one node's relations is itself unbounded
             // work on a high-fan-in entity, so a walk that has already spent
             // its budget must not start another one.
-            if let Some(reason) = meter.exceeded_time() {
+            if let Some(reason) = meter.should_stop() {
                 stop = reason;
                 break 'walk;
             }
@@ -1042,6 +1112,97 @@ mod tests {
                 .any(|d| d.component == "entity_bodies" && d.reason == "authority_unavailable"),
             "absent bodies must be explained: {:?}",
             response.degradations
+        );
+    }
+
+    #[test]
+    fn a_cancelled_walk_stops_and_says_why() {
+        let (graph, focal_id) = hub_graph(200);
+        let (_t, binding) = empty_binding();
+
+        let cancel = TraceCancel::new();
+        cancel.cancel();
+        let response = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &hub_request(focal_id),
+            TraceBudget::cancellable(cancel),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.total_steps, 0,
+            "a walk cancelled before it began expands nothing"
+        );
+        assert!(response.truncated);
+        let stop = response
+            .degradations
+            .iter()
+            .find(|d| d.component == "trace_walk")
+            .expect("cancellation must be disclosed");
+        assert_eq!(stop.reason, "cancelled");
+        assert_ne!(
+            stop.reason, "time_budget_exceeded",
+            "an abandoned walk must not be reported as having run out of time"
+        );
+    }
+
+    /// The property FIR-1898 is actually about: the WORK stops, not just the
+    /// response. A cancelled walk must leave traversal undone that the same
+    /// walk uncancelled completes, measured against that walk rather than a
+    /// constant.
+    ///
+    /// Cancellation is set before the call rather than raced against a running
+    /// one. A walk over a test-sized graph finishes in microseconds, so a
+    /// cancel-from-another-thread test would be deciding a race, and a test that
+    /// sometimes cancels a walk that already ended proves nothing on the runs
+    /// where it loses. The checkpoint being exercised is the same one either
+    /// way.
+    #[test]
+    fn a_cancelled_walk_leaves_traversal_undone() {
+        let (graph, focal_id) = hub_graph(400);
+        let (_t, binding) = empty_binding();
+        let request = TraceDataFlowRequest {
+            focal: focal_id.to_string(),
+            depth: Some(2),
+            direction: Some(TraceDirection::Calls),
+            limit_per_step: Some(25),
+        };
+
+        let uncancelled = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &request,
+            TraceBudget::bounded(),
+        )
+        .unwrap();
+        assert!(
+            uncancelled.total_steps > 0,
+            "the control must actually walk something"
+        );
+        assert!(
+            !uncancelled
+                .degradations
+                .iter()
+                .any(|d| d.component == "trace_walk"),
+            "the control must run to completion inside every bound"
+        );
+
+        let cancel = TraceCancel::new();
+        cancel.cancel();
+        let cancelled = build_trace_data_flow_response_within(
+            &binding,
+            &graph,
+            &request,
+            TraceBudget::cancellable(cancel),
+        )
+        .unwrap();
+
+        assert!(
+            cancelled.total_steps < uncancelled.total_steps,
+            "cancelling must leave steps unwalked: {} vs {}",
+            cancelled.total_steps,
+            uncancelled.total_steps
         );
     }
 
