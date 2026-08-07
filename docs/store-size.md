@@ -9,8 +9,9 @@ actually been measured.
 
 Two directories are walked and their file bytes summed.
 
-- **Store**, everything under `.kin/`. That is the graph snapshot, the text
-  index, the source CAS, and the repository authority payload.
+- **Store**, everything under `.kin/`. That is the graph snapshot, the admitted
+  source bodies, the repository authority record, and any index built beside
+  them.
 - **Git object store**, everything under `.git/objects`, following a `.git`
   gitlink file when the checkout is a linked worktree or a submodule. Packfiles
   and loose objects both count.
@@ -30,26 +31,40 @@ store.
 The store is not a copy of the packfile, so it is not bounded by one, and the
 gap is much larger than the semantic layer alone accounts for.
 
-The larger driver is the import itself. Git keeps history as zlib-compressed
-objects packed with deltas, so one packfile holds every revision of a file as a
-base plus a chain of differences. Kin admits that same reachable history into a
-content-addressed store that writes each body verbatim, one file per body, with
-no compression and no deltas between revisions. Everything Git had folded
-together is unfolded. That cost is paid on a repository Kin parses nothing in:
-a 27-file shell repository with zero entities extracted still produced a store
-many times its pack.
+Two things inside `.kin/` account for essentially all of it. Broken down on
+ripgrep at 2,261 commits, whose 6.1 MiB object store became a 405.4 MiB store:
 
-On top of that, Kin derives a semantic entity and relation layer over every
-revision, which adds a second, smaller amount that does scale with how much of
-the history is in a language Kin parses. `kin languages` lists them.
+| Part of `.kin/` | Size | Share |
+| --- | --- | --- |
+| `kindb/<repo>/snapshots` (the graph snapshot) | 287.4 MiB | 64% |
+| `kindb/<repo>/source-blobs` (admitted bodies) | 159.8 MiB | 36% |
+| everything else | under 1 MiB | rounding |
+
+**Source blobs.** Git keeps history as zlib-compressed objects packed with
+deltas, so one packfile holds every revision of a file as a base plus a chain of
+differences. Kin admits that same reachable history into a content-addressed
+store that writes each body verbatim, one file per body, with no compression and
+no deltas between revisions. Everything Git had folded together is unfolded, and
+14,063 reachable objects become 14,063 files. This cost is paid even where Kin
+parses nothing: a 27-file shell repository with zero entities extracted still
+produced a store many times its pack.
+
+**The graph snapshot.** Larger than the blobs, and it is not a snapshot of the
+current state. It carries the semantic layer for the whole history, one delta per
+change, and a delta records entities in full rather than by reference. So the
+snapshot grows with the number of entity identities the history ever held, which
+is far more than the number alive at the tip: ripgrep's tip carries 3,568
+entities across 2,327 changes, and an entity's identity is derived partly from
+its starting line, so an edit that shifts a function down a file retires one
+identity and creates another for code that did not change.
 
 Both terms scale with **history depth** rather than with the size of your
 checkout, which is why a repository with a small working tree and thousands of
 commits can still produce a large store.
 
-The ratio is not a constant and it is not currently explained. It varies by
-more than 3x across repositories of similar size in different languages, and
-why is an open question rather than a documented property.
+The ratio is not a constant and is not fully explained. It varies by more than
+3x across repositories of similar size in different languages, and why is an open
+question rather than a documented property.
 
 A store can also land **below** its Git object store, but not for the reason it
 is tempting to assume. A short history does not do it: a two-commit repository
@@ -80,6 +95,15 @@ numbers.
 
 | Repository | Commits | Git object store | Kin store | Ratio |
 | --- | --- | --- | --- | --- |
+| ripgrep (Rust), at `e89fff89` | 2,261 | 6.1 MiB | 405.4 MiB | 66.5x |
+| cobra (Go), at `adbc8813` | 1,106 | 2.2 MiB | 121.2 MiB | 55.6x |
+| a two-commit fixture (one Rust file) | 2 | 444 B | 16.0 KiB | 36.9x |
+| a fixture that reset away a 3 MB commit | 1 | 2.9 MiB | 10.6 KiB | `<0.01x` |
+
+Reported separately, measured against packs rather than by the walk above, so
+listed as corroboration rather than as rows measured the same way: anyhow 47x,
+click 109.1x, zod 163x, sinatra 75.1x, and a 27-file shell repository with zero
+entities extracted at 27.4x.
 
 This is a record of what has been measured, not a bound. Kin does not currently
 cap store size, warn above a threshold, or refuse to admit a repository for
