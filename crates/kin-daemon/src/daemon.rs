@@ -1449,13 +1449,27 @@ pub async fn run_with_authority_on(
 
     // Spawn projection rebuild in background — VFS needs it but locate doesn't.
     // The reconcile loop and API server can start immediately.
+    //
+    // Registered with the self-limit supervisor as disclose-only. The whole pass
+    // is a single `rebuild_projection().await`: there is no loop and so nowhere
+    // between start and finish for it to read a halt. Making it stoppable means
+    // threading cancellation through `ProjectionState::from_resolved_tree`,
+    // which is an API change rather than a registration. Until then the honest
+    // thing is to let a user see it working and how long since it advanced, and
+    // to never claim it was stopped.
     let projection_state = Arc::clone(&state);
+    let projection_pass = state
+        .background_work
+        .disclosed_pass(crate::background_work::PASS_PROJECTION);
     tokio::spawn(async move {
+        projection_pass.working(Instant::now());
         if let Err(error) = projection_state.rebuild_projection().await {
             tracing::error!(error = %error, "failed to rebuild projection state on startup");
         } else {
+            projection_pass.advanced(1, Instant::now());
             tracing::info!("projection state rebuilt in background");
         }
+        projection_pass.idle();
     });
 
     // Spawn the orphan session sweeper (Phase 7).
@@ -2020,6 +2034,10 @@ pub async fn run_with_authority_on(
             .working_dir()
             .canonicalize()
             .unwrap_or_else(|_| state.layout.working_dir().to_path_buf());
+        // Registered with the self-limit supervisor. Unlike the projection
+        // rebuild this pass is a real loop, so it has a checkpoint to read a
+        // halt at and can be stopped rather than only disclosed.
+        let lsp_pass = state.background_work.pass(crate::background_work::PASS_LSP);
         let _lsp_handle = tokio::spawn(async move {
             info!("LSP enrichment worker started");
             let source_view = match lsp_state.graph_owned_source_view() {
@@ -2047,10 +2065,27 @@ pub async fn run_with_authority_on(
             loop {
                 use crate::state::LspEnrichmentMessage;
 
+                // The supervisor's verdict is read here, at the worker's own
+                // checkpoint, so an enrichment in flight finishes rather than
+                // being torn out from under the LSP server it is talking to.
+                if lsp_pass.halted() {
+                    for (lang, server) in servers {
+                        info!(language = %lang, "shutting down LSP server");
+                        let _ = server.shutdown().await;
+                    }
+                    info!("LSP enrichment worker stopped by the background-work supervisor");
+                    break;
+                }
+
                 // Process buffered requests first (always incremental), then wait for new messages.
                 let message = if let Some(buffered) = pending_buffer.pop() {
                     LspEnrichmentMessage::Incremental(buffered)
                 } else {
+                    // Blocked on the channel is genuinely doing nothing, so the
+                    // working stretch ends here. A wedged enrichment never
+                    // reaches this point, which is exactly why the stretch it
+                    // started keeps accumulating and becomes observable.
+                    lsp_pass.idle();
                     tokio::select! {
                         Some(msg) = lsp_rx.recv() => msg,
                         _ = lsp_cancel.changed() => {
@@ -2063,6 +2098,7 @@ pub async fn run_with_authority_on(
                         }
                     }
                 };
+                lsp_pass.working(Instant::now());
 
                 match message {
                     LspEnrichmentMessage::Incremental(request) => {
@@ -2293,6 +2329,12 @@ pub async fn run_with_authority_on(
                                 "LSP enrichment added relations"
                             );
                             lsp_state.mark_dirty();
+                            // Relations reaching the graph is this pass's unit of
+                            // durable work, so it is what the supervisor is told
+                            // about. Querying an LSP server and finding nothing is
+                            // not progress, and crediting it would let a worker
+                            // that answers "no relations" forever look healthy.
+                            lsp_pass.advanced(total_relations as u64, Instant::now());
                         } else {
                             info!(
                                 path = %rel_path,
@@ -2516,6 +2558,14 @@ pub async fn run_with_authority_on(
 
                             files_processed += 1;
                             total_relations += file_relations;
+                            // Credited per file rather than once at the end. A
+                            // cold sweep walks the whole graph, and a pass that
+                            // reported nothing until it finished would look
+                            // stalled for the entire run and be stopped part
+                            // way through exactly the work a user asked for.
+                            if file_relations > 0 {
+                                lsp_pass.advanced(file_relations as u64, Instant::now());
+                            }
 
                             if file_relations > 0 {
                                 info!(
@@ -2528,6 +2578,14 @@ pub async fn run_with_authority_on(
 
                             // Check for shutdown between files.
                             if *lsp_cancel.borrow() {
+                                break;
+                            }
+                            // Same checkpoint, for the supervisor's verdict. A
+                            // sweep that is burning the CPU without enriching
+                            // anything stops here, between files, rather than
+                            // mid-request to a language server.
+                            if lsp_pass.halted() {
+                                info!("LSP cold sweep stopped by the background-work supervisor");
                                 break;
                             }
                         }
