@@ -166,6 +166,19 @@ pub struct DaemonWorkState {
     /// the supervisor's first sample, which is not the same as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_cpu_seconds: Option<f64>,
+    /// Complete durable-authority loads this daemon has paid for.
+    ///
+    /// Belongs beside the CPU figure because it is the same kind of fact: what
+    /// this process has spent. One load per publication rather than one per
+    /// request is the property the authority cache exists to make true, and
+    /// until now the only way to check it on a running daemon was
+    /// `RUST_LOG=kin_daemon=debug`. A number that climbs with request volume
+    /// instead of with publications says the reuse regressed.
+    ///
+    /// Absent when the daemon predates this field, which is not the same as a
+    /// daemon that has loaded nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_loads: Option<u64>,
     /// Every background pass this daemon has actually started.
     #[serde(default)]
     pub passes: Vec<BackgroundPassReport>,
@@ -236,6 +249,15 @@ fn render_daemon_work_lines(work: &DaemonWorkState) -> Vec<String> {
             None => "not sampled yet".to_string(),
         }
     )];
+    // Rendered next to CPU because it is the other half of the same question.
+    // CPU says how much was spent; this says how much of it was spent opening
+    // durable authority, which is the one repeated cost the daemon caches away
+    // and the one a regression puts straight back.
+    if let Some(loads) = work.authority_loads {
+        lines.push(format!(
+            "Authority loads: {loads} (climbs with publications, not with requests)"
+        ));
+    }
     if work.passes.is_empty() {
         lines.push("Background passes: none started".to_string());
         return lines;
@@ -455,6 +477,48 @@ async fn run_daemon_resources(
 mod tests {
     use super::*;
     use kin_infer::resource::{AcceleratorBackend, AcceleratorInfo, HostInfo, MemoryInfo};
+
+    /// The counter is rendered when the daemon reports one and omitted when it
+    /// does not, rather than shown as a zero.
+    ///
+    /// Both directions, because a renderer that always printed the line and one
+    /// that never did would each pass a single-sided test. Zero is a real
+    /// answer here — a daemon that has served everything from cache — and it
+    /// has to be distinguishable from a daemon too old to have the field.
+    #[test]
+    fn authority_loads_render_only_when_the_daemon_reports_them() {
+        let present = render_daemon_work_lines(&DaemonWorkState {
+            daemon_cpu_seconds: Some(12.0),
+            authority_loads: Some(3),
+            passes: Vec::new(),
+        });
+        assert!(
+            present
+                .iter()
+                .any(|line| line.contains("Authority loads: 3")),
+            "a reported count must reach the text surface: {present:?}"
+        );
+
+        let zero = render_daemon_work_lines(&DaemonWorkState {
+            daemon_cpu_seconds: Some(12.0),
+            authority_loads: Some(0),
+            passes: Vec::new(),
+        });
+        assert!(
+            zero.iter().any(|line| line.contains("Authority loads: 0")),
+            "zero loads is an answer, not an absence: {zero:?}"
+        );
+
+        let absent = render_daemon_work_lines(&DaemonWorkState {
+            daemon_cpu_seconds: Some(12.0),
+            authority_loads: None,
+            passes: Vec::new(),
+        });
+        assert!(
+            !absent.iter().any(|line| line.contains("Authority loads")),
+            "a daemon that reports no count must not have one invented: {absent:?}"
+        );
+    }
 
     fn sample_plan(profile: Profile) -> ResourcePlan {
         let host = HostInfo {

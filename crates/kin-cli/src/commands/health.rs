@@ -2062,6 +2062,7 @@ mod tests {
         let check =
             background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
                 daemon_cpu_seconds: Some(41.6),
+                authority_loads: None,
                 passes: vec![
                     pass_report("embed", "working", None),
                     pass_report("reconcile", "idle", None),
@@ -2088,6 +2089,7 @@ mod tests {
         let check =
             background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
                 daemon_cpu_seconds: Some(48_180.0),
+                authority_loads: None,
                 passes: vec![
                     pass_report(
                         "embed",
