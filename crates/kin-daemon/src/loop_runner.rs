@@ -1805,7 +1805,16 @@ pub async fn run_loop(
                         let deferral = retry_lane.defer(path, Instant::now(), retry_base);
                         report_modified_during_reconcile(path, &e, deferral);
                     } else {
-                        warn!(error = %e, "reconciliation error for event, skipping");
+                        // Retrying a deterministic failure would re-derive the
+                        // same rejected transaction forever, so the event is
+                        // dropped. Name the path: its enrichment now stays at
+                        // whatever the last accepted pass admitted, and an
+                        // error without a path cannot be traced back to it.
+                        warn!(
+                            file = %semantic_repo_path,
+                            error = %e,
+                            "reconciliation error for event; dropping it and leaving this path's enrichment stale"
+                        );
                     }
                     if tree_changed {
                         state.bump_version();
@@ -3746,7 +3755,11 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                 }
             }
             Err(e) => {
-                warn!(error = %e, "sync reconciliation error for event, skipping");
+                warn!(
+                    file = %semantic_repo_path,
+                    error = %e,
+                    "sync reconciliation error for event; dropping it and leaving this path's enrichment stale"
+                );
             }
         }
     }
