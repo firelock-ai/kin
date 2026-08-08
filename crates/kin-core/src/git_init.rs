@@ -1019,7 +1019,7 @@ mod tests {
         git(&source, ["add", "--all"]);
         git(&source, ["commit", "-m", "initial"]);
         let head = git_stdout(&source, ["rev-parse", "HEAD"]);
-        std::fs::write(source.join(".git/shallow"), format!("{head}\n")).unwrap();
+        std::fs::write(source.join(".git/shallow"), format!("{}\n", head.trim())).unwrap();
         std::fs::write(source.join("init.log"), b"log\n").unwrap();
 
         let error = init_from_git(&source).unwrap_err().to_string();
