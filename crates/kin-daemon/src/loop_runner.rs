@@ -3299,6 +3299,49 @@ mod tests {
         assert_eq!(entity_ids_for(&state, "keep.rs"), kept_entities);
     }
 
+    /// A rule wide enough to empty the repository is refused, not obeyed.
+    ///
+    /// Retraction is automatic now, so a careless rule reaches graph truth
+    /// without anyone confirming it. The mass-deletion guard is what stands
+    /// between a mistyped `.kinignore` and a wiped graph, and it has to count
+    /// retractions the same way it counts deletions.
+    #[tokio::test]
+    async fn a_retraction_wide_enough_to_be_a_wipe_is_refused() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(root.join("bulk")).unwrap();
+        for index in 0..20 {
+            std::fs::write(
+                root.join(format!("bulk/member{index}.rs")),
+                format!("pub fn member_{index}() -> u32 {{ {index} }}\n"),
+            )
+            .unwrap();
+        }
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let before = state.graph.resolved_tree();
+        assert_eq!(before.len(), 20, "the guard needs a non-trivial tree");
+
+        std::fs::write(root.join(".kinignore"), b"bulk\n").unwrap();
+        let error = sync_filesystem_with_graph(&state)
+            .await
+            .expect_err("a rule covering the whole repository must be refused");
+        assert!(
+            error.to_string().contains("unconfirmed mass deletion"),
+            "{error}"
+        );
+        assert_eq!(
+            state.graph.resolved_tree(),
+            before,
+            "a refused observation must retain graph truth whole"
+        );
+        assert!(
+            !entity_ids_for(&state, "bulk/member0.rs").is_empty(),
+            "a refused retraction must not have evicted anything"
+        );
+    }
+
     /// A file wide enough that indexing it takes long enough for a replacement to
     /// land between the reconciler's two reads.
     ///
