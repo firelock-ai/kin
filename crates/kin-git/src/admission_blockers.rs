@@ -192,9 +192,15 @@ impl EffectiveHookSurface {
     fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         if let Some(configured) = &self.configured {
+            let read = if configured.repository_scoped {
+                "that directory is what Kin read"
+            } else {
+                "Kin did not count what is in it, because a hooks path the host sets applies to \
+                 every repository on this machine rather than to this one"
+            };
             notes.push(format!(
                 "{} core.hooksPath is {}, so Git runs hooks from there and ignores anything under \
-                 .git/hooks; that directory is what Kin read",
+                 .git/hooks; {read}",
                 configured.scope,
                 configured.value.display()
             ));
@@ -215,15 +221,23 @@ impl EffectiveHookSurface {
     }
 }
 
-/// Resolve the hook surface the way Git does, then read it.
+/// Resolve the hook surface the way Git does, then read what the repository
+/// owns.
 ///
 /// `.git/hooks` is what Git runs only when nothing overrides it, so an entry
 /// sitting there under a `core.hooksPath` override is inert, and counting it
 /// refuses a repository over a file that can never execute. The configured
-/// directory is read instead, whichever scope named it, because the question
-/// admission asks is which hooks run against this worktree and a host-wide
-/// setting answers it just as completely as a repository-local one. The scope
-/// changes only how the refusal reads, never what it counts.
+/// directory is what Git would run instead.
+///
+/// Whether that directory is read depends on who named it, and the reason is
+/// worth stating because it is the one place this boundary decides rather than
+/// reports. A repository that redirects its own hooks carries that surface to
+/// whoever clones it, and Kin refuses it. A `core.hooksPath` the host sets
+/// applies to every repository on the machine, including ones Kin already
+/// manages, so refusing on it would mean Kin can never be adopted on that
+/// machine at all. That one is reported with its path and its scope, and left
+/// alone. Nothing about it is hidden; the refusal says which directory Git runs
+/// and that Kin did not count it.
 pub(crate) fn effective_hook_surface(
     repo: &gix::Repository,
     ambient: &gix::Repository,
@@ -233,6 +247,14 @@ pub(crate) fn effective_hook_surface(
         Some(configured) => configured.value.clone(),
         None => repo.common_dir().join("hooks"),
     };
+    if !surface_is_repository_owned(configured.as_ref()) {
+        return Ok(EffectiveHookSurface {
+            directory,
+            configured,
+            hooks: Vec::new(),
+            kin_legacy: Vec::new(),
+        });
+    }
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -279,6 +301,14 @@ pub(crate) fn effective_hook_surface(
         hooks,
         kin_legacy,
     })
+}
+
+/// Whether the resolved hook directory is the repository's own surface.
+///
+/// The default `.git/hooks` and a repository-scoped override both are. A host
+/// scope is not, and is reported rather than counted.
+fn surface_is_repository_owned(configured: Option<&ConfiguredHooksPath>) -> bool {
+    configured.is_none_or(|configured| configured.repository_scoped)
 }
 
 /// Read `core.hooksPath` from the scope Git would honour, if any.
@@ -866,11 +896,37 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("your global core.hooksPath"), "{notes:?}");
         assert!(notes[0].contains(".git/hooks"), "{notes:?}");
+        assert!(
+            notes[0].contains("did not count"),
+            "a surface Kin left alone says so: {notes:?}"
+        );
     }
 
-    /// A hook the host redirected Git to is still a hook that runs here.
+    /// Which hook surfaces the repository owns, and which it does not.
+    ///
+    /// The host-scoped arm has no hermetic end-to-end case, because a test
+    /// cannot give this process a global Git configuration without racing every
+    /// other test in it. Pinning the decision itself is what is available.
     #[test]
-    fn a_hooks_path_set_outside_the_repository_still_blocks_on_what_it_holds() {
+    fn only_the_repositorys_own_hook_surface_is_counted() {
+        assert!(surface_is_repository_owned(None));
+        for (repository_scoped, expected) in [(true, true), (false, false)] {
+            let configured = ConfiguredHooksPath {
+                value: PathBuf::from("/somewhere/hooks"),
+                repository_scoped,
+                scope: "scope",
+            };
+            assert_eq!(
+                surface_is_repository_owned(Some(&configured)),
+                expected,
+                "repository_scoped={repository_scoped}"
+            );
+        }
+    }
+
+    /// A hook the repository itself redirected Git to is counted.
+    #[test]
+    fn a_repository_scoped_hooks_path_blocks_on_what_it_holds() {
         let fixture = Fixture::clean();
         let hooks = fixture.temp.path().join("empty-hooks");
         let hook = hooks.join("pre-commit");
