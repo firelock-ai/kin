@@ -295,7 +295,6 @@ fn build_semantic_git_import_plan(
             .collect::<Result<Vec<_>>>()?;
         let raw_tree = tree_decoder.resolved_entries(parsed.tree)?;
         let resolved_tree = assign_artifact_identities(
-            &snapshot.repository_id,
             oid,
             &first_parent_tree,
             &secondary_parent_trees,
@@ -685,7 +684,6 @@ fn insert_leaf(
 }
 
 fn assign_artifact_identities(
-    repository_id: &RepositoryId,
     introducing_commit: GitObjectId,
     first_parent: &ResolvedTree,
     secondary_parents: &[&ResolvedTree],
@@ -747,7 +745,7 @@ fn assign_artifact_identities(
             match candidate {
                 Some(candidate) => candidate,
                 None => {
-                    let derived = introduced_artifact_id(repository_id, introducing_commit, &path);
+                    let derived = introduced_artifact_id(introducing_commit, &path);
                     if known_artifact_ids.contains(&derived) || assigned.contains(&derived) {
                         return Err(GitError::InvalidSnapshot(format!(
                             "deterministic artifact identity collision at {} in commit {}",
@@ -773,13 +771,31 @@ fn assign_artifact_identities(
     })
 }
 
-fn introduced_artifact_id(
-    repository_id: &RepositoryId,
-    commit_oid: GitObjectId,
-    path: &kin_model::RepoPath,
-) -> ArtifactId {
+/// Derive the identity of an artifact from the content event that introduced
+/// it: the commit that first carried the path, and the path itself.
+///
+/// The commit id already addresses the whole tree and history behind it, so two
+/// admissions of one repository derive one identity and their trees, changes,
+/// and history root agree by hash rather than by structural walk. This
+/// deliberately excludes the repository identity, which `KinManifest::new`
+/// mints fresh per admission: including it made every derived id a function of
+/// which copy of a repository happened to observe the content, which is the
+/// opposite of content addressing and is what left two clones unable to agree
+/// on a single graph root.
+///
+/// This runs only for a path the parent tree has no identity for. Continuity
+/// across a commit comes from reusing the first parent's id, and across a merge
+/// from the secondary-candidate matching above; neither is changed here. So the
+/// commit in the key is the commit that *introduced* the path, and the id stays
+/// a fact about where content entered history rather than about where the file
+/// currently sits.
+///
+/// Two repositories deriving one id means they share the commit and the path,
+/// so they hold the same content under the same identity, which is the intended
+/// answer rather than a collision. Identity that must not be shared is refused
+/// against `known_artifact_ids` at the call site.
+fn introduced_artifact_id(commit_oid: GitObjectId, path: &kin_model::RepoPath) -> ArtifactId {
     let mut name = Vec::new();
-    append_identity_field(&mut name, repository_id.as_str().as_bytes());
     append_identity_field(&mut name, commit_oid.as_bytes());
     append_identity_field(&mut name, path.as_bytes());
     ArtifactId(Uuid::new_v5(&GIT_ARTIFACT_NAMESPACE, &name))

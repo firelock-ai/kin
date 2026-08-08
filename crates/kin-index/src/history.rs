@@ -48,7 +48,7 @@ use crate::pipeline::IndexPipeline;
 /// authored to contain until it is admitted again, and reports nothing about
 /// which version authored it. Coupling the dial to graph authority so a
 /// version gap can be detected and refused is open follow-up work.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 7;
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 8;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///

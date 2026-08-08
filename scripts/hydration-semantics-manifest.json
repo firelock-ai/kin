@@ -1,6 +1,6 @@
 {
   "comment": "Replay-semantics surface pinned by scripts/verify-hydration-semantics.py. These functions re-author the entity/relation deltas persisted for historical changes during Git admission, so editing one changes what a repository's past is said to contain the next time that repository is admitted. A digest mismatch is not a failure to fix by regenerating: decide first whether replay semantics changed, and if so bump HYDRATION_SEMANTICS_VERSION and hydration_semantics_version together. Bumping the version records the decision; it does not migrate, invalidate, or re-enrich a repository that was already admitted, because nothing persists the version beside a graph or compares it when one is opened.",
-  "hydration_semantics_version": 7,
+  "hydration_semantics_version": 8,
   "guarded": [
     {
       "file": "crates/kin-index/src/history.rs",
@@ -82,14 +82,14 @@
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "build_semantic_git_import_plan",
-      "digest": "sha256:ed32076e2e329bb714b10d8de562d262ee5a29a794a4b0d203a6268bbb863bb8",
+      "digest": "sha256:f7d2b5c5e1b35c9f62b5b920a5a7955e7922fbb4ede9ec2bc19f03972c473b45",
       "reason": "Builds the parent-first change sequence and tree map replay consumes. Its ordering and tree selection decide the baseline every historical delta is computed against.",
       "owner": "kin-git"
     },
     {
       "file": "crates/kin-git/src/semantic_import.rs",
       "function": "assign_artifact_identities",
-      "digest": "sha256:9665b558bbd0b395f455a9db301c7d1769ceb17ccbe99f7bd92ec62440cb50e3",
+      "digest": "sha256:fed7906995c0ecd2272309ec87d356fbb1cc29cc96cdeec44b4455dcedb3482a",
       "reason": "Assigns the stable artifact identities trees and entities are keyed by across the imported history. Reassignment here silently repoints every historical file.",
       "owner": "kin-git"
     }
