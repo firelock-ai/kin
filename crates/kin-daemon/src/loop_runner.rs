@@ -789,6 +789,168 @@ fn persist_non_entity_enrichment(
     }
 }
 
+/// Deferrals of one path before its log line escalates from debug to warn.
+///
+/// A file saved while the pass is reading it defers once and reconciles on the
+/// retry. That is routine and must not write a warning on every editor save.
+/// A path that keeps deferring is the livelock condition, so past this small
+/// threshold the loop has to say so or it spends a core silently at info level.
+const RETRY_WARN_ATTEMPTS: u32 = 3;
+
+/// Ceiling of the per-path retry ladder, as a power-of-two multiple of the
+/// loop's poll interval. Six doublings is 64 intervals, or 6.4s at the default
+/// 100ms poll.
+const RETRY_BACKOFF_MAX_SHIFT: u32 = 6;
+
+/// Wait imposed on a path's `attempts`-th consecutive deferral.
+///
+/// The first retry waits one poll interval, which is the cadence at which the
+/// loop already re-examines an idle working copy, so a path that merely lost one
+/// race is retried no slower than a fresh notification would have been. Each
+/// further consecutive deferral doubles the wait to a ceiling.
+fn retry_backoff(attempts: u32, base: Duration) -> Duration {
+    let shift = attempts.saturating_sub(1).min(RETRY_BACKOFF_MAX_SHIFT);
+    base.saturating_mul(1u32 << shift)
+}
+
+/// What one deferral cost the path that caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Deferral {
+    /// Consecutive deferrals of this path, counting this one.
+    attempts: u32,
+    /// How long this path is held out of the loop before it is retried.
+    wait: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetryLadder {
+    attempts: u32,
+    not_before: Instant,
+}
+
+/// Paths the reconcile pass deferred, with a per-path attempt ladder.
+///
+/// Every attempt at a path costs a complete exact-tree admission, so a path
+/// rewritten faster than it reconciles cannot be re-injected on the next tick:
+/// it would defer again, and the loop would spin at the speed of the storage
+/// walk while admitting nothing. The ladder widens the wait for the offending
+/// path alone, so an unstable path degrades into a slow lane while every other
+/// path keeps its prompt first attempt. One tick that looks at a path without
+/// deferring it forgets that path's ladder, which is what keeps a file that
+/// settles from inheriting the wait it earned while it was flapping, and what
+/// bounds the table to paths that are unstable right now.
+#[derive(Debug, Default)]
+struct RetryLane {
+    /// Outstanding retries, in the order they were deferred.
+    queued: VecDeque<PathBuf>,
+    ladder: HashMap<PathBuf, RetryLadder>,
+}
+
+impl RetryLane {
+    /// Defer `path` and widen its ladder by one step.
+    fn defer(&mut self, path: &Path, now: Instant, base: Duration) -> Deferral {
+        let ladder = self
+            .ladder
+            .entry(path.to_path_buf())
+            .or_insert(RetryLadder {
+                attempts: 0,
+                not_before: now,
+            });
+        ladder.attempts = ladder.attempts.saturating_add(1);
+        let wait = retry_backoff(ladder.attempts, base);
+        ladder.not_before = now + wait;
+        let deferral = Deferral {
+            attempts: ladder.attempts,
+            wait,
+        };
+        if !self.is_queued(path) {
+            self.queued.push_back(path.to_path_buf());
+        }
+        deferral
+    }
+
+    /// Whether this path is waiting out a ladder step and must not be looked at.
+    fn waiting(&self, path: &Path, now: Instant) -> bool {
+        self.ladder
+            .get(path)
+            .is_some_and(|ladder| ladder.not_before > now)
+    }
+
+    /// Remove and return the outstanding retries whose ladder step has elapsed,
+    /// in the order they were deferred. Their ladders are retained, so a path
+    /// that defers again keeps climbing instead of restarting at one step.
+    fn take_due(&mut self, now: Instant) -> Vec<PathBuf> {
+        let mut due = Vec::new();
+        let mut still_waiting = VecDeque::new();
+        while let Some(path) = self.queued.pop_front() {
+            if self.waiting(&path, now) {
+                still_waiting.push_back(path);
+            } else {
+                due.push(path);
+            }
+        }
+        self.queued = still_waiting;
+        due
+    }
+
+    /// Forget a path's ladder and any outstanding retry for it.
+    fn forget(&mut self, path: &Path) {
+        self.ladder.remove(path);
+        self.queued.retain(|queued| queued != path);
+    }
+
+    fn is_queued(&self, path: &Path) -> bool {
+        self.queued.iter().any(|queued| queued == path)
+    }
+
+    /// Whether any retry is still owed. A ladder left behind for a path that has
+    /// already been handed back to the loop is bookkeeping, not outstanding work.
+    fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
+}
+
+/// Report one deferral of a path that changed while it was being reconciled.
+///
+/// This is the only one of the loop's deferral sites that is routine: an editor
+/// save landing mid-read produces it once and the retry succeeds. It stayed at
+/// debug for that reason, which is also why a path stuck in this state burned a
+/// core for hours without writing a line at the daemon's info level. The first
+/// occurrences stay at debug and a repeat escalates.
+fn report_modified_during_reconcile(
+    path: &Path,
+    error: &kin_reconcile::ReconcileError,
+    deferral: Deferral,
+) {
+    if deferral.attempts >= RETRY_WARN_ATTEMPTS {
+        warn!(
+            file = %path.display(),
+            error = %error,
+            attempts = deferral.attempts,
+            backoff_ms = deferral.wait.as_millis(),
+            "file keeps changing during reconcile; retrying it on a widening backoff"
+        );
+    } else {
+        debug!(
+            file = %path.display(),
+            error = %error,
+            attempts = deferral.attempts,
+            "file changed during reconcile, queued for retry"
+        );
+    }
+}
+
+/// Whether a reconcile failure is the mid-read race that earns a retry.
+///
+/// Every other failure is reported and dropped: retrying it would repeat the
+/// same complete admission for the same outcome.
+fn reconcile_error_earns_retry(error: &kin_reconcile::ReconcileError) -> bool {
+    matches!(
+        error,
+        kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }
+    )
+}
+
 /// Run the reconciliation loop until the cancellation token fires.
 ///
 /// This is the main loop of the daemon. It:
@@ -855,13 +1017,16 @@ pub async fn run_loop(
         warn!("reconciliation batch_size=0 is invalid; clamping to 1");
     }
 
-    // RACE CONDITION HARDENING: Retry queue for files that were modified
+    // RACE CONDITION HARDENING: Retry lane for files that were modified
     // during reconciliation. When a FileModifiedDuringReconcile error
     // occurs, the file watcher may have already drained the event for the
     // new content in the current batch. Without re-queuing, the file would
-    // remain stale in the graph until the next external write. This queue
-    // injects synthetic Changed events at the start of the next tick.
-    let mut retry_queue: Vec<PathBuf> = Vec::new();
+    // remain stale in the graph until the next external write. This lane
+    // injects synthetic Changed events once a path's backoff has elapsed.
+    let mut retry_lane = RetryLane::default();
+    // Base of the per-path retry ladder. A zero poll interval would otherwise
+    // make every ladder step zero, which is the spin the ladder exists to stop.
+    let retry_base = interval.max(Duration::from_millis(1));
 
     // The watcher API drains its whole channel at once, while this loop deliberately
     // processes only a bounded batch per tick. Keep the unprocessed tail here so a burst
@@ -960,13 +1125,15 @@ pub async fn run_loop(
         // Collect retries first and real watcher notifications second. Dedup once per tick,
         // only when something new arrived; a real remove/recreate therefore supersedes a
         // synthetic Changed retry without repeatedly rebuilding an unchanged backlog.
+        let tick_started = Instant::now();
         let mut incoming_events = Vec::new();
-        if !retry_queue.is_empty() {
+        let due_retries = retry_lane.take_due(tick_started);
+        if !due_retries.is_empty() {
             debug!(
-                count = retry_queue.len(),
-                "injecting retry events from previous tick"
+                count = due_retries.len(),
+                "injecting retry events whose backoff elapsed"
             );
-            incoming_events.extend(retry_queue.drain(..).map(FileEvent::Changed));
+            incoming_events.extend(due_retries.into_iter().map(FileEvent::Changed));
         }
         incoming_events.extend(watcher.drain());
         // A graph-only repository member owns its own host subtree. Admission
@@ -974,8 +1141,32 @@ pub async fn run_loop(
         // observation of this repository's source projection. Waking the tick
         // on such an event would still run a complete working-copy admission
         // and sweep unobserved host content into repository authority, so it
-        // is dropped before it can schedule any work.
-        incoming_events.retain(|event| !event_is_beneath_graph_only_member(&state, event));
+        // is dropped before it can schedule any work. Dropping it also ends any
+        // ladder the path had, because a path that carries no observation of this
+        // repository can never be retried and would otherwise leave an entry
+        // behind that nothing clears.
+        incoming_events.retain(|event| {
+            if !event_is_beneath_graph_only_member(&state, event) {
+                return true;
+            }
+            let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+            retry_lane.forget(path);
+            false
+        });
+        // A path already waiting out a ladder step is not looked at again until
+        // that step elapses, whichever queue its next notification arrived on.
+        // The retry is already owed and re-reads whatever the file then holds, so
+        // dropping a repeat notification for it loses no observation while
+        // sparing the complete exact-tree admission that observation would cost.
+        // A removal is terminal rather than a flap: it is never held back, and it
+        // ends the ladder because there is no longer a file to stabilize.
+        incoming_events.retain(|event| match event {
+            FileEvent::Removed(path) => {
+                retry_lane.forget(path);
+                true
+            }
+            FileEvent::Changed(path) => !retry_lane.waiting(path, tick_started),
+        });
         enqueue_file_events(&mut pending_events, incoming_events);
 
         if pending_events.is_empty() {
@@ -1068,9 +1259,11 @@ pub async fn run_loop(
                     error = %error,
                     "complete exact-tree admission failed; retaining graph truth and retrying watcher paths"
                 );
-                retry_queue.extend(watcher_batch.iter().map(|event| match event {
-                    FileEvent::Changed(path) | FileEvent::Removed(path) => path.clone(),
-                }));
+                let deferred_at = Instant::now();
+                for event in &watcher_batch {
+                    let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+                    retry_lane.defer(path, deferred_at, retry_base);
+                }
                 drop(graph_mutation);
                 drop(reconciler);
                 drop(coordination);
@@ -1123,23 +1316,27 @@ pub async fn run_loop(
             match host_entry_matches_graph(&state, path, admitted_repo_path) {
                 Ok(true) => {}
                 Ok(false) => {
+                    let deferral = retry_lane.defer(path, Instant::now(), retry_base);
                     warn!(
                         file = %admitted_repo_path,
+                        attempts = deferral.attempts,
+                        backoff_ms = deferral.wait.as_millis(),
                         "host entry changed after exact-tree admission; deferring semantic enrichment"
                     );
-                    retry_queue.push(path.clone());
                     if tree_changed {
                         state.bump_version();
                     }
                     continue;
                 }
                 Err(error) => {
+                    let deferral = retry_lane.defer(path, Instant::now(), retry_base);
                     warn!(
                         file = %admitted_repo_path,
                         error = %error,
+                        attempts = deferral.attempts,
+                        backoff_ms = deferral.wait.as_millis(),
                         "could not revalidate exact host entry; deferring semantic enrichment"
                     );
-                    retry_queue.push(path.clone());
                     if tree_changed {
                         state.bump_version();
                     }
@@ -1328,23 +1525,27 @@ pub async fn run_loop(
                         match host_entry_matches_graph(&state, path, &semantic_repo_path) {
                             Ok(true) => {}
                             Ok(false) => {
+                                let deferral = retry_lane.defer(path, Instant::now(), retry_base);
                                 warn!(
                                     file = %semantic_repo_path,
+                                    attempts = deferral.attempts,
+                                    backoff_ms = deferral.wait.as_millis(),
                                     "host entry changed during semantic reconciliation; discarded transaction and queued retry"
                                 );
-                                retry_queue.push(path.clone());
                                 if tree_changed {
                                     state.bump_version();
                                 }
                                 continue;
                             }
                             Err(error) => {
+                                let deferral = retry_lane.defer(path, Instant::now(), retry_base);
                                 warn!(
                                     file = %semantic_repo_path,
                                     error = %error,
+                                    attempts = deferral.attempts,
+                                    backoff_ms = deferral.wait.as_millis(),
                                     "could not revalidate reconciled host entry; discarded transaction and queued retry"
                                 );
-                                retry_queue.push(path.clone());
                                 if tree_changed {
                                     state.bump_version();
                                 }
@@ -1464,14 +1665,11 @@ pub async fn run_loop(
                 Err(e) => {
                     // FileModifiedDuringReconcile is an expected race — the file
                     // changed while we were processing it. Re-queue the file so
-                    // it's reconciled on the next tick even if the watcher already
+                    // it's reconciled on a later tick even if the watcher already
                     // drained the event for the new content in this batch.
-                    if matches!(
-                        e,
-                        kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }
-                    ) {
-                        debug!(error = %e, "file changed during reconcile, queued for retry");
-                        retry_queue.push(path.clone());
+                    if reconcile_error_earns_retry(&e) {
+                        let deferral = retry_lane.defer(path, Instant::now(), retry_base);
+                        report_modified_during_reconcile(path, &e, deferral);
                     } else {
                         warn!(error = %e, "reconciliation error for event, skipping");
                     }
@@ -1482,6 +1680,18 @@ pub async fn run_loop(
             }
         }
         drop(graph_mutation);
+
+        // Every path this tick looked at without deferring is stable as far as
+        // the pass can tell, so its ladder is forgotten and its next deferral
+        // starts at one interval again. This covers admission, ignored paths, and
+        // enrichment failures alike, and it is what bounds the ladder table to
+        // the paths that are unstable right now.
+        for event in &batch {
+            let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+            if !retry_lane.is_queued(path) {
+                retry_lane.forget(path);
+            }
+        }
 
         // Drop write locks before rebuilding projection (it takes its own locks).
         drop(reconciler);
@@ -1512,7 +1722,7 @@ pub async fn run_loop(
 
         pass.advanced(admitted_events, Instant::now());
 
-        let backlog_remains = !pending_events.is_empty() || !retry_queue.is_empty();
+        let backlog_remains = !pending_events.is_empty() || !retry_lane.is_empty();
         if !backlog_remains {
             state
                 .reconciliation_status
@@ -1527,8 +1737,22 @@ pub async fn run_loop(
 
         // A retained backlog should catch up promptly, but yield between batches so the
         // daemon's other Tokio tasks and the cancellation sender are never starved.
-        if backlog_remains {
+        //
+        // Only work this loop can pick up without waiting earns the yield. When the
+        // only backlog left is a retry lane serving out its ladder, yielding would
+        // return immediately into another complete exact-tree admission for a path
+        // that is not eligible yet, which is the spin that burned a core for hours.
+        // That case waits the poll interval instead: the same cadence the loop uses
+        // when it has nothing to do, short enough that a fresh notification for any
+        // other path is still picked up promptly, and interruptible so shutdown does
+        // not wait on it.
+        if !pending_events.is_empty() {
             tokio::task::yield_now().await;
+        } else if !retry_lane.is_empty() {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = cancel.changed() => {}
+            }
         }
     }
 
@@ -2384,6 +2608,461 @@ mod tests {
         assert!(!should_block_mass_deletion(0, 100, false)); // nothing removed -> allowed
         assert!(!should_block_mass_deletion(10, 10, false)); // tiny repo (baseline < 16) -> allowed
         assert!(!should_block_mass_deletion(100, 100, true)); // operator override -> allowed
+    }
+
+    #[test]
+    fn retry_backoff_starts_at_the_poll_interval_and_doubles_to_a_ceiling() {
+        let base = Duration::from_millis(100);
+        assert_eq!(
+            (1..=9)
+                .map(|attempts| retry_backoff(attempts, base).as_millis())
+                .collect::<Vec<_>>(),
+            vec![100, 200, 400, 800, 1600, 3200, 6400, 6400, 6400],
+            "the first retry waits one poll interval, later ones double to a ceiling"
+        );
+        assert_eq!(
+            retry_backoff(u32::MAX, base),
+            base * (1 << RETRY_BACKOFF_MAX_SHIFT),
+            "an attempt count that cannot overflow the shift must still land on the ceiling"
+        );
+    }
+
+    #[test]
+    fn retry_lane_holds_an_unstable_path_and_releases_it_when_its_step_elapses() {
+        let base = Duration::from_millis(100);
+        let start = Instant::now();
+        let unstable = PathBuf::from("/repo/Cargo.lock");
+        let healthy = PathBuf::from("/repo/src/lib.rs");
+        let mut lane = RetryLane::default();
+
+        let first = lane.defer(&unstable, start, base);
+        assert_eq!(
+            first,
+            Deferral {
+                attempts: 1,
+                wait: base
+            }
+        );
+        assert!(lane.waiting(&unstable, start));
+        assert!(lane.waiting(&unstable, start + base - Duration::from_millis(1)));
+        assert!(!lane.waiting(&unstable, start + base));
+        assert!(
+            !lane.waiting(&healthy, start),
+            "a path with no ladder is never held back"
+        );
+        assert!(
+            lane.take_due(start).is_empty(),
+            "a path inside its ladder step is not due"
+        );
+        assert_eq!(lane.take_due(start + base), vec![unstable.clone()]);
+
+        // Deferring again keeps climbing rather than restarting the ladder.
+        let second = lane.defer(&unstable, start + base, base);
+        assert_eq!(
+            second,
+            Deferral {
+                attempts: 2,
+                wait: base * 2
+            }
+        );
+        assert!(lane.waiting(&unstable, start + base * 2));
+        assert!(!lane.waiting(&unstable, start + base * 3));
+    }
+
+    #[test]
+    fn retry_lane_forgets_the_ladder_of_a_path_that_reconciles() {
+        let base = Duration::from_millis(100);
+        let start = Instant::now();
+        let path = PathBuf::from("/repo/Cargo.lock");
+        let mut lane = RetryLane::default();
+
+        for _ in 0..4 {
+            lane.defer(&path, start, base);
+        }
+        assert!(!lane.is_empty());
+
+        // One tick that looked at the path without deferring it.
+        lane.forget(&path);
+        assert!(lane.is_empty());
+        assert!(!lane.waiting(&path, start));
+        assert_eq!(
+            lane.defer(&path, start, base),
+            Deferral {
+                attempts: 1,
+                wait: base
+            },
+            "a path that settled must not inherit the wait it earned while flapping"
+        );
+    }
+
+    /// The livelock, counted. A path rewritten faster than it reconciles defers
+    /// on every attempt, and each attempt costs a complete exact-tree admission.
+    /// The pre-fix loop re-injected it on the very next turn, so the number of
+    /// admissions over a window was the number of turns the window allowed. The
+    /// ladder makes that count logarithmic in the window instead.
+    ///
+    /// Simulated time throughout: the counts are exact, not sampled.
+    #[test]
+    fn an_unstable_path_costs_a_bounded_number_of_admissions_where_the_old_loop_spun() {
+        let base = Duration::from_millis(100);
+        // Each attempt runs a complete workspace scan. 50ms is a small store; the
+        // founder's umbrella took far longer, which only widens the gap below.
+        let admission_cost = Duration::from_millis(50);
+        let window = Duration::from_secs(60);
+        let path = PathBuf::from("/repo/Cargo.lock");
+
+        // Pre-fix: the retry queue was drained into the tick unconditionally, so
+        // the loop attempted the path again the moment the previous attempt ended.
+        let mut spinning_attempts = 0u32;
+        let mut elapsed = Duration::ZERO;
+        while elapsed < window {
+            spinning_attempts += 1;
+            elapsed += admission_cost;
+        }
+
+        // Post-fix: the same always-deferring path, but the lane decides when it
+        // is eligible. The loop otherwise polls, which costs no admission.
+        let start = Instant::now();
+        let mut lane = RetryLane::default();
+        let mut ladder_attempts = 0u32;
+        let mut now = start;
+        lane.defer(&path, now, base);
+        while now < start + window {
+            let due = lane.take_due(now);
+            if due.is_empty() {
+                now += base;
+                continue;
+            }
+            ladder_attempts += 1;
+            now += admission_cost;
+            lane.defer(&path, now, base);
+        }
+
+        assert_eq!(
+            spinning_attempts, 1200,
+            "the pre-fix loop attempted the path once per admission for the whole window"
+        );
+        assert!(
+            ladder_attempts <= 20,
+            "a permanently unstable path must cost a bounded number of admissions per \
+             minute, got {ladder_attempts}"
+        );
+        assert!(
+            ladder_attempts >= 2,
+            "the ladder must keep retrying rather than abandoning the path, got \
+             {ladder_attempts}"
+        );
+        assert!(
+            spinning_attempts / ladder_attempts >= 50,
+            "the ladder must be at least an order of magnitude cheaper: {spinning_attempts} \
+             vs {ladder_attempts}"
+        );
+    }
+
+    /// Two-sided: a path that reconciles is never held back. The same simulation
+    /// with a path that stops deferring after its first attempt spends nothing on
+    /// the ladder and is looked at the moment its event arrives.
+    #[test]
+    fn a_progressing_path_is_never_held_back_by_the_ladder() {
+        let base = Duration::from_millis(100);
+        let start = Instant::now();
+        let path = PathBuf::from("/repo/src/lib.rs");
+        let mut lane = RetryLane::default();
+
+        for tick in 0..100u32 {
+            let now = start + base * tick;
+            assert!(
+                !lane.waiting(&path, now),
+                "a path that keeps reconciling must never wait on a ladder step"
+            );
+            // The tick looked at it and admitted it, so nothing is deferred.
+            lane.forget(&path);
+            assert!(lane.is_empty());
+        }
+    }
+
+    #[test]
+    fn only_the_mid_read_race_earns_a_retry() {
+        assert!(reconcile_error_earns_retry(
+            &kin_reconcile::ReconcileError::FileModifiedDuringReconcile {
+                path: "src/lib.rs".to_string(),
+                expected_hash: "aa".to_string(),
+                actual_hash: "bb".to_string(),
+            }
+        ));
+        assert!(!reconcile_error_earns_retry(
+            &kin_reconcile::ReconcileError::TrafficCheck("unrelated failure".to_string())
+        ));
+        assert!(!reconcile_error_earns_retry(
+            &kin_reconcile::ReconcileError::BrokenAstRejected {
+                file_id: FilePathId::new("src/lib.rs"),
+                error_ranges: Vec::new(),
+            }
+        ));
+    }
+
+    /// The silence that let this burn a core for hours: the mid-read race
+    /// re-queued at debug while the daemon ran at info. A repeat has to escalate,
+    /// and a single benign save must not.
+    #[test]
+    fn a_repeat_deferral_escalates_from_debug_to_warn() {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct Captured {
+            events: Vec<(tracing::Level, String)>,
+        }
+
+        struct CaptureLayer(Arc<Mutex<Captured>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Render<'a>(&'a mut String);
+                impl tracing::field::Visit for Render<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write;
+                        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                    }
+                }
+                let mut rendered = String::new();
+                event.record(&mut Render(&mut rendered));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push((*event.metadata().level(), rendered));
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+        let error = kin_reconcile::ReconcileError::FileModifiedDuringReconcile {
+            path: "Cargo.lock".to_string(),
+            expected_hash: "aa".to_string(),
+            actual_hash: "bb".to_string(),
+        };
+        let path = PathBuf::from("/repo/Cargo.lock");
+
+        tracing::subscriber::with_default(subscriber, || {
+            for attempts in 1..=4u32 {
+                report_modified_during_reconcile(
+                    &path,
+                    &error,
+                    Deferral {
+                        attempts,
+                        wait: retry_backoff(attempts, Duration::from_millis(100)),
+                    },
+                );
+            }
+        });
+
+        let events = std::mem::take(&mut captured.lock().unwrap().events);
+        let levels = events.iter().map(|(level, _)| *level).collect::<Vec<_>>();
+        assert_eq!(
+            levels,
+            vec![
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG,
+                tracing::Level::WARN,
+                tracing::Level::WARN,
+            ],
+            "a routine save stays at debug and a repeat escalates at {RETRY_WARN_ATTEMPTS} \
+             attempts; captured {events:?}"
+        );
+        assert!(
+            events[2].1.contains("attempts=3") && events[2].1.contains("backoff_ms=400"),
+            "the escalated line must carry the attempt count and the wait: {:?}",
+            events[2].1
+        );
+    }
+
+    /// Which of the loop's deferral sites the live spin used, proven rather than
+    /// inferred from the log's silence. A file replaced by rename between the
+    /// reconciler's index read and its verify read is the mid-read race, and the
+    /// rename keeps every read a complete, parseable file so a torn read cannot
+    /// stand in for the race being tested.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_replaced_under_the_reconciler_reports_the_mid_read_race() {
+        use std::sync::atomic::AtomicBool;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let path = repo.path().join("src/lib.rs");
+        let first = wide_source("first");
+        let second = wide_source("second");
+        std::fs::write(&path, &first).unwrap();
+
+        let state = open_test_state(&repo);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let path = path.clone();
+            let staging = repo.path().join("src/.lib.rs.staged");
+            let first = first.clone();
+            let second = second.clone();
+            std::thread::spawn(move || {
+                let mut flip = false;
+                while !stop.load(Ordering::Relaxed) {
+                    let body = if flip { &first } else { &second };
+                    flip = !flip;
+                    if std::fs::write(&staging, body).is_ok() {
+                        let _ = std::fs::rename(&staging, &path);
+                    }
+                }
+            })
+        };
+
+        let mut reconciler = state.reconciler.write().await;
+        let mut observed = None;
+        let mut other_outcomes = Vec::new();
+        for _ in 0..200 {
+            match reconciler.reconcile_file_change(
+                &FileEvent::Changed(path.clone()),
+                &state.blobs,
+                state.graph.as_ref(),
+            ) {
+                Err(error) if reconcile_error_earns_retry(&error) => {
+                    observed = Some(error);
+                    break;
+                }
+                Err(error) => other_outcomes.push(format!("{error}")),
+                Ok(result) => other_outcomes.push(format!("{:?}", result.outcome)),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let observed = observed.unwrap_or_else(|| {
+            panic!(
+                "a file replaced under the reconciler must report the mid-read race; \
+                 saw instead: {other_outcomes:?}"
+            )
+        });
+        assert!(
+            matches!(
+                observed,
+                kin_reconcile::ReconcileError::FileModifiedDuringReconcile { .. }
+            ),
+            "the deferral the live spin took is the mid-read race, not one of the four \
+             warn-level sites: {observed:?}"
+        );
+    }
+
+    /// Two-sided acceptance against the real loop: a file rewritten in a tight
+    /// loop must still reach graph truth once it settles. The ladder slows an
+    /// unstable path; it must not lose it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_rewritten_in_a_tight_loop_still_reaches_graph_truth() {
+        use std::sync::atomic::AtomicBool;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let path = repo.path().join("src/lib.rs");
+        std::fs::write(&path, b"pub fn start() {}\n").unwrap();
+
+        let state = open_test_state(&repo);
+        // Ambient watcher observation revises tracked members and never enlarges
+        // the workspace, so the path has to cross the explicit admission seam
+        // before the loop can reconcile edits to it at all.
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert!(
+            tree_entry(&state, "src/lib.rs").is_some(),
+            "the fixture must be tracked before the loop is asked to revise it"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let loop_state = Arc::clone(&state);
+        let runner = tokio::spawn(async move {
+            run_loop(
+                loop_state,
+                LoopConfig {
+                    poll_interval_ms: 10,
+                    batch_size: 64,
+                },
+                cancel_rx,
+            )
+            .await
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut revision = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    revision += 1;
+                    let _ = std::fs::write(
+                        &path,
+                        format!("pub fn revision_{revision}() -> u32 {{ {revision} }}\n"),
+                    );
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let settled = b"pub fn settled() -> u32 { 0 }\n";
+        std::fs::write(&path, settled).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last = None;
+        while Instant::now() < deadline {
+            if let Some(entry) = tree_entry(&state, "src/lib.rs") {
+                let bytes = read_tree_entry_bytes(&state, entry);
+                if bytes == settled {
+                    last = Some(bytes);
+                    break;
+                }
+                last = Some(bytes);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        cancel_tx.send(true).unwrap();
+        runner.await.unwrap().unwrap();
+
+        assert_eq!(
+            last.as_deref(),
+            Some(settled.as_slice()),
+            "a path slowed by the retry ladder must still reach graph truth once it settles"
+        );
+        let pass = state
+            .background_work
+            .registered(crate::background_work::PASS_RECONCILE)
+            .expect("the reconcile loop must register with the background-work supervisor");
+        assert!(
+            pass.progress() > 0,
+            "the supervisor must observe the reconcile pass admitting work"
+        );
+    }
+
+    /// A file wide enough that indexing it takes long enough for a replacement to
+    /// land between the reconciler's two reads.
+    ///
+    /// Gated with its only caller: a helper whose call site is platform-gated is
+    /// dead code on every other platform, and no macOS build can see that.
+    #[cfg(unix)]
+    fn wide_source(tag: &str) -> Vec<u8> {
+        let mut source = String::new();
+        for index in 0..4000 {
+            source.push_str(&format!(
+                "pub fn {tag}_item_{index}(value: u32) -> u32 {{ value + {index} }}\n"
+            ));
+        }
+        source.into_bytes()
     }
 }
 
