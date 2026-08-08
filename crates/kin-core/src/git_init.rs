@@ -1803,6 +1803,22 @@ mod tests {
         git(source, ["init", "--initial-branch=main"]);
         git(source, ["config", "user.email", "kin@example.invalid"]);
         git(source, ["config", "user.name", "Kin Test"]);
+        pin_default_hook_surface(source);
+    }
+
+    /// Bind a fixture's hook surface to its own `.git/hooks`.
+    ///
+    /// Admission resolves hooks from merged Git configuration, and this process
+    /// is not the isolated Git child a fixture launches, so a developer host
+    /// that sets `core.hooksPath` globally would redirect every fixture at once
+    /// and refuse them all. Repository scope outranks the host.
+    fn pin_default_hook_surface(source: &Path) {
+        let hooks = source.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        git(
+            source,
+            ["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
     }
 
     fn initialize_annotated_tag_source(source: &Path) {

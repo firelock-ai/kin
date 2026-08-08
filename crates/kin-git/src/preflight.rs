@@ -1613,15 +1613,19 @@ fn branch_fact_mut<'a>(
 
 /// Refuse any key outside the exact allowlist, naming the one that matched.
 ///
-/// `scope` is the section spelling the caller has already validated as safe to
-/// print. Key names are safe on their own; the values behind them are not, and
-/// none is printed. Without the name the reader is told a category and has to
-/// bisect their own config to find which line Kin meant.
+/// `scope` is the section spelling, which the caller builds from a subsection
+/// name that has only been checked for control characters. That is not enough
+/// to print: a `[remote "https://user:token@host/repo"]` section passes it and
+/// would carry a credential into the refusal, so the subsection is dropped
+/// unless it reads as a plain identifier. Key names are always safe, and the
+/// values behind them are never printed. Without a name the reader is handed a
+/// category and has to bisect their own config to find the line Kin meant.
 fn reject_unknown_config_keys(
     section: &gix::config::file::Section<'_>,
     scope: &str,
     allowed: &[&str],
 ) -> Result<()> {
+    let scope = printable_config_scope(scope);
     for name in section.value_names() {
         let name = name.to_string();
         if !allowed
@@ -1634,6 +1638,22 @@ fn reject_unknown_config_keys(
         }
     }
     Ok(())
+}
+
+/// Keep a section spelling printable, dropping a subsection that is not a plain
+/// identifier rather than disclosing whatever it holds.
+fn printable_config_scope(scope: &str) -> String {
+    let Some((section, subsection)) = scope.split_once('.') else {
+        return scope.to_string();
+    };
+    let printable = !subsection.is_empty()
+        && subsection
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if printable {
+        return scope.to_string();
+    }
+    section.to_string()
 }
 
 fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result<()> {
@@ -3503,13 +3523,39 @@ mod tests {
         ));
     }
 
+    /// Naming the key must not name a credential the section header carries.
+    #[test]
+    fn an_unsupported_key_is_named_without_disclosing_its_section() {
+        assert_eq!(printable_config_scope("branch.main"), "branch.main");
+        assert_eq!(
+            printable_config_scope("remote.https://user:s3cr3t@host/repo"),
+            "remote"
+        );
+
+        let (temp, repo) = config_only_repository();
+        let config = repo.join(".git/config");
+        let mut body = fs::read(&config).expect("read config");
+        body.extend_from_slice(
+            b"\n[remote \"https://user:s3cr3t@host/repo\"]\n\ttagOpt = --tags\n",
+        );
+        fs::write(&config, body).expect("write config");
+        fs::write(repo.join("README.md"), b"seed\n").expect("seed file");
+        git(&repo, &["add", "README.md"]);
+        commit(&repo, "seed");
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        let message = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect_err("unsupported key must reject")
+            .to_string();
+
+        assert!(message.contains("tagOpt"), "{message}");
+        assert!(!message.contains("s3cr3t"), "{message}");
+    }
+
     #[test]
     fn returns_structured_hook_filter_and_worktree_blockers() {
         let hook = Fixture::clean();
-        // Pinned rather than left implicit: a developer host carrying a global
-        // `core.hooksPath` makes `.git/hooks` inert, and this case would then
-        // assert nothing here while still passing on a host without one.
-        pin_default_hook_surface(&hook.repo);
         let hook_path = hook.repo.join(".git/hooks/pre-commit");
         fs::write(&hook_path, b"#!/bin/sh\nexit 0\n").expect("hook");
         let mut permissions = fs::metadata(&hook_path)
@@ -3639,6 +3685,16 @@ mod tests {
             ],
         );
         git_dir(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        // The linked worktree resolves hooks through this common directory, so
+        // the pin that keeps a developer host out of the answer belongs here.
+        git_dir(
+            &bare,
+            &[
+                "config",
+                "core.hooksPath",
+                bare.join("hooks").to_str().expect("bare hooks path"),
+            ],
+        );
         let linked = temp.path().join("linked");
         git_dir(
             &bare,
@@ -4046,14 +4102,15 @@ mod tests {
         git(repo, &["config", "user.name", "Kin Test"]);
         git(repo, &["config", "user.email", "kin@example.invalid"]);
         git(repo, &["config", "commit.gpgSign", "false"]);
+        pin_default_hook_surface(repo);
     }
 
     /// Bind a fixture's hook surface to its own `.git/hooks`.
     ///
-    /// Hook resolution reads the merged Git configuration, so a developer host
-    /// that sets `core.hooksPath` globally redirects a fixture too. Any case
-    /// that has to decide about `.git/hooks` pins it, or it proves one thing on
-    /// a plain host and nothing at all on that one.
+    /// Hook resolution reads the merged Git configuration, and this process is
+    /// not the isolated Git child a fixture launches, so a developer host that
+    /// sets `core.hooksPath` globally redirects a fixture too. Repository scope
+    /// outranks the host, so pinning it here settles what every case reads.
     fn pin_default_hook_surface(repo: &Path) {
         let hooks = repo.join(".git/hooks");
         fs::create_dir_all(&hooks).expect("default hook directory");

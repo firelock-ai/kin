@@ -133,13 +133,25 @@ pub fn collect_git_admission_blockers(repo_path: &Path) -> Result<GitAdmissionRe
         ));
     }
 
-    if let Err(GitError::MigrationPreflight(reason)) = remote_mapping_facts(&repo) {
-        report.blockers.push(GitAdmissionBlocker::new(
-            reason,
-            "unset that key in .git/config, or clone without it",
-        ));
+    // The scan stops at the first key it refuses, so this reports one key
+    // rather than all of them. Naming that one is the whole difference from
+    // the category the message used to carry.
+    match remote_mapping_facts(&repo) {
+        Ok(_) => {}
+        Err(GitError::MigrationPreflight(reason)) => report.blockers.push(
+            GitAdmissionBlocker::new(reason, "unset that key in .git/config, or clone without it"),
+        ),
+        Err(error) => return Err(error),
     }
 
+    // A sparse index describes directories rather than leaves, so comparing it
+    // against a committed tree would name every path in the repository and
+    // none of them would be the problem. Admission refuses it outright and
+    // that refusal is the one worth reporting.
+    if let Some(sparse) = sparse_checkout_blocker(&repo)? {
+        report.blockers.push(sparse);
+        return Ok(report);
+    }
     let index = read_index(&repo)?;
     report.blockers.extend(staged_blockers(&repo, &index)?);
     report
@@ -180,14 +192,12 @@ impl EffectiveHookSurface {
     fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         if let Some(configured) = &self.configured {
-            if !configured.repository_scoped {
-                notes.push(format!(
-                    "{} core.hooksPath is {}, so Git ignores anything under .git/hooks here and \
-                     Kin counts neither",
-                    configured.scope,
-                    configured.value.display()
-                ));
-            }
+            notes.push(format!(
+                "{} core.hooksPath is {}, so Git runs hooks from there and ignores anything under \
+                 .git/hooks; that directory is what Kin read",
+                configured.scope,
+                configured.value.display()
+            ));
         }
         if !self.kin_legacy.is_empty() {
             notes.push(format!(
@@ -209,14 +219,11 @@ impl EffectiveHookSurface {
 ///
 /// `.git/hooks` is what Git runs only when nothing overrides it, so an entry
 /// sitting there under a `core.hooksPath` override is inert, and counting it
-/// refuses a repository over a file that can never execute.
-///
-/// Which directory is then read depends on who redirected it. A repository that
-/// points its own hooks somewhere carries that surface to its next reader, and
-/// Kin refuses it. A host-wide `core.hooksPath` is the operator's environment
-/// instead, shared by every repository on the machine, so reading it would
-/// refuse all of them for something no repository carries. That one is reported
-/// as the reason `.git/hooks` went uncounted and blocks nothing.
+/// refuses a repository over a file that can never execute. The configured
+/// directory is read instead, whichever scope named it, because the question
+/// admission asks is which hooks run against this worktree and a host-wide
+/// setting answers it just as completely as a repository-local one. The scope
+/// changes only how the refusal reads, never what it counts.
 pub(crate) fn effective_hook_surface(
     repo: &gix::Repository,
     ambient: &gix::Repository,
@@ -226,17 +233,6 @@ pub(crate) fn effective_hook_surface(
         Some(configured) => configured.value.clone(),
         None => repo.common_dir().join("hooks"),
     };
-    if configured
-        .as_ref()
-        .is_some_and(|configured| !configured.repository_scoped)
-    {
-        return Ok(EffectiveHookSurface {
-            directory,
-            configured,
-            hooks: Vec::new(),
-            kin_legacy: Vec::new(),
-        });
-    }
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -291,14 +287,20 @@ fn configured_hooks_path(
     repo: &gix::Repository,
 ) -> Result<Option<ConfiguredHooksPath>> {
     let snapshot = ambient.config_snapshot();
+    // An empty value is how a repository cancels a host-wide override, and it
+    // reaches interpolation as a missing path rather than an empty one, so it
+    // has to be recognised before asking for the resolved form.
+    if snapshot
+        .string("core.hooksPath")
+        .is_none_or(|value| value.is_empty())
+    {
+        return Ok(None);
+    }
     let Some(value) = snapshot.trusted_path("core.hooksPath") else {
         return Ok(None);
     };
     let value = value
         .map_err(|error| preflight_error(format!("resolve configured Git hooks path: {error}")))?;
-    if value.as_os_str().is_empty() {
-        return Ok(None);
-    }
     let (repository_scoped, scope) = hooks_path_scope(&snapshot);
     // Git reads a relative hooks path from the top of the working tree, so
     // resolving it against the process working directory would name a
@@ -359,11 +361,26 @@ fn is_legacy_kin_hook_link(hooks_dir: &Path, path: &Path, metadata: &fs::Metadat
     let Some(parent) = target.parent() else {
         return Ok(false);
     };
+    if target.file_name() != path.file_name() {
+        return Ok(false);
+    }
     Ok(parent.file_name().is_some_and(|name| name == "hooks")
         && parent
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|name| name == ".kin"))
+}
+
+fn sparse_checkout_blocker(repo: &gix::Repository) -> Result<Option<GitAdmissionBlocker>> {
+    let configured = repo.config_snapshot().boolean("core.sparseCheckout") == Some(true)
+        || repo.git_dir().join("info/sparse-checkout").exists();
+    if !configured && !read_index(repo)?.is_sparse() {
+        return Ok(None);
+    }
+    Ok(Some(GitAdmissionBlocker::new(
+        "sparse checkout configuration is ambiguous for exact migration",
+        "run 'git sparse-checkout disable' so the worktree carries the whole committed tree",
+    )))
 }
 
 fn read_index(repo: &gix::Repository) -> Result<gix::index::File> {
@@ -458,13 +475,36 @@ fn collect_tree_entries(
             let subtree = repo
                 .find_object(oid)
                 .map_err(|error| preflight_error(format!("read committed Git tree: {error}")))?
-                .into_tree();
+                .try_into_tree()
+                .map_err(|_| {
+                    preflight_error(format!(
+                        "committed Git entry {} is recorded as a tree but is not one",
+                        display_path(&path)
+                    ))
+                })?;
             collect_tree_entries(repo, &subtree, &path, entries)?;
             continue;
         }
-        entries.insert(path, (u32::from(mode.value()), oid));
+        entries.insert(path, (canonical_mode(mode), oid));
     }
     Ok(())
+}
+
+/// The mode Git's index records for one committed entry.
+///
+/// A tree may carry a non-canonical file mode such as `100664`, which several
+/// importers still write, while the index decodes to the canonical `100644`.
+/// Comparing the raw values reads such a repository as having every file
+/// staged, and no `git restore --staged` can clear it because nothing is.
+/// Admission itself compares the entry kind, so this does too.
+fn canonical_mode(mode: gix::objs::tree::EntryMode) -> u32 {
+    match mode.kind() {
+        gix::objs::tree::EntryKind::Tree => 0o040_000,
+        gix::objs::tree::EntryKind::Blob => 0o100_644,
+        gix::objs::tree::EntryKind::BlobExecutable => 0o100_755,
+        gix::objs::tree::EntryKind::Link => 0o120_000,
+        gix::objs::tree::EntryKind::Commit => 0o160_000,
+    }
 }
 
 /// Worktree paths that are neither tracked nor ignored.
@@ -623,18 +663,37 @@ mod tests {
             git(&repo, &["config", "user.name", "Kin Test"]);
             git(&repo, &["config", "user.email", "kin@example.invalid"]);
             git(&repo, &["config", "commit.gpgSign", "false"]);
-            fs::write(repo.join("README.md"), b"seed\n").expect("readme");
-            git(&repo, &["add", "README.md"]);
-            git(&repo, &["commit", "-m", "seed", "--no-gpg-sign"]);
-            Self { temp, repo }
+            let fixture = Self { temp, repo };
+            fixture.pin_ambient_configuration();
+            fs::write(fixture.repo.join("README.md"), b"seed\n").expect("readme");
+            git(&fixture.repo, &["add", "README.md"]);
+            git(&fixture.repo, &["commit", "-m", "seed", "--no-gpg-sign"]);
+            fixture
+        }
+
+        /// Take the developer's own Git configuration out of the answer.
+        ///
+        /// Hook and ignore resolution both read merged configuration, and this
+        /// process is not the isolated Git child the fixture launches. A host
+        /// carrying a global `core.hooksPath` or `core.excludesFile` would
+        /// otherwise redirect or silence a case, which is how a suite passes on
+        /// one machine while proving nothing on another. Repository scope
+        /// outranks the host, so pinning both here settles it.
+        fn pin_ambient_configuration(&self) {
+            self.pin_hook_surface(&self.temp.path().join("empty-hooks"));
+            let excludes = self.temp.path().join("global-ignore");
+            fs::write(&excludes, b"").expect("empty global excludes");
+            git(
+                &self.repo,
+                &[
+                    "config",
+                    "core.excludesFile",
+                    excludes.to_str().expect("utf8 test path"),
+                ],
+            );
         }
 
         /// Bind the hook surface to a directory this case owns.
-        ///
-        /// Hook resolution reads merged Git configuration, so a developer host
-        /// carrying a global `core.hooksPath` redirects a fixture too. Every
-        /// case here that decides about hooks pins the surface, or it proves
-        /// one thing on a plain host and nothing at all on that one.
         fn pin_hook_surface(&self, directory: &Path) {
             fs::create_dir_all(directory).expect("hook directory");
             git(
@@ -669,6 +728,13 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn surface_for(fixture: &Fixture) -> EffectiveHookSurface {
+        let source = fs::canonicalize(&fixture.repo).expect("canonical source");
+        let repo = open_repo(&source).expect("open repository");
+        let ambient = open_repo_with_user_ignore_config(&source).expect("open ambient repository");
+        effective_hook_surface(&repo, &ambient).expect("resolve hook surface")
     }
 
     fn write_executable(path: &Path, body: &[u8]) {
@@ -784,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_scoped_hooks_path_explains_itself_without_blocking() {
+    fn a_hooks_path_says_which_scope_redirected_it() {
         let surface = EffectiveHookSurface {
             directory: PathBuf::from("/home/dev/.config/git/hooks"),
             configured: Some(ConfiguredHooksPath {
@@ -800,6 +866,81 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("your global core.hooksPath"), "{notes:?}");
         assert!(notes[0].contains(".git/hooks"), "{notes:?}");
+    }
+
+    /// A hook the host redirected Git to is still a hook that runs here.
+    #[test]
+    fn a_hooks_path_set_outside_the_repository_still_blocks_on_what_it_holds() {
+        let fixture = Fixture::clean();
+        let hooks = fixture.temp.path().join("empty-hooks");
+        let hook = hooks.join("pre-commit");
+        write_executable(&hook, b"#!/bin/sh\nexit 0\n");
+        let surface = surface_for(&fixture);
+
+        assert_eq!(surface.hooks.len(), 1);
+        assert_eq!(surface.hooks[0].path, hook);
+    }
+
+    /// With nothing overriding it, `.git/hooks` is the surface.
+    ///
+    /// An empty `core.hooksPath` is how a repository says "no override" over a
+    /// host that sets one, so this reaches the default branch on any machine.
+    #[test]
+    fn the_default_surface_is_read_when_no_hooks_path_overrides_it() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "core.hooksPath", ""]);
+        let hook = fixture.repo.join(".git/hooks/pre-commit");
+        write_executable(&hook, b"#!/bin/sh\nexit 0\n");
+
+        let surface = surface_for(&fixture);
+        assert!(surface.configured.is_none(), "{surface:?}");
+        assert_eq!(surface.hooks.len(), 1, "{surface:?}");
+        assert_eq!(surface.hooks[0].name, b"pre-commit");
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("pre-commit"), "{refusal}");
+    }
+
+    /// The sample hooks `git init` writes are not hooks.
+    #[test]
+    fn the_sample_hooks_git_init_writes_are_not_blockers() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "core.hooksPath", ""]);
+        assert!(
+            fixture.repo.join(".git/hooks/pre-commit.sample").exists(),
+            "the fixture must carry the samples this case is about"
+        );
+
+        let report = fixture.report();
+        assert!(report.is_clear(), "{report:?}");
+    }
+
+    /// Only a link that keeps its own name under `.kin/hooks` is Kin's.
+    #[test]
+    fn a_link_that_merely_lands_in_a_kin_hooks_directory_still_blocks() {
+        let fixture = Fixture::clean();
+        let hooks = fixture.temp.path().join("empty-hooks");
+        let installed = fixture.temp.path().join(".kin/hooks");
+        fs::create_dir_all(&installed).expect("installed kin hooks");
+        write_executable(&installed.join("something-else"), b"#!/bin/sh\nexit 0\n");
+        symlink(installed.join("something-else"), hooks.join("pre-commit")).expect("link");
+
+        let surface = surface_for(&fixture);
+        assert_eq!(surface.hooks.len(), 1, "{surface:?}");
+        assert!(surface.kin_legacy.is_empty(), "{surface:?}");
+    }
+
+    #[test]
+    fn a_sparse_checkout_keeps_its_own_refusal() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "core.sparseCheckout", "true"]);
+
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("sparse checkout"), "{refusal}");
+        assert!(refusal.contains("sparse-checkout disable"), "{refusal}");
+        assert!(
+            !refusal.contains("staged or otherwise uncommitted"),
+            "a sparse index must not be reported path by path:\n{refusal}"
+        );
     }
 
     #[test]
