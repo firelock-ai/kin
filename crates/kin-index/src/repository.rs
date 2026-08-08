@@ -1428,6 +1428,39 @@ mod tests {
         assert_eq!(none.retained_total(), 5);
     }
 
+    /// The retraction set is the covered set less graph-only membership, and it
+    /// answers with the same predicate the scanner admits by, so a rule cannot
+    /// exclude a path at admission while a retraction disagrees about it.
+    #[test]
+    fn retraction_matches_admission_and_withholds_graph_only_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".kinignore"), b"investor\n").unwrap();
+        let ignore = RepositoryIgnore::load(root).unwrap();
+
+        let gitlink = path("investor/vendored");
+        let tracked = [
+            path("src/main.rs"),
+            path("investor/deck/build_deck.py"),
+            gitlink.clone(),
+        ];
+
+        let retracted =
+            tracked_paths_retracted_by_ignore(&ignore, tracked.iter(), std::iter::once(&gitlink));
+        assert_eq!(retracted.paths(), [path("investor/deck/build_deck.py")]);
+        assert_eq!(retracted.tracked_total(), 3);
+        assert_eq!(retracted.retained_total(), 2);
+
+        // Every retracted path is one the scanner would also refuse to admit.
+        for retracted in retracted.paths() {
+            assert!(ignore.matches(retracted), "{retracted}");
+        }
+        // Falsification: without the graph-only exemption the Gitlink is covered
+        // too, so the assertion above is testing the exemption and not the rule.
+        let covered = tracked_paths_covered_by_ignore(&ignore, tracked.iter());
+        assert!(covered.paths().contains(&gitlink));
+    }
+
     #[cfg(unix)]
     #[test]
     fn unsupported_untracked_special_entry_is_diagnosed_and_skipped() {

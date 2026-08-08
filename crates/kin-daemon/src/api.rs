@@ -18126,6 +18126,58 @@ mod tests {
         assert!(tracked_paths(&state).contains("target/debug/app.o"));
     }
 
+    /// Untracking is not enough. Entities are what rank, so a purge that left
+    /// them behind produced the worst reading of all: the artifact listing no
+    /// longer names the file while search and locate still return it.
+    #[tokio::test]
+    async fn purge_ignored_evicts_the_entities_that_made_a_path_rank() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // The rule lands after the admission, which is the whole scenario: a
+        // repository that already carries a path is told to stop carrying it.
+        for (path, content) in [
+            ("investor/deck/build_deck.py", &b"def valuation(): pass\n"[..]),
+            ("src/lib.py", &b"def kept(): pass\n"[..]),
+            (".kinignore", &b"investor\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+            install_repository_file(&state, path, content);
+        }
+
+        let private = test_entity("valuation", "investor/deck/build_deck.py");
+        let kept = test_entity("kept", "src/lib.py");
+        state.graph.upsert_entity(&private).unwrap();
+        state.graph.upsert_entity(&kept).unwrap();
+        assert!(state.graph.get_entity(&private.id).unwrap().is_some());
+
+        let app = router(Arc::clone(&state));
+        let (_, applied) = purge_ignored_through_api(&app, true).await;
+        assert_eq!(applied["report"]["purge_count"], json!(1));
+
+        let live = tracked_paths(&state);
+        assert!(!live.contains("investor/deck/build_deck.py"));
+        assert!(
+            state.graph.get_entity(&private.id).unwrap().is_none(),
+            "a purged path's entity still resolves, so it still ranks"
+        );
+        assert!(state
+            .graph
+            .query_entities(&kin_db::EntityFilter {
+                file_path: Some(kin_model::FilePathId::new("investor/deck/build_deck.py")),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+
+        // The two-sided arm: an unnamed sibling keeps both its artifact and its
+        // entity, so the purge removed one path rather than clearing the graph.
+        assert!(live.contains("src/lib.py"));
+        assert_eq!(state.graph.get_entity(&kept.id).unwrap(), Some(kept));
+    }
+
     fn branch_change(state: &DaemonState) -> SemanticChangeId {
         let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
         let lease = authority.manager.read_authority();
