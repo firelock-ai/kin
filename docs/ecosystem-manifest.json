@@ -7,7 +7,7 @@
     "summary": "Firelock (the company) builds Kin (the semantic repo and collaboration substrate). KinLab is the hosted collaboration product; @kinlab is the shared package and registry scope.",
     "product": {
       "name": "Kin",
-      "descriptor": "The semantic repo and collaboration substrate — the system of record for AI-written software.",
+      "descriptor": "The semantic repo and collaboration substrate, the system of record for AI-written software.",
       "github": "https://github.com/firelock-ai/kin"
     },
     "company": {
@@ -153,7 +153,15 @@
         "kin",
         "kin-db"
       ],
-      "note": "Private benchmarking and proof-packaging harness. Kept private/trade-secret per IP strategy — not one of the open supporting repos."
+      "note": "Private benchmarking and proof-packaging harness. Kept private/trade-secret per IP strategy, not one of the open supporting repos."
+    },
+    {
+      "name": "kin-bench-spec",
+      "layer": "support",
+      "role": "public-benchmark-spec-and-verifier",
+      "dependsOn": [],
+      "status": "active",
+      "note": "Public specification and standalone verifier for Kin's merge-trust benchmark. Open counterpart to the private kin-bench harness, whose runner and proof infrastructure stay proprietary."
     },
     {
       "name": "kin-lsp",
@@ -178,7 +186,17 @@
       "layer": "infrastructure",
       "role": "shared-ci-and-release-workflows",
       "dependsOn": [],
-      "note": "Reusable GitHub Actions workflows for CI and release pipelines. Infrastructure/CI-only — not a product surface."
+      "note": "Reusable GitHub Actions workflows for CI and release pipelines. Infrastructure/CI-only, not a product surface."
+    },
+    {
+      "name": "homebrew-kin",
+      "layer": "infrastructure",
+      "role": "homebrew-distribution-tap",
+      "dependsOn": [
+        "kin"
+      ],
+      "status": "active",
+      "note": "Homebrew tap carrying the kin formula. Delivery infrastructure that installs published kin release archives, not a product surface."
     },
     {
       "name": "experimental/kin-kernel",

@@ -56,7 +56,7 @@ command line (the flag wins):
 
 | profile | surface |
 | -- | -- |
-| `agent-default` | the curated agent belt — **the default** |
+| `agent-default` | the curated agent belt, **the default** |
 | `full` | every tool this reference documents |
 | `benchmark` | the retrieval belt the benchmark arm drives |
 | `context-bench` | read-only graph-native retrieval, no write-side session or transaction tools |
@@ -69,20 +69,20 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 ## 1. Retrieval & Codebase Exploration
 *Tools:* `semantic_search`, `semantic_locate`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
 
-- **`semantic_search`**: Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations — not raw string occurrences like grep — and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
-- **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index — the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage`, and requires the running daemon.
+- **`semantic_search`**: Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations rather than raw string occurrences like grep, and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
+- **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage`, and requires the running daemon.
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
 - **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle.
 - **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
-- **`graph_neighborhood`**: Return the dependency neighborhood of an entity — what it depends on and what depends on it — traversed to a given depth. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
+- **`graph_neighborhood`**: Return the dependency neighborhood of an entity, traversed to a given depth. The neighborhood covers what it depends on and what depends on it. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
 
 ---
 
 ## 2. Tracing & References
 *Tools:* `trace_computation`, `trace_data_flow`, `find_references`, `bulk_check_references`, `entity_history`
 
-- **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood — its body plus callers, callees, and imports — in one structured response (a flat snapshot, not an ordered walk).
+- **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood in one structured response (a flat snapshot, not an ordered walk). The response carries its body plus callers, callees, and imports.
 - **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood).
 - **`find_references`**: Find all entities that import, call, or reference a target symbol.
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
@@ -93,9 +93,9 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 ## 3. Semantic Change, Impact & Review
 *Tools:* `impact_analysis`, `semantic_diff`, `semantic_review`
 
-- **`semantic_diff`**: Compute an entity-level diff — which declarations were added, removed, or changed — rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, file paths, or a list of change IDs.
+- **`semantic_diff`**: Compute an entity-level diff of which declarations were added, removed, or changed, rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, file paths, or a list of change IDs.
 - **`impact_analysis`**: Walk the relation graph from what changed to find the downstream entities that could be affected ("if I change this, what else might break?").
-- **`semantic_review`**: Produce a complete review of a change in one call — entity-level diff, downstream impact, and an overall risk assessment — in `text` or `json` form.
+- **`semantic_review`**: Produce a complete review of a change in one call. It covers entity-level diff, downstream impact, and an overall risk assessment, in `text` or `json` form.
 
 ---
 
@@ -141,12 +141,12 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 ## 8. Verification & Compliance
 *Tools:* `kin_verify_entity`, `kin_coverage_summary`, `kin_security_scan`, `kin_release_check`, `kin_contract_check`, `kin_provenance_query`
 
-- **`kin_verify_entity`**: Inspect the test coverage recorded for an entity — which tests are linked to it and whether it is covered (optionally filtered by runner).
-- **`kin_coverage_summary`**: Report repo-wide test coverage — total entities, how many are covered, the ratio, and what's still untested.
+- **`kin_verify_entity`**: Inspect the test coverage recorded for an entity, reporting which tests are linked to it and whether it is covered (optionally filtered by runner).
+- **`kin_coverage_summary`**: Report repo-wide test coverage, including total entities, how many are covered, the ratio, and what's still untested.
 - **`kin_security_scan`**: Run a graph-based security/quality scan that returns findings with severity (today it surfaces dead/unreachable code; `propagate=true` also computes each finding's downstream impact).
 - **`kin_release_check`**: Run a graph-only advisory against a named branch and immutable source change. It checks exact history/tree completeness and an optional source entity count; `require_approval` covers every reachable non-root change, while `require_proof` currently fails closed for every non-empty source because verification runs are not yet source-bound. Final object availability and mutation CAS remain daemon `kin release` authority.
 - **`kin_contract_check`**: Check whether a specific behavioral contract has backing tests (which tests cover it, and whether it is covered).
-- **`kin_provenance_query`**: Answer who-changed-and-whether-approved for an entity — its change count, latest change, recorded approvals, and recent audit events.
+- **`kin_provenance_query`**: Answer who-changed-and-whether-approved for an entity, returning its change count, latest change, recorded approvals, and recent audit events.
 
 ---
 
@@ -165,4 +165,4 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 
 - **`dead_code` / `find_dead_code_seeded`**: Identify unreachable or orphaned entities (whole-repo or seeded by a semantic query).
 - **`benchmark`**: Run Kin's retrieval/locate benchmarks.
-- **`kin_graph_status`**: Report one schema-bound, point-in-time status view of the exact daemon graph selected for the call — entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, a process-local authority epoch, and backing authority. The daemon holds its normal embedding-work fence while reading internally synchronized coverage counters, then revalidates graph/scope authority before publishing; observed counts still do not attest enrichment completeness.
+- **`kin_graph_status`**: Report one schema-bound, point-in-time status view of the exact daemon graph selected for the call, covering entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, a process-local authority epoch, and backing authority. The daemon holds its normal embedding-work fence while reading internally synchronized coverage counters, then revalidates graph/scope authority before publishing; observed counts still do not attest enrichment completeness.

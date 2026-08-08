@@ -7,13 +7,13 @@ This is the authoritative list of supported `KIN_*` environment variables (422 t
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
-- an unrecognized `KIN_*` name is warned (a likely typo — it has no effect);
+- an unrecognized `KIN_*` name is warned as a likely typo, because setting it has no effect;
 - an invalid value is a hard startup error for a **correctness** variable, otherwise a warning;
 - a correctness variable set away from its default is logged, so behavior drift is never silent.
 
 Variables owned by sibling components (e.g. `KIN_VFS_*` from kin-vfs) are recognized as external and left alone.
 
-**Zero-bound rule.** For a `*_TIMEOUT_MS`, `*_BUDGET_MS`, or bounded `*_TIMEOUT_SECS` knob, `0` means **disabled / unbounded** — the bound never fires. It is never an instant zero-length timeout.
+**Zero-bound rule.** For a `*_TIMEOUT_MS`, `*_BUDGET_MS`, or bounded `*_TIMEOUT_SECS` knob, `0` means **disabled / unbounded**, so the bound never fires. It is never an instant zero-length timeout.
 
 Sensitivity legend: **correctness** (affects retrieval/ranking/output or data safety), **operational** (perf/resources/lifecycle), **diagnostic** (debug/telemetry), **secret** (credential; value never logged).
 
@@ -99,7 +99,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_DISABLE_LSP` | bool | false | correctness | disable LSP enrichment in the daemon, reducing relation coverage |
 | `KIN_DAEMON_EMBED_BATCH_SIZE` | usize | *(unset)* | operational | embedding batch size for daemon-side embed passes |
 | `KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS` | seconds>=0 | 3 | operational | readiness wait for an already-running daemon |
-| `KIN_DAEMON_HTTP_TIMEOUT_SECS` | seconds>=0 | 300 | operational | per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300 — long-running requests (large-repo review) need a higher value |
+| `KIN_DAEMON_HTTP_TIMEOUT_SECS` | seconds>=0 | 300 | operational | per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300, and long-running requests (large-repo review) need a higher value |
 | `KIN_DAEMON_IDLE_FLUSH_SECS` | seconds>=0 | 2 | operational | idle debounce before a full-graph persistence flush |
 | `KIN_DAEMON_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | auto-shutdown after this idle period; 0 disables idle shutdown |
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
@@ -152,7 +152,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | --- | --- | --- | --- | --- |
 | `KIN_EMBED_BACKEND` | enum | auto | correctness | kin-db embedding compute backend: auto (default) uses batched Metal, 'cpu' forces the SIMD/pure path, 'metal'/'gpu' forces Metal; cpu vs metal shifts embeddings in the last ULPs |
 | `KIN_EMBED_CACHE` | bool | true | operational | kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on |
-| `KIN_EMBED_CACHE_BUDGET_GB` | float>=0 | *(unset)* | operational | kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing — the cache is pruned only by an explicit budget or command |
+| `KIN_EMBED_CACHE_BUDGET_GB` | float>=0 | *(unset)* | operational | kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing, so the cache is pruned only by an explicit budget or command |
 | `KIN_EMBED_CACHE_DIR` | path | *(unset)* | operational | kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings |
 | `KIN_EMBED_HTTP_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | HTTP timeout for the embedding service client |
 | `KIN_EMBED_HYBRID` | string | off | correctness | kin-db hybrid CPU/GPU embedding split: off (default), 'seq'/'floor' for the sequence-length floor, or any other truthy value for the balanced split; engaging the CPU twin computes some vectors off the Metal device |

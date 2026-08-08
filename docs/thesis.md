@@ -29,8 +29,8 @@ Kin replaces the file-first, diff-first substrate with a semantic, graph-first m
 2. **The filesystem is a projection**: Editor views and on-disk files are not the source
    of truth; they are derived views computed from the graph state.
 3. **Change tracking via semantic fingerprints**: Changes are tracked as semantic changes
-   to graph nodes — using AST hashes, signature hashes, behavior hashes, and stability
-   scores — rather than as line diffs.
+   to graph nodes rather than as line diffs, using AST hashes, signature hashes, behavior
+   hashes, and stability scores.
 
 ---
 
