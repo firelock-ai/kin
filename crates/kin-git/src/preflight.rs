@@ -22,6 +22,7 @@ use kin_model::{
     RepositoryId, RepositoryRefState, TreeEntry, WorkspaceHead,
 };
 
+use crate::admission_blockers::effective_hook_surface;
 use crate::error::{
     GitCheckoutFilterFact, GitError, LocalGitHookExecutability, LocalGitHookFact, LocalGitHookKind,
     RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result,
@@ -400,14 +401,23 @@ fn observe(
         });
     }
 
-    let (configured_custom_hooks_path, hooks) = local_hook_facts(&repo)?;
+    let ambient_repo = open_repo_with_user_ignore_config(&source_worktree)?;
+    if stable_path(ambient_repo.git_dir()) != stable_path(repo.git_dir())
+        || stable_path(ambient_repo.common_dir()) != stable_path(repo.common_dir())
+    {
+        return Err(preflight_error(
+            "resolved user ignore configuration opened a different Git repository",
+        ));
+    }
+
+    let hook_surface = effective_hook_surface(&repo, &ambient_repo)?;
     let filters = checkout_filter_facts(&repo);
-    if configured_custom_hooks_path || !hooks.is_empty() || !filters.is_empty() {
+    if !hook_surface.hooks.is_empty() || !filters.is_empty() {
         return Err(GitError::LocalCompatibilityBlockers {
-            hook_count: hooks.len(),
-            custom_hooks_path: configured_custom_hooks_path,
+            hook_count: hook_surface.hooks.len(),
+            custom_hooks_path: hook_surface.repository_scoped_hooks_path(),
             filter_count: filters.len(),
-            hooks,
+            hooks: hook_surface.hooks,
             filters,
         });
     }
@@ -419,14 +429,6 @@ fn observe(
         && plan.workspace_seed.base_tree_hash.is_none()
         && expected_entries.is_empty();
     let (index_file, raw_index) = read_strict_index(&repo, absent_index_allowed)?;
-    let ambient_repo = open_repo_with_user_ignore_config(&source_worktree)?;
-    if stable_path(ambient_repo.git_dir()) != stable_path(repo.git_dir())
-        || stable_path(ambient_repo.common_dir()) != stable_path(repo.common_dir())
-    {
-        return Err(preflight_error(
-            "resolved user ignore configuration opened a different Git repository",
-        ));
-    }
     let index = prove_index(&index_file, raw_index.as_deref(), expected_entries)?;
     index_file
         .verify_extensions(true, &repo.objects)
@@ -1287,7 +1289,7 @@ fn prove_tracked_entry(
     Ok(())
 }
 
-fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()> {
+pub(crate) fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()> {
     if let Some(operation) = repo.state() {
         return Err(preflight_error(format!(
             "Git operation {operation:?} is in progress"
@@ -1364,7 +1366,7 @@ fn find_lock_file(root: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn other_registered_worktrees(
+pub(crate) fn other_registered_worktrees(
     repo: &gix::Repository,
     source_worktree: &Path,
 ) -> Result<Vec<RegisteredGitWorktreeFact>> {
@@ -1415,48 +1417,7 @@ fn other_registered_worktrees(
     Ok(facts)
 }
 
-fn local_hook_facts(repo: &gix::Repository) -> Result<(bool, Vec<LocalGitHookFact>)> {
-    let custom_hooks_path = repo
-        .config_snapshot()
-        .plumbing()
-        .sections_by_name("core")
-        .is_some_and(|mut sections| {
-            sections.any(|section| section.contains_value_name("hooksPath"))
-        });
-    if custom_hooks_path {
-        return Ok((true, Vec::new()));
-    }
-    let hooks_dir = repo.common_dir().join("hooks");
-    let entries = match fs::read_dir(&hooks_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((false, Vec::new()));
-        }
-        Err(error) => return Err(GitError::io(&hooks_dir, error)),
-    };
-    let entries = entries
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|error| GitError::io(&hooks_dir, error))?;
-    let entries = exact_directory_names(&hooks_dir, entries)?;
-    let mut hooks = Vec::new();
-    for (name, entry) in entries {
-        if name.ends_with(b".sample") {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|error| GitError::io(entry.path(), error))?;
-        hooks.push(LocalGitHookFact {
-            name,
-            kind: hook_kind(&metadata),
-            executable: hook_executability(&metadata)?,
-            byte_len: metadata.len(),
-        });
-    }
-    hooks.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok((false, hooks))
-}
-
-fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
+pub(crate) fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
     let config = repo.config_snapshot();
     let mut facts = BTreeMap::<Vec<u8>, GitCheckoutFilterFact>::new();
     if let Some(sections) = config.plumbing().sections_by_name("filter") {
@@ -1488,7 +1449,7 @@ fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
     facts.into_values().collect()
 }
 
-fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts> {
+pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts> {
     let config = repo.config_snapshot();
     let mut remotes = Vec::<GitRemoteConfigFact>::new();
     let mut branch_tracking = Vec::<GitBranchTrackingFact>::new();
@@ -1515,7 +1476,11 @@ fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts>
             "remote" => {
                 if let Some(name) = section.header().subsection_name() {
                     validate_safe_identifier(name, "remote name")?;
-                    reject_unknown_config_keys(section, &["url", "pushurl", "fetch", "push"])?;
+                    reject_unknown_config_keys(
+                        section,
+                        &format!("remote.{}", String::from_utf8_lossy(name)),
+                        &["url", "pushurl", "fetch", "push"],
+                    )?;
                     let fact = remote_fact_mut(&mut remotes, name);
                     append_explicit_values(
                         section,
@@ -1536,7 +1501,7 @@ fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts>
                         validate_safe_refspec(value, gix::refspec::parse::Operation::Push)
                     })?;
                 } else {
-                    reject_unknown_config_keys(section, &["pushdefault"])?;
+                    reject_unknown_config_keys(section, "remote", &["pushdefault"])?;
                     set_unique_explicit_value(
                         section,
                         "pushdefault",
@@ -1551,7 +1516,11 @@ fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts>
                     .subsection_name()
                     .ok_or_else(|| unsafe_git_config("branch section without a name"))?;
                 validate_safe_branch_name(name)?;
-                reject_unknown_config_keys(section, &["remote", "merge", "pushremote"])?;
+                reject_unknown_config_keys(
+                    section,
+                    &format!("branch.{}", String::from_utf8_lossy(name)),
+                    &["remote", "merge", "pushremote"],
+                )?;
                 let fact = branch_fact_mut(&mut branch_tracking, name);
                 set_unique_explicit_value(section, "remote", &mut fact.remote, |value| {
                     validate_safe_identifier(value, "branch remote")
@@ -1567,7 +1536,7 @@ fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts>
                 if section.header().subsection_name().is_some() {
                     return Err(unsafe_git_config("named push section"));
                 }
-                reject_unknown_config_keys(section, &["default"])?;
+                reject_unknown_config_keys(section, "push", &["default"])?;
                 set_unique_explicit_value(section, "default", &mut push_default, |value| {
                     validate_push_default(value)
                 })?;
@@ -1642,22 +1611,49 @@ fn branch_fact_mut<'a>(
     branches.last_mut().expect("branch was just inserted")
 }
 
+/// Refuse any key outside the exact allowlist, naming the one that matched.
+///
+/// `scope` is the section spelling, which the caller builds from a subsection
+/// name that has only been checked for control characters. That is not enough
+/// to print: a `[remote "https://user:token@host/repo"]` section passes it and
+/// would carry a credential into the refusal, so the subsection is dropped
+/// unless it reads as a plain identifier. Key names are always safe, and the
+/// values behind them are never printed. Without a name the reader is handed a
+/// category and has to bisect their own config to find the line Kin meant.
 fn reject_unknown_config_keys(
     section: &gix::config::file::Section<'_>,
+    scope: &str,
     allowed: &[&str],
 ) -> Result<()> {
+    let scope = printable_config_scope(scope);
     for name in section.value_names() {
         let name = name.to_string();
         if !allowed
             .iter()
             .any(|allowed| name.eq_ignore_ascii_case(allowed))
         {
-            return Err(unsafe_git_config(
-                "unsupported transfer-affecting repository-local key",
-            ));
+            return Err(unsafe_git_config(format!(
+                "unsupported transfer-affecting repository-local key {scope}.{name}"
+            )));
         }
     }
     Ok(())
+}
+
+/// Keep a section spelling printable, dropping a subsection that is not a plain
+/// identifier rather than disclosing whatever it holds.
+fn printable_config_scope(scope: &str) -> String {
+    let Some((section, subsection)) = scope.split_once('.') else {
+        return scope.to_string();
+    };
+    let printable = !subsection.is_empty()
+        && subsection
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if printable {
+        return scope.to_string();
+    }
+    section.to_string()
 }
 
 fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result<()> {
@@ -1674,7 +1670,9 @@ fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result
             .iter()
             .any(|blocked| name.eq_ignore_ascii_case(blocked))
         {
-            return Err(unsafe_git_config("unsupported transfer-affecting core key"));
+            return Err(unsafe_git_config(format!(
+                "unsupported transfer-affecting core key core.{name}"
+            )));
         }
     }
     Ok(())
@@ -1985,7 +1983,7 @@ fn encode_byte_values(hash: &mut FramedHash, values: &[Vec<u8>]) {
     }
 }
 
-fn open_repo_with_user_ignore_config(path: &Path) -> Result<gix::Repository> {
+pub(crate) fn open_repo_with_user_ignore_config(path: &Path) -> Result<gix::Repository> {
     let dot_git = path.join(".git");
     let open_path = if dot_git.is_dir() { &dot_git } else { path };
     let options = gix::open::Options::default()
@@ -1998,7 +1996,7 @@ fn open_repo_with_user_ignore_config(path: &Path) -> Result<gix::Repository> {
     })
 }
 
-fn local_ignore_inputs(repo: &gix::Repository) -> Result<Vec<GitLocalIgnoreInputFact>> {
+pub(crate) fn local_ignore_inputs(repo: &gix::Repository) -> Result<Vec<GitLocalIgnoreInputFact>> {
     let mut inputs = Vec::new();
     if let Some(path) = resolved_global_excludes_path(repo)? {
         if let Some(body) = read_optional_regular_file(&path)? {
@@ -2020,7 +2018,7 @@ fn local_ignore_inputs(repo: &gix::Repository) -> Result<Vec<GitLocalIgnoreInput
     Ok(inputs)
 }
 
-fn frozen_ignore_stack<'repo>(
+pub(crate) fn frozen_ignore_stack<'repo>(
     repo: &'repo gix::Repository,
     index: &gix::index::File,
     inputs: &[GitLocalIgnoreInputFact],
@@ -2298,7 +2296,7 @@ fn ignored_entry_kind(metadata: &fs::Metadata) -> IgnoredLocalEntryKind {
     }
 }
 
-fn hook_kind(metadata: &fs::Metadata) -> LocalGitHookKind {
+pub(crate) fn hook_kind(metadata: &fs::Metadata) -> LocalGitHookKind {
     if metadata.file_type().is_symlink() {
         LocalGitHookKind::Symlink
     } else if metadata.is_file() {
@@ -2310,11 +2308,11 @@ fn hook_kind(metadata: &fs::Metadata) -> LocalGitHookKind {
     }
 }
 
-fn stable_path(path: &Path) -> PathBuf {
+pub(crate) fn stable_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn preflight_error(reason: impl Into<String>) -> GitError {
+pub(crate) fn preflight_error(reason: impl Into<String>) -> GitError {
     GitError::MigrationPreflight(reason.into())
 }
 
@@ -2325,7 +2323,7 @@ fn preflight_error(reason: impl Into<String>) -> GitError {
 /// the operator would discover the next only by re-running. Admission refuses
 /// with every non-representable entry named instead, which is what makes one
 /// refusal enough to act on.
-fn exact_directory_names(
+pub(crate) fn exact_directory_names(
     directory: &Path,
     entries: Vec<fs::DirEntry>,
 ) -> Result<Vec<(Vec<u8>, fs::DirEntry)>> {
@@ -2473,7 +2471,7 @@ fn filesystem_executable(_metadata: &fs::Metadata) -> Result<bool> {
 }
 
 /// Executable-bit observation for one local hook file.
-fn hook_executability(metadata: &fs::Metadata) -> Result<LocalGitHookExecutability> {
+pub(crate) fn hook_executability(metadata: &fs::Metadata) -> Result<LocalGitHookExecutability> {
     if !filesystem_records_executable_bit() {
         return Ok(LocalGitHookExecutability::Unrecorded);
     }
@@ -3525,6 +3523,36 @@ mod tests {
         ));
     }
 
+    /// Naming the key must not name a credential the section header carries.
+    #[test]
+    fn an_unsupported_key_is_named_without_disclosing_its_section() {
+        assert_eq!(printable_config_scope("branch.main"), "branch.main");
+        assert_eq!(
+            printable_config_scope("remote.https://user:s3cr3t@host/repo"),
+            "remote"
+        );
+
+        let (temp, repo) = config_only_repository();
+        let config = repo.join(".git/config");
+        let mut body = fs::read(&config).expect("read config");
+        body.extend_from_slice(
+            b"\n[remote \"https://user:s3cr3t@host/repo\"]\n\ttagOpt = --tags\n",
+        );
+        fs::write(&config, body).expect("write config");
+        fs::write(repo.join("README.md"), b"seed\n").expect("seed file");
+        git(&repo, &["add", "README.md"]);
+        commit(&repo, "seed");
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        let message = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect_err("unsupported key must reject")
+            .to_string();
+
+        assert!(message.contains("tagOpt"), "{message}");
+        assert!(!message.contains("s3cr3t"), "{message}");
+    }
+
     #[test]
     fn returns_structured_hook_filter_and_worktree_blockers() {
         let hook = Fixture::clean();
@@ -3545,6 +3573,7 @@ mod tests {
                 assert_eq!(hook_count, 1);
                 assert_eq!(filter_count, 0);
                 assert_eq!(hooks[0].name, b"pre-commit");
+                assert_eq!(stable_path(&hooks[0].path), stable_path(&hook_path));
                 assert_eq!(
                     hooks[0].executable,
                     LocalGitHookExecutability::Executable,
@@ -3580,14 +3609,29 @@ mod tests {
         }
 
         let custom_hooks = Fixture::clean();
+        let custom_dir = custom_hooks.temp.path().join("custom-hooks");
+        fs::create_dir_all(&custom_dir).expect("custom hooks directory");
+        let redirected = custom_dir.join("pre-push");
+        fs::write(&redirected, b"#!/bin/sh\nexit 0\n").expect("redirected hook");
         git(
             &custom_hooks.repo,
-            &["config", "core.hooksPath", "../custom-hooks"],
+            &[
+                "config",
+                "core.hooksPath",
+                custom_dir.to_str().expect("utf8 test path"),
+            ],
         );
         match custom_hooks.preflight().expect_err("custom hooks blocker") {
             GitError::LocalCompatibilityBlockers {
-                custom_hooks_path, ..
-            } => assert!(custom_hooks_path),
+                custom_hooks_path,
+                hooks,
+                ..
+            } => {
+                assert!(custom_hooks_path);
+                assert_eq!(hooks.len(), 1);
+                assert_eq!(hooks[0].name, b"pre-push");
+                assert_eq!(stable_path(&hooks[0].path), stable_path(&redirected));
+            }
             error => panic!("unexpected error: {error:?}"),
         }
 
@@ -3641,6 +3685,16 @@ mod tests {
             ],
         );
         git_dir(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        // The linked worktree resolves hooks through this common directory, so
+        // the pin that keeps a developer host out of the answer belongs here.
+        git_dir(
+            &bare,
+            &[
+                "config",
+                "core.hooksPath",
+                bare.join("hooks").to_str().expect("bare hooks path"),
+            ],
+        );
         let linked = temp.path().join("linked");
         git_dir(
             &bare,
@@ -4048,6 +4102,26 @@ mod tests {
         git(repo, &["config", "user.name", "Kin Test"]);
         git(repo, &["config", "user.email", "kin@example.invalid"]);
         git(repo, &["config", "commit.gpgSign", "false"]);
+        pin_default_hook_surface(repo);
+    }
+
+    /// Bind a fixture's hook surface to its own `.git/hooks`.
+    ///
+    /// Hook resolution reads the merged Git configuration, and this process is
+    /// not the isolated Git child a fixture launches, so a developer host that
+    /// sets `core.hooksPath` globally redirects a fixture too. Repository scope
+    /// outranks the host, so pinning it here settles what every case reads.
+    fn pin_default_hook_surface(repo: &Path) {
+        let hooks = repo.join(".git/hooks");
+        fs::create_dir_all(&hooks).expect("default hook directory");
+        git(
+            repo,
+            &[
+                "config",
+                "core.hooksPath",
+                hooks.to_str().expect("utf8 test path"),
+            ],
+        );
     }
 
     fn commit(repo: &Path, message: &str) {

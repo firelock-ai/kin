@@ -22,6 +22,9 @@ pub enum RegisteredGitWorktreeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalGitHookFact {
     pub name: Vec<u8>,
+    /// Where the hook actually lives. Under a `core.hooksPath` override this is
+    /// not under `.git/hooks`, which is why the name alone cannot locate it.
+    pub path: std::path::PathBuf,
     pub kind: LocalGitHookKind,
     pub executable: LocalGitHookExecutability,
     pub byte_len: u64,
@@ -73,6 +76,44 @@ pub struct UnsealedContentGap {
     /// Why the body could not be sealed: absent, unreadable, or not matching
     /// the identity the tree recorded.
     pub detail: String,
+}
+
+/// One reason this Git source cannot be admitted, with the way out.
+///
+/// `subject` names the exact path, hook, or configuration key that blocks, and
+/// `remedy` is the single action that clears it. A blocker that cannot say both
+/// is a category rather than a finding and does not belong here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitAdmissionBlocker {
+    pub subject: String,
+    pub remedy: String,
+}
+
+impl GitAdmissionBlocker {
+    pub fn new(subject: impl Into<String>, remedy: impl Into<String>) -> Self {
+        Self {
+            subject: subject.into(),
+            remedy: remedy.into(),
+        }
+    }
+}
+
+/// Render every blocker and note as its own line.
+///
+/// The count leads so a reader knows how much is coming before reading any of
+/// it, and notes trail the list because they explain what was *not* counted.
+fn describe_admission_blockers(blockers: &[GitAdmissionBlocker], notes: &[String]) -> String {
+    let mut described = format!(
+        "this Git repository has {} admission blocker(s):",
+        blockers.len()
+    );
+    for blocker in blockers {
+        described.push_str(&format!("\n  - {}; {}", blocker.subject, blocker.remedy));
+    }
+    for note in notes {
+        described.push_str(&format!("\n  note: {note}"));
+    }
+    described
 }
 
 /// Render a gap report so the failure names the paths an operator must fix.
@@ -142,6 +183,20 @@ pub enum GitError {
 
     #[error("Git migration preflight failed: {0}")]
     MigrationPreflight(String),
+
+    /// Every source-state reason admission would refuse, reported together
+    /// before any history is derived.
+    ///
+    /// One blocker at a time, arriving after minutes of derivation, turns a
+    /// five-minute cleanup into an afternoon of guessing. This variant carries
+    /// the whole list so a reader fixes the repository once.
+    #[error("{}", describe_admission_blockers(blockers, notes))]
+    AdmissionBlocked {
+        blockers: Vec<GitAdmissionBlocker>,
+        /// Context that changes how the list reads, such as a `core.hooksPath`
+        /// that makes `.git/hooks` inert, or Kin's own legacy hook links.
+        notes: Vec<String>,
+    },
 
     #[error(
         "Git migration source has {count} other registered worktree(s); single-workspace import must account for each workspace"

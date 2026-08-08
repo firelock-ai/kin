@@ -301,14 +301,19 @@ BOUNDARY_DIRS = [
     "crates/kin-core/src/tree.rs",
     # kin-git is scanned by default because it also carries answer-adjacent
     # logic (co-change, blame-style history) that must come from graph truth.
-    # These three modules are the Git format boundary itself: capturing a Git
-    # repository, proving a checkout matches its committed seed before
-    # admission, and materializing graph-owned history back out as Git. Reading
-    # a Git repository from disk is the entire point of an import boundary, and
-    # none of these modules answers a locate/search/context/trace/review/xref
-    # query. Enumerated file by file so every other kin-git module, including
-    # any newly added one, keeps being scanned.
+    # These four modules are the Git format boundary itself: capturing a Git
+    # repository, reporting what would stop one being admitted, proving a
+    # checkout matches its committed seed before admission, and materializing
+    # graph-owned history back out as Git. Reading a Git repository from disk is
+    # the entire point of an import boundary, and none of these modules answers
+    # a locate/search/context/trace/review/xref query. Enumerated file by file
+    # so every other kin-git module, including any newly added one, keeps being
+    # scanned.
     "crates/kin-git/src/lossless.rs",
+    # Runs before any graph exists, on the source Git repository, and produces
+    # only refusals. Nothing it reads reaches a query answer, and its whole
+    # output is a list of reasons admission cannot start.
+    "crates/kin-git/src/admission_blockers.rs",
     "crates/kin-git/src/preflight.rs",
     "crates/kin-git/src/repository_export.rs",
     "crates/kin-runtime/",

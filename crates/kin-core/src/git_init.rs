@@ -15,10 +15,10 @@ use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
-    seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
-    GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
-    SealedContentSource,
+    check_git_admission_blockers, plan_semantic_git_import, preflight_git_migration,
+    preflight_git_migration_after_publication, seal_all_content_observation_observed,
+    AdmittedContentClosure, GitLocalIgnoreSourceKind, GitMigrationPreflightProof,
+    LosslessGitRepository, SealedContentObservation, SealedContentSource,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
@@ -193,6 +193,19 @@ fn init_from_git_with_hooks(
     let source = canonical_new_repository_root(working_dir)?;
     require_git_boundary(&source)?;
 
+    let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);
+
+    // Ahead of every derivation phase on purpose. Each blocker below is source
+    // state the proof would refuse anyway, and deriving a whole semantic
+    // history first only means the operator waits minutes to be told that a
+    // file they could see is untracked.
+    progress.begin("check admission blockers");
+    {
+        let _span = info_span!("kin.init.check_admission_blockers").entered();
+        check_git_admission_blockers(&source)
+            .map_err(|error| git_boundary_error("admit this Git repository", error))?;
+    }
+
     let manifest = KinManifest::new();
     let repository_id = RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
@@ -217,8 +230,6 @@ fn init_from_git_with_hooks(
     // published `.kin` behind to reference them.
     let capture_store = BlobStore::new_ephemeral(capture_dir.path().join("objects"))
         .map_err(|error| git_boundary_error("create capture CAS", error))?;
-
-    let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);
 
     progress.begin("capture Git repository");
     let snapshot = {
@@ -990,6 +1001,62 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
+    /// Source blockers are reported before any derivation phase runs.
+    ///
+    /// The fixture is shallow as well as dirty. Capture is the phase after the
+    /// blocker check and refuses a shallow source with its own message, so
+    /// whichever message comes back names the phase that ran first. A timing
+    /// assertion would claim the same thing and pass on a slow machine for the
+    /// wrong reason.
+    #[test]
+    fn source_blockers_are_reported_before_any_history_is_derived() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        let head = git_stdout(&source, ["rev-parse", "HEAD"]);
+        std::fs::write(source.join(".git/shallow"), format!("{}\n", head.trim())).unwrap();
+        std::fs::write(source.join("init.log"), b"log\n").unwrap();
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        assert!(error.contains("init.log"), "{error}");
+        assert!(
+            !error.contains("shallow"),
+            "capture must not have run yet: {error}"
+        );
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    /// One refusal carries every blocker, each with the way out.
+    #[test]
+    fn every_source_blocker_reaches_the_operator_together() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
+        std::fs::write(source.join("init.log"), b"log\n").unwrap();
+        std::fs::write(source.join("staged.txt"), b"staged\n").unwrap();
+        git(&source, ["add", "staged.txt"]);
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        assert!(error.contains("init.log"), "{error}");
+        assert!(error.contains("staged.txt"), "{error}");
+        assert!(error.contains("remote.origin.tagOpt"), "{error}");
+        assert!(error.contains(".gitignore"), "{error}");
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
     #[test]
     fn unsafe_remote_configuration_fails_before_staging_without_disclosure() {
         let root = tempfile::tempdir().unwrap();
@@ -1736,6 +1803,22 @@ mod tests {
         git(source, ["init", "--initial-branch=main"]);
         git(source, ["config", "user.email", "kin@example.invalid"]);
         git(source, ["config", "user.name", "Kin Test"]);
+        pin_default_hook_surface(source);
+    }
+
+    /// Bind a fixture's hook surface to its own `.git/hooks`.
+    ///
+    /// Admission resolves hooks from merged Git configuration, and this process
+    /// is not the isolated Git child a fixture launches, so a developer host
+    /// that sets `core.hooksPath` globally would redirect every fixture at once
+    /// and refuse them all. Repository scope outranks the host.
+    fn pin_default_hook_surface(source: &Path) {
+        let hooks = source.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        git(
+            source,
+            ["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
     }
 
     fn initialize_annotated_tag_source(source: &Path) {
