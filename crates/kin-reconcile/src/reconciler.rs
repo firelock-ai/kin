@@ -1864,8 +1864,8 @@ fn merge_deltas(
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        EntityKind, EntityMetadata, EntityRole, EntityStore, FingerprintAlgorithm, Hash256,
+        LanguageId, SemanticFingerprint, Visibility,
     };
 
     fn make_entity(name: &str, file: &str) -> Entity {
@@ -1946,6 +1946,107 @@ mod tests {
 
         reconciler.lkg.record(entity, vec![]);
         assert!(reconciler.lkg().get(&id).is_some());
+    }
+
+    /// Reconcile a file twice, returning the delta the second pass derived.
+    fn reconcile_twice(first: &str, second: &str) -> Result<TransactionDelta> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let blobs = BlobStore::new(root.join(".kin-blobs")).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let mut reconciler = Reconciler::new(root.clone());
+        let path = root.join("hooks.rs");
+
+        // Seed graph truth entity by entity. Committing the first delta whole
+        // would need a staged tree carrying the artifact, and the tree plays no
+        // part in how the second pass re-matches what it parses.
+        std::fs::write(&path, first).unwrap();
+        let seeded = reconciler
+            .reconcile_file_change(&FileEvent::Changed(path.clone()), &blobs, &graph)?
+            .delta;
+        for entity_delta in &seeded.entity_deltas {
+            if let EntityDelta::Added { new } = entity_delta {
+                graph.upsert_entity(new).unwrap();
+            }
+        }
+
+        std::fs::write(&path, second).unwrap();
+        Ok(reconciler
+            .reconcile_file_change(&FileEvent::Changed(path), &blobs, &graph)?
+            .delta)
+    }
+
+    /// A file may declare one name twice, and each declaration is its own entity.
+    ///
+    /// Identity is derived from the declaration's start line, so an edit above a
+    /// declaration invalidates the identity the graph holds for it. Re-matching
+    /// then falls back to name and kind, and both parsed halves of a cfg-gated
+    /// pair claimed whichever half the graph returned first. Two deltas for one
+    /// entity is not a transaction, so the edit was refused whole and nothing in
+    /// the file ever advanced again.
+    #[test]
+    fn an_edit_above_a_duplicated_declaration_yields_one_delta_per_entity() {
+        let delta = reconcile_twice(
+            "#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+            "pub fn probe() -> u32 { 9 }\n\n#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+        )
+        .expect("an ordinary edit must derive a valid transaction");
+
+        let mut targets = delta
+            .entity_deltas
+            .iter()
+            .map(EntityDelta::target_id)
+            .collect::<Vec<_>>();
+        let before = targets.len();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(
+            targets.len(),
+            before,
+            "the transaction carries more than one delta for some entity"
+        );
+        assert!(
+            delta
+                .entity_deltas
+                .iter()
+                .any(|entity_delta| matches!(entity_delta, EntityDelta::Added { new } if new.name == "probe")),
+            "the added declaration never reached the transaction"
+        );
+    }
+
+    /// Each half of a duplicated declaration keeps its own identity across an edit.
+    ///
+    /// Matching one parsed entity to one existing entity is what holds the
+    /// invariant, and matching them to the same one both breaks the transaction
+    /// and loses a declaration. Pin the surviving count, not only the delta shape.
+    #[test]
+    fn both_halves_of_a_duplicated_declaration_survive_an_edit() {
+        let delta = reconcile_twice(
+            "#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+            "pub fn probe() -> u32 { 9 }\n\n#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+        )
+        .expect("an ordinary edit must derive a valid transaction");
+
+        let removed = delta
+            .entity_deltas
+            .iter()
+            .filter(|entity_delta| matches!(entity_delta, EntityDelta::Removed { .. }))
+            .count();
+        assert_eq!(
+            removed, 0,
+            "an edit that removed no declaration must remove no entity"
+        );
+        let hooks = delta
+            .entity_deltas
+            .iter()
+            .filter(|entity_delta| {
+                matches!(entity_delta, EntityDelta::Modified { new, .. } if new.name == "hook")
+            })
+            .count();
+        assert_eq!(
+            hooks, 2,
+            "both halves of the duplicated declaration must advance"
+        );
     }
 
     #[test]
