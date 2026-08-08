@@ -152,6 +152,97 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
     assert!(!payload["initial_change_id"].is_null());
     assert!(repo.join(".kin/manifest.json").is_file());
     assert!(!repo.join("AGENTS.md").exists());
+    assert!(
+        payload["uncommitted_worktree"].is_null(),
+        "a source that matched carries no disclosure: {payload}"
+    );
+}
+
+/// A repository someone has been working in initializes and says what it saw.
+///
+/// The first repository a new adopter points `kin init` at has untracked files
+/// and unstaged edits in it, so this is the shape that decides whether adoption
+/// starts at all. Both halves are asserted: init succeeds, and the delta it did
+/// not admit is named on the surface the operator is looking at.
+#[test]
+fn a_worked_in_git_repository_initializes_and_discloses_the_delta() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("worked-in");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+    fs::write(repo.join("README.md"), "edited after the commit\n").expect("unstaged edit");
+    fs::write(repo.join("scratch.log"), "log\n").expect("untracked file");
+    fs::write(repo.join("staged.txt"), "staged\n").expect("staged file");
+    run_git(&repo, &["add", "staged.txt"]);
+
+    let output = kin_init(&repo, &home, &["--json"]);
+    assert!(
+        output.status.success(),
+        "a worked-in repository must initialize: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("init stdout should be JSON");
+    let disclosed = &payload["uncommitted_worktree"];
+    assert_eq!(disclosed["observed_paths"], 3, "{payload}");
+    assert_eq!(disclosed["unlisted_paths"], 0, "{payload}");
+    let states = disclosed["paths"]
+        .as_array()
+        .expect("disclosed paths")
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().expect("path").to_string(),
+                entry["state"].as_str().expect("state").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        states.contains(&("README.md".to_string(), "modified".to_string())),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&("staged.txt".to_string(), "staged".to_string())),
+        "{states:?}"
+    );
+    assert!(
+        states.contains(&("scratch.log".to_string(), "untracked".to_string())),
+        "{states:?}"
+    );
+
+    // The worktree keeps everything it had, and the admitted state is the
+    // commit rather than what is on disk.
+    assert_eq!(
+        fs::read_to_string(repo.join("README.md")).expect("read README"),
+        "edited after the commit\n"
+    );
+    assert!(repo.join("scratch.log").is_file());
+    assert_eq!(payload["workspace_generation"], 0);
+}
+
+/// The same repository through the human surface.
+#[test]
+fn a_worked_in_git_repository_names_the_delta_in_human_output() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("worked-in-human");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+    fs::write(repo.join("scratch.log"), "log\n").expect("untracked file");
+
+    let output = kin_init(&repo, &home, &[]);
+    assert!(output.status.success(), "init must succeed");
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        printed.contains("Uncommitted worktree state: 1 path(s) differ"),
+        "{printed}"
+    );
+    assert!(printed.contains("untracked (1): scratch.log"), "{printed}");
+    assert!(
+        printed.contains("None of it entered repository authority"),
+        "{printed}"
+    );
 }
 
 #[test]

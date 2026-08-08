@@ -347,7 +347,10 @@ fn uncommitted_worktree_disclosure(
         if paths.is_empty() {
             continue;
         }
-        let unlisted = paths.len().saturating_sub(DISCLOSED_PATHS)
+        // Paths the walk stopped naming are part of the total this line states
+        // and are not among the ones it can list, so they count once in each
+        // and never in both.
+        let observed = paths.len()
             + if kind == kin_git::GitWorkspaceDivergenceKind::Untracked {
                 divergence.untracked_beyond_cap
             } else {
@@ -359,14 +362,11 @@ fn uncommitted_worktree_disclosure(
             .cloned()
             .collect::<Vec<_>>()
             .join(", ");
+        let unlisted = observed - paths.len().min(DISCLOSED_PATHS);
         if unlisted > 0 {
             rendered.push_str(&format!(", and {unlisted} more"));
         }
-        lines.push(format!(
-            "    {} ({}): {rendered}",
-            kind.label(),
-            paths.len() + unlisted
-        ));
+        lines.push(format!("    {} ({observed}): {rendered}", kind.label()));
     }
     lines.push(
         "  None of it entered repository authority, and none of it was touched. It becomes \
@@ -504,6 +504,94 @@ mod tests {
         assert!(
             semantic_absence_notice(&enrichment(SemanticEnrichmentPresence::Present, 19_405))
                 .is_none()
+        );
+    }
+
+    fn divergence(
+        entries: Vec<(&str, kin_git::GitWorkspaceDivergenceKind)>,
+        beyond_cap: usize,
+    ) -> kin_git::GitWorkspaceDivergenceFacts {
+        let mut facts = kin_git::GitWorkspaceDivergenceFacts::none();
+        facts.entries = entries
+            .into_iter()
+            .map(|(path, kind)| kin_git::GitWorkspaceDivergence {
+                path: kin_model::RepoPath::from_bytes(path.as_bytes().to_vec())
+                    .expect("test repo path"),
+                kind,
+                detail: String::new(),
+                observed: None,
+            })
+            .collect();
+        facts.untracked_beyond_cap = beyond_cap;
+        facts
+    }
+
+    /// The disclosure names the paths and says where they went.
+    ///
+    /// A list with no disposition reads as damage, so the sentence about what
+    /// happens to the delta is asserted alongside the paths themselves.
+    #[test]
+    fn the_uncommitted_disclosure_names_paths_and_their_disposition() {
+        let lines = uncommitted_worktree_disclosure(&divergence(
+            vec![
+                ("src/main.rs", kin_git::GitWorkspaceDivergenceKind::Modified),
+                ("notes.txt", kin_git::GitWorkspaceDivergenceKind::Untracked),
+                ("staged.rs", kin_git::GitWorkspaceDivergenceKind::Staged),
+            ],
+            0,
+        ))
+        .join("\n");
+
+        assert!(lines.contains("3 path(s) differ"), "{lines}");
+        assert!(lines.contains("staged (1): staged.rs"), "{lines}");
+        assert!(lines.contains("modified (1): src/main.rs"), "{lines}");
+        assert!(lines.contains("untracked (1): notes.txt"), "{lines}");
+        assert!(
+            lines.contains("None of it entered repository authority"),
+            "{lines}"
+        );
+        assert!(lines.contains("the first time the daemon runs"), "{lines}");
+    }
+
+    /// A long list is capped and the rest counted, including what the walk
+    /// stopped naming, so the total the header states is never contradicted by
+    /// the lines beneath it.
+    #[test]
+    fn the_uncommitted_disclosure_counts_what_it_does_not_list() {
+        let entries = (0..12)
+            .map(|index| (index, kin_git::GitWorkspaceDivergenceKind::Untracked))
+            .collect::<Vec<_>>();
+        let named = entries
+            .iter()
+            .map(|(index, kind)| (format!("untracked-{index:02}.log"), *kind))
+            .collect::<Vec<_>>();
+        let lines = uncommitted_worktree_disclosure(&divergence(
+            named
+                .iter()
+                .map(|(path, kind)| (path.as_str(), *kind))
+                .collect(),
+            7,
+        ))
+        .join("\n");
+
+        assert!(lines.contains("19 path(s) differ"), "{lines}");
+        assert!(lines.contains("untracked (19)"), "{lines}");
+        assert!(lines.contains("untracked-00.log"), "{lines}");
+        assert!(lines.contains("untracked-09.log"), "{lines}");
+        assert!(!lines.contains("untracked-10.log"), "{lines}");
+        assert!(lines.contains("and 9 more"), "{lines}");
+    }
+
+    /// The falsification: a source that matched prints nothing, or the
+    /// disclosure is noise on every clean init.
+    #[test]
+    fn a_source_that_matched_gets_no_disclosure() {
+        assert!(
+            uncommitted_worktree_disclosure(&kin_git::GitWorkspaceDivergenceFacts::none())
+                .is_empty()
+        );
+        assert!(
+            uncommitted_worktree_payload(&kin_git::GitWorkspaceDivergenceFacts::none()).is_none()
         );
     }
 }
