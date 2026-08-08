@@ -588,9 +588,10 @@ impl Reconciler {
         let mut delta = TransactionDelta::default();
         let blob_hash = serde_json::Value::String(indexed.blob_hash.to_string());
 
-        // Track which existing entities we've matched
-        let mut matched_existing: HashMap<EntityId, bool> =
-            existing.iter().map(|e| (e.id, false)).collect();
+        // Every entity id this transaction already speaks for. One delta per
+        // entity is the transaction invariant, so an id enters this set the
+        // moment a delta names it and no later delta may name it again.
+        let mut claimed: HashSet<EntityId> = HashSet::new();
 
         // Process new entities from the parse
         for new_entity in &indexed.entities {
@@ -621,18 +622,32 @@ impl Reconciler {
             // exact id first, while still requiring the entity kind to match;
             // ordinary filesystem reconciliation continues to match by name
             // and kind as before.
+            //
+            // Both passes skip an entity another parsed declaration already
+            // claimed, so the match is one-to-one. Identity is derived from the
+            // declaration's start line, so an edit above a declaration retires
+            // the id the graph holds for it and drops it to the name-and-kind
+            // pass. A file that declares one name twice, which a cfg-gated pair
+            // does routinely, would otherwise collapse both halves onto
+            // whichever half the graph returned first.
             let existing_match = existing
                 .iter()
-                .find(|entity| entity.id == new_entity.id && entity.kind == new_entity.kind)
+                .find(|entity| {
+                    entity.id == new_entity.id
+                        && entity.kind == new_entity.kind
+                        && !claimed.contains(&entity.id)
+                })
                 .or_else(|| {
                     existing.iter().find(|entity| {
-                        entity.name == new_entity.name && entity.kind == new_entity.kind
+                        entity.name == new_entity.name
+                            && entity.kind == new_entity.kind
+                            && !claimed.contains(&entity.id)
                     })
                 });
 
             match existing_match {
                 Some(old) => {
-                    matched_existing.insert(old.id, true);
+                    claimed.insert(old.id);
 
                     let mut updated = new_entity.clone();
                     updated.id = old.id;
@@ -669,8 +684,19 @@ impl Reconciler {
                     }
                 }
                 None => {
-                    // New entity
+                    // New entity. Identity is derived from the file, name,
+                    // kind, and start line, so two declarations sharing all
+                    // four are one entity as far as the graph can tell and only
+                    // the first of them can be carried.
                     let mut added_entity = new_entity.clone();
+                    if !claimed.insert(added_entity.id) {
+                        warn!(
+                            entity = %added_entity.name,
+                            id = %added_entity.id,
+                            "declaration repeats an identity this transaction already carries, skipping"
+                        );
+                        continue;
+                    }
                     added_entity
                         .metadata
                         .extra
@@ -691,19 +717,18 @@ impl Reconciler {
             }
         }
 
-        // Entities that existed before but are no longer in the file -> removed
-        for (id, matched) in &matched_existing {
-            if !matched {
-                let old = existing
-                    .iter()
-                    .find(|entity| entity.id == *id)
-                    .expect("matched-existing map is derived from existing entities");
+        // Entities that existed before but are no longer in the file -> removed.
+        // Claiming as we go keeps one delta per entity even if graph truth
+        // handed back the same entity twice, and walking `existing` rather than
+        // a map keeps the removal order the order the graph reported.
+        for old in &existing {
+            if claimed.insert(old.id) {
                 delta
                     .entity_deltas
                     .push(EntityDelta::Removed { old: old.clone() });
-                self.lkg.remove(id);
-                removed.push(*id);
-                debug!(id = %id, "entity removed from file");
+                self.lkg.remove(&old.id);
+                removed.push(old.id);
+                debug!(id = %old.id, "entity removed from file");
             }
         }
 
@@ -1864,8 +1889,8 @@ fn merge_deltas(
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
-        SemanticFingerprint, Visibility,
+        EntityKind, EntityMetadata, EntityRole, EntityStore, FingerprintAlgorithm, Hash256,
+        LanguageId, SemanticFingerprint, Visibility,
     };
 
     fn make_entity(name: &str, file: &str) -> Entity {
@@ -1946,6 +1971,107 @@ mod tests {
 
         reconciler.lkg.record(entity, vec![]);
         assert!(reconciler.lkg().get(&id).is_some());
+    }
+
+    /// Reconcile a file twice, returning the delta the second pass derived.
+    fn reconcile_twice(first: &str, second: &str) -> Result<TransactionDelta> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let blobs = BlobStore::new(root.join(".kin-blobs")).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let mut reconciler = Reconciler::new(root.clone());
+        let path = root.join("hooks.rs");
+
+        // Seed graph truth entity by entity. Committing the first delta whole
+        // would need a staged tree carrying the artifact, and the tree plays no
+        // part in how the second pass re-matches what it parses.
+        std::fs::write(&path, first).unwrap();
+        let seeded = reconciler
+            .reconcile_file_change(&FileEvent::Changed(path.clone()), &blobs, &graph)?
+            .delta;
+        for entity_delta in &seeded.entity_deltas {
+            if let EntityDelta::Added { new } = entity_delta {
+                graph.upsert_entity(new).unwrap();
+            }
+        }
+
+        std::fs::write(&path, second).unwrap();
+        Ok(reconciler
+            .reconcile_file_change(&FileEvent::Changed(path), &blobs, &graph)?
+            .delta)
+    }
+
+    /// A file may declare one name twice, and each declaration is its own entity.
+    ///
+    /// Identity is derived from the declaration's start line, so an edit above a
+    /// declaration invalidates the identity the graph holds for it. Re-matching
+    /// then falls back to name and kind, and both parsed halves of a cfg-gated
+    /// pair claimed whichever half the graph returned first. Two deltas for one
+    /// entity is not a transaction, so the edit was refused whole and nothing in
+    /// the file ever advanced again.
+    #[test]
+    fn an_edit_above_a_duplicated_declaration_yields_one_delta_per_entity() {
+        let delta = reconcile_twice(
+            "#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+            "pub fn probe() -> u32 { 9 }\n\n#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+        )
+        .expect("an ordinary edit must derive a valid transaction");
+
+        let mut targets = delta
+            .entity_deltas
+            .iter()
+            .map(EntityDelta::target_id)
+            .collect::<Vec<_>>();
+        let before = targets.len();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(
+            targets.len(),
+            before,
+            "the transaction carries more than one delta for some entity"
+        );
+        assert!(
+            delta
+                .entity_deltas
+                .iter()
+                .any(|entity_delta| matches!(entity_delta, EntityDelta::Added { new } if new.name == "probe")),
+            "the added declaration never reached the transaction"
+        );
+    }
+
+    /// Each half of a duplicated declaration keeps its own identity across an edit.
+    ///
+    /// Matching one parsed entity to one existing entity is what holds the
+    /// invariant, and matching them to the same one both breaks the transaction
+    /// and loses a declaration. Pin the surviving count, not only the delta shape.
+    #[test]
+    fn both_halves_of_a_duplicated_declaration_survive_an_edit() {
+        let delta = reconcile_twice(
+            "#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+            "pub fn probe() -> u32 { 9 }\n\n#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+        )
+        .expect("an ordinary edit must derive a valid transaction");
+
+        let removed = delta
+            .entity_deltas
+            .iter()
+            .filter(|entity_delta| matches!(entity_delta, EntityDelta::Removed { .. }))
+            .count();
+        assert_eq!(
+            removed, 0,
+            "an edit that removed no declaration must remove no entity"
+        );
+        let hooks = delta
+            .entity_deltas
+            .iter()
+            .filter(|entity_delta| {
+                matches!(entity_delta, EntityDelta::Modified { new, .. } if new.name == "hook")
+            })
+            .count();
+        assert_eq!(
+            hooks, 2,
+            "both halves of the duplicated declaration must advance"
+        );
     }
 
     #[test]

@@ -1805,7 +1805,16 @@ pub async fn run_loop(
                         let deferral = retry_lane.defer(path, Instant::now(), retry_base);
                         report_modified_during_reconcile(path, &e, deferral);
                     } else {
-                        warn!(error = %e, "reconciliation error for event, skipping");
+                        // Retrying a deterministic failure would re-derive the
+                        // same rejected transaction forever, so the event is
+                        // dropped. Name the path: its enrichment now stays at
+                        // whatever the last accepted pass admitted, and an
+                        // error without a path cannot be traced back to it.
+                        warn!(
+                            file = %semantic_repo_path,
+                            error = %e,
+                            "reconciliation error for event; dropping it and leaving this path's enrichment stale"
+                        );
                     }
                     if tree_changed {
                         state.bump_version();
@@ -3341,6 +3350,99 @@ mod tests {
         );
     }
 
+    fn entity_names_for(state: &DaemonState, file: &str) -> Vec<String> {
+        let mut names = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(file)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// An edit reaches the graph even when the file declares one name twice.
+    ///
+    /// Entity identity is derived from the declaration's start line, so an edit
+    /// above a declaration invalidates the identity the graph holds for it.
+    /// Re-matching then falls back to name and kind, and a file carrying a
+    /// cfg-gated pair collapsed both parsed halves onto whichever half the graph
+    /// returned first. Two deltas for one entity is not a transaction, so the
+    /// whole reconcile was refused and the edit never became queryable.
+    #[tokio::test]
+    async fn an_edit_above_a_duplicated_declaration_admits_the_new_entity() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        std::fs::write(
+            root.join("hooks.rs"),
+            b"#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        assert_eq!(
+            entity_names_for(&state, "hooks.rs"),
+            vec!["hook".to_string(), "hook".to_string()],
+            "the fixture needs both halves of the duplicated declaration admitted"
+        );
+
+        std::fs::write(
+            root.join("hooks.rs"),
+            b"pub fn probe() -> u32 { 9 }\n\n#[cfg(unix)]\npub fn hook() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn hook() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        assert!(
+            entity_names_for(&state, "hooks.rs").contains(&"probe".to_string()),
+            "a function added by an ordinary edit never became queryable: {:?}",
+            entity_names_for(&state, "hooks.rs")
+        );
+        assert_eq!(
+            entity_names_for(&state, "hooks.rs"),
+            vec!["hook".to_string(), "hook".to_string(), "probe".to_string()],
+            "the edit must leave one entity per declaration"
+        );
+    }
+
+    /// A comment-only edit advances the same file's entities.
+    ///
+    /// Every entity in an edited file carries the file's blob hash, so a comment
+    /// is a real modification of each of them. The pass therefore has to hold the
+    /// one-delta-per-entity invariant on an edit that changes no declaration at
+    /// all, and it must keep the entity ids it already published.
+    #[tokio::test]
+    async fn a_comment_only_edit_keeps_the_files_entities_and_their_ids() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        std::fs::write(
+            root.join("notes.rs"),
+            b"// leading note\n#[cfg(unix)]\npub fn note() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn note() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+        let before = entity_ids_for(&state, "notes.rs");
+        assert_eq!(before.len(), 2, "the fixture needs both declarations");
+
+        std::fs::write(
+            root.join("notes.rs"),
+            b"// leading note\n#[cfg(unix)]\npub fn note() -> u32 { 1 }\n\n#[cfg(not(unix))]\npub fn note() -> u32 { 2 }\n\n// trailing note\n",
+        )
+        .unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        assert_eq!(
+            entity_ids_for(&state, "notes.rs"),
+            before,
+            "a comment-only edit must leave every declaration's identity alone"
+        );
+    }
+
     /// A file wide enough that indexing it takes long enough for a replacement to
     /// land between the reconciler's two reads.
     ///
@@ -3653,7 +3755,11 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                 }
             }
             Err(e) => {
-                warn!(error = %e, "sync reconciliation error for event, skipping");
+                warn!(
+                    file = %semantic_repo_path,
+                    error = %e,
+                    "sync reconciliation error for event; dropping it and leaving this path's enrichment stale"
+                );
             }
         }
     }
