@@ -191,9 +191,11 @@ pub fn execute_graph_command(
         GraphCommandRequest::Status => build_graph_status_response(binding, graph),
         GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
-        GraphCommandRequest::Source { entity } => {
-            build_graph_source_response(binding, graph, entity)
-        }
+        GraphCommandRequest::Source { entity } => build_graph_source_response(
+            &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
+            graph,
+            entity,
+        ),
     }
 }
 
@@ -738,7 +740,7 @@ fn graph_entity_not_found_lines(name: &str) -> Vec<String> {
 /// daemon MCP path consumes this directly so those cases surface distinctly to
 /// agents instead of collapsing into one opaque message.
 pub fn build_entity_source_outcome(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<EntitySourceOutcome> {
@@ -767,16 +769,16 @@ pub fn build_entity_source_outcome(
         )));
     }
 
-    let record = graph_source_record(binding, graph, &entity)?;
+    let record = graph_source_record(repository_authority, graph, &entity)?;
     Ok(EntitySourceOutcome::Found(record))
 }
 
 pub fn build_graph_source_response(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<GraphCommandResponse> {
-    match build_entity_source_outcome(binding, graph, entity_query)? {
+    match build_entity_source_outcome(repository_authority, graph, entity_query)? {
         EntitySourceOutcome::Found(record) => {
             let mut lines = vec![
                 format!(
@@ -861,11 +863,11 @@ fn resolve_source_entity(
 }
 
 fn graph_source_record(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    repository_authority: &super::repository_authority::RequestRepositoryAuthority,
     _graph: &kin_db::InMemoryGraph,
     entity: &Entity,
 ) -> Result<GraphSourceRecord> {
-    let authority = super::repository_authority::ActiveRepositoryAuthority::open(binding)?;
+    let authority = repository_authority.open()?;
     let workspace = authority.workspace()?;
     graph_source_record_from(&authority, &workspace, entity)
 }
@@ -1577,6 +1579,79 @@ mod tests {
         file_id: FilePathId,
     }
 
+    impl GraphSourceFixture {
+        /// The pinned arm, which is what a one-shot CLI invocation holds: these
+        /// tests measure the source-resolution taxonomy, not authority sharing.
+        fn authority(&self) -> super::super::repository_authority::RequestRepositoryAuthority {
+            super::super::repository_authority::RequestRepositoryAuthority::pinned(
+                self.binding.clone(),
+            )
+        }
+    }
+
+    /// A batch of source resolutions costs ONE authority open, not one each.
+    ///
+    /// `get_entity_sources` resolves source per entity, and every resolution
+    /// used to open authority for itself: a batch of N entities paid N
+    /// whole-store verifications. The shared arm makes the batch cost one, which
+    /// also makes it coherent, since per-entity opens could straddle a
+    /// publication and return rows from two different generations.
+    ///
+    /// Both arms are measured in one test on purpose. The bound is only evidence
+    /// if the counter can tell them apart, and the pinned half is what proves it
+    /// can: it still climbs with batch size, which is exactly right for a
+    /// one-shot invocation and exactly what the daemon must not do.
+    #[test]
+    fn a_batch_of_source_resolutions_shares_one_authority_open() {
+        const BATCH: usize = 4;
+        const SOURCE: &[u8] = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(SOURCE));
+        let entity = source_entity("target", fixture.file_id.clone(), 0, SOURCE.len() - 1);
+        let id = entity.id;
+        commit_source_entity(&fixture, &entity);
+        let opens = super::super::repository_authority::repository_authority_opens_on_this_thread;
+
+        let shared = std::sync::Arc::new(
+            super::super::repository_authority::ActiveRepositoryAuthority::open(&fixture.binding)
+                .expect("open authority for the batch"),
+        );
+        let shared_authority =
+            super::super::repository_authority::RequestRepositoryAuthority::shared(
+                fixture.binding.clone(),
+                std::sync::Arc::new(move || Ok(std::sync::Arc::clone(&shared))),
+            );
+
+        let before = opens();
+        for _ in 0..BATCH {
+            let outcome =
+                build_entity_source_outcome(&shared_authority, &fixture.graph, &id.to_string())
+                    .expect("resolve source through the shared authority");
+            assert!(
+                matches!(outcome, EntitySourceOutcome::Found(_)),
+                "each resolution must actually project a body, or the count proves nothing"
+            );
+        }
+        assert_eq!(
+            opens() - before,
+            0,
+            "a batch reading through one already-open authority must not open again, once per \
+             item or at all"
+        );
+
+        let pinned = fixture.authority();
+        let before = opens();
+        for _ in 0..BATCH {
+            build_entity_source_outcome(&pinned, &fixture.graph, &id.to_string())
+                .expect("resolve source through the pinned authority");
+        }
+        assert_eq!(
+            opens() - before,
+            BATCH as u64,
+            "the pinned arm opens per resolution, which is what a one-shot CLI invocation wants \
+             and what proves this counter can see the difference"
+        );
+    }
+
     fn graph_source_fixture(source: Option<&[u8]>) -> GraphSourceFixture {
         // Publication proves the Git source three times and requires all three
         // proofs to agree, and the proof deliberately includes the contents of
@@ -1679,7 +1754,8 @@ mod tests {
         commit_source_entity(&fixture, &entity);
 
         let response =
-            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .unwrap();
         let source = response.source.unwrap();
 
         assert_eq!(source.body, body);
@@ -1714,8 +1790,9 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        let error = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
-            .expect_err("a span derived from other bytes must not serve a mis-sliced body");
+        let error =
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .expect_err("a span derived from other bytes must not serve a mis-sliced body");
         let message = format!("{error:#}");
         assert!(
             message.contains("does not describe these bytes"),
@@ -1744,7 +1821,8 @@ mod tests {
         commit_source_entity(&fixture, &entity);
 
         let response =
-            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .unwrap();
         let record = response.source.unwrap();
         assert_eq!(record.body, "fn target() {}");
         assert_eq!(record.span_coherence, "digest_verified");
@@ -1764,7 +1842,8 @@ mod tests {
         )
         .unwrap();
         let response =
-            build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string()).unwrap();
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .unwrap();
         assert_eq!(response.source.unwrap().body, "fn target() {}");
     }
 
@@ -1777,9 +1856,10 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        let err = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
-            .unwrap_err()
-            .to_string();
+        let err =
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .unwrap_err()
+                .to_string();
 
         assert!(
             err.contains(&format!("source span 0..{end} is out of bounds")),
@@ -1795,9 +1875,10 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        let err = build_graph_source_response(&fixture.binding, &fixture.graph, &id.to_string())
-            .unwrap_err()
-            .to_string();
+        let err =
+            build_graph_source_response(&fixture.authority(), &fixture.graph, &id.to_string())
+                .unwrap_err()
+                .to_string();
 
         assert!(
             err.contains("source 'src/lib.rs' is absent from repository-v6 workspace"),
@@ -1817,7 +1898,7 @@ mod tests {
         let id = entity.id;
         commit_source_entity(&fixture, &entity);
 
-        match build_entity_source_outcome(&fixture.binding, &fixture.graph, &id.to_string())
+        match build_entity_source_outcome(&fixture.authority(), &fixture.graph, &id.to_string())
             .unwrap()
         {
             EntitySourceOutcome::Found(record) => assert_eq!(record.body, body),
@@ -1830,8 +1911,12 @@ mod tests {
         let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
         let invented = uuid::Uuid::new_v4();
 
-        match build_entity_source_outcome(&fixture.binding, &fixture.graph, &invented.to_string())
-            .unwrap()
+        match build_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &invented.to_string(),
+        )
+        .unwrap()
         {
             EntitySourceOutcome::NotFound(message) => {
                 assert!(message.contains(&invented.to_string()), "{message}");
@@ -1852,7 +1937,7 @@ mod tests {
         let id = entity.id;
         fixture.graph.upsert_entity(&entity).unwrap();
 
-        match build_entity_source_outcome(&fixture.binding, &fixture.graph, &id.to_string())
+        match build_entity_source_outcome(&fixture.authority(), &fixture.graph, &id.to_string())
             .unwrap()
         {
             EntitySourceOutcome::NoSource(message) => {
@@ -1869,17 +1954,23 @@ mod tests {
         let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
 
         let invented = uuid::Uuid::new_v4();
-        let not_found =
-            build_entity_source_outcome(&fixture.binding, &fixture.graph, &invented.to_string())
-                .unwrap();
+        let not_found = build_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &invented.to_string(),
+        )
+        .unwrap();
 
         let mut spanless = source_entity("target", fixture.file_id.clone(), 0, 8);
         spanless.span = None;
         let spanless_id = spanless.id;
         fixture.graph.upsert_entity(&spanless).unwrap();
-        let no_source =
-            build_entity_source_outcome(&fixture.binding, &fixture.graph, &spanless_id.to_string())
-                .unwrap();
+        let no_source = build_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &spanless_id.to_string(),
+        )
+        .unwrap();
 
         let (nf, ns) = match (not_found, no_source) {
             (EntitySourceOutcome::NotFound(nf), EntitySourceOutcome::NoSource(ns)) => (nf, ns),
@@ -1896,9 +1987,12 @@ mod tests {
         let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
         let invented = uuid::Uuid::new_v4();
 
-        let response =
-            build_graph_source_response(&fixture.binding, &fixture.graph, &invented.to_string())
-                .unwrap();
+        let response = build_graph_source_response(
+            &fixture.authority(),
+            &fixture.graph,
+            &invented.to_string(),
+        )
+        .unwrap();
 
         assert!(response.source.is_none());
         let error = response.error.expect("not-found must populate error");

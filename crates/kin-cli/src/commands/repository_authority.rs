@@ -16,15 +16,126 @@ use kin_model::{
     WorkspaceState,
 };
 
-pub(crate) struct ActiveRepositoryAuthority {
+pub struct ActiveRepositoryAuthority {
     manager: RepositoryAuthorityManager<LocalFileBackend>,
     payload_stats: Option<AuthorityPayloadStats>,
     pub(crate) repository_id: RepositoryId,
     pub(crate) workspace_id: WorkspaceId,
 }
 
+thread_local! {
+    static REPOSITORY_AUTHORITY_OPENS_ON_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Repository-authority opens this crate's wrapper has performed ON THE CALLING
+/// THREAD.
+///
+/// An open decodes the persisted snapshot and re-verifies every persisted body
+/// against its content address, so its cost is a property of the store rather
+/// than of the request. That makes the COUNT, not the wall clock, the honest
+/// thing for a test to bound: a helper that opens once per item stays O(items)
+/// here no matter how small the fixture is, where a timing assertion on a small
+/// fixture passes with the defect present.
+///
+/// Per-thread rather than per-process because test binaries run in parallel and
+/// a sibling test that projects a body would otherwise land in the same counter.
+/// The caller must keep the measured section on one thread; a section that hands
+/// its work to a worker reads zero, which fails an `== 1` bound loudly rather
+/// than passing it silently.
+pub fn repository_authority_opens_on_this_thread() -> u64 {
+    REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(std::cell::Cell::get)
+}
+
+/// The repository authority one command reads at, and who paid for the open.
+///
+/// The same contract kin-mcp's `RequestRepositoryAuthority` states for the MCP
+/// query tools, for the commands that read source through *this* crate's
+/// wrapper. A one-shot CLI invocation has nobody to share an open with and opens
+/// for itself, which is what every command helper did before this type existed.
+/// A long-lived daemon does: it resolves one open per durable publication and
+/// hands the same authority to every request reading at that publication.
+///
+/// Both arms answer from an open that passed KinDB's complete open-time
+/// validation. There is no arm that produces authority which skipped it, and
+/// reuse can only hand back the result of a validation that already ran over
+/// these exact durable bytes. What a server must get right is not WHETHER the
+/// authority it shares was validated but WHICH publication it was validated at;
+/// see [`Self::shared`].
+#[derive(Clone)]
+pub struct RequestRepositoryAuthority {
+    binding: kin_core::LocalRepositoryAuthorityBinding,
+    shared: Option<SharedAuthorityResolver>,
+}
+
+/// A server's promise to produce authority for the publication a request reads
+/// at, run only when a command actually reaches a source read.
+pub type SharedAuthorityResolver =
+    std::sync::Arc<dyn Fn() -> Result<std::sync::Arc<ActiveRepositoryAuthority>> + Send + Sync>;
+
+impl RequestRepositoryAuthority {
+    /// Authority this command opens for itself.
+    pub fn pinned(binding: kin_core::LocalRepositoryAuthorityBinding) -> Self {
+        Self {
+            binding,
+            shared: None,
+        }
+    }
+
+    /// Authority a server resolves for the publication this request reads at.
+    ///
+    /// The server owns the freshness argument, and it is the whole of what this
+    /// type cannot check for itself. Each call to the resolver must return an
+    /// authority opened at a durable publication the server confirmed is still
+    /// the one local storage holds, with that confirmation read BEFORE the open
+    /// it labels rather than after. A label taken afterwards can name a
+    /// publication that landed during the load, which marks older bytes as
+    /// current and serves them past the commit that replaced them.
+    pub fn shared(
+        binding: kin_core::LocalRepositoryAuthorityBinding,
+        resolve: SharedAuthorityResolver,
+    ) -> Self {
+        Self {
+            binding,
+            shared: Some(resolve),
+        }
+    }
+
+    /// The startup-pinned identity and storage capability behind this authority,
+    /// for the surfaces that still take a binding.
+    pub fn binding(&self) -> &kin_core::LocalRepositoryAuthorityBinding {
+        &self.binding
+    }
+
+    /// The open authority to read this command from.
+    ///
+    /// Reuses the caller's open when there is one, and otherwise performs the
+    /// full validating open. Read paths call this rather than
+    /// [`ActiveRepositoryAuthority::open`] so a server's shared open is not
+    /// silently bypassed by one of them.
+    ///
+    /// A helper that resolves per item — the batched source tools resolve once
+    /// per entity — costs one open for the whole batch on the shared arm and one
+    /// per item on the pinned arm, which is exactly the one-shot behavior that
+    /// arm is for.
+    pub(crate) fn open(&self) -> Result<std::sync::Arc<ActiveRepositoryAuthority>> {
+        match &self.shared {
+            Some(resolve) => resolve(),
+            None => ActiveRepositoryAuthority::open(&self.binding).map(std::sync::Arc::new),
+        }
+    }
+}
+
 impl ActiveRepositoryAuthority {
-    pub(crate) fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
+    /// Open the authority from durable storage.
+    ///
+    /// This re-verifies every persisted body against its content address, so it
+    /// costs whatever the whole store is worth rather than whatever the caller
+    /// asked for. `pub` so a long-lived server can pay for one open and hand it
+    /// to the requests that read at that publication, through
+    /// [`RequestRepositoryAuthority::shared`].
+    pub fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
+        REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| opens.set(opens.get() + 1));
         let repository_id = binding.repository_id().clone();
         let workspace_id = binding.workspace_id();
         let (manager, payload_stats) = binding
