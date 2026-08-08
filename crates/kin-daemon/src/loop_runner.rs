@@ -308,6 +308,17 @@ fn host_entry_matches_graph(
         .artifact_id_at_path(repo_path)
         .and_then(|artifact_id| state.graph.resolved_artifact(&artifact_id))
         .map(|artifact| artifact.entry);
+    if expected.is_none() && observed.is_some() {
+        // A file present on disk with no graph entry is what an excluded path
+        // looks like once the rules cover it. Retraction untracks rather than
+        // deletes, so the file outliving its artifact is the intended end state
+        // here and not evidence that the host moved under the admission.
+        let ignore = kin_index::RepositoryIgnore::load(state.layout.working_dir())
+            .map_err(kin_index::IndexError::from)?;
+        if ignore.matches(repo_path) {
+            return Ok(true);
+        }
+    }
     Ok(observed == expected)
 }
 
@@ -460,10 +471,44 @@ fn exact_tree_admission(
     }
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    // A rule that begins matching an already-admitted path retracts it. Ignoring
+    // a path is a statement about the semantic index rather than about future
+    // walks alone, so the rules are applied to graph-owned tracked identity here
+    // and not only to the leaves the walk meets.
+    let retracted = kin_index::tracked_paths_retracted_by_ignore(
+        &ignore,
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    );
+    let retracted_paths = retracted.paths().iter().cloned().collect::<BTreeSet<_>>();
+    announce_retraction(&retracted);
+    // Planned from graph-owned identity rather than inferred from the walk. The
+    // observation planner refuses an unmatched removal beside an unmatched
+    // addition, because a walk cannot tell that pair apart from a move, and
+    // writing a rule produces exactly that pair: `.kinignore` arrives as the
+    // addition in the same tick its rule retracts something. The artifact this
+    // removes is already known by id, so it is named outright and never has to
+    // be guessed at.
+    let retraction_deltas = retracted
+        .paths()
+        .iter()
+        .filter_map(|path| previous.artifact_at_path(path))
+        .map(|artifact| TreeDelta::Removed {
+            artifact_id: artifact.artifact_id,
+            old: artifact.located_entry(),
+        })
+        .collect::<Vec<_>>();
+    let planning_base = previous
+        .apply(&retraction_deltas)
+        .map_err(invalid_tree_transition)?;
+    let scanned_tracked = tracked_paths
+        .iter()
+        .filter(|path| !retracted_paths.contains(*path))
+        .collect::<Vec<&RepoPath>>();
     let scan = kin_index::scan_repository_preserving_graph_only(
         working_dir,
         &ignore,
-        tracked_paths.iter(),
+        scanned_tracked.into_iter(),
         graph_only_paths.iter(),
     )
     .map_err(kin_index::IndexError::from)?;
@@ -478,7 +523,16 @@ fn exact_tree_admission(
         }
         observed.retain(|path, _| previous.artifact_id_at_path(path).is_some());
     }
-    let deltas = kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone())?;
+    // A bounded tick re-inserts every tracked path its observation did not
+    // cover, which would restore the paths the rules just retracted. Editing
+    // `.kinignore` is exactly that shape of event, so without this the surface a
+    // user writes the rule on is the one surface where it never takes effect.
+    observed.retain(|path, _| !retracted_paths.contains(path));
+    let mut deltas = retraction_deltas;
+    deltas.extend(kin_core::plan_observed_tree_deltas(
+        &planning_base,
+        observed.entries().clone(),
+    )?);
 
     let removed_count = deltas
         .iter()
@@ -533,6 +587,13 @@ fn exact_tree_admission(
             desired_tree,
         );
         let _ = publish_exact_workspace_tree(state, &admitted)?;
+        // Authority has committed the removal, so the entities derived from
+        // those paths go before the graph is asked to match. kin-db refuses a
+        // tree transition that leaves an entity on a path the staged tree no
+        // longer carries, and it is right to: an artifact that stops existing
+        // while its entities keep ranking is the exposure this ordering exists
+        // to prevent.
+        evict_enrichment_for_removed_paths(state, &deltas)?;
         state.graph.apply_transaction_delta(&TransactionDelta {
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
@@ -580,11 +641,23 @@ fn admit_file_event_with_exact_tree(
         return Ok(AdmittedFileEvent::Ignored);
     }
     let file_id = semantic_file_id(&repo_path);
-    let tracked = state.graph.artifact_id_at_path(&repo_path).is_some()
-        || admitted_paths.contains(&repo_path);
+    let in_graph = state.graph.artifact_id_at_path(&repo_path).is_some();
+    let tracked = in_graph || admitted_paths.contains(&repo_path);
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
-    if !tracked && ignore.matches(&repo_path) {
+    if !in_graph && ignore.matches(&repo_path) {
+        // The rules exclude this path and graph truth no longer carries it. If
+        // the preceding transition is what took it out, it is a retraction and
+        // its enrichment has to go with it. Reading the host here instead would
+        // find the file still present, classify it as an ordinary change, and
+        // re-enrich a path the repository just stopped tracking.
+        if admitted_paths.contains(&repo_path) {
+            return Ok(AdmittedFileEvent::Removed {
+                repo_path,
+                file_id,
+                tree_changed: true,
+            });
+        }
         return Ok(AdmittedFileEvent::Ignored);
     }
 
@@ -713,6 +786,69 @@ fn clear_incompatible_facets(
     }
 
     Ok(cleanup)
+}
+
+/// Retracted paths named in one operator-facing line, with a bounded sample.
+///
+/// A retraction removes graph-owned identity, so it is never allowed to happen
+/// quietly. A rule broad enough to cover a source tree has to be visible in the
+/// log the moment it takes effect rather than discovered later as a gap in
+/// query results.
+pub(crate) const ANNOUNCED_RETRACTION_SAMPLE: usize = 20;
+
+fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
+    if retracted.is_empty() {
+        return;
+    }
+    let sample = retracted
+        .paths()
+        .iter()
+        .take(ANNOUNCED_RETRACTION_SAMPLE)
+        .map(RepoPath::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        retracted = retracted.len(),
+        tracked = retracted.tracked_total(),
+        retained = retracted.retained_total(),
+        sample = %sample,
+        "ignore rules now cover tracked paths; retracting them from graph truth with their \
+         entities and embeddings. The files stay on disk."
+    );
+}
+
+/// Remove the enrichment derived from every path a tree transition drops.
+///
+/// Entities, their relations, and their text and vector index presence are what
+/// make a path rankable, and none of it is inferred from the tree: kin-db keeps
+/// entity removal an explicit transition and refuses a tree change that would
+/// strand one. Clearing here is what lets a removal of any kind, a deleted file
+/// or a newly ignored one, take the whole artifact out rather than only its
+/// tree entry.
+pub(crate) fn evict_enrichment_for_removed_paths(
+    state: &DaemonState,
+    deltas: &[TreeDelta],
+) -> Result<Vec<EntityId>> {
+    let mut removed_entities = Vec::new();
+    for delta in deltas {
+        let TreeDelta::Removed { old, .. } = delta else {
+            continue;
+        };
+        let Some(file_id) = semantic_file_id(&old.path) else {
+            continue;
+        };
+        let cleanup = clear_incompatible_facets(state, &file_id, EnrichmentFacet::None)?;
+        for id in cleanup.removed_entities {
+            state.emit_event(DaemonEvent::EntityChanged {
+                entity_id: id,
+                change_type: ChangeType::Deleted,
+                file_path: Some(file_id.0.clone()),
+                session_id: None,
+            });
+            removed_entities.push(id);
+        }
+    }
+    Ok(removed_entities)
 }
 
 /// Clear UTF-8-only enrichment for an artifact the exact-tree transaction has
@@ -3047,6 +3183,122 @@ mod tests {
             pass.progress() > 0,
             "the supervisor must observe the reconcile pass admitting work"
         );
+    }
+
+    fn entity_ids_for(state: &DaemonState, file: &str) -> Vec<EntityId> {
+        let mut ids = state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(FilePathId::new(file)),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    /// Deleting a source file takes its entities with it.
+    ///
+    /// Entity removal is an explicit transition rather than something a tree
+    /// change implies, so an admission that dropped the artifact and left the
+    /// entities behind was refused outright: authority had already committed
+    /// the removal, the graph kept the old tree, and the watcher retried that
+    /// path for as long as the daemon ran.
+    #[tokio::test]
+    async fn deleting_an_entity_bearing_file_removes_its_entities_with_the_artifact() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        std::fs::write(root.join("gone.rs"), b"pub fn gone() -> u32 { 3 }\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let ids = entity_ids_for(&state, "gone.rs");
+        assert!(
+            !ids.is_empty(),
+            "the fixture admitted no entities, so nothing below proves an eviction"
+        );
+
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        assert!(tree_entry(&state, "gone.rs").is_none());
+        assert!(entity_ids_for(&state, "gone.rs").is_empty());
+        for id in &ids {
+            assert!(
+                state.graph.get_entity(id).unwrap().is_none(),
+                "a deleted file's entity id still resolves: {id}"
+            );
+        }
+        assert_eq!(
+            authority_tree(&state).artifact_at_path(&test_repo_path("gone.rs")),
+            None,
+            "graph truth and repository authority disagree about the removal"
+        );
+    }
+
+    /// A rule written after admission retracts what it names.
+    ///
+    /// Listing a path in `.kinignore` is a statement about the semantic index,
+    /// not only about future walks. The next admission therefore has to remove
+    /// the artifact and every entity, layout, and enrichment facet that let it
+    /// rank, while the file itself stays on disk.
+    #[tokio::test]
+    async fn a_rule_added_after_admission_retracts_the_path_and_its_entities() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+
+        std::fs::create_dir_all(root.join("investor/deck")).unwrap();
+        std::fs::write(
+            root.join("investor/deck/build_deck.rs"),
+            b"pub fn valuation_slide() -> u32 { 7 }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("keep.rs"), b"pub fn kept() -> u32 { 1 }\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let private_entities = entity_ids_for(&state, "investor/deck/build_deck.rs");
+        let kept_entities = entity_ids_for(&state, "keep.rs");
+        assert!(
+            !private_entities.is_empty(),
+            "the fixture admitted no entities, so nothing below proves an eviction"
+        );
+        assert!(!kept_entities.is_empty());
+
+        std::fs::write(root.join(".kinignore"), b"investor\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        assert!(
+            tree_entry(&state, "investor/deck/build_deck.rs").is_none(),
+            "a newly ignored path is still tracked"
+        );
+        assert!(
+            entity_ids_for(&state, "investor/deck/build_deck.rs").is_empty(),
+            "a retracted path still owns entities"
+        );
+        for id in &private_entities {
+            assert!(
+                state.graph.get_entity(id).unwrap().is_none(),
+                "a retracted entity id still resolves: {id}"
+            );
+        }
+        assert!(!state
+            .graph
+            .entity_bearing_file_paths()
+            .contains(&"investor/deck/build_deck.rs".to_string()));
+        assert!(
+            root.join("investor/deck/build_deck.rs").exists(),
+            "retraction untracks a path; it must never delete the file"
+        );
+
+        // The two-sided arm: an unnamed sibling keeps its artifact and the
+        // exact entity ids it had, so the rule retracted one path rather than
+        // resetting the graph.
+        assert!(tree_entry(&state, "keep.rs").is_some());
+        assert_eq!(entity_ids_for(&state, "keep.rs"), kept_entities);
     }
 
     /// A file wide enough that indexing it takes long enough for a replacement to

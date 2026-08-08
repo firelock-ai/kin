@@ -526,6 +526,30 @@ pub fn tracked_paths_covered_by_ignore<'a>(
     }
 }
 
+/// Name the tracked paths that `ignore` retracts.
+///
+/// This is the one source every retraction reads, so what a rule excludes at
+/// admission and what it removes afterwards are decided by the same compiled
+/// rules and can never drift apart. [`RepositoryIgnore::matches`] is the single
+/// predicate underneath: the scanner applies it to decide whether an untracked
+/// leaf is admitted, and this applies it to decide whether an already-tracked
+/// path stays.
+///
+/// `graph_only` members are withheld. Their identity comes from import truth
+/// rather than from a host walk, so nothing could reconstruct them if a rule
+/// happened to match their path, and dropping them would also break the
+/// scanner's graph-only-is-a-subset-of-tracked precondition.
+pub fn tracked_paths_retracted_by_ignore<'a>(
+    ignore: &RepositoryIgnore,
+    tracked: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only: impl IntoIterator<Item = &'a RepoPath>,
+) -> IgnoredTrackedPaths {
+    let graph_only = graph_only.into_iter().collect::<BTreeSet<_>>();
+    let mut covered = tracked_paths_covered_by_ignore(ignore, tracked);
+    covered.paths.retain(|path| !graph_only.contains(path));
+    covered
+}
+
 /// Convert a host-relative path to Kin's byte-exact repository path.
 pub fn repo_path_from_host_relative(path: &Path) -> io::Result<RepoPath> {
     let mut bytes = Vec::new();

@@ -57,17 +57,11 @@ pub(crate) fn execute(
         }
     }
 
-    let covered = kin_index::tracked_paths_covered_by_ignore(&ignore, tracked.iter());
-    // A graph-only member's identity is owned by import truth and cannot be
-    // reconstructed from a host walk, so it is never retired by a rule that
-    // happens to match its path. Dropping it from the tracked set would also
-    // break the scanner's graph-only-is-a-subset-of-tracked precondition.
-    let purge_set = covered
-        .paths()
-        .iter()
-        .filter(|path| !graph_only.contains(*path))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    // The same rule source the daemon's own admission reads, so what this
+    // command reports and what a tick retracts can never be two different sets.
+    let covered =
+        kin_index::tracked_paths_retracted_by_ignore(&ignore, tracked.iter(), graph_only.iter());
+    let purge_set = covered.paths().iter().cloned().collect::<BTreeSet<_>>();
 
     let sample_paths = purge_set
         .iter()
@@ -158,6 +152,10 @@ pub(crate) fn execute(
     // artifacts, which would otherwise still be served as complete.
     let graph_mutation = state.begin_graph_authority_mutation();
     let generation = crate::loop_runner::publish_exact_workspace_tree(state, &admitted)?;
+    // Untracking an artifact while its entities keep ranking is the exposure a
+    // purge exists to close, so the enrichment goes with the tree entry and it
+    // goes before the graph is asked to accept a tree that no longer carries it.
+    crate::loop_runner::evict_enrichment_for_removed_paths(state, &deltas)?;
     state.graph.apply_transaction_delta(&TransactionDelta {
         entity_deltas: Vec::new(),
         relation_deltas: Vec::new(),
