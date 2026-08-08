@@ -3190,7 +3190,7 @@ mod platform_materialization_tests {
             "index authority settles the mode without rereading the worktree: {matched:?}"
         );
 
-        let diverged = prove_one_entry(
+        let compared = prove_one_entry(
             &tracked,
             TreeEntry::Blob {
                 hash,
@@ -3199,13 +3199,26 @@ mod platform_materialization_tests {
             &blob_store,
             ExecutableModeAuthority::WorktreeMode,
             SymlinkMaterialization::Link,
-        )
-        .expect("a worktree authority must still compare the filesystem");
-        let rendered = only_detail(&diverged);
-        assert!(
-            rendered.contains("executable mode differs"),
-            "unexpected detail: {rendered}"
         );
+        // Which outcome is correct is decided by the same predicate the
+        // production path decides on, so both hosts assert the behavior they
+        // actually have rather than one of them asserting the other's.
+        if filesystem_records_executable_bit() {
+            let rendered = only_detail(&compared.expect("a mode difference is observed"));
+            assert!(
+                rendered.contains("executable mode differs"),
+                "unexpected detail: {rendered}"
+            );
+        } else {
+            // A host with no executable bit never reaches worktree authority
+            // through `worktree_materialization`. Driving it here is what keeps
+            // the fail-closed backstop from rotting into a silent `false`.
+            let error = compared.expect_err("a mode this host cannot read is refused");
+            assert!(
+                error.to_string().contains("records no executable bit"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
