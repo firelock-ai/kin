@@ -767,6 +767,44 @@ mod tests {
         effective_hook_surface(&repo, &ambient).expect("resolve hook surface")
     }
 
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = fixture_git()
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("run fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf8 git stdout")
+            .trim()
+            .to_string()
+    }
+
+    fn git_stdin(repo: &Path, args: &[&str], input: &str) -> String {
+        git_bytes_stdin(repo, args, input.as_bytes())
+    }
+
+    fn git_bytes_stdin(repo: &Path, args: &[&str], input: &[u8]) -> String {
+        let output = fixture_git()
+            .current_dir(repo)
+            .args(args)
+            .output_with_input(input)
+            .expect("run fixture git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf8 git stdout")
+            .trim()
+            .to_string()
+    }
+
     fn write_executable(path: &Path, body: &[u8]) {
         fs::write(path, body).expect("write executable");
         let mut permissions = fs::metadata(path).expect("metadata").permissions();
@@ -1038,6 +1076,54 @@ mod tests {
             report.is_clear(),
             "ignored content is admissible: {report:?}"
         );
+    }
+
+    /// A committed tree may record a mode the index cannot hold.
+    ///
+    /// `100664` is legal in a tree and several importers write it, while the
+    /// index decodes every plain file to `100644`. Comparing the raw values
+    /// reads such a repository as having every file staged, and no `git restore
+    /// --staged` clears it because nothing is staged. Admission itself admits
+    /// this repository, so a refusal here would be both wrong and inescapable.
+    #[test]
+    fn a_non_canonical_committed_filemode_is_not_read_as_staged() {
+        let fixture = Fixture::clean();
+        let blob = git_stdout(&fixture.repo, &["rev-parse", "HEAD:README.md"]);
+        // Written as raw tree bytes because `git mktree` canonicalises the mode
+        // on the way in, which is exactly the normalisation this case needs to
+        // be missing.
+        let mut body = b"100664 README.md\0".to_vec();
+        body.extend(
+            (0..blob.len() / 2)
+                .map(|index| u8::from_str_radix(&blob[index * 2..index * 2 + 2], 16))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("hex object id"),
+        );
+        let tree = git_bytes_stdin(
+            &fixture.repo,
+            &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+            &body,
+        );
+        let commit = git_stdin(
+            &fixture.repo,
+            &["commit-tree", &tree, "-m", "non-canonical mode"],
+            "",
+        );
+        git(&fixture.repo, &["reset", "--hard", &commit]);
+        // Read as raw object bytes, because `cat-file -p` prints the
+        // canonicalised mode and would report the fixture worked either way.
+        let raw = fixture_git()
+            .current_dir(&fixture.repo)
+            .args(["cat-file", "tree", "HEAD^{tree}"])
+            .output()
+            .expect("read raw committed tree");
+        assert!(
+            raw.stdout.starts_with(b"100664 "),
+            "the fixture must keep the mode this case is about"
+        );
+
+        let report = fixture.report();
+        assert!(report.is_clear(), "{report:?}");
     }
 
     #[test]
