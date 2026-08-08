@@ -11,12 +11,18 @@
 //! system of record for source truth, not for derived bytes that any build
 //! reproduces.
 //!
-//! Ignore rules apply only to paths that are not already tracked. A tracked
-//! path remains observable after a rule begins matching it, so ignore
-//! configuration can never silently turn graph-owned truth into a deletion.
-//! Retiring already-admitted derived output is therefore a deliberate operator
-//! action: [`tracked_paths_covered_by_ignore`] names exactly which tracked
-//! paths a purge would untrack.
+//! The scanner itself applies ignore rules only to paths that are not already
+//! tracked, so a walk can never turn graph-owned identity into a deletion on
+//! its own. Deciding that an already-admitted path should go is the caller's,
+//! and it is made against graph truth rather than against the walk:
+//! [`tracked_paths_retracted_by_ignore`] names exactly which tracked paths the
+//! current rules retract, and a caller withholds those from the tracked set it
+//! passes here. Admission and retraction therefore read one compiled rule set
+//! through one predicate, [`RepositoryIgnore::matches`].
+//!
+//! Imported graph-only members are never in that set. Their identity comes from
+//! import truth and no host walk could rebuild it, so a rule matching their path
+//! does not retire them.
 //!
 //! A caller receives [`CompleteRepositoryScan`] only after every representable
 //! directory entry, metadata lookup, file read, and symbolic-link read

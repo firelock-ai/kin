@@ -4,15 +4,18 @@
 //! Wire types and CLI transport for retiring tracked paths that ignore rules
 //! now cover.
 //!
-//! Ignore rules never hide tracked paths, so a repository that admitted derived
-//! output before a rule existed keeps carrying it in graph truth forever. That
-//! retention is deliberate: an ignore rule must never turn into a silent
-//! deletion. Retiring the backlog is therefore an operator action with its own
-//! surface, and this is that surface.
+//! Admission retracts a tracked path once the rules cover it, so the backlog a
+//! repository built up before a rule existed clears on its own. This surface
+//! exists for the operator who wants to see the set first, or to retire it now
+//! rather than on the next observation.
 //!
 //! The default is a dry run. It names how many tracked paths the current rules
 //! cover, how many would remain, and a bounded sample of the paths themselves.
 //! Nothing moves until `--confirm`.
+//!
+//! Retiring a path removes the artifact and the entities, layout, and index
+//! presence derived from it, because those are what let it rank. The file stays
+//! on disk; this untracks rather than deletes.
 
 use anyhow::{anyhow, Context, Result};
 use kin_model::{AuthorId, OperationId, RepositoryId};
