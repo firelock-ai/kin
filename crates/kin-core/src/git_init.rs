@@ -435,6 +435,12 @@ fn init_from_git_with_hooks(
     // proved that alias while validating the complete history; preserve it in
     // the initialization receipt instead of reporting an absent initial change.
     result.authority.initial_change_id = workspace_base_change_id;
+    // What the source held that the committed state does not. None of it is in
+    // the repository this call published; all of it is still in the worktree,
+    // where the daemon admits it as workspace state on its first run.
+    result
+        .workspace_divergence
+        .clone_from(&source_proof.workspace_divergence);
 
     info!(
         path = %source.display(),

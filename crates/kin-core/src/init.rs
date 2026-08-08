@@ -64,6 +64,12 @@ pub struct InitResult {
     /// exact raw tag target remains in `GitExternalAuthority`.
     pub head: WorkspaceHead,
     pub authority: RepositoryBootstrap,
+    /// Source paths initialization observed differing from the state it
+    /// admitted, disclosed rather than admitted.
+    ///
+    /// Always empty for an unborn native repository, which has no source to
+    /// differ from.
+    pub workspace_divergence: kin_git::GitWorkspaceDivergenceFacts,
 }
 
 #[derive(Clone)]
@@ -1210,6 +1216,7 @@ fn publish_repository_layout_impl(
         workspace_id: prepared.workspace_id,
         head: bootstrap.workspace.workspace_head.clone(),
         authority: bootstrap,
+        workspace_divergence: kin_git::GitWorkspaceDivergenceFacts::none(),
     })
 }
 

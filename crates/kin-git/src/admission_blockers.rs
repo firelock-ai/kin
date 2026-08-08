@@ -7,41 +7,33 @@
 //! history. Every refusal it can reach before publication, though, is decided
 //! by source state a reader can observe in about a second: registered
 //! worktrees, the hook surface Git would really run, checkout filters,
-//! repository-local transport configuration, the index against HEAD, and
-//! untracked worktree paths.
+//! repository-local transport configuration, and a sparse checkout.
 //!
 //! This boundary reads exactly those, reports all of them at once with the
 //! path or key that caused each and the one action that clears it, and admits
 //! nothing: a clean report only means the expensive proof is worth starting.
 //! Admission policy is unchanged, so anything reported here is something the
 //! authority proof would have refused anyway, only later and one at a time.
+//!
+//! A worktree that has been worked in is not among them. Uncommitted state is
+//! not repository authority and never enters it, so the proof observes the
+//! delta and reports it rather than refusing; see [`crate::preflight`].
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use gix::bstr::ByteSlice;
-use kin_model::RepoPath;
 
 use crate::error::{
     GitAdmissionBlocker, GitError, LocalGitHookFact, RegisteredGitWorktreeKind, Result,
 };
 use crate::lossless::open_repo;
 use crate::preflight::{
-    checkout_filter_facts, exact_directory_names, frozen_ignore_stack, hook_executability,
-    hook_kind, local_ignore_inputs, open_repo_with_user_ignore_config, other_registered_worktrees,
-    preflight_error, reject_in_progress_operations, remote_mapping_facts, stable_path,
+    checkout_filter_facts, exact_directory_names, hook_executability, hook_kind,
+    open_repo_with_user_ignore_config, other_registered_worktrees, preflight_error,
+    reject_in_progress_operations, scan_remote_mapping, stable_path,
 };
 
 /// Paths of one class printed before the rest are counted rather than listed.
 const REPORTED_PATHS: usize = 10;
-
-/// Untracked paths gathered before the walk stops looking for more.
-///
-/// A worktree carrying an unignored build directory holds hundreds of
-/// thousands of them, and every one past the first few hundred changes neither
-/// the verdict nor what the reader has to do about it.
-const UNTRACKED_SCAN_CAP: usize = 512;
 
 /// Everything one Git source repository would be refused for, in one report.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -133,30 +125,19 @@ pub fn collect_git_admission_blockers(repo_path: &Path) -> Result<GitAdmissionRe
         ));
     }
 
-    // The scan stops at the first key it refuses, so this reports one key
-    // rather than all of them. Naming that one is the whole difference from
-    // the category the message used to carry.
-    match remote_mapping_facts(&repo) {
-        Ok(_) => {}
-        Err(GitError::MigrationPreflight(reason)) => report.blockers.push(
-            GitAdmissionBlocker::new(reason, "unset that key in .git/config, or clone without it"),
-        ),
-        Err(error) => return Err(error),
+    // Every offending key, not the first. A repository outside the safe subset
+    // usually holds several, and one name per run is what turns a config edit
+    // into a sequence of them.
+    for reason in scan_remote_mapping(&repo)?.refusals {
+        report.blockers.push(GitAdmissionBlocker::new(
+            reason,
+            "unset that key in .git/config, or clone without it",
+        ));
     }
 
-    // A sparse index describes directories rather than leaves, so comparing it
-    // against a committed tree would name every path in the repository and
-    // none of them would be the problem. Admission refuses it outright and
-    // that refusal is the one worth reporting.
     if let Some(sparse) = sparse_checkout_blocker(&repo)? {
         report.blockers.push(sparse);
-        return Ok(report);
     }
-    let index = read_index(&repo)?;
-    report.blockers.extend(staged_blockers(&repo, &index)?);
-    report
-        .blockers
-        .extend(untracked_blockers(&ambient, &index, &source)?);
     Ok(report)
 }
 
@@ -423,236 +404,6 @@ fn read_index(repo: &gix::Repository) -> Result<gix::index::File> {
     .map_err(|error| preflight_error(format!("open Git index: {error}")))
 }
 
-/// Index entries that do not equal the committed tree they came from.
-fn staged_blockers(
-    repo: &gix::Repository,
-    index: &gix::index::File,
-) -> Result<Vec<GitAdmissionBlocker>> {
-    let committed = committed_tree_entries(repo)?;
-    let mut staged = Vec::new();
-    let mut removed = committed.clone();
-    for entry in index.entries() {
-        let path = entry.path(index).to_vec();
-        match removed.remove(&path) {
-            Some(committed) if committed == (entry.mode.bits(), entry.id) => {}
-            Some(_) | None => staged.push(display_path(&path)),
-        }
-    }
-    let mut blockers = Vec::new();
-    if !staged.is_empty() {
-        blockers.push(GitAdmissionBlocker::new(
-            format!(
-                "index contains {} staged or otherwise uncommitted path(s): {}",
-                staged.len(),
-                render_paths(staged)
-            ),
-            "commit them or run 'git restore --staged' on each, because Kin admits committed \
-             history exactly",
-        ));
-    }
-    let mut deleted = removed
-        .into_keys()
-        .map(|path| display_path(&path))
-        .collect::<Vec<_>>();
-    if !deleted.is_empty() {
-        deleted.sort();
-        blockers.push(GitAdmissionBlocker::new(
-            format!(
-                "index no longer carries {} committed path(s): {}",
-                deleted.len(),
-                render_paths(deleted)
-            ),
-            "commit the removal or run 'git restore --staged' on each",
-        ));
-    }
-    Ok(blockers)
-}
-
-/// Every blob, symlink, and gitlink the current HEAD commit records.
-///
-/// An unborn HEAD commits nothing, so every index entry there is staged.
-fn committed_tree_entries(
-    repo: &gix::Repository,
-) -> Result<BTreeMap<Vec<u8>, (u32, gix::ObjectId)>> {
-    let Ok(head) = repo.head_commit() else {
-        return Ok(BTreeMap::new());
-    };
-    let tree = head
-        .tree()
-        .map_err(|error| preflight_error(format!("read committed Git tree: {error}")))?;
-    let mut entries = BTreeMap::new();
-    collect_tree_entries(repo, &tree, &[], &mut entries)?;
-    Ok(entries)
-}
-
-fn collect_tree_entries(
-    repo: &gix::Repository,
-    tree: &gix::Tree<'_>,
-    prefix: &[u8],
-    entries: &mut BTreeMap<Vec<u8>, (u32, gix::ObjectId)>,
-) -> Result<()> {
-    for entry in tree.iter() {
-        let entry =
-            entry.map_err(|error| preflight_error(format!("read committed Git tree: {error}")))?;
-        let mut path = prefix.to_vec();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(entry.filename().as_bytes());
-        let mode = entry.mode();
-        let oid = entry.oid().to_owned();
-        if mode.is_tree() {
-            let subtree = repo
-                .find_object(oid)
-                .map_err(|error| preflight_error(format!("read committed Git tree: {error}")))?
-                .try_into_tree()
-                .map_err(|_| {
-                    preflight_error(format!(
-                        "committed Git entry {} is recorded as a tree but is not one",
-                        display_path(&path)
-                    ))
-                })?;
-            collect_tree_entries(repo, &subtree, &path, entries)?;
-            continue;
-        }
-        entries.insert(path, (canonical_mode(mode), oid));
-    }
-    Ok(())
-}
-
-/// The mode Git's index records for one committed entry.
-///
-/// A tree may carry a non-canonical file mode such as `100664`, which several
-/// importers still write, while the index decodes to the canonical `100644`.
-/// Comparing the raw values reads such a repository as having every file
-/// staged, and no `git restore --staged` can clear it because nothing is.
-/// Admission itself compares the entry kind, so this does too.
-fn canonical_mode(mode: gix::objs::tree::EntryMode) -> u32 {
-    match mode.kind() {
-        gix::objs::tree::EntryKind::Tree => 0o040_000,
-        gix::objs::tree::EntryKind::Blob => 0o100_644,
-        gix::objs::tree::EntryKind::BlobExecutable => 0o100_755,
-        gix::objs::tree::EntryKind::Link => 0o120_000,
-        gix::objs::tree::EntryKind::Commit => 0o160_000,
-    }
-}
-
-/// Worktree paths that are neither tracked nor ignored.
-fn untracked_blockers(
-    ambient: &gix::Repository,
-    index: &gix::index::File,
-    workdir: &Path,
-) -> Result<Vec<GitAdmissionBlocker>> {
-    let inputs = local_ignore_inputs(ambient)?;
-    let (mut excludes, _) = frozen_ignore_stack(ambient, index, &inputs)?;
-    let tracked = index
-        .entries()
-        .iter()
-        .map(|entry| entry.path(index).to_vec())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut scan = UntrackedScan {
-        tracked,
-        found: Vec::new(),
-        capped: false,
-    };
-    scan_untracked(workdir, &[], true, &mut excludes, &mut scan)?;
-    if scan.found.is_empty() {
-        return Ok(Vec::new());
-    }
-    let counted = if scan.capped {
-        format!("at least {}", scan.found.len())
-    } else {
-        scan.found.len().to_string()
-    };
-    Ok(vec![GitAdmissionBlocker::new(
-        format!(
-            "worktree contains {counted} untracked non-ignored path(s): {}",
-            render_paths(scan.found.iter().map(RepoPath::to_string).collect())
-        ),
-        "commit them, delete them, or add them to .gitignore",
-    )])
-}
-
-struct UntrackedScan {
-    tracked: std::collections::BTreeSet<Vec<u8>>,
-    found: Vec<RepoPath>,
-    capped: bool,
-}
-
-/// Walk the worktree the way the authority proof does, collecting instead of
-/// refusing at the first entry.
-///
-/// The ignore decision itself is the same call over the same frozen inputs, so
-/// a path listed here is a path the proof would have refused.
-fn scan_untracked(
-    absolute: &Path,
-    relative: &[u8],
-    root: bool,
-    excludes: &mut gix::AttributeStack<'_>,
-    scan: &mut UntrackedScan,
-) -> Result<()> {
-    let entries = fs::read_dir(absolute)
-        .map_err(|error| GitError::io(absolute, error))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|error| GitError::io(absolute, error))?;
-    let entries = exact_directory_names(absolute, entries)?;
-
-    for (name, directory_entry) in entries {
-        if scan.capped {
-            return Ok(());
-        }
-        if root && name == b".git" {
-            continue;
-        }
-        let path_bytes = if relative.is_empty() {
-            name
-        } else {
-            let mut joined = Vec::with_capacity(relative.len() + 1 + name.len());
-            joined.extend_from_slice(relative);
-            joined.push(b'/');
-            joined.extend_from_slice(&name);
-            joined
-        };
-        if scan.tracked.contains(&path_bytes) {
-            continue;
-        }
-        let absolute_path = directory_entry.path();
-        let metadata = fs::symlink_metadata(&absolute_path)
-            .map_err(|error| GitError::io(&absolute_path, error))?;
-        let mode = if metadata.is_dir() {
-            Some(gix::index::entry::Mode::DIR)
-        } else if metadata.file_type().is_symlink() {
-            Some(gix::index::entry::Mode::SYMLINK)
-        } else {
-            Some(gix::index::entry::Mode::FILE)
-        };
-        let ignored = excludes
-            .at_entry(path_bytes.as_bstr(), mode)
-            .map_err(|error| {
-                preflight_error(format!(
-                    "evaluate ignore rules for {}: {error}",
-                    display_path(&path_bytes)
-                ))
-            })?
-            .is_excluded();
-        if ignored {
-            continue;
-        }
-        if metadata.is_dir() {
-            scan_untracked(&absolute_path, &path_bytes, false, excludes, scan)?;
-            continue;
-        }
-        let path = RepoPath::from_bytes(path_bytes)
-            .map_err(|error| preflight_error(format!("invalid worktree path: {error}")))?;
-        scan.found.push(path);
-        if scan.found.len() >= UNTRACKED_SCAN_CAP {
-            scan.capped = true;
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
 /// Print the first few of a list and count the rest.
 fn render_paths(mut paths: Vec<String>) -> String {
     let total = paths.len();
@@ -662,10 +413,6 @@ fn render_paths(mut paths: Vec<String>) -> String {
         return format!("{listed}, and {} more", total - REPORTED_PATHS);
     }
     listed
-}
-
-fn display_path(path: &[u8]) -> String {
-    String::from_utf8_lossy(path).into_owned()
 }
 
 #[cfg(all(test, unix))]

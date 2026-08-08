@@ -75,6 +75,26 @@ struct InitResultPayload<'a> {
     /// object store it was admitted from costs. Measured after publication, so
     /// it describes the store the caller now has rather than a projection of it.
     store_footprint: StoreFootprint,
+    /// Source paths that were not the committed state, and are therefore not in
+    /// what was admitted. Absent when the source carried none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncommitted_worktree: Option<UncommittedWorktreePayload>,
+}
+
+/// The uncommitted delta initialization saw and did not admit.
+#[derive(Debug, Serialize)]
+struct UncommittedWorktreePayload {
+    /// Paths observed, including any past the listing cap.
+    observed_paths: usize,
+    /// Observed paths not carried in `paths`, because the walk stopped listing.
+    unlisted_paths: usize,
+    paths: Vec<UncommittedPathPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct UncommittedPathPayload {
+    path: String,
+    state: &'static str,
 }
 
 pub async fn run(path: Option<String>, json: bool) -> Result<()> {
@@ -205,9 +225,30 @@ fn print_json_result(
         initial_change_id: result.authority.initial_change_id.as_ref(),
         exact_reachable_git_history: boundary == InitBoundary::ExactGit,
         store_footprint: StoreFootprint::measure(&result.layout),
+        uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn uncommitted_worktree_payload(
+    divergence: &kin_git::GitWorkspaceDivergenceFacts,
+) -> Option<UncommittedWorktreePayload> {
+    if divergence.is_empty() {
+        return None;
+    }
+    Some(UncommittedWorktreePayload {
+        observed_paths: divergence.observed_paths(),
+        unlisted_paths: divergence.untracked_beyond_cap,
+        paths: divergence
+            .entries
+            .iter()
+            .map(|entry| UncommittedPathPayload {
+                path: entry.path.to_string(),
+                state: entry.kind.label(),
+            })
+            .collect(),
+    })
 }
 
 fn print_human_result(
@@ -262,7 +303,77 @@ fn print_human_result(
         StoreFootprint::measure(&result.layout).render()
     );
     println!("  {}", store_size_notice());
+    for line in uncommitted_worktree_disclosure(&result.workspace_divergence) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Paths listed by name before the rest are counted rather than named.
+const DISCLOSED_PATHS: usize = 10;
+
+/// What to say about a source that had been worked in before it was admitted.
+///
+/// Authority is the committed state, so none of this is in the repository this
+/// command published, and none of it was lost either: it is still in the
+/// worktree, and the daemon admits it as workspace state the same way it admits
+/// every later edit. Both halves have to be said. A list with no disposition
+/// reads as damage, and a disposition with no list is a claim the operator
+/// cannot check.
+///
+/// Returns the exact lines to print, so absence is one empty vector rather than
+/// a branch at the call site.
+fn uncommitted_worktree_disclosure(
+    divergence: &kin_git::GitWorkspaceDivergenceFacts,
+) -> Vec<String> {
+    if divergence.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  Uncommitted worktree state: {} path(s) differ from the committed state that was admitted",
+        divergence.observed_paths()
+    )];
+    for kind in [
+        kin_git::GitWorkspaceDivergenceKind::Staged,
+        kin_git::GitWorkspaceDivergenceKind::StagedRemoval,
+        kin_git::GitWorkspaceDivergenceKind::Modified,
+        kin_git::GitWorkspaceDivergenceKind::Missing,
+        kin_git::GitWorkspaceDivergenceKind::Untracked,
+    ] {
+        let paths = divergence
+            .of_kind(kind)
+            .map(|entry| entry.path.to_string())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            continue;
+        }
+        let unlisted = paths.len().saturating_sub(DISCLOSED_PATHS)
+            + if kind == kin_git::GitWorkspaceDivergenceKind::Untracked {
+                divergence.untracked_beyond_cap
+            } else {
+                0
+            };
+        let mut rendered = paths
+            .iter()
+            .take(DISCLOSED_PATHS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if unlisted > 0 {
+            rendered.push_str(&format!(", and {unlisted} more"));
+        }
+        lines.push(format!(
+            "    {} ({}): {rendered}",
+            kind.label(),
+            paths.len() + unlisted
+        ));
+    }
+    lines.push(
+        "  None of it entered repository authority, and none of it was touched. It becomes \
+         workspace state the first time the daemon runs here."
+            .to_string(),
+    );
+    lines
 }
 
 /// What to say when initialization produced no semantic entities at all.
