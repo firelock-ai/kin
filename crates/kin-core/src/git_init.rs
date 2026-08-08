@@ -1148,7 +1148,10 @@ mod tests {
 
         let error = init_from_git(&source).unwrap_err().to_string();
 
-        assert!(error.contains("MERGE_HEAD") || error.contains("Merge"), "{error}");
+        assert!(
+            error.contains("MERGE_HEAD") || error.contains("Merge"),
+            "{error}"
+        );
         assert!(error.contains("finish or abort"), "{error}");
         assert!(!source.join(".kin").exists());
         assert_no_staging_directories(root.path());

@@ -390,8 +390,9 @@ impl DivergenceLog {
     }
 
     fn finish(mut self) -> GitWorkspaceDivergenceFacts {
-        self.entries
-            .sort_by(|left, right| (left.kind.code(), &left.path).cmp(&(right.kind.code(), &right.path)));
+        self.entries.sort_by(|left, right| {
+            (left.kind.code(), &left.path).cmp(&(right.kind.code(), &right.path))
+        });
         let mut hash = FramedHash::new(b"kin.git.preflight.divergence.v1");
         hash.u64(self.entries.len() as u64);
         for entry in &self.entries {
@@ -1432,22 +1433,24 @@ fn prove_tracked_entry(
     match expected.tree_entry {
         TreeEntry::Blob { hash, executable } => {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Ok(diverged(
+                diverged(
                     state,
                     path,
                     "the worktree no longer materializes it as a regular file",
                     None,
-                ));
+                );
+                return Ok(());
             }
             if state.executable_authority == ExecutableModeAuthority::WorktreeMode
                 && filesystem_executable(metadata)? != executable
             {
-                return Ok(diverged(
+                diverged(
                     state,
                     path,
                     "its executable mode differs from the committed tree",
                     None,
-                ));
+                );
+                return Ok(());
             }
             let actual =
                 fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
@@ -1464,7 +1467,8 @@ fn prove_tracked_entry(
                              normalization explains the difference"
                             .to_string(),
                     };
-                return Ok(diverged(state, path, detail, Some(digest(&actual))));
+                diverged(state, path, detail, Some(digest(&actual)));
+                return Ok(());
             }
             state.tracked_hash.u64(1);
             state.tracked_hash.bytes(hash.as_bytes());
@@ -1474,12 +1478,13 @@ fn prove_tracked_entry(
             let target = match state.symlink_materialization {
                 SymlinkMaterialization::Link => {
                     if !metadata.file_type().is_symlink() {
-                        return Ok(diverged(
+                        diverged(
                             state,
                             path,
                             "the worktree no longer materializes it as a symbolic link",
                             None,
-                        ));
+                        );
+                        return Ok(());
                     }
                     let target = fs::read_link(absolute_path)
                         .map_err(|error| GitError::io(absolute_path, error))?;
@@ -1492,56 +1497,62 @@ fn prove_tracked_entry(
                 // filesystem fallback for a missing link.
                 SymlinkMaterialization::TargetTextFile(source) => {
                     if metadata.file_type().is_symlink() {
-                        return Ok(diverged(
+                        diverged(
                             state,
                             path,
                             match source {
-                                SymlinkCapabilitySource::RepositoryRecorded =>
+                                SymlinkCapabilitySource::RepositoryRecorded => {
                                     "it is a real symbolic link, but the repository records \
                                      core.symlinks=false, so Git writes and compares the target \
-                                     as a regular file here",
-                                SymlinkCapabilitySource::PlatformDefault =>
+                                     as a regular file here"
+                                }
+                                SymlinkCapabilitySource::PlatformDefault => {
                                     "it is a real symbolic link, but this repository records no \
                                      core.symlinks value and Git's default on this platform \
                                      writes and compares the target as a regular file. Record \
                                      core.symlinks=true if this worktree really does carry real \
-                                     links",
+                                     links"
+                                }
                             },
                             None,
-                        ));
+                        );
+                        return Ok(());
                     }
                     if !metadata.is_file() {
-                        return Ok(diverged(
+                        diverged(
                             state,
                             path,
                             "it is not the regular file holding its target, which is what Git \
                              materializes under core.symlinks=off",
                             None,
-                        ));
+                        );
+                        return Ok(());
                     }
                     fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?
                 }
             };
             let committed = state.blob_store.read(&target_blob)?;
             if target != committed {
-                return Ok(diverged(
+                diverged(
                     state,
                     path,
                     "its link target differs from the committed tree",
                     Some(digest(&target)),
-                ));
+                );
+                return Ok(());
             }
             state.tracked_hash.u64(2);
             state.tracked_hash.bytes(target_blob.as_bytes());
         }
         TreeEntry::Gitlink { target } => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Ok(diverged(
+                diverged(
                     state,
                     path,
                     "the worktree no longer materializes it as a directory",
                     None,
-                ));
+                );
+                return Ok(());
             }
             let mut entries =
                 fs::read_dir(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
@@ -1982,7 +1993,10 @@ fn printable_config_scope(scope: &str) -> String {
     section.to_string()
 }
 
-fn collect_transfer_core_keys(section: &gix::config::file::Section<'_>, refusals: &mut Vec<String>) {
+fn collect_transfer_core_keys(
+    section: &gix::config::file::Section<'_>,
+    refusals: &mut Vec<String>,
+) {
     const TRANSFER_KEYS: &[&str] = &[
         "askpass",
         "gitproxy",
@@ -3814,7 +3828,9 @@ mod tests {
         let untracked = Fixture::clean();
         fs::write(untracked.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
         assert_discloses(
-            &untracked.preflight().expect("an untracked path is observed"),
+            &untracked
+                .preflight()
+                .expect("an untracked path is observed"),
             "surprise.txt",
             GitWorkspaceDivergenceKind::Untracked,
             "",
@@ -3918,7 +3934,8 @@ mod tests {
             "committed history is untouched by uncommitted work"
         );
         assert_eq!(
-            dirty_proof.semantic_plan_fingerprint, clean_proof.semantic_plan_fingerprint
+            dirty_proof.semantic_plan_fingerprint,
+            clean_proof.semantic_plan_fingerprint
         );
         assert_eq!(
             dirty_proof.workspace_divergence.observed_paths(),
@@ -4013,7 +4030,12 @@ mod tests {
         .trim()
         .to_string();
         let commit = String::from_utf8(
-            git_stdin(&repo, &["commit-tree", &tree, "-m", "non-canonical mode"], "").stdout,
+            git_stdin(
+                &repo,
+                &["commit-tree", &tree, "-m", "non-canonical mode"],
+                "",
+            )
+            .stdout,
         )
         .expect("utf8 object id")
         .trim()

@@ -183,7 +183,8 @@ fn a_worked_in_git_repository_initializes_and_discloses_the_delta() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("init stdout should be JSON");
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).expect("init stdout should be JSON");
     let disclosed = &payload["uncommitted_worktree"];
     assert_eq!(disclosed["observed_paths"], 3, "{payload}");
     assert_eq!(disclosed["unlisted_paths"], 0, "{payload}");
