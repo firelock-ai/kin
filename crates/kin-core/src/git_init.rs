@@ -1002,6 +1002,62 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
+    /// Source blockers are reported before any derivation phase runs.
+    ///
+    /// The fixture is shallow as well as dirty. Capture is the phase after the
+    /// blocker check and refuses a shallow source with its own message, so
+    /// whichever message comes back names the phase that ran first. A timing
+    /// assertion would claim the same thing and pass on a slow machine for the
+    /// wrong reason.
+    #[test]
+    fn source_blockers_are_reported_before_any_history_is_derived() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        let head = git_stdout(&source, ["rev-parse", "HEAD"]);
+        std::fs::write(source.join(".git/shallow"), format!("{head}\n")).unwrap();
+        std::fs::write(source.join("init.log"), b"log\n").unwrap();
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        assert!(error.contains("init.log"), "{error}");
+        assert!(
+            !error.contains("shallow"),
+            "capture must not have run yet: {error}"
+        );
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    /// One refusal carries every blocker, each with the way out.
+    #[test]
+    fn every_source_blocker_reaches_the_operator_together() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
+        std::fs::write(source.join("init.log"), b"log\n").unwrap();
+        std::fs::write(source.join("staged.txt"), b"staged\n").unwrap();
+        git(&source, ["add", "staged.txt"]);
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        assert!(error.contains("init.log"), "{error}");
+        assert!(error.contains("staged.txt"), "{error}");
+        assert!(error.contains("remote.origin.tagOpt"), "{error}");
+        assert!(error.contains(".gitignore"), "{error}");
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
     #[test]
     fn unsafe_remote_configuration_fails_before_staging_without_disclosure() {
         let root = tempfile::tempdir().unwrap();
