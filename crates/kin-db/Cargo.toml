@@ -34,9 +34,9 @@ gcs = ["object_store/gcp", "tokio", "bytes"]
 sql = ["rusqlite"]
 
 [dependencies]
-kin-model = { version = "=0.7.7", registry = "kin" }
+kin-model = { version = "=0.7.8", registry = "kin" }
 kin-infer = { version = "0.2.44", registry = "kin", optional = true }
-kin-vector = { version = "=0.1.9", registry = "kin", optional = true }
+kin-vector = { version = "=0.1.11", registry = "kin", optional = true }
 kin-search = { version = "0.1.5", registry = "kin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -86,5 +86,5 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 async-trait = "0.1"
 futures-util = "0.3"
-kin-vector = { version = "=0.1.9", registry = "kin" }
+kin-vector = { version = "=0.1.11", registry = "kin" }
 rand = "0.10"
