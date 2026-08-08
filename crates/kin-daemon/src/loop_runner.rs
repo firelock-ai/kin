@@ -903,6 +903,8 @@ impl RetryLane {
         self.queued.iter().any(|queued| queued == path)
     }
 
+    /// Whether any retry is still owed. A ladder left behind for a path that has
+    /// already been handed back to the loop is bookkeeping, not outstanding work.
     fn is_empty(&self) -> bool {
         self.queued.is_empty()
     }
@@ -1139,8 +1141,18 @@ pub async fn run_loop(
         // observation of this repository's source projection. Waking the tick
         // on such an event would still run a complete working-copy admission
         // and sweep unobserved host content into repository authority, so it
-        // is dropped before it can schedule any work.
-        incoming_events.retain(|event| !event_is_beneath_graph_only_member(&state, event));
+        // is dropped before it can schedule any work. Dropping it also ends any
+        // ladder the path had, because a path that carries no observation of this
+        // repository can never be retried and would otherwise leave an entry
+        // behind that nothing clears.
+        incoming_events.retain(|event| {
+            if !event_is_beneath_graph_only_member(&state, event) {
+                return true;
+            }
+            let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+            retry_lane.forget(path);
+            false
+        });
         // A path already waiting out a ladder step is not looked at again until
         // that step elapses, whichever queue its next notification arrived on.
         // The retry is already owed and re-reads whatever the file then holds, so
