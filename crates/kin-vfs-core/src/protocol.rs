@@ -19,11 +19,16 @@ use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump when making breaking wire-format changes.
 ///
+/// v4: stat answers are stamped with the repository-authority generation that
+/// produced them. [`VfsResponse::Stat`] and [`VfsResponse::Error`] both carry a
+/// `generation`, so a client can key an attribute cache on graph truth rather
+/// than on a clock, and can key a negative answer as well as a positive one.
+///
 /// v3: byte-exact path authority — request paths and directory-entry names
 /// are raw validated bytes (no `String` path identity), invalidations carry
 /// canonical path bytes, and `ErrorCode::UnsupportedBoundary` reports gitlink
 /// repository boundaries.
-pub const VFS_PROTOCOL_VERSION: u32 = 3;
+pub const VFS_PROTOCOL_VERSION: u32 = 4;
 
 /// Request from VFS shim to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,8 +96,14 @@ pub enum VfsRequest {
 /// Response from daemon to VFS shim.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum VfsResponse {
-    /// Metadata.
-    Stat(VirtualStat),
+    /// Metadata, stamped with the generation of the snapshot that produced it.
+    ///
+    /// `generation` is the monotonic repository-authority generation the
+    /// responder held when it resolved this path, or `0` when the responder has
+    /// no authority generation to report. A client may remember this answer
+    /// only while that exact generation is still current; `0` is never
+    /// rememberable.
+    Stat { stat: VirtualStat, generation: u64 },
 
     /// Directory listing with byte-exact entry names.
     DirEntries(Vec<DirEntry>),
@@ -109,8 +120,17 @@ pub enum VfsResponse {
     /// Pong.
     Pong,
 
-    /// Error.
-    Error { code: ErrorCode, message: String },
+    /// Error, stamped like [`VfsResponse::Stat`].
+    ///
+    /// A definitive `NotFound` is an answer about graph truth, so it carries a
+    /// generation for the same reason a positive answer does: a client that
+    /// cannot key an absence cannot remember one, and absence is the hot
+    /// result for tools that probe.
+    Error {
+        code: ErrorCode,
+        message: String,
+        generation: u64,
+    },
 
     /// Push invalidation from daemon to shim, carrying canonical path bytes.
     /// An empty list means "everything may have changed".

@@ -21,6 +21,24 @@ pub trait ContentProvider: Send + Sync {
     /// Get metadata for a path (file or directory).
     fn stat(&self, path: &VfsPath) -> VfsResult<VirtualStat>;
 
+    /// Get metadata together with the version that produced it.
+    ///
+    /// A client that remembers an answer must know which snapshot answered, and
+    /// the two facts have to come from the same one. Reading [`Self::version`]
+    /// *after* [`Self::stat`] would stamp an answer from the old snapshot with
+    /// the new version whenever an install lands between the calls, and a
+    /// client would then hold a stale attribute under a current stamp with
+    /// nothing left to expire it.
+    ///
+    /// This default reads the version first, which cannot make that mistake: an
+    /// under-stated stamp only costs a client its cache entry. A provider whose
+    /// answer and version share a snapshot should override this and return both
+    /// from it, which is exact rather than merely safe.
+    fn stat_at(&self, path: &VfsPath) -> (u64, VfsResult<VirtualStat>) {
+        let version = self.version();
+        (version, self.stat(path))
+    }
+
     /// List entries in a directory.
     fn read_dir(&self, path: &VfsPath) -> VfsResult<Vec<DirEntry>>;
 
