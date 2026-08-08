@@ -15,6 +15,7 @@ use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
+    check_git_admission_blockers,
     plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
     seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
     GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
@@ -193,6 +194,19 @@ fn init_from_git_with_hooks(
     let source = canonical_new_repository_root(working_dir)?;
     require_git_boundary(&source)?;
 
+    let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);
+
+    // Ahead of every derivation phase on purpose. Each blocker below is source
+    // state the proof would refuse anyway, and deriving a whole semantic
+    // history first only means the operator waits minutes to be told that a
+    // file they could see is untracked.
+    progress.begin("check admission blockers");
+    {
+        let _span = info_span!("kin.init.check_admission_blockers").entered();
+        check_git_admission_blockers(&source)
+            .map_err(|error| git_boundary_error("admit this Git repository", error))?;
+    }
+
     let manifest = KinManifest::new();
     let repository_id = RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
@@ -217,8 +231,6 @@ fn init_from_git_with_hooks(
     // published `.kin` behind to reference them.
     let capture_store = BlobStore::new_ephemeral(capture_dir.path().join("objects"))
         .map_err(|error| git_boundary_error("create capture CAS", error))?;
-
-    let mut progress = PhaseProgress::new(GIT_ADMISSION_PHASES);
 
     progress.begin("capture Git repository");
     let snapshot = {

@@ -21,6 +21,7 @@ fn kin_process_group_guardian_worker() {
     assert_eq!(dispatched, requested);
 }
 
+pub mod admission_blockers;
 pub mod admission_history;
 pub mod authority;
 pub mod error;
@@ -35,11 +36,15 @@ pub mod semantic_import;
 #[doc(hidden)]
 pub mod test_support;
 
+pub use admission_blockers::{
+    check_git_admission_blockers, collect_git_admission_blockers, GitAdmissionReport,
+};
 pub use admission_history::{admit_semantic_git_import, AdmittedSemanticGitImportPlan};
 pub use authority::build_git_external_authority;
 pub use error::{
-    GitCheckoutFilterFact, GitError, LocalGitHookExecutability, LocalGitHookFact, LocalGitHookKind,
-    RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result, UnsealedContentGap,
+    GitAdmissionBlocker, GitCheckoutFilterFact, GitError, LocalGitHookExecutability,
+    LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact, RegisteredGitWorktreeKind,
+    Result, UnsealedContentGap,
 };
 pub use global_config::empty_global_git_config;
 pub use lossless::{

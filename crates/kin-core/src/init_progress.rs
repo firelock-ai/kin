@@ -21,7 +21,7 @@ use std::time::Instant;
 /// Number of phases in the exact Git admission ladder. A ladder that completes
 /// on a different count than this is a drift bug that would print `[16/15]` to
 /// a user, so [`PhaseProgress::finish`] asserts the two agree.
-pub(crate) const GIT_ADMISSION_PHASES: usize = 16;
+pub(crate) const GIT_ADMISSION_PHASES: usize = 17;
 
 /// Erase the current line and return to column zero. Only ever written to a
 /// terminal, so a redirected log never receives escape bytes.
