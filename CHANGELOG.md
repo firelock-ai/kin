@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-08-08
+
+### Changed
+
+- Derive Git artifact identity from content alone (#698)
+- Tell a slow daemon apart from a dead one in the MCP client (#699)
+- Share one repository authority across the kin-cli-backed source tools (#701)
+- Disclose the projection rebuild and stop a wedged LSP worker (#702)
+- Report authority loads where a user can read them (#703)
+- Give the reconcile retry queue a per-path backoff so an unstable file cannot spin a core (#710)
+
+
 ## [0.5.8] - 2026-08-07
 
 ### Changed
