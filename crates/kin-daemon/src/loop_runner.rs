@@ -794,7 +794,7 @@ fn clear_incompatible_facets(
 /// quietly. A rule broad enough to cover a source tree has to be visible in the
 /// log the moment it takes effect rather than discovered later as a gap in
 /// query results.
-pub(crate) const ANNOUNCED_RETRACTION_SAMPLE: usize = 20;
+const ANNOUNCED_RETRACTION_SAMPLE: usize = 20;
 
 fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
     if retracted.is_empty() {
@@ -828,8 +828,7 @@ fn announce_retraction(retracted: &kin_index::IgnoredTrackedPaths) {
 pub(crate) fn evict_enrichment_for_removed_paths(
     state: &DaemonState,
     deltas: &[TreeDelta],
-) -> Result<Vec<EntityId>> {
-    let mut removed_entities = Vec::new();
+) -> Result<()> {
     for delta in deltas {
         let TreeDelta::Removed { old, .. } = delta else {
             continue;
@@ -845,10 +844,9 @@ pub(crate) fn evict_enrichment_for_removed_paths(
                 file_path: Some(file_id.0.clone()),
                 session_id: None,
             });
-            removed_entities.push(id);
         }
     }
-    Ok(removed_entities)
+    Ok(())
 }
 
 /// Clear UTF-8-only enrichment for an artifact the exact-tree transaction has
