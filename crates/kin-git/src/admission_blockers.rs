@@ -91,10 +91,12 @@ pub fn collect_git_admission_blockers(repo_path: &Path) -> Result<GitAdmissionRe
     let mut report = GitAdmissionReport::default();
     match reject_in_progress_operations(&repo) {
         Ok(()) => {}
-        Err(GitError::MigrationPreflight(reason)) => report.blockers.push(GitAdmissionBlocker::new(
-            reason,
-            "finish or abort the Git operation, then run kin init again",
-        )),
+        Err(GitError::MigrationPreflight(reason)) => {
+            report.blockers.push(GitAdmissionBlocker::new(
+                reason,
+                "finish or abort the Git operation, then run kin init again",
+            ))
+        }
         Err(error) => return Err(error),
     }
 
@@ -344,11 +346,7 @@ fn hooks_path_scope(snapshot: &gix::config::Snapshot<'_>) -> (bool, &'static str
 /// installed hook directory rather than anything the repository carries.
 /// Counting them makes Kin refuse a repository over its own leftovers, and it
 /// is exactly the repositories Kin has already touched that hit it.
-fn is_legacy_kin_hook_link(
-    hooks_dir: &Path,
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<bool> {
+fn is_legacy_kin_hook_link(hooks_dir: &Path, path: &Path, metadata: &fs::Metadata) -> Result<bool> {
     if !metadata.file_type().is_symlink() {
         return Ok(false);
     }
@@ -600,7 +598,6 @@ fn display_path(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
 }
 
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -817,7 +814,10 @@ mod tests {
         }
 
         let refusal = fixture.refusal();
-        assert!(refusal.contains("12 untracked non-ignored path(s)"), "{refusal}");
+        assert!(
+            refusal.contains("12 untracked non-ignored path(s)"),
+            "{refusal}"
+        );
         assert!(refusal.contains("untracked-00.log"), "{refusal}");
         assert!(refusal.contains("untracked-09.log"), "{refusal}");
         assert!(refusal.contains("and 2 more"), "{refusal}");
@@ -837,7 +837,10 @@ mod tests {
         fs::write(fixture.repo.join("build/output.bin"), b"artifact\n").expect("artifact");
 
         let report = fixture.report();
-        assert!(report.is_clear(), "ignored content is admissible: {report:?}");
+        assert!(
+            report.is_clear(),
+            "ignored content is admissible: {report:?}"
+        );
     }
 
     #[test]

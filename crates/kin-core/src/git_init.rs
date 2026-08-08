@@ -15,11 +15,10 @@ use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    check_git_admission_blockers,
-    plan_semantic_git_import, preflight_git_migration, preflight_git_migration_after_publication,
-    seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
-    GitMigrationPreflightProof, LosslessGitRepository, SealedContentObservation,
-    SealedContentSource,
+    check_git_admission_blockers, plan_semantic_git_import, preflight_git_migration,
+    preflight_git_migration_after_publication, seal_all_content_observation_observed,
+    AdmittedContentClosure, GitLocalIgnoreSourceKind, GitMigrationPreflightProof,
+    LosslessGitRepository, SealedContentObservation, SealedContentSource,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
