@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-08-08
+
+### Changed
+
+- State the proof page's actual promise and de-em-dash two installer messages (#705)
+- Rewrite the em dashes out of six public docs and complete the ecosystem manifest (#706)
+
+
 ## [0.5.9] - 2026-08-08
 
 ### Changed
