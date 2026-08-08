@@ -84,12 +84,20 @@ struct InitResultPayload<'a> {
 /// The uncommitted delta initialization saw and did not admit.
 #[derive(Debug, Serialize)]
 struct UncommittedWorktreePayload {
-    /// Paths observed, including any past the listing cap.
+    /// Paths observed, including every one this payload does not carry.
     observed_paths: usize,
-    /// Observed paths not carried in `paths`, because the walk stopped listing.
+    /// Observed paths not carried in `paths`.
     unlisted_paths: usize,
     paths: Vec<UncommittedPathPayload>,
 }
+
+/// Paths one machine-readable result carries by name.
+///
+/// Nothing bounds how many paths can differ: a repository whose checkout Git
+/// rewrote reports every text file it holds. A count of those is useful on a
+/// piped stdout and tens of thousands of path strings are not, so the payload
+/// carries a sample and says exactly how many it left out.
+const SERIALIZED_PATHS: usize = 200;
 
 #[derive(Debug, Serialize)]
 struct UncommittedPathPayload {
@@ -237,17 +245,19 @@ fn uncommitted_worktree_payload(
     if divergence.is_empty() {
         return None;
     }
+    let paths = divergence
+        .entries
+        .iter()
+        .take(SERIALIZED_PATHS)
+        .map(|entry| UncommittedPathPayload {
+            path: entry.path.to_string(),
+            state: entry.kind.label(),
+        })
+        .collect::<Vec<_>>();
     Some(UncommittedWorktreePayload {
         observed_paths: divergence.observed_paths(),
-        unlisted_paths: divergence.untracked_beyond_cap,
-        paths: divergence
-            .entries
-            .iter()
-            .map(|entry| UncommittedPathPayload {
-                path: entry.path.to_string(),
-                state: entry.kind.label(),
-            })
-            .collect(),
+        unlisted_paths: divergence.observed_paths() - paths.len(),
+        paths,
     })
 }
 
@@ -580,6 +590,41 @@ mod tests {
         assert!(lines.contains("untracked-09.log"), "{lines}");
         assert!(!lines.contains("untracked-10.log"), "{lines}");
         assert!(lines.contains("and 9 more"), "{lines}");
+    }
+
+    /// The machine-readable payload carries a sample and counts the rest.
+    ///
+    /// A repository whose checkout Git rewrote reports every text file it
+    /// holds, so an unbounded array here is tens of thousands of path strings
+    /// on a piped stdout. The count stays exact either way, and the two
+    /// numbers must always add up to it.
+    #[test]
+    fn the_uncommitted_payload_bounds_its_path_list_without_losing_the_count() {
+        let entries = (0..SERIALIZED_PATHS + 40)
+            .map(|index| {
+                (
+                    format!("src/file-{index:04}.rs"),
+                    kin_git::GitWorkspaceDivergenceKind::Modified,
+                )
+            })
+            .collect::<Vec<_>>();
+        let payload = uncommitted_worktree_payload(&divergence(
+            entries
+                .iter()
+                .map(|(path, kind)| (path.as_str(), *kind))
+                .collect(),
+            13,
+        ))
+        .expect("a divergent source carries a payload");
+
+        assert_eq!(payload.observed_paths, SERIALIZED_PATHS + 53);
+        assert_eq!(payload.paths.len(), SERIALIZED_PATHS);
+        assert_eq!(payload.unlisted_paths, 53);
+        assert_eq!(
+            payload.paths.len() + payload.unlisted_paths,
+            payload.observed_paths,
+            "what is listed plus what is not must be what was observed"
+        );
     }
 
     /// The falsification: a source that matched prints nothing, or the
