@@ -122,8 +122,6 @@ fn test_query_vector_not_nan() {
 
 #[test]
 fn test_stored_vectors_not_nan() {
-    use kin_vector::HnswSnapshot;
-
     let kndb = vue_graph_path();
     if !kndb.exists() {
         eprintln!("SKIP: Vue graph not present at {}", kndb.display());
@@ -135,21 +133,22 @@ fn test_stored_vectors_not_nan() {
         return;
     }
 
-    // Load the raw HNSW snapshot directly from disk. kin-vector has no public
-    // iterator over stored nodes, but HnswSnapshot is `pub` so we can
-    // deserialize it ourselves to inspect stored vectors.
-    let bytes = std::fs::read(&kvec).expect("read kvec");
-    let snapshot: HnswSnapshot<RetrievalKey> =
-        rmp_serde::from_slice(&bytes).expect("deserialize HnswSnapshot");
+    // Read the sidecar through kin-vector's own loader rather than decoding the
+    // container here. Hand-decoding couples this test to one serialization, so
+    // it breaks on every format revision even though what it asserts — stored
+    // vectors are finite and non-zero — has nothing to do with encoding.
+    // `keys()` + `get()` is the public iterator over stored vectors, and it
+    // reports live entries only, where indexing `nodes` by internal index also
+    // walks slots that removal has freed.
+    let index = kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(&kvec)
+        .expect("load Vue kvec sidecar");
 
-    let total_nodes = snapshot.graph.nodes.len();
-    let active_ids = snapshot.graph.idx_to_id.len();
-    println!(
-        "stored index: format_version={}, dims={}, nodes={}, ids={}",
-        snapshot.format_version, snapshot.graph.dimensions, total_nodes, active_ids
-    );
+    let mut keys = index.keys();
+    keys.sort_unstable();
+    let total_nodes = keys.len();
+    println!("stored index: live vectors={total_nodes}");
 
-    assert!(total_nodes > 0, "Vue's HNSW index has zero stored nodes");
+    assert!(total_nodes > 0, "Vue's HNSW index has zero stored vectors");
 
     // Sample broadly: first 5, evenly spaced 10, last 5. More coverage
     // exposes cases where only part of the index is corrupted.
@@ -168,10 +167,10 @@ fn test_stored_vectors_not_nan() {
     let mut zero_norm_nodes = 0usize;
 
     for idx in &sample_idxs {
-        let node = &snapshot.graph.nodes[*idx];
-        let v = &node.vector;
-        let nan_count = count_nan(v);
-        let n = norm(v);
+        let key = keys[*idx];
+        let v = index.get(&key).expect("a live key must have a vector");
+        let nan_count = count_nan(&v);
+        let n = norm(&v);
         let first_vals: Vec<f32> = v.iter().take(5).copied().collect();
         println!(
             "node[{idx}]: dims={}, norm={:.6}, nan_count={}, first5={:?}",
