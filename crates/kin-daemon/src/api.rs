@@ -18139,7 +18139,10 @@ mod tests {
         // The rule lands after the admission, which is the whole scenario: a
         // repository that already carries a path is told to stop carrying it.
         for (path, content) in [
-            ("investor/deck/build_deck.py", &b"def valuation(): pass\n"[..]),
+            (
+                "investor/deck/build_deck.py",
+                &b"def valuation(): pass\n"[..],
+            ),
             ("src/lib.py", &b"def kept(): pass\n"[..]),
             (".kinignore", &b"investor\n"[..]),
         ] {

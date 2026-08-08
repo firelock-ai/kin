@@ -69,9 +69,9 @@ pub use repository::{
     host_path_from_repo_path, is_repository_control_path, read_verified_scanned_entry,
     repo_path_from_host_relative, scan_repository, scan_repository_preserving_graph_only,
     should_track_host_relative_path, tracked_paths_covered_by_ignore,
-    tracked_paths_retracted_by_ignore, CompleteRepositoryScan,
-    CompleteScanToken, IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore,
-    RepositoryScanDiagnostics, ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES,
+    tracked_paths_retracted_by_ignore, CompleteRepositoryScan, CompleteScanToken,
+    IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore, RepositoryScanDiagnostics,
+    ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES,
 };
 pub use support::{compute_coverage_report, CoverageReport};
 pub use watcher::{FileEvent, FileWatcher};
