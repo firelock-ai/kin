@@ -332,6 +332,172 @@ unsafe fn cosine_distance_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Distance with the norms lifted out
+// ---------------------------------------------------------------------------
+//
+// The fused kernels above run three accumulator chains over one pass: `dot`,
+// `norm_a`, and `norm_b`. A search evaluates that against every visited node, so
+// it recomputes the query's norm once per candidate and each node's norm once
+// per query — three multiply-adds per element where one would do.
+//
+// The chains are independent: no chain reads another's accumulator, and each
+// visits the elements in the same fixed order. Lifting one chain into its own
+// loop therefore reproduces its operation sequence exactly and leaves the others
+// untouched, so a distance assembled from separately-computed parts is
+// bit-identical to the fused one rather than merely close. That is what makes
+// memoizing a norm safe here: nothing is approximated and no vector is assumed
+// to be unit-length. kin-vector accepts any finite vector through `upsert` and
+// stores it verbatim, so the norms are measured, never assumed.
+
+/// Squared L2 norm — the plain sum of squares, NOT its square root — computed
+/// with the same kernel dispatch and reduction order the matching
+/// [`cosine_distance`] kernel uses for its `norm_a` / `norm_b` accumulators.
+///
+/// This is the value [`cosine_distance_with_sq_norms`] expects. Because the
+/// kernel choice is a process-global gate, a norm computed here always matches
+/// the kernel that will consume it; a norm carried between processes would not,
+/// which is why nothing persists these.
+#[inline]
+pub fn squared_norm(v: &[f32]) -> f32 {
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        if simd_enabled() {
+            // SAFETY: as in `cosine_distance` — NEON is part of the mandatory
+            // aarch64 baseline, so no runtime CPU probe is needed.
+            return unsafe { squared_norm_neon(v) };
+        }
+    }
+    squared_norm_scalar(v)
+}
+
+/// Sequential sum of squares — the exact reduction
+/// [`cosine_distance_scalar`] applies to build `norm_a` / `norm_b`.
+#[inline]
+fn squared_norm_scalar(v: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for &x in v {
+        acc += x * x;
+    }
+    acc
+}
+
+/// Four-lane sum of squares — the exact reduction [`cosine_distance_neon`]
+/// applies to build `na` / `nb`: the same lane layout, the same single
+/// `vaddvq_f32` fold, the same sequential `len % 4` tail, and the same
+/// deliberate mul-then-add.
+///
+/// SAFETY: NEON is guaranteed on aarch64; callers invoke this only under
+/// `cfg(target_arch = "aarch64")`.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn squared_norm_neon(v: &[f32]) -> f32 {
+    use core::arch::aarch64::*;
+
+    let n = v.len();
+    let mut acc = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    let simd_end = n - (n % 4);
+    while i < simd_end {
+        let x = vld1q_f32(v.as_ptr().add(i));
+        acc = vaddq_f32(acc, vmulq_f32(x, x));
+        i += 4;
+    }
+
+    let mut acc_s = vaddvq_f32(acc);
+
+    while i < n {
+        let x = *v.get_unchecked(i);
+        acc_s += x * x;
+        i += 1;
+    }
+
+    acc_s
+}
+
+/// Cosine distance from vectors whose squared norms are already known.
+///
+/// `sq_norm_a` and `sq_norm_b` must be [`squared_norm`] of `a` and `b`. Given
+/// that, this returns the same bits as `cosine_distance(a, b)` for every input:
+/// the dot product is accumulated by the same kernel in the same order, and the
+/// denominator, the degenerate-norm short-circuit, and the final expression are
+/// unchanged.
+#[inline]
+pub fn cosine_distance_with_sq_norms(a: &[f32], sq_norm_a: f32, b: &[f32], sq_norm_b: f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 1.0;
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        if simd_enabled() {
+            // SAFETY: as in `cosine_distance` — NEON is part of the mandatory
+            // aarch64 baseline, so no runtime CPU probe is needed.
+            let dot = unsafe { dot_neon(a, b) };
+            return cosine_from_parts(dot, sq_norm_a, sq_norm_b);
+        }
+    }
+    cosine_from_parts(dot_scalar(a, b), sq_norm_a, sq_norm_b)
+}
+
+/// The tail both cosine kernels share once `dot` and the two squared norms
+/// exist: `1 - dot / sqrt(na * nb)`, with the degenerate-denominator guard that
+/// keeps a zero-norm input from producing NaN.
+#[inline]
+fn cosine_from_parts(dot: f32, sq_norm_a: f32, sq_norm_b: f32) -> f32 {
+    let denom = (sq_norm_a * sq_norm_b).sqrt();
+    if denom < f32::EPSILON {
+        return 1.0;
+    }
+    1.0 - dot / denom
+}
+
+/// Sequential dot product — the exact reduction [`cosine_distance_scalar`]
+/// applies to build `dot`.
+#[inline]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
+/// Four-lane dot product — the exact reduction [`cosine_distance_neon`] applies
+/// to build `dot`, down to the fold and the sequential tail.
+///
+/// SAFETY: NEON is guaranteed on aarch64; callers invoke this only under
+/// `cfg(target_arch = "aarch64")`.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::aarch64::*;
+
+    let n = a.len();
+    let mut dot = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    let simd_end = n - (n % 4);
+    while i < simd_end {
+        let va = vld1q_f32(a.as_ptr().add(i));
+        let vb = vld1q_f32(b.as_ptr().add(i));
+        dot = vaddq_f32(dot, vmulq_f32(va, vb));
+        i += 4;
+    }
+
+    let mut dot_s = vaddvq_f32(dot);
+
+    while i < n {
+        let x = *a.get_unchecked(i);
+        let y = *b.get_unchecked(i);
+        dot_s += x * y;
+        i += 1;
+    }
+
+    dot_s
+}
+
+// ---------------------------------------------------------------------------
 // Index self-description (model identity + graph provenance)
 // ---------------------------------------------------------------------------
 
@@ -481,6 +647,22 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     /// canonical key order so final topology is independent of ingestion order.
     #[serde(skip)]
     pub canonical_order_dirty: bool,
+    /// [`squared_norm`] of each node's vector, parallel to `nodes`. A search
+    /// evaluates a node's norm once per query without it; with it, once per
+    /// load.
+    ///
+    /// Rebuilt on load beside `backlinks` and deliberately not serialized: the
+    /// value depends on which distance kernel this process resolved (the `simd`
+    /// feature and the `KIN_VECTOR_SIMD` gate), so a persisted norm could reach
+    /// a process running the other kernel and break the bit-identity the memo
+    /// rests on.
+    ///
+    /// Read only when it is exactly as long as `nodes`, and grown only in step
+    /// with `nodes` — a graph assembled by writing `nodes` directly leaves it
+    /// empty, and the distance path falls back to the fused kernel, which is
+    /// slower and never different.
+    #[serde(skip)]
+    pub sq_norms: Vec<f32>,
 }
 
 /// Read-only result of planning a node's insertion against a fixed graph state.
@@ -509,6 +691,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             descriptor: IndexDescriptor::default(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
+            sq_norms: Vec::new(),
         }
     }
 
@@ -517,7 +700,7 @@ impl<Id: VectorId> HnswGraph<Id> {
     }
 
     /// A persistence snapshot of the graph: the serialized fields copied, with the
-    /// rebuilt-on-load reverse index dropped and the canonical-order flag cleared.
+    /// rebuilt-on-load derived tables dropped and the canonical-order flag cleared.
     /// Taken under the graph lock so the heavy serialize + fsync can run after the
     /// lock is released, without blocking concurrent upserts.
     fn clone_for_persist(&self) -> HnswGraph<Id> {
@@ -533,6 +716,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             descriptor: self.descriptor.clone(),
             backlinks: Vec::new(),
             canonical_order_dirty: false,
+            sq_norms: Vec::new(),
         }
     }
 
@@ -566,7 +750,10 @@ impl<Id: VectorId> HnswGraph<Id> {
             return Vec::new();
         }
 
-        let entry_dist = cosine_distance(query, &self.nodes[entry].vector);
+        // The query's own norm is the same for every node this traversal visits,
+        // so it is measured once here instead of once per candidate.
+        let query_sq_norm = squared_norm(query);
+        let entry_dist = self.distance_to_node(query, query_sq_norm, entry);
 
         // Heap entries are ordered by (distance, key_hash, idx). The key_hash —
         // a process-independent hash of the node's key — breaks distance ties so
@@ -610,7 +797,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                 if layer >= self.nodes[nb].connections.len() {
                     continue;
                 }
-                let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
+                let nb_dist = self.distance_to_node(query, query_sq_norm, nb);
                 let worst_dist = result
                     .peek()
                     .map(|(OrderedF32(d), _, _)| *d)
@@ -652,6 +839,13 @@ impl<Id: VectorId> HnswGraph<Id> {
             target_level = target_level
         )
         .entered();
+        // Both norms this descent needs are loop-invariant: the query's, and the
+        // current node's, which only changes when the descent moves. Distance is
+        // a pure function of the two vectors, so carrying `d_cur` forward and
+        // refreshing it exactly when `current` moves gives the same comparisons
+        // the per-neighbor recomputation gave.
+        let query_sq_norm = squared_norm(query);
+        let mut d_cur = self.distance_to_node(query, query_sq_norm, current);
         let mut level = top_level;
         while level > target_level {
             let mut changed = true;
@@ -666,10 +860,10 @@ impl<Id: VectorId> HnswGraph<Id> {
                         if level >= self.nodes[nb].connections.len() {
                             continue;
                         }
-                        let d_nb = cosine_distance(query, &self.nodes[nb].vector);
-                        let d_cur = cosine_distance(query, &self.nodes[current].vector);
+                        let d_nb = self.distance_to_node(query, query_sq_norm, nb);
                         if d_nb < d_cur {
                             current = nb;
+                            d_cur = d_nb;
                             changed = true;
                         }
                     }
@@ -784,6 +978,61 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
     }
 
+    /// Recompute the whole `sq_norms` table from `nodes`.
+    fn rebuild_sq_norms(&mut self) {
+        self.sq_norms.clear();
+        self.sq_norms.reserve(self.nodes.len());
+        self.sq_norms
+            .extend(self.nodes.iter().map(|node| squared_norm(&node.vector)));
+    }
+
+    /// Record the norm of a node just appended to `nodes`.
+    ///
+    /// Appends only when the table was tracking `nodes` up to that push.
+    /// Otherwise it rebuilds, because extending a table that had fallen behind
+    /// would make its LENGTH match while the entries it never saw stayed unset —
+    /// a memo that reads as ready and answers with the wrong norm. The table is
+    /// either wholly correct or visibly absent; there is no in-between state a
+    /// search can consume.
+    fn push_sq_norm(&mut self, value: f32) {
+        if self.sq_norms.len() + 1 == self.nodes.len() {
+            self.sq_norms.push(value);
+        } else {
+            self.rebuild_sq_norms();
+        }
+    }
+
+    /// Record the norm of a node written into an existing slot, with the same
+    /// all-or-nothing rule as [`HnswGraph::push_sq_norm`].
+    fn replace_sq_norm(&mut self, idx: usize, value: f32) {
+        if self.sq_norms.len() == self.nodes.len() {
+            self.sq_norms[idx] = value;
+        } else {
+            self.rebuild_sq_norms();
+        }
+    }
+
+    /// Cosine distance from `query` — whose squared norm the caller has already
+    /// computed once for the whole traversal — to the node at `idx`.
+    ///
+    /// Takes the memoized node norm when the table is tracking `nodes`, and
+    /// falls back to the fused kernel when it is not. Both arms return the same
+    /// bits; the memo changes only how much arithmetic runs to produce them.
+    #[inline]
+    fn distance_to_node(&self, query: &[f32], query_sq_norm: f32, idx: usize) -> f32 {
+        let vector = &self.nodes[idx].vector;
+        if self.sq_norms.len() != self.nodes.len() {
+            return cosine_distance(query, vector);
+        }
+        let node_sq_norm = self.sq_norms[idx];
+        debug_assert_eq!(
+            node_sq_norm.to_bits(),
+            squared_norm(vector).to_bits(),
+            "memoized squared norm for node {idx} does not match its vector"
+        );
+        cosine_distance_with_sq_norms(query, query_sq_norm, vector, node_sq_norm)
+    }
+
     /// Sort `(distance, idx)` pairs ascending by distance, breaking ties by the
     /// node's stable key hash rather than by internal index. NaN distances sort
     /// last (via `total_cmp`). Key-based tie-breaks keep neighbor pruning
@@ -879,6 +1128,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         level: usize,
         plan: InsertionPlan,
     ) {
+        let node_sq_norm = squared_norm(vector);
         let node = HnswNode {
             vector: vector.to_vec(),
             connections: vec![Vec::new(); level + 1],
@@ -888,6 +1138,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         // Allocate or reuse an internal index.
         let idx = if let Some(free_idx) = self.free_list.pop() {
             self.nodes[free_idx] = node;
+            self.replace_sq_norm(free_idx, node_sq_norm);
             self.idx_to_id[free_idx] = entity_id;
             if self.backlinks.len() <= free_idx {
                 self.backlinks.resize_with(free_idx + 1, Vec::new);
@@ -897,6 +1148,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         } else {
             let idx = self.nodes.len();
             self.nodes.push(node);
+            self.push_sq_norm(node_sq_norm);
             self.idx_to_id.push(entity_id);
             self.backlinks.push(Vec::new());
             idx
@@ -932,10 +1184,11 @@ impl<Id: VectorId> HnswGraph<Id> {
                     // Prune: keep only the closest nb_m_max neighbors.
                     // Clone data to satisfy the borrow checker.
                     let nb_vec = self.nodes[nb].vector.clone();
+                    let nb_sq_norm = squared_norm(&nb_vec);
                     let conns = self.nodes[nb].connections[lc].clone();
                     let mut scored: Vec<(f32, usize)> = conns
                         .iter()
-                        .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
+                        .map(|&n| (self.distance_to_node(&nb_vec, nb_sq_norm, n), n))
                         .collect();
                     self.sort_scored_neighbors(&mut scored);
                     let pruned = scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
@@ -1035,6 +1288,9 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.nodes[idx].connections.clear();
         self.nodes[idx].vector.clear();
         self.nodes[idx].level = 0;
+        // An empty vector's squared norm is 0.0, which is what `squared_norm`
+        // returns for it — the memo stays exactly what a recompute would give.
+        self.replace_sq_norm(idx, 0.0);
         if idx < self.backlinks.len() {
             self.backlinks[idx].clear();
         }
@@ -1457,6 +1713,7 @@ fn try_load_snapshot<Id: VectorId>(bytes: &[u8]) -> Result<HnswGraph<Id>, Vector
     }
     let mut graph = snapshot.graph;
     graph.rebuild_backlinks();
+    graph.rebuild_sq_norms();
     Ok(graph)
 }
 
@@ -3355,6 +3612,328 @@ mod tests {
         eprintln!(
             "[simd-rank] max scalar-distance inversion under NEON order: {max_inversion:.3e}"
         );
+    }
+
+    /// A workload for the memoization parity tests: deterministic pseudo-random
+    /// vectors across the dimensions that exercise every branch of both kernels
+    /// (the four-lane body, each `len % 4` tail length, and the 768-d production
+    /// shape), each pair scaled to a spread of magnitudes.
+    ///
+    /// Non-unit vectors are the point. kin-vector stores whatever `upsert` is
+    /// handed, so a memo that quietly assumed unit length would agree with the
+    /// fused kernel on normalized input and diverge everywhere else. Half these
+    /// cases have norms far from 1, and the near-zero, denormal, all-zero, and
+    /// overflow-to-infinity cases pin the degenerate-denominator behavior.
+    fn norm_memo_cases() -> Vec<(Vec<f32>, Vec<f32>)> {
+        fn vec_for(seed: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let h = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407))
+                        .wrapping_add(0x9E3779B97F4A7C15);
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        }
+        fn scaled(v: &[f32], k: f32) -> Vec<f32> {
+            v.iter().map(|x| x * k).collect()
+        }
+        fn unit(v: &[f32]) -> Vec<f32> {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 1e-12 {
+                v.iter().map(|x| x / n).collect()
+            } else {
+                v.to_vec()
+            }
+        }
+
+        let mut cases: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        for &dim in &[1usize, 2, 3, 4, 5, 6, 7, 8, 31, 48, 127, 768] {
+            let a = vec_for(dim as u64 * 2, dim);
+            let b = vec_for(dim as u64 * 2 + 1, dim);
+            // Wildly different magnitudes on each side, including one vector far
+            // longer than the other.
+            for &(ka, kb) in &[
+                (1.0f32, 1.0f32),
+                (1e-3, 1e3),
+                (3.7, 0.017),
+                (1e4, 1e4),
+                (2.0, 1.0),
+            ] {
+                cases.push((scaled(&a, ka), scaled(&b, kb)));
+            }
+            // The normalized shape the embedding pipeline actually produces.
+            cases.push((unit(&a), unit(&b)));
+            // Identical, opposite, and mixed-normalization pairs.
+            let v = vec_for(99 + dim as u64, dim);
+            cases.push((v.clone(), v.clone()));
+            cases.push((unit(&v), scaled(&v, 512.0)));
+            let neg: Vec<f32> = v.iter().map(|x| -x).collect();
+            cases.push((v, neg));
+            // Degenerate denominators and extreme magnitudes.
+            cases.push((vec![1e-30f32; dim], vec![1e-30f32; dim]));
+            cases.push((vec![f32::from_bits(1); dim], vec![f32::from_bits(3); dim]));
+            cases.push((vec![0.0f32; dim], vec![0.0f32; dim]));
+            cases.push((vec![0.0f32; dim], scaled(&a, 5.0)));
+            cases.push((vec![1e30f32; dim], vec![1e30f32; dim]));
+        }
+        cases
+    }
+
+    /// THE claim this change rests on: a cosine distance assembled from a
+    /// separately-computed dot product and two separately-computed squared norms
+    /// is the SAME BITS as the fused kernel it replaces — not close, identical.
+    ///
+    /// Exact equality, never a tolerance. The fused kernel runs three independent
+    /// accumulator chains over one pass; lifting a chain into its own loop
+    /// reproduces its operation sequence exactly and reassociates nothing, so any
+    /// difference at all would mean the split kernels had drifted from the fused
+    /// ones and the memo could shift a ranking. A tolerance would hide precisely
+    /// the regression this exists to catch.
+    ///
+    /// Both public entry points are compared through whichever kernel this
+    /// process resolved; `memoized_kernels_are_bit_identical_to_fused_kernels`
+    /// covers each kernel directly, so neither arm depends on the ambient gate.
+    #[test]
+    fn memoized_cosine_is_bit_identical_to_fused_cosine() {
+        let cases = norm_memo_cases();
+        for (a, b) in &cases {
+            let fused = cosine_distance(a, b);
+            let memoized = cosine_distance_with_sq_norms(a, squared_norm(a), b, squared_norm(b));
+            assert_eq!(
+                fused.to_bits(),
+                memoized.to_bits(),
+                "memoized cosine differs from fused cosine at dim {}: \
+                 fused={fused:?} memoized={memoized:?}",
+                a.len()
+            );
+        }
+        // Empty operands take the same degenerate branch. The mismatched-length
+        // branch is not exercised here: both entry points `debug_assert` equal
+        // lengths before the runtime guard, so a debug build panics before
+        // reaching it. The guard stays a release-build backstop in both.
+        assert_eq!(
+            cosine_distance(&[], &[]).to_bits(),
+            cosine_distance_with_sq_norms(&[], 0.0, &[], 0.0).to_bits()
+        );
+        eprintln!(
+            "[norm-memo] memoized == fused, bit-exact, over {} cases",
+            cases.len()
+        );
+    }
+
+    /// The same claim held against EACH kernel directly rather than whichever one
+    /// the process-global `KIN_VECTOR_SIMD` gate resolved. The gate is sampled
+    /// once per process, so a test that only went through the public entry point
+    /// would leave one kernel's split-vs-fused parity unproven in any single run.
+    #[test]
+    fn memoized_kernels_are_bit_identical_to_fused_kernels() {
+        for (a, b) in &norm_memo_cases() {
+            let fused = cosine_distance_scalar(a, b);
+            let split = cosine_from_parts(
+                dot_scalar(a, b),
+                squared_norm_scalar(a),
+                squared_norm_scalar(b),
+            );
+            assert_eq!(
+                fused.to_bits(),
+                split.to_bits(),
+                "scalar split kernels differ from the fused scalar kernel at dim {}",
+                a.len()
+            );
+
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            {
+                // SAFETY: NEON is part of the mandatory aarch64 baseline.
+                let (fused_neon, split_neon) = unsafe {
+                    (
+                        cosine_distance_neon(a, b),
+                        cosine_from_parts(
+                            dot_neon(a, b),
+                            squared_norm_neon(a),
+                            squared_norm_neon(b),
+                        ),
+                    )
+                };
+                assert_eq!(
+                    fused_neon.to_bits(),
+                    split_neon.to_bits(),
+                    "NEON split kernels differ from the fused NEON kernel at dim {}",
+                    a.len()
+                );
+            }
+        }
+    }
+
+    /// `squared_norm` must reproduce the norm accumulator of the kernel that will
+    /// consume it — including on a query whose length is not a multiple of four,
+    /// where the tail rounds differently from the lanes.
+    #[test]
+    fn squared_norm_matches_the_kernel_norm_accumulators() {
+        for (a, _) in &norm_memo_cases() {
+            let mut sequential = 0.0f32;
+            for &x in a {
+                sequential += x * x;
+            }
+            assert_eq!(
+                squared_norm_scalar(a).to_bits(),
+                sequential.to_bits(),
+                "scalar squared_norm is not the sequential sum of squares at dim {}",
+                a.len()
+            );
+            // A vector's cosine distance to itself is `1 - dot/sqrt(n*n)`, so
+            // feeding `squared_norm` back in must land on the fused self-distance.
+            assert_eq!(
+                cosine_distance(a, a).to_bits(),
+                cosine_distance_with_sq_norms(a, squared_norm(a), a, squared_norm(a)).to_bits(),
+                "self-distance diverges at dim {}",
+                a.len()
+            );
+        }
+    }
+
+    /// The memo is a side table indexed in parallel with `nodes`, so the risk it
+    /// carries is going stale rather than being wrong on day one. This walks the
+    /// mutations that can desynchronize it — insert, overwrite, remove, reuse of a
+    /// freed slot, compaction, and a save/load round trip — and after each one
+    /// asserts every entry still equals a fresh recompute, bit for bit.
+    #[test]
+    fn memoized_norms_track_the_graph_through_its_mutations() {
+        fn assert_memo_exact<Id: VectorId>(graph: &HnswGraph<Id>, after: &str) {
+            assert_eq!(
+                graph.sq_norms.len(),
+                graph.nodes.len(),
+                "memo length diverged from nodes after {after}"
+            );
+            for (idx, node) in graph.nodes.iter().enumerate() {
+                assert_eq!(
+                    graph.sq_norms[idx].to_bits(),
+                    squared_norm(&node.vector).to_bits(),
+                    "memo for node {idx} is stale after {after}"
+                );
+            }
+        }
+
+        // Deliberately NOT unit vectors: the memo has to carry real norms.
+        let dim = 8;
+        let vector_for = |k: u64| -> Vec<f32> {
+            (0..dim)
+                .map(|d| ((k * 31 + d as u64 % 7) as f32 + 0.5) * (1.0 + k as f32))
+                .collect()
+        };
+
+        let index: VectorIndex<u64> = VectorIndex::new(dim).unwrap();
+        for k in 0..24u64 {
+            index.upsert(k, &vector_for(k)).unwrap();
+        }
+        assert_memo_exact(&index.graph.read(), "inserts");
+
+        // Overwrite an existing key: remove + insert into the freed slot.
+        index.upsert(7, &vector_for(700)).unwrap();
+        assert_memo_exact(&index.graph.read(), "overwrite");
+
+        // Remove several, then insert new keys so freed slots are reused.
+        for k in [2u64, 11, 19] {
+            index.remove(&k).unwrap();
+        }
+        assert_memo_exact(&index.graph.read(), "removals");
+        for k in 100..104u64 {
+            index.upsert(k, &vector_for(k)).unwrap();
+        }
+        assert_memo_exact(&index.graph.read(), "free-slot reuse");
+
+        index.compact().unwrap();
+        assert_memo_exact(&index.graph.read(), "compact");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.kvec");
+        index.save(&path).unwrap();
+        let reloaded: VectorIndex<u64> = VectorIndex::load_from_disk(&path).unwrap();
+        assert_memo_exact(&reloaded.graph.read(), "load from disk");
+
+        // A graph whose `nodes` were written directly leaves the memo absent, and
+        // the distance path must fall back rather than read unset entries.
+        let mut hand_built: HnswGraph<u64> = HnswGraph::new(dim);
+        hand_built.nodes = vec![HnswNode {
+            vector: vector_for(5),
+            connections: vec![Vec::new()],
+            level: 0,
+        }];
+        hand_built.idx_to_id = vec![5];
+        hand_built.id_to_idx.insert(5, 0);
+        hand_built.entry_point = Some(0);
+        assert!(hand_built.sq_norms.is_empty(), "memo must start absent");
+        let query = vector_for(3);
+        assert_eq!(
+            hand_built
+                .distance_to_node(&query, squared_norm(&query), 0)
+                .to_bits(),
+            cosine_distance(&query, &hand_built.nodes[0].vector).to_bits(),
+            "absent memo must fall back to the fused kernel"
+        );
+    }
+
+    /// End to end: the memo must not move a single result bit. The same index is
+    /// queried twice — once with the memo populated, once with it cleared so every
+    /// distance runs through the fused kernel — and the two result lists must
+    /// match exactly, ids and distances alike.
+    #[test]
+    fn search_results_are_bit_identical_with_and_without_the_memo() {
+        let dim = 16;
+        let vector_for = |k: u64| -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let h = k
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407));
+                    // Scale varies per key so stored vectors are emphatically not
+                    // unit length.
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * (1.0 + (k % 9) as f32)
+                })
+                .collect()
+        };
+
+        let index: VectorIndex<u64> = VectorIndex::new(dim).unwrap();
+        for k in 0..200u64 {
+            index.upsert(k, &vector_for(k)).unwrap();
+        }
+        for k in [3u64, 44, 91, 150] {
+            index.remove(&k).unwrap();
+        }
+
+        let queries: Vec<Vec<f32>> = (900..916u64).map(vector_for).collect();
+
+        let with_memo: Vec<Vec<(u64, f32)>> = queries
+            .iter()
+            .map(|q| index.search_similar(q, 10).unwrap())
+            .collect();
+
+        index.graph.write().sq_norms.clear();
+        let without_memo: Vec<Vec<(u64, f32)>> = queries
+            .iter()
+            .map(|q| index.search_similar(q, 10).unwrap())
+            .collect();
+
+        assert!(
+            with_memo.iter().any(|r| !r.is_empty()),
+            "corpus produced no results — the comparison would be vacuous"
+        );
+        for (qi, (memo, fused)) in with_memo.iter().zip(&without_memo).enumerate() {
+            assert_eq!(
+                memo.len(),
+                fused.len(),
+                "query {qi}: result count differs with and without the memo"
+            );
+            for (rank, ((id_m, d_m), (id_f, d_f))) in memo.iter().zip(fused).enumerate() {
+                assert_eq!(id_m, id_f, "query {qi} rank {rank}: id differs");
+                assert_eq!(
+                    d_m.to_bits(),
+                    d_f.to_bits(),
+                    "query {qi} rank {rank}: distance differs ({d_m:?} vs {d_f:?})"
+                );
+            }
+        }
     }
 
     /// CPU-efficiency measurement for KIN_VECTOR_SIMD: wall-clock ns/op for the
