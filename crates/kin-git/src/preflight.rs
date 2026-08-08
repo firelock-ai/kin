@@ -5,10 +5,22 @@
 //!
 //! A lossless object/ref snapshot proves committed repository history, not the
 //! mutable Git index or materialized checkout. This boundary independently
-//! proves that the source index and every tracked worktree leaf equal the
+//! observes the source index and every tracked worktree leaf against the
 //! committed workspace seed before a later admission lane may construct a
 //! workspace mutation. It never executes hooks or filters, never recurses into
 //! gitlinks, and never manufactures an admission token.
+//!
+//! Repository authority is the committed workspace seed and nothing else, so a
+//! path that differs from it is reported rather than refused: an index entry
+//! that is not the committed one, a tracked leaf the worktree materializes
+//! differently, a committed path the worktree no longer carries, and a worktree
+//! path that is neither tracked nor ignored are all recorded as divergence and
+//! carried in the proof. That is what a working repository looks like, and the
+//! daemon admits exactly this delta as workspace state on its first run.
+//! Ambiguity about the source itself still refuses, because there the committed
+//! state a migration would seal is not decidable: an in-progress Git operation,
+//! a conflicted or sparse index, an entry Git has been told not to compare, and
+//! a materialized nested repository.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -57,6 +69,9 @@ pub struct GitMigrationPreflightProof {
     pub semantic_plan_fingerprint: Hash256,
     pub index: GitIndexPreflightProof,
     pub tracked_worktree: GitTrackedWorktreeProof,
+    /// Index and worktree state that is not the committed workspace seed.
+    /// Observed, never admitted: authority is the seed alone.
+    pub workspace_divergence: GitWorkspaceDivergenceFacts,
     pub ignored_local: IgnoredLocalWorktreeFact,
     pub compatibility: GitMigrationCompatibilityFacts,
     pub remote_mapping: GitRemoteMappingFacts,
@@ -83,6 +98,101 @@ pub struct GitTrackedWorktreeProof {
     /// proves only as graph-owned, physically absent entries.
     pub host_unrepresentable_count: usize,
     pub fingerprint: Hash256,
+}
+
+/// Everything about one source that is not its committed workspace seed.
+///
+/// A working repository is edited, and none of that editing is repository
+/// authority: the seed is the committed tree, the delta is workspace state, and
+/// the daemon admits it through the same path it admits every later edit. The
+/// proof therefore carries the delta instead of refusing it, so init can say
+/// what it saw and what will happen to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitWorkspaceDivergenceFacts {
+    /// Divergent paths, grouped by kind and ordered by path within a kind.
+    pub entries: Vec<GitWorkspaceDivergence>,
+    /// Untracked paths found past the listing cap, counted rather than kept.
+    pub untracked_beyond_cap: usize,
+    pub fingerprint: Hash256,
+}
+
+impl GitWorkspaceDivergenceFacts {
+    /// The facts of a source with nothing to disclose.
+    ///
+    /// Its fingerprint is the one an observation of a repository that matched
+    /// its committed state produces, so a caller that has no source to observe
+    /// and one that observed no difference are not distinguishable by identity.
+    pub fn none() -> Self {
+        DivergenceLog::default().finish()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.untracked_beyond_cap == 0
+    }
+
+    /// Divergent paths observed, including the untracked ones past the cap.
+    pub fn observed_paths(&self) -> usize {
+        self.entries.len() + self.untracked_beyond_cap
+    }
+
+    pub fn of_kind(
+        &self,
+        kind: GitWorkspaceDivergenceKind,
+    ) -> impl Iterator<Item = &GitWorkspaceDivergence> {
+        self.entries.iter().filter(move |entry| entry.kind == kind)
+    }
+}
+
+/// One path whose source state differs from the committed workspace seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitWorkspaceDivergence {
+    pub path: RepoPath,
+    pub kind: GitWorkspaceDivergenceKind,
+    /// One sentence naming what differs, for a kind that has more than one way
+    /// of differing. Empty when the kind already says everything.
+    pub detail: String,
+    /// Identity of the worktree bytes this observation read, where it read
+    /// them. A divergence proved by reading content carries what it read, so
+    /// repeating the observation detects content that moved under it.
+    pub observed: Option<Hash256>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitWorkspaceDivergenceKind {
+    /// Index entry that is not the committed entry for its path, or is a path
+    /// the committed tree does not carry at all.
+    Staged,
+    /// Committed path the index no longer carries.
+    StagedRemoval,
+    /// Tracked path the worktree materializes differently than committed.
+    Modified,
+    /// Committed path the worktree does not materialize at all.
+    Missing,
+    /// Worktree path that is neither tracked nor ignored.
+    Untracked,
+}
+
+impl GitWorkspaceDivergenceKind {
+    /// Stable ordering and encoding code, so grouping and the fingerprint agree.
+    fn code(self) -> u64 {
+        match self {
+            Self::Staged => 1,
+            Self::StagedRemoval => 2,
+            Self::Modified => 3,
+            Self::Missing => 4,
+            Self::Untracked => 5,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::StagedRemoval => "staged removal",
+            Self::Modified => "modified",
+            Self::Missing => "missing",
+            Self::Untracked => "untracked",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +336,83 @@ impl fmt::Debug for GitBranchTrackingFact {
             .field("push_remote_present", &self.push_remote.is_some())
             .field("values", &"<redacted>")
             .finish()
+    }
+}
+
+/// Untracked paths kept by name before the rest are only counted.
+///
+/// A worktree carrying an unignored build directory holds hundreds of
+/// thousands of them. The count stays exact because the walk has to visit every
+/// entry anyway to prove the tracked ones; only the list is bounded.
+const LISTED_UNTRACKED_CAP: usize = 512;
+
+/// Collects divergence while the index and worktree are observed.
+#[derive(Debug, Default)]
+struct DivergenceLog {
+    entries: Vec<GitWorkspaceDivergence>,
+    untracked_listed: usize,
+    untracked_beyond_cap: usize,
+}
+
+impl DivergenceLog {
+    fn record(
+        &mut self,
+        path: RepoPath,
+        kind: GitWorkspaceDivergenceKind,
+        detail: impl Into<String>,
+        observed: Option<Hash256>,
+    ) {
+        self.entries.push(GitWorkspaceDivergence {
+            path,
+            kind,
+            detail: detail.into(),
+            observed,
+        });
+    }
+
+    /// Whether the index itself is carrying something the commit does not.
+    fn records_index_state(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                GitWorkspaceDivergenceKind::Staged | GitWorkspaceDivergenceKind::StagedRemoval
+            )
+        })
+    }
+
+    fn record_untracked(&mut self, path: RepoPath) {
+        if self.untracked_listed >= LISTED_UNTRACKED_CAP {
+            self.untracked_beyond_cap += 1;
+            return;
+        }
+        self.untracked_listed += 1;
+        self.record(path, GitWorkspaceDivergenceKind::Untracked, "", None);
+    }
+
+    fn finish(mut self) -> GitWorkspaceDivergenceFacts {
+        self.entries.sort_by(|left, right| {
+            (left.kind.code(), &left.path).cmp(&(right.kind.code(), &right.path))
+        });
+        let mut hash = FramedHash::new(b"kin.git.preflight.divergence.v1");
+        hash.u64(self.entries.len() as u64);
+        for entry in &self.entries {
+            hash.bytes(entry.path.as_bytes());
+            hash.u64(entry.kind.code());
+            hash.bytes(entry.detail.as_bytes());
+            match &entry.observed {
+                Some(observed) => {
+                    hash.u64(1);
+                    hash.bytes(observed.as_bytes());
+                }
+                None => hash.u64(0),
+            }
+        }
+        hash.u64(self.untracked_beyond_cap as u64);
+        GitWorkspaceDivergenceFacts {
+            entries: self.entries,
+            untracked_beyond_cap: self.untracked_beyond_cap,
+            fingerprint: hash.finish(),
+        }
     }
 }
 
@@ -429,10 +616,23 @@ fn observe(
         && plan.workspace_seed.base_tree_hash.is_none()
         && expected_entries.is_empty();
     let (index_file, raw_index) = read_strict_index(&repo, absent_index_allowed)?;
-    let index = prove_index(&index_file, raw_index.as_deref(), expected_entries)?;
-    index_file
-        .verify_extensions(true, &repo.objects)
-        .map_err(|error| preflight_error(format!("verify Git index extensions: {error}")))?;
+    let mut divergence = DivergenceLog::default();
+    let index = prove_index(
+        &index_file,
+        raw_index.as_deref(),
+        expected_entries,
+        &mut divergence,
+    )?;
+    // The tree extension caches the tree this index would write. An index that
+    // carries staged work has not written that tree, and Git invalidates the
+    // subtrees it covers rather than removing them, so resolving it against the
+    // object database asks for an object the source has never had a reason to
+    // create. The extension is verified where it describes something written.
+    if !divergence.records_index_state() {
+        index_file
+            .verify_extensions(true, &repo.objects)
+            .map_err(|error| preflight_error(format!("verify Git index extensions: {error}")))?;
+    }
     let (tracked_worktree, ignored_local) = prove_worktree(
         &ambient_repo,
         &index_file,
@@ -440,7 +640,9 @@ fn observe(
         expected_entries,
         blob_store,
         published_kin_dir,
+        &mut divergence,
     )?;
+    let workspace_divergence = divergence.finish();
     let snapshot_fingerprint = fingerprint_snapshot(&snapshot);
     let semantic_plan_fingerprint = fingerprint_plan(plan)?;
     let compatibility = GitMigrationCompatibilityFacts {
@@ -463,6 +665,7 @@ fn observe(
         semantic_plan_fingerprint,
         index,
         tracked_worktree,
+        workspace_divergence,
         ignored_local,
         compatibility,
         remote_mapping,
@@ -589,10 +792,21 @@ fn read_strict_index(
     Ok((index, before))
 }
 
+/// Observe the index against the committed workspace seed.
+///
+/// An entry that is not the committed one is staged work, which is recorded
+/// rather than refused. What still refuses is an index that cannot be read as a
+/// statement about the worktree at all: a conflict stage, a sparse directory
+/// entry, and the two flags with which Git is told to stop comparing a path, so
+/// a repository whose index disagrees with its own worktree by instruction is
+/// never observed as if it agreed. `INTENT_TO_ADD` is not among them, because
+/// it announces a path the operator has not committed, which is staged work
+/// like any other.
 fn prove_index(
     index: &gix::index::File,
     raw_file: Option<&[u8]>,
     expected: &BTreeMap<RepoPath, ExpectedIndexEntry>,
+    divergence: &mut DivergenceLog,
 ) -> Result<GitIndexPreflightProof> {
     if index.is_sparse() {
         return Err(preflight_error(
@@ -613,7 +827,6 @@ fn prove_index(
         }
         let ambiguous = gix::index::entry::Flags::ASSUME_VALID
             | gix::index::entry::Flags::SKIP_WORKTREE
-            | gix::index::entry::Flags::INTENT_TO_ADD
             | gix::index::entry::Flags::CONFLICTED;
         if entry.flags.intersects(ambiguous) {
             return Err(preflight_error(format!(
@@ -626,16 +839,25 @@ fn prove_index(
                 "index path {path} is a sparse directory entry"
             )));
         }
-        let expected_entry = expected.get(&path).ok_or_else(|| {
-            preflight_error(format!(
-                "index contains staged or otherwise uncommitted path {path}"
-            ))
-        })?;
         let actual_oid = git_object_id(entry.id)?;
-        if entry.mode != expected_entry.mode || actual_oid != expected_entry.oid {
-            return Err(preflight_error(format!(
-                "index entry {path} does not match committed workspace seed"
-            )));
+        match expected.get(&path) {
+            None => divergence.record(
+                path.clone(),
+                GitWorkspaceDivergenceKind::Staged,
+                "the committed tree does not carry this path",
+                None,
+            ),
+            Some(expected_entry)
+                if entry.mode != expected_entry.mode || actual_oid != expected_entry.oid =>
+            {
+                divergence.record(
+                    path.clone(),
+                    GitWorkspaceDivergenceKind::Staged,
+                    "the index entry is not the committed one",
+                    None,
+                )
+            }
+            Some(_) => {}
         }
         if !seen.insert(path.clone()) {
             return Err(preflight_error(format!("index repeats path {path}")));
@@ -645,14 +867,13 @@ fn prove_index(
         logical.bytes(actual_oid.as_bytes());
         logical.u64(u64::from(entry.flags.bits()));
     }
-    if seen.len() != expected.len() {
-        let missing = expected
-            .keys()
-            .find(|path| !seen.contains(*path))
-            .expect("different lengths imply a missing expected path");
-        return Err(preflight_error(format!(
-            "index is missing committed path {missing}"
-        )));
+    for path in expected.keys().filter(|path| !seen.contains(*path)) {
+        divergence.record(
+            path.clone(),
+            GitWorkspaceDivergenceKind::StagedRemoval,
+            "",
+            None,
+        );
     }
     Ok(GitIndexPreflightProof {
         present: raw_file.is_some(),
@@ -673,14 +894,21 @@ fn prove_worktree(
     expected: &BTreeMap<RepoPath, ExpectedIndexEntry>,
     blob_store: &BlobStore,
     published_kin_dir: Option<&Path>,
+    divergence: &mut DivergenceLog,
 ) -> Result<(GitTrackedWorktreeProof, IgnoredLocalWorktreeFact)> {
     let ignore_inputs = local_ignore_inputs(ignore_repo)?;
     let (mut excludes, ignore_case) = frozen_ignore_stack(ignore_repo, index, &ignore_inputs)?;
     let (executable_authority, symlink_materialization) = worktree_materialization(ignore_repo)?;
     let mut tracked_hash = FramedHash::new(b"kin.git.preflight.worktree.v2");
     tracked_hash.u64(expected.len() as u64);
+    let indexed = index
+        .entries()
+        .iter()
+        .map(|entry| entry.path(index).to_vec())
+        .collect::<BTreeSet<_>>();
     let mut state = WorktreeWalk {
         expected,
+        indexed: &indexed,
         blob_store,
         seen: BTreeSet::new(),
         tracked_hash,
@@ -693,6 +921,7 @@ fn prove_worktree(
             repo: ignore_repo,
             index,
         }),
+        divergence,
     };
     let graph_only_paths = expected
         .iter()
@@ -724,14 +953,10 @@ fn prove_worktree(
             "local Git ignore inputs changed while the worktree was being verified",
         ));
     }
-    if state.seen.len() != expected.len() {
-        let missing = expected
-            .keys()
-            .find(|path| !state.seen.contains(*path))
-            .expect("different lengths imply a missing expected path");
-        return Err(preflight_error(format!(
-            "worktree is missing committed path {missing}"
-        )));
+    for path in expected.keys().filter(|path| !state.seen.contains(*path)) {
+        state
+            .divergence
+            .record(path.clone(), GitWorkspaceDivergenceKind::Missing, "", None);
     }
     for (path, entry) in &graph_only_paths {
         hash_host_unrepresentable_entry(&mut state.tracked_hash, path, entry.tree_entry);
@@ -773,6 +998,11 @@ fn prove_worktree(
 
 struct WorktreeWalk<'a> {
     expected: &'a BTreeMap<RepoPath, ExpectedIndexEntry>,
+    /// Every path the index carries, which is what Git means by tracked. A path
+    /// here but not in `expected` is staged work, already reported as such by
+    /// the index observation, so the walk neither repeats it as untracked nor
+    /// records it as ignored local content.
+    indexed: &'a BTreeSet<Vec<u8>>,
     blob_store: &'a BlobStore,
     seen: BTreeSet<RepoPath>,
     tracked_hash: FramedHash,
@@ -782,8 +1012,9 @@ struct WorktreeWalk<'a> {
     executable_authority: ExecutableModeAuthority,
     symlink_materialization: SymlinkMaterialization,
     /// Absent when a caller has no repository to consult, which costs only the
-    /// precision of a refusal and never changes whether one is raised.
+    /// precision of a report and never changes whether one is raised.
     diagnosis: Option<CheckoutDiagnosis<'a>>,
+    divergence: &'a mut DivergenceLog,
 }
 
 /// Read-only Git handles consulted solely to explain a refusal.
@@ -1114,6 +1345,9 @@ fn walk_directory(
             prove_tracked_entry(&absolute_path, &path, &metadata, expected, state)?;
             continue;
         }
+        if state.indexed.contains(&path_bytes) {
+            continue;
+        }
 
         let mode = if metadata.is_dir() {
             Some(gix::index::entry::Mode::DIR)
@@ -1149,14 +1383,40 @@ fn walk_directory(
                 byte_len: metadata.len(),
             });
         } else {
-            return Err(preflight_error(format!(
-                "worktree contains untracked non-ignored path {path}"
-            )));
+            state.divergence.record_untracked(path);
         }
     }
     Ok(())
 }
 
+/// Record one tracked leaf as materialized differently than committed.
+///
+/// The tracked fingerprint carries a marker rather than the committed identity,
+/// so a worktree that diverges never fingerprints as one that matched. What
+/// differs is carried by the divergence facts, which the marker deliberately
+/// does not repeat.
+fn diverged(
+    state: &mut WorktreeWalk<'_>,
+    path: &RepoPath,
+    detail: impl Into<String>,
+    observed: Option<Hash256>,
+) {
+    state.tracked_hash.u64(5);
+    state.divergence.record(
+        path.clone(),
+        GitWorkspaceDivergenceKind::Modified,
+        detail,
+        observed,
+    );
+}
+
+/// Observe one tracked leaf against its committed entry.
+///
+/// A leaf the worktree materializes differently is recorded and the walk
+/// continues, because the committed entry is authority and the worktree is
+/// workspace state. A materialized nested repository still refuses: its content
+/// belongs to another repository, and admitting it as this workspace's edits
+/// would swallow a checkout Kin never mapped.
 fn prove_tracked_entry(
     absolute_path: &Path,
     path: &RepoPath,
@@ -1173,35 +1433,42 @@ fn prove_tracked_entry(
     match expected.tree_entry {
         TreeEntry::Blob { hash, executable } => {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err(preflight_error(format!(
-                    "tracked blob {path} is not a regular file"
-                )));
+                diverged(
+                    state,
+                    path,
+                    "the worktree no longer materializes it as a regular file",
+                    None,
+                );
+                return Ok(());
             }
             if state.executable_authority == ExecutableModeAuthority::WorktreeMode
                 && filesystem_executable(metadata)? != executable
             {
-                return Err(preflight_error(format!(
-                    "tracked blob {path} has a different executable mode than the committed tree"
-                )));
+                diverged(
+                    state,
+                    path,
+                    "its executable mode differs from the committed tree",
+                    None,
+                );
+                return Ok(());
             }
             let actual =
                 fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
             let committed = state.blob_store.read(&hash)?;
             if actual != committed {
-                return Err(preflight_error(
+                let detail =
                     match classify_blob_divergence(state.diagnosis, path, &actual, &committed) {
                         BlobDivergence::CheckoutTransformation(reason) => format!(
-                            "tracked blob {path} differs from the committed tree because \
-                             {reason}; Kin cannot yet admit a repository whose worktree Git \
-                             rewrites on checkout. This is not an unstaged edit"
+                            "its worktree bytes differ from the committed tree because {reason}, \
+                             so this is not an unstaged edit"
                         ),
-                        BlobDivergence::UnstagedEdit => format!(
-                            "tracked blob {path} has unstaged edits; its worktree bytes differ \
-                             from the committed tree and no checkout filter, LFS pointer, or \
-                             line-ending normalization explains the difference"
-                        ),
-                    },
-                ));
+                        BlobDivergence::UnstagedEdit => "its worktree bytes differ from the \
+                             committed tree and no checkout filter, LFS pointer, or line-ending \
+                             normalization explains the difference"
+                            .to_string(),
+                    };
+                diverged(state, path, detail, Some(digest(&actual)));
+                return Ok(());
             }
             state.tracked_hash.u64(1);
             state.tracked_hash.bytes(hash.as_bytes());
@@ -1211,9 +1478,13 @@ fn prove_tracked_entry(
             let target = match state.symlink_materialization {
                 SymlinkMaterialization::Link => {
                     if !metadata.file_type().is_symlink() {
-                        return Err(preflight_error(format!(
-                            "tracked symlink {path} is not a symbolic link"
-                        )));
+                        diverged(
+                            state,
+                            path,
+                            "the worktree no longer materializes it as a symbolic link",
+                            None,
+                        );
+                        return Ok(());
                     }
                     let target = fs::read_link(absolute_path)
                         .map_err(|error| GitError::io(absolute_path, error))?;
@@ -1226,46 +1497,62 @@ fn prove_tracked_entry(
                 // filesystem fallback for a missing link.
                 SymlinkMaterialization::TargetTextFile(source) => {
                     if metadata.file_type().is_symlink() {
-                        return Err(preflight_error(match source {
-                            SymlinkCapabilitySource::RepositoryRecorded => format!(
-                                "tracked symlink {path} is a real symbolic link, but the \
-                                 repository records core.symlinks=false, so Git writes and \
-                                 compares the target as a regular file here; the worktree \
-                                 disagrees with the repository's own configuration"
-                            ),
-                            SymlinkCapabilitySource::PlatformDefault => format!(
-                                "tracked symlink {path} is a real symbolic link, but this \
-                                 repository records no core.symlinks value and Git's default on \
-                                 this platform writes and compares the target as a regular file; \
-                                 the worktree holds a link the Git that reads it would not have \
-                                 created. Record core.symlinks=true if this worktree really does \
-                                 carry real links"
-                            ),
-                        }));
+                        diverged(
+                            state,
+                            path,
+                            match source {
+                                SymlinkCapabilitySource::RepositoryRecorded => {
+                                    "it is a real symbolic link, but the repository records \
+                                     core.symlinks=false, so Git writes and compares the target \
+                                     as a regular file here"
+                                }
+                                SymlinkCapabilitySource::PlatformDefault => {
+                                    "it is a real symbolic link, but this repository records no \
+                                     core.symlinks value and Git's default on this platform \
+                                     writes and compares the target as a regular file. Record \
+                                     core.symlinks=true if this worktree really does carry real \
+                                     links"
+                                }
+                            },
+                            None,
+                        );
+                        return Ok(());
                     }
                     if !metadata.is_file() {
-                        return Err(preflight_error(format!(
-                            "tracked symlink {path} is not the regular file holding its target, \
-                             which is what Git materializes under core.symlinks=off"
-                        )));
+                        diverged(
+                            state,
+                            path,
+                            "it is not the regular file holding its target, which is what Git \
+                             materializes under core.symlinks=off",
+                            None,
+                        );
+                        return Ok(());
                     }
                     fs::read(absolute_path).map_err(|error| GitError::io(absolute_path, error))?
                 }
             };
             let committed = state.blob_store.read(&target_blob)?;
             if target != committed {
-                return Err(preflight_error(format!(
-                    "tracked symlink {path} target differs from the committed tree"
-                )));
+                diverged(
+                    state,
+                    path,
+                    "its link target differs from the committed tree",
+                    Some(digest(&target)),
+                );
+                return Ok(());
             }
             state.tracked_hash.u64(2);
             state.tracked_hash.bytes(target_blob.as_bytes());
         }
         TreeEntry::Gitlink { target } => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(preflight_error(format!(
-                    "gitlink {path} is not materialized as a directory"
-                )));
+                diverged(
+                    state,
+                    path,
+                    "the worktree no longer materializes it as a directory",
+                    None,
+                );
+                return Ok(());
             }
             let mut entries =
                 fs::read_dir(absolute_path).map_err(|error| GitError::io(absolute_path, error))?;
@@ -1449,12 +1736,38 @@ pub(crate) fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFi
     facts.into_values().collect()
 }
 
+/// Everything one repository-local Git configuration says about transport.
+pub(crate) struct RemoteMappingScan {
+    pub(crate) facts: GitRemoteMappingFacts,
+    /// Every reason this configuration is outside the safe exact subset, in
+    /// configuration order. Non-empty means `facts` is incomplete, because a
+    /// section that carried a refusal contributed nothing.
+    pub(crate) refusals: Vec<String>,
+}
+
+/// Read the transport configuration, refusing at the first reason it carries.
 pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts> {
+    let scan = scan_remote_mapping(repo)?;
+    match scan.refusals.into_iter().next() {
+        Some(reason) => Err(unsafe_git_config(reason)),
+        None => Ok(scan.facts),
+    }
+}
+
+/// Read the transport configuration, collecting every reason it carries.
+///
+/// A repository whose configuration is outside the safe subset usually holds
+/// more than one key that puts it there, and clearing them one refusal per run
+/// is what makes a five-minute edit an afternoon. Only a configuration this
+/// boundary cannot read at all still stops the scan, because past that point
+/// the remaining sections are not decidable.
+pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappingScan> {
     let config = repo.config_snapshot();
     let mut remotes = Vec::<GitRemoteConfigFact>::new();
     let mut branch_tracking = Vec::<GitBranchTrackingFact>::new();
     let mut remote_push_default = None;
     let mut push_default = None;
+    let mut refusals = Vec::<String>::new();
 
     for section in config.plumbing().sections().filter(|section| {
         matches!(
@@ -1469,18 +1782,22 @@ pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMa
             .map_err(|_| unsafe_git_config("non-UTF-8 section name"))?
             .to_ascii_lowercase();
         if section.meta().level != 0 || matches!(section_name.as_str(), "include" | "includeif") {
-            return Err(unsafe_git_config("repository-local include"));
+            refusals.push("repository-local include".to_string());
+            continue;
         }
 
         match section_name.as_str() {
             "remote" => {
                 if let Some(name) = section.header().subsection_name() {
                     validate_safe_identifier(name, "remote name")?;
-                    reject_unknown_config_keys(
+                    if collect_unknown_config_keys(
                         section,
                         &format!("remote.{}", String::from_utf8_lossy(name)),
                         &["url", "pushurl", "fetch", "push"],
-                    )?;
+                        &mut refusals,
+                    ) {
+                        continue;
+                    }
                     let fact = remote_fact_mut(&mut remotes, name);
                     append_explicit_values(
                         section,
@@ -1501,7 +1818,14 @@ pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMa
                         validate_safe_refspec(value, gix::refspec::parse::Operation::Push)
                     })?;
                 } else {
-                    reject_unknown_config_keys(section, "remote", &["pushdefault"])?;
+                    if collect_unknown_config_keys(
+                        section,
+                        "remote",
+                        &["pushdefault"],
+                        &mut refusals,
+                    ) {
+                        continue;
+                    }
                     set_unique_explicit_value(
                         section,
                         "pushdefault",
@@ -1516,11 +1840,14 @@ pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMa
                     .subsection_name()
                     .ok_or_else(|| unsafe_git_config("branch section without a name"))?;
                 validate_safe_branch_name(name)?;
-                reject_unknown_config_keys(
+                if collect_unknown_config_keys(
                     section,
                     &format!("branch.{}", String::from_utf8_lossy(name)),
                     &["remote", "merge", "pushremote"],
-                )?;
+                    &mut refusals,
+                ) {
+                    continue;
+                }
                 let fact = branch_fact_mut(&mut branch_tracking, name);
                 set_unique_explicit_value(section, "remote", &mut fact.remote, |value| {
                     validate_safe_identifier(value, "branch remote")
@@ -1536,23 +1863,23 @@ pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMa
                 if section.header().subsection_name().is_some() {
                     return Err(unsafe_git_config("named push section"));
                 }
-                reject_unknown_config_keys(section, "push", &["default"])?;
+                if collect_unknown_config_keys(section, "push", &["default"], &mut refusals) {
+                    continue;
+                }
                 set_unique_explicit_value(section, "default", &mut push_default, |value| {
                     validate_push_default(value)
                 })?;
             }
-            "core" => reject_transfer_core_keys(section)?,
+            "core" => collect_transfer_core_keys(section, &mut refusals),
             // Split out of the arm below because it is the one section here a
             // user reaches without ever configuring transport: `git submodule
             // add` writes it for them.
-            "submodule" => {
-                return Err(unsafe_submodule_config(
-                    section
-                        .header()
-                        .subsection_name()
-                        .and_then(|name| name.to_str().ok()),
-                ));
-            }
+            "submodule" => refusals.push(unsafe_submodule_reason(
+                section
+                    .header()
+                    .subsection_name()
+                    .and_then(|name| name.to_str().ok()),
+            )),
             "credential" | "http" | "https" | "url" | "protocol" | "transport" | "transfer"
             | "fetch" | "receive" | "uploadpack" | "ssh" | "lfs" => {
                 // Twelve sections share this refusal, so naming the one that
@@ -1561,20 +1888,25 @@ pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMa
                 // these literals and is always safe to print; the subsection
                 // name is not, because for `url`, `http`, and `credential` it is
                 // itself a URL that can carry `user:password@`.
-                return Err(unsafe_git_config(format!(
+                refusals.push(format!(
                     "unsupported transfer-affecting section [{section_name}]"
-                )));
+                ));
             }
             _ => {}
         }
     }
 
-    validate_remote_relationships(&remotes, &branch_tracking, remote_push_default.as_deref())?;
-    Ok(GitRemoteMappingFacts {
-        remotes,
-        branch_tracking,
-        remote_push_default,
-        push_default,
+    if refusals.is_empty() {
+        validate_remote_relationships(&remotes, &branch_tracking, remote_push_default.as_deref())?;
+    }
+    Ok(RemoteMappingScan {
+        facts: GitRemoteMappingFacts {
+            remotes,
+            branch_tracking,
+            remote_push_default,
+            push_default,
+        },
+        refusals,
     })
 }
 
@@ -1611,7 +1943,7 @@ fn branch_fact_mut<'a>(
     branches.last_mut().expect("branch was just inserted")
 }
 
-/// Refuse any key outside the exact allowlist, naming the one that matched.
+/// Collect every key outside the exact allowlist, naming each one.
 ///
 /// `scope` is the section spelling, which the caller builds from a subsection
 /// name that has only been checked for control characters. That is not enough
@@ -1620,24 +1952,29 @@ fn branch_fact_mut<'a>(
 /// unless it reads as a plain identifier. Key names are always safe, and the
 /// values behind them are never printed. Without a name the reader is handed a
 /// category and has to bisect their own config to find the line Kin meant.
-fn reject_unknown_config_keys(
+///
+/// Answers whether the section carried any, because a section that did is not
+/// parsed for facts the caller would then have to discard.
+fn collect_unknown_config_keys(
     section: &gix::config::file::Section<'_>,
     scope: &str,
     allowed: &[&str],
-) -> Result<()> {
+    refusals: &mut Vec<String>,
+) -> bool {
     let scope = printable_config_scope(scope);
+    let before = refusals.len();
     for name in section.value_names() {
         let name = name.to_string();
         if !allowed
             .iter()
             .any(|allowed| name.eq_ignore_ascii_case(allowed))
         {
-            return Err(unsafe_git_config(format!(
+            refusals.push(format!(
                 "unsupported transfer-affecting repository-local key {scope}.{name}"
-            )));
+            ));
         }
     }
-    Ok(())
+    refusals.len() != before
 }
 
 /// Keep a section spelling printable, dropping a subsection that is not a plain
@@ -1656,7 +1993,10 @@ fn printable_config_scope(scope: &str) -> String {
     section.to_string()
 }
 
-fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result<()> {
+fn collect_transfer_core_keys(
+    section: &gix::config::file::Section<'_>,
+    refusals: &mut Vec<String>,
+) {
     const TRANSFER_KEYS: &[&str] = &[
         "askpass",
         "gitproxy",
@@ -1670,12 +2010,11 @@ fn reject_transfer_core_keys(section: &gix::config::file::Section<'_>) -> Result
             .iter()
             .any(|blocked| name.eq_ignore_ascii_case(blocked))
         {
-            return Err(unsafe_git_config(format!(
+            refusals.push(format!(
                 "unsupported transfer-affecting core key core.{name}"
-            )));
+            ));
         }
     }
-    Ok(())
 }
 
 fn explicit_values(section: &gix::config::file::Section<'_>, key: &str) -> Result<Vec<Vec<u8>>> {
@@ -1866,16 +2205,16 @@ fn validate_remote_relationships(
 /// credential the way naming a `url` subsection would. A path that is not valid
 /// UTF-8 has no spelling worth printing and is left out rather than turning a
 /// refusal about submodules into one about encoding.
-fn unsafe_submodule_config(path: Option<&str>) -> GitError {
+fn unsafe_submodule_reason(path: Option<&str>) -> String {
     let subject = match path {
         Some(path) => format!("unsupported submodule section for '{path}'"),
         None => "unsupported submodule section".to_string(),
     };
-    unsafe_git_config(format!(
+    format!(
         "{subject}; Kin cannot yet import a repository that carries submodules. Remove them with \
          'git submodule deinit --all' and drop the matching .gitmodules entries, or run kin init \
          inside the submodule's own repository"
-    ))
+    )
 }
 
 fn unsafe_git_config(reason: impl Into<String>) -> GitError {
@@ -1949,6 +2288,7 @@ fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
     hash.bytes(proof.index.raw_file_hash.as_bytes());
     hash.bytes(proof.index.logical_fingerprint.as_bytes());
     hash.bytes(proof.tracked_worktree.fingerprint.as_bytes());
+    hash.bytes(proof.workspace_divergence.fingerprint.as_bytes());
     hash.bytes(proof.ignored_local.fingerprint.as_bytes());
     hash.u64(proof.remote_mapping.remotes.len() as u64);
     for remote in &proof.remote_mapping.remotes {
@@ -2652,13 +2992,17 @@ mod platform_materialization_tests {
     /// the cases below would otherwise only be compiled here and never run. The
     /// walk state is small enough to build outright, which lets both platforms
     /// execute the same comparison logic against a real store and real files.
+    ///
+    /// Answers with what the entry was recorded as differing by, so a case
+    /// asserting agreement asserts an empty list rather than the absence of an
+    /// error a matching entry could never have produced.
     fn prove_one_entry(
         absolute: &std::path::Path,
         entry: TreeEntry,
         blob_store: &BlobStore,
         executable_authority: ExecutableModeAuthority,
         symlink_materialization: SymlinkMaterialization,
-    ) -> Result<()> {
+    ) -> Result<Vec<GitWorkspaceDivergence>> {
         let path = RepoPath::from_bytes(b"tracked".to_vec()).expect("repo path");
         let expected = ExpectedIndexEntry {
             mode: match entry {
@@ -2674,8 +3018,11 @@ mod platform_materialization_tests {
         };
         let mut expected_entries = BTreeMap::new();
         expected_entries.insert(path.clone(), expected);
+        let indexed = BTreeSet::new();
+        let mut divergence = DivergenceLog::default();
         let mut state = WorktreeWalk {
             expected: &expected_entries,
+            indexed: &indexed,
             blob_store,
             seen: BTreeSet::new(),
             tracked_hash: FramedHash::new(b"kin.git.preflight.worktree.test"),
@@ -2685,9 +3032,19 @@ mod platform_materialization_tests {
             executable_authority,
             symlink_materialization,
             diagnosis: None,
+            divergence: &mut divergence,
         };
         let metadata = fs::symlink_metadata(absolute).expect("entry metadata");
-        prove_tracked_entry(absolute, &path, &metadata, expected, &mut state)
+        prove_tracked_entry(absolute, &path, &metadata, expected, &mut state)?;
+        Ok(divergence.entries)
+    }
+
+    /// The one sentence a single recorded divergence carries.
+    fn only_detail(entries: &[GitWorkspaceDivergence]) -> String {
+        let [entry] = entries else {
+            panic!("expected exactly one divergence, got {entries:?}");
+        };
+        entry.detail.clone()
     }
 
     #[test]
@@ -2698,29 +3055,32 @@ mod platform_materialization_tests {
 
         let tracked = temp.path().join("tracked");
         fs::write(&tracked, b"src/main.rs").expect("target text file");
-        prove_one_entry(
+        let matched = prove_one_entry(
             &tracked,
             TreeEntry::Symlink { target_blob },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
             SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
-        .expect("the target text file matches the committed target");
+        .expect("the target text file is observed");
+        assert!(
+            matched.is_empty(),
+            "the target text file matches the committed target: {matched:?}"
+        );
 
         fs::write(&tracked, b"src/other.rs").expect("rewrite target text file");
-        let error = prove_one_entry(
+        let diverged = prove_one_entry(
             &tracked,
             TreeEntry::Symlink { target_blob },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
             SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
-        .expect_err("a different target is not the committed one");
+        .expect("a different target is observed rather than refused");
+        let detail = only_detail(&diverged);
         assert!(
-            error
-                .to_string()
-                .contains("target differs from the committed"),
-            "unexpected error: {error}"
+            detail.contains("target differs from the committed"),
+            "unexpected detail: {detail}"
         );
     }
 
@@ -2759,13 +3119,13 @@ mod platform_materialization_tests {
     }
 
     #[test]
-    fn a_real_link_where_links_are_off_is_refused_rather_than_read_through() {
+    fn a_real_link_where_links_are_off_is_reported_rather_than_read_through() {
         let temp = tempfile::tempdir().expect("tempdir");
         let blob_store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let target_blob = blob_store.write(b"src/main.rs").expect("target blob");
 
         // Both sources resolve to the same materialization and must produce
-        // the same refusal, but they must not blame the same party for it.
+        // the same report, but they must not blame the same party for it.
         for (source, blamed) in [
             (
                 SymlinkCapabilitySource::RepositoryRecorded,
@@ -2781,22 +3141,22 @@ mod platform_materialization_tests {
                 return;
             }
 
-            let error = prove_one_entry(
+            let diverged = prove_one_entry(
                 &tracked,
                 TreeEntry::Symlink { target_blob },
                 &blob_store,
                 ExecutableModeAuthority::IndexMode,
                 SymlinkMaterialization::TargetTextFile(source),
             )
-            .expect_err("a real link contradicts a worktree that cannot hold one");
-            let rendered = error.to_string();
+            .expect("a real link contradicts a worktree that cannot hold one");
+            let rendered = only_detail(&diverged);
             assert!(
                 rendered.contains("is a real symbolic link"),
-                "unexpected error: {rendered}"
+                "unexpected detail: {rendered}"
             );
             assert!(
                 rendered.contains(blamed),
-                "the refusal must name who decided the materialization: {rendered}"
+                "the report must name who decided the materialization: {rendered}"
             );
         }
     }
@@ -2812,9 +3172,9 @@ mod platform_materialization_tests {
 
         // The file carries no executable bit anywhere, yet the committed tree
         // says it is executable. Under index authority the index proof already
-        // settled that, so admission proceeds; under worktree authority the
-        // same file must be refused.
-        prove_one_entry(
+        // settled that, so the entry agrees; under worktree authority the same
+        // file must be reported as differing.
+        let matched = prove_one_entry(
             &tracked,
             TreeEntry::Blob {
                 hash,
@@ -2825,8 +3185,12 @@ mod platform_materialization_tests {
             SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
         .expect("the index carries the exact mode");
+        assert!(
+            matched.is_empty(),
+            "index authority settles the mode without rereading the worktree: {matched:?}"
+        );
 
-        let error = prove_one_entry(
+        let compared = prove_one_entry(
             &tracked,
             TreeEntry::Blob {
                 hash,
@@ -2835,14 +3199,26 @@ mod platform_materialization_tests {
             &blob_store,
             ExecutableModeAuthority::WorktreeMode,
             SymlinkMaterialization::Link,
-        )
-        .expect_err("a worktree authority must still compare the filesystem");
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("different executable mode")
-                || rendered.contains("records no executable bit"),
-            "unexpected error: {rendered}"
         );
+        // Which outcome is correct is decided by the same predicate the
+        // production path decides on, so both hosts assert the behavior they
+        // actually have rather than one of them asserting the other's.
+        if filesystem_records_executable_bit() {
+            let rendered = only_detail(&compared.expect("a mode difference is observed"));
+            assert!(
+                rendered.contains("executable mode differs"),
+                "unexpected detail: {rendered}"
+            );
+        } else {
+            // A host with no executable bit never reaches worktree authority
+            // through `worktree_materialization`. Driving it here is what keeps
+            // the fail-closed backstop from rotting into a silent `false`.
+            let error = compared.expect_err("a mode this host cannot read is refused");
+            assert!(
+                error.to_string().contains("records no executable bit"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3261,8 +3637,13 @@ mod tests {
 
         let normal = fixture
             .preflight()
-            .expect_err("ordinary preflight must not hide an ambient .kin");
-        assert!(normal.to_string().contains("untracked non-ignored"));
+            .expect("ordinary preflight observes an ambient .kin");
+        assert_discloses(
+            &normal,
+            ".kin/version",
+            GitWorkspaceDivergenceKind::Untracked,
+            "",
+        );
         let after = preflight_git_migration_after_publication(
             &fixture.repo,
             &published_kin,
@@ -3274,35 +3655,70 @@ mod tests {
         assert_eq!(after, before);
 
         fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
-        let error = preflight_git_migration_after_publication(
+        let sibling = preflight_git_migration_after_publication(
             &fixture.repo,
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
             &fixture.store,
         )
-        .expect_err("post-publication proof must retain all other worktree authority");
-        assert!(error.to_string().contains("outside-kin.txt"));
+        .expect("post-publication proof must retain all other worktree authority");
+        assert_discloses(
+            &sibling,
+            "outside-kin.txt",
+            GitWorkspaceDivergenceKind::Untracked,
+            "",
+        );
+        assert_ne!(
+            sibling, after,
+            "a path that appeared after publication must change the proof"
+        );
     }
 
+    /// Tracked drift after publication is reported, and moves the proof.
+    ///
+    /// Init compares this proof against the one it took before publication and
+    /// refuses on any difference, so reporting the drift rather than refusing it
+    /// here keeps the same fail-closed outcome. Asserting the inequality is what
+    /// proves that: a report the proof did not carry would leave the caller's
+    /// comparison equal and the drift undetected.
     #[test]
-    fn post_publication_proof_still_rejects_tracked_source_drift() {
+    fn post_publication_proof_still_detects_tracked_source_drift() {
         let fixture = Fixture::clean();
         let published_kin = fixture.repo.join(".kin");
         fs::create_dir(&published_kin).expect("published Kin directory");
         fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
-        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
-            .expect("tracked source drift");
-
-        let error = preflight_git_migration_after_publication(
+        let clean = preflight_git_migration_after_publication(
             &fixture.repo,
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
             &fixture.store,
         )
-        .expect_err("tracked source drift must fail after publication");
-        assert!(error.to_string().contains("bytes differ"));
+        .expect("post-publication proof");
+        assert_no_divergence(&clean);
+
+        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
+            .expect("tracked source drift");
+        let drifted = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect("tracked source drift is observed after publication");
+        assert_discloses(
+            &drifted,
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::Modified,
+            "bytes differ",
+        );
+        assert_ne!(drifted, clean, "drift must move the proof");
+        assert_ne!(
+            drifted.observation_fingerprint, clean.observation_fingerprint,
+            "drift must move the observation fingerprint"
+        );
     }
 
     #[test]
@@ -3324,18 +3740,52 @@ mod tests {
         assert_preflight_contains(&nested_worktree, "materialized nested-repository state");
     }
 
+    /// Staged work is reported, not refused.
+    ///
+    /// An edit that was staged and one that was only announced with
+    /// `git add -N` are both paths the operator has not committed, so both are
+    /// workspace state rather than a reason the source cannot be read.
     #[test]
-    fn rejects_staged_conflicted_intent_and_ambiguous_index_state() {
+    fn reports_staged_and_intent_to_add_index_state() {
         let staged = Fixture::clean();
         fs::write(staged.repo.join("compose.yaml"), b"services: {}\n").expect("edit");
         git(&staged.repo, &["add", "compose.yaml"]);
-        assert_preflight_contains(&staged, "index entry compose.yaml");
+        let proof = staged.preflight().expect("staged work is observed");
+        assert_discloses(
+            &proof,
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::Staged,
+            "not the committed one",
+        );
 
         let intent = Fixture::clean();
         fs::write(intent.repo.join("intent.txt"), b"intent\n").expect("intent");
         git(&intent.repo, &["add", "--intent-to-add", "intent.txt"]);
-        assert_preflight_contains(&intent, "ambiguous flags");
+        let proof = intent.preflight().expect("an announced path is observed");
+        assert_discloses(
+            &proof,
+            "intent.txt",
+            GitWorkspaceDivergenceKind::Staged,
+            "does not carry this path",
+        );
+        // The index carries it, which is what Git calls tracked, so the worktree
+        // walk must not report the same path a second time as untracked.
+        assert_eq!(
+            proof.workspace_divergence.entries.len(),
+            1,
+            "{:?}",
+            proof.workspace_divergence
+        );
+    }
 
+    /// An index Git has been told not to compare is still refused.
+    ///
+    /// Under these the index no longer states anything about the worktree, so an
+    /// observation of one would not be an observation of the source at all. That
+    /// is ambiguity about the source rather than uncommitted work, which is the
+    /// line the in-progress-operation refusal already draws.
+    #[test]
+    fn rejects_conflicted_and_ambiguous_index_state() {
         let assume = Fixture::clean();
         git(
             &assume.repo,
@@ -3372,15 +3822,32 @@ mod tests {
         assert_preflight_contains(&sparse, "sparse checkout");
     }
 
+    /// Every shape of worktree edit is observed and reported.
+    ///
+    /// None of it enters authority, which the clean case above already proves is
+    /// the committed tree, so each one is workspace state whose only remaining
+    /// question is whether init said so.
     #[test]
-    fn rejects_unstaged_untracked_mode_symlink_and_byte_mismatches() {
+    fn reports_unstaged_untracked_mode_symlink_and_byte_mismatches() {
         let unstaged = Fixture::clean();
         fs::write(unstaged.repo.join("src/main.rs"), b"fn changed() {}\n").expect("edit");
-        assert_preflight_contains(&unstaged, "bytes differ");
+        assert_discloses(
+            &unstaged.preflight().expect("an edit is observed"),
+            "src/main.rs",
+            GitWorkspaceDivergenceKind::Modified,
+            "bytes differ",
+        );
 
         let untracked = Fixture::clean();
         fs::write(untracked.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
-        assert_preflight_contains(&untracked, "untracked non-ignored");
+        assert_discloses(
+            &untracked
+                .preflight()
+                .expect("an untracked path is observed"),
+            "surprise.txt",
+            GitWorkspaceDivergenceKind::Untracked,
+            "",
+        );
 
         let executable = Fixture::clean();
         let mut permissions = fs::metadata(executable.repo.join("script.sh"))
@@ -3388,7 +3855,12 @@ mod tests {
             .permissions();
         permissions.set_mode(0o644);
         fs::set_permissions(executable.repo.join("script.sh"), permissions).expect("chmod");
-        assert_preflight_contains(&executable, "executable mode");
+        assert_discloses(
+            &executable.preflight().expect("a mode change is observed"),
+            "script.sh",
+            GitWorkspaceDivergenceKind::Modified,
+            "executable mode differs",
+        );
 
         let symlink_target = Fixture::clean();
         fs::remove_file(symlink_target.repo.join("source-link")).expect("remove symlink");
@@ -3397,16 +3869,101 @@ mod tests {
             symlink_target.repo.join("source-link"),
         )
         .expect("new symlink");
-        assert_preflight_contains(&symlink_target, "target differs");
+        assert_discloses(
+            &symlink_target
+                .preflight()
+                .expect("a repointed link is observed"),
+            "source-link",
+            GitWorkspaceDivergenceKind::Modified,
+            "link target differs",
+        );
 
         let symlink_kind = Fixture::clean();
         fs::remove_file(symlink_kind.repo.join("source-link")).expect("remove symlink");
         fs::write(symlink_kind.repo.join("source-link"), b"src/main.rs").expect("regular file");
-        assert_preflight_contains(&symlink_kind, "not a symbolic link");
+        assert_discloses(
+            &symlink_kind
+                .preflight()
+                .expect("a replaced link is observed"),
+            "source-link",
+            GitWorkspaceDivergenceKind::Modified,
+            "no longer materializes it as a symbolic link",
+        );
+
+        let removed = Fixture::clean();
+        fs::remove_file(removed.repo.join("compose.yaml")).expect("remove tracked file");
+        assert_discloses(
+            &removed
+                .preflight()
+                .expect("a deleted committed path is observed"),
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::Missing,
+            "",
+        );
+
+        let unstaged_removal = Fixture::clean();
+        git(&unstaged_removal.repo, &["rm", "--cached", "compose.yaml"]);
+        assert_discloses(
+            &unstaged_removal
+                .preflight()
+                .expect("a staged removal is observed"),
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::StagedRemoval,
+            "",
+        );
+    }
+
+    /// A worked-in source seals authority at the committed tree regardless.
+    ///
+    /// This is the load-bearing half of admitting a dirty repository: the
+    /// workspace seed the proof is bound to has to stay the committed tree, and
+    /// the fingerprints of what was proven have to stay those of the clean
+    /// source, so nothing uncommitted can reach repository authority through a
+    /// path that merely stopped refusing.
+    #[test]
+    fn a_worked_in_source_still_seals_authority_at_the_committed_tree() {
+        // One repository observed twice, because a second fixture commits its
+        // own gitlink target and would differ for a reason this case is not
+        // about.
+        let fixture = Fixture::clean();
+        let clean_proof = fixture.preflight().expect("clean preflight");
+
+        fs::write(fixture.repo.join("src/main.rs"), b"fn edited() {}\n").expect("edit");
+        fs::write(fixture.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
+        fs::write(fixture.repo.join("staged.txt"), b"staged\n").expect("staged");
+        git(&fixture.repo, &["add", "staged.txt"]);
+        let dirty_proof = fixture
+            .preflight()
+            .expect("a worked-in source is admissible");
+
+        assert_eq!(
+            dirty_proof.base_tree_hash, clean_proof.base_tree_hash,
+            "authority is the committed tree, not the worktree"
+        );
+        assert_eq!(dirty_proof.head, clean_proof.head);
+        assert_eq!(dirty_proof.base_target, clean_proof.base_target);
+        assert_eq!(
+            dirty_proof.snapshot_fingerprint, clean_proof.snapshot_fingerprint,
+            "committed history is untouched by uncommitted work"
+        );
+        assert_eq!(
+            dirty_proof.semantic_plan_fingerprint,
+            clean_proof.semantic_plan_fingerprint
+        );
+        assert_eq!(
+            dirty_proof.workspace_divergence.observed_paths(),
+            3,
+            "{:?}",
+            dirty_proof.workspace_divergence
+        );
+        assert_ne!(
+            dirty_proof.observation_fingerprint, clean_proof.observation_fingerprint,
+            "what was observed must not fingerprint as a source that matched"
+        );
     }
 
     #[test]
-    fn rejects_clean_status_checkout_transformations() {
+    fn reports_clean_status_checkout_transformations() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
@@ -3429,24 +3986,100 @@ mod tests {
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let error =
-            preflight_git_migration(&repo, &snapshot, &plan, &store).expect_err("CRLF rejection");
-        let reported = error.to_string();
-        assert!(reported.contains("gradlew.bat"), "{reported}");
+        let proof = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect("a rewritten checkout is observed");
+        let reported = only_detail(&proof.workspace_divergence.entries);
         assert!(reported.contains("text eol=crlf"), "{reported}");
         assert!(reported.contains("line endings"), "{reported}");
         assert!(reported.contains("is not an unstaged edit"), "{reported}");
-        assert!(!reported.contains("has unstaged edits"), "{reported}");
+        assert!(!reported.contains("no checkout filter"), "{reported}");
+        assert_discloses(
+            &proof,
+            "gradlew.bat",
+            GitWorkspaceDivergenceKind::Modified,
+            "line endings",
+        );
+    }
+
+    /// A committed tree may record a mode the index cannot hold.
+    ///
+    /// `100664` is legal in a tree and several importers write it, while the
+    /// index decodes every plain file to `100644`. Comparing the raw values
+    /// reads such a repository as having every file staged, and no `git restore
+    /// --staged` clears it because nothing is. The comparison runs on the entry
+    /// kind for exactly this reason, and a repository that would have to answer
+    /// for a report it cannot act on is what asserts it.
+    #[test]
+    fn a_non_canonical_committed_filemode_is_not_reported_as_staged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source");
+        git(&repo, &["init", "--initial-branch=main"]);
+        configure_identity(&repo);
+        pin_default_hook_surface(&repo);
+        fs::write(repo.join("README.md"), b"seed\n").expect("readme");
+        git(&repo, &["add", "--all"]);
+        commit(&repo, "seed");
+
+        let blob = git_stdout(&repo, &["rev-parse", "HEAD:README.md"]);
+        // Written as raw tree bytes because `git mktree` canonicalises the mode
+        // on the way in, which is exactly the normalisation this case needs to
+        // be missing.
+        let mut body = b"100664 README.md\0".to_vec();
+        body.extend(
+            (0..blob.len() / 2)
+                .map(|index| u8::from_str_radix(&blob[index * 2..index * 2 + 2], 16))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("hex object id"),
+        );
+        let tree = String::from_utf8(
+            git_command(&repo)
+                .args(["hash-object", "-t", "tree", "-w", "--stdin", "--literally"])
+                .output_with_input(&body)
+                .expect("write raw tree")
+                .stdout,
+        )
+        .expect("utf8 object id")
+        .trim()
+        .to_string();
+        let commit = String::from_utf8(
+            git_stdin(
+                &repo,
+                &["commit-tree", &tree, "-m", "non-canonical mode"],
+                "",
+            )
+            .stdout,
+        )
+        .expect("utf8 object id")
+        .trim()
+        .to_string();
+        git(&repo, &["reset", "--hard", &commit]);
+        // Read as raw object bytes, because `cat-file -p` prints the
+        // canonicalised mode and would report the fixture worked either way.
+        let raw = git_command(&repo)
+            .args(["cat-file", "tree", "HEAD^{tree}"])
+            .output()
+            .expect("read raw committed tree");
+        assert!(
+            raw.stdout.starts_with(b"100664 "),
+            "the fixture must keep the mode this case is about"
+        );
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        let proof = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect("a non-canonical mode is admissible");
+        assert_no_divergence(&proof);
     }
 
     /// The partner of the checkout-transformation case above.
     ///
     /// A tree Git rewrote on checkout and a tree its operator edited both reach
-    /// the same byte comparison, so the refusal is only useful if each names its
+    /// the same byte comparison, so the report is only useful if each names its
     /// own cause. Asserting that neither message carries the other's sentence is
     /// what keeps the two from collapsing back into one accusation.
     #[test]
-    fn rejects_unstaged_edits_without_blaming_a_checkout_filter() {
+    fn reports_unstaged_edits_without_blaming_a_checkout_filter() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
@@ -3461,11 +4094,15 @@ mod tests {
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let error = preflight_git_migration(&repo, &snapshot, &plan, &store)
-            .expect_err("unstaged edit rejection");
-        let reported = error.to_string();
-        assert!(reported.contains("text.txt"), "{reported}");
-        assert!(reported.contains("has unstaged edits"), "{reported}");
+        let proof =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("an edit is observed");
+        assert_discloses(
+            &proof,
+            "text.txt",
+            GitWorkspaceDivergenceKind::Modified,
+            "no checkout filter",
+        );
+        let reported = only_detail(&proof.workspace_divergence.entries);
         assert!(!reported.contains("is not an unstaged edit"), "{reported}");
         assert!(!reported.contains(".gitattributes"), "{reported}");
         assert!(!reported.contains("line endings"), "{reported}");
@@ -4095,6 +4732,46 @@ mod tests {
         assert!(
             error.to_string().contains(expected),
             "expected {expected:?} in {error:?}"
+        );
+    }
+
+    /// One path reported as diverging, of the expected kind and reason.
+    ///
+    /// Asserts the proof was produced at all, which is the half that would
+    /// silently disappear if the observation went back to refusing.
+    fn assert_discloses(
+        proof: &GitMigrationPreflightProof,
+        path: &str,
+        kind: GitWorkspaceDivergenceKind,
+        detail: &str,
+    ) {
+        let divergence = &proof.workspace_divergence;
+        let found = divergence
+            .entries
+            .iter()
+            .find(|entry| entry.path.to_string() == path && entry.kind == kind)
+            .unwrap_or_else(|| {
+                panic!("{path} is not reported as {}: {divergence:?}", kind.label())
+            });
+        assert!(
+            found.detail.contains(detail),
+            "expected {detail:?} in {found:?}"
+        );
+    }
+
+    /// The one sentence a single reported divergence carries.
+    fn only_detail(entries: &[GitWorkspaceDivergence]) -> String {
+        let [entry] = entries else {
+            panic!("expected exactly one divergence, got {entries:?}");
+        };
+        entry.detail.clone()
+    }
+
+    fn assert_no_divergence(proof: &GitMigrationPreflightProof) {
+        assert!(
+            proof.workspace_divergence.is_empty(),
+            "unexpected divergence: {:?}",
+            proof.workspace_divergence
         );
     }
 

@@ -75,6 +75,34 @@ struct InitResultPayload<'a> {
     /// object store it was admitted from costs. Measured after publication, so
     /// it describes the store the caller now has rather than a projection of it.
     store_footprint: StoreFootprint,
+    /// Source paths that were not the committed state, and are therefore not in
+    /// what was admitted. Absent when the source carried none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncommitted_worktree: Option<UncommittedWorktreePayload>,
+}
+
+/// The uncommitted delta initialization saw and did not admit.
+#[derive(Debug, Serialize)]
+struct UncommittedWorktreePayload {
+    /// Paths observed, including every one this payload does not carry.
+    observed_paths: usize,
+    /// Observed paths not carried in `paths`.
+    unlisted_paths: usize,
+    paths: Vec<UncommittedPathPayload>,
+}
+
+/// Paths one machine-readable result carries by name.
+///
+/// Nothing bounds how many paths can differ: a repository whose checkout Git
+/// rewrote reports every text file it holds. A count of those is useful on a
+/// piped stdout and tens of thousands of path strings are not, so the payload
+/// carries a sample and says exactly how many it left out.
+const SERIALIZED_PATHS: usize = 200;
+
+#[derive(Debug, Serialize)]
+struct UncommittedPathPayload {
+    path: String,
+    state: &'static str,
 }
 
 pub async fn run(path: Option<String>, json: bool) -> Result<()> {
@@ -205,9 +233,32 @@ fn print_json_result(
         initial_change_id: result.authority.initial_change_id.as_ref(),
         exact_reachable_git_history: boundary == InitBoundary::ExactGit,
         store_footprint: StoreFootprint::measure(&result.layout),
+        uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn uncommitted_worktree_payload(
+    divergence: &kin_git::GitWorkspaceDivergenceFacts,
+) -> Option<UncommittedWorktreePayload> {
+    if divergence.is_empty() {
+        return None;
+    }
+    let paths = divergence
+        .entries
+        .iter()
+        .take(SERIALIZED_PATHS)
+        .map(|entry| UncommittedPathPayload {
+            path: entry.path.to_string(),
+            state: entry.kind.label(),
+        })
+        .collect::<Vec<_>>();
+    Some(UncommittedWorktreePayload {
+        observed_paths: divergence.observed_paths(),
+        unlisted_paths: divergence.observed_paths() - paths.len(),
+        paths,
+    })
 }
 
 fn print_human_result(
@@ -262,7 +313,77 @@ fn print_human_result(
         StoreFootprint::measure(&result.layout).render()
     );
     println!("  {}", store_size_notice());
+    for line in uncommitted_worktree_disclosure(&result.workspace_divergence) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Paths listed by name before the rest are counted rather than named.
+const DISCLOSED_PATHS: usize = 10;
+
+/// What to say about a source that had been worked in before it was admitted.
+///
+/// Authority is the committed state, so none of this is in the repository this
+/// command published, and none of it was lost either: it is still in the
+/// worktree, and the daemon admits it as workspace state the same way it admits
+/// every later edit. Both halves have to be said. A list with no disposition
+/// reads as damage, and a disposition with no list is a claim the operator
+/// cannot check.
+///
+/// Returns the exact lines to print, so absence is one empty vector rather than
+/// a branch at the call site.
+fn uncommitted_worktree_disclosure(
+    divergence: &kin_git::GitWorkspaceDivergenceFacts,
+) -> Vec<String> {
+    if divergence.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  Uncommitted worktree state: {} path(s) differ from the committed state that was admitted",
+        divergence.observed_paths()
+    )];
+    for kind in [
+        kin_git::GitWorkspaceDivergenceKind::Staged,
+        kin_git::GitWorkspaceDivergenceKind::StagedRemoval,
+        kin_git::GitWorkspaceDivergenceKind::Modified,
+        kin_git::GitWorkspaceDivergenceKind::Missing,
+        kin_git::GitWorkspaceDivergenceKind::Untracked,
+    ] {
+        let paths = divergence
+            .of_kind(kind)
+            .map(|entry| entry.path.to_string())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            continue;
+        }
+        // Paths the walk stopped naming are part of the total this line states
+        // and are not among the ones it can list, so they count once in each
+        // and never in both.
+        let observed = paths.len()
+            + if kind == kin_git::GitWorkspaceDivergenceKind::Untracked {
+                divergence.untracked_beyond_cap
+            } else {
+                0
+            };
+        let mut rendered = paths
+            .iter()
+            .take(DISCLOSED_PATHS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unlisted = observed - paths.len().min(DISCLOSED_PATHS);
+        if unlisted > 0 {
+            rendered.push_str(&format!(", and {unlisted} more"));
+        }
+        lines.push(format!("    {} ({observed}): {rendered}", kind.label()));
+    }
+    lines.push(
+        "  None of it entered repository authority, and none of it was touched. It becomes \
+         workspace state the first time the daemon runs here."
+            .to_string(),
+    );
+    lines
 }
 
 /// What to say when initialization produced no semantic entities at all.
@@ -393,6 +514,129 @@ mod tests {
         assert!(
             semantic_absence_notice(&enrichment(SemanticEnrichmentPresence::Present, 19_405))
                 .is_none()
+        );
+    }
+
+    fn divergence(
+        entries: Vec<(&str, kin_git::GitWorkspaceDivergenceKind)>,
+        beyond_cap: usize,
+    ) -> kin_git::GitWorkspaceDivergenceFacts {
+        let mut facts = kin_git::GitWorkspaceDivergenceFacts::none();
+        facts.entries = entries
+            .into_iter()
+            .map(|(path, kind)| kin_git::GitWorkspaceDivergence {
+                path: kin_model::RepoPath::from_bytes(path.as_bytes().to_vec())
+                    .expect("test repo path"),
+                kind,
+                detail: String::new(),
+                observed: None,
+            })
+            .collect();
+        facts.untracked_beyond_cap = beyond_cap;
+        facts
+    }
+
+    /// The disclosure names the paths and says where they went.
+    ///
+    /// A list with no disposition reads as damage, so the sentence about what
+    /// happens to the delta is asserted alongside the paths themselves.
+    #[test]
+    fn the_uncommitted_disclosure_names_paths_and_their_disposition() {
+        let lines = uncommitted_worktree_disclosure(&divergence(
+            vec![
+                ("src/main.rs", kin_git::GitWorkspaceDivergenceKind::Modified),
+                ("notes.txt", kin_git::GitWorkspaceDivergenceKind::Untracked),
+                ("staged.rs", kin_git::GitWorkspaceDivergenceKind::Staged),
+            ],
+            0,
+        ))
+        .join("\n");
+
+        assert!(lines.contains("3 path(s) differ"), "{lines}");
+        assert!(lines.contains("staged (1): staged.rs"), "{lines}");
+        assert!(lines.contains("modified (1): src/main.rs"), "{lines}");
+        assert!(lines.contains("untracked (1): notes.txt"), "{lines}");
+        assert!(
+            lines.contains("None of it entered repository authority"),
+            "{lines}"
+        );
+        assert!(lines.contains("the first time the daemon runs"), "{lines}");
+    }
+
+    /// A long list is capped and the rest counted, including what the walk
+    /// stopped naming, so the total the header states is never contradicted by
+    /// the lines beneath it.
+    #[test]
+    fn the_uncommitted_disclosure_counts_what_it_does_not_list() {
+        let entries = (0..12)
+            .map(|index| (index, kin_git::GitWorkspaceDivergenceKind::Untracked))
+            .collect::<Vec<_>>();
+        let named = entries
+            .iter()
+            .map(|(index, kind)| (format!("untracked-{index:02}.log"), *kind))
+            .collect::<Vec<_>>();
+        let lines = uncommitted_worktree_disclosure(&divergence(
+            named
+                .iter()
+                .map(|(path, kind)| (path.as_str(), *kind))
+                .collect(),
+            7,
+        ))
+        .join("\n");
+
+        assert!(lines.contains("19 path(s) differ"), "{lines}");
+        assert!(lines.contains("untracked (19)"), "{lines}");
+        assert!(lines.contains("untracked-00.log"), "{lines}");
+        assert!(lines.contains("untracked-09.log"), "{lines}");
+        assert!(!lines.contains("untracked-10.log"), "{lines}");
+        assert!(lines.contains("and 9 more"), "{lines}");
+    }
+
+    /// The machine-readable payload carries a sample and counts the rest.
+    ///
+    /// A repository whose checkout Git rewrote reports every text file it
+    /// holds, so an unbounded array here is tens of thousands of path strings
+    /// on a piped stdout. The count stays exact either way, and the two
+    /// numbers must always add up to it.
+    #[test]
+    fn the_uncommitted_payload_bounds_its_path_list_without_losing_the_count() {
+        let entries = (0..SERIALIZED_PATHS + 40)
+            .map(|index| {
+                (
+                    format!("src/file-{index:04}.rs"),
+                    kin_git::GitWorkspaceDivergenceKind::Modified,
+                )
+            })
+            .collect::<Vec<_>>();
+        let payload = uncommitted_worktree_payload(&divergence(
+            entries
+                .iter()
+                .map(|(path, kind)| (path.as_str(), *kind))
+                .collect(),
+            13,
+        ))
+        .expect("a divergent source carries a payload");
+
+        assert_eq!(payload.observed_paths, SERIALIZED_PATHS + 53);
+        assert_eq!(payload.paths.len(), SERIALIZED_PATHS);
+        assert_eq!(payload.unlisted_paths, 53);
+        assert_eq!(
+            payload.paths.len() + payload.unlisted_paths,
+            payload.observed_paths,
+            "what is listed plus what is not must be what was observed"
+        );
+    }
+
+    /// The falsification: a source that matched prints nothing, or the
+    /// disclosure is noise on every clean init.
+    #[test]
+    fn a_source_that_matched_gets_no_disclosure() {
+        assert!(
+            uncommitted_worktree_disclosure(&kin_git::GitWorkspaceDivergenceFacts::none())
+                .is_empty()
+        );
+        assert!(
+            uncommitted_worktree_payload(&kin_git::GitWorkspaceDivergenceFacts::none()).is_none()
         );
     }
 }

@@ -12,12 +12,13 @@
         "fresh Git repositories import the complete exact reachable object, ref, change, tree, mode, symlink, gitlink, and non-code-artifact closure atomically",
         "fresh non-Git repositories create only an unborn repository-v6 authority",
         "existing .kin and non-empty non-Git directories fail without mutation",
-        "safe exact Git remote mappings are sealed into graph-adjacent local transport config while unsafe mappings fail closed before .kin publication"
+        "safe exact Git remote mappings are sealed into graph-adjacent local transport config while unsafe mappings fail closed before .kin publication",
+        "a Git worktree carrying uncommitted work is admitted at its committed state, with every differing path disclosed in human and JSON output rather than refused"
       ],
       "evidence_tests": [
         "crates/kin-cli/tests/init_json.rs"
       ],
-      "note": "The clean-slate admission dispatcher is implemented and covered by exact Git and native-unborn acceptance tests."
+      "note": "The clean-slate admission dispatcher is implemented and covered by exact Git and native-unborn acceptance tests. Repository authority is the committed workspace seed and nothing else, so index and worktree state that is not the seed is observed and reported rather than refused: it stays in the worktree and the daemon admits it as workspace state through the same seam it admits every later edit. What still refuses is ambiguity about the source itself, where the committed state a migration would seal is not decidable, which is an in-progress Git operation, a conflicted or sparse index, an entry Git has been told not to compare, a materialized nested repository, a hook the repository owns, a checkout filter, another registered worktree, and repository-local transport configuration outside the safe exact subset. That last refusal now names every offending key rather than the first."
     },
     {
       "command": "status",

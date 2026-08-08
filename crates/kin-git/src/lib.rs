@@ -56,8 +56,9 @@ pub use preflight::{
     preflight_git_migration, preflight_git_migration_after_publication, GitBranchTrackingFact,
     GitIndexPreflightProof, GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind,
     GitMigrationCompatibilityFacts, GitMigrationPreflightProof, GitRemoteConfigFact,
-    GitRemoteMappingFacts, GitTrackedWorktreeProof, IgnoredLocalEntry, IgnoredLocalEntryKind,
-    IgnoredLocalWorktreeFact,
+    GitRemoteMappingFacts, GitTrackedWorktreeProof, GitWorkspaceDivergence,
+    GitWorkspaceDivergenceFacts, GitWorkspaceDivergenceKind, IgnoredLocalEntry,
+    IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
 };
 pub use repository_export::{
     export_repository_to_git, verify_repository_git_export, RepositoryGitCommitBinding,
