@@ -180,6 +180,18 @@ enum LocalDirectoryBindKind {
     Staging,
 }
 
+/// Whether a repository authority lock excludes other holders of the same
+/// repository, or only excludes writers.
+///
+/// Every mutation takes `Exclusive`. `Shared` belongs to entry points that
+/// create nothing, rename nothing and delete nothing, so concurrent readers
+/// of one repository stop serializing on each other.
+#[derive(Clone, Copy)]
+enum LocalRepositoryLockAccess {
+    Exclusive,
+    Shared,
+}
+
 #[cfg(test)]
 std::thread_local! {
     static REPOSITORY_AFTER_PREOPEN_HOOK:
@@ -230,6 +242,144 @@ fn run_local_directory_after_preopen_hook(kind: LocalDirectoryBindKind) {
 #[cfg(not(test))]
 fn run_local_directory_after_preopen_hook(_kind: LocalDirectoryBindKind) {}
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many times this thread re-resolved the repository namespace from
+    /// the filesystem root, and how many digest-prefix capability chains it
+    /// walked. Both are load-independent proxies for the per-object syscall
+    /// envelope: a confirmation is roughly twenty syscalls including two
+    /// `realpath` calls and a directory-stream read, and a walk is an `openat`
+    /// per chain component. A test asserts they are amortized per write
+    /// session rather than paid per body.
+    static SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    static SOURCE_ENVELOPE_CAPABILITY_WALKS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_source_blob_capability_walk() {
+    SOURCE_ENVELOPE_CAPABILITY_WALKS.with(|walks| walks.set(walks.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_source_blob_capability_walk() {}
+
+#[cfg(test)]
+fn record_repository_visibility_confirmation() {
+    SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS
+        .with(|confirmations| confirmations.set(confirmations.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_repository_visibility_confirmation() {}
+
+/// Repository-visibility confirmations and prefix capability walks recorded on
+/// this thread since the last reset.
+#[cfg(all(test, unix))]
+fn source_envelope_counters() -> (u64, u64) {
+    (
+        SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS.with(std::cell::Cell::get),
+        SOURCE_ENVELOPE_CAPABILITY_WALKS.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(all(test, unix))]
+fn reset_source_envelope_counters() {
+    SOURCE_ENVELOPE_REPOSITORY_CONFIRMATIONS.with(|confirmations| confirmations.set(0));
+    SOURCE_ENVELOPE_CAPABILITY_WALKS.with(|walks| walks.set(0));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Device cache flushes and ordering barriers this thread issued through
+    /// the immutable-source write path. Directory barriers are not counted
+    /// here; these are the per-body costs, which are the ones that scale.
+    static SOURCE_DEVICE_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SOURCE_ORDERING_BARRIERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_source_device_flush() {
+    SOURCE_DEVICE_FLUSHES.with(|flushes| flushes.set(flushes.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_source_device_flush() {}
+
+// Gated to Apple, not merely to unix: `F_BARRIERFSYNC` is the only ordering
+// barrier this path issues and it exists nowhere else, so a unix-wide
+// definition is dead code on Linux and fails the `-D warnings` gate there.
+#[cfg(all(test, target_vendor = "apple"))]
+fn record_source_ordering_barrier() {
+    SOURCE_ORDERING_BARRIERS.with(|barriers| barriers.set(barriers.get() + 1));
+}
+
+#[cfg(all(not(test), target_vendor = "apple"))]
+fn record_source_ordering_barrier() {}
+
+/// Device flushes and ordering barriers recorded on this thread since the
+/// last reset.
+#[cfg(all(test, unix))]
+fn source_barrier_counters() -> (u64, u64) {
+    (
+        SOURCE_DEVICE_FLUSHES.with(std::cell::Cell::get),
+        SOURCE_ORDERING_BARRIERS.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(all(test, unix))]
+fn reset_source_barrier_counters() {
+    SOURCE_DEVICE_FLUSHES.with(|flushes| flushes.set(0));
+    SOURCE_ORDERING_BARRIERS.with(|barriers| barriers.set(0));
+}
+
+/// How a body's own bytes reach the device before the `linkat` that names it.
+///
+/// `FullDevice` is an `fsync` plus a flush of the drive's write cache. On
+/// Apple platforms that is what `File::sync_all` issues: the standard library
+/// maps `fsync` to `fcntl(F_FULLFSYNC)` there.
+///
+/// `Ordering` is Apple's `F_BARRIERFSYNC`, which `fcntl(2)` documents as
+/// doing the same thing as `fsync` and then issuing a barrier to the drive,
+/// so that everything fsynced on that device beforehand is persisted before
+/// any I/O issued after the barrier. That is precisely the data-before-name
+/// guarantee this path needs, and the man page names this two-phase use as
+/// what the barrier is for. It exists only on HFS and APFS, so every other
+/// platform and every unsupported volume resolves back to `FullDevice`, which
+/// is the stronger barrier rather than a weaker one.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SourceBodyBarrier {
+    FullDevice,
+    Ordering,
+}
+
+#[cfg(unix)]
+fn issue_source_body_barrier(
+    file: &std::fs::File,
+    barrier: SourceBodyBarrier,
+) -> Result<(), std::io::Error> {
+    #[cfg(target_vendor = "apple")]
+    if matches!(barrier, SourceBodyBarrier::Ordering) {
+        // SAFETY: the descriptor is live for the duration of the call and
+        // F_BARRIERFSYNC ignores its argument.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0 {
+            record_source_ordering_barrier();
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOTTY) | Some(libc::ENOTSUP) | Some(libc::EINVAL) => {}
+            _ => return Err(error),
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = barrier;
+    record_source_device_flush();
+    file.sync_all()
+}
+
 #[cfg(all(test, unix))]
 fn fail_source_file_sync_once() {
     SOURCE_FILE_SYNC_FAILURE.with(|failure| failure.set(true));
@@ -247,6 +397,7 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
             display_path.display()
         )));
     }
+    record_source_device_flush();
     file.sync_all().map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to fsync immutable source blob {}: {error}",
@@ -257,6 +408,7 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
 
 #[cfg(windows)]
 fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result<(), KinDbError> {
+    record_source_device_flush();
     file.sync_all().map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to flush immutable source blob {}: {error}",
@@ -396,14 +548,20 @@ fn source_component(name: &str) -> Result<CString, KinDbError> {
     })
 }
 
+/// Open one immutable-source directory component, reporting a component that
+/// simply is not there as absence rather than as a fault.
+///
+/// Only `ENOENT` is absence. A symlinked component fails `O_NOFOLLOW` with
+/// `ELOOP` and a non-directory fails `O_DIRECTORY` with `ENOTDIR`, so the
+/// refusals this walk exists to make are still errors.
 #[cfg(unix)]
-fn open_source_directory_at(
+fn open_optional_source_directory_at(
     parent: &std::fs::File,
     name: &str,
     display_path: &Path,
     create: bool,
     confirm_durability: bool,
-) -> Result<std::fs::File, KinDbError> {
+) -> Result<Option<std::fs::File>, KinDbError> {
     let component = source_component(name)?;
     if create {
         // SAFETY: both descriptors and the NUL-terminated component are valid
@@ -432,6 +590,9 @@ fn open_source_directory_at(
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
         return Err(KinDbError::StorageError(format!(
             "refusing symlinked or non-directory immutable source blob ancestor {} (or missing path): {error}",
             display_path.display()
@@ -442,7 +603,25 @@ fn open_source_directory_at(
     if confirm_durability {
         mmap::sync_directory_handle(parent, display_path.parent().unwrap_or(display_path))?;
     }
-    Ok(directory)
+    Ok(Some(directory))
+}
+
+#[cfg(unix)]
+fn open_source_directory_at(
+    parent: &std::fs::File,
+    name: &str,
+    display_path: &Path,
+    create: bool,
+    confirm_durability: bool,
+) -> Result<std::fs::File, KinDbError> {
+    open_optional_source_directory_at(parent, name, display_path, create, confirm_durability)?
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "refusing symlinked or non-directory immutable source blob ancestor {} (or missing path): {}",
+                display_path.display(),
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))
+        })
 }
 
 #[cfg(unix)]
@@ -497,14 +676,21 @@ fn prepare_source_trust_root(
     Ok(())
 }
 
+/// The `source-blobs/sha256/HH` directory component a digest publishes into.
 #[cfg(unix)]
-fn open_source_blob_capability_from_repository(
+fn source_blob_prefix(digest: [u8; 32]) -> String {
+    hex::encode(&digest[..1])
+}
+
+#[cfg(unix)]
+fn open_source_blob_prefix_capability_from_repository(
     repository: &cap_std::fs::Dir,
     repository_display: &Path,
-    digest: [u8; 32],
+    prefix: &str,
     create: bool,
     confirm_durability: bool,
 ) -> Result<SourceBlobCapability, KinDbError> {
+    record_source_blob_capability_walk();
     let repo_dir = mmap::open_directory_handle_at(repository, Path::new("."), repository_display)
         .map_err(|error| {
         KinDbError::StorageError(format!(
@@ -518,9 +704,8 @@ fn open_source_blob_capability_from_repository(
             repository_display.display()
         ))
     })?;
-    let digest_hex = hex::encode(digest);
     let mut display = repository_display.to_path_buf();
-    for component in ["source-blobs", "sha256", &digest_hex[..2]] {
+    for component in ["source-blobs", "sha256", prefix] {
         display.push(component);
         parent =
             open_source_directory_at(&parent, component, &display, create, confirm_durability)?;
@@ -530,6 +715,65 @@ fn open_source_blob_capability_from_repository(
         leaf_dir: parent,
         leaf_path: display,
     })
+}
+
+#[cfg(unix)]
+fn open_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+    create: bool,
+    confirm_durability: bool,
+) -> Result<SourceBlobCapability, KinDbError> {
+    open_source_blob_prefix_capability_from_repository(
+        repository,
+        repository_display,
+        &source_blob_prefix(digest),
+        create,
+        confirm_durability,
+    )
+}
+
+/// Pin the digest-prefix chain for a read, creating nothing.
+///
+/// A repository that has never stored a body has no `source-blobs/sha256/HH`
+/// chain, which is the same answer as a repository that does not hold this
+/// body: `None`, with nothing written.
+#[cfg(unix)]
+fn open_existing_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+) -> Result<Option<SourceBlobCapability>, KinDbError> {
+    record_source_blob_capability_walk();
+    let repo_dir = mmap::open_directory_handle_at(repository, Path::new("."), repository_display)
+        .map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository capability {}: {error}",
+            repository_display.display()
+        ))
+    })?;
+    let mut parent = repo_dir.try_clone().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository directory {}: {error}",
+            repository_display.display()
+        ))
+    })?;
+    let mut display = repository_display.to_path_buf();
+    for component in ["source-blobs", "sha256", &source_blob_prefix(digest)] {
+        display.push(component);
+        let Some(next) =
+            open_optional_source_directory_at(&parent, component, &display, false, false)?
+        else {
+            return Ok(None);
+        };
+        parent = next;
+    }
+    Ok(Some(SourceBlobCapability {
+        repo_dir,
+        leaf_dir: parent,
+        leaf_path: display,
+    }))
 }
 
 #[cfg(unix)]
@@ -544,16 +788,16 @@ fn same_directory(left: &std::fs::File, right: &std::fs::File) -> Result<bool, K
 }
 
 #[cfg(unix)]
-fn confirm_source_blob_namespace_from_repository(
+fn confirm_source_blob_prefix_namespace_from_repository(
     repository: &cap_std::fs::Dir,
     repository_display: &Path,
-    digest: [u8; 32],
+    prefix: &str,
     capability: &SourceBlobCapability,
 ) -> Result<(), KinDbError> {
-    let current = open_source_blob_capability_from_repository(
+    let current = open_source_blob_prefix_capability_from_repository(
         repository,
         repository_display,
-        digest,
+        prefix,
         false,
         false,
     )?;
@@ -566,6 +810,21 @@ fn confirm_source_blob_namespace_from_repository(
         )));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn confirm_source_blob_namespace_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+    capability: &SourceBlobCapability,
+) -> Result<(), KinDbError> {
+    confirm_source_blob_prefix_namespace_from_repository(
+        repository,
+        repository_display,
+        &source_blob_prefix(digest),
+        capability,
+    )
 }
 
 #[cfg(unix)]
@@ -667,14 +926,20 @@ fn read_source_file_at(
 ///
 /// `confirm_directory` decides whether the directory entry is made durable
 /// before this call returns. A batch clears it and issues one directory
-/// barrier per touched directory at its flush instead. The body's own fsync
+/// barrier per touched directory at its flush instead. The body's own barrier
 /// always happens before the `linkat` that names it, in both modes, so a
 /// deferred barrier can only lose the name.
+///
+/// `barrier` decides how strong that body barrier is. A batch orders rather
+/// than flushes, and flushes the device once for the whole session before it
+/// makes any name durable, so the body still reaches the device before the
+/// name that points at it.
 fn publish_source_file_at(
     directory: &std::fs::File,
     digest_hex: &str,
     data: &[u8],
     confirm_directory: bool,
+    barrier: SourceBodyBarrier,
 ) -> Result<bool, KinDbError> {
     let staging = format!(".{digest_hex}.no-clobber-{}", uuid::Uuid::new_v4());
     let staging_name = source_component(&staging)?;
@@ -698,7 +963,7 @@ fn publish_source_file_at(
     let mut staged = unsafe { std::fs::File::from_raw_fd(fd) };
     let write_result = staged
         .write_all(data)
-        .and_then(|()| staged.sync_all())
+        .and_then(|()| issue_source_body_barrier(&staged, barrier))
         .map_err(|error| KinDbError::StorageError(error.to_string()));
     drop(staged);
     if let Err(error) = write_result {
@@ -873,13 +1138,18 @@ fn windows_source_metadata_is_reparse(metadata: &cap_std::fs::Metadata) -> bool 
     cap_fs_ext::OsMetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+/// Open one immutable-source directory component, reporting a component that
+/// simply is not there as absence rather than as a fault.
+///
+/// Only a not-found open is absence. A reparse point or a non-directory still
+/// fails, so the refusals this walk exists to make are unchanged.
 #[cfg(windows)]
-fn open_windows_source_directory_at(
+fn open_optional_windows_source_directory_at(
     parent: &cap_std::fs::Dir,
     component: &std::ffi::OsStr,
     display_path: &Path,
     create: bool,
-) -> Result<cap_std::fs::Dir, KinDbError> {
+) -> Result<Option<cap_std::fs::Dir>, KinDbError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
     use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -906,12 +1176,16 @@ fn open_windows_source_directory_at(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .follow(FollowSymlinks::No)
         .maybe_dir(true);
-    let file = parent.open_with(component, &options).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {error}",
-            display_path.display()
-        ))
-    })?;
+    let file = match parent.open_with(component, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {error}",
+                display_path.display()
+            )));
+        }
+    };
     let metadata = file
         .metadata()
         .map_err(|error| KinDbError::StorageError(error.to_string()))?;
@@ -921,7 +1195,25 @@ fn open_windows_source_directory_at(
             display_path.display()
         )));
     }
-    Ok(cap_std::fs::Dir::from_std_file(file.into_std()))
+    Ok(Some(cap_std::fs::Dir::from_std_file(file.into_std())))
+}
+
+#[cfg(windows)]
+fn open_windows_source_directory_at(
+    parent: &cap_std::fs::Dir,
+    component: &std::ffi::OsStr,
+    display_path: &Path,
+    create: bool,
+) -> Result<cap_std::fs::Dir, KinDbError> {
+    open_optional_windows_source_directory_at(parent, component, display_path, create)?.ok_or_else(
+        || {
+            KinDbError::StorageError(format!(
+                "refusing reparse-point or non-directory immutable source blob ancestor {} (or missing path): {}",
+                display_path.display(),
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ))
+        },
+    )
 }
 
 #[cfg(windows)]
@@ -931,6 +1223,7 @@ fn open_windows_source_blob_capability_from_repository(
     digest: [u8; 32],
     create: bool,
 ) -> Result<WindowsSourceBlobCapability, KinDbError> {
+    record_source_blob_capability_walk();
     let mut directories = vec![repository.open_dir(".").map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to clone retained Windows repository capability {}: {error}",
@@ -966,6 +1259,54 @@ fn open_windows_source_blob_capability_from_repository(
         capability.sync_ancestor_publication()?;
     }
     Ok(capability)
+}
+
+/// Pin the digest-prefix chain for a read, creating nothing.
+///
+/// A repository that has never stored a body has no `source-blobs/sha256/HH`
+/// chain, which is the same answer as a repository that does not hold this
+/// body: `None`, with nothing written.
+#[cfg(windows)]
+fn open_existing_windows_source_blob_capability_from_repository(
+    repository: &cap_std::fs::Dir,
+    repository_display: &Path,
+    digest: [u8; 32],
+) -> Result<Option<WindowsSourceBlobCapability>, KinDbError> {
+    record_source_blob_capability_walk();
+    let mut directories = vec![repository.open_dir(".").map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained Windows repository capability {}: {error}",
+            repository_display.display()
+        ))
+    })?];
+    let mut display_paths = vec![repository_display.to_path_buf()];
+    let mut display = repository_display.to_path_buf();
+    let digest_hex = hex::encode(digest);
+    for component in [
+        std::ffi::OsStr::new("source-blobs"),
+        std::ffi::OsStr::new("sha256"),
+        std::ffi::OsStr::new(&digest_hex[..2]),
+    ] {
+        display.push(component);
+        let Some(next) = open_optional_windows_source_directory_at(
+            directories
+                .last()
+                .expect("repository capability was inserted"),
+            component,
+            &display,
+            false,
+        )?
+        else {
+            return Ok(None);
+        };
+        directories.push(next);
+        display_paths.push(display.clone());
+    }
+    Ok(Some(WindowsSourceBlobCapability {
+        directories,
+        display_paths,
+        leaf_path: display,
+    }))
 }
 
 #[cfg(windows)]
@@ -2302,57 +2643,128 @@ struct LocalRepositoryCapability {
     lock_publication_sync_pending: std::sync::atomic::AtomicBool,
 }
 
-/// Directory entries a write batch has published but not yet made durable.
+/// The digest-prefix directories a write batch pinned, and whose entries it
+/// has published but not yet made durable.
 ///
-/// One handle is retained per digest prefix the batch wrote into, which bounds
-/// the set at the 256 possible prefixes however many bodies the batch carries.
+/// One capability is retained per digest prefix the batch wrote into, which
+/// bounds the set at the 256 possible prefixes however many bodies the batch
+/// carries. A prefix is walked and namespace-confirmed once, when it is
+/// pinned; every later body in that prefix publishes through the pinned
+/// descriptor, and the flush re-confirms every pinned prefix before it issues
+/// a barrier.
 #[cfg(unix)]
 #[derive(Default)]
 struct DeferredSourceDurability {
-    leaves: parking_lot::Mutex<std::collections::BTreeMap<String, (std::fs::File, PathBuf)>>,
+    prefixes: parking_lot::Mutex<
+        std::collections::BTreeMap<String, std::sync::Arc<SourceBlobCapability>>,
+    >,
 }
 
 #[cfg(unix)]
 impl DeferredSourceDurability {
-    fn record(
+    /// Pin a digest prefix for the rest of the session, or return the
+    /// descriptor already pinned for it.
+    ///
+    /// The walk that opens a prefix is followed immediately by the same
+    /// namespace confirmation a per-object write performs, so a capability
+    /// enters the cache only after it has been checked against a fresh
+    /// resolution of its own path.
+    fn capability(
         &self,
-        capability: &SourceBlobCapability,
-        digest_hex: &str,
-    ) -> Result<(), KinDbError> {
-        let prefix = &digest_hex[..2];
-        let mut leaves = self.leaves.lock();
-        if leaves.contains_key(prefix) {
-            return Ok(());
+        namespace: &LocalRepositoryCapability,
+        prefix: &str,
+    ) -> Result<std::sync::Arc<SourceBlobCapability>, KinDbError> {
+        let mut prefixes = self.prefixes.lock();
+        if let Some(capability) = prefixes.get(prefix) {
+            return Ok(std::sync::Arc::clone(capability));
         }
-        let retained = capability.leaf_dir.try_clone().map_err(|error| {
-            KinDbError::StorageError(format!(
-                "failed to retain immutable source directory {} for a deferred durability barrier: {error}",
-                capability.leaf_path.display()
-            ))
-        })?;
-        leaves.insert(prefix.to_string(), (retained, capability.leaf_path.clone()));
-        Ok(())
+        let capability = std::sync::Arc::new(open_source_blob_prefix_capability_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            prefix,
+            true,
+            false,
+        )?);
+        confirm_source_blob_prefix_namespace_from_repository(
+            &namespace.directory,
+            &namespace.display_path,
+            prefix,
+            &capability,
+        )?;
+        prefixes.insert(prefix.to_string(), std::sync::Arc::clone(&capability));
+        Ok(capability)
     }
 
-    /// Issue every outstanding barrier child before parent: each digest
-    /// directory that names bodies, then the prefix chain naming those
-    /// directories, then the repository directory naming the chain.
+    /// Re-confirm every pinned prefix, flush the device once, then issue every
+    /// outstanding barrier child before parent: each digest directory that
+    /// names bodies, then the prefix chain naming those directories, then the
+    /// repository directory naming the chain.
+    ///
+    /// The confirmations run first and as a group, so a namespace substituted
+    /// at any point in the session fails the session before a single name is
+    /// made durable.
+    ///
+    /// The device flush runs next, before the first directory barrier, so at
+    /// the moment any name becomes durable every body it could name is
+    /// already on stable media.
     ///
     /// The record is cleared only once every barrier succeeded, so a failed
     /// flush stays outstanding and a retry reissues it rather than reporting
     /// durability this batch never reached.
     fn flush(&self, namespace: &LocalRepositoryCapability) -> Result<(), KinDbError> {
-        let mut leaves = self.leaves.lock();
-        if leaves.is_empty() {
+        let mut prefixes = self.prefixes.lock();
+        if prefixes.is_empty() {
             return Ok(());
         }
-        for (directory, display) in leaves.values() {
-            mmap::sync_directory_handle(directory, display)?;
+        for (prefix, capability) in prefixes.iter() {
+            confirm_source_blob_prefix_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                prefix,
+                capability,
+            )?;
+        }
+        sync_source_blob_device(namespace)?;
+        for capability in prefixes.values() {
+            mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)?;
         }
         sync_source_blob_chain(namespace)?;
-        leaves.clear();
+        prefixes.clear();
         Ok(())
     }
+}
+
+/// Flush the drive's write cache once for the whole write session.
+///
+/// Each body reached the device behind an ordering barrier, which guarantees
+/// it is persisted before anything issued afterwards but promises nothing
+/// about when. This is what converts ordered into persisted, and it is issued
+/// before the first directory barrier so no name can become durable ahead of
+/// its bytes.
+///
+/// It is issued through the repository directory handle because `F_FULLFSYNC`
+/// asks the drive to flush, which is a property of the device rather than of
+/// the descriptor it is requested on.
+#[cfg(unix)]
+fn sync_source_blob_device(namespace: &LocalRepositoryCapability) -> Result<(), KinDbError> {
+    let repo_dir = mmap::open_directory_handle_at(
+        &namespace.directory,
+        Path::new("."),
+        &namespace.display_path,
+    )
+    .map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to clone retained repository capability {}: {error}",
+            namespace.display_path.display()
+        ))
+    })?;
+    record_source_device_flush();
+    repo_dir.sync_all().map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to flush the device before publishing names below {}: {error}",
+            namespace.display_path.display()
+        ))
+    })
 }
 
 /// Make the `source-blobs/sha256` chain durable, child before parent.
@@ -2422,6 +2834,47 @@ impl LocalSourceDurability<'_> {
         matches!(self, Self::Immediate)
     }
 
+    /// Whether the repository namespace is re-resolved from the filesystem
+    /// root around this body.
+    ///
+    /// A batch is already bracketed by that check: acquiring the repository
+    /// lock resolves and identity-matches the namespace before the first body,
+    /// and the flush confirms it again after the last. Repeating it per body
+    /// re-derives an identity the session already pinned.
+    fn confirms_repository_inline(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    /// Whether the digest-prefix chain is re-walked and compared against the
+    /// pinned descriptor around this body.
+    ///
+    /// A batch confirms a prefix when it pins it and again for every pinned
+    /// prefix at its flush, so the check moves to the session boundary rather
+    /// than disappearing.
+    fn confirms_namespace_inline(&self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    /// Pin the digest-prefix directory this body publishes into.
+    fn capability(
+        &self,
+        namespace: &LocalRepositoryCapability,
+        prefix: &str,
+    ) -> Result<std::sync::Arc<SourceBlobCapability>, KinDbError> {
+        match self {
+            Self::Immediate => Ok(std::sync::Arc::new(
+                open_source_blob_prefix_capability_from_repository(
+                    &namespace.directory,
+                    &namespace.display_path,
+                    prefix,
+                    true,
+                    self.confirms_ancestors_inline(),
+                )?,
+            )),
+            Self::Deferred(deferred) => deferred.capability(namespace, prefix),
+        }
+    }
+
     /// Acknowledge the inode a body actually landed on.
     ///
     /// A batch owes nothing here. A body this call published was fsynced
@@ -2436,16 +2889,29 @@ impl LocalSourceDurability<'_> {
         }
     }
 
-    fn sync_leaf(
-        &self,
-        capability: &SourceBlobCapability,
-        digest_hex: &str,
-    ) -> Result<(), KinDbError> {
+    /// Make the directory entry naming this body durable.
+    ///
+    /// A batch owes nothing here either: the prefix directory was retained
+    /// when it was pinned, so its barrier is already outstanding and the flush
+    /// issues one per prefix rather than one per body.
+    fn sync_leaf(&self, capability: &SourceBlobCapability) -> Result<(), KinDbError> {
         match self {
             Self::Immediate => {
                 mmap::sync_directory_handle(&capability.leaf_dir, &capability.leaf_path)
             }
-            Self::Deferred(deferred) => deferred.record(capability, digest_hex),
+            Self::Deferred(_) => Ok(()),
+        }
+    }
+
+    /// How this body's bytes reach the device before the `linkat` names them.
+    ///
+    /// A per-object write flushes the drive's cache, because nothing later
+    /// will. A batch only orders, and pays one device flush for the whole
+    /// session at its flush, before any name becomes durable.
+    fn body_barrier(&self) -> SourceBodyBarrier {
+        match self {
+            Self::Immediate => SourceBodyBarrier::FullDevice,
+            Self::Deferred(_) => SourceBodyBarrier::Ordering,
         }
     }
 }
@@ -4209,6 +4675,7 @@ impl LocalFileBackend {
         &self,
         namespace: &LocalRepositoryCapability,
     ) -> Result<(), KinDbError> {
+        record_repository_visibility_confirmation();
         let root = self.storage_root_capability()?.ok_or_else(|| {
             KinDbError::StorageError(format!(
                 "local storage root {} disappeared while repository capability was held",
@@ -4533,6 +5000,28 @@ impl LocalFileBackend {
     }
 
     fn acquire_existing_lock(&self, repo_id: &str) -> Result<LocalRepositoryLock, KinDbError> {
+        self.acquire_existing_lock_with_access(repo_id, LocalRepositoryLockAccess::Exclusive)
+    }
+
+    /// Take the repository authority lock without excluding other readers.
+    ///
+    /// Only an entry point that creates nothing, renames nothing and deletes
+    /// nothing may use this. A shared holder still excludes every writer,
+    /// because every mutation takes the exclusive lock, so what a shared
+    /// reader can observe is bounded by the publication protocol rather than
+    /// by mutual exclusion.
+    fn acquire_existing_shared_lock(
+        &self,
+        repo_id: &str,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
+        self.acquire_existing_lock_with_access(repo_id, LocalRepositoryLockAccess::Shared)
+    }
+
+    fn acquire_existing_lock_with_access(
+        &self,
+        repo_id: &str,
+        access: LocalRepositoryLockAccess,
+    ) -> Result<LocalRepositoryLock, KinDbError> {
         let namespace = self
             .repository_capability(repo_id, false)?
             .ok_or_else(|| {
@@ -4561,8 +5050,16 @@ impl LocalFileBackend {
         Self::pin_repository_lock_identity(&namespace, &lock_file)?;
         Self::confirm_repository_lock_publication(&namespace)?;
         let lock_target = Self::repository_lock_target(&namespace, &lock_file)?;
-        use fs2::FileExt;
-        lock_target.lock_exclusive().map_err(|error| {
+        // Named through `fs2::FileExt` rather than by method call: `std`'s
+        // `File` grew inherent `lock_shared`, `try_lock_shared` and `unlock`
+        // methods that shadow this trait's, so an unqualified call would take
+        // one lock through `std` and its exclusive counterpart, which `std`
+        // does not provide under that name, through `fs2`.
+        let acquired = match access {
+            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::lock_exclusive(&lock_target),
+            LocalRepositoryLockAccess::Shared => fs2::FileExt::lock_shared(&lock_target),
+        };
+        acquired.map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to acquire existing local repository authority lock {}: {error}",
                 lock_path.display()
@@ -4575,6 +5072,43 @@ impl LocalFileBackend {
             #[cfg(unix)]
             _marker_file: lock_file,
         })
+    }
+
+    /// Whether taking the repository authority lock at `access` would block
+    /// right now, against the same lock target a real acquisition uses.
+    ///
+    /// This is how the exclusion property is asserted without a stopwatch:
+    /// a blocking acquisition can only be observed by waiting for it, and a
+    /// wait that is long enough to mean something is long enough to be flaky.
+    #[cfg(test)]
+    fn repository_lock_would_block(
+        &self,
+        repo_id: &str,
+        access: LocalRepositoryLockAccess,
+    ) -> Result<bool, KinDbError> {
+        let namespace = self.repository_capability(repo_id, false)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository authority directory {} is unavailable for a lock probe",
+                self.base_path.join(repo_id).display()
+            ))
+        })?;
+        let lock_file = Self::open_repository_lock(&namespace, false)?;
+        let lock_target = Self::repository_lock_target(&namespace, &lock_file)?;
+        let attempt = match access {
+            LocalRepositoryLockAccess::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_target),
+            LocalRepositoryLockAccess::Shared => fs2::FileExt::try_lock_shared(&lock_target),
+        };
+        match attempt {
+            Ok(()) => {
+                fs2::FileExt::unlock(&lock_target)
+                    .map_err(|error| KinDbError::StorageError(error.to_string()))?;
+                Ok(false)
+            }
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(true),
+            Err(error) => Err(KinDbError::StorageError(format!(
+                "failed to probe the local repository authority lock: {error}"
+            ))),
+        }
     }
 
     fn acquire_lock_for_initialization(
@@ -5947,19 +6481,15 @@ impl LocalFileBackend {
         data: &[u8],
         durability: &LocalSourceDurability<'_>,
     ) -> Result<(), KinDbError> {
-        self.confirm_repository_visible(namespace)?;
-        let capability = open_source_blob_capability_from_repository(
-            &namespace.directory,
-            &namespace.display_path,
-            digest,
-            true,
-            durability.confirms_ancestors_inline(),
-        )?;
+        if durability.confirms_repository_inline() {
+            self.confirm_repository_visible(namespace)?;
+        }
+        let digest_hex = hex::encode(digest);
+        let capability = durability.capability(namespace, &digest_hex[..2])?;
         #[cfg(test)]
         if let Some(hook) = self.source_blob_after_capability_hook.lock().take() {
             hook();
         }
-        let digest_hex = hex::encode(digest);
 
         if let Some(existing) =
             read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
@@ -5975,15 +6505,19 @@ impl LocalFileBackend {
                     capability.leaf_path.display()
                 )));
             }
-            confirm_source_blob_namespace_from_repository(
-                &namespace.directory,
-                &namespace.display_path,
-                digest,
-                &capability,
-            )?;
+            if durability.confirms_namespace_inline() {
+                confirm_source_blob_namespace_from_repository(
+                    &namespace.directory,
+                    &namespace.display_path,
+                    digest,
+                    &capability,
+                )?;
+            }
             durability.sync_body(&existing.file, &capability.leaf_path.join(&digest_hex))?;
-            durability.sync_leaf(&capability, &digest_hex)?;
-            self.confirm_repository_visible(namespace)?;
+            durability.sync_leaf(&capability)?;
+            if durability.confirms_repository_inline() {
+                self.confirm_repository_visible(namespace)?;
+            }
             return Ok(());
         }
 
@@ -5995,18 +6529,21 @@ impl LocalFileBackend {
         // Re-walk without creating anything and compare the directory
         // identity to the pinned handle. A substituted ancestor is rejected
         // before publication; all writes remain relative to the old handle.
-        confirm_source_blob_namespace_from_repository(
-            &namespace.directory,
-            &namespace.display_path,
-            digest,
-            &capability,
-        )?;
+        if durability.confirms_namespace_inline() {
+            confirm_source_blob_namespace_from_repository(
+                &namespace.directory,
+                &namespace.display_path,
+                digest,
+                &capability,
+            )?;
+        }
 
         let _published = publish_source_file_at(
             &capability.leaf_dir,
             &digest_hex,
             data,
             durability.confirms_leaf_inline(),
+            durability.body_barrier(),
         )?;
         let installed =
             read_source_file_at(&capability.leaf_dir, &digest_hex, MAX_SOURCE_BLOB_BYTES)?
@@ -6031,8 +6568,10 @@ impl LocalFileBackend {
         // Confirm the inode actually selected at the target name, then
         // reconfirm its directory entry in file-before-directory order.
         durability.sync_body(&installed.file, &capability.leaf_path.join(&digest_hex))?;
-        durability.sync_leaf(&capability, &digest_hex)?;
-        self.confirm_repository_visible(namespace)?;
+        durability.sync_leaf(&capability)?;
+        if durability.confirms_repository_inline() {
+            self.confirm_repository_visible(namespace)?;
+        }
         Ok(())
     }
 
@@ -6259,7 +6798,7 @@ impl StorageBackend for LocalFileBackend {
             return Ok(None);
         }
         #[cfg(any(unix, windows))]
-        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_shared_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest, max_bytes);
@@ -6272,12 +6811,15 @@ impl StorageBackend for LocalFileBackend {
         {
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_windows_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
@@ -6315,13 +6857,15 @@ impl StorageBackend for LocalFileBackend {
             // None) while still opening every component capability-relatively.
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-                false,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             let digest_hex = hex::encode(digest);
             let Some(data) = read_source_file_at(&capability.leaf_dir, &digest_hex, max_bytes)?
             else {
@@ -6356,7 +6900,7 @@ impl StorageBackend for LocalFileBackend {
             )));
         }
         #[cfg(any(unix, windows))]
-        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_shared_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = operation;
@@ -6378,7 +6922,7 @@ impl StorageBackend for LocalFileBackend {
             return Ok(None);
         }
         #[cfg(any(unix, windows))]
-        let authority_lock = self.acquire_existing_lock(repo_id)?;
+        let authority_lock = self.acquire_existing_shared_lock(repo_id)?;
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (repo_id, digest);
@@ -6391,12 +6935,15 @@ impl StorageBackend for LocalFileBackend {
         {
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_windows_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_windows_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             confirm_windows_source_blob_namespace_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
@@ -6423,13 +6970,15 @@ impl StorageBackend for LocalFileBackend {
         {
             let namespace = &authority_lock.namespace;
             self.confirm_repository_visible(namespace)?;
-            let capability = open_source_blob_capability_from_repository(
+            let Some(capability) = open_existing_source_blob_capability_from_repository(
                 &namespace.directory,
                 &namespace.display_path,
                 digest,
-                true,
-                false,
-            )?;
+            )?
+            else {
+                self.confirm_repository_visible(namespace)?;
+                return Ok(None);
+            };
             let digest_hex = hex::encode(digest);
             let byte_len = open_source_file_at(&capability.leaf_dir, &digest_hex)?
                 .map(|(_, byte_len)| byte_len);
@@ -6451,6 +7000,10 @@ impl StorageBackend for LocalFileBackend {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok(None);
         }
+        // Exclusive despite the name: `load_authority_unlocked` finalizes
+        // retired quarantines, which deletes quarantined delta artifacts, and
+        // clears superseded snapshots. An authority load is a recovery step,
+        // not a read.
         let lock = self.acquire_existing_lock(repo_id)?;
         let authority = self.load_authority_unlocked(&lock.namespace)?;
         self.confirm_repository_visible(&lock.namespace)?;
@@ -6461,6 +7014,8 @@ impl StorageBackend for LocalFileBackend {
         if self.existing_repository_path(repo_id)?.is_none() {
             return Ok((None, Vec::new()));
         }
+        // Exclusive: this finalizes retired quarantines directly as well as
+        // through the authority load.
         let lock = self.acquire_existing_lock(repo_id)?;
         let authority = self.load_authority_unlocked(&lock.namespace)?;
         let authority_record = self.read_authority_record_raw_unlocked(&lock.namespace)?;
@@ -7312,6 +7867,249 @@ mod tests {
         }
     }
 
+    /// The prefix a capability is keyed by is the same two hex characters the
+    /// digest directory has always been named after.
+    #[cfg(unix)]
+    #[test]
+    fn source_blob_prefix_is_the_first_two_digest_hex_characters() {
+        for seed in 0u32..512 {
+            let digest = source_digest(format!("prefix equivalence {seed}").as_bytes());
+            assert_eq!(source_blob_prefix(digest), hex::encode(digest)[..2]);
+        }
+    }
+
+    /// Bodies whose digests land in exactly `prefixes` digest-prefix
+    /// directories, `per_prefix` bodies in each.
+    #[cfg(unix)]
+    fn bodies_sharing_digest_prefixes(prefixes: usize, per_prefix: usize) -> Vec<Vec<u8>> {
+        let mut grouped: std::collections::BTreeMap<u8, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        let mut candidate = 0u32;
+        while grouped
+            .values()
+            .filter(|bodies| bodies.len() >= per_prefix)
+            .count()
+            < prefixes
+        {
+            let body = format!("prefix fixture body {candidate}").into_bytes();
+            let entry = grouped.entry(source_digest(&body)[0]).or_default();
+            if entry.len() < per_prefix {
+                entry.push(body);
+            }
+            candidate += 1;
+            assert!(
+                candidate < 1_000_000,
+                "digest prefix search did not converge"
+            );
+        }
+        grouped
+            .into_values()
+            .filter(|bodies| bodies.len() >= per_prefix)
+            .take(prefixes)
+            .flatten()
+            .collect()
+    }
+
+    /// The per-object envelope is two full repository re-resolutions and two
+    /// digest-prefix walks per body; a write session pays a fixed envelope
+    /// instead, whatever it carries.
+    ///
+    /// Both counters are load-independent proxies for syscalls: a repository
+    /// confirmation is roughly twenty of them, including two `realpath` calls
+    /// and a directory-stream read, and a prefix walk is an `openat` per chain
+    /// component. Reverting either hoist puts the batch back on the per-object
+    /// numbers this test also pins.
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_amortizes_the_per_object_envelope() {
+        const PREFIXES: usize = 2;
+        const PER_PREFIX: usize = 12;
+        let bodies = bodies_sharing_digest_prefixes(PREFIXES, PER_PREFIX);
+        let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+        assert_eq!(bodies.len(), PREFIXES * PER_PREFIX);
+        assert_eq!(
+            digests
+                .iter()
+                .map(|digest| digest[0])
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            PREFIXES
+        );
+
+        let batched_dir = TempDir::new().unwrap();
+        let batched = LocalFileBackend::new(batched_dir.path());
+        reset_source_envelope_counters();
+        batched
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .expect("a batch publishes every body it accepted");
+        let (batched_confirmations, batched_walks) = source_envelope_counters();
+
+        // Two confirmations bracket the whole session: acquiring the
+        // repository lock ends in `confirm_existing_lock_visible`, which
+        // confirms the namespace under the held lock, and the flush confirms
+        // it again after the last body.
+        assert_eq!(
+            batched_confirmations, 2,
+            "a write session must re-resolve the repository twice, not twice per body"
+        );
+        // Two walks to pin and confirm each prefix, one more per prefix to
+        // re-confirm it at the flush.
+        assert_eq!(
+            batched_walks,
+            (PREFIXES * 3) as u64,
+            "a write session must walk each digest prefix a fixed number of times"
+        );
+
+        let per_object_dir = TempDir::new().unwrap();
+        let per_object = LocalFileBackend::new(per_object_dir.path());
+        reset_source_envelope_counters();
+        for (digest, body) in digests.iter().zip(&bodies) {
+            per_object
+                .save_source_blob("repo-a", *digest, body)
+                .unwrap();
+        }
+        let (per_object_confirmations, per_object_walks) = source_envelope_counters();
+        assert_eq!(
+            per_object_confirmations,
+            (bodies.len() * 3) as u64,
+            "the per-object contract still re-resolves the repository around every body"
+        );
+        assert_eq!(
+            per_object_walks,
+            (bodies.len() * 2) as u64,
+            "the per-object contract still walks and re-confirms the prefix per body"
+        );
+
+        // Amortizing the envelope may not change what either path stores.
+        assert_eq!(
+            collect_store_tree(&batched_dir.path().join("repo-a").join("source-blobs")),
+            collect_store_tree(&per_object_dir.path().join("repo-a").join("source-blobs")),
+        );
+    }
+
+    /// A write session flushes the drive's cache once, not once per body.
+    ///
+    /// On Apple platforms `File::sync_all` is `fcntl(F_FULLFSYNC)`, a full
+    /// device cache flush, and it was the single largest cost left inside the
+    /// per-body write. A session issues `F_BARRIERFSYNC` per body instead,
+    /// which orders that body ahead of the `linkat` naming it, and one
+    /// `F_FULLFSYNC` before it makes any name durable.
+    ///
+    /// Elsewhere `fsync` is already the strongest barrier available, so the
+    /// per-body flush stays and this test pins that it stayed.
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_flushes_the_device_once_per_session() {
+        const PREFIXES: usize = 2;
+        const PER_PREFIX: usize = 12;
+        let bodies = bodies_sharing_digest_prefixes(PREFIXES, PER_PREFIX);
+        let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+
+        let batched_dir = TempDir::new().unwrap();
+        let batched = LocalFileBackend::new(batched_dir.path());
+        reset_source_barrier_counters();
+        batched
+            .with_source_blob_write_batch("repo-a", &mut |batch| {
+                for (digest, body) in digests.iter().zip(&bodies) {
+                    batch.save(*digest, body)?;
+                }
+                Ok(())
+            })
+            .expect("a batch publishes every body it accepted");
+        let (batched_flushes, batched_barriers) = source_barrier_counters();
+
+        #[cfg(target_vendor = "apple")]
+        {
+            assert_eq!(
+                batched_barriers,
+                bodies.len() as u64,
+                "every body must still be ordered ahead of the name that points at it"
+            );
+            assert_eq!(
+                batched_flushes, 1,
+                "a session must flush the device once, before it makes any name durable"
+            );
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            assert_eq!(
+                batched_barriers, 0,
+                "only Apple platforms offer an ordering barrier below a full flush"
+            );
+            assert_eq!(
+                batched_flushes,
+                bodies.len() as u64 + 1,
+                "elsewhere each body keeps its own flush, plus the session's"
+            );
+        }
+
+        let per_object_dir = TempDir::new().unwrap();
+        let per_object = LocalFileBackend::new(per_object_dir.path());
+        reset_source_barrier_counters();
+        for (digest, body) in digests.iter().zip(&bodies) {
+            per_object
+                .save_source_blob("repo-a", *digest, body)
+                .unwrap();
+        }
+        let (per_object_flushes, per_object_barriers) = source_barrier_counters();
+        assert_eq!(
+            per_object_barriers, 0,
+            "the per-object contract must never weaken a body barrier to an ordering one"
+        );
+        assert_eq!(
+            per_object_flushes,
+            (bodies.len() * 2) as u64,
+            "the per-object contract still flushes the device for the staged body and its acknowledgement"
+        );
+
+        // A weaker per-body barrier may not change what the session stores.
+        assert_eq!(
+            collect_store_tree(&batched_dir.path().join("repo-a").join("source-blobs")),
+            collect_store_tree(&per_object_dir.path().join("repo-a").join("source-blobs")),
+        );
+        let reopened = LocalFileBackend::new(batched_dir.path());
+        for (digest, body) in digests.iter().zip(&bodies) {
+            assert_eq!(
+                reopened.load_source_blob("repo-a", *digest).unwrap(),
+                Some(body.clone())
+            );
+        }
+    }
+
+    /// The session envelope is fixed, so carrying more bodies through the same
+    /// prefixes costs nothing more.
+    #[cfg(unix)]
+    #[test]
+    fn local_source_blob_batch_envelope_does_not_grow_with_body_count() {
+        let mut counters = Vec::new();
+        for per_prefix in [4usize, 16] {
+            let bodies = bodies_sharing_digest_prefixes(2, per_prefix);
+            let digests: Vec<[u8; 32]> = bodies.iter().map(|body| source_digest(body)).collect();
+            let dir = TempDir::new().unwrap();
+            let backend = LocalFileBackend::new(dir.path());
+            reset_source_envelope_counters();
+            backend
+                .with_source_blob_write_batch("repo-a", &mut |batch| {
+                    for (digest, body) in digests.iter().zip(&bodies) {
+                        batch.save(*digest, body)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            counters.push((bodies.len(), source_envelope_counters()));
+        }
+        assert_ne!(counters[0].0, counters[1].0);
+        assert_eq!(
+            counters[0].1, counters[1].1,
+            "a session that carries four times the bodies must pay the same envelope"
+        );
+    }
+
     #[test]
     fn local_source_blob_batch_and_per_object_writes_interoperate() {
         let dir = TempDir::new().unwrap();
@@ -7465,6 +8263,150 @@ mod tests {
             .expect("the reader observes a complete store");
         assert_eq!(observed, Some(bodies[0].clone()));
         reader.unwrap().join().unwrap();
+    }
+
+    /// Readers of one repository stop excluding each other; writers still
+    /// exclude everyone.
+    ///
+    /// Every acquisition here goes through the real lock target, and the
+    /// unheld case is the control: the probe is able to report "free", so a
+    /// report of "would block" carries information.
+    #[test]
+    fn source_blob_readers_share_the_repository_lock_and_writers_still_exclude_them() {
+        use LocalRepositoryLockAccess::{Exclusive, Shared};
+
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let body = b"a body two readers want at once";
+        let digest = source_digest(body);
+        backend.save_source_blob("repo-a", digest, body).unwrap();
+
+        assert!(
+            !backend
+                .repository_lock_would_block("repo-a", Shared)
+                .unwrap(),
+            "nothing is held, so a shared acquisition is free"
+        );
+        assert!(
+            !backend
+                .repository_lock_would_block("repo-a", Exclusive)
+                .unwrap(),
+            "nothing is held, so an exclusive acquisition is free"
+        );
+
+        let reader = backend.acquire_existing_shared_lock("repo-a").unwrap();
+        assert!(
+            !backend
+                .repository_lock_would_block("repo-a", Shared)
+                .unwrap(),
+            "a second reader must not wait on the first"
+        );
+        assert!(
+            backend
+                .repository_lock_would_block("repo-a", Exclusive)
+                .unwrap(),
+            "a writer must still wait on a reader"
+        );
+        // A second reader really can complete a read while the first holds.
+        assert_eq!(
+            backend.load_source_blob("repo-a", digest).unwrap(),
+            Some(body.to_vec())
+        );
+        drop(reader);
+
+        let writer = backend.acquire_existing_lock("repo-a").unwrap();
+        assert!(
+            backend
+                .repository_lock_would_block("repo-a", Shared)
+                .unwrap(),
+            "a reader must still wait on a writer"
+        );
+        assert!(
+            backend
+                .repository_lock_would_block("repo-a", Exclusive)
+                .unwrap(),
+            "a writer must still wait on a writer"
+        );
+        drop(writer);
+    }
+
+    /// A read creates nothing, so it may be taken under a shared lock.
+    ///
+    /// A repository that has never stored a body has no
+    /// `source-blobs/sha256/HH` chain. Reading used to mint that chain, which
+    /// is a mutation, and was the only reason a lookup needed the exclusive
+    /// lock. The GCS backend answers the same trait methods without creating
+    /// anything, so directory creation was never part of the read contract.
+    #[test]
+    fn source_blob_read_of_a_repository_without_bodies_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+        let source_blobs = dir.path().join("repo-a").join("source-blobs");
+        assert!(!source_blobs.exists());
+
+        let digest = source_digest(b"a body this repository never stored");
+        assert_eq!(backend.load_source_blob("repo-a", digest).unwrap(), None);
+        assert!(
+            !source_blobs.exists(),
+            "a lookup must not mint the digest-prefix chain"
+        );
+        assert_eq!(backend.source_blob_len("repo-a", digest).unwrap(), None);
+        assert!(
+            !source_blobs.exists(),
+            "a length probe must not mint the digest-prefix chain"
+        );
+        assert_eq!(
+            backend
+                .load_source_blob_bounded("repo-a", digest, 16)
+                .unwrap(),
+            None
+        );
+        assert!(!source_blobs.exists());
+
+        // A repository that does hold bodies still answers a missing one with
+        // None rather than an error.
+        let stored = b"a body this repository does store";
+        let stored_digest = source_digest(stored);
+        backend
+            .save_source_blob("repo-a", stored_digest, stored)
+            .unwrap();
+        assert_eq!(
+            backend.load_source_blob("repo-a", stored_digest).unwrap(),
+            Some(stored.to_vec())
+        );
+        assert_eq!(backend.load_source_blob("repo-a", digest).unwrap(), None);
+    }
+
+    /// A symlinked or non-directory ancestor is still a refusal, not absence.
+    #[cfg(unix)]
+    #[test]
+    fn source_blob_read_still_refuses_a_symlinked_prefix_rather_than_reporting_absence() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let body = b"a body below a substituted prefix";
+        let digest = source_digest(body);
+        backend.save_source_blob("repo-a", digest, body).unwrap();
+
+        let prefix = dir
+            .path()
+            .join("repo-a")
+            .join("source-blobs")
+            .join("sha256")
+            .join(&hex::encode(digest)[..2]);
+        std::fs::remove_dir_all(&prefix).unwrap();
+        symlink(outside.path(), &prefix).unwrap();
+
+        let error = backend
+            .load_source_blob("repo-a", digest)
+            .expect_err("a symlinked digest prefix must fail closed, not read as absent");
+        assert!(
+            error.to_string().contains("refusing symlinked"),
+            "unexpected substituted-prefix error: {error}"
+        );
     }
 
     #[test]
