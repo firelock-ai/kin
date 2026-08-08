@@ -514,44 +514,6 @@ mod tests {
         effective_hook_surface(&repo, &ambient).expect("resolve hook surface")
     }
 
-    fn git_stdout(repo: &Path, args: &[&str]) -> String {
-        let output = fixture_git()
-            .current_dir(repo)
-            .args(args)
-            .output()
-            .expect("run fixture git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("utf8 git stdout")
-            .trim()
-            .to_string()
-    }
-
-    fn git_stdin(repo: &Path, args: &[&str], input: &str) -> String {
-        git_bytes_stdin(repo, args, input.as_bytes())
-    }
-
-    fn git_bytes_stdin(repo: &Path, args: &[&str], input: &[u8]) -> String {
-        let output = fixture_git()
-            .current_dir(repo)
-            .args(args)
-            .output_with_input(input)
-            .expect("run fixture git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("utf8 git stdout")
-            .trim()
-            .to_string()
-    }
-
     fn write_executable(path: &Path, body: &[u8]) {
         fs::write(path, body).expect("write executable");
         let mut permissions = fs::metadata(path).expect("metadata").permissions();
@@ -578,17 +540,14 @@ mod tests {
             &["config", "filter.demo.clean", "external-clean"],
         );
         git(&fixture.repo, &["config", "remote.origin.tagOpt", "--tags"]);
-        fs::write(fixture.repo.join("init.log"), b"log\n").expect("untracked");
-        fs::write(fixture.repo.join("staged.txt"), b"staged\n").expect("staged");
-        git(&fixture.repo, &["add", "staged.txt"]);
+        git(&fixture.repo, &["config", "core.sshCommand", "ssh -v"]);
 
         let refusal = fixture.refusal();
         for expected in [
             "pre-commit",
             "filter \"demo\"",
             "remote.origin.tagOpt",
-            "init.log",
-            "staged.txt",
+            "core.sshCommand",
         ] {
             assert!(
                 refusal.contains(expected),
@@ -597,7 +556,7 @@ mod tests {
         }
         let report = fixture.report();
         assert!(
-            report.blockers.len() >= 5,
+            report.blockers.len() >= 4,
             "one refusal must carry every class: {report:?}"
         );
         for blocker in &report.blockers {
@@ -606,6 +565,68 @@ mod tests {
                 "every blocker names its way out: {blocker:?}"
             );
         }
+    }
+
+    /// Every offending transport key at once, not the first one found.
+    ///
+    /// Clearing them one refusal per attempt is the whole cost this reports
+    /// away, and it only shows up on a repository carrying more than one, which
+    /// an ordinary editor-configured checkout does.
+    #[test]
+    fn every_unsupported_transport_key_is_named_in_one_refusal() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "remote.origin.tagOpt", "--tags"]);
+        git(
+            &fixture.repo,
+            &["config", "branch.main.vscode-merge-base", "origin/main"],
+        );
+        git(&fixture.repo, &["config", "core.askPass", "/bin/true"]);
+
+        let refusal = fixture.refusal();
+        for expected in [
+            "remote.origin.tagOpt",
+            "branch.main.vscode-merge-base",
+            "core.askPass",
+        ] {
+            assert!(
+                refusal.contains(expected),
+                "expected {expected:?} in refusal:\n{refusal}"
+            );
+        }
+    }
+
+    /// Two offending keys inside one section are both named.
+    #[test]
+    fn a_section_carrying_two_unsupported_keys_names_both() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "remote.origin.tagOpt", "--tags"]);
+        git(&fixture.repo, &["config", "remote.origin.prune", "true"]);
+
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("remote.origin.tagOpt"), "{refusal}");
+        assert!(refusal.contains("remote.origin.prune"), "{refusal}");
+    }
+
+    /// A worked-in repository is admissible.
+    ///
+    /// Untracked, staged, and staged-removed paths are all worktree state
+    /// rather than repository authority, so none of them is a blocker. The
+    /// disclosure of what they are lives in the migration proof, which reads
+    /// content this boundary deliberately never opens.
+    #[test]
+    fn a_worked_in_worktree_is_not_a_blocker() {
+        let fixture = Fixture::clean();
+        fs::write(fixture.repo.join("init.log"), b"log\n").expect("untracked");
+        fs::write(fixture.repo.join("staged.txt"), b"staged\n").expect("staged");
+        git(&fixture.repo, &["add", "staged.txt"]);
+        git(&fixture.repo, &["rm", "--cached", "README.md"]);
+
+        let report = fixture.report();
+        assert!(
+            report.is_clear(),
+            "uncommitted state is not an admission blocker: {report:?}"
+        );
+        check_git_admission_blockers(&fixture.repo).expect("a worked-in repository clears");
     }
 
     #[test]
@@ -785,31 +806,6 @@ mod tests {
     }
 
     #[test]
-    fn untracked_paths_are_listed_and_the_rest_counted() {
-        let fixture = Fixture::clean();
-        for index in 0..12 {
-            fs::write(
-                fixture.repo.join(format!("untracked-{index:02}.log")),
-                b"noise\n",
-            )
-            .expect("untracked file");
-        }
-
-        let refusal = fixture.refusal();
-        assert!(
-            refusal.contains("12 untracked non-ignored path(s)"),
-            "{refusal}"
-        );
-        assert!(refusal.contains("untracked-00.log"), "{refusal}");
-        assert!(refusal.contains("untracked-09.log"), "{refusal}");
-        assert!(refusal.contains("and 2 more"), "{refusal}");
-        assert!(
-            refusal.contains(".gitignore"),
-            "the remedy names the way out:\n{refusal}"
-        );
-    }
-
-    #[test]
     fn an_ignored_path_is_not_a_blocker() {
         let fixture = Fixture::clean();
         fs::write(fixture.repo.join(".gitignore"), b"build/\n").expect("gitignore");
@@ -822,67 +818,6 @@ mod tests {
         assert!(
             report.is_clear(),
             "ignored content is admissible: {report:?}"
-        );
-    }
-
-    /// A committed tree may record a mode the index cannot hold.
-    ///
-    /// `100664` is legal in a tree and several importers write it, while the
-    /// index decodes every plain file to `100644`. Comparing the raw values
-    /// reads such a repository as having every file staged, and no `git restore
-    /// --staged` clears it because nothing is staged. Admission itself admits
-    /// this repository, so a refusal here would be both wrong and inescapable.
-    #[test]
-    fn a_non_canonical_committed_filemode_is_not_read_as_staged() {
-        let fixture = Fixture::clean();
-        let blob = git_stdout(&fixture.repo, &["rev-parse", "HEAD:README.md"]);
-        // Written as raw tree bytes because `git mktree` canonicalises the mode
-        // on the way in, which is exactly the normalisation this case needs to
-        // be missing.
-        let mut body = b"100664 README.md\0".to_vec();
-        body.extend(
-            (0..blob.len() / 2)
-                .map(|index| u8::from_str_radix(&blob[index * 2..index * 2 + 2], 16))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .expect("hex object id"),
-        );
-        let tree = git_bytes_stdin(
-            &fixture.repo,
-            &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
-            &body,
-        );
-        let commit = git_stdin(
-            &fixture.repo,
-            &["commit-tree", &tree, "-m", "non-canonical mode"],
-            "",
-        );
-        git(&fixture.repo, &["reset", "--hard", &commit]);
-        // Read as raw object bytes, because `cat-file -p` prints the
-        // canonicalised mode and would report the fixture worked either way.
-        let raw = fixture_git()
-            .current_dir(&fixture.repo)
-            .args(["cat-file", "tree", "HEAD^{tree}"])
-            .output()
-            .expect("read raw committed tree");
-        assert!(
-            raw.stdout.starts_with(b"100664 "),
-            "the fixture must keep the mode this case is about"
-        );
-
-        let report = fixture.report();
-        assert!(report.is_clear(), "{report:?}");
-    }
-
-    #[test]
-    fn a_staged_deletion_is_reported_as_an_uncommitted_path() {
-        let fixture = Fixture::clean();
-        git(&fixture.repo, &["rm", "--cached", "README.md"]);
-
-        let refusal = fixture.refusal();
-        assert!(refusal.contains("README.md"), "{refusal}");
-        assert!(
-            refusal.contains("committed path(s)"),
-            "a staged removal is named as one:\n{refusal}"
         );
     }
 
@@ -909,12 +844,14 @@ mod tests {
     #[test]
     fn a_blocked_repository_is_refused_without_a_snapshot_or_a_plan() {
         let fixture = Fixture::clean();
-        fs::write(fixture.repo.join("init.log"), b"log\n").expect("untracked");
+        let hooks = fixture.temp.path().join("hooks");
+        fixture.pin_hook_surface(&hooks);
+        write_executable(&hooks.join("pre-commit"), b"#!/bin/sh\nexit 0\n");
         // The whole argument list is one path. Nothing here can consult a
         // lossless snapshot, an import plan, or a blob store, because it is
         // never given one, which is what makes the check cheap enough to run
         // before any of them exist.
         let refusal = check_git_admission_blockers(&fixture.repo).expect_err("blocked admission");
-        assert!(refusal.to_string().contains("init.log"), "{refusal}");
+        assert!(refusal.to_string().contains("pre-commit"), "{refusal}");
     }
 }

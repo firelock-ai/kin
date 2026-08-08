@@ -370,6 +370,16 @@ impl DivergenceLog {
         });
     }
 
+    /// Whether the index itself is carrying something the commit does not.
+    fn records_index_state(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                GitWorkspaceDivergenceKind::Staged | GitWorkspaceDivergenceKind::StagedRemoval
+            )
+        })
+    }
+
     fn record_untracked(&mut self, path: RepoPath) {
         if self.untracked_listed >= LISTED_UNTRACKED_CAP {
             self.untracked_beyond_cap += 1;
@@ -612,9 +622,16 @@ fn observe(
         expected_entries,
         &mut divergence,
     )?;
-    index_file
-        .verify_extensions(true, &repo.objects)
-        .map_err(|error| preflight_error(format!("verify Git index extensions: {error}")))?;
+    // The tree extension caches the tree this index would write. An index that
+    // carries staged work has not written that tree, and Git invalidates the
+    // subtrees it covers rather than removing them, so resolving it against the
+    // object database asks for an object the source has never had a reason to
+    // create. The extension is verified where it describes something written.
+    if !divergence.records_index_state() {
+        index_file
+            .verify_extensions(true, &repo.objects)
+            .map_err(|error| preflight_error(format!("verify Git index extensions: {error}")))?;
+    }
     let (tracked_worktree, ignored_local) = prove_worktree(
         &ambient_repo,
         &index_file,
@@ -883,8 +900,14 @@ fn prove_worktree(
     let (executable_authority, symlink_materialization) = worktree_materialization(ignore_repo)?;
     let mut tracked_hash = FramedHash::new(b"kin.git.preflight.worktree.v2");
     tracked_hash.u64(expected.len() as u64);
+    let indexed = index
+        .entries()
+        .iter()
+        .map(|entry| entry.path(index).to_vec())
+        .collect::<BTreeSet<_>>();
     let mut state = WorktreeWalk {
         expected,
+        indexed: &indexed,
         blob_store,
         seen: BTreeSet::new(),
         tracked_hash,
@@ -974,6 +997,11 @@ fn prove_worktree(
 
 struct WorktreeWalk<'a> {
     expected: &'a BTreeMap<RepoPath, ExpectedIndexEntry>,
+    /// Every path the index carries, which is what Git means by tracked. A path
+    /// here but not in `expected` is staged work, already reported as such by
+    /// the index observation, so the walk neither repeats it as untracked nor
+    /// records it as ignored local content.
+    indexed: &'a BTreeSet<Vec<u8>>,
     blob_store: &'a BlobStore,
     seen: BTreeSet<RepoPath>,
     tracked_hash: FramedHash,
@@ -1314,6 +1342,9 @@ fn walk_directory(
 
         if let Some(expected) = state.expected.get(&path).copied() {
             prove_tracked_entry(&absolute_path, &path, &metadata, expected, state)?;
+            continue;
+        }
+        if state.indexed.contains(&path_bytes) {
             continue;
         }
 
@@ -2947,13 +2978,17 @@ mod platform_materialization_tests {
     /// the cases below would otherwise only be compiled here and never run. The
     /// walk state is small enough to build outright, which lets both platforms
     /// execute the same comparison logic against a real store and real files.
+    ///
+    /// Answers with what the entry was recorded as differing by, so a case
+    /// asserting agreement asserts an empty list rather than the absence of an
+    /// error a matching entry could never have produced.
     fn prove_one_entry(
         absolute: &std::path::Path,
         entry: TreeEntry,
         blob_store: &BlobStore,
         executable_authority: ExecutableModeAuthority,
         symlink_materialization: SymlinkMaterialization,
-    ) -> Result<()> {
+    ) -> Result<Vec<GitWorkspaceDivergence>> {
         let path = RepoPath::from_bytes(b"tracked".to_vec()).expect("repo path");
         let expected = ExpectedIndexEntry {
             mode: match entry {
@@ -2969,8 +3004,11 @@ mod platform_materialization_tests {
         };
         let mut expected_entries = BTreeMap::new();
         expected_entries.insert(path.clone(), expected);
+        let indexed = BTreeSet::new();
+        let mut divergence = DivergenceLog::default();
         let mut state = WorktreeWalk {
             expected: &expected_entries,
+            indexed: &indexed,
             blob_store,
             seen: BTreeSet::new(),
             tracked_hash: FramedHash::new(b"kin.git.preflight.worktree.test"),
@@ -2980,9 +3018,19 @@ mod platform_materialization_tests {
             executable_authority,
             symlink_materialization,
             diagnosis: None,
+            divergence: &mut divergence,
         };
         let metadata = fs::symlink_metadata(absolute).expect("entry metadata");
-        prove_tracked_entry(absolute, &path, &metadata, expected, &mut state)
+        prove_tracked_entry(absolute, &path, &metadata, expected, &mut state)?;
+        Ok(divergence.entries)
+    }
+
+    /// The one sentence a single recorded divergence carries.
+    fn only_detail(entries: &[GitWorkspaceDivergence]) -> String {
+        let [entry] = entries else {
+            panic!("expected exactly one divergence, got {entries:?}");
+        };
+        entry.detail.clone()
     }
 
     #[test]
@@ -2993,29 +3041,32 @@ mod platform_materialization_tests {
 
         let tracked = temp.path().join("tracked");
         fs::write(&tracked, b"src/main.rs").expect("target text file");
-        prove_one_entry(
+        let matched = prove_one_entry(
             &tracked,
             TreeEntry::Symlink { target_blob },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
             SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
-        .expect("the target text file matches the committed target");
+        .expect("the target text file is observed");
+        assert!(
+            matched.is_empty(),
+            "the target text file matches the committed target: {matched:?}"
+        );
 
         fs::write(&tracked, b"src/other.rs").expect("rewrite target text file");
-        let error = prove_one_entry(
+        let diverged = prove_one_entry(
             &tracked,
             TreeEntry::Symlink { target_blob },
             &blob_store,
             ExecutableModeAuthority::IndexMode,
             SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
-        .expect_err("a different target is not the committed one");
+        .expect("a different target is observed rather than refused");
+        let detail = only_detail(&diverged);
         assert!(
-            error
-                .to_string()
-                .contains("target differs from the committed"),
-            "unexpected error: {error}"
+            detail.contains("target differs from the committed"),
+            "unexpected detail: {detail}"
         );
     }
 
@@ -3054,13 +3105,13 @@ mod platform_materialization_tests {
     }
 
     #[test]
-    fn a_real_link_where_links_are_off_is_refused_rather_than_read_through() {
+    fn a_real_link_where_links_are_off_is_reported_rather_than_read_through() {
         let temp = tempfile::tempdir().expect("tempdir");
         let blob_store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let target_blob = blob_store.write(b"src/main.rs").expect("target blob");
 
         // Both sources resolve to the same materialization and must produce
-        // the same refusal, but they must not blame the same party for it.
+        // the same report, but they must not blame the same party for it.
         for (source, blamed) in [
             (
                 SymlinkCapabilitySource::RepositoryRecorded,
@@ -3076,22 +3127,22 @@ mod platform_materialization_tests {
                 return;
             }
 
-            let error = prove_one_entry(
+            let diverged = prove_one_entry(
                 &tracked,
                 TreeEntry::Symlink { target_blob },
                 &blob_store,
                 ExecutableModeAuthority::IndexMode,
                 SymlinkMaterialization::TargetTextFile(source),
             )
-            .expect_err("a real link contradicts a worktree that cannot hold one");
-            let rendered = error.to_string();
+            .expect("a real link contradicts a worktree that cannot hold one");
+            let rendered = only_detail(&diverged);
             assert!(
                 rendered.contains("is a real symbolic link"),
-                "unexpected error: {rendered}"
+                "unexpected detail: {rendered}"
             );
             assert!(
                 rendered.contains(blamed),
-                "the refusal must name who decided the materialization: {rendered}"
+                "the report must name who decided the materialization: {rendered}"
             );
         }
     }
@@ -3107,9 +3158,9 @@ mod platform_materialization_tests {
 
         // The file carries no executable bit anywhere, yet the committed tree
         // says it is executable. Under index authority the index proof already
-        // settled that, so admission proceeds; under worktree authority the
-        // same file must be refused.
-        prove_one_entry(
+        // settled that, so the entry agrees; under worktree authority the same
+        // file must be reported as differing.
+        let matched = prove_one_entry(
             &tracked,
             TreeEntry::Blob {
                 hash,
@@ -3120,8 +3171,12 @@ mod platform_materialization_tests {
             SymlinkMaterialization::TargetTextFile(SymlinkCapabilitySource::RepositoryRecorded),
         )
         .expect("the index carries the exact mode");
+        assert!(
+            matched.is_empty(),
+            "index authority settles the mode without rereading the worktree: {matched:?}"
+        );
 
-        let error = prove_one_entry(
+        let diverged = prove_one_entry(
             &tracked,
             TreeEntry::Blob {
                 hash,
@@ -3131,12 +3186,11 @@ mod platform_materialization_tests {
             ExecutableModeAuthority::WorktreeMode,
             SymlinkMaterialization::Link,
         )
-        .expect_err("a worktree authority must still compare the filesystem");
-        let rendered = error.to_string();
+        .expect("a worktree authority must still compare the filesystem");
+        let rendered = only_detail(&diverged);
         assert!(
-            rendered.contains("different executable mode")
-                || rendered.contains("records no executable bit"),
-            "unexpected error: {rendered}"
+            rendered.contains("executable mode differs"),
+            "unexpected detail: {rendered}"
         );
     }
 
@@ -3556,8 +3610,13 @@ mod tests {
 
         let normal = fixture
             .preflight()
-            .expect_err("ordinary preflight must not hide an ambient .kin");
-        assert!(normal.to_string().contains("untracked non-ignored"));
+            .expect("ordinary preflight observes an ambient .kin");
+        assert_discloses(
+            &normal,
+            ".kin/version",
+            GitWorkspaceDivergenceKind::Untracked,
+            "",
+        );
         let after = preflight_git_migration_after_publication(
             &fixture.repo,
             &published_kin,
@@ -3569,35 +3628,70 @@ mod tests {
         assert_eq!(after, before);
 
         fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
-        let error = preflight_git_migration_after_publication(
+        let sibling = preflight_git_migration_after_publication(
             &fixture.repo,
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
             &fixture.store,
         )
-        .expect_err("post-publication proof must retain all other worktree authority");
-        assert!(error.to_string().contains("outside-kin.txt"));
+        .expect("post-publication proof must retain all other worktree authority");
+        assert_discloses(
+            &sibling,
+            "outside-kin.txt",
+            GitWorkspaceDivergenceKind::Untracked,
+            "",
+        );
+        assert_ne!(
+            sibling, after,
+            "a path that appeared after publication must change the proof"
+        );
     }
 
+    /// Tracked drift after publication is reported, and moves the proof.
+    ///
+    /// Init compares this proof against the one it took before publication and
+    /// refuses on any difference, so reporting the drift rather than refusing it
+    /// here keeps the same fail-closed outcome. Asserting the inequality is what
+    /// proves that: a report the proof did not carry would leave the caller's
+    /// comparison equal and the drift undetected.
     #[test]
-    fn post_publication_proof_still_rejects_tracked_source_drift() {
+    fn post_publication_proof_still_detects_tracked_source_drift() {
         let fixture = Fixture::clean();
         let published_kin = fixture.repo.join(".kin");
         fs::create_dir(&published_kin).expect("published Kin directory");
         fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
-        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
-            .expect("tracked source drift");
-
-        let error = preflight_git_migration_after_publication(
+        let clean = preflight_git_migration_after_publication(
             &fixture.repo,
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
             &fixture.store,
         )
-        .expect_err("tracked source drift must fail after publication");
-        assert!(error.to_string().contains("bytes differ"));
+        .expect("post-publication proof");
+        assert_no_divergence(&clean);
+
+        fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
+            .expect("tracked source drift");
+        let drifted = preflight_git_migration_after_publication(
+            &fixture.repo,
+            &published_kin,
+            &fixture.snapshot,
+            &fixture.plan,
+            &fixture.store,
+        )
+        .expect("tracked source drift is observed after publication");
+        assert_discloses(
+            &drifted,
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::Modified,
+            "bytes differ",
+        );
+        assert_ne!(drifted, clean, "drift must move the proof");
+        assert_ne!(
+            drifted.observation_fingerprint, clean.observation_fingerprint,
+            "drift must move the observation fingerprint"
+        );
     }
 
     #[test]
@@ -3619,18 +3713,52 @@ mod tests {
         assert_preflight_contains(&nested_worktree, "materialized nested-repository state");
     }
 
+    /// Staged work is reported, not refused.
+    ///
+    /// An edit that was staged and one that was only announced with
+    /// `git add -N` are both paths the operator has not committed, so both are
+    /// workspace state rather than a reason the source cannot be read.
     #[test]
-    fn rejects_staged_conflicted_intent_and_ambiguous_index_state() {
+    fn reports_staged_and_intent_to_add_index_state() {
         let staged = Fixture::clean();
         fs::write(staged.repo.join("compose.yaml"), b"services: {}\n").expect("edit");
         git(&staged.repo, &["add", "compose.yaml"]);
-        assert_preflight_contains(&staged, "index entry compose.yaml");
+        let proof = staged.preflight().expect("staged work is observed");
+        assert_discloses(
+            &proof,
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::Staged,
+            "not the committed one",
+        );
 
         let intent = Fixture::clean();
         fs::write(intent.repo.join("intent.txt"), b"intent\n").expect("intent");
         git(&intent.repo, &["add", "--intent-to-add", "intent.txt"]);
-        assert_preflight_contains(&intent, "ambiguous flags");
+        let proof = intent.preflight().expect("an announced path is observed");
+        assert_discloses(
+            &proof,
+            "intent.txt",
+            GitWorkspaceDivergenceKind::Staged,
+            "does not carry this path",
+        );
+        // The index carries it, which is what Git calls tracked, so the worktree
+        // walk must not report the same path a second time as untracked.
+        assert_eq!(
+            proof.workspace_divergence.entries.len(),
+            1,
+            "{:?}",
+            proof.workspace_divergence
+        );
+    }
 
+    /// An index Git has been told not to compare is still refused.
+    ///
+    /// Under these the index no longer states anything about the worktree, so an
+    /// observation of one would not be an observation of the source at all. That
+    /// is ambiguity about the source rather than uncommitted work, which is the
+    /// line the in-progress-operation refusal already draws.
+    #[test]
+    fn rejects_conflicted_and_ambiguous_index_state() {
         let assume = Fixture::clean();
         git(
             &assume.repo,
@@ -3667,15 +3795,30 @@ mod tests {
         assert_preflight_contains(&sparse, "sparse checkout");
     }
 
+    /// Every shape of worktree edit is observed and reported.
+    ///
+    /// None of it enters authority, which the clean case above already proves is
+    /// the committed tree, so each one is workspace state whose only remaining
+    /// question is whether init said so.
     #[test]
-    fn rejects_unstaged_untracked_mode_symlink_and_byte_mismatches() {
+    fn reports_unstaged_untracked_mode_symlink_and_byte_mismatches() {
         let unstaged = Fixture::clean();
         fs::write(unstaged.repo.join("src/main.rs"), b"fn changed() {}\n").expect("edit");
-        assert_preflight_contains(&unstaged, "bytes differ");
+        assert_discloses(
+            &unstaged.preflight().expect("an edit is observed"),
+            "src/main.rs",
+            GitWorkspaceDivergenceKind::Modified,
+            "bytes differ",
+        );
 
         let untracked = Fixture::clean();
         fs::write(untracked.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
-        assert_preflight_contains(&untracked, "untracked non-ignored");
+        assert_discloses(
+            &untracked.preflight().expect("an untracked path is observed"),
+            "surprise.txt",
+            GitWorkspaceDivergenceKind::Untracked,
+            "",
+        );
 
         let executable = Fixture::clean();
         let mut permissions = fs::metadata(executable.repo.join("script.sh"))
@@ -3683,7 +3826,12 @@ mod tests {
             .permissions();
         permissions.set_mode(0o644);
         fs::set_permissions(executable.repo.join("script.sh"), permissions).expect("chmod");
-        assert_preflight_contains(&executable, "executable mode");
+        assert_discloses(
+            &executable.preflight().expect("a mode change is observed"),
+            "script.sh",
+            GitWorkspaceDivergenceKind::Modified,
+            "executable mode differs",
+        );
 
         let symlink_target = Fixture::clean();
         fs::remove_file(symlink_target.repo.join("source-link")).expect("remove symlink");
@@ -3692,16 +3840,100 @@ mod tests {
             symlink_target.repo.join("source-link"),
         )
         .expect("new symlink");
-        assert_preflight_contains(&symlink_target, "target differs");
+        assert_discloses(
+            &symlink_target
+                .preflight()
+                .expect("a repointed link is observed"),
+            "source-link",
+            GitWorkspaceDivergenceKind::Modified,
+            "link target differs",
+        );
 
         let symlink_kind = Fixture::clean();
         fs::remove_file(symlink_kind.repo.join("source-link")).expect("remove symlink");
         fs::write(symlink_kind.repo.join("source-link"), b"src/main.rs").expect("regular file");
-        assert_preflight_contains(&symlink_kind, "not a symbolic link");
+        assert_discloses(
+            &symlink_kind
+                .preflight()
+                .expect("a replaced link is observed"),
+            "source-link",
+            GitWorkspaceDivergenceKind::Modified,
+            "no longer materializes it as a symbolic link",
+        );
+
+        let removed = Fixture::clean();
+        fs::remove_file(removed.repo.join("compose.yaml")).expect("remove tracked file");
+        assert_discloses(
+            &removed
+                .preflight()
+                .expect("a deleted committed path is observed"),
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::Missing,
+            "",
+        );
+
+        let unstaged_removal = Fixture::clean();
+        git(&unstaged_removal.repo, &["rm", "--cached", "compose.yaml"]);
+        assert_discloses(
+            &unstaged_removal
+                .preflight()
+                .expect("a staged removal is observed"),
+            "compose.yaml",
+            GitWorkspaceDivergenceKind::StagedRemoval,
+            "",
+        );
+    }
+
+    /// A worked-in source seals authority at the committed tree regardless.
+    ///
+    /// This is the load-bearing half of admitting a dirty repository: the
+    /// workspace seed the proof is bound to has to stay the committed tree, and
+    /// the fingerprints of what was proven have to stay those of the clean
+    /// source, so nothing uncommitted can reach repository authority through a
+    /// path that merely stopped refusing.
+    #[test]
+    fn a_worked_in_source_still_seals_authority_at_the_committed_tree() {
+        // One repository observed twice, because a second fixture commits its
+        // own gitlink target and would differ for a reason this case is not
+        // about.
+        let fixture = Fixture::clean();
+        let clean_proof = fixture.preflight().expect("clean preflight");
+
+        fs::write(fixture.repo.join("src/main.rs"), b"fn edited() {}\n").expect("edit");
+        fs::write(fixture.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
+        fs::write(fixture.repo.join("staged.txt"), b"staged\n").expect("staged");
+        git(&fixture.repo, &["add", "staged.txt"]);
+        let dirty_proof = fixture
+            .preflight()
+            .expect("a worked-in source is admissible");
+
+        assert_eq!(
+            dirty_proof.base_tree_hash, clean_proof.base_tree_hash,
+            "authority is the committed tree, not the worktree"
+        );
+        assert_eq!(dirty_proof.head, clean_proof.head);
+        assert_eq!(dirty_proof.base_target, clean_proof.base_target);
+        assert_eq!(
+            dirty_proof.snapshot_fingerprint, clean_proof.snapshot_fingerprint,
+            "committed history is untouched by uncommitted work"
+        );
+        assert_eq!(
+            dirty_proof.semantic_plan_fingerprint, clean_proof.semantic_plan_fingerprint
+        );
+        assert_eq!(
+            dirty_proof.workspace_divergence.observed_paths(),
+            3,
+            "{:?}",
+            dirty_proof.workspace_divergence
+        );
+        assert_ne!(
+            dirty_proof.observation_fingerprint, clean_proof.observation_fingerprint,
+            "what was observed must not fingerprint as a source that matched"
+        );
     }
 
     #[test]
-    fn rejects_clean_status_checkout_transformations() {
+    fn reports_clean_status_checkout_transformations() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
@@ -3724,24 +3956,95 @@ mod tests {
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let error =
-            preflight_git_migration(&repo, &snapshot, &plan, &store).expect_err("CRLF rejection");
-        let reported = error.to_string();
-        assert!(reported.contains("gradlew.bat"), "{reported}");
+        let proof = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect("a rewritten checkout is observed");
+        let reported = only_detail(&proof.workspace_divergence.entries);
         assert!(reported.contains("text eol=crlf"), "{reported}");
         assert!(reported.contains("line endings"), "{reported}");
         assert!(reported.contains("is not an unstaged edit"), "{reported}");
-        assert!(!reported.contains("has unstaged edits"), "{reported}");
+        assert!(!reported.contains("no checkout filter"), "{reported}");
+        assert_discloses(
+            &proof,
+            "gradlew.bat",
+            GitWorkspaceDivergenceKind::Modified,
+            "line endings",
+        );
+    }
+
+    /// A committed tree may record a mode the index cannot hold.
+    ///
+    /// `100664` is legal in a tree and several importers write it, while the
+    /// index decodes every plain file to `100644`. Comparing the raw values
+    /// reads such a repository as having every file staged, and no `git restore
+    /// --staged` clears it because nothing is. The comparison runs on the entry
+    /// kind for exactly this reason, and a repository that would have to answer
+    /// for a report it cannot act on is what asserts it.
+    #[test]
+    fn a_non_canonical_committed_filemode_is_not_reported_as_staged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source");
+        git(&repo, &["init", "--initial-branch=main"]);
+        configure_identity(&repo);
+        pin_default_hook_surface(&repo);
+        fs::write(repo.join("README.md"), b"seed\n").expect("readme");
+        git(&repo, &["add", "--all"]);
+        commit(&repo, "seed");
+
+        let blob = git_stdout(&repo, &["rev-parse", "HEAD:README.md"]);
+        // Written as raw tree bytes because `git mktree` canonicalises the mode
+        // on the way in, which is exactly the normalisation this case needs to
+        // be missing.
+        let mut body = b"100664 README.md\0".to_vec();
+        body.extend(
+            (0..blob.len() / 2)
+                .map(|index| u8::from_str_radix(&blob[index * 2..index * 2 + 2], 16))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("hex object id"),
+        );
+        let tree = String::from_utf8(
+            git_command(&repo)
+                .args(["hash-object", "-t", "tree", "-w", "--stdin", "--literally"])
+                .output_with_input(&body)
+                .expect("write raw tree")
+                .stdout,
+        )
+        .expect("utf8 object id")
+        .trim()
+        .to_string();
+        let commit = String::from_utf8(
+            git_stdin(&repo, &["commit-tree", &tree, "-m", "non-canonical mode"], "").stdout,
+        )
+        .expect("utf8 object id")
+        .trim()
+        .to_string();
+        git(&repo, &["reset", "--hard", &commit]);
+        // Read as raw object bytes, because `cat-file -p` prints the
+        // canonicalised mode and would report the fixture worked either way.
+        let raw = git_command(&repo)
+            .args(["cat-file", "tree", "HEAD^{tree}"])
+            .output()
+            .expect("read raw committed tree");
+        assert!(
+            raw.stdout.starts_with(b"100664 "),
+            "the fixture must keep the mode this case is about"
+        );
+
+        let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+        let (snapshot, plan) = snapshot_plan(&repo, &store);
+        let proof = preflight_git_migration(&repo, &snapshot, &plan, &store)
+            .expect("a non-canonical mode is admissible");
+        assert_no_divergence(&proof);
     }
 
     /// The partner of the checkout-transformation case above.
     ///
     /// A tree Git rewrote on checkout and a tree its operator edited both reach
-    /// the same byte comparison, so the refusal is only useful if each names its
+    /// the same byte comparison, so the report is only useful if each names its
     /// own cause. Asserting that neither message carries the other's sentence is
     /// what keeps the two from collapsing back into one accusation.
     #[test]
-    fn rejects_unstaged_edits_without_blaming_a_checkout_filter() {
+    fn reports_unstaged_edits_without_blaming_a_checkout_filter() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
@@ -3756,11 +4059,15 @@ mod tests {
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let error = preflight_git_migration(&repo, &snapshot, &plan, &store)
-            .expect_err("unstaged edit rejection");
-        let reported = error.to_string();
-        assert!(reported.contains("text.txt"), "{reported}");
-        assert!(reported.contains("has unstaged edits"), "{reported}");
+        let proof =
+            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("an edit is observed");
+        assert_discloses(
+            &proof,
+            "text.txt",
+            GitWorkspaceDivergenceKind::Modified,
+            "no checkout filter",
+        );
+        let reported = only_detail(&proof.workspace_divergence.entries);
         assert!(!reported.contains("is not an unstaged edit"), "{reported}");
         assert!(!reported.contains(".gitattributes"), "{reported}");
         assert!(!reported.contains("line endings"), "{reported}");
@@ -4390,6 +4697,46 @@ mod tests {
         assert!(
             error.to_string().contains(expected),
             "expected {expected:?} in {error:?}"
+        );
+    }
+
+    /// One path reported as diverging, of the expected kind and reason.
+    ///
+    /// Asserts the proof was produced at all, which is the half that would
+    /// silently disappear if the observation went back to refusing.
+    fn assert_discloses(
+        proof: &GitMigrationPreflightProof,
+        path: &str,
+        kind: GitWorkspaceDivergenceKind,
+        detail: &str,
+    ) {
+        let divergence = &proof.workspace_divergence;
+        let found = divergence
+            .entries
+            .iter()
+            .find(|entry| entry.path.to_string() == path && entry.kind == kind)
+            .unwrap_or_else(|| {
+                panic!("{path} is not reported as {}: {divergence:?}", kind.label())
+            });
+        assert!(
+            found.detail.contains(detail),
+            "expected {detail:?} in {found:?}"
+        );
+    }
+
+    /// The one sentence a single reported divergence carries.
+    fn only_detail(entries: &[GitWorkspaceDivergence]) -> String {
+        let [entry] = entries else {
+            panic!("expected exactly one divergence, got {entries:?}");
+        };
+        entry.detail.clone()
+    }
+
+    fn assert_no_divergence(proof: &GitMigrationPreflightProof) {
+        assert!(
+            proof.workspace_divergence.is_empty(),
+            "unexpected divergence: {:?}",
+            proof.workspace_divergence
         );
     }
 

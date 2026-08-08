@@ -1009,7 +1009,7 @@ mod tests {
 
     /// Source blockers are reported before any derivation phase runs.
     ///
-    /// The fixture is shallow as well as dirty. Capture is the phase after the
+    /// The fixture is shallow as well as blocked. Capture is the phase after the
     /// blocker check and refuses a shallow source with its own message, so
     /// whichever message comes back names the phase that ran first. A timing
     /// assertion would claim the same thing and pass on a slow machine for the
@@ -1025,11 +1025,11 @@ mod tests {
         git(&source, ["commit", "-m", "initial"]);
         let head = git_stdout(&source, ["rev-parse", "HEAD"]);
         std::fs::write(source.join(".git/shallow"), format!("{}\n", head.trim())).unwrap();
-        std::fs::write(source.join("init.log"), b"log\n").unwrap();
+        git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
 
         let error = init_from_git(&source).unwrap_err().to_string();
 
-        assert!(error.contains("init.log"), "{error}");
+        assert!(error.contains("remote.origin.tagOpt"), "{error}");
         assert!(
             !error.contains("shallow"),
             "capture must not have run yet: {error}"
@@ -1049,16 +1049,107 @@ mod tests {
         git(&source, ["add", "--all"]);
         git(&source, ["commit", "-m", "initial"]);
         git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
+        git(&source, ["config", "branch.main.vscode-merge-base", "main"]);
+        git(&source, ["config", "filter.demo.clean", "external-clean"]);
+
+        let error = init_from_git(&source).unwrap_err().to_string();
+
+        assert!(error.contains("remote.origin.tagOpt"), "{error}");
+        assert!(error.contains("branch.main.vscode-merge-base"), "{error}");
+        assert!(error.contains("filter \"demo\""), "{error}");
+        assert!(!source.join(".kin").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    /// A repository someone has been working in initializes.
+    ///
+    /// This is the whole point of the change: the wall a first adopter hits is
+    /// an ordinary working tree, and the repository that comes out of it must
+    /// still be sealed at the committed state. The assertions are therefore both
+    /// halves, that init succeeded and that nothing uncommitted reached
+    /// authority, plus the disclosure that says where the delta went.
+    #[test]
+    fn a_worked_in_repository_initializes_and_discloses_what_it_did_not_admit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        std::fs::write(source.join("kept.txt"), b"committed\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        let committed_tree = git_stdout(&source, ["rev-parse", "HEAD^{tree}"]);
+
+        std::fs::write(source.join("README.md"), b"edited after the commit\n").unwrap();
         std::fs::write(source.join("init.log"), b"log\n").unwrap();
         std::fs::write(source.join("staged.txt"), b"staged\n").unwrap();
         git(&source, ["add", "staged.txt"]);
 
+        let result = init_from_git(&source).unwrap();
+
+        // The tree under authority is the committed one, byte for byte. Reading
+        // it back out of the repository and comparing against Git's own hash of
+        // the commit is what proves the edit did not enter, rather than the
+        // absence of an error.
+        assert_eq!(
+            git_stdout(&source, ["rev-parse", "HEAD^{tree}"]),
+            committed_tree
+        );
+        assert_eq!(result.authority.workspace.workspace_generation, 0);
+        let divergence = &result.workspace_divergence;
+        assert_eq!(divergence.observed_paths(), 3, "{divergence:?}");
+        let disclosed = divergence
+            .entries
+            .iter()
+            .map(|entry| (entry.path.to_string(), entry.kind))
+            .collect::<Vec<_>>();
+        assert!(
+            disclosed.contains(&(
+                "README.md".to_string(),
+                kin_git::GitWorkspaceDivergenceKind::Modified
+            )),
+            "{disclosed:?}"
+        );
+        assert!(
+            disclosed.contains(&(
+                "staged.txt".to_string(),
+                kin_git::GitWorkspaceDivergenceKind::Staged
+            )),
+            "{disclosed:?}"
+        );
+        assert!(
+            disclosed.contains(&(
+                "init.log".to_string(),
+                kin_git::GitWorkspaceDivergenceKind::Untracked
+            )),
+            "{disclosed:?}"
+        );
+        // The source keeps every one of them.
+        assert_eq!(
+            std::fs::read(source.join("README.md")).unwrap(),
+            b"edited after the commit\n"
+        );
+        assert!(source.join("init.log").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    /// An ambiguous source still refuses, and says so before deriving anything.
+    #[test]
+    fn an_in_progress_git_operation_still_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        let head = git_stdout(&source, ["rev-parse", "HEAD"]);
+        std::fs::write(source.join(".git/MERGE_HEAD"), format!("{}\n", head.trim())).unwrap();
+
         let error = init_from_git(&source).unwrap_err().to_string();
 
-        assert!(error.contains("init.log"), "{error}");
-        assert!(error.contains("staged.txt"), "{error}");
-        assert!(error.contains("remote.origin.tagOpt"), "{error}");
-        assert!(error.contains(".gitignore"), "{error}");
+        assert!(error.contains("MERGE_HEAD") || error.contains("Merge"), "{error}");
+        assert!(error.contains("finish or abort"), "{error}");
         assert!(!source.join(".kin").exists());
         assert_no_staging_directories(root.path());
     }
@@ -1125,6 +1216,12 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
+    /// A tracked edit racing publication is still fatal.
+    ///
+    /// The proof no longer refuses an edited worktree, so what catches this is
+    /// the comparison of the two proofs rather than the second one failing. The
+    /// outcome is the same and the reason is different, which is why the
+    /// assertion names the sentence the comparison produces.
     #[test]
     fn source_drift_immediately_after_publication_is_detected_fail_loud() {
         let root = tempfile::tempdir().unwrap();
@@ -1149,7 +1246,12 @@ mod tests {
             error,
             KinError::RepositoryPublishedButUncertain { .. }
         ));
-        assert!(error.to_string().contains("after publication"));
+        assert!(
+            error
+                .to_string()
+                .contains("changed across repository publication"),
+            "{error}"
+        );
         assert!(source.join(".kin").is_dir());
         assert_no_staging_directories(root.path());
     }
