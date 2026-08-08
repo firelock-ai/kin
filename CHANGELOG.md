@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.12] - 2026-08-08
+
+### Changed
+
+- Match each parsed declaration to a distinct entity (#715)
+
+
 ## [0.5.11] - 2026-08-08
 
 ### Changed
