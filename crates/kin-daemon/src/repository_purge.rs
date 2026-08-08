@@ -3,11 +3,12 @@
 
 //! Daemon-owned retirement of tracked paths that ignore rules now cover.
 //!
-//! Ignore rules deliberately never hide tracked paths, so adding a rule cannot
-//! turn graph-owned identity into a deletion. The cost of that safety is a
-//! backlog: a repository that admitted derived output before a rule existed
-//! keeps carrying it. This module is the deliberate operator action that
-//! retires the backlog, and nothing here runs without an explicit confirmation.
+//! Admission retracts a covered path on its own, so this module is not what
+//! makes a rule take effect. It is the operator's surface for seeing the set
+//! before anything moves, and for retiring it now instead of on the next
+//! observation. Nothing here runs without an explicit confirmation, and it
+//! reads the same rule source admission does so the two cannot name different
+//! sets.
 //!
 //! The removal is published as one complete exact-tree observation, the same
 //! transition shape the watch loop admits, with one difference: the scan is
@@ -16,6 +17,10 @@
 //! as removed. Doing it through a real completed walk rather than a synthesized
 //! delta means the purge inherits the same completion proof, authority
 //! compare-and-swap, and mass-deletion guard as every other admission.
+//!
+//! The enrichment derived from a retired path goes with it. Untracking an
+//! artifact while its entities keep ranking is the exposure this exists to
+//! close, not an acceptable halfway state.
 
 use anyhow::{Context, Result};
 use kin_cli::commands::purge_ignored::{
@@ -57,17 +62,11 @@ pub(crate) fn execute(
         }
     }
 
-    let covered = kin_index::tracked_paths_covered_by_ignore(&ignore, tracked.iter());
-    // A graph-only member's identity is owned by import truth and cannot be
-    // reconstructed from a host walk, so it is never retired by a rule that
-    // happens to match its path. Dropping it from the tracked set would also
-    // break the scanner's graph-only-is-a-subset-of-tracked precondition.
-    let purge_set = covered
-        .paths()
-        .iter()
-        .filter(|path| !graph_only.contains(*path))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    // The same rule source the daemon's own admission reads, so what this
+    // command reports and what a tick retracts can never be two different sets.
+    let covered =
+        kin_index::tracked_paths_retracted_by_ignore(&ignore, tracked.iter(), graph_only.iter());
+    let purge_set = covered.paths().iter().cloned().collect::<BTreeSet<_>>();
 
     let sample_paths = purge_set
         .iter()
@@ -158,6 +157,10 @@ pub(crate) fn execute(
     // artifacts, which would otherwise still be served as complete.
     let graph_mutation = state.begin_graph_authority_mutation();
     let generation = crate::loop_runner::publish_exact_workspace_tree(state, &admitted)?;
+    // Untracking an artifact while its entities keep ranking is the exposure a
+    // purge exists to close, so the enrichment goes with the tree entry and it
+    // goes before the graph is asked to accept a tree that no longer carries it.
+    crate::loop_runner::evict_enrichment_for_removed_paths(state, &deltas)?;
     state.graph.apply_transaction_delta(&TransactionDelta {
         entity_deltas: Vec::new(),
         relation_deltas: Vec::new(),

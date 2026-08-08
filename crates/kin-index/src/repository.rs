@@ -11,12 +11,18 @@
 //! system of record for source truth, not for derived bytes that any build
 //! reproduces.
 //!
-//! Ignore rules apply only to paths that are not already tracked. A tracked
-//! path remains observable after a rule begins matching it, so ignore
-//! configuration can never silently turn graph-owned truth into a deletion.
-//! Retiring already-admitted derived output is therefore a deliberate operator
-//! action: [`tracked_paths_covered_by_ignore`] names exactly which tracked
-//! paths a purge would untrack.
+//! The scanner itself applies ignore rules only to paths that are not already
+//! tracked, so a walk can never turn graph-owned identity into a deletion on
+//! its own. Deciding that an already-admitted path should go is the caller's,
+//! and it is made against graph truth rather than against the walk:
+//! [`tracked_paths_retracted_by_ignore`] names exactly which tracked paths the
+//! current rules retract, and a caller withholds those from the tracked set it
+//! passes here. Admission and retraction therefore read one compiled rule set
+//! through one predicate, [`RepositoryIgnore::matches`].
+//!
+//! Imported graph-only members are never in that set. Their identity comes from
+//! import truth and no host walk could rebuild it, so a rule matching their path
+//! does not retire them.
 //!
 //! A caller receives [`CompleteRepositoryScan`] only after every representable
 //! directory entry, metadata lookup, file read, and symbolic-link read
@@ -524,6 +530,30 @@ pub fn tracked_paths_covered_by_ignore<'a>(
         paths,
         tracked_total,
     }
+}
+
+/// Name the tracked paths that `ignore` retracts.
+///
+/// This is the one source every retraction reads, so what a rule excludes at
+/// admission and what it removes afterwards are decided by the same compiled
+/// rules and can never drift apart. [`RepositoryIgnore::matches`] is the single
+/// predicate underneath: the scanner applies it to decide whether an untracked
+/// leaf is admitted, and this applies it to decide whether an already-tracked
+/// path stays.
+///
+/// `graph_only` members are withheld. Their identity comes from import truth
+/// rather than from a host walk, so nothing could reconstruct them if a rule
+/// happened to match their path, and dropping them would also break the
+/// scanner's graph-only-is-a-subset-of-tracked precondition.
+pub fn tracked_paths_retracted_by_ignore<'a>(
+    ignore: &RepositoryIgnore,
+    tracked: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only: impl IntoIterator<Item = &'a RepoPath>,
+) -> IgnoredTrackedPaths {
+    let graph_only = graph_only.into_iter().collect::<BTreeSet<_>>();
+    let mut covered = tracked_paths_covered_by_ignore(ignore, tracked);
+    covered.paths.retain(|path| !graph_only.contains(path));
+    covered
 }
 
 /// Convert a host-relative path to Kin's byte-exact repository path.
@@ -1402,6 +1432,39 @@ mod tests {
         assert!(none.is_empty());
         assert_eq!(none.tracked_total(), 5);
         assert_eq!(none.retained_total(), 5);
+    }
+
+    /// The retraction set is the covered set less graph-only membership, and it
+    /// answers with the same predicate the scanner admits by, so a rule cannot
+    /// exclude a path at admission while a retraction disagrees about it.
+    #[test]
+    fn retraction_matches_admission_and_withholds_graph_only_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join(".kinignore"), b"investor\n").unwrap();
+        let ignore = RepositoryIgnore::load(root).unwrap();
+
+        let gitlink = path("investor/vendored");
+        let tracked = [
+            path("src/main.rs"),
+            path("investor/deck/build_deck.py"),
+            gitlink.clone(),
+        ];
+
+        let retracted =
+            tracked_paths_retracted_by_ignore(&ignore, tracked.iter(), std::iter::once(&gitlink));
+        assert_eq!(retracted.paths(), [path("investor/deck/build_deck.py")]);
+        assert_eq!(retracted.tracked_total(), 3);
+        assert_eq!(retracted.retained_total(), 2);
+
+        // Every retracted path is one the scanner would also refuse to admit.
+        for retracted in retracted.paths() {
+            assert!(ignore.matches(retracted), "{retracted}");
+        }
+        // Falsification: without the graph-only exemption the Gitlink is covered
+        // too, so the assertion above is testing the exemption and not the rule.
+        let covered = tracked_paths_covered_by_ignore(&ignore, tracked.iter());
+        assert!(covered.paths().contains(&gitlink));
     }
 
     #[cfg(unix)]
