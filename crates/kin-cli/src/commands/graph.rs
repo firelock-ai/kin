@@ -1166,6 +1166,105 @@ mod tests {
         (temp, binding, kin_db::InMemoryGraph::new())
     }
 
+    /// The exact reported failure. `kin graph status` on the umbrella store
+    /// printed "No issues detected" while the daemon had failed every
+    /// whole-tree admission since Aug 6, because every check this command runs
+    /// reads the graph, and the graph a failing loop leaves behind is
+    /// internally perfect and merely out of date.
+    #[test]
+    fn graph_status_refuses_no_issues_while_the_daemon_is_admitting_nothing() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        let healthy = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        assert!(
+            healthy
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "the same graph with a healthy daemon must still pass, or this test \
+             proves nothing about the reconcile term: {:?}",
+            healthy.lines
+        );
+
+        let degraded = build_graph_status_response(
+            &binding,
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                admission_failure_streak: 412,
+                admission_failures: 412,
+                last_admission_error: Some("scan exceeded its budget".to_string()),
+                last_admission_success_age_seconds: Some(172_800),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !degraded
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "this is the lie the ticket exists to kill: {:?}",
+            degraded.lines
+        );
+        let warning = degraded
+            .lines
+            .iter()
+            .find(|line| line.contains("reconcile loop degraded"))
+            .expect("the fault must be named on the surface a user reads");
+        assert!(warning.contains("412"), "{warning}");
+        assert!(warning.contains("172800"), "{warning}");
+        assert!(
+            degraded.error.is_none(),
+            "a live runtime fault is not a defect in the graph this command \
+             inspected, and must not change the exit code"
+        );
+    }
+
+    /// A dropped reconcile event reaches the same verdict. This is the FIR-2145
+    /// shape, where events errored and were skipped while every surface read
+    /// clean.
+    #[test]
+    fn graph_status_names_dropped_reconcile_events() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_status_response(
+            &binding,
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                skipped_events: 7,
+                last_error: Some("src/lib.rs: parser rejected the transaction".to_string()),
+                last_error_age_seconds: Some(90),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "{:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("src/lib.rs: parser rejected the transaction")),
+            "the daemon's own error must survive to the surface: {:?}",
+            response.lines
+        );
+    }
+
     #[test]
     fn graph_status_labels_each_relation_total_with_its_scope() {
         let (_temp, binding, graph) = graph_validation_fixture();

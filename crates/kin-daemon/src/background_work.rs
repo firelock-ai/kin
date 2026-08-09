@@ -1024,4 +1024,121 @@ mod tests {
         assert_eq!(second.progress(), 7);
         assert_eq!(supervisor.reports(Instant::now()).len(), 1);
     }
+
+    /// The FIR-2147 shape: every complete admission failing, for long enough
+    /// that the last success is hours old. The streak is what names it.
+    #[test]
+    fn consecutive_admission_failures_accumulate_into_a_streak() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        probes.record_admission_success(base);
+        for step in 1..=8 {
+            probes.record_admission_failure("ignored churn starved admission", at(base, step * 60));
+        }
+
+        let report = probes.report(at(base, 8 * 60));
+        assert_eq!(report.admission_failure_streak, 8);
+        assert_eq!(report.admission_failures, 8);
+        assert_eq!(report.last_admission_success_age_seconds, Some(480));
+        assert_eq!(
+            report.last_admission_error.as_deref(),
+            Some("ignored churn starved admission")
+        );
+        assert!(report.degraded(), "eight failures in a row is not healthy");
+    }
+
+    /// The falsification, and the property that keeps the streak honest: a
+    /// success ends it. A counter that only ever climbed would report a store
+    /// that failed once an hour ago and has admitted cleanly ever since as
+    /// permanently degraded, and nobody would keep reading it.
+    #[test]
+    fn one_success_clears_the_streak_without_erasing_the_history() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        for step in 1..=8 {
+            probes.record_admission_failure("transient", at(base, step * 60));
+        }
+        assert!(probes.report(at(base, 480)).degraded());
+
+        probes.record_admission_success(at(base, 500));
+
+        let report = probes.report(at(base, 500));
+        assert_eq!(report.admission_failure_streak, 0);
+        assert_eq!(
+            report.admission_failures, 8,
+            "the cumulative count survives, so a store that fails half its passes still says so"
+        );
+        assert!(
+            !report.degraded(),
+            "a loop that is admitting again is not degraded"
+        );
+    }
+
+    /// A dropped reconcile event leaves one path's enrichment stale until that
+    /// path changes again, so the count and the reason both have to survive to
+    /// a surface.
+    #[test]
+    fn a_dropped_event_is_counted_and_keeps_its_reason() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        probes.record_event_skipped("src/a.rs: parser rejected the transaction", at(base, 10));
+        probes.record_event_skipped("src/b.rs: parser rejected the transaction", at(base, 20));
+
+        let report = probes.report(at(base, 30));
+        assert_eq!(report.skipped_events, 2);
+        assert_eq!(
+            report.last_error.as_deref(),
+            Some("src/b.rs: parser rejected the transaction"),
+            "the most recent error is the one that survives"
+        );
+        assert_eq!(report.last_error_age_seconds, Some(10));
+        assert!(
+            report.last_error_at.is_some(),
+            "a wall-clock stamp is what lines this up against a log"
+        );
+        assert!(report.degraded());
+    }
+
+    /// Backlog age measures one unbroken backlog. A daemon that drained hours
+    /// ago and picked up new work a second ago is not carrying an hours-old
+    /// backlog, and reporting one would make the threshold fire on healthy
+    /// bursts forever after the first slow day.
+    #[test]
+    fn backlog_age_measures_the_current_backlog_and_not_the_oldest_one() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+
+        probes.observe_backlog(true, at(base, 0));
+        probes.observe_backlog(true, at(base, 100));
+        assert_eq!(
+            probes.report(at(base, 200)).backlog_age_seconds,
+            Some(200),
+            "a retained backlog ages from when it started, not from the last tick"
+        );
+
+        probes.observe_backlog(false, at(base, 300));
+        assert_eq!(probes.report(at(base, 300)).backlog_age_seconds, None);
+
+        probes.observe_backlog(true, at(base, 400));
+        assert_eq!(
+            probes.report(at(base, 405)).backlog_age_seconds,
+            Some(5),
+            "the next backlog starts its own clock"
+        );
+    }
+
+    /// The whole-mechanism two-sided check. A daemon that has done nothing at
+    /// all reports nothing wrong, because an untouched repository is the most
+    /// common state there is and a probe that called it degraded would be
+    /// turned off within a day.
+    #[test]
+    fn a_daemon_that_has_reconciled_nothing_is_not_degraded() {
+        let report = ReconcileProbes::default().report(Instant::now());
+        assert_eq!(report.skipped_events, 0);
+        assert_eq!(report.admission_failure_streak, 0);
+        assert_eq!(report.last_admission_success_age_seconds, None);
+        assert_eq!(report.backlog_age_seconds, None);
+        assert!(!report.degraded());
+        assert!(report.degraded_reasons().is_empty());
+    }
 }

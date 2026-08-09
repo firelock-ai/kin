@@ -645,6 +645,140 @@ mod tests {
     /// does not, rather than shown as a zero.
     ///
     /// Both directions, because a renderer that always printed the line and one
+    /// A store failing every admission pass, planted at the exact shape the
+    /// umbrella store carried for two days.
+    fn failing_admission() -> ReconcileHealth {
+        ReconcileHealth {
+            admission_failure_streak: 412,
+            admission_failures: 412,
+            last_admission_error: Some("scan exceeded its budget".to_string()),
+            last_admission_success_age_seconds: Some(172_800),
+            last_admission_success_at: Some("2026-08-06T09:00:00+00:00".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_failing_admission_streak_is_a_degraded_reason_that_names_its_threshold() {
+        let reasons = failing_admission().degraded_reasons();
+        assert_eq!(reasons.len(), 1, "one fault, one reason: {reasons:?}");
+        let reason = &reasons[0];
+        assert!(reason.contains("412"), "the streak must be named: {reason}");
+        assert!(
+            reason.contains(&ADMISSION_FAILURE_STREAK_ATTENTION.to_string()),
+            "an operator must not have to find the constant: {reason}"
+        );
+        assert!(
+            reason.contains("172800"),
+            "how long since anything was admitted is the point: {reason}"
+        );
+        assert!(
+            reason.contains("scan exceeded its budget"),
+            "the daemon's own error, not a summary invented here: {reason}"
+        );
+    }
+
+    /// The falsification. Same shape, one below the threshold, and the verdict
+    /// has to flip. A check that fired on any failure at all would pass the test
+    /// above while being useless, because a single deferred admission is the
+    /// retry mechanism working as designed.
+    #[test]
+    fn a_streak_below_the_threshold_is_not_degraded() {
+        let below = ReconcileHealth {
+            admission_failure_streak: ADMISSION_FAILURE_STREAK_ATTENTION - 1,
+            admission_failures: ADMISSION_FAILURE_STREAK_ATTENTION - 1,
+            last_admission_error: Some("file changed during admission".to_string()),
+            last_admission_success_age_seconds: Some(30),
+            ..Default::default()
+        };
+        assert!(
+            !below.degraded(),
+            "a retry in progress is the mechanism working: {:?}",
+            below.degraded_reasons()
+        );
+
+        let at_threshold = ReconcileHealth {
+            admission_failure_streak: ADMISSION_FAILURE_STREAK_ATTENTION,
+            ..below
+        };
+        assert!(
+            at_threshold.degraded(),
+            "one more consecutive failure crosses it"
+        );
+    }
+
+    #[test]
+    fn a_dropped_reconcile_event_degrades_and_carries_its_error() {
+        let dropped = ReconcileHealth {
+            skipped_events: 3,
+            last_error: Some("src/lib.rs: parser rejected the transaction".to_string()),
+            last_error_age_seconds: Some(45),
+            ..Default::default()
+        };
+        let reasons = dropped.degraded_reasons();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("3 reconcile event(s)"), "{reasons:?}");
+        assert!(reasons[0].contains("src/lib.rs"), "{reasons:?}");
+        assert!(
+            reasons[0].contains("stale"),
+            "the consequence is what makes the count worth reading: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_backlog_degrades_only_once_it_has_stopped_draining() {
+        let draining = ReconcileHealth {
+            backlog_age_seconds: Some(BACKLOG_STALE_SECONDS - 1),
+            ..Default::default()
+        };
+        assert!(
+            !draining.degraded(),
+            "a burst being worked off is not a fault: {:?}",
+            draining.degraded_reasons()
+        );
+
+        let stuck = ReconcileHealth {
+            backlog_age_seconds: Some(BACKLOG_STALE_SECONDS),
+            ..Default::default()
+        };
+        assert!(stuck.degraded());
+        assert!(stuck.degraded_reasons()[0].contains(&BACKLOG_STALE_SECONDS.to_string()));
+    }
+
+    /// The reconcile line is rendered whether or not anything is wrong. A
+    /// counter that appears only on a fault cannot be checked against, and its
+    /// absence reads exactly like a surface nobody wired up.
+    #[test]
+    fn the_reconcile_line_is_rendered_on_a_healthy_daemon_too() {
+        let healthy = render_reconcile_lines(&ReconcileHealth {
+            last_admission_success_age_seconds: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(healthy.len(), 1, "no degradation, no extra lines: {healthy:?}");
+        assert!(healthy[0].contains("last admitted 4s ago"), "{healthy:?}");
+        assert!(healthy[0].contains("0 consecutive admission failure(s)"), "{healthy:?}");
+        assert!(healthy[0].contains("no backlog"), "{healthy:?}");
+
+        let degraded = render_reconcile_lines(&failing_admission());
+        assert!(
+            degraded.iter().any(|line| line.contains("Reconcile degraded")),
+            "the fault has to reach the text surface: {degraded:?}"
+        );
+    }
+
+    /// A daemon that has never admitted anything says so rather than reporting a
+    /// zero-second age. The two are different facts and a fresh daemon is not a
+    /// daemon that admitted something a moment ago.
+    #[test]
+    fn a_daemon_that_has_never_admitted_says_so_rather_than_reporting_zero() {
+        let lines = render_reconcile_lines(&ReconcileHealth::default());
+        assert!(
+            lines[0].contains("never admitted in this daemon's life"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("last admitted 0s ago"), "{lines:?}");
+    }
+
     /// that never did would each pass a single-sided test. Zero is a real
     /// answer here — a daemon that has served everything from cache — and it
     /// has to be distinguishable from a daemon too old to have the field.

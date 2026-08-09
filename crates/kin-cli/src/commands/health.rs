@@ -2091,6 +2091,73 @@ mod tests {
         );
     }
 
+    /// The FIR-2147 shape at the `kin health` surface. No pass is stopped —
+    /// the reconcile loop is waking, failing, and sleeping on schedule, which
+    /// is exactly why the supervisor never stopped it — and the check still
+    /// must not answer healthy.
+    #[test]
+    fn background_work_degrades_when_reconcile_admits_nothing_though_no_pass_is_stopped() {
+        let check =
+            background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
+                daemon_cpu_seconds: Some(9_000.0),
+                authority_loads: None,
+                passes: vec![
+                    pass_report("embed", "idle", None),
+                    pass_report("reconcile", "working", None),
+                ],
+                reconcile: crate::commands::resources::ReconcileHealth {
+                    admission_failure_streak: 412,
+                    admission_failures: 412,
+                    last_admission_error: Some("scan exceeded its budget".to_string()),
+                    last_admission_success_age_seconds: Some(172_800),
+                    ..Default::default()
+                },
+            });
+        assert!(
+            !matches!(check.status, HealthStatus::Healthy),
+            "a daemon that has admitted nothing for two days is not healthy: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("412"),
+            "the check must name the streak: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("scan exceeded its budget"),
+            "the daemon's own error must survive to the surface: {}",
+            check.detail
+        );
+    }
+
+    /// The falsification. Identical passes, identical CPU, and a reconcile loop
+    /// that is admitting normally. If this reported anything but healthy the
+    /// check above would be measuring the passes rather than the admissions.
+    #[test]
+    fn background_work_stays_healthy_when_reconcile_is_admitting_normally() {
+        let check =
+            background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
+                daemon_cpu_seconds: Some(9_000.0),
+                authority_loads: None,
+                passes: vec![
+                    pass_report("embed", "idle", None),
+                    pass_report("reconcile", "working", None),
+                ],
+                reconcile: crate::commands::resources::ReconcileHealth {
+                    admission_failures: 2,
+                    last_admission_success_age_seconds: Some(3),
+                    ..Default::default()
+                },
+            });
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check.detail.contains("reconcile admitting normally"),
+            "a healthy verdict must say what it checked, or its silence is \
+             indistinguishable from never having looked: {}",
+            check.detail
+        );
+    }
+
     /// The falsification: the same shape with a stopped pass must NOT read
     /// healthy, and must carry the daemon's own reason rather than a summary
     /// invented here.
