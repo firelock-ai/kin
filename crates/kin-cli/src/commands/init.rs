@@ -12,6 +12,8 @@
 //! This command deliberately does not parse a checkout, synthesize a snapshot
 //! change, or rebuild an existing repository from raw filesystem contents.
 
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -235,8 +237,7 @@ fn print_json_result(
         store_footprint: StoreFootprint::measure(&result.layout),
         uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
     };
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    emit(&format!("{}\n", serde_json::to_string_pretty(&payload)?))
 }
 
 fn uncommitted_worktree_payload(
@@ -266,57 +267,92 @@ fn print_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
 ) -> Result<()> {
+    emit(&render_human_result(result, boundary, semantic_enrichment)?)
+}
+
+/// Hand a finished result to stdout, tolerating a reader that already left.
+///
+/// The store is durable before a single byte of this is written, so a consumer
+/// that closed its pipe must not turn a completed admission into a failure.
+/// `println!` panics on a write error, which is exactly what `kin init | head`
+/// did. Every write error that is not a departed reader is still reported.
+fn emit(rendered: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(rendered.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error).context("write the kin init result to stdout"),
+    }
+}
+
+/// The whole human result as one string, so it reaches stdout in one write.
+fn render_human_result(
+    result: &kin_core::InitResult,
+    boundary: InitBoundary,
+    semantic_enrichment: &SemanticEnrichmentStatus,
+) -> Result<String> {
     let default_ref = initialized_default_ref(result);
-    println!(
+    let mut out = String::new();
+    writeln!(
+        out,
         "Initialized Kin repository authority at {}",
         result.layout.root().display()
-    );
-    println!("  Authority: repository-v6 (graph-owned)");
-    println!("  Repository: {}", result.repository_id);
-    println!("  Workspace: {}", result.workspace_id);
+    )?;
+    writeln!(out, "  Authority: repository-v6 (graph-owned)")?;
+    writeln!(out, "  Repository: {}", result.repository_id)?;
+    writeln!(out, "  Workspace: {}", result.workspace_id)?;
     match default_ref {
-        Some(default_ref) => println!("  Default ref: {default_ref}"),
-        None => println!("  Default ref: none (detached workspace)"),
+        Some(default_ref) => writeln!(out, "  Default ref: {default_ref}")?,
+        None => writeln!(out, "  Default ref: none (detached workspace)")?,
     }
-    println!(
+    writeln!(
+        out,
         "  Authority generation: {}",
         result.authority.receipt.generation
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  Workspace generation: {}",
         result.authority.workspace.workspace_generation
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  Workspace head: {}",
         serde_json::to_string(&result.authority.workspace.workspace_head)?
-    );
+    )?;
     match boundary {
         InitBoundary::ExactGit => {
-            println!(
+            writeln!(
+                out,
                 "  Imported: exact reachable Git history, refs, raw objects, workspace, and admission policy"
-            );
+            )?;
         }
         InitBoundary::NativeUnborn => {
-            println!("  History: unborn (no synthetic commit)");
-            println!("  Workspace: empty exact tree");
+            writeln!(out, "  History: unborn (no synthetic commit)")?;
+            writeln!(out, "  Workspace: empty exact tree")?;
         }
     }
-    println!(
+    writeln!(
+        out,
         "  Semantic enrichment: {}",
         render_semantic_enrichment(semantic_enrichment)
-    );
+    )?;
     if let Some(notice) = semantic_absence_notice(semantic_enrichment) {
-        println!("{notice}");
+        writeln!(out, "{notice}")?;
     }
-    println!(
+    writeln!(
+        out,
         "  Store size: {}",
         StoreFootprint::measure(&result.layout).render()
-    );
-    println!("  {}", store_size_notice());
+    )?;
+    writeln!(out, "  {}", store_size_notice())?;
     for line in uncommitted_worktree_disclosure(&result.workspace_divergence) {
-        println!("{line}");
+        writeln!(out, "{line}")?;
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Paths listed by name before the rest are counted rather than named.
