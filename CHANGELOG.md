@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-08-09
+
+### Changed
+
+- Lead with the version gap when a store predates the layout this build serves (#721)
+- Publish what the reconcile loop actually admitted (#722)
+- Stop reading the content of entries the ignore rules exclude (#723)
+- Qualify every absence these two retrieval tools report, including the ones they could not look up (#720)
+- Keep kin init progress on the terminal it was drawn for (#724)
+
+
 ## [0.5.13] - 2026-08-09
 
 ### Changed
