@@ -167,6 +167,23 @@ pub async fn open_snapshot_explicit_admin_read_only(
     }
 }
 
+/// Carry a failed daemon resolution into a channel that can only hold a string.
+///
+/// A store this build cannot open answers the question by itself, so it passes
+/// through as the whole message rather than as a cause under a missing daemon.
+/// Anything else keeps the daemon framing and brings its cause with it:
+/// rendering an `anyhow` chain with `{error}` prints the outermost context only,
+/// which reduced every failure here to "kin daemon is required but unavailable:
+/// kin daemon is required".
+fn daemon_resolution_storage_error(error: anyhow::Error) -> kin_db::KinDbError {
+    if let Some(crate::daemon_client::AutoStartError::IncompatibleStore(message)) =
+        error.downcast_ref::<crate::daemon_client::AutoStartError>()
+    {
+        return kin_db::KinDbError::StorageError(message.clone());
+    }
+    kin_db::KinDbError::StorageError(format!("kin daemon is required but unavailable: {error:#}"))
+}
+
 /// Whether the offline/admin local-snapshot escape hatch is enabled.
 fn daemon_bootstrap_admin_allowed() -> bool {
     std::env::var("KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN")
@@ -187,11 +204,7 @@ async fn open_snapshot_daemon_first_with_mode(
     .entered();
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await
-        .map_err(|error| {
-            kin_db::KinDbError::StorageError(format!(
-                "kin daemon is required but unavailable: {error}"
-            ))
-        })?
+        .map_err(daemon_resolution_storage_error)?
         .ok_or_else(|| {
             kin_db::KinDbError::StorageError(
                 "kin daemon is required but no daemon endpoint is available".to_string(),

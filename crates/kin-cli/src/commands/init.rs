@@ -153,13 +153,25 @@ fn ensure_directory(dir: &Path) -> Result<()> {
 
 fn reject_existing_repository(dir: &Path) -> Result<()> {
     if path_exists(&dir.join(".kin"))? {
-        anyhow::bail!(
-            "Kin repository already exists at {}; `kin init` never rebuilds graph authority from \
-             the working tree",
-            dir.display()
-        );
+        anyhow::bail!(existing_repository_refusal(dir));
     }
     Ok(())
+}
+
+/// The refusal `kin init` raises over a directory that already holds a store.
+///
+/// The reader who arrives here most often is the one the store wall just sent,
+/// after an older store refused to open. That wall names a rebuild, and `kin
+/// init` is half of it, so this refusal names the same rebuild instead of
+/// stopping at the fact that a store exists.
+fn existing_repository_refusal(dir: &Path) -> String {
+    format!(
+        "Kin repository already exists at {}; `kin init` never rebuilds graph authority from the \
+         working tree. If this build cannot open that store, {} again to rebuild it from the \
+         repository's Git history.",
+        dir.display(),
+        super::REBUILD_INCOMPATIBLE_STORE
+    )
 }
 
 fn require_empty_native_boundary(dir: &Path) -> Result<()> {
@@ -484,6 +496,42 @@ mod tests {
         assert!(
             absent.contains("not installed") && absent.contains("git"),
             "a host without git must be told before being sent to a git commit: {absent}"
+        );
+    }
+
+    /// The store wall and this refusal are read in sequence by one reader, so
+    /// they have to name one remedy between them.
+    ///
+    /// They did not. The wall sent the reader to `kin init` in a fresh checkout,
+    /// and `kin init` answered that a repository already exists and that it
+    /// never rebuilds graph authority, which reads as a flat contradiction and
+    /// leaves no next move.
+    #[test]
+    fn the_store_wall_and_the_existing_repository_refusal_name_one_remedy() {
+        let wall = crate::commands::incompatible_store_refusal(
+            std::path::Path::new("/repo/.kin"),
+            &kin_core::KinError::IncompatibleVersion {
+                found: 1,
+                supported: 2,
+            },
+        );
+        let refusal = existing_repository_refusal(std::path::Path::new("/repo"));
+
+        assert!(
+            wall.contains(crate::commands::REBUILD_INCOMPATIBLE_STORE),
+            "the store wall must name the shared remedy: {wall}"
+        );
+        assert!(
+            refusal.contains(crate::commands::REBUILD_INCOMPATIBLE_STORE),
+            "the existing-repository refusal must name the same remedy: {refusal}"
+        );
+        assert!(
+            wall.contains("found v1, this binary requires v2"),
+            "the wall must lead with the version gap it is about: {wall}"
+        );
+        assert!(
+            !wall.contains("fresh checkout") && !refusal.contains("fresh checkout"),
+            "neither text may send the reader to a checkout they do not have"
         );
     }
 

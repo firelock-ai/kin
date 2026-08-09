@@ -1945,11 +1945,16 @@ impl DaemonState {
         // namespace, so letting either path speak first buries the real story
         // under a serde or storage error instead of the version gap.
         if let Err(error) = layout.check_version() {
+            // The remedy has to be one `kin init` will actually honor. Sending
+            // the reader to a fresh checkout read as sound advice and was not:
+            // `kin init` refuses over an existing store, so the instruction
+            // dead-ended in the working tree the reader was standing in.
             return Err(DaemonError::IncompatibleRepo(format!(
                 "{error}. This repository was created before the \
-                 repository-authority layout change; re-create it with this \
-                 build (`kin clone` or `kin init` in a fresh checkout), or \
-                 open it with a matching older kin."
+                 repository-authority layout change and there is no in-place \
+                 upgrade. Remove .kin/ and run `kin init` to rebuild the store \
+                 from the repository's Git history, or open it with a matching \
+                 older kin."
             )));
         }
 
@@ -6735,8 +6740,13 @@ mod tests {
             "message must name the layout gap: {message}"
         );
         assert!(
-            message.contains("kin clone") || message.contains("kin init"),
+            message.contains("Remove .kin/ and run `kin init`"),
             "message must name a remediation path: {message}"
+        );
+        assert!(
+            !message.contains("fresh checkout"),
+            "the remedy must be one `kin init` honors in the tree the reader is in, and `kin \
+             init` refuses over an existing store: {message}"
         );
         assert!(
             !message.contains("missing field"),

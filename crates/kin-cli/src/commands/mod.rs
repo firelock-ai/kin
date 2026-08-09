@@ -128,6 +128,33 @@ pub(crate) fn not_a_kin_repository() -> anyhow::Error {
     anyhow::anyhow!(NOT_A_KIN_REPOSITORY)
 }
 
+/// The one remedy for a `.kin/` store this build cannot open.
+///
+/// Two messages have to agree on it. The store wall sends the reader to
+/// `kin init`, and `kin init` refuses over an existing store, so a refusal that
+/// named a different path would send the reader in a circle. The consistency
+/// test in `commands::init` holds both texts against this token.
+pub(crate) const REBUILD_INCOMPATIBLE_STORE: &str = "remove .kin/ and run `kin init`";
+
+/// The wall a store written by an older kin is refused with.
+///
+/// The version gap leads, because it is the whole reason nothing else will
+/// work. There is no in-place upgrade and no migration command, so the remedy
+/// is the rebuild the reader can actually perform, and the case where that
+/// rebuild has no source to draw on is named rather than left to be discovered.
+pub(crate) fn incompatible_store_refusal(
+    kin_root: &std::path::Path,
+    error: &kin_core::KinError,
+) -> String {
+    format!(
+        "{error} ({})\nAn older kin wrote this store and there is no in-place upgrade. Kin \
+         re-derives the store from the repository's Git history, so {REBUILD_INCOMPATIBLE_STORE} \
+         here to rebuild it. If the repository has no Git history to re-admit, keep a copy of \
+         .kin/ and open it with the kin that wrote it.",
+        kin_root.display()
+    )
+}
+
 #[cfg(test)]
 mod repository_refusal_tests {
     use super::{require_repository_layout_at, NOT_A_KIN_REPOSITORY};
