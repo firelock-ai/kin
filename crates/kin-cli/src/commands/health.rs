@@ -1655,7 +1655,20 @@ pub fn background_work_health_from_state(
         Some(seconds) => format!("daemon has used {seconds:.0}s of CPU"),
         None => "daemon CPU not sampled yet".to_string(),
     };
-    if stopped.is_empty() {
+    // A pass that is still running is not thereby working. The supervisor stops
+    // a pass that holds the CPU without advancing, but a reconcile loop that
+    // wakes, fails its admission, and sleeps again advances its own clock
+    // perfectly well while admitting nothing, so it is never stopped and this
+    // check called it healthy for as long as that lasted. The loop's own
+    // account of what it admitted is therefore read beside the stop flags
+    // rather than trusted to be implied by them.
+    let mut reasons: Vec<String> = stopped
+        .iter()
+        .filter_map(|pass| pass.stopped_reason.as_deref())
+        .map(str::to_string)
+        .collect();
+    reasons.extend(work.reconcile.degraded_reasons());
+    if reasons.is_empty() {
         let working = work
             .passes
             .iter()
@@ -1666,21 +1679,17 @@ pub fn background_work_health_from_state(
             "Background work",
             HealthStatus::Healthy,
             format!(
-                "{cpu}; {} background pass(es), {working} working, none stopped",
+                "{cpu}; {} background pass(es), {working} working, none stopped; reconcile \
+                 admitting normally",
                 work.passes.len()
             ),
         );
     }
-    let reasons = stopped
-        .iter()
-        .filter_map(|pass| pass.stopped_reason.as_deref())
-        .collect::<Vec<_>>()
-        .join("; ");
     HealthCheck::new(
         "background_work",
         "Background work",
         HealthStatus::Stale,
-        format!("{cpu}; {reasons}"),
+        format!("{cpu}; {}", reasons.join("; ")),
     )
     .with_manual_fix(
         "restart the daemon (`kin daemon restart`) to retry the stopped pass, and report the \
@@ -2067,6 +2076,7 @@ mod tests {
                     pass_report("embed", "working", None),
                     pass_report("reconcile", "idle", None),
                 ],
+                reconcile: Default::default(),
             });
         assert!(matches!(check.status, HealthStatus::Healthy));
         assert!(
@@ -2077,6 +2087,73 @@ mod tests {
         assert!(
             check.detail.contains("none stopped"),
             "a busy daemon is not a faulty one: {}",
+            check.detail
+        );
+    }
+
+    /// The FIR-2147 shape at the `kin health` surface. No pass is stopped —
+    /// the reconcile loop is waking, failing, and sleeping on schedule, which
+    /// is exactly why the supervisor never stopped it — and the check still
+    /// must not answer healthy.
+    #[test]
+    fn background_work_degrades_when_reconcile_admits_nothing_though_no_pass_is_stopped() {
+        let check =
+            background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
+                daemon_cpu_seconds: Some(9_000.0),
+                authority_loads: None,
+                passes: vec![
+                    pass_report("embed", "idle", None),
+                    pass_report("reconcile", "working", None),
+                ],
+                reconcile: crate::commands::resources::ReconcileHealth {
+                    admission_failure_streak: 412,
+                    admission_failures: 412,
+                    last_admission_error: Some("scan exceeded its budget".to_string()),
+                    last_admission_success_age_seconds: Some(172_800),
+                    ..Default::default()
+                },
+            });
+        assert!(
+            !matches!(check.status, HealthStatus::Healthy),
+            "a daemon that has admitted nothing for two days is not healthy: {:?}",
+            check.status
+        );
+        assert!(
+            check.detail.contains("412"),
+            "the check must name the streak: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("scan exceeded its budget"),
+            "the daemon's own error must survive to the surface: {}",
+            check.detail
+        );
+    }
+
+    /// The falsification. Identical passes, identical CPU, and a reconcile loop
+    /// that is admitting normally. If this reported anything but healthy the
+    /// check above would be measuring the passes rather than the admissions.
+    #[test]
+    fn background_work_stays_healthy_when_reconcile_is_admitting_normally() {
+        let check =
+            background_work_health_from_state(&crate::commands::resources::DaemonWorkState {
+                daemon_cpu_seconds: Some(9_000.0),
+                authority_loads: None,
+                passes: vec![
+                    pass_report("embed", "idle", None),
+                    pass_report("reconcile", "working", None),
+                ],
+                reconcile: crate::commands::resources::ReconcileHealth {
+                    admission_failures: 2,
+                    last_admission_success_age_seconds: Some(3),
+                    ..Default::default()
+                },
+            });
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(
+            check.detail.contains("reconcile admitting normally"),
+            "a healthy verdict must say what it checked, or its silence is \
+             indistinguishable from never having looked: {}",
             check.detail
         );
     }
@@ -2098,6 +2175,7 @@ mod tests {
                     ),
                     pass_report("reconcile", "idle", None),
                 ],
+                reconcile: Default::default(),
             });
         assert!(matches!(check.status, HealthStatus::Stale));
         assert!(check

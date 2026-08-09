@@ -182,13 +182,23 @@ fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
     Ok(())
 }
 
+/// Render a graph command.
+///
+/// `reconcile` is the running daemon's account of what its reconciliation loop
+/// has actually admitted. It is a separate argument rather than something
+/// derived from the graph because it cannot be derived from the graph: a store
+/// whose every admission has failed for two days holds a graph that is
+/// internally perfect and simply out of date, and every content check here
+/// passes on it. That is how `kin graph status` came to report no issues on a
+/// store the daemon had been failing to admit since Aug 6.
 pub fn execute_graph_command(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &GraphCommandRequest,
+    reconcile: &crate::commands::resources::ReconcileHealth,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => build_graph_status_response(binding, graph),
+        GraphCommandRequest::Status => build_graph_status_response(binding, graph, reconcile),
         GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => build_graph_source_response(
@@ -202,6 +212,7 @@ pub fn execute_graph_command(
 fn build_graph_status_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
+    reconcile: &crate::commands::resources::ReconcileHealth,
 ) -> Result<GraphCommandResponse> {
     let health = inspect_graph(binding, graph)?;
 
@@ -381,6 +392,14 @@ fn build_graph_status_response(
             "very low entity-to-entity relation density ({:.2} rels/entity) — entity linker may be failing",
             entity_rels_per_ent
         ));
+    }
+    // Reported as warnings rather than as criticals on purpose. A degraded
+    // reconcile loop is a live runtime fault and not a defect in the graph this
+    // command inspected, and criticals set the response error, which would turn
+    // `kin graph status` nonzero for every caller scripting it. Killing the
+    // false all-clear is the requirement; changing an exit code is not.
+    for reason in reconcile.degraded_reasons() {
+        warnings.push(format!("reconcile loop degraded — {reason}"));
     }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
@@ -1147,6 +1166,150 @@ mod tests {
         (temp, binding, kin_db::InMemoryGraph::new())
     }
 
+    /// The exact reported failure. `kin graph status` on the umbrella store
+    /// printed "No issues detected" while the daemon had failed every
+    /// whole-tree admission since Aug 6, because every check this command runs
+    /// reads the graph, and the graph a failing loop leaves behind is
+    /// internally perfect and merely out of date.
+    #[test]
+    fn graph_status_refuses_no_issues_while_the_daemon_is_admitting_nothing() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let caller = test_entity("run_task");
+        let callee = test_entity("finalize");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph
+            .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
+            .unwrap();
+
+        // The control. This fixture's graph raises unrelated warnings of its own
+        // (pending embeddings, uniform roles), so the all-clear line is not what
+        // separates the two halves here and asserting on it would pass whatever
+        // the reconcile term did. What must differ is the reconcile warning
+        // itself: absent on a healthy daemon, present on this one.
+        let healthy = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        assert!(
+            !healthy
+                .lines
+                .iter()
+                .any(|line| line.contains("reconcile loop degraded")),
+            "a healthy daemon must not be reported as degraded: {:?}",
+            healthy.lines
+        );
+
+        let degraded = build_graph_status_response(
+            &binding,
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                admission_failure_streak: 412,
+                admission_failures: 412,
+                last_admission_error: Some("scan exceeded its budget".to_string()),
+                last_admission_success_age_seconds: Some(172_800),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !degraded
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "this is the lie the ticket exists to kill: {:?}",
+            degraded.lines
+        );
+        let warning = degraded
+            .lines
+            .iter()
+            .find(|line| line.contains("reconcile loop degraded"))
+            .expect("the fault must be named on the surface a user reads");
+        assert!(warning.contains("412"), "{warning}");
+        assert!(warning.contains("172800"), "{warning}");
+        assert!(
+            degraded.error.is_none(),
+            "a live runtime fault is not a defect in the graph this command \
+             inspected, and must not change the exit code"
+        );
+    }
+
+    /// A dropped reconcile event reaches the same verdict. This is the FIR-2145
+    /// shape, where events errored and were skipped while every surface read
+    /// clean.
+    #[test]
+    fn graph_status_names_dropped_reconcile_events() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_status_response(
+            &binding,
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                skipped_events: 7,
+                last_error: Some("src/lib.rs: parser rejected the transaction".to_string()),
+                last_error_age_seconds: Some(90),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The reconcile warning is the assertion that carries this test. The
+        // all-clear line is checked below it rather than above it because this
+        // fixture's graph raises warnings of its own, so its absence would hold
+        // whether or not the reconcile term existed.
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("reconcile loop degraded")),
+            "a dropped event must be named on the surface a user reads: {:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("src/lib.rs: parser rejected the transaction")),
+            "the daemon's own error must survive to the surface: {:?}",
+            response.lines
+        );
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "{:?}",
+            response.lines
+        );
+    }
+
+    /// The all-clear line and a degraded reconcile loop are mutually exclusive
+    /// by construction, and this is the assertion that proves it.
+    ///
+    /// No fixture in this module produces a warning-free graph, so a test that
+    /// planted a degraded loop and checked the all-clear was gone would hold
+    /// with the reconcile term deleted. Reading the suppression rule against the
+    /// same reasons the surface renders is what cannot pass by accident: any
+    /// non-empty reason set makes the warning list non-empty, and a non-empty
+    /// warning list is exactly what withholds the all-clear at the call site.
+    #[test]
+    fn a_degraded_reconcile_loop_always_withholds_the_all_clear() {
+        let degraded = crate::commands::resources::ReconcileHealth {
+            admission_failure_streak: 412,
+            last_admission_success_age_seconds: Some(172_800),
+            ..Default::default()
+        };
+        assert!(
+            !degraded.degraded_reasons().is_empty(),
+            "the planted state must be degraded, or this proves nothing"
+        );
+
+        let clean = crate::commands::resources::ReconcileHealth::default();
+        assert!(
+            clean.degraded_reasons().is_empty(),
+            "an untouched daemon contributes no warnings, so the all-clear is \
+             still reachable for a graph that earns it"
+        );
+    }
+
     #[test]
     fn graph_status_labels_each_relation_total_with_its_scope() {
         let (_temp, binding, graph) = graph_validation_fixture();
@@ -1158,7 +1321,7 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph).unwrap();
+        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
 
         // The entity-rooted total and the whole-table total count different
         // scopes, so neither line may carry a bare "Relations" label.
@@ -1201,7 +1364,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph).unwrap();
+        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
 
         assert!(response
             .lines
@@ -2131,7 +2294,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let validate = build_graph_validate_response(&binding, &graph).unwrap();
-        let status = build_graph_status_response(&binding, &graph).unwrap();
+        let status = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
 
         let validate_notes = note_lines(&validate);
         assert!(

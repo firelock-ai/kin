@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use kin_cli::commands::resources::{BackgroundPassReport, DaemonWorkState};
+use kin_cli::commands::resources::{BackgroundPassReport, DaemonWorkState, ReconcileHealth};
 
 /// The background embedding worker.
 pub const PASS_EMBED: &str = "embed";
@@ -336,6 +336,14 @@ pub struct BackgroundWorkSupervisor {
     /// by `/health`, which must stay cheap enough to poll.
     cpu_millis: AtomicU64,
     cpu_sampled: AtomicBool,
+    /// What the reconcile loop admitted, dropped, and last failed at.
+    ///
+    /// Held here rather than filled in by whoever assembles a report, because a
+    /// surface that forgets to attach it publishes a default — no failures, no
+    /// dropped events — which is indistinguishable from a healthy loop and is
+    /// the exact false all-clear these probes exist to end. Owned by the
+    /// supervisor, every disclosure it builds carries them.
+    reconcile: ReconcileProbes,
 }
 
 impl Default for BackgroundWorkSupervisor {
@@ -351,7 +359,13 @@ impl BackgroundWorkSupervisor {
             passes: RwLock::new(BTreeMap::new()),
             cpu_millis: AtomicU64::new(0),
             cpu_sampled: AtomicBool::new(false),
+            reconcile: ReconcileProbes::default(),
         }
+    }
+
+    /// The reconcile loop's probe handle, for the loop to record into.
+    pub fn reconcile(&self) -> &ReconcileProbes {
+        &self.reconcile
     }
 
     fn passes(
@@ -506,6 +520,146 @@ impl BackgroundWorkSupervisor {
             // not one, so the caller that can see both fills this in.
             authority_loads: None,
             passes: self.reports(now),
+            reconcile: self.reconcile.report(now),
+        }
+    }
+
+    /// Whether the reconcile loop's own account of itself is degraded. Drives
+    /// the `attention` health status beside `any_stopped`.
+    pub fn reconcile_degraded(&self, now: Instant) -> bool {
+        self.reconcile.report(now).degraded()
+    }
+}
+
+/// One recorded fault: what failed, when it failed on the monotonic clock, and
+/// when it failed on the wall clock.
+///
+/// Both clocks are kept because they answer different questions. The age a
+/// surface reports has to come from the monotonic mark, or a clock adjustment
+/// makes a fresh failure look hours old. The wall-clock stamp is what lines the
+/// same failure up against a log or another machine's account of the incident,
+/// and it cannot be derived from the monotonic one after the fact.
+#[derive(Debug, Clone)]
+struct RecordedFault {
+    message: String,
+    at: Instant,
+    wall_clock: chrono::DateTime<chrono::Utc>,
+}
+
+impl RecordedFault {
+    fn new(message: impl Into<String>, now: Instant) -> Self {
+        Self {
+            message: message.into(),
+            at: now,
+            wall_clock: chrono::Utc::now(),
+        }
+    }
+}
+
+/// What the filesystem reconciliation loop has actually managed to admit.
+///
+/// The loop already knew every fact here. It logged an admission failure at
+/// `warn!` and moved on, it logged a dropped event at `warn!` and moved on, and
+/// no surface a user or agent can reach carried either. So a store whose every
+/// admission pass failed for two days answered `kin graph status` with no
+/// issues detected, which is not a missing feature but an incorrect answer.
+/// These probes are what those log lines publish to.
+///
+/// Recording is deliberately cheap and never fallible: the call sites are error
+/// paths in a loop holding graph-authority locks, and a probe that could block
+/// or fail there would be a worse defect than the blindness it fixes.
+#[derive(Debug, Default)]
+pub struct ReconcileProbes {
+    inner: Mutex<ReconcileProbesInner>,
+}
+
+#[derive(Debug, Default)]
+struct ReconcileProbesInner {
+    skipped_events: u64,
+    last_error: Option<RecordedFault>,
+    admission_failure_streak: u64,
+    admission_failures: u64,
+    last_admission_error: Option<RecordedFault>,
+    last_admission_success: Option<RecordedFault>,
+    /// When the currently retained backlog first became non-empty. Cleared the
+    /// moment the loop drains it, so the reported age is the age of one
+    /// unbroken backlog rather than of the oldest one this daemon ever saw.
+    backlog_since: Option<Instant>,
+}
+
+impl ReconcileProbes {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReconcileProbesInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A reconcile event errored and was dropped, leaving that path's
+    /// enrichment stale.
+    pub fn record_event_skipped(&self, error: impl std::fmt::Display, now: Instant) {
+        let mut inner = self.lock();
+        inner.skipped_events = inner.skipped_events.saturating_add(1);
+        inner.last_error = Some(RecordedFault::new(error.to_string(), now));
+    }
+
+    /// A complete exact-tree admission attempt failed. Extends the streak.
+    pub fn record_admission_failure(&self, error: impl std::fmt::Display, now: Instant) {
+        let mut inner = self.lock();
+        inner.admission_failures = inner.admission_failures.saturating_add(1);
+        inner.admission_failure_streak = inner.admission_failure_streak.saturating_add(1);
+        inner.last_admission_error = Some(RecordedFault::new(error.to_string(), now));
+    }
+
+    /// A complete exact-tree admission attempt succeeded. Ends the streak.
+    ///
+    /// Success clears the streak but keeps `admission_failures`, so a store that
+    /// fails half its passes and recovers each time still reports that it is
+    /// doing so. Only the consecutive count drives the verdict.
+    pub fn record_admission_success(&self, now: Instant) {
+        let mut inner = self.lock();
+        inner.admission_failure_streak = 0;
+        inner.last_admission_success = Some(RecordedFault::new(String::new(), now));
+    }
+
+    /// Whether the loop finished a tick still holding work.
+    ///
+    /// Called every tick with the loop's own backlog predicate. The first tick
+    /// that reports a backlog starts the clock and later ticks leave it alone,
+    /// so the age measures one unbroken backlog. A tick that reports none stops
+    /// it.
+    pub fn observe_backlog(&self, retained: bool, now: Instant) {
+        let mut inner = self.lock();
+        if !retained {
+            inner.backlog_since = None;
+        } else if inner.backlog_since.is_none() {
+            inner.backlog_since = Some(now);
+        }
+    }
+
+    /// The disclosure surfaces' view of all of it.
+    pub fn report(&self, now: Instant) -> ReconcileHealth {
+        let inner = self.lock();
+        let age = |fault: &RecordedFault| now.saturating_duration_since(fault.at).as_secs();
+        ReconcileHealth {
+            skipped_events: inner.skipped_events,
+            last_error: inner.last_error.as_ref().map(|fault| fault.message.clone()),
+            last_error_age_seconds: inner.last_error.as_ref().map(age),
+            last_error_at: inner
+                .last_error
+                .as_ref()
+                .map(|fault| fault.wall_clock.to_rfc3339()),
+            admission_failure_streak: inner.admission_failure_streak,
+            admission_failures: inner.admission_failures,
+            last_admission_error: inner
+                .last_admission_error
+                .as_ref()
+                .map(|fault| fault.message.clone()),
+            last_admission_success_age_seconds: inner.last_admission_success.as_ref().map(age),
+            last_admission_success_at: inner
+                .last_admission_success
+                .as_ref()
+                .map(|fault| fault.wall_clock.to_rfc3339()),
+            backlog_age_seconds: inner
+                .backlog_since
+                .map(|since| now.saturating_duration_since(since).as_secs()),
         }
     }
 }
@@ -866,5 +1020,122 @@ mod tests {
         let second = supervisor.pass(PASS_EMBED);
         assert_eq!(second.progress(), 7);
         assert_eq!(supervisor.reports(Instant::now()).len(), 1);
+    }
+
+    /// The FIR-2147 shape: every complete admission failing, for long enough
+    /// that the last success is hours old. The streak is what names it.
+    #[test]
+    fn consecutive_admission_failures_accumulate_into_a_streak() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        probes.record_admission_success(base);
+        for step in 1..=8 {
+            probes.record_admission_failure("ignored churn starved admission", at(base, step * 60));
+        }
+
+        let report = probes.report(at(base, 8 * 60));
+        assert_eq!(report.admission_failure_streak, 8);
+        assert_eq!(report.admission_failures, 8);
+        assert_eq!(report.last_admission_success_age_seconds, Some(480));
+        assert_eq!(
+            report.last_admission_error.as_deref(),
+            Some("ignored churn starved admission")
+        );
+        assert!(report.degraded(), "eight failures in a row is not healthy");
+    }
+
+    /// The falsification, and the property that keeps the streak honest: a
+    /// success ends it. A counter that only ever climbed would report a store
+    /// that failed once an hour ago and has admitted cleanly ever since as
+    /// permanently degraded, and nobody would keep reading it.
+    #[test]
+    fn one_success_clears_the_streak_without_erasing_the_history() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        for step in 1..=8 {
+            probes.record_admission_failure("transient", at(base, step * 60));
+        }
+        assert!(probes.report(at(base, 480)).degraded());
+
+        probes.record_admission_success(at(base, 500));
+
+        let report = probes.report(at(base, 500));
+        assert_eq!(report.admission_failure_streak, 0);
+        assert_eq!(
+            report.admission_failures, 8,
+            "the cumulative count survives, so a store that fails half its passes still says so"
+        );
+        assert!(
+            !report.degraded(),
+            "a loop that is admitting again is not degraded"
+        );
+    }
+
+    /// A dropped reconcile event leaves one path's enrichment stale until that
+    /// path changes again, so the count and the reason both have to survive to
+    /// a surface.
+    #[test]
+    fn a_dropped_event_is_counted_and_keeps_its_reason() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        probes.record_event_skipped("src/a.rs: parser rejected the transaction", at(base, 10));
+        probes.record_event_skipped("src/b.rs: parser rejected the transaction", at(base, 20));
+
+        let report = probes.report(at(base, 30));
+        assert_eq!(report.skipped_events, 2);
+        assert_eq!(
+            report.last_error.as_deref(),
+            Some("src/b.rs: parser rejected the transaction"),
+            "the most recent error is the one that survives"
+        );
+        assert_eq!(report.last_error_age_seconds, Some(10));
+        assert!(
+            report.last_error_at.is_some(),
+            "a wall-clock stamp is what lines this up against a log"
+        );
+        assert!(report.degraded());
+    }
+
+    /// Backlog age measures one unbroken backlog. A daemon that drained hours
+    /// ago and picked up new work a second ago is not carrying an hours-old
+    /// backlog, and reporting one would make the threshold fire on healthy
+    /// bursts forever after the first slow day.
+    #[test]
+    fn backlog_age_measures_the_current_backlog_and_not_the_oldest_one() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+
+        probes.observe_backlog(true, at(base, 0));
+        probes.observe_backlog(true, at(base, 100));
+        assert_eq!(
+            probes.report(at(base, 200)).backlog_age_seconds,
+            Some(200),
+            "a retained backlog ages from when it started, not from the last tick"
+        );
+
+        probes.observe_backlog(false, at(base, 300));
+        assert_eq!(probes.report(at(base, 300)).backlog_age_seconds, None);
+
+        probes.observe_backlog(true, at(base, 400));
+        assert_eq!(
+            probes.report(at(base, 405)).backlog_age_seconds,
+            Some(5),
+            "the next backlog starts its own clock"
+        );
+    }
+
+    /// The whole-mechanism two-sided check. A daemon that has done nothing at
+    /// all reports nothing wrong, because an untouched repository is the most
+    /// common state there is and a probe that called it degraded would be
+    /// turned off within a day.
+    #[test]
+    fn a_daemon_that_has_reconciled_nothing_is_not_degraded() {
+        let report = ReconcileProbes::default().report(Instant::now());
+        assert_eq!(report.skipped_events, 0);
+        assert_eq!(report.admission_failure_streak, 0);
+        assert_eq!(report.last_admission_success_age_seconds, None);
+        assert_eq!(report.backlog_age_seconds, None);
+        assert!(!report.degraded());
+        assert!(report.degraded_reasons().is_empty());
     }
 }

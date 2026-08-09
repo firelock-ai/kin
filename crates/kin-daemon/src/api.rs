@@ -765,6 +765,14 @@ pub struct HealthResponse {
     /// machine without advancing, and drives `status: "attention"`.
     #[serde(default)]
     pub background_passes: Vec<kin_cli::commands::resources::BackgroundPassReport>,
+    /// What the filesystem reconciliation loop has admitted, dropped, and last
+    /// failed at. A degraded reconcile state drives `status: "attention"`.
+    ///
+    /// Distinct from `reconciliation_status`, which reports whether a pass is
+    /// running right now and is satisfied by a loop that runs constantly and
+    /// admits nothing. These are the outcomes.
+    #[serde(default)]
+    pub reconcile: kin_cli::commands::resources::ReconcileHealth,
     pub build: BuildResponse,
 }
 
@@ -2497,8 +2505,11 @@ async fn health(
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
-    let background_passes = state.background_work.reports(std::time::Instant::now());
+    let sampled_at = std::time::Instant::now();
+    let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
+    let reconcile = state.background_work.reconcile().report(sampled_at);
+    let reconcile_degraded = reconcile.degraded();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
@@ -2506,14 +2517,21 @@ async fn health(
     // cannot durably persist vector progress, OR the persisted vector index was
     // discarded at open and is being re-derived, OR coordination evidence could
     // not be persisted, OR a background pass was stopped for spending the
-    // machine without advancing. The graph itself stays intact and served in all
-    // cases.
+    // machine without advancing, OR the reconcile loop is failing to admit what
+    // it observes. The graph itself stays intact and served in all cases.
+    //
+    // The reconcile term is the one that was missing. `reconciliation_status`
+    // below reports whether a pass is running this instant, which a loop failing
+    // every admission satisfies perfectly well, so this endpoint answered `ok`
+    // for a daemon that had admitted nothing in days. That field stays as it is,
+    // and the verdict now also reads what those passes achieved.
     let status = if mass_deletion_blocked
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
         || coordination_event_persist_failures > 0
         || background_pass_stopped
+        || reconcile_degraded
     {
         "attention"
     } else {
@@ -2561,6 +2579,7 @@ async fn health(
         spine_warming: state.spine_warming(),
         daemon_cpu_seconds: state.background_work.daemon_cpu_seconds(),
         background_passes,
+        reconcile,
         build: current_build_response(),
     }))
 }
@@ -3232,6 +3251,10 @@ async fn command_graph(
         &repository_authority,
         graph.as_ref(),
         &request,
+        &state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now()),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -22038,6 +22061,117 @@ mod tests {
     // -----------------------------------------------------------------------
     // Health and readiness
     // -----------------------------------------------------------------------
+
+    /// The FIR-2147 shape end to end on `/health`.
+    ///
+    /// Nothing here is stopped and nothing is wedged. The reconcile loop wakes,
+    /// fails its whole-tree admission, defers the paths, and sleeps, on
+    /// schedule, forever. That is why the stall supervisor never touched it and
+    /// why `reconciliation_status` reads `idle`: both describe whether a pass is
+    /// running, and this loop runs perfectly. The verdict has to come from what
+    /// the passes achieved instead.
+    #[tokio::test]
+    async fn health_degrades_when_every_complete_admission_is_failing() {
+        let state = test_state();
+        let probes = state.background_work.reconcile();
+        let base = std::time::Instant::now();
+        probes.record_admission_success(base);
+        for step in 1..=12u64 {
+            probes.record_admission_failure(
+                "scan exceeded its budget",
+                base + Duration::from_secs(step),
+            );
+        }
+
+        let json = health_json(state).await;
+        assert_eq!(
+            json.status, "attention",
+            "a daemon admitting nothing must not answer ok"
+        );
+        assert_eq!(
+            json.reconciliation_status, "idle",
+            "the old field is unchanged and still says idle, which is the whole \
+             reason the new one had to exist"
+        );
+        assert_eq!(json.reconcile.admission_failure_streak, 12);
+        assert_eq!(json.reconcile.admission_failures, 12);
+        assert_eq!(
+            json.reconcile.last_admission_error.as_deref(),
+            Some("scan exceeded its budget")
+        );
+        assert!(
+            json.reconcile.last_admission_success_at.is_some(),
+            "the wall-clock stamp is what lines this up against a log"
+        );
+        assert!(json.reconcile.degraded());
+    }
+
+    /// The falsification for the test above. Same daemon, same twelve failures,
+    /// and one later success. A verdict keyed on cumulative failures rather than
+    /// on consecutive ones would pass the test above and fail here, and would
+    /// then call every daemon that ever hit a transient failure permanently
+    /// degraded until it restarted.
+    #[tokio::test]
+    async fn health_returns_to_ok_once_admission_succeeds_again() {
+        let state = test_state();
+        let probes = state.background_work.reconcile();
+        let base = std::time::Instant::now();
+        for step in 1..=12u64 {
+            probes.record_admission_failure("transient", base + Duration::from_secs(step));
+        }
+        assert_eq!(health_json(Arc::clone(&state)).await.status, "attention");
+
+        state
+            .background_work
+            .reconcile()
+            .record_admission_success(base + Duration::from_secs(13));
+
+        let json = health_json(state).await;
+        assert_eq!(json.status, "ok");
+        assert_eq!(json.reconcile.admission_failure_streak, 0);
+        assert_eq!(
+            json.reconcile.admission_failures, 12,
+            "the history is kept even though the verdict cleared"
+        );
+        assert!(!json.reconcile.degraded());
+    }
+
+    /// The FIR-2145 shape: events errored and were dropped while every surface
+    /// read clean. Each dropped event leaves one path's enrichment stale, so the
+    /// count and the daemon's own error both have to reach `/health`.
+    #[tokio::test]
+    async fn health_degrades_and_names_the_error_when_reconcile_events_are_dropped() {
+        let state = test_state();
+        let base = std::time::Instant::now();
+        state
+            .background_work
+            .reconcile()
+            .record_event_skipped("src/lib.rs: parser rejected the transaction", base);
+
+        let json = health_json(state).await;
+        assert_eq!(json.status, "attention");
+        assert_eq!(json.reconciliation_status, "idle");
+        assert_eq!(json.reconcile.skipped_events, 1);
+        assert_eq!(
+            json.reconcile.last_error.as_deref(),
+            Some("src/lib.rs: parser rejected the transaction")
+        );
+        assert!(json.reconcile.last_error_at.is_some());
+    }
+
+    /// The two-sided floor. A daemon that has reconciled nothing at all is the
+    /// most common state there is, and a probe that called it degraded would be
+    /// switched off within a day.
+    #[tokio::test]
+    async fn health_is_ok_on_a_daemon_that_has_reconciled_nothing() {
+        let json = health_json(test_state()).await;
+        assert_eq!(json.status, "ok");
+        assert_eq!(json.reconcile.skipped_events, 0);
+        assert_eq!(json.reconcile.admission_failure_streak, 0);
+        assert_eq!(json.reconcile.last_admission_success_age_seconds, None);
+        assert_eq!(json.reconcile.backlog_age_seconds, None);
+        assert!(!json.reconcile.degraded());
+    }
 
     #[tokio::test]
     async fn health_includes_version_string() {
