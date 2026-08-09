@@ -45,6 +45,14 @@ const DAEMON_BINARY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum AutoStartError {
     #[error("kin-daemon binary not found (not in PATH or next to kin binary)")]
     BinaryNotFound,
+    /// The `.kin/` store predates the layout this build serves.
+    ///
+    /// Its own text is the whole answer, so callers render it as the headline
+    /// rather than as a cause under a missing daemon. No daemon can start
+    /// against such a store, and saying the daemon is required first states a
+    /// consequence and buries the reason.
+    #[error("{0}")]
+    IncompatibleStore(String),
     #[error("daemon startup failed: {0}")]
     SpawnFailed(String),
     #[error("daemon failed to become ready before the startup deadline: {0}")]
@@ -6723,6 +6731,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     kin_root: &Path,
     idle_timeout_override: Option<&'static str>,
 ) -> std::result::Result<String, AutoStartError> {
+    refuse_incompatible_store(kin_root)?;
     install_spawn_registrar();
     let supervisor_url = ensure_supervisor_running()
         .await
@@ -6825,6 +6834,31 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     Ok(base_url)
 }
 
+/// Refuse a `.kin/` store this build cannot serve before anything is spawned.
+///
+/// The daemon holds the same gate, but reaching it costs a supervisor, a binary
+/// probe and a daemon process that all exist only to die, and it turns the
+/// answer into a line quoted out of a log tail underneath "kin daemon is
+/// required". Checking the on-disk marker here is one file read and it makes the
+/// version gap the thing the reader is told.
+///
+/// Only the version gap is answered here. Any other failure to read the marker
+/// is recorded and left to the daemon, whose gate sees the same file.
+fn refuse_incompatible_store(kin_root: &Path) -> std::result::Result<(), AutoStartError> {
+    match kin_core::KinLayout::new(kin_root.to_path_buf()).check_version() {
+        Ok(()) => Ok(()),
+        Err(error @ kin_core::KinError::IncompatibleVersion { .. }) => {
+            Err(AutoStartError::IncompatibleStore(
+                crate::commands::incompatible_store_refusal(kin_root, &error),
+            ))
+        }
+        Err(error) => {
+            tracing::debug!(%error, kin_root = %kin_root.display(), "could not read the .kin/ layout version before starting a daemon");
+            Ok(())
+        }
+    }
+}
+
 fn map_supervisor_auto_start_error(error: anyhow::Error) -> AutoStartError {
     if matches!(
         error.downcast_ref::<DaemonBinaryDiscoveryError>(),
@@ -6892,6 +6926,10 @@ async fn resolve_daemon_url_inner(
 
     match ensure_daemon_running_with_idle_timeout(layout.root(), idle_timeout_override).await {
         Ok(url) => Ok(Some(url)),
+        // A store this build cannot open is the whole answer. Adding the daemon
+        // framing over it would promote the consequence to the headline and
+        // demote the reason to a nested cause.
+        Err(err @ AutoStartError::IncompatibleStore(_)) => Err(anyhow::Error::new(err)),
         Err(err) => Err(anyhow::Error::new(err).context("kin daemon is required")),
     }
 }
