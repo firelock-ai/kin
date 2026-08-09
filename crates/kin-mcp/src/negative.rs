@@ -706,7 +706,24 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         return None;
     }
 
-    let (trustworthy, trust_reason) = envelope.negative_trust(NegativeClass::Structural);
+    let (mut trustworthy, trust_reason) = envelope.negative_trust(NegativeClass::Structural);
+    let mut trust_reason = trust_reason.to_string();
+
+    // A graph holding no entities answers every name identically, so a miss
+    // there describes the graph and not the code. That is the shape that made a
+    // bare "not found" dangerous: an agent reads it as proof the symbol does not
+    // exist and acts on it.
+    if envelope.graph_state.entity_count == Some(0) {
+        let gap = "graph_empty: the graph holds no entities at all, so a name that resolves to \
+                   nothing says nothing about whether the symbol exists";
+        trust_reason = if trustworthy {
+            gap.to_string()
+        } else {
+            format!("{trust_reason}; {gap}")
+        };
+        trustworthy = false;
+    }
+
     let consequence = if trustworthy {
         "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name, not about the symbol's usage — nothing was looked up."
     } else {
@@ -1313,6 +1330,259 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("focal_not_in_graph"));
+    }
+
+    /// A resolved trace chain that came back empty, reporting everything the
+    /// in-process handler reports: a unique, non-method focal and a walk that
+    /// finished inside its bounds.
+    fn clean_empty_trace(direction: &str) -> Value {
+        json!({
+            "focal_id": "00000000-0000-0000-0000-000000000001",
+            "focal_name": "do_work",
+            "focal_kind": "Function",
+            "direction": direction,
+            "depth": 3,
+            "chain": [],
+            "total_steps": 0,
+            "truncated": false,
+            "focal_resolution": {
+                "addressed_by": "name",
+                "same_name_candidates": 1,
+            },
+        })
+    }
+
+    #[test]
+    fn trace_on_loaded_graph_is_authoritative_when_the_walk_reports_no_gap() {
+        let negative = negative_for(
+            "trace_data_flow",
+            &clean_empty_trace("both"),
+            &structural_ready_envelope(),
+        )
+        .expect("an empty chain yields a negative");
+        assert_eq!(negative["kind"], json!("no_flow"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("structural_authoritative"));
+    }
+
+    /// The reported defect: the walk never reported how the focal resolved, and
+    /// the qualifier certified absence anyway. A count it cannot see is unknown,
+    /// and unknown never certifies.
+    #[test]
+    fn trace_without_a_resolution_report_is_inconclusive() {
+        let mut payload = clean_empty_trace("callers");
+        payload.as_object_mut().unwrap().remove("focal_resolution");
+        let negative = negative_for("trace_data_flow", &payload, &structural_ready_envelope())
+            .expect("an empty chain yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("focal_resolution_unreported"));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("NOT authoritative"));
+    }
+
+    #[test]
+    fn trace_with_same_named_twins_is_inconclusive() {
+        let mut payload = clean_empty_trace("callers");
+        payload["focal_resolution"]["same_name_candidates"] = json!(2);
+        let negative = negative_for("trace_data_flow", &payload, &structural_ready_envelope())
+            .expect("an empty chain yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("focal_resolution_ambiguous"), "{reason}");
+        assert!(reason.contains('2'), "the count must be named: {reason}");
+    }
+
+    /// The method gate is the one `find_references` already applies, and it
+    /// bears on a walk that read incoming edges. An outgoing-only walk never
+    /// looked at them, so the gate does not apply and the absence stands.
+    #[test]
+    fn trace_method_gate_follows_the_direction_that_was_walked() {
+        for direction in ["callers", "both"] {
+            let mut payload = clean_empty_trace(direction);
+            payload["focal_kind"] = json!("Method");
+            let negative =
+                negative_for("trace_data_flow", &payload, &structural_ready_envelope()).unwrap();
+            assert_eq!(
+                negative["safe_to_conclude_absent"],
+                json!(false),
+                "a {direction} walk reads incoming edges: {negative}"
+            );
+            assert!(negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("method_call_resolution_incomplete"));
+        }
+
+        let mut outgoing = clean_empty_trace("calls");
+        outgoing["focal_kind"] = json!("Method");
+        let negative =
+            negative_for("trace_data_flow", &outgoing, &structural_ready_envelope()).unwrap();
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "an outgoing-only walk never read the under-resolved edges: {negative}"
+        );
+    }
+
+    /// A walk stopped by its own caps or work bounds did not examine what an
+    /// empty chain is read as having ruled out. `degradations` is the daemon
+    /// route's name for the same fact.
+    #[test]
+    fn trace_cut_short_by_its_own_bounds_is_inconclusive() {
+        let mut truncated = clean_empty_trace("both");
+        truncated["truncated"] = json!(true);
+        let negative =
+            negative_for("trace_data_flow", &truncated, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("trace_walk_truncated"));
+
+        let mut degraded = clean_empty_trace("both");
+        degraded["degradations"] = json!([{ "component": "entity_bodies", "reason": "budget" }]);
+        let negative =
+            negative_for("trace_data_flow", &degraded, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("trace_walk_degraded"));
+    }
+
+    /// An absence with two causes has two, and a reader deciding whether to
+    /// re-run or to stop trusting the graph needs both.
+    #[test]
+    fn trace_reports_every_gap_beside_the_substrate_reason() {
+        let mut payload = clean_empty_trace("callers");
+        payload["focal_kind"] = json!("Method");
+        payload.as_object_mut().unwrap().remove("focal_resolution");
+        let negative = negative_for("trace_data_flow", &payload, &Envelope::offline()).unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("offline_fallback"), "{reason}");
+        assert!(reason.contains("method_call_resolution_incomplete"), "{reason}");
+        assert!(reason.contains("focal_resolution_unreported"), "{reason}");
+    }
+
+    #[test]
+    fn trace_absence_names_the_direction_that_was_walked() {
+        let outgoing =
+            negative_for("trace_data_flow", &clean_empty_trace("calls"), &Envelope::offline())
+                .unwrap();
+        let subject = outgoing["subject"].as_str().unwrap();
+        assert!(
+            subject.contains("anything it calls") && !subject.contains("either direction"),
+            "{subject}"
+        );
+        assert!(outgoing["advice"].as_str().unwrap().contains("callers were not walked"));
+
+        let incoming =
+            negative_for("trace_data_flow", &clean_empty_trace("callers"), &Envelope::offline())
+                .unwrap();
+        assert!(incoming["subject"]
+            .as_str()
+            .unwrap()
+            .contains("anything that calls it"));
+
+        let merged =
+            negative_for("trace_data_flow", &clean_empty_trace("both"), &Envelope::offline())
+                .unwrap();
+        assert!(merged["subject"].as_str().unwrap().contains("either direction"));
+    }
+
+    #[test]
+    fn a_populated_chain_still_gets_no_negative() {
+        let mut payload = clean_empty_trace("both");
+        payload["chain"] = json!([{ "step": 1, "entity_name": "caller" }]);
+        assert!(negative_for("trace_data_flow", &payload, &structural_ready_envelope()).is_none());
+    }
+
+    // ---- resolution misses: the answer with no collection to count ----
+
+    #[test]
+    fn resolution_miss_is_authoritative_on_a_populated_ready_graph() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+        }));
+        for (tool, message) in [
+            ("find_references", "Entity not found"),
+            ("trace_data_flow", "no entity found matching 'embed_batch'"),
+            (
+                "trace_data_flow",
+                "trace_data_flow: no entity matches focal 'embed_batch'",
+            ),
+        ] {
+            let negative = resolution_miss_for(tool, message, &envelope)
+                .unwrap_or_else(|| panic!("{tool} must qualify its miss: {message}"));
+            assert_eq!(negative["kind"], json!("focal_not_resolved"));
+            assert_eq!(negative["interpretation"], json!("name_not_resolved"));
+            assert_eq!(negative["result_count"], json!(0));
+            assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+            assert_eq!(negative["trust"], json!("authoritative"));
+        }
+    }
+
+    #[test]
+    fn resolution_miss_on_an_empty_graph_is_inconclusive() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 0,
+        }));
+        let negative = resolution_miss_for("trace_data_flow", "no entity found matching 'x'", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"].as_str().unwrap().contains("graph_empty"));
+    }
+
+    #[test]
+    fn resolution_miss_offline_is_inconclusive() {
+        let negative = resolution_miss_for("find_references", "Entity not found", &Envelope::offline())
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("offline_fallback"));
+        assert!(negative["advice"].as_str().unwrap().contains("NOT authoritative"));
+    }
+
+    /// The guard has to be able to say no. A malformed request or an
+    /// unreachable daemon never looked anything up, so dressing either as an
+    /// absence would invent the very verdict this module exists to qualify.
+    #[test]
+    fn a_request_or_transport_failure_is_not_a_resolution_miss() {
+        for message in [
+            "missing required parameter: focal",
+            "invalid direction 'sideways': expected calls, callers, or both",
+            "unsupported relation kind 'sideways': use calls, imports, or references",
+            "kin-mcp has no Kin repository bound for 'trace_data_flow': not inside a kin repository",
+            "daemon is unreachable",
+        ] {
+            assert!(
+                resolution_miss_for("trace_data_flow", message, &structural_ready_envelope())
+                    .is_none(),
+                "must not be read as an absence: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_with_no_miss_framing_gets_no_resolution_negative() {
+        assert!(
+            resolution_miss_for("semantic_search", "Entity not found", &Envelope::daemon())
+                .is_none()
+        );
     }
 
     #[test]

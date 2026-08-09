@@ -445,7 +445,9 @@ impl Envelope {
 /// - Non-object JSON payloads (arrays/scalars) are wrapped as
 ///   `{ "_kin": <envelope>, "result": <payload> }`.
 /// - Human-readable text (e.g. error messages that are not JSON) is wrapped as
-///   `{ "_kin": <envelope>, "message": <text> }`, preserving the message.
+///   `{ "_kin": <envelope>, "message": <text> }`, preserving the message, plus
+///   `negative` when one was synthesized for it — a resolution miss is reported
+///   as text and still has to be calibratable.
 ///
 /// `is_error` and any non-text content blocks are preserved unchanged.
 pub fn annotate(result: ToolCallResult, envelope: &Envelope) -> ToolCallResult {
@@ -548,6 +550,9 @@ fn annotate_block(
         Err(_) => {
             let mut map = Map::new();
             map.insert(ENVELOPE_KEY.to_string(), envelope_value.clone());
+            if let Some(negative) = negative {
+                map.insert(crate::negative::NEGATIVE_KEY.to_string(), negative.clone());
+            }
             map.insert("message".to_string(), Value::String(text));
             Value::Object(map)
         }
