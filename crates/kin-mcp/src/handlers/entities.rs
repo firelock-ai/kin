@@ -836,7 +836,8 @@ this call per entity — bulk_check_references does the batch in one shot. \
 When no references come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
-before treating the entity as safe to delete.";
+before treating the entity as safe to delete. An entity_id or name that resolves to nothing \
+carries the same object, naming the resolution miss rather than reporting an empty result.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -2277,7 +2278,12 @@ happens substrate-side and comes back as one structured response, so you don't l
 get_entity_source per hop and exhaust your tool-call budget. Tune depth and \
 limit_per_step to control breadth; results flag when they were truncated. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
-flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\".";
+flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\", and its \
+`subject` scopes the absence to the direction that was walked, so an empty 'callers' result is \
+never read as \"this calls nothing\". A focal name the graph holds more than once, and a method \
+whose incoming calls may not have been linked, each downgrade that flag rather than certifying \
+absence. A focal that resolves to no entity at all carries the same object, naming the \
+resolution miss rather than reporting an empty chain.";
 
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
@@ -2322,6 +2328,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     };
 
     // Resolve focal: UUID first, then exact-name lookup via the ranking path.
+    let addressed_by_id = uuid::Uuid::parse_str(trimmed).is_ok();
     let focal_entity = if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
         store
             .get_entity(&kin_model::ids::EntityId(uuid))
@@ -2335,6 +2342,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             trimmed
         )));
     };
+    let same_name_candidates = same_name_entity_count(store, &focal_entity.name)?;
 
     let reference_kinds = [
         RelationKind::Calls,
@@ -2459,10 +2467,38 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
+        "focal_resolution": {
+            "addressed_by": if addressed_by_id { "entity_id" } else { "name" },
+            "same_name_candidates": same_name_candidates,
+        },
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// How many entities carry `name` exactly, the focal included.
+///
+/// A name the graph holds more than once is the cfg-twin shape: two arms of the
+/// same declaration are admitted as distinct entities, and a call the extractor
+/// cannot attribute to one of them lands on neither. The walk follows a single
+/// candidate, so an empty chain says nothing about the others — but only the
+/// handler can see how many there were, and the qualifier that reads this
+/// treats an unreported count as unknown rather than as one.
+///
+/// Never reports zero: the focal was resolved from this store, so it is its own
+/// first candidate whatever the pattern query matched.
+fn same_name_entity_count<G: GraphStore>(store: &G, name: &str) -> Result<usize> {
+    let filter = EntityFilter {
+        name_pattern: Some(name.to_string()),
+        ..Default::default()
+    };
+    let matched = store.query_entities(&filter).map_err(McpError::graph)?;
+    Ok(matched
+        .iter()
+        .filter(|entity| entity.name == name)
+        .count()
+        .max(1))
 }
 
 pub const GRAPH_NEIGHBORHOOD_DESC: &str = "\

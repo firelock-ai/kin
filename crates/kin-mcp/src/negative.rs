@@ -198,16 +198,109 @@ fn neighborhood_absence_subject(payload: &Value) -> Option<&'static str> {
     }
 }
 
+/// What an empty chain means for the side of the flow that was actually
+/// walked. A callers-only walk that comes back empty is evidence about what
+/// reaches the focal and says nothing about what the focal reaches, so the
+/// merged wording would claim a direction the traversal never followed. A
+/// payload without a direction keeps the unnarrowed wording rather than a guess.
+fn trace_absence_subject(payload: &Value) -> Option<&'static str> {
+    match payload.get("direction").and_then(Value::as_str)? {
+        "calls" => Some(
+            "no data-flow chain was found from the focal entity to anything it calls; its callers were not walked",
+        ),
+        "callers" => Some(
+            "no data-flow chain was found into the focal entity from anything that calls it; its callees were not walked",
+        ),
+        "both" => Some(
+            "no data-flow chain was found from the focal entity in either direction",
+        ),
+        _ => None,
+    }
+}
+
+/// Every reason an empty trace chain is unsafe to read as "nothing flows here",
+/// in a stable order. All that apply are reported: an absence with two causes
+/// has two, and naming only the first hands back a narrower explanation than
+/// the evidence supports.
+///
+/// The gates mirror the ones `find_references` already applies, because both
+/// tools answer from the same typed `Calls`/`Imports`/`References` edges and an
+/// absence over those edges is trustworthy under the same conditions for both.
+/// `trace_data_flow` used to skip all of them and certify absence on nothing but
+/// the substrate gate, which is how an entity with a live caller came back
+/// authoritative-absent.
+fn trace_flow_gaps(payload: &Value) -> Vec<String> {
+    let mut gaps = Vec::new();
+
+    // Receiver-method calls (`x.method()`) are linked by bare name while method
+    // entities are keyed by their qualified name, so a method's incoming `Calls`
+    // edges are frequently dropped — the same gate `find_references` applies.
+    // It bears on the walk only when the walk read incoming edges at all, which
+    // an unreported direction cannot rule out.
+    let direction = payload.get("direction").and_then(Value::as_str);
+    let walked_callers = !matches!(direction, Some("calls"));
+    if walked_callers && focal_is_method(payload) {
+        gaps.push(
+            "method_call_resolution_incomplete: receiver-method calls are linked by bare name \
+             and may be unresolved, so an empty chain is not an authoritative absence for a method"
+                .to_string(),
+        );
+    }
+
+    // A name the graph holds more than once (the cfg-twin shape: two arms of the
+    // same declaration admitted as distinct entities) means the walk followed
+    // one of them, and an edge the extractor could not attribute to a single
+    // candidate sits on neither. Certifying that as absence answers for every
+    // twin a question that was asked of one.
+    match payload
+        .get("focal_resolution")
+        .and_then(|resolution| resolution.get("same_name_candidates"))
+        .and_then(Value::as_u64)
+    {
+        None => gaps.push(
+            "focal_resolution_unreported: the walk did not report how many entities share the \
+             focal's name, so an empty chain may describe a same-named sibling rather than the \
+             entity that was asked about"
+                .to_string(),
+        ),
+        Some(candidates) if candidates > 1 => gaps.push(format!(
+            "focal_resolution_ambiguous: {candidates} entities share the focal's name and only \
+             one was walked, so an empty chain is not evidence about the others"
+        )),
+        Some(_) => {}
+    }
+
+    // A walk cut short by its own caps or work ceilings stopped before it could
+    // observe what it is being read as having ruled out.
+    if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
+        gaps.push(
+            "trace_walk_truncated: the walk hit a per-step or total cap, so it stopped before \
+             examining everything an empty chain would have to rule out"
+                .to_string(),
+        );
+    }
+    if payload
+        .get("degradations")
+        .and_then(Value::as_array)
+        .is_some_and(|degradations| !degradations.is_empty())
+    {
+        gaps.push(
+            "trace_walk_degraded: the walk reported degradations, so it did not complete under \
+             its own work bounds"
+                .to_string(),
+        );
+    }
+
+    gaps
+}
+
 /// A human sentence spelling out "absent as-of X, coverage Y%, degraded Z" and
 /// the actionable consequence, so the negative is legible without cross-reading
-/// the envelope. `subject` is passed rather than read off `spec` because a tool
-/// may narrow its own framing before the advice is built.
-fn build_advice(
-    spec: &RetrievalSpec,
-    subject: &str,
-    envelope: &Envelope,
-    trustworthy: bool,
-) -> String {
+/// the envelope. `subject` and `consequence` are passed rather than read off a
+/// spec because a tool may narrow its own framing before the advice is built,
+/// and because a name that never resolved carries a different consequence than
+/// a lookup that ran and found nothing.
+fn build_advice(subject: &str, consequence: &str, envelope: &Envelope) -> String {
     let as_of = match &envelope.graph_as_of {
         Some(value) => format!("graph as-of {value}"),
         None => "an unversioned graph snapshot".to_string(),
@@ -227,30 +320,40 @@ fn build_advice(
         format!("degraded signals [{}]", degraded.join(", "))
     };
 
-    let consequence = if spec.always {
-        if trustworthy {
-            "A `has_references: false` row here is an authoritative negative — safe to treat that entity as unreferenced."
-        } else {
-            "Do NOT treat a `has_references: false` row as proof of disuse: the index is not authoritative yet, so a false verdict may simply mean 'not indexed'. Re-check once trust is authoritative."
-        }
-    } else if trustworthy {
-        "Absence is authoritative: safe to treat the target as genuinely absent/unused."
-    } else {
-        "Absence is NOT authoritative: do not conclude the target is unused or deletable — an empty result may mean 'not indexed'. Re-check after embedding is complete and the daemon is healthy."
-    };
-
     format!("{subject}, against {as_of} with {coverage} and {degraded}. {consequence}")
 }
 
-/// True when `payload.focal_entity.kind` is a method — the entity kind whose
-/// incoming call edges the linker under-resolves, so absence of
-/// references must not be certified as authoritative.
-fn focal_entity_is_method(payload: &Value) -> bool {
+/// The consequence sentence for a retrieval tool that ran and came back empty.
+fn absence_consequence(always: bool, trustworthy: bool) -> &'static str {
+    match (always, trustworthy) {
+        (true, true) => {
+            "A `has_references: false` row here is an authoritative negative — safe to treat that entity as unreferenced."
+        }
+        (true, false) => {
+            "Do NOT treat a `has_references: false` row as proof of disuse: the index is not authoritative yet, so a false verdict may simply mean 'not indexed'. Re-check once trust is authoritative."
+        }
+        (false, true) => "Absence is authoritative: safe to treat the target as genuinely absent/unused.",
+        (false, false) => {
+            "Absence is NOT authoritative: do not conclude the target is unused or deletable — an empty result may mean 'not indexed'. Re-check after embedding is complete and the daemon is healthy."
+        }
+    }
+}
+
+/// The kind the payload reports for its focal entity, whichever shape carries
+/// it: `find_references` nests the focal under `focal_entity`, `trace_data_flow`
+/// reports it flat as `focal_kind`.
+fn focal_kind(payload: &Value) -> Option<&str> {
     payload
         .get("focal_entity")
         .and_then(|focal| focal.get("kind"))
-        .and_then(|kind| kind.as_str())
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
+        .or_else(|| payload.get("focal_kind"))
+        .and_then(Value::as_str)
+}
+
+/// True when the payload's focal is a method — the entity kind whose call edges
+/// the linker under-resolves, so absence must not be certified as authoritative.
+fn focal_is_method(payload: &Value) -> bool {
+    focal_kind(payload).is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
 }
 
 fn cross_repo_references_gap(payload: &Value) -> Option<String> {
@@ -408,7 +511,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // verdict — the calls may simply never have been linked. Never let an agent
     // read "safe to delete" off an incomplete call graph: downgrade to
     // inconclusive so the absence is flagged as possibly-unresolved, not certain.
-    if tool == "find_references" && focal_entity_is_method(payload) {
+    if tool == "find_references" && focal_is_method(payload) {
         trustworthy = false;
         trust_reason = "method_call_resolution_incomplete: receiver-method calls are \
              linked by bare name and may be unresolved, so an empty result is not an \
@@ -494,6 +597,25 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         }
     }
 
+    // The same split the neighborhood makes: the substrate reason describes what
+    // is underneath every answer, the walk's own gaps describe this one, and a
+    // reader needs both to know whether to re-run or to stop trusting the graph.
+    if tool == "trace_data_flow" {
+        if let Some(directional) = trace_absence_subject(payload) {
+            subject = directional;
+        }
+        let gaps = trace_flow_gaps(payload);
+        if !gaps.is_empty() {
+            let gaps = gaps.join("; ");
+            trust_reason = if trustworthy {
+                gaps
+            } else {
+                format!("{trust_reason}; {gaps}")
+            };
+            trustworthy = false;
+        }
+    }
+
     let interpretation = if spec.always {
         "qualified_verdicts"
     } else {
@@ -526,7 +648,98 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     );
     negative.insert(
         "advice".to_string(),
-        json!(build_advice(&spec, subject, envelope, trustworthy)),
+        json!(build_advice(
+            subject,
+            absence_consequence(spec.always, trustworthy),
+            envelope
+        )),
+    );
+    Some(Value::Object(negative))
+}
+
+/// How one tool frames "I could not resolve what you named". These answers are
+/// a human message rather than an empty collection, so [`negative_for`] cannot
+/// see them at all: there is no payload to count, and the response used to
+/// arrive as a bare `{"message": ...}` with the envelope but no negative beside
+/// it — the one shape an agent cannot calibrate.
+fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
+    match tool {
+        "find_references" => Some((
+            "focal_not_resolved",
+            "the entity that was asked about could not be resolved, so no references were looked up",
+        )),
+        "trace_data_flow" => Some((
+            "focal_not_resolved",
+            "the focal that was asked about could not be resolved, so no data-flow chain was walked",
+        )),
+        _ => None,
+    }
+}
+
+/// True when an error message reports that the thing the caller named was not
+/// found, rather than a malformed request or a transport failure.
+///
+/// Matched on the family rather than one exact sentence, because three
+/// producers word this differently today — `Entity not found` from the
+/// references handler, `trace_data_flow: no entity matches focal 'X'` from the
+/// in-process trace handler, and `no entity found matching 'X'` from the
+/// daemon's trace route — and a qualifier that only fires for the wording it
+/// was written against would go quiet the moment one of them is reworded, which
+/// looks exactly like the tool having no miss to qualify.
+fn is_resolution_miss(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("no entity") || message.contains("entity not found")
+}
+
+/// Build a confidence-qualified negative for a resolution miss reported as
+/// `message`, or `None` when the tool has no miss framing or the message is
+/// some other failure (bad parameters, an unreachable daemon) that says nothing
+/// about whether the named symbol exists.
+///
+/// Trust is computed from the same structural gate a resolved-but-empty answer
+/// uses: on a daemon graph that is initialized, loaded, and undegraded, "the
+/// graph holds no entity under that name" is a real answer; on anything less it
+/// may only mean the name is not indexed yet.
+pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Option<Value> {
+    let (kind, subject) = resolution_miss_spec(tool)?;
+    if !is_resolution_miss(message) {
+        return None;
+    }
+
+    let (trustworthy, trust_reason) = envelope.negative_trust(NegativeClass::Structural);
+    let consequence = if trustworthy {
+        "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name, not about the symbol's usage — nothing was looked up."
+    } else {
+        "Absence is NOT authoritative: the name may simply not be indexed yet, so do not conclude the symbol does not exist. Re-check once the graph is complete and the daemon is healthy."
+    };
+
+    let mut negative = Map::new();
+    negative.insert("kind".to_string(), json!(kind));
+    negative.insert("subject".to_string(), json!(subject));
+    negative.insert("result_count".to_string(), json!(0));
+    negative.insert("interpretation".to_string(), json!("name_not_resolved"));
+    negative.insert("safe_to_conclude_absent".to_string(), json!(trustworthy));
+    negative.insert(
+        "trust".to_string(),
+        json!(if trustworthy {
+            "authoritative"
+        } else {
+            "inconclusive"
+        }),
+    );
+    negative.insert("trust_reason".to_string(), json!(trust_reason));
+    negative.insert(
+        "graph_as_of".to_string(),
+        envelope.graph_as_of.clone().unwrap_or(Value::Null),
+    );
+    negative.insert("semantic_coverage".to_string(), coverage_value(envelope));
+    negative.insert(
+        "degraded_signals".to_string(),
+        json!(envelope.degraded.active_labels()),
+    );
+    negative.insert(
+        "advice".to_string(),
+        json!(build_advice(subject, consequence, envelope)),
     );
     Some(Value::Object(negative))
 }

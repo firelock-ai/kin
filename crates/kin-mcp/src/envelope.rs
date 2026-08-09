@@ -481,6 +481,16 @@ fn first_payload_value(result: &ToolCallResult) -> Option<Value> {
     })
 }
 
+/// The first text content block verbatim. This is what a failed call carries
+/// instead of a payload: human-readable text that [`annotate_block`] preserves
+/// under `message`.
+fn first_message_text(result: &ToolCallResult) -> Option<&str> {
+    result.content.first().map(|block| {
+        let ContentBlock::Text { text } = block;
+        text.as_str()
+    })
+}
+
 /// The single call sites use to attach the envelope: lift any metadata the tool
 /// payload already carries (`semantic_coverage`, `graph_as_of`) into `base`,
 /// synthesize a confidence-qualified `negative` for retrieval tools that came
@@ -488,15 +498,25 @@ fn first_payload_value(result: &ToolCallResult) -> Option<Value> {
 /// lift + qualify + annotate together in one chokepoint means every dispatch
 /// path (offline and daemon) produces a consistently-enriched envelope and an
 /// identical negative contract regardless of which runtime answered.
+///
+/// A retrieval tool has two ways of reporting "nothing", and only one of them
+/// carries a payload. When the name a caller passed resolves to no entity the
+/// answer is a human message with no collection to count, which used to reach
+/// the agent as a bare `{"message": ...}` beside the envelope while every
+/// resolved answer from the same tool carried a full negative. That asymmetry
+/// is the one an agent cannot see, so the miss is qualified here too.
 pub fn finalize(result: ToolCallResult, base: Envelope, tool_name: &str) -> ToolCallResult {
     let payload = first_payload_value(&result);
     let envelope = match &payload {
         Some(payload) => base.with_payload_metadata(payload),
         None => base,
     };
-    let negative = payload
-        .as_ref()
-        .and_then(|payload| crate::negative::negative_for(tool_name, payload, &envelope));
+    let negative = match &payload {
+        Some(payload) => crate::negative::negative_for(tool_name, payload, &envelope),
+        None if result.is_error == Some(true) => first_message_text(&result)
+            .and_then(|message| crate::negative::resolution_miss_for(tool_name, message, &envelope)),
+        None => None,
+    };
     annotate_inner(result, &envelope, negative.as_ref())
 }
 
