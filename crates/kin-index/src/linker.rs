@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -384,14 +385,14 @@ fn link_cross_file_against_entity_refs(
                     let total =
                         found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
                     if done.is_multiple_of(progress_interval) || done == total_files {
-                        eprint!(
+                        draw_progress(format_args!(
                             "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
                             done,
                             total_files,
                             (done * 100) / total_files,
                             total,
                             link_start.elapsed().as_secs_f64()
-                        );
+                        ));
                     }
                 }
                 relations
@@ -402,7 +403,7 @@ fn link_cross_file_against_entity_refs(
     let resolved = merge_resolved(per_file_relations, files, &ctx, artifact_ids, completeness);
 
     if shows_progress_bar(total_files) {
-        eprintln!(); // newline after \r progress
+        draw_progress(format_args!("\n")); // newline after \r progress
     }
     debug!(resolved = resolved.len(), "cross-file linking complete");
     Ok(resolved)
@@ -3950,7 +3951,31 @@ const PROGRESS_BAR_MIN_FILES: usize = 50;
 /// Whether this link pass prints a progress bar, and therefore whether it has a
 /// line to terminate.
 fn shows_progress_bar(total_files: usize) -> bool {
-    total_files > PROGRESS_BAR_MIN_FILES
+    progress_bar_is_drawn(total_files, std::io::stderr().is_terminal())
+}
+
+/// The bar decision, split from the terminal probe so both halves are testable.
+///
+/// The terminal half is not cosmetic. The bar redraws in place with a carriage
+/// return, which a terminal shows as one line and a pipe records as one frame
+/// per update, so a captured run kept every frame instead of the final one. Off
+/// a terminal the surrounding phase ladder already reports this phase with a
+/// start line and an end line carrying its elapsed time, which is the whole of
+/// what a log needs.
+fn progress_bar_is_drawn(total_files: usize, stderr_is_terminal: bool) -> bool {
+    total_files > PROGRESS_BAR_MIN_FILES && stderr_is_terminal
+}
+
+/// Draw one frame of the in-place bar, or the newline that ends it.
+///
+/// Progress is advisory and the work is not. `eprint!` panics when its write
+/// fails, so a consumer that closed the reading end used to take a running
+/// admission down with it partway through, leaving no store behind. Failures
+/// here are dropped and the link pass carries on.
+fn draw_progress(args: std::fmt::Arguments<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_fmt(args);
+    let _ = stderr.flush();
 }
 
 /// Resolve cross-file relations using the incrementally updated linker state.
@@ -4019,21 +4044,21 @@ fn link_cross_file_incremental_internal(
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let total = found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
                 if done.is_multiple_of(progress_interval) || done == total_files {
-                    eprint!(
+                    draw_progress(format_args!(
                         "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
                         done,
                         total_files,
                         (done * 100) / total_files,
                         total,
                         link_start.elapsed().as_secs_f64()
-                    );
+                    ));
                 }
             }
             relations
         })
         .collect();
     if shows_progress_bar(total_files) {
-        eprintln!(); // newline after \r progress
+        draw_progress(format_args!("\n")); // newline after \r progress
     }
 
     Ok(merge_incremental_resolved(
@@ -4679,10 +4704,25 @@ mod tests {
 
     #[test]
     fn the_progress_gate_excludes_its_own_threshold() {
-        assert!(!shows_progress_bar(0));
-        assert!(!shows_progress_bar(1));
-        assert!(!shows_progress_bar(PROGRESS_BAR_MIN_FILES));
-        assert!(shows_progress_bar(PROGRESS_BAR_MIN_FILES + 1));
+        assert!(!progress_bar_is_drawn(0, true));
+        assert!(!progress_bar_is_drawn(1, true));
+        assert!(!progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES, true));
+        assert!(progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES + 1, true));
+    }
+
+    /// The bar redraws with a carriage return, which only a terminal reads as an
+    /// overwrite. A pipe keeps every frame, so a captured admission of a large
+    /// repository collected megabytes of `Linking:` lines that a reader had to
+    /// scroll past to find the phase summaries underneath.
+    ///
+    /// The terminal probe is passed in rather than read here on purpose. Reading
+    /// the real stderr would make this test pass or fail on whether a human ran
+    /// it from a terminal, which is a check that answers a different question
+    /// every time it runs.
+    #[test]
+    fn the_in_place_bar_is_never_drawn_off_a_terminal() {
+        assert!(!progress_bar_is_drawn(PROGRESS_BAR_MIN_FILES + 1, false));
+        assert!(!progress_bar_is_drawn(100_000, false));
     }
 
     /// A progress bar and the newline that terminates it must be decided by the
