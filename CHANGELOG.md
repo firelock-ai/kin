@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.13] - 2026-08-09
+
+### Changed
+
+- Admit a worked-in Git repository and disclose what it did not admit (#718)
+
+
 ## [0.5.12] - 2026-08-08
 
 ### Changed
