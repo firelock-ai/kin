@@ -1182,14 +1182,18 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
+        // The control. This fixture's graph raises unrelated warnings of its own
+        // (pending embeddings, uniform roles), so the all-clear line is not what
+        // separates the two halves here and asserting on it would pass whatever
+        // the reconcile term did. What must differ is the reconcile warning
+        // itself: absent on a healthy daemon, present on this one.
         let healthy = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
         assert!(
-            healthy
+            !healthy
                 .lines
                 .iter()
-                .any(|line| line.contains("No issues detected")),
-            "the same graph with a healthy daemon must still pass, or this test \
-             proves nothing about the reconcile term: {:?}",
+                .any(|line| line.contains("reconcile loop degraded")),
+            "a healthy daemon must not be reported as degraded: {:?}",
             healthy.lines
         );
 
@@ -1247,12 +1251,16 @@ mod tests {
             },
         )
         .unwrap();
+        // The reconcile warning is the assertion that carries this test. The
+        // all-clear line is checked below it rather than above it because this
+        // fixture's graph raises warnings of its own, so its absence would hold
+        // whether or not the reconcile term existed.
         assert!(
-            !response
+            response
                 .lines
                 .iter()
-                .any(|line| line.contains("No issues detected")),
-            "{:?}",
+                .any(|line| line.contains("reconcile loop degraded")),
+            "a dropped event must be named on the surface a user reads: {:?}",
             response.lines
         );
         assert!(
@@ -1262,6 +1270,43 @@ mod tests {
                 .any(|line| line.contains("src/lib.rs: parser rejected the transaction")),
             "the daemon's own error must survive to the surface: {:?}",
             response.lines
+        );
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("No issues detected")),
+            "{:?}",
+            response.lines
+        );
+    }
+
+    /// The all-clear line and a degraded reconcile loop are mutually exclusive
+    /// by construction, and this is the assertion that proves it.
+    ///
+    /// No fixture in this module produces a warning-free graph, so a test that
+    /// planted a degraded loop and checked the all-clear was gone would hold
+    /// with the reconcile term deleted. Reading the suppression rule against the
+    /// same reasons the surface renders is what cannot pass by accident: any
+    /// non-empty reason set makes the warning list non-empty, and a non-empty
+    /// warning list is exactly what withholds the all-clear at the call site.
+    #[test]
+    fn a_degraded_reconcile_loop_always_withholds_the_all_clear() {
+        let degraded = crate::commands::resources::ReconcileHealth {
+            admission_failure_streak: 412,
+            last_admission_success_age_seconds: Some(172_800),
+            ..Default::default()
+        };
+        assert!(
+            !degraded.degraded_reasons().is_empty(),
+            "the planted state must be degraded, or this proves nothing"
+        );
+
+        let clean = crate::commands::resources::ReconcileHealth::default();
+        assert!(
+            clean.degraded_reasons().is_empty(),
+            "an untouched daemon contributes no warnings, so the all-clear is \
+             still reachable for a graph that earns it"
         );
     }
 
