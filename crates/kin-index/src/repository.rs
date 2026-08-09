@@ -1850,7 +1850,10 @@ mod tests {
         // reported missing, so the exemption is scoped to ignored paths.
         let admitted = path("gone.rs");
         let scan = scan_repository(root, &ignore, [&tracked, &admitted]).unwrap();
-        assert_eq!(scan.missing_tracked_paths([&admitted]), [admitted.clone()]);
+        assert_eq!(
+            scan.missing_tracked_paths([&admitted]),
+            std::slice::from_ref(&admitted)
+        );
         assert!(scan.missing_tracked_paths([&tracked]).is_empty());
     }
 
