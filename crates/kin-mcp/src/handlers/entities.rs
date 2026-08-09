@@ -2328,8 +2328,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     };
 
     // Resolve focal: UUID first, then exact-name lookup via the ranking path.
-    let addressed_by_id = uuid::Uuid::parse_str(trimmed).is_ok();
-    let focal_entity = if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+    let focal_id = uuid::Uuid::parse_str(trimmed).ok();
+    let focal_entity = if let Some(uuid) = focal_id {
         store
             .get_entity(&kin_model::ids::EntityId(uuid))
             .map_err(McpError::graph)?
@@ -2468,7 +2468,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         "total_steps": total_steps,
         "truncated": truncated,
         "focal_resolution": {
-            "addressed_by": if addressed_by_id { "entity_id" } else { "name" },
+            "addressed_by": if focal_id.is_some() { "entity_id" } else { "name" },
             "same_name_candidates": same_name_candidates,
         },
     });
