@@ -11,8 +11,15 @@
 //! system of record for source truth, not for derived bytes that any build
 //! reproduces.
 //!
-//! The scanner itself applies ignore rules only to paths that are not already
-//! tracked, so a walk can never turn graph-owned identity into a deletion on
+//! An ignore rule is a statement about IO, not only about membership. Nothing
+//! the effective rules exclude is opened, read, hashed, or verified here, and
+//! an excluded directory is not descended into at all. A tracked path the rules
+//! exclude is recorded as unverified instead: the walk reports that it declined
+//! to observe the path rather than reporting it absent, so an ignored subtree
+//! can neither cost content reads nor turn its own churn into a failure of the
+//! tree around it.
+//!
+//! The scanner therefore never turns graph-owned identity into a deletion on
 //! its own. Deciding that an already-admitted path should go is the caller's,
 //! and it is made against graph truth rather than against the walk:
 //! [`tracked_paths_retracted_by_ignore`] names exactly which tracked paths the
@@ -62,6 +69,11 @@ pub struct RepositoryScanDiagnostics {
     pub entries_inspected: usize,
     pub admitted_entries: usize,
     pub ignored_untracked_entries: usize,
+    /// Tracked paths the effective rules exclude, observed as unverified.
+    ///
+    /// None of them was opened or read, so every one of them contributes zero
+    /// to `content_bytes_read` and none can fail the scan by changing.
+    pub ignored_tracked_entries_unverified: usize,
     /// Host leaves outside Kin's regular-file/symlink tree that were skipped.
     ///
     /// A tracked path with one of these types fails the scan instead.
@@ -115,6 +127,7 @@ pub struct CompleteScanToken {
 pub struct CompleteRepositoryScan {
     entries: BTreeMap<RepoPath, ScannedRepositoryEntry>,
     graph_only_paths: BTreeSet<RepoPath>,
+    unverified_ignored_paths: BTreeSet<RepoPath>,
     diagnostics: RepositoryScanDiagnostics,
     completion: CompleteScanToken,
 }
@@ -150,10 +163,25 @@ impl CompleteRepositoryScan {
         self.completion
     }
 
+    /// Tracked paths the effective ignore rules excluded from observation.
+    ///
+    /// The walk declined to open, read, or descend into them, so it holds no
+    /// evidence about their content and none about whether they still exist. A
+    /// caller keeps its graph truth for these paths, or retracts them outright
+    /// through [`tracked_paths_retracted_by_ignore`].
+    pub fn unverified_ignored_paths(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &RepoPath> + DoubleEndedIterator {
+        self.unverified_ignored_paths.iter()
+    }
+
     /// Paths known to graph truth that are absent from this complete scan.
     ///
     /// This method deliberately lives on the complete result so no partial
-    /// collection can authorize inferred removal.
+    /// collection can authorize inferred removal. An unverified ignored path is
+    /// unobserved rather than absent, so it is never reported here: inferring
+    /// its removal would let a rule delete graph-owned truth silently, which is
+    /// the job of an announced retraction and of nothing else.
     pub fn missing_tracked_paths<'a>(
         &'a self,
         tracked: impl IntoIterator<Item = &'a RepoPath>,
@@ -161,7 +189,9 @@ impl CompleteRepositoryScan {
         tracked
             .into_iter()
             .filter(|path| {
-                !self.entries.contains_key(*path) && !self.graph_only_paths.contains(*path)
+                !self.entries.contains_key(*path)
+                    && !self.graph_only_paths.contains(*path)
+                    && !self.unverified_ignored_paths.contains(*path)
             })
             .cloned()
             .collect()
@@ -685,20 +715,32 @@ pub fn scan_repository_preserving_graph_only<'a>(
             RepositoryScanDiagnostics::default(),
         ));
     }
+    // Excluded before the walk starts, so no ignored path can reach the host
+    // at all. Leaving them in the tracked set is what let one ignored VM image
+    // pull its whole subtree into the walk and read it on every pass. Imported
+    // graph-only members stay tracked: their identity is preserved by the walk
+    // rather than by a rule, and the graph-only-is-a-subset-of-tracked
+    // precondition is theirs to keep.
+    let (unverified_ignored_paths, tracked_paths): (BTreeSet<_>, BTreeSet<_>) = tracked_paths
+        .into_iter()
+        .partition(|path| ignore.matches(path) && !graph_only_paths.contains(path));
     let mut scanner = Scanner {
         root,
         ignore,
         tracked_paths,
         graph_only_paths,
+        unverified_ignored_paths,
         entries: BTreeMap::new(),
         diagnostics: RepositoryScanDiagnostics::default(),
     };
     scanner.walk(root)?;
     scanner.diagnostics.admitted_entries = scanner.entries.len();
     scanner.diagnostics.graph_only_entries_preserved = scanner.graph_only_paths.len();
+    scanner.diagnostics.ignored_tracked_entries_unverified = scanner.unverified_ignored_paths.len();
     Ok(CompleteRepositoryScan {
         entries: scanner.entries,
         graph_only_paths: scanner.graph_only_paths,
+        unverified_ignored_paths: scanner.unverified_ignored_paths,
         diagnostics: scanner.diagnostics,
         completion: CompleteScanToken { _private: () },
     })
@@ -709,6 +751,7 @@ struct Scanner<'a> {
     ignore: &'a RepositoryIgnore,
     tracked_paths: BTreeSet<RepoPath>,
     graph_only_paths: BTreeSet<RepoPath>,
+    unverified_ignored_paths: BTreeSet<RepoPath>,
     entries: BTreeMap<RepoPath, ScannedRepositoryEntry>,
     diagnostics: RepositoryScanDiagnostics,
 }
@@ -723,14 +766,19 @@ impl Scanner<'_> {
         IncompleteRepositoryScan::io(path, operation, error, self.diagnostics)
     }
 
+    /// Whether graph truth tracks `path` itself or anything beneath it.
+    ///
+    /// Answered over the ordered range that starts at `path`, because this runs
+    /// once per directory entry and a repository with a large tracked set was
+    /// paying a full pass over that set for every entry it inspected. Repository
+    /// paths order by their bytes, so every descendant of `path` sorts after it
+    /// and before the first path that does not begin with those bytes.
     fn is_tracked_or_contains_tracked(&self, path: &RepoPath) -> bool {
-        self.tracked_paths.iter().any(|tracked| {
-            tracked == path
-                || tracked
-                    .as_bytes()
-                    .strip_prefix(path.as_bytes())
-                    .is_some_and(|suffix| suffix.starts_with(b"/"))
-        })
+        let prefix = path.as_bytes();
+        self.tracked_paths
+            .range(path.clone()..)
+            .take_while(|tracked| tracked.as_bytes().starts_with(prefix))
+            .any(|tracked| tracked == path || tracked.as_bytes()[prefix.len()..].starts_with(b"/"))
     }
 
     fn walk(&mut self, directory: &Path) -> Result<(), IncompleteRepositoryScan> {
@@ -776,8 +824,14 @@ impl Scanner<'_> {
                 continue;
             }
 
-            if ignored && !self.tracked_paths.contains(&repo_path) {
-                self.diagnostics.ignored_untracked_entries += 1;
+            if ignored {
+                // Reached only by a leaf the walk had another reason to visit,
+                // such as a re-admission that could have named it. Excluded
+                // leaves are never opened, so whether this one is tracked
+                // changes what the diagnostics say and nothing else.
+                if !self.unverified_ignored_paths.contains(&repo_path) {
+                    self.diagnostics.ignored_untracked_entries += 1;
+                }
                 continue;
             }
 
@@ -1181,8 +1235,13 @@ mod tests {
     /// Uses names absent from [`DEFAULT_IGNORED_NAMES`] on purpose. Asserting
     /// this against `target` would pass on the built-in defaults alone and
     /// prove nothing about `.kinignore` parsing.
+    ///
+    /// A rule covers the walk whether or not the path is tracked. Tracking used
+    /// to exempt a path from the rules and keep it in the hasher, which is how
+    /// one ignored VM image admitted before its rule existed went on costing
+    /// 120GB of reads per pass and failing every admission when it churned.
     #[test]
-    fn explicit_ignore_applies_only_before_tracking() {
+    fn explicit_ignore_withholds_a_covered_path_from_the_walk() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir_all(root.join("build/nested")).unwrap();
@@ -1204,10 +1263,17 @@ mod tests {
         let retained = path("build/retained.bin");
         fs::write(root.join("build/retained.bin"), b"updated tracked bytes").unwrap();
         let tracked = scan_repository(root, &ignore, [&retained]).unwrap();
-        assert!(tracked.entry(&retained).is_some());
+        assert!(
+            tracked.entry(&retained).is_none(),
+            "a covered path stays out of the hasher once a rule names it"
+        );
         assert_eq!(
-            tracked.entry(&retained).unwrap().content_hash,
-            sha256_bytes(b"updated tracked bytes")
+            tracked.unverified_ignored_paths().collect::<Vec<_>>(),
+            [&retained]
+        );
+        assert!(
+            tracked.missing_tracked_paths([&retained]).is_empty(),
+            "declining to observe a path is not evidence that it is gone"
         );
         assert!(tracked.entry(&path("build/nested/new.bin")).is_none());
         assert!(tracked.entry(&path("vendor/pkg/index.js")).is_none());
@@ -1379,10 +1445,12 @@ mod tests {
         assert!(prefixed.matches(&path("target/other.o")));
     }
 
-    /// The trap behind FIR-1854: a default exclude alone retires nothing,
-    /// because ignore rules never hide graph-owned identity.
+    /// The trap behind FIR-1854: a default exclude alone retires nothing. The
+    /// walk stops observing the path, and stopping short of observing it is
+    /// exactly why it cannot report the path gone. Retirement stays an
+    /// announced retraction the caller performs against graph truth.
     #[test]
-    fn default_excludes_never_hide_already_tracked_paths() {
+    fn default_excludes_never_retire_an_already_tracked_path() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir_all(root.join("target/debug")).unwrap();
@@ -1394,11 +1462,22 @@ mod tests {
         let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
 
         assert!(
-            scan.entry(&tracked).is_some(),
+            scan.missing_tracked_paths([&tracked]).is_empty(),
             "a default exclude must not silently delete graph-owned truth"
         );
+        assert_eq!(
+            scan.unverified_ignored_paths().collect::<Vec<_>>(),
+            [&tracked]
+        );
+        assert!(scan.entry(&tracked).is_none());
         assert!(scan.entry(&path("target/debug/fresh.o")).is_none());
-        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+        assert_eq!(scan.diagnostics().content_bytes_read, 0);
+
+        // Falsification: the retraction the caller would perform instead names
+        // this exact path, so the walk is declining to observe something a rule
+        // really does cover rather than something it merely failed to reach.
+        let retracted = tracked_paths_retracted_by_ignore(&ignore, [&tracked], std::iter::empty());
+        assert_eq!(retracted.paths(), [tracked]);
     }
 
     #[test]
@@ -1544,6 +1623,7 @@ mod tests {
             ignore: &ignore,
             tracked_paths: BTreeSet::new(),
             graph_only_paths: BTreeSet::new(),
+            unverified_ignored_paths: BTreeSet::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
         };
@@ -1597,6 +1677,181 @@ mod tests {
             deinitialized.missing_tracked_paths([&gitlink]).is_empty(),
             "host absence cannot infer removal of graph-owned Gitlink identity"
         );
+    }
+
+    /// FIR-2147: an ignore rule is a statement about IO, not only about
+    /// membership. A tracked path the rules exclude is observed as unverified
+    /// and never opened, so no byte of an ignored subtree reaches the hasher.
+    #[test]
+    fn an_ignored_subtree_costs_no_content_reads_even_when_tracked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("vm/nested")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let rules = b"vm\n";
+        let source = b"fn main() {}";
+        fs::write(root.join(".kinignore"), rules).unwrap();
+        fs::write(root.join("src/main.rs"), source).unwrap();
+        fs::write(root.join("vm/disk.img"), vec![0x5a_u8; 128 * 1024]).unwrap();
+        fs::write(root.join("vm/nested/state.bin"), vec![0x11_u8; 4 * 1024]).unwrap();
+
+        // Admitted before the rule existed, which is the only way graph truth
+        // can hold a path its own rules now exclude.
+        let tracked = path("vm/disk.img");
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+
+        assert!(scan.entry(&path("src/main.rs")).is_some());
+        assert!(scan.entry(&tracked).is_none());
+        assert_eq!(
+            scan.diagnostics().content_bytes_read,
+            (rules.len() + source.len()) as u64,
+            "an ignored subtree must cost zero content bytes"
+        );
+        assert_eq!(scan.diagnostics().ignored_tracked_entries_unverified, 1);
+        assert_eq!(
+            scan.unverified_ignored_paths().collect::<Vec<_>>(),
+            [&tracked]
+        );
+        assert!(
+            scan.missing_tracked_paths([&tracked]).is_empty(),
+            "an unobserved ignored path must never authorize inferred removal"
+        );
+
+        // Falsification: the same fixture under empty rules reads every one of
+        // those bytes, so the accounting above cannot pass vacuously.
+        let everything =
+            scan_repository(root, &RepositoryIgnore::admit_everything(), [&tracked]).unwrap();
+        assert!(everything.entry(&tracked).is_some());
+        assert_eq!(
+            everything.diagnostics().content_bytes_read,
+            (rules.len() + source.len() + 132 * 1024) as u64
+        );
+        assert_eq!(
+            everything.diagnostics().ignored_tracked_entries_unverified,
+            0
+        );
+    }
+
+    /// The live shape behind FIR-2147: a 120GB VM image inside an ignored
+    /// subtree rewrote itself while the walk hashed it, and the churn failed
+    /// every whole-tree admission for two days. Nothing in an ignored subtree
+    /// is read now, so its churn cannot reach the rest of the tree.
+    #[test]
+    fn churn_beneath_an_ignored_subtree_admits_the_rest_of_the_tree() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        fs::create_dir_all(root.join("vm")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let rules = b"vm\n";
+        let source = b"fn main() {}";
+        fs::write(root.join(".kinignore"), rules).unwrap();
+        fs::write(root.join("src/main.rs"), source).unwrap();
+        fs::write(root.join("vm/disk.img"), vec![0x5a_u8; 256 * 1024]).unwrap();
+
+        let tracked = path("vm/disk.img");
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let root = root.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut large = false;
+                while !stop.load(Ordering::Relaxed) {
+                    large = !large;
+                    let len = if large { 384 * 1024 } else { 256 * 1024 };
+                    let _ = fs::write(root.join("vm/disk.img"), vec![0xa5_u8; len]);
+                }
+            })
+        };
+
+        let expected_bytes = (rules.len() + source.len()) as u64;
+        let mut source_hash = None;
+        for pass in 0..25 {
+            let ignore = RepositoryIgnore::load(&root).unwrap();
+            let scan = scan_repository(&root, &ignore, [&tracked])
+                .unwrap_or_else(|error| panic!("pass {pass} must admit the tree: {error}"));
+            let admitted = scan.entry(&path("src/main.rs")).unwrap();
+            assert_eq!(*source_hash.get_or_insert(admitted.content_hash), {
+                admitted.content_hash
+            });
+            assert_eq!(scan.diagnostics().content_bytes_read, expected_bytes);
+            assert_eq!(scan.diagnostics().ignored_tracked_entries_unverified, 1);
+            assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+
+        // Positive control: with the churn stopped and no rules at all, the
+        // walk really does reach and read that file, so the passes above were
+        // scanning a fixture that could have failed them.
+        let everything =
+            scan_repository(&root, &RepositoryIgnore::admit_everything(), [&tracked]).unwrap();
+        assert!(everything.entry(&tracked).is_some());
+        assert!(everything.diagnostics().content_bytes_read > 256 * 1024);
+    }
+
+    /// Two-sided: quieting an ignored subtree must not quiet the tree Kin does
+    /// admit. Content that changes under an admitted file still fails closed.
+    #[test]
+    fn churn_in_an_admitted_file_still_fails_the_scan_loudly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let live = root.join("live.rs");
+        fs::write(&live, b"fn live() {}").unwrap();
+        let ignore = RepositoryIgnore::default();
+        let scanner = Scanner {
+            root,
+            ignore: &ignore,
+            tracked_paths: BTreeSet::new(),
+            graph_only_paths: BTreeSet::new(),
+            unverified_ignored_paths: BTreeSet::new(),
+            entries: BTreeMap::new(),
+            diagnostics: RepositoryScanDiagnostics::default(),
+        };
+
+        let error = scanner
+            .hash_regular_file_after_open(&live, || {
+                fs::write(&live, b"fn live() { rewritten }").unwrap();
+            })
+            .expect_err("content churn under an admitted file must fail closed");
+        assert_eq!(error.operation, "verify file content");
+        assert!(error.reason.contains("file changed during scan"));
+
+        // Falsification: the identical call against an untouched file succeeds,
+        // so the failure above is the churn and not the fixture.
+        let (_, bytes_read, _) = scanner.hash_regular_file(&live).unwrap();
+        assert_eq!(bytes_read, b"fn live() { rewritten }".len() as u64);
+    }
+
+    /// An ignored tracked path is unobservable, not absent. Reporting it
+    /// missing would let a rule delete graph-owned truth through inference,
+    /// which is what retraction exists to do explicitly and announce.
+    #[test]
+    fn an_unverified_ignored_path_is_never_inferred_as_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("vm")).unwrap();
+        fs::write(root.join(".kinignore"), b"vm\n").unwrap();
+        fs::write(root.join("kept.rs"), b"pub fn kept() {}").unwrap();
+
+        // Tracked, ignored, and no longer materialized. Absence inside a
+        // subtree the walk never entered proves nothing about the member.
+        let tracked = path("vm/disk.img");
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+        assert_eq!(scan.diagnostics().ignored_tracked_entries_unverified, 1);
+
+        // Falsification: an admitted tracked path that really is gone is still
+        // reported missing, so the exemption is scoped to ignored paths.
+        let admitted = path("gone.rs");
+        let scan = scan_repository(root, &ignore, [&tracked, &admitted]).unwrap();
+        assert_eq!(scan.missing_tracked_paths([&admitted]), [admitted.clone()]);
+        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
     }
 
     #[test]
