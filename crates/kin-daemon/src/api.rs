@@ -765,6 +765,14 @@ pub struct HealthResponse {
     /// machine without advancing, and drives `status: "attention"`.
     #[serde(default)]
     pub background_passes: Vec<kin_cli::commands::resources::BackgroundPassReport>,
+    /// What the filesystem reconciliation loop has admitted, dropped, and last
+    /// failed at. A degraded reconcile state drives `status: "attention"`.
+    ///
+    /// Distinct from `reconciliation_status`, which reports whether a pass is
+    /// running right now and is satisfied by a loop that runs constantly and
+    /// admits nothing. These are the outcomes.
+    #[serde(default)]
+    pub reconcile: kin_cli::commands::resources::ReconcileHealth,
     pub build: BuildResponse,
 }
 
@@ -2497,8 +2505,11 @@ async fn health(
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
-    let background_passes = state.background_work.reports(std::time::Instant::now());
+    let sampled_at = std::time::Instant::now();
+    let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
+    let reconcile = state.background_work.reconcile().report(sampled_at);
+    let reconcile_degraded = reconcile.degraded();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
@@ -2506,14 +2517,21 @@ async fn health(
     // cannot durably persist vector progress, OR the persisted vector index was
     // discarded at open and is being re-derived, OR coordination evidence could
     // not be persisted, OR a background pass was stopped for spending the
-    // machine without advancing. The graph itself stays intact and served in all
-    // cases.
+    // machine without advancing, OR the reconcile loop is failing to admit what
+    // it observes. The graph itself stays intact and served in all cases.
+    //
+    // The reconcile term is the one that was missing. `reconciliation_status`
+    // below reports whether a pass is running this instant, which a loop failing
+    // every admission satisfies perfectly well, so this endpoint answered `ok`
+    // for a daemon that had admitted nothing in days. That field stays as it is,
+    // and the verdict now also reads what those passes achieved.
     let status = if mass_deletion_blocked
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
         || coordination_event_persist_failures > 0
         || background_pass_stopped
+        || reconcile_degraded
     {
         "attention"
     } else {
@@ -2561,6 +2579,7 @@ async fn health(
         spine_warming: state.spine_warming(),
         daemon_cpu_seconds: state.background_work.daemon_cpu_seconds(),
         background_passes,
+        reconcile,
         build: current_build_response(),
     }))
 }
@@ -3232,6 +3251,10 @@ async fn command_graph(
         &repository_authority,
         graph.as_ref(),
         &request,
+        &state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now()),
     )
     .map_err(internal_error)?;
     Ok(Json(response))

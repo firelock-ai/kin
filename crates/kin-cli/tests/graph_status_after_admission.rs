@@ -203,7 +203,7 @@ fn graph_status(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
-    execute_graph_command(binding, graph, &GraphCommandRequest::Status).expect("run graph status")
+    execute_graph_command(binding, graph, &GraphCommandRequest::Status, &Default::default()).expect("run graph status")
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn graph_validate(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> kin_cli::commands::graph::GraphCommandResponse {
-    execute_graph_command(binding, graph, &GraphCommandRequest::Validate)
+    execute_graph_command(binding, graph, &GraphCommandRequest::Validate, &Default::default())
         .expect("run graph validate")
 }
 

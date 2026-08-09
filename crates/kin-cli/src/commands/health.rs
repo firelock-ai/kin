@@ -1655,7 +1655,20 @@ pub fn background_work_health_from_state(
         Some(seconds) => format!("daemon has used {seconds:.0}s of CPU"),
         None => "daemon CPU not sampled yet".to_string(),
     };
-    if stopped.is_empty() {
+    // A pass that is still running is not thereby working. The supervisor stops
+    // a pass that holds the CPU without advancing, but a reconcile loop that
+    // wakes, fails its admission, and sleeps again advances its own clock
+    // perfectly well while admitting nothing, so it is never stopped and this
+    // check called it healthy for as long as that lasted. The loop's own
+    // account of what it admitted is therefore read beside the stop flags
+    // rather than trusted to be implied by them.
+    let mut reasons: Vec<String> = stopped
+        .iter()
+        .filter_map(|pass| pass.stopped_reason.as_deref())
+        .map(str::to_string)
+        .collect();
+    reasons.extend(work.reconcile.degraded_reasons());
+    if reasons.is_empty() {
         let working = work
             .passes
             .iter()
@@ -1666,21 +1679,17 @@ pub fn background_work_health_from_state(
             "Background work",
             HealthStatus::Healthy,
             format!(
-                "{cpu}; {} background pass(es), {working} working, none stopped",
+                "{cpu}; {} background pass(es), {working} working, none stopped; reconcile \
+                 admitting normally",
                 work.passes.len()
             ),
         );
     }
-    let reasons = stopped
-        .iter()
-        .filter_map(|pass| pass.stopped_reason.as_deref())
-        .collect::<Vec<_>>()
-        .join("; ");
     HealthCheck::new(
         "background_work",
         "Background work",
         HealthStatus::Stale,
-        format!("{cpu}; {reasons}"),
+        format!("{cpu}; {}", reasons.join("; ")),
     )
     .with_manual_fix(
         "restart the daemon (`kin daemon restart`) to retry the stopped pass, and report the \
@@ -2067,6 +2076,7 @@ mod tests {
                     pass_report("embed", "working", None),
                     pass_report("reconcile", "idle", None),
                 ],
+                reconcile: Default::default(),
             });
         assert!(matches!(check.status, HealthStatus::Healthy));
         assert!(
@@ -2098,6 +2108,7 @@ mod tests {
                     ),
                     pass_report("reconcile", "idle", None),
                 ],
+                reconcile: Default::default(),
             });
         assert!(matches!(check.status, HealthStatus::Stale));
         assert!(check

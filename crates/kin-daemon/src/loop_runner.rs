@@ -1387,13 +1387,23 @@ pub async fn run_loop(
             })
             .collect::<BTreeSet<_>>();
         let exact_admission = match exact_tree_admission(&state, Some(&observation)) {
-            Ok(admission) => admission,
+            Ok(admission) => {
+                state
+                    .background_work
+                    .reconcile()
+                    .record_admission_success(Instant::now());
+                admission
+            }
             Err(error) => {
                 warn!(
                     error = %error,
                     "complete exact-tree admission failed; retaining graph truth and retrying watcher paths"
                 );
                 let deferred_at = Instant::now();
+                state
+                    .background_work
+                    .reconcile()
+                    .record_admission_failure(&error, deferred_at);
                 for event in &watcher_batch {
                     let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
                     retry_lane.defer(path, deferred_at, retry_base);
@@ -1425,6 +1435,10 @@ pub async fn run_loop(
                 Ok(admitted) => admitted,
                 Err(error) => {
                     warn!(error = %error, "failed to admit exact repository-tree entry");
+                    state
+                        .background_work
+                        .reconcile()
+                        .record_event_skipped(&error, Instant::now());
                     continue;
                 }
             };
@@ -1815,6 +1829,10 @@ pub async fn run_loop(
                             error = %e,
                             "reconciliation error for event; dropping it and leaving this path's enrichment stale"
                         );
+                        state.background_work.reconcile().record_event_skipped(
+                            format!("{semantic_repo_path}: {e}"),
+                            Instant::now(),
+                        );
                     }
                     if tree_changed {
                         state.bump_version();
@@ -1866,6 +1884,14 @@ pub async fn run_loop(
         pass.advanced(admitted_events, Instant::now());
 
         let backlog_remains = !pending_events.is_empty() || !retry_lane.is_empty();
+        // Reported from the loop's own predicate rather than recomputed on the
+        // status surface, which cannot see either queue. A backlog that never
+        // clears is how a wedged retry ladder looks from outside: the loop is
+        // busy, its status alternates, and nothing is being admitted.
+        state
+            .background_work
+            .reconcile()
+            .observe_backlog(backlog_remains, Instant::now());
         if !backlog_remains {
             state
                 .reconciliation_status
@@ -3539,6 +3565,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
             Ok(admitted) => admitted,
             Err(error) => {
                 warn!(error = %error, "failed to admit exact repository-tree entry during sync");
+                state
+                    .background_work
+                    .reconcile()
+                    .record_event_skipped(&error, Instant::now());
                 continue;
             }
         };
@@ -3759,6 +3789,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                     file = %semantic_repo_path,
                     error = %e,
                     "sync reconciliation error for event; dropping it and leaving this path's enrichment stale"
+                );
+                state.background_work.reconcile().record_event_skipped(
+                    format!("{semantic_repo_path}: {e}"),
+                    Instant::now(),
                 );
             }
         }

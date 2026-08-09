@@ -182,13 +182,23 @@ fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
     Ok(())
 }
 
+/// Render a graph command.
+///
+/// `reconcile` is the running daemon's account of what its reconciliation loop
+/// has actually admitted. It is a separate argument rather than something
+/// derived from the graph because it cannot be derived from the graph: a store
+/// whose every admission has failed for two days holds a graph that is
+/// internally perfect and simply out of date, and every content check here
+/// passes on it. That is how `kin graph status` came to report no issues on a
+/// store the daemon had been failing to admit since Aug 6.
 pub fn execute_graph_command(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     request: &GraphCommandRequest,
+    reconcile: &crate::commands::resources::ReconcileHealth,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => build_graph_status_response(binding, graph),
+        GraphCommandRequest::Status => build_graph_status_response(binding, graph, reconcile),
         GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => build_graph_source_response(
@@ -202,6 +212,7 @@ pub fn execute_graph_command(
 fn build_graph_status_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
+    reconcile: &crate::commands::resources::ReconcileHealth,
 ) -> Result<GraphCommandResponse> {
     let health = inspect_graph(binding, graph)?;
 
@@ -381,6 +392,14 @@ fn build_graph_status_response(
             "very low entity-to-entity relation density ({:.2} rels/entity) — entity linker may be failing",
             entity_rels_per_ent
         ));
+    }
+    // Reported as warnings rather than as criticals on purpose. A degraded
+    // reconcile loop is a live runtime fault and not a defect in the graph this
+    // command inspected, and criticals set the response error, which would turn
+    // `kin graph status` nonzero for every caller scripting it. Killing the
+    // false all-clear is the requirement; changing an exit code is not.
+    for reason in reconcile.degraded_reasons() {
+        warnings.push(format!("reconcile loop degraded — {reason}"));
     }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
@@ -1158,7 +1177,7 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph).unwrap();
+        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
 
         // The entity-rooted total and the whole-table total count different
         // scopes, so neither line may carry a bare "Relations" label.
@@ -1201,7 +1220,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph).unwrap();
+        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
 
         assert!(response
             .lines
@@ -2131,7 +2150,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let validate = build_graph_validate_response(&binding, &graph).unwrap();
-        let status = build_graph_status_response(&binding, &graph).unwrap();
+        let status = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
 
         let validate_notes = note_lines(&validate);
         assert!(

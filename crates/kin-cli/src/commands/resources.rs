@@ -182,6 +182,142 @@ pub struct DaemonWorkState {
     /// Every background pass this daemon has actually started.
     #[serde(default)]
     pub passes: Vec<BackgroundPassReport>,
+    /// What the reconciliation loop dropped, retried, and last failed at.
+    #[serde(default)]
+    pub reconcile: ReconcileHealth,
+}
+
+/// Consecutive complete-admission failures before the daemon stops calling
+/// itself healthy.
+///
+/// Not one. A complete exact-tree admission that fails is deferred and retried
+/// by design, and a file rewritten mid-pass fails one attempt and succeeds on
+/// the next, so a single failure is the mechanism working. Three consecutive
+/// failures is no longer a retry: every attempt since the loop last admitted
+/// anything has failed, and whatever is rejecting them is not clearing on its
+/// own.
+pub const ADMISSION_FAILURE_STREAK_ATTENTION: u64 = 3;
+
+/// How long a retained reconcile backlog may sit before it is called stale.
+///
+/// The loop drains a backlog in bounded batches and yields between them, so a
+/// large burst legitimately takes minutes. Fifteen minutes of continuously
+/// retained backlog is not a burst being worked off, it is a backlog that is
+/// not draining.
+pub const BACKLOG_STALE_SECONDS: u64 = 900;
+
+/// What the filesystem reconciliation loop is actually managing to admit.
+///
+/// This exists because the loop's failures were invisible to every surface that
+/// claimed to report daemon health. Admission can fail on every pass for days
+/// while `reconciliation_status` reads `idle`, because `idle` describes whether
+/// a pass is running right now and says nothing about whether the last one
+/// worked. A degraded daemon reporting no issues is the failure this answers,
+/// so each field here is a fault the loop already knew about and did not
+/// publish.
+///
+/// Counters are cumulative for this daemon process and reset on restart. Ages
+/// are monotonic and therefore unaffected by a wall-clock adjustment; the
+/// paired timestamps are wall clock, for lining an incident up against a log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileHealth {
+    /// Reconcile events dropped after erroring. Each one leaves exactly one
+    /// path's enrichment at whatever the last accepted pass admitted, and it
+    /// stays there until that path changes again, so a non-zero count is stale
+    /// graph truth rather than transient noise.
+    #[serde(default)]
+    pub skipped_events: u64,
+    /// The most recent reconcile-event error, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Seconds since `last_error` was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_age_seconds: Option<u64>,
+    /// Wall-clock time of `last_error`, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<String>,
+    /// Complete exact-tree admission attempts that have failed since the last
+    /// one succeeded. This is the counter that would have named the failure on
+    /// a store whose every admission pass had failed for two days.
+    #[serde(default)]
+    pub admission_failure_streak: u64,
+    /// Every complete-admission failure this daemon has seen, streak or not.
+    #[serde(default)]
+    pub admission_failures: u64,
+    /// The most recent complete-admission error, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_admission_error: Option<String>,
+    /// Seconds since a complete exact-tree admission last succeeded. Absent
+    /// means none has succeeded in this daemon's life, which is not the same as
+    /// zero and is only a fault when paired with failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_admission_success_age_seconds: Option<u64>,
+    /// Wall-clock time of the last successful admission, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_admission_success_at: Option<String>,
+    /// Seconds the loop has held a non-empty backlog without ever clearing it.
+    /// Absent when the backlog is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlog_age_seconds: Option<u64>,
+}
+
+impl ReconcileHealth {
+    /// Every reason this reconcile state is degraded, worst first, empty when
+    /// it is not.
+    ///
+    /// One function so the three surfaces cannot disagree. `/health` turning
+    /// `attention` while `kin graph status` prints no issues is the same defect
+    /// as neither of them saying anything, and two independently written
+    /// verdicts drift into exactly that.
+    ///
+    /// Each reason states its own threshold. An operator reading "3 consecutive
+    /// failures" should not have to find the constant to know whether that is
+    /// the limit or merely a number.
+    pub fn degraded_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.admission_failure_streak >= ADMISSION_FAILURE_STREAK_ATTENTION {
+            let since = match self.last_admission_success_age_seconds {
+                Some(age) => format!("last succeeded {age}s ago"),
+                None => "none has ever succeeded in this daemon's life".to_string(),
+            };
+            let error = self
+                .last_admission_error
+                .as_deref()
+                .unwrap_or("no error recorded");
+            reasons.push(format!(
+                "complete exact-tree admission has failed {} consecutive times (attention at \
+                 {ADMISSION_FAILURE_STREAK_ATTENTION}); {since}; last error: {error}",
+                self.admission_failure_streak
+            ));
+        }
+        if self.skipped_events > 0 {
+            let error = self.last_error.as_deref().unwrap_or("no error recorded");
+            let age = match self.last_error_age_seconds {
+                Some(age) => format!("{age}s ago"),
+                None => "at an unrecorded time".to_string(),
+            };
+            reasons.push(format!(
+                "{} reconcile event(s) errored and were dropped, leaving those paths' enrichment \
+                 stale; most recent {age}: {error}",
+                self.skipped_events
+            ));
+        }
+        if let Some(age) = self.backlog_age_seconds {
+            if age >= BACKLOG_STALE_SECONDS {
+                reasons.push(format!(
+                    "the reconcile backlog has been retained for {age}s without clearing \
+                     (attention at {BACKLOG_STALE_SECONDS})"
+                ));
+            }
+        }
+        reasons
+    }
+
+    /// Whether this reconcile state should stop any surface from reporting a
+    /// healthy daemon.
+    pub fn degraded(&self) -> bool {
+        !self.degraded_reasons().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +394,7 @@ fn render_daemon_work_lines(work: &DaemonWorkState) -> Vec<String> {
             "Authority loads: {loads} (climbs with publications, not with requests)"
         ));
     }
+    lines.extend(render_reconcile_lines(&work.reconcile));
     if work.passes.is_empty() {
         lines.push("Background passes: none started".to_string());
         return lines;
@@ -276,6 +413,32 @@ fn render_daemon_work_lines(work: &DaemonWorkState) -> Vec<String> {
             "Background pass {}: {detail}, {} units, {progress_age}",
             pass.name, pass.progress
         ));
+    }
+    lines
+}
+
+/// The reconcile loop's own account of itself.
+///
+/// Rendered whether or not it is degraded, for the same reason the pass lines
+/// are: a counter that only appears once it is non-zero cannot be checked
+/// against, and its absence reads identically to a surface that was never
+/// wired up.
+fn render_reconcile_lines(reconcile: &ReconcileHealth) -> Vec<String> {
+    let admission = match reconcile.last_admission_success_age_seconds {
+        Some(age) => format!("last admitted {age}s ago"),
+        None => "never admitted in this daemon's life".to_string(),
+    };
+    let backlog = match reconcile.backlog_age_seconds {
+        Some(age) => format!("backlog retained {age}s"),
+        None => "no backlog".to_string(),
+    };
+    let mut lines = vec![format!(
+        "Reconcile: {admission}, {} consecutive admission failure(s), {} dropped event(s), \
+         {backlog}",
+        reconcile.admission_failure_streak, reconcile.skipped_events
+    )];
+    for reason in reconcile.degraded_reasons() {
+        lines.push(format!("Reconcile degraded: {reason}"));
     }
     lines
 }
@@ -491,6 +654,7 @@ mod tests {
             daemon_cpu_seconds: Some(12.0),
             authority_loads: Some(3),
             passes: Vec::new(),
+            reconcile: Default::default(),
         });
         assert!(
             present
@@ -503,6 +667,7 @@ mod tests {
             daemon_cpu_seconds: Some(12.0),
             authority_loads: Some(0),
             passes: Vec::new(),
+            reconcile: Default::default(),
         });
         assert!(
             zero.iter().any(|line| line.contains("Authority loads: 0")),
@@ -513,6 +678,7 @@ mod tests {
             daemon_cpu_seconds: Some(12.0),
             authority_loads: None,
             passes: Vec::new(),
+            reconcile: Default::default(),
         });
         assert!(
             !absent.iter().any(|line| line.contains("Authority loads")),
