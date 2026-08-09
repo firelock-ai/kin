@@ -446,8 +446,8 @@ impl Envelope {
 ///   `{ "_kin": <envelope>, "result": <payload> }`.
 /// - Human-readable text (e.g. error messages that are not JSON) is wrapped as
 ///   `{ "_kin": <envelope>, "message": <text> }`, preserving the message, plus
-///   `negative` when one was synthesized for it — a resolution miss is reported
-///   as text and still has to be calibratable.
+///   `negative` when one was synthesized for it, since a resolution miss is
+///   reported as text and still has to be calibratable.
 ///
 /// `is_error` and any non-text content blocks are preserved unchanged.
 pub fn annotate(result: ToolCallResult, envelope: &Envelope) -> ToolCallResult {

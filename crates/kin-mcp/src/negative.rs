@@ -234,9 +234,9 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
 
     // Receiver-method calls (`x.method()`) are linked by bare name while method
     // entities are keyed by their qualified name, so a method's incoming `Calls`
-    // edges are frequently dropped — the same gate `find_references` applies.
-    // It bears on the walk only when the walk read incoming edges at all, which
-    // an unreported direction cannot rule out.
+    // edges are frequently dropped, which is the gate `find_references` already
+    // applies. It bears on the walk only when the walk read incoming edges at
+    // all, which an unreported direction cannot rule out.
     let direction = payload.get("direction").and_then(Value::as_str);
     let walked_callers = !matches!(direction, Some("calls"));
     if walked_callers && focal_is_method(payload) {
@@ -350,7 +350,7 @@ fn focal_kind(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// True when the payload's focal is a method — the entity kind whose call edges
+/// True when the payload's focal is a method, the entity kind whose call edges
 /// the linker under-resolves, so absence must not be certified as authoritative.
 fn focal_is_method(payload: &Value) -> bool {
     focal_kind(payload).is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
@@ -661,7 +661,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
 /// a human message rather than an empty collection, so [`negative_for`] cannot
 /// see them at all: there is no payload to count, and the response used to
 /// arrive as a bare `{"message": ...}` with the envelope but no negative beside
-/// it — the one shape an agent cannot calibrate.
+/// it, which is the one shape an agent cannot calibrate.
 fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
     match tool {
         "find_references" => Some((
@@ -679,13 +679,13 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
 /// True when an error message reports that the thing the caller named was not
 /// found, rather than a malformed request or a transport failure.
 ///
-/// Matched on the family rather than one exact sentence, because three
-/// producers word this differently today — `Entity not found` from the
-/// references handler, `trace_data_flow: no entity matches focal 'X'` from the
-/// in-process trace handler, and `no entity found matching 'X'` from the
-/// daemon's trace route — and a qualifier that only fires for the wording it
-/// was written against would go quiet the moment one of them is reworded, which
-/// looks exactly like the tool having no miss to qualify.
+/// Matched on the family rather than one exact sentence. Three producers word
+/// this differently today: `Entity not found` from the references handler,
+/// `trace_data_flow: no entity matches focal 'X'` from the in-process trace
+/// handler, and `no entity found matching 'X'` from the daemon's trace route. A
+/// qualifier that only fires for the wording it was written against would go
+/// quiet the moment one of them is reworded, which looks exactly like the tool
+/// having no miss to qualify.
 fn is_resolution_miss(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no entity") || message.contains("entity not found")
@@ -725,7 +725,7 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
     }
 
     let consequence = if trustworthy {
-        "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name, not about the symbol's usage — nothing was looked up."
+        "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name and not about the symbol's usage, because nothing was looked up."
     } else {
         "Absence is NOT authoritative: the name may simply not be indexed yet, so do not conclude the symbol does not exist. Re-check once the graph is complete and the daemon is healthy."
     };

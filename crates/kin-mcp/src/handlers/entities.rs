@@ -2482,9 +2482,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
 /// A name the graph holds more than once is the cfg-twin shape: two arms of the
 /// same declaration are admitted as distinct entities, and a call the extractor
 /// cannot attribute to one of them lands on neither. The walk follows a single
-/// candidate, so an empty chain says nothing about the others — but only the
-/// handler can see how many there were, and the qualifier that reads this
-/// treats an unreported count as unknown rather than as one.
+/// candidate, so an empty chain says nothing about the others. Only the handler
+/// can see how many there were, and the qualifier that reads this treats an
+/// unreported count as unknown rather than as one.
 ///
 /// Never reports zero: the focal was resolved from this store, so it is its own
 /// first candidate whatever the pattern query matched.
@@ -4254,7 +4254,7 @@ mod tests {
     /// The authoritative side of the trace absence: a focal that is in the
     /// graph, carries a name nothing else shares, is not a method, and has no
     /// edges at all. That is a real absence, and the qualifier must still be
-    /// willing to say so — a gate that never certifies anything is as useless
+    /// willing to say so. A gate that never certifies anything is as useless
     /// as one that certifies everything.
     #[test]
     fn trace_data_flow_isolated_focal_is_authoritative_on_a_ready_graph() {
