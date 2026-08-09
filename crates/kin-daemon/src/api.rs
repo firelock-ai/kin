@@ -22143,10 +22143,10 @@ mod tests {
     async fn health_degrades_and_names_the_error_when_reconcile_events_are_dropped() {
         let state = test_state();
         let base = std::time::Instant::now();
-        state.background_work.reconcile().record_event_skipped(
-            "src/lib.rs: parser rejected the transaction",
-            base,
-        );
+        state
+            .background_work
+            .reconcile()
+            .record_event_skipped("src/lib.rs: parser rejected the transaction", base);
 
         let json = health_json(state).await;
         assert_eq!(json.status, "attention");

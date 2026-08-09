@@ -640,10 +640,7 @@ impl ReconcileProbes {
         let age = |fault: &RecordedFault| now.saturating_duration_since(fault.at).as_secs();
         ReconcileHealth {
             skipped_events: inner.skipped_events,
-            last_error: inner
-                .last_error
-                .as_ref()
-                .map(|fault| fault.message.clone()),
+            last_error: inner.last_error.as_ref().map(|fault| fault.message.clone()),
             last_error_age_seconds: inner.last_error.as_ref().map(age),
             last_error_at: inner
                 .last_error

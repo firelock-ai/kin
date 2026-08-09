@@ -754,14 +754,23 @@ mod tests {
             last_admission_success_age_seconds: Some(4),
             ..Default::default()
         });
-        assert_eq!(healthy.len(), 1, "no degradation, no extra lines: {healthy:?}");
+        assert_eq!(
+            healthy.len(),
+            1,
+            "no degradation, no extra lines: {healthy:?}"
+        );
         assert!(healthy[0].contains("last admitted 4s ago"), "{healthy:?}");
-        assert!(healthy[0].contains("0 consecutive admission failure(s)"), "{healthy:?}");
+        assert!(
+            healthy[0].contains("0 consecutive admission failure(s)"),
+            "{healthy:?}"
+        );
         assert!(healthy[0].contains("no backlog"), "{healthy:?}");
 
         let degraded = render_reconcile_lines(&failing_admission());
         assert!(
-            degraded.iter().any(|line| line.contains("Reconcile degraded")),
+            degraded
+                .iter()
+                .any(|line| line.contains("Reconcile degraded")),
             "the fault has to reach the text surface: {degraded:?}"
         );
     }

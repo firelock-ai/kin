@@ -3790,10 +3790,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                     error = %e,
                     "sync reconciliation error for event; dropping it and leaving this path's enrichment stale"
                 );
-                state.background_work.reconcile().record_event_skipped(
-                    format!("{semantic_repo_path}: {e}"),
-                    Instant::now(),
-                );
+                state
+                    .background_work
+                    .reconcile()
+                    .record_event_skipped(format!("{semantic_repo_path}: {e}"), Instant::now());
             }
         }
     }
