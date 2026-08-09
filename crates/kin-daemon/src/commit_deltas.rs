@@ -551,6 +551,13 @@ impl CompleteWorkspaceObservation {
 ///
 /// Graph-only entries (currently Gitlinks) are copied from the parent tree:
 /// their host checkout is neither membership evidence nor an identity source.
+///
+/// So are the tracked paths the walk declined to observe because ignore rules
+/// cover them. The walk holds no evidence about those paths, and an observation
+/// that omitted them would plan their removal, which would turn a rule into a
+/// silent deletion on the first pass that stopped reading them. Retiring an
+/// ignored member is an announced retraction the caller performs against graph
+/// truth, never something an unobserved path infers on its own.
 pub(crate) fn observed_tree_from_complete_scan(
     blobs: &kin_blobs::BlobStore,
     scan: &kin_index::CompleteRepositoryScan,
@@ -561,6 +568,11 @@ pub(crate) fn observed_tree_from_complete_scan(
         .filter(|artifact| matches!(artifact.entry, TreeEntry::Gitlink { .. }))
         .map(|artifact| (artifact.path.clone(), artifact.entry))
         .collect::<BTreeMap<_, _>>();
+    for path in scan.unverified_ignored_paths() {
+        if let Some(artifact) = previous.artifact_at_path(path) {
+            observed.insert(artifact.path.clone(), artifact.entry);
+        }
+    }
 
     for scanned in scan.entries() {
         let content = read_scanned_entry(scanned)?;
@@ -1407,6 +1419,115 @@ mod tests {
         );
     }
 
+    /// FIR-2147: the walk declines to observe a tracked path its rules cover,
+    /// so the observation carries that path's existing truth forward unchanged.
+    /// Reading "unobserved" as "absent" would delete graph-owned identity by
+    /// inference, and it would do it on the exact pass that stopped reading the
+    /// path. Retiring an ignored member stays an announced retraction.
+    #[test]
+    fn an_unverified_ignored_path_keeps_its_previous_tree_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+
+        let working = layout.working_dir();
+        std::fs::create_dir_all(working.join("vm")).unwrap();
+        std::fs::write(working.join(".kinignore"), b"vm\n").unwrap();
+        std::fs::write(working.join("kept.rs"), b"pub fn kept() {}").unwrap();
+        // Admitted before the rule existed, and rewritten on the host since.
+        std::fs::write(working.join("vm/disk.img"), b"rewritten since").unwrap();
+        let admitted_bytes = b"admitted before the rule existed";
+        let admitted_hash = Hash256::from_bytes(blobs.write(admitted_bytes).unwrap().0);
+        let ignored = RepoPath::from_utf8("vm/disk.img").unwrap();
+        let previous = resolved_tree(vec![(
+            ArtifactId::new(),
+            ignored.clone(),
+            TreeEntry::blob(admitted_hash, false),
+        )]);
+
+        let ignore = kin_index::RepositoryIgnore::load(&working).unwrap();
+        let scan = kin_index::scan_repository(
+            &working,
+            &ignore,
+            previous.artifacts_by_path().map(|artifact| &artifact.path),
+        )
+        .unwrap();
+        assert_eq!(
+            scan.unverified_ignored_paths().collect::<Vec<_>>(),
+            [&ignored]
+        );
+
+        let observed = observed_tree_from_complete_scan(&blobs, &scan, &previous).unwrap();
+        assert_eq!(
+            observed.entries().get(&ignored),
+            Some(&TreeEntry::blob(admitted_hash, false)),
+            "an unobserved ignored path keeps the exact entry graph truth holds"
+        );
+
+        let deltas =
+            kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone()).unwrap();
+        assert!(
+            !deltas
+                .iter()
+                .any(|delta| matches!(delta, TreeDelta::Removed { .. })),
+            "declining to read a path must not plan its removal: {deltas:?}"
+        );
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            TreeDelta::Added { new, .. } if new.path == RepoPath::from_utf8("kept.rs").unwrap()
+        )));
+
+        // Falsification: the same fixture removes a tracked path the rules do
+        // not cover, so the absence of a Removed delta above is the ignore rule
+        // and not a planner that never removes anything. Every host file is
+        // already tracked here, because an unmatched removal beside an
+        // unmatched addition is refused as a possible move.
+        let gone = RepoPath::from_utf8("gone.rs").unwrap();
+        let previous_with_gone = resolved_tree(vec![
+            (
+                ArtifactId::new(),
+                ignored.clone(),
+                TreeEntry::blob(admitted_hash, false),
+            ),
+            (
+                ArtifactId::new(),
+                RepoPath::from_utf8(".kinignore").unwrap(),
+                TreeEntry::blob(Hash256::from_bytes(blobs.write(b"vm\n").unwrap().0), false),
+            ),
+            (
+                ArtifactId::new(),
+                RepoPath::from_utf8("kept.rs").unwrap(),
+                TreeEntry::blob(
+                    Hash256::from_bytes(blobs.write(b"pub fn kept() {}").unwrap().0),
+                    false,
+                ),
+            ),
+            (
+                ArtifactId::new(),
+                gone.clone(),
+                TreeEntry::blob(admitted_hash, false),
+            ),
+        ]);
+        let scan = kin_index::scan_repository(
+            &working,
+            &ignore,
+            previous_with_gone
+                .artifacts_by_path()
+                .map(|artifact| &artifact.path),
+        )
+        .unwrap();
+        let observed =
+            observed_tree_from_complete_scan(&blobs, &scan, &previous_with_gone).unwrap();
+        let deltas =
+            kin_core::plan_observed_tree_deltas(&previous_with_gone, observed.entries().clone())
+                .unwrap();
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            TreeDelta::Removed { old, .. } if old.path == gone
+        )));
+    }
+
     /// A file whose content changed since the last commit appears as Modified.
     #[test]
     fn changed_file_appears_as_modified_tree_delta() {
@@ -1789,8 +1910,12 @@ mod tests {
         );
     }
 
+    /// A rule covers what commit reads, not only what commit admits. A tracked
+    /// path the rules cover keeps the truth the graph already holds for it and
+    /// the host copy stops being read, so its bytes can change all they like
+    /// without moving repository truth or failing the walk around it.
     #[test]
-    fn commit_ignore_hides_only_untracked_paths_and_retains_tracked_updates() {
+    fn commit_ignore_withholds_covered_paths_and_carries_their_truth_forward() {
         let tmp = tempfile::tempdir().unwrap();
         let init = kin_core::init(tmp.path()).unwrap();
         let layout = init.layout;
@@ -1802,29 +1927,49 @@ mod tests {
         let source = layout.working_dir();
         std::fs::create_dir_all(source.join("target")).unwrap();
         std::fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
         std::fs::write(source.join(".kinignore"), b"target/\nnode_modules/\n.env\n").unwrap();
         std::fs::write(source.join("target/retained.bin"), b"new tracked bytes").unwrap();
         std::fs::write(source.join("target/untracked.bin"), b"build output").unwrap();
         std::fs::write(source.join("node_modules/pkg/index.js"), b"generated").unwrap();
         std::fs::write(source.join(".env"), b"SECRET=never-admit").unwrap();
+        std::fs::write(source.join("src/lib.rs"), b"new admitted bytes").unwrap();
 
         let old_hash = Hash256::from_bytes(blobs.write(b"old tracked bytes").unwrap().0);
         let retained = RepoPath::from_utf8("target/retained.bin").unwrap();
+        let admitted = RepoPath::from_utf8("src/lib.rs").unwrap();
         let artifact_id = ArtifactId::new();
+        let admitted_id = ArtifactId::new();
         let head = record_commit(
             &graph,
             vec![],
             vec![],
-            vec![TreeDelta::Added {
-                artifact_id,
-                new: LocatedEntry::new(retained.clone(), TreeEntry::blob(old_hash, false)),
-            }],
+            vec![
+                TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(retained.clone(), TreeEntry::blob(old_hash, false)),
+                },
+                TreeDelta::Added {
+                    artifact_id: admitted_id,
+                    new: LocatedEntry::new(admitted.clone(), TreeEntry::blob(old_hash, false)),
+                },
+            ],
             &genesis.id,
             "main",
         );
 
         admit_working_tree(&graph, &blobs, &layout).unwrap();
         let deltas = compute_deltas_vs_last_commit(&graph, &head).unwrap();
+        assert!(
+            !deltas.tree_deltas.iter().any(|delta| delta
+                .new_state()
+                .is_some_and(|new| new.path == retained)
+                || delta.old_state().is_some_and(|old| old.path == retained)),
+            "a covered path's host bytes must not move repository truth: {:?}",
+            deltas.tree_deltas
+        );
+        // Falsification: the same commit still follows an admitted file whose
+        // bytes changed, so the silence above belongs to the rule.
         assert!(deltas.tree_deltas.iter().any(|delta| {
             matches!(
                 delta,
@@ -1832,7 +1977,7 @@ mod tests {
                     artifact_id: id,
                     new,
                     ..
-                } if *id == artifact_id && new.path == retained
+                } if *id == admitted_id && new.path == admitted
             )
         }));
         for ignored in [".env", "target/untracked.bin", "node_modules/pkg/index.js"] {
