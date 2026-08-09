@@ -825,10 +825,11 @@ impl Scanner<'_> {
             }
 
             if ignored {
-                // Reached only by a leaf the walk had another reason to visit,
-                // such as a re-admission that could have named it. Excluded
-                // leaves are never opened, so whether this one is tracked
-                // changes what the diagnostics say and nothing else.
+                // An excluded leaf the walk met anyway, either inside an
+                // admitted directory or under one a re-admission forced it to
+                // descend into. Nothing excluded is opened, so tracking decides
+                // which counter this bumps and nothing else: a covered tracked
+                // path left the tracked set before the walk began.
                 if !self.unverified_ignored_paths.contains(&repo_path) {
                     self.diagnostics.ignored_untracked_entries += 1;
                 }
