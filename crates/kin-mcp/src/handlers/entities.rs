@@ -836,7 +836,8 @@ this call per entity — bulk_check_references does the batch in one shot. \
 When no references come back, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
-before treating the entity as safe to delete.";
+before treating the entity as safe to delete. An entity_id or name that resolves to nothing \
+carries the same object, naming the resolution miss rather than reporting an empty result.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -2277,7 +2278,12 @@ happens substrate-side and comes back as one structured response, so you don't l
 get_entity_source per hop and exhaust your tool-call budget. Tune depth and \
 limit_per_step to control breadth; results flag when they were truncated. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
-flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\".";
+flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\", and its \
+`subject` scopes the absence to the direction that was walked, so an empty 'callers' result is \
+never read as \"this calls nothing\". A focal name the graph holds more than once, and a method \
+whose incoming calls may not have been linked, each downgrade that flag rather than certifying \
+absence. A focal that resolves to no entity at all carries the same object, naming the \
+resolution miss rather than reporting an empty chain.";
 
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
@@ -2322,7 +2328,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     };
 
     // Resolve focal: UUID first, then exact-name lookup via the ranking path.
-    let focal_entity = if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+    let focal_id = uuid::Uuid::parse_str(trimmed).ok();
+    let focal_entity = if let Some(uuid) = focal_id {
         store
             .get_entity(&kin_model::ids::EntityId(uuid))
             .map_err(McpError::graph)?
@@ -2335,6 +2342,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             trimmed
         )));
     };
+    let same_name_candidates = same_name_entity_count(store, &focal_entity.name)?;
 
     let reference_kinds = [
         RelationKind::Calls,
@@ -2459,10 +2467,38 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
+        "focal_resolution": {
+            "addressed_by": if focal_id.is_some() { "entity_id" } else { "name" },
+            "same_name_candidates": same_name_candidates,
+        },
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// How many entities carry `name` exactly, the focal included.
+///
+/// A name the graph holds more than once is the cfg-twin shape: two arms of the
+/// same declaration are admitted as distinct entities, and a call the extractor
+/// cannot attribute to one of them lands on neither. The walk follows a single
+/// candidate, so an empty chain says nothing about the others. Only the handler
+/// can see how many there were, and the qualifier that reads this treats an
+/// unreported count as unknown rather than as one.
+///
+/// Never reports zero: the focal was resolved from this store, so it is its own
+/// first candidate whatever the pattern query matched.
+fn same_name_entity_count<G: GraphStore>(store: &G, name: &str) -> Result<usize> {
+    let filter = EntityFilter {
+        name_pattern: Some(name.to_string()),
+        ..Default::default()
+    };
+    let matched = store.query_entities(&filter).map_err(McpError::graph)?;
+    Ok(matched
+        .iter()
+        .filter(|entity| entity.name == name)
+        .count()
+        .max(1))
 }
 
 pub const GRAPH_NEIGHBORHOOD_DESC: &str = "\
@@ -4174,6 +4210,299 @@ mod tests {
             response.get("negative").is_none(),
             "a truncated edge array is not an absence and must not be qualified as one: {response}"
         );
+    }
+
+    /// A graph that is initialized, loaded, and holds entities: the only state
+    /// in which a structural absence is authoritative. Carries the entity count
+    /// `structurally_ready_envelope` leaves unknown, because a resolution miss
+    /// on a graph holding nothing is a fact about the graph, not the name.
+    fn populated_ready_envelope() -> crate::Envelope {
+        crate::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_generation": 12,
+            "graph_entity_count": 3,
+        }))
+    }
+
+    /// Run `trace_data_flow` through the annotation chokepoint, so the payload
+    /// key names the handler writes are pinned to the qualifier that reads them.
+    fn traced_response(
+        store: &InMemoryGraph,
+        focal: &str,
+        direction: &str,
+        envelope: crate::Envelope,
+    ) -> serde_json::Value {
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!(focal));
+        args.insert("direction".to_string(), serde_json::json!(direction));
+        let annotated = crate::finalize_with_envelope(
+            handle_trace_data_flow(&args, store).unwrap(),
+            envelope,
+            "trace_data_flow",
+        );
+        parsed_response(&annotated)
+    }
+
+    fn trust_reason(response: &serde_json::Value) -> String {
+        response["negative"]["trust_reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the negative must carry a trust_reason: {response}"))
+            .to_string()
+    }
+
+    /// The authoritative side of the trace absence: a focal that is in the
+    /// graph, carries a name nothing else shares, is not a method, and has no
+    /// edges at all. That is a real absence, and the qualifier must still be
+    /// willing to say so. A gate that never certifies anything is as useless
+    /// as one that certifies everything.
+    #[test]
+    fn trace_data_flow_isolated_focal_is_authoritative_on_a_ready_graph() {
+        let store = InMemoryGraph::new();
+        let lonely = make_entity("lonely", "src/lonely.rs");
+        store.upsert_entity(&lonely).unwrap();
+
+        let response = traced_response(
+            &store,
+            &lonely.id.to_string(),
+            "both",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(response["focal_name"], "lonely");
+        assert_eq!(response["total_steps"], 0);
+        assert_eq!(response["focal_resolution"]["same_name_candidates"], 1);
+        assert_eq!(response["negative"]["kind"], "no_flow");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], true,
+            "a resolved, uniquely named, non-method focal with no edges on a loaded graph is a \
+             real absence: {}",
+            response["negative"]
+        );
+    }
+
+    /// And the inconclusive side of the same walk. The in-process runtime is a
+    /// fallback surface, so the identical empty chain must not be handed back
+    /// as proof the entity is unused.
+    #[test]
+    fn trace_data_flow_isolated_focal_is_inconclusive_on_an_unattested_graph() {
+        let store = InMemoryGraph::new();
+        let lonely = make_entity("lonely", "src/lonely.rs");
+        store.upsert_entity(&lonely).unwrap();
+
+        let response = traced_response(
+            &store,
+            &lonely.id.to_string(),
+            "both",
+            crate::Envelope::offline(),
+        );
+        assert_eq!(response["negative"]["kind"], "no_flow");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an unattested runtime cannot certify absence: {}",
+            response["negative"]
+        );
+        assert!(trust_reason(&response).contains("offline_fallback"));
+    }
+
+    /// The reported shape: two cfg arms of one declaration are admitted as
+    /// distinct entities, a call the extractor cannot attribute to a single
+    /// candidate lands on neither, and the walk follows one twin. An empty
+    /// chain there answers for both twins a question that was asked of one, so
+    /// it must never be certified.
+    #[test]
+    fn trace_data_flow_same_named_twins_never_certify_absence() {
+        let store = InMemoryGraph::new();
+        let real = make_entity("process_embedding_queue", "src/engine/graph.rs");
+        let stub = make_entity("process_embedding_queue", "src/engine/graph_stub.rs");
+        store.upsert_entity(&real).unwrap();
+        store.upsert_entity(&stub).unwrap();
+
+        let response = traced_response(
+            &store,
+            &real.id.to_string(),
+            "callers",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(response["total_steps"], 0);
+        assert_eq!(response["focal_resolution"]["same_name_candidates"], 2);
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "a name the graph holds twice cannot certify absence for either twin: {}",
+            response["negative"]
+        );
+        assert!(trust_reason(&response).contains("focal_resolution_ambiguous"));
+    }
+
+    /// Receiver-method calls are linked by bare name while method entities are
+    /// keyed by their qualified name, so a method's incoming call edges are
+    /// frequently missing. `find_references` has always refused to certify that
+    /// absence; the trace reads the same edges and now refuses too.
+    #[test]
+    fn trace_data_flow_method_focal_never_certifies_an_empty_callers_walk() {
+        let store = InMemoryGraph::new();
+        let mut method = make_entity("process_embedding_queue", "src/engine/graph.rs");
+        method.kind = EntityKind::Method;
+        store.upsert_entity(&method).unwrap();
+
+        let response = traced_response(
+            &store,
+            &method.id.to_string(),
+            "callers",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an empty callers walk on a method is not proof of disuse: {}",
+            response["negative"]
+        );
+        assert!(trust_reason(&response).contains("method_call_resolution_incomplete"));
+    }
+
+    /// An empty walk is empty only on the side that was walked. This focal is
+    /// genuinely called by another entity, so a merged claim would be false;
+    /// the outgoing walk may say only that it calls nothing.
+    #[test]
+    fn trace_data_flow_absence_names_the_direction_that_was_walked() {
+        let (store, _, _, callee_id) = neighborhood_fixture();
+
+        let outgoing = traced_response(
+            &store,
+            &callee_id.to_string(),
+            "calls",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(outgoing["total_steps"], 0);
+        let subject = outgoing["negative"]["subject"]
+            .as_str()
+            .expect("the negative must carry a subject")
+            .to_string();
+        assert!(
+            subject.contains("anything it calls") && !subject.contains("either direction"),
+            "an outgoing-only walk must claim only what the focal calls: {subject}"
+        );
+
+        let incoming = traced_response(
+            &store,
+            &callee_id.to_string(),
+            "callers",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(
+            incoming["total_steps"], 2,
+            "the focal really is called, transitively, which is what makes the merged claim false"
+        );
+    }
+
+    /// The asymmetry an agent cannot see: every resolved answer from this tool
+    /// carried the full negative while a name that resolved to nothing arrived
+    /// as a bare message. The message still has to survive, because it is the
+    /// only part a human reads.
+    #[test]
+    fn trace_data_flow_focal_miss_carries_the_negative_beside_its_message() {
+        let store = InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!("absent_symbol"));
+        let annotated = crate::finalize_with_envelope(
+            handle_trace_data_flow(&args, &store).unwrap(),
+            populated_ready_envelope(),
+            "trace_data_flow",
+        );
+        let response = parsed_response(&annotated);
+
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("absent_symbol")),
+            "the human-readable message must survive beside the qualifier: {response}"
+        );
+        assert!(
+            response[crate::ENVELOPE_KEY].is_object(),
+            "the envelope must ride along as it always did: {response}"
+        );
+        assert_eq!(response["negative"]["kind"], "focal_not_resolved");
+        assert_eq!(response["negative"]["interpretation"], "name_not_resolved");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], true,
+            "a name no entity carries, on a loaded graph that holds entities, is a real answer: {}",
+            response["negative"]
+        );
+    }
+
+    /// The other half: a graph holding nothing at all answers every name the
+    /// same way, so a miss there is a fact about the graph rather than about
+    /// the symbol. This is the case that made a bare "not found" dangerous.
+    #[test]
+    fn trace_data_flow_focal_miss_on_an_empty_graph_is_not_authoritative() {
+        let store = InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert("focal".to_string(), serde_json::json!("absent_symbol"));
+        let empty_graph = crate::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 0,
+        }));
+        let annotated = crate::finalize_with_envelope(
+            handle_trace_data_flow(&args, &store).unwrap(),
+            empty_graph,
+            "trace_data_flow",
+        );
+        let response = parsed_response(&annotated);
+
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "a graph with no entities cannot report that a name is absent from the code: {}",
+            response["negative"]
+        );
+        assert!(trust_reason(&response).contains("graph_empty"));
+    }
+
+    /// `find_references` answered its own miss the same bare way, and gets the
+    /// same qualifier from the same chokepoint.
+    #[tokio::test]
+    async fn find_references_entity_miss_carries_the_negative_beside_its_message() {
+        let store = InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(EntityId::new().to_string()),
+        );
+        let annotated = crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            populated_ready_envelope(),
+            "find_references",
+        );
+        let response = parsed_response(&annotated);
+
+        assert_eq!(response["message"], "Entity not found");
+        assert!(response[crate::ENVELOPE_KEY].is_object());
+        assert_eq!(response["negative"]["kind"], "focal_not_resolved");
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], true,
+            "an id no entity carries, on a loaded graph that holds entities, is a real answer: {}",
+            response["negative"]
+        );
+    }
+
+    /// And its inconclusive side, so neither tool can certify a miss off a
+    /// fallback surface.
+    #[tokio::test]
+    async fn find_references_entity_miss_is_inconclusive_on_an_unattested_graph() {
+        let store = InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(EntityId::new().to_string()),
+        );
+        let annotated = crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            crate::Envelope::offline(),
+            "find_references",
+        );
+        let response = parsed_response(&annotated);
+
+        assert_eq!(response["message"], "Entity not found");
+        assert_eq!(response["negative"]["safe_to_conclude_absent"], false);
+        assert!(trust_reason(&response).contains("offline_fallback"));
     }
 
     /// The declared tool schema must offer the parameter the handler honors,
