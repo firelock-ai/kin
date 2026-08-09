@@ -1468,34 +1468,52 @@ mod tests {
         let negative = negative_for("trace_data_flow", &payload, &Envelope::offline()).unwrap();
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(reason.contains("offline_fallback"), "{reason}");
-        assert!(reason.contains("method_call_resolution_incomplete"), "{reason}");
+        assert!(
+            reason.contains("method_call_resolution_incomplete"),
+            "{reason}"
+        );
         assert!(reason.contains("focal_resolution_unreported"), "{reason}");
     }
 
     #[test]
     fn trace_absence_names_the_direction_that_was_walked() {
-        let outgoing =
-            negative_for("trace_data_flow", &clean_empty_trace("calls"), &Envelope::offline())
-                .unwrap();
+        let outgoing = negative_for(
+            "trace_data_flow",
+            &clean_empty_trace("calls"),
+            &Envelope::offline(),
+        )
+        .unwrap();
         let subject = outgoing["subject"].as_str().unwrap();
         assert!(
             subject.contains("anything it calls") && !subject.contains("either direction"),
             "{subject}"
         );
-        assert!(outgoing["advice"].as_str().unwrap().contains("callers were not walked"));
+        assert!(outgoing["advice"]
+            .as_str()
+            .unwrap()
+            .contains("callers were not walked"));
 
-        let incoming =
-            negative_for("trace_data_flow", &clean_empty_trace("callers"), &Envelope::offline())
-                .unwrap();
+        let incoming = negative_for(
+            "trace_data_flow",
+            &clean_empty_trace("callers"),
+            &Envelope::offline(),
+        )
+        .unwrap();
         assert!(incoming["subject"]
             .as_str()
             .unwrap()
             .contains("anything that calls it"));
 
-        let merged =
-            negative_for("trace_data_flow", &clean_empty_trace("both"), &Envelope::offline())
-                .unwrap();
-        assert!(merged["subject"].as_str().unwrap().contains("either direction"));
+        let merged = negative_for(
+            "trace_data_flow",
+            &clean_empty_trace("both"),
+            &Envelope::offline(),
+        )
+        .unwrap();
+        assert!(merged["subject"]
+            .as_str()
+            .unwrap()
+            .contains("either direction"));
     }
 
     #[test]
@@ -1539,22 +1557,30 @@ mod tests {
             "graph_loaded": true,
             "graph_entity_count": 0,
         }));
-        let negative = resolution_miss_for("trace_data_flow", "no entity found matching 'x'", &envelope)
-            .expect("a miss is still qualified");
+        let negative =
+            resolution_miss_for("trace_data_flow", "no entity found matching 'x'", &envelope)
+                .expect("a miss is still qualified");
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
-        assert!(negative["trust_reason"].as_str().unwrap().contains("graph_empty"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("graph_empty"));
     }
 
     #[test]
     fn resolution_miss_offline_is_inconclusive() {
-        let negative = resolution_miss_for("find_references", "Entity not found", &Envelope::offline())
-            .expect("a miss is still qualified");
+        let negative =
+            resolution_miss_for("find_references", "Entity not found", &Envelope::offline())
+                .expect("a miss is still qualified");
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
         assert!(negative["trust_reason"]
             .as_str()
             .unwrap()
             .contains("offline_fallback"));
-        assert!(negative["advice"].as_str().unwrap().contains("NOT authoritative"));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("NOT authoritative"));
     }
 
     /// The guard has to be able to say no. A malformed request or an

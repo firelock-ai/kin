@@ -515,8 +515,9 @@ pub fn finalize(result: ToolCallResult, base: Envelope, tool_name: &str) -> Tool
     };
     let negative = match &payload {
         Some(payload) => crate::negative::negative_for(tool_name, payload, &envelope),
-        None if result.is_error == Some(true) => first_message_text(&result)
-            .and_then(|message| crate::negative::resolution_miss_for(tool_name, message, &envelope)),
+        None if result.is_error == Some(true) => first_message_text(&result).and_then(|message| {
+            crate::negative::resolution_miss_for(tool_name, message, &envelope)
+        }),
         None => None,
     };
     annotate_inner(result, &envelope, negative.as_ref())

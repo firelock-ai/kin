@@ -4273,8 +4273,7 @@ mod tests {
         assert_eq!(response["focal_resolution"]["same_name_candidates"], 1);
         assert_eq!(response["negative"]["kind"], "no_flow");
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            true,
+            response["negative"]["safe_to_conclude_absent"], true,
             "a resolved, uniquely named, non-method focal with no edges on a loaded graph is a \
              real absence: {}",
             response["negative"]
@@ -4298,8 +4297,7 @@ mod tests {
         );
         assert_eq!(response["negative"]["kind"], "no_flow");
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            false,
+            response["negative"]["safe_to_conclude_absent"], false,
             "an unattested runtime cannot certify absence: {}",
             response["negative"]
         );
@@ -4328,8 +4326,7 @@ mod tests {
         assert_eq!(response["total_steps"], 0);
         assert_eq!(response["focal_resolution"]["same_name_candidates"], 2);
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            false,
+            response["negative"]["safe_to_conclude_absent"], false,
             "a name the graph holds twice cannot certify absence for either twin: {}",
             response["negative"]
         );
@@ -4354,8 +4351,7 @@ mod tests {
             structurally_ready_envelope(),
         );
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            false,
+            response["negative"]["safe_to_conclude_absent"], false,
             "an empty callers walk on a method is not proof of disuse: {}",
             response["negative"]
         );
@@ -4426,8 +4422,7 @@ mod tests {
         assert_eq!(response["negative"]["kind"], "focal_not_resolved");
         assert_eq!(response["negative"]["interpretation"], "name_not_resolved");
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            true,
+            response["negative"]["safe_to_conclude_absent"], true,
             "a name no entity carries, on a loaded graph that holds entities, is a real answer: {}",
             response["negative"]
         );
@@ -4454,8 +4449,7 @@ mod tests {
         let response = parsed_response(&annotated);
 
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            false,
+            response["negative"]["safe_to_conclude_absent"], false,
             "a graph with no entities cannot report that a name is absent from the code: {}",
             response["negative"]
         );
@@ -4483,8 +4477,7 @@ mod tests {
         assert!(response[crate::ENVELOPE_KEY].is_object());
         assert_eq!(response["negative"]["kind"], "focal_not_resolved");
         assert_eq!(
-            response["negative"]["safe_to_conclude_absent"],
-            true,
+            response["negative"]["safe_to_conclude_absent"], true,
             "an id no entity carries, on a loaded graph that holds entities, is a real answer: {}",
             response["negative"]
         );
