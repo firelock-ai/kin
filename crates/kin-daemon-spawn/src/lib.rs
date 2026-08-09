@@ -907,6 +907,7 @@ impl ProcessGroupGuardianLauncher {
                         watcher_status: None,
                         watcher_failure: None,
                         group_barrier_completed: false,
+                        finalized: false,
                         cleanup_timeout: self.cleanup_timeout,
                         watcher_reaper,
                     });
@@ -1092,6 +1093,17 @@ pub struct ProcessGroupGuardian {
     watcher_status: Option<std::process::ExitStatus>,
     watcher_failure: Option<String>,
     group_barrier_completed: bool,
+    /// Whether launcher-side finalization has already consumed the terminal
+    /// watcher status, so no later call can do anything but report that.
+    ///
+    /// Finalization happens exactly once. Reporting the already-finalized
+    /// sentinel to an explicit caller is right, and reporting it from `Drop` is
+    /// pure noise: an owner that reaped its guardian and then dropped the handle
+    /// is the ordinary end of a bounded probe, not a cleanup failure. Every
+    /// bounded daemon probe took that shape, so a single failed daemon start
+    /// printed one "failed cleanup during Drop" warning per probe and buried the
+    /// real cause under them.
+    finalized: bool,
     cleanup_timeout: Duration,
     watcher_reaper: std::sync::mpsc::Sender<WatcherReaperJob>,
 }
@@ -1234,6 +1246,7 @@ impl ProcessGroupGuardian {
                 "process-group watcher was already finalized",
             ));
         };
+        self.finalized = true;
 
         self.ownership.take();
         let finalization = finalize_owned_process_group(
@@ -1347,6 +1360,18 @@ impl ProcessGroupGuardian {
 #[cfg(unix)]
 impl Drop for ProcessGroupGuardian {
     fn drop(&mut self) {
+        // A guardian its owner already reaped owns nothing and can only report
+        // the already-finalized sentinel. That is the ordinary end of a bounded
+        // probe, so it is recorded and not warned about. Warning here printed
+        // one "failed cleanup during Drop" line per daemon binary probe and
+        // pushed the real reason a start failed out of the reader's view.
+        if self.finalized {
+            tracing::debug!(
+                process_group = self.process_group,
+                "process-group guardian dropped after its owner finalized it"
+            );
+            return;
+        }
         self.request_cleanup();
         let deadline = std::time::Instant::now()
             + self.cleanup_timeout
@@ -4342,6 +4367,117 @@ mod tests {
         guardian
             .reap_until(std::time::Instant::now() + Duration::from_secs(5))
             .unwrap();
+    }
+
+    /// Every WARN and ERROR message a closure emits on this thread.
+    ///
+    /// A missing log line is invisible to an ordinary assertion, so the quiet
+    /// path has to be captured to be checked at all.
+    #[derive(Clone, Default)]
+    struct CapturedDiagnostics(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl CapturedDiagnostics {
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::field::Visit for CapturedDiagnostics {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.lock().unwrap().push(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CapturedDiagnostics {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = self.clone();
+            event.record(&mut visitor);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_guardian_its_owner_reaped_reports_no_cleanup_failure() {
+        // Every bounded probe reaps its guardian and then drops the handle, so
+        // the second finalization attempt is the normal case, not a fault. When
+        // Drop warned about it, a single failed daemon start printed one
+        // "failed cleanup during Drop" line per probe above the one line saying
+        // why the daemon would not start.
+        let root = tempfile::tempdir().unwrap();
+        let readiness_path = root.path().join("guardian.ready");
+        let executable = std::env::current_exe().unwrap();
+        let launcher = ProcessGroupGuardianLauncher::exact_test(
+            &executable,
+            "tests::process_group_guardian_worker",
+        );
+        let mut guardian = launcher
+            .spawn_with(
+                &readiness_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+                |_| {},
+            )
+            .unwrap();
+        assert!(
+            !guardian.finalized,
+            "a live guardian has not been finalized yet"
+        );
+        guardian.request_cleanup();
+        guardian
+            .reap_until(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            guardian.finalized,
+            "an explicit reap must record that finalization already happened"
+        );
+        let repeated = guardian
+            .try_reap()
+            .expect_err("a guardian finalizes exactly once");
+        assert!(
+            repeated.to_string().contains("already finalized"),
+            "unexpected repeat-finalization error: {repeated}"
+        );
+
+        let captured = CapturedDiagnostics::default();
+        tracing::subscriber::with_default(captured.clone(), || drop(guardian));
+        assert!(
+            captured.messages().is_empty(),
+            "dropping an already-reaped guardian must stay quiet: {:?}",
+            captured.messages()
+        );
+    }
+
+    #[test]
+    fn captured_diagnostics_records_a_warning_it_is_meant_to_catch() {
+        // The check above passes when nothing is logged, which is also what it
+        // would report if the capture never worked. This is the positive
+        // control that proves the capture can see a warning at all.
+        let captured = CapturedDiagnostics::default();
+        tracing::subscriber::with_default(captured.clone(), || {
+            tracing::warn!("process-group guardian reported failed cleanup during Drop");
+        });
+        assert_eq!(
+            captured.messages(),
+            vec!["process-group guardian reported failed cleanup during Drop".to_string()],
+            "the capture must see a warning emitted inside its scope"
+        );
     }
 
     #[cfg(unix)]
