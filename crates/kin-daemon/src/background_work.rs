@@ -586,10 +586,30 @@ struct ReconcileProbesInner {
     /// unbroken backlog rather than of the oldest one this daemon ever saw.
     backlog_since: Option<Instant>,
     /// How many host paths the most recent complete scan observed that
-    /// repository authority does not track.
+    /// repository authority does not track and no observation covered.
     untracked_path_count: u64,
     /// A bounded sample of those paths.
     untracked_paths_sample: Vec<String>,
+    /// What the most recent complete walk deliberately did not observe.
+    excluded: ExcludedHostContent,
+}
+
+/// Host content one complete walk declined to observe at all.
+///
+/// Separate from the untracked count because the two answer different
+/// questions. An untracked path is admissible content nothing has taken yet;
+/// these are paths the product will not index however long a reader waits, so
+/// the honest answer to "where is my file" is different in each case.
+///
+/// Counts only, never lists. An excluded directory is counted once and never
+/// descended into, so these stay small enough to read, and a surface that
+/// enumerated every derived file would have stopped being a notice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExcludedHostContent {
+    /// Untracked entries the effective ignore rules excluded.
+    pub ignored: u64,
+    /// Untracked leaves outside Kin's regular-file and symbolic-link tree.
+    pub unsupported: u64,
 }
 
 /// How many untracked paths a disclosure names outright.
@@ -646,7 +666,12 @@ impl ReconcileProbes {
         }
     }
 
-    /// What one complete scan saw on the host that authority does not track.
+    /// What one complete scan saw on the host that it did not admit.
+    ///
+    /// `paths` are admissible content authority does not carry and this pass did
+    /// not take; `excluded` is what the same walk declined to observe at all.
+    /// Both come from one scan and are recorded together so the two halves of
+    /// "why is my file missing" can never describe different moments.
     ///
     /// Replaces the previous record rather than accumulating. The scan behind it
     /// is complete, so its answer is the current truth about the working copy,
@@ -655,6 +680,7 @@ impl ReconcileProbes {
     pub fn record_untracked_observation<T: std::fmt::Display>(
         &self,
         paths: impl IntoIterator<Item = T>,
+        excluded: ExcludedHostContent,
     ) {
         let mut count: u64 = 0;
         let mut sample = Vec::new();
@@ -667,6 +693,7 @@ impl ReconcileProbes {
         let mut inner = self.lock();
         inner.untracked_path_count = count;
         inner.untracked_paths_sample = sample;
+        inner.excluded = excluded;
     }
 
     /// The disclosure surfaces' view of all of it.
@@ -697,6 +724,8 @@ impl ReconcileProbes {
                 .map(|since| now.saturating_duration_since(since).as_secs()),
             untracked_path_count: inner.untracked_path_count,
             untracked_paths_sample: inner.untracked_paths_sample.clone(),
+            ignored_path_count: inner.excluded.ignored,
+            unsupported_path_count: inner.excluded.unsupported,
         }
     }
 }

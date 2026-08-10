@@ -260,20 +260,32 @@ pub struct ReconcileHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backlog_age_seconds: Option<u64>,
     /// Host paths the most recent complete scan observed that repository
-    /// authority does not track.
+    /// authority does not track and no observation covered.
     ///
-    /// Ambient observation revises graph-owned history but never enlarges it, so
-    /// a path the workspace has never tracked stays untracked until an explicit
-    /// seam admits it. That is deliberate, and it is also the exact reason a
-    /// freshly written file is not queryable. Reported so the answer to "why is
-    /// my new file missing" is on the status surface instead of inferable only
-    /// from the loop's source.
+    /// Watching a working copy admits new non-ignored files into the workspace,
+    /// so a path that stays untracked is one nothing observed arriving: the
+    /// daemon was down when it appeared, or its notification never came. No
+    /// later ambient tick picks it up on its own, which is exactly why it is
+    /// reported rather than left for a reader to infer from the loop's source.
     #[serde(default)]
     pub untracked_path_count: u64,
     /// A bounded sample of `untracked_path_count`, so the notice names paths a
     /// reader can act on without a large working copy flooding the surface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub untracked_paths_sample: Vec<String>,
+    /// Untracked host entries the effective ignore rules excluded from the most
+    /// recent walk.
+    ///
+    /// A count, never a list. An excluded directory is counted once and never
+    /// descended into, so this stays small enough to read, and it is the only
+    /// signal that separates "nothing has taken your file yet" from "the rules
+    /// exclude it and nothing ever will".
+    #[serde(default)]
+    pub ignored_path_count: u64,
+    /// Untracked host leaves outside Kin's regular-file and symbolic-link tree,
+    /// which no admission can represent.
+    #[serde(default)]
+    pub unsupported_path_count: u64,
 }
 
 impl ReconcileHealth {
@@ -343,6 +355,12 @@ impl ReconcileHealth {
     /// reader to ignore the field. It still has to be said: a path the loop
     /// declines to admit is a path whose entities never appear, and silence
     /// there is what made a deliberate refusal look like a stuck daemon.
+    ///
+    /// The two notices answer the same reader's question from opposite sides. A
+    /// file that is missing because nothing observed it arriving is recoverable
+    /// and gets named outright; a file that is missing because the rules exclude
+    /// it is not, and the count is what tells the reader to go and read the
+    /// rules instead of waiting.
     pub fn notices(&self) -> Vec<String> {
         let mut notices = Vec::new();
         if self.untracked_path_count > 0 {
@@ -360,10 +378,32 @@ impl ReconcileHealth {
                 }
             };
             notices.push(format!(
-                "{} host path(s) observed but not tracked{sample}. Watching a file never enlarges \
-                 the repository, so these stay unqueryable until a commit admits them or kin \
-                 admit does it on demand.",
+                "{} host path(s) observed but not tracked{sample}. Watching a working copy admits \
+                 new non-ignored files, so nothing observed these arriving and no later tick picks \
+                 them up on its own; kin admit takes them now, and the next commit takes them \
+                 anyway.",
                 self.untracked_path_count
+            ));
+        }
+        if self.ignored_path_count > 0 || self.unsupported_path_count > 0 {
+            let mut excluded = Vec::new();
+            if self.ignored_path_count > 0 {
+                excluded.push(format!(
+                    "{} excluded by the ignore rules",
+                    self.ignored_path_count
+                ));
+            }
+            if self.unsupported_path_count > 0 {
+                excluded.push(format!(
+                    "{} outside Kin's file and symbolic-link tree",
+                    self.unsupported_path_count
+                ));
+            }
+            notices.push(format!(
+                "The last complete walk left host content unobserved: {}. Nothing admits these, so \
+                 a file missing from here is missing on purpose; check .kinignore before waiting \
+                 on it.",
+                excluded.join(", ")
             ));
         }
         notices
@@ -738,6 +778,49 @@ mod tests {
             ReconcileHealth::default().notices().is_empty(),
             "a working copy with nothing untracked says nothing"
         );
+    }
+
+    /// Excluded content is announced as a count and never as a list.
+    ///
+    /// It answers a different question from the untracked notice. A path nothing
+    /// observed is recoverable and gets named; a path the rules exclude is not
+    /// coming however long anyone waits, and the only useful answer is how much
+    /// is being left out and where the decision lives. Listing it instead would
+    /// put every derived file in the working copy on a surface whose job is to
+    /// name the one file a reader is looking for.
+    #[test]
+    fn excluded_host_content_is_announced_as_a_count_without_degrading_the_daemon() {
+        let health = ReconcileHealth {
+            ignored_path_count: 3,
+            unsupported_path_count: 1,
+            ..Default::default()
+        };
+        assert!(!health.degraded(), "{:?}", health.degraded_reasons());
+        let notices = health.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = &notices[0];
+        assert!(
+            notice.contains('3') && notice.contains("ignore rules"),
+            "the excluded count and its cause must both be named: {notice}"
+        );
+        assert!(
+            notice.contains('1') && notice.contains("symbolic-link"),
+            "content Kin cannot represent is a separate cause: {notice}"
+        );
+        assert!(
+            notice.contains(".kinignore"),
+            "the reader needs the file that decides this: {notice}"
+        );
+
+        // The two notices are independent: a repository can be missing a file
+        // for either reason, and a reader gets whichever answer is true.
+        let both = ReconcileHealth {
+            untracked_path_count: 1,
+            untracked_paths_sample: vec!["src/new.rs".to_string()],
+            ignored_path_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(both.notices().len(), 2, "{:?}", both.notices());
     }
 
     #[test]
