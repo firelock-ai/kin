@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.16] - 2026-08-10
+
+### Changed
+
+- Register the embedding environment kin-db actually reads (#731)
+
+
 ## [0.5.15] - 2026-08-10
 
 ### Changed
