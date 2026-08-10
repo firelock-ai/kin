@@ -780,7 +780,13 @@ with the unknown field named, never accepted with the source dropped. A refusal 
 one-line JSON object carrying schema, code, and the operations it names, so you can branch on the \
 code instead of reading the sentence. On success the change is attributed to the calling session: \
 its vendor and client name become the change author and a queryable audit record, so \
-kin_provenance_query, kin history, and kin blame all name the agent that wrote it.";
+kin_provenance_query, kin history, and kin blame all name the agent that wrote it. Re-sending a \
+commit that already landed is safe and is answered, not refused: the reply carries \
+already_applied true beside the original change_id, repository_generation, and modified_files, and \
+publishes nothing further. That answer is derived from the repository receipt rather than from any \
+in-memory record, so it survives the transaction being forgotten and stays correct however many \
+times it is retried. It omits ops_applied, which only the staged record could name. A commit that \
+never landed under this id still fails closed and says authority was consulted too.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {

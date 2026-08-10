@@ -4481,6 +4481,213 @@ mod tests {
         relation
     }
 
+    /// Rewrite one authority-owned entity in the live graph the way parser
+    /// reconciliation does: in place, under the graph-authority epoch alone,
+    /// holding neither the coordination gate nor the persistence lock.
+    fn rewrite_authority_entity_in_live_graph(state: &Arc<DaemonState>, entity: &Entity) -> Entity {
+        use kin_model::EntityStore;
+        let mut rewritten = entity.clone();
+        rewritten.doc_summary = Some("derived summary the enrichment worker computed".to_string());
+        let guard = state.begin_graph_authority_mutation();
+        state.graph.upsert_entity(&rewritten).unwrap();
+        state.bump_version();
+        drop(guard);
+        rewritten
+    }
+
+    /// A derived REWRITE of an authority-owned entity must not refuse a commit.
+    ///
+    /// Parser reconciliation and the LSP worker rewrite existing entities
+    /// continuously and outside the coordination gate, so refusing on a rewrite
+    /// refuses every commit that follows any tick, naming a different entity
+    /// each attempt. The instruction such a refusal carries, to re-send once the
+    /// daemon reads current authority, can then never converge: the worker wins
+    /// the race every time and only a daemon recycle clears it.
+    #[test]
+    fn a_commit_after_a_derived_entity_rewrite_is_not_refused() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let before = load_native_commit_base(&state.layout).unwrap();
+        let rewritten = rewrite_authority_entity_in_live_graph(&state, &entity);
+        assert!(
+            !semantic_workspace_matches(state.graph.as_ref(), &before.graph),
+            "the rewrite must put the live graph out of step with authority, or this test proves \
+             nothing about the refusal it exists to falsify"
+        );
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a commit issued after a derived entity rewrite must not be refused: {}",
+            result_text(&result)
+        );
+
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation + 1);
+        assert_eq!(
+            after
+                .graph
+                .to_snapshot()
+                .entities
+                .get(&entity.id)
+                .expect("the entity must survive the commit")
+                .doc_summary,
+            None,
+            "the derived summary must not be absorbed into the published change"
+        );
+        assert_ne!(
+            rewritten.doc_summary, None,
+            "the fixture must actually have written a derived value"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n"
+        );
+    }
+
+    /// Losing an entity authority owns is still divergence: a derived view may
+    /// hold more than authority, and may hold a richer value for what authority
+    /// owns, but it may never hold less.
+    #[test]
+    fn a_commit_is_refused_when_the_live_graph_has_dropped_an_authority_entity() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\npub fn other() -> u8 { 3 }\n",
+            "value",
+        );
+        let dropped = load_native_commit_base(&state.layout)
+            .unwrap()
+            .graph
+            .to_snapshot()
+            .entities
+            .into_values()
+            .find(|candidate| candidate.id != entity.id)
+            .expect("the fixture must own a second entity to drop");
+        let guard = state.begin_graph_authority_mutation();
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Removed { old: dropped }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        state.bump_version();
+        drop(guard);
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "a commit must be refused while the daemon holds less than authority owns"
+        );
+        assert!(
+            result_text(&result).contains("is missing"),
+            "the refusal must name the loss: {}",
+            result_text(&result)
+        );
+    }
+
+    /// A retry of a commit whose record is gone must be answered from the
+    /// repository receipt, not reported as a missing transaction.
+    ///
+    /// A successful commit evicts its own record, and a client whose per-attempt
+    /// budget expired during a long apply retries straight into that gap. The
+    /// old answer, `Transaction not found`, reported failure over a commit whose
+    /// file, entity, and provenance had all landed, which is a double-apply
+    /// generator because any correct agent retries a failure.
+    #[test]
+    fn a_retry_of_an_evicted_committed_transaction_answers_from_the_receipt() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let first = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
+        let first_body: serde_json::Value = serde_json::from_str(result_text(&first)).unwrap();
+        let generation_after_first = load_native_commit_base(&state.layout)
+            .unwrap()
+            .roots
+            .generation;
+
+        // Exactly what a successful commit leaves behind for the next attempt:
+        // the durable store and the live registry both forget the transaction.
+        state
+            .mcp_transactions
+            .lock()
+            .unwrap()
+            .remove(&transaction_id);
+        let retry_sessions = test_sessions();
+        assert!(
+            retry_sessions.get_transaction(&transaction_id).is_none(),
+            "the fixture must reproduce the evicted-record state the retry actually meets"
+        );
+
+        let retry = commit_exact_transaction(&state, &retry_sessions, &arguments, None);
+        assert_ne!(
+            retry.is_error,
+            Some(true),
+            "a retry of an applied commit must not report failure: {}",
+            result_text(&retry)
+        );
+        let retry_body: serde_json::Value = serde_json::from_str(result_text(&retry)).unwrap();
+        assert_eq!(retry_body["status"], "committed");
+        assert_eq!(retry_body["already_applied"], true);
+        assert_eq!(retry_body["change_id"], first_body["change_id"]);
+        assert_eq!(
+            load_native_commit_base(&state.layout)
+                .unwrap()
+                .roots
+                .generation,
+            generation_after_first,
+            "answering the retry must not publish a second repository generation"
+        );
+    }
+
+    /// An id that never named a transaction still fails closed, and says it
+    /// checked repository authority too, so the caller can tell "already landed"
+    /// apart from "nothing was ever published under this id".
+    #[test]
+    fn a_commit_for_an_unknown_transaction_id_still_fails_closed() {
+        let (_dir, state) = test_state();
+        install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let arguments = HashMap::from([(
+            "transaction_id".to_string(),
+            serde_json::json!(uuid::Uuid::new_v4().to_string()),
+        )]);
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(result.is_error, Some(true));
+        let message = result_text(&result);
+        assert!(message.contains("Transaction not found"), "{message}");
+        assert!(
+            message.contains("holds no receipt"),
+            "the refusal must say authority was consulted as well: {message}"
+        );
+    }
+
     /// The same acceptance as the enrichment-tick case, in the exact shape the
     /// LSP worker writes: relations only, on entities authority already owns.
     #[test]

@@ -2669,6 +2669,55 @@ mod tests {
         }
     }
 
+    /// Product mode must teach the whole operation schema on a decode failure,
+    /// exactly as the in-process handler does. This path used to decode by hand
+    /// and answer with whichever single field serde stopped on, so a caller
+    /// improvising the shape against a real daemon learned one field per
+    /// attempt and never saw the contract it was failing.
+    #[test]
+    fn delegate_stage_decode_failure_names_the_whole_operation_schema() {
+        let mut args = HashMap::new();
+        args.insert("transaction_id".into(), serde_json::json!("tx-1"));
+        args.insert(
+            "operations".into(),
+            serde_json::json!([{ "target": "Foo::bar", "content": "new source" }]),
+        );
+        let err = validate_stage_arguments(&args).unwrap_err();
+        for expected in [
+            "each element of `operations` is one of",
+            "an entity source edit",
+            "`verb` (string, REQUIRED)",
+            "`target` (string, REQUIRED)",
+            "`description` (string, REQUIRED)",
+            "`body` (string, optional)",
+            "`payload` (object, optional)",
+            "create/add/upsert/insert, update/modify, or delete/remove",
+        ] {
+            assert!(err.contains(expected), "refusal omits {expected:?}: {err}");
+        }
+    }
+
+    /// The key a caller reaches for before it reaches for `body` is named in
+    /// the refusal rather than dropped, because silently discarding it commits
+    /// nothing while reporting success.
+    #[test]
+    fn delegate_stage_names_an_unknown_source_field_rather_than_dropping_it() {
+        let mut args = HashMap::new();
+        args.insert("transaction_id".into(), serde_json::json!("tx-1"));
+        args.insert(
+            "operations".into(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": "Foo::bar",
+                "description": "why",
+                "new_body": "new source",
+            }]),
+        );
+        let err = validate_stage_arguments(&args).unwrap_err();
+        assert!(err.contains("'new_body'"), "{err}");
+        assert!(err.contains("New source text goes in `body`"), "{err}");
+    }
+
     #[test]
     fn delegate_stage_rejects_relation_modify() {
         let args = stage_args(vec![stage_op("modify", Some(stage_relation()))]);
