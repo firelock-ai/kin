@@ -46,15 +46,15 @@ KIND_MAP = {
 }
 # Non-literal defaults rendered as readable prose for the doc.
 DYN = {
-    "profile.multihop_timeout_ms(": "profile-dependent (200/500/1000 ms)",
-    "profile.multihop_frontier_limit(": "profile-dependent (50/100/200)",
+    "profile.multihop_timeout_ms()": "profile-dependent (200/500/1000 ms)",
+    "profile.multihop_frontier_limit()": "profile-dependent (50/100/200)",
     "profile_max_depth": "profile-dependent",
     "default_seed_limit": "repo-size adaptive (5 or 8)",
     "usize::MAX": "unbounded",
     "[]": "(none)",
     "default_artifact_hops": "context-dependent",
-    "retention_floor_pct.min(0.08": "adaptive (<= 0.08)",
-    "support_floor_pct.min(0.15": "adaptive (<= 0.15)",
+    "retention_floor_pct.min(0.08)": "adaptive (<= 0.08)",
+    "support_floor_pct.min(0.15)": "adaptive (<= 0.15)",
     "base.max_chars": "snippet-config default",
     "base.max_lines": "snippet-config default",
     "base.max_symbols_per_file": "snippet-config default",
@@ -74,9 +74,41 @@ BUILD_INFO = {
 HELPER_RE = re.compile(
     r'\b([a-z_][a-z0-9_]*env[a-z0-9_]*|rank_env_f32|semloc_env_f32'
     r"|cochange_env_usize|duration_from_env_secs)"
-    r'\(\s*"(KIN_[A-Z0-9_]+)"\s*(?:,\s*(.+?))?\s*\)',
+    r'\(\s*"(KIN_[A-Z0-9_]+)"\s*',
     re.S,
 )
+
+
+def default_arg(text, start):
+    """Return the helper's default argument, or None when it takes no default.
+
+    `start` is the offset just past the variable-name literal, so the helper's
+    own opening paren is already consumed and the scan begins at depth 1.
+
+    This tracks bracket depth and skips string literals rather than matching to
+    the first close paren. A default that is itself a call, such as
+    `quality.cross_encoder_default(ce_model_cached)`, closes an inner paren
+    before the helper's own, so stopping at the first one lifts a syntactically
+    incomplete expression into the published default column.
+    """
+    if start >= len(text) or text[start] != ",":
+        return None
+    i = start + 1
+    depth = 1
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : i]
+        i += 1
+    return None
 
 
 def kind_from_fn(fn):
@@ -109,7 +141,8 @@ def build_catalog():
         with open(path, encoding="utf-8", errors="ignore") as fh:
             text = fh.read()
         for m in HELPER_RE.finditer(text):
-            fn, name, default = m.group(1), m.group(2), (m.group(3) or "").strip()
+            fn, name = m.group(1), m.group(2)
+            default = (default_arg(text, m.end()) or "").strip()
             default = default.split("\n")[0].strip().rstrip(",").strip()
             if len(default) > 60:
                 default = default[:60]
@@ -130,7 +163,13 @@ def pretty_default(d):
     d = d.strip()
     if d in DYN:
         return DYN[d]
-    if d.endswith("("):
+    if d.endswith(")") and "(" in d:
+        # A call expression has no single literal value to publish, so it is
+        # described rather than printed. This used to key off a trailing `(`,
+        # which only ever appeared because the extractor cut the argument at
+        # its first close paren; a default whose own call took an argument
+        # therefore missed this branch and leaked a broken expression into the
+        # published default column.
         return DYN.get(d, "context-dependent")
     if re.match(r"^-?[0-9.]+$", d):
         return d

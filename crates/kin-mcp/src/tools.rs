@@ -1273,6 +1273,39 @@ mod tests {
         assert_eq!(list.tools.len(), 64);
     }
 
+    /// The tool reference must name every tool the registry serves, and its
+    /// headline count must be that number.
+    ///
+    /// The reference presents itself as the whole surface, so a tool the
+    /// registry defines but the page never names is invisible to the agents
+    /// the page exists for, and two of the tools this caught ship in
+    /// `agent-default`. Nothing tied the page to the registry, which is why it
+    /// drifted to claiming 62 while serving 64. `docs/env-vars.md` has exactly
+    /// this tie and did not drift.
+    #[test]
+    fn mcp_doc_names_every_registered_tool() {
+        let doc = include_str!("../../../docs/mcp-tools.md");
+        let list = tool_definitions();
+        for tool in &list.tools {
+            assert!(
+                doc.contains(tool.name.as_str()),
+                "{} is served by the registry but named nowhere in docs/mcp-tools.md",
+                tool.name
+            );
+        }
+        let headline = format!("exposes {} semantic tools", list.tools.len());
+        assert!(
+            doc.contains(headline.as_str()),
+            "docs/mcp-tools.md must state the served tool count, which is now {}",
+            list.tools.len()
+        );
+        assert!(
+            !doc.contains("kin_not_a_real_tool"),
+            "the containment probe must be able to answer no, or the assertions \
+             above prove nothing"
+        );
+    }
+
     #[test]
     fn agent_default_profile_is_small_and_valid() {
         let list = tool_definitions();

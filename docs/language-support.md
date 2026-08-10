@@ -18,8 +18,10 @@ tiers:
 | **Structured artifact** | Dedicated extractors for manifests and configs (Cargo.toml, package.json, go.mod, pom.xml, Dockerfile, CI configs, SQL migrations…) |
 | **Opaque artifact** | Content hash + MIME hint. Never dropped, never parsed |
 
-Incremental edits (reconcile/watch) resolve adapters by file extension and can
-reach further than whole-repo ingest for a few languages, noted below.
+Whole-repo ingest and incremental edits (reconcile/watch) route the same way.
+Both resolve every extension the adapter registry claims, so a file lands in
+the same tier whichever path admitted it, and a test asserts that the two
+cannot drift apart.
 
 ## Full semantic support
 
@@ -36,25 +38,19 @@ reach further than whole-repo ingest for a few languages, noted below.
 | Kotlin | ✓ | calls, contains, extends, implements, references | ✓ | ✓ | ✗ |
 | C# | ✓ | calls, contains, extends, references | ✗ | ✓ | ✗ |
 | Ruby | ✓ | calls, contains, extends, references | ✗ | ✓ | ✗ |
-
-## Full adapters not yet routed by whole-repo ingest
-
-Swift, PHP, and HCL/Terraform have complete adapters (with relations, and for
-Swift/PHP test + doc extraction) that currently apply only on incremental
-edits. Whole-repo ingest classifies Swift and PHP as shallow syntax and
-HCL/Terraform as opaque. Until ingest routing is unified, treat their
-effective support as the lower tier.
+| Swift | ✓ | calls, contains, implements, references | ✓ (xctest) | ✓ | ✗ |
+| PHP | ✓ | calls, contains, extends, implements, references | ✓ (phpunit) | ✓ | ✗ |
+| HCL / Terraform | ✓ | imports, references | ✗ | ✓ | ✗ |
 
 ## Shallow syntax support
 
-Grammar-backed shallow extraction (declarations + imports + fingerprint, no
-call graph) covers C, C++, C#, Ruby, PHP, and Swift. It applies when a file
-reaches the shallow tier.
+The shallow tier exists in the pipeline but currently routes no extensions.
+Every language with a shallow grammar also has a full entity-extraction
+adapter, so those files take the full semantic path instead.
 
-The following extensions are currently **classified as shallow but have no
-grammar wired**, so they degrade to opaque in practice: Scala, Lua, R, Zig,
-Elixir, Erlang, Haskell, OCaml, Perl. Treat these as unsupported for semantic
-extraction today.
+Extensions with neither a full adapter nor a wired grammar are stored as
+opaque artifacts: Scala, Lua, R, Zig, Elixir, Erlang, Haskell, OCaml, Perl.
+Treat these as unsupported for semantic extraction today.
 
 ## LSP enrichment
 

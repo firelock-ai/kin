@@ -43,7 +43,7 @@ pub const GENERATED_KNOBS: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_COMPANION_ENTITY_LIMIT", kind: Kind::Usize, default: "24", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: companion entity limit" },
     EnvVarSpec { name: "KIN_LOCATE_CONTRIB_PATH_PENALTY", kind: Kind::NonNegF32, default: "0.2", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: contrib path penalty" },
     EnvVarSpec { name: "KIN_LOCATE_CORROBORATED_RESOLVE_FLOOR_PCT", kind: Kind::NonNegF32, default: "0.05", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: corroborated resolve floor pct" },
-    EnvVarSpec { name: "KIN_LOCATE_CROSS_ENCODER_ENABLED", kind: Kind::Bool, default: "quality.cross_encoder_default(ce_model_cached", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: cross encoder enabled" },
+    EnvVarSpec { name: "KIN_LOCATE_CROSS_ENCODER_ENABLED", kind: Kind::Bool, default: "context-dependent", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: cross encoder enabled" },
     EnvVarSpec { name: "KIN_LOCATE_CURATED_TERM_LIMIT", kind: Kind::Usize, default: "6", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: curated term limit" },
     EnvVarSpec { name: "KIN_LOCATE_CUSTOM_IMPL_DIR_SEED_BONUS", kind: Kind::NonNegF32, default: "1.5", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: custom impl dir seed bonus" },
     EnvVarSpec { name: "KIN_LOCATE_CUSTOM_IMPL_DIR_SEED_MIN", kind: Kind::Usize, default: "4", sensitivity: Sensitivity::Correctness, summary: "locate tuning knob: custom impl dir seed min" },

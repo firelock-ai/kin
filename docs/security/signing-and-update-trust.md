@@ -14,8 +14,8 @@ For the daemon/projection runtime trust model see
 ## What a Release Contains
 
 A tagged release (`v*.*.*`) builds one archive per platform. Each archive bundles
-the `kin` CLI, the mandatory `kin-daemon`, and — when built — the `kin-vfs`
-projection CLI and its interposition shim. Every archive is published alongside a
+the `kin` CLI and the mandatory `kin-daemon`, plus the `kin-vfs` projection CLI
+and its interposition shim when built. Every archive is published alongside a
 per-artifact SHA-256 file:
 
 | Platform | Archive | Checksum |
@@ -222,7 +222,7 @@ lives on Apple's servers and is validated **online by Gatekeeper on first run**.
 
 Audit consequence: an end user verifying notarization offline (e.g.
 `stapler validate`) will not find a stapled ticket on the tarball or the bare
-binary — that is expected for this artifact shape, not a signing gap. If a
+binary. That is expected for this artifact shape, not a signing gap. If a
 `.dmg`/`.pkg` installer is added later, the pipeline has a documented place to
 add `xcrun stapler staple`.
 
@@ -230,8 +230,8 @@ add `xcrun stapler staple`.
 
 The Linux core binaries (`kin`, `kin-daemon`) target
 `*-unknown-linux-musl` and link **static by default**. A single Linux artifact
-per architecture therefore runs across distros — musl (Alpine) and glibc
-(Ubuntu/Debian/RHEL) alike — with no OpenSSL or glibc-version coupling. From a
+per architecture therefore runs across distros, musl (Alpine) and glibc
+(Ubuntu/Debian/RHEL) alike, with no OpenSSL or glibc-version coupling. From a
 supply-chain standpoint this means the Linux binary does not dynamically pull a
 host TLS/crypto library at runtime for its own operation; the musl C toolchain
 (`musl-tools`) is installed only to build the static C dependencies (ring,

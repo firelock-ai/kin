@@ -35,7 +35,7 @@ The following are **out of scope** here:
 - hosted services such as KinLab, which run under their own operational security
   model;
 - an attacker who already has code execution as the same OS user (that is inside
-  the trust boundary — see [Residual Risks](#residual-risks-and-hardening) for
+  the trust boundary; see [Residual Risks](#residual-risks-and-hardening) for
   the partial defenses that still apply);
 - physical access and full-disk compromise.
 
@@ -76,7 +76,7 @@ The daemon supports a per-install bearer token. On first run it auto-provisions 
 random token at `.kin/daemon.token` with owner-only permissions (`0600` on
 Unix); local clients read the same file and present it as
 `Authorization: Bearer <token>`. The authentication middleware is scoped to the
-daemon's own control routes — the package-registry routes (cargo/npm/oci/go) stay
+daemon's own control routes. The package-registry routes (cargo/npm/oci/go) stay
 public so that build tooling, which does not send credentials on reads, can fetch
 from a token-protected daemon.
 
@@ -89,11 +89,11 @@ Enforcement of the per-install token is **on by default**:
   `.kin/daemon.token` and send it, so a fresh install authenticates out of the
   box with no operator setup.
 - `KIN_DAEMON_REQUIRE_TOKEN` is the documented escape hatch: set it to a falsy
-  value (`0`, `false`, `no`, or `off`) to run without bearer auth — for example, an
-  older local client that predates token support and cannot yet send the header.
-  In that state the daemon relies on the loopback bind, the Host/Origin guard,
-  and OS-level filesystem and process isolation rather than on bearer
-  authentication. An explicit truthy value is equivalent to the default.
+  value (`0`, `false`, `no`, or `off`) to run without bearer auth. One example
+  is an older local client that predates token support and cannot yet send the
+  header. In that state the daemon relies on the loopback bind, the
+  Host/Origin guard, and OS-level filesystem and process isolation rather than
+  on bearer authentication. An explicit truthy value is equivalent to the default.
 - Setting `KIN_DAEMON_AUTH_TOKEN` to an explicit value always takes precedence
   and is always enforced, even while `KIN_DAEMON_REQUIRE_TOKEN` is opted out;
   this is also the token required to bind a non-loopback address.
@@ -132,8 +132,8 @@ process** and runs with that process's privileges. Two consequences follow:
   privileged (for example setuid) binaries, so it cannot be used to inject into a
   more-privileged process.
 
-The daemon-side counterpart of projection — materializing graph-owned files into
-a workspace for a session or an exec request — runs within the same-user
+The daemon-side counterpart of projection, materializing graph-owned files into
+a workspace for a session or an exec request, runs within the same-user
 daemon trust boundary described above.
 
 ## Blob-Store Integrity
@@ -153,7 +153,7 @@ The storage substrate that performs reads and any read-time verification is
 properties.
 
 An attacker with write access to a repository's `.kin/` directory could modify
-stored blobs or graph state — but such an attacker already holds same-user
+stored blobs or graph state, but such an attacker already holds same-user
 filesystem access, which is inside the trust boundary. Content-addressing limits
 that actor to detectable substitution rather than silent tampering wherever
 addresses are re-verified.

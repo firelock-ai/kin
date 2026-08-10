@@ -55,20 +55,20 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ALLOW_OFFLINE_RESTORE` | bool | false | operational | allow restoring a backup without remote verification |
 | `KIN_ALLOW_PARENT_STORE` | bool | false | operational | allow discovering a store in a parent directory |
 | `KIN_API_URL` | url | *(unset)* | operational | hosted API base URL (release/pipeline commands) |
-| `KIN_BENCHMARK` | bool | false | diagnostic | benchmark-mode marker for with-sessions |
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
-| `KIN_CLAUDE_DISALLOWED_TOOLS` | string | *(unset)* | operational | comma-separated tool names disallowed in a with-session |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
 | `KIN_NO_DAEMON` | bool | false | operational | force in-process execution instead of the daemon |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
 | `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |
 | `KIN_ORG_ID` | string | *(unset)* | operational | organization id for federation/remote |
 | `KIN_ORIGINAL_PATH` | path | *(unset)* | operational | caller's original PATH preserved across a with/exec shim |
-| `KIN_PLUGIN_DIR` | path | *(unset)* | operational | plugin directory override |
 | `KIN_PRIMARY_REPO_ID` | string | *(unset)* | operational | primary repo id for a multi-repo daemon |
 | `KIN_PROFILE` | string | compat-v0 | correctness | retrieval quality profile: compat-v0 (default, pre-profile behavior) or accuracy-v1 (opt-in candidate pending A/B-tuned graduation); proof runs pin this explicitly |
 | `KIN_REGEN_ENV_DOC` | string | *(unset)* | diagnostic | dev/test tooling: set to regenerate docs/env-vars.md from the registry |
+| `KIN_REMOTE_AUTH_TOKEN` | secret | *(unset)* | secret | fallback KinLab auth token read after KIN_REMOTE_BEARER_TOKEN |
+| `KIN_REMOTE_BASE_URL` | url | *(unset)* | operational | KinLab base URL for remote and federation calls |
+| `KIN_REMOTE_BEARER_TOKEN` | secret | *(unset)* | secret | KinLab bearer token used when no stored auth session is present |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
 | `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
@@ -253,7 +253,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_COMPANION_ENTITY_LIMIT` | usize | 24 | correctness | locate tuning knob: companion entity limit |
 | `KIN_LOCATE_CONTRIB_PATH_PENALTY` | float>=0 | 0.2 | correctness | locate tuning knob: contrib path penalty |
 | `KIN_LOCATE_CORROBORATED_RESOLVE_FLOOR_PCT` | float>=0 | 0.05 | correctness | locate tuning knob: corroborated resolve floor pct |
-| `KIN_LOCATE_CROSS_ENCODER_ENABLED` | bool | quality.cross_encoder_default(ce_model_cached | correctness | locate tuning knob: cross encoder enabled |
+| `KIN_LOCATE_CROSS_ENCODER_ENABLED` | bool | context-dependent | correctness | locate tuning knob: cross encoder enabled |
 | `KIN_LOCATE_CROSS_ENCODER_MODEL` | string | *(unset)* | correctness | override the cross-encoder rerank model id |
 | `KIN_LOCATE_CROSS_ENCODER_REVISION` | string | *(unset)* | correctness | override the cross-encoder rerank model revision |
 | `KIN_LOCATE_CURATED_TERM_LIMIT` | usize | 6 | correctness | locate tuning knob: curated term limit |

@@ -214,9 +214,11 @@ cd /path/to/your/repository
 kin init .
 ```
 
-In a clean Git repository, `kin init` atomically admits complete reachable
+In a detected Git repository, `kin init` atomically admits complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
-repository-v6 graph authority. It never substitutes an exact-HEAD snapshot or
+repository-v6 graph authority. A worktree with uncommitted edits, staged
+changes, or untracked files still admits: `kin init` admits the committed state
+and discloses what it did not admit. It never substitutes an exact-HEAD snapshot or
 raw-filesystem semantic rebuild. Supported repository-local remote URLs,
 refspecs, branch tracking, and push defaults are sealed into Kin's Git
 coexistence configuration; unsafe, ambiguous, or unsupported transfer settings
@@ -372,7 +374,10 @@ that measured scope as hypotheses until they have their own reproducible proof.
 - [Quickstart and advanced configuration](docs/quickstart.md)
 - [Store size and what drives it](docs/store-size.md)
 - [MCP tool reference](docs/mcp-tools.md)
+- [Language support and what each tier extracts](docs/language-support.md)
+- [Environment variable reference](docs/env-vars.md)
 - [Graph-first thesis](docs/thesis.md)
+- [Write-authority model and its transitional state](docs/write-authority-model.md)
 - [GitHub Discussions](https://github.com/firelock-ai/kin/discussions)
 - [Bug reports and feature requests](https://github.com/firelock-ai/kin/issues/new/choose)
 - [Contributing guide](CONTRIBUTING.md)

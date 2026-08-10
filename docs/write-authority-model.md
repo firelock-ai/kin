@@ -13,11 +13,11 @@ At this stage, the graph exercises a **veto** at the write boundary:
 
 This ensures that the repository remains strictly compliant with semantic governance policies, shifting validation from post-commit CI loops to stage-time (or even write-time) checks.
 
-## The Transitional State: Filesystem-Authoritative with Forensic Reconcile
+## The Transitional State: A Permissive Write Path with Forensic Reconcile
 
 Because completely blocking standard development tools (like Git, traditional IDEs, or `sed`) creates immediate adoption friction, Kin currently operates in a **transitional state**:
 
-- **Filesystem-Authoritative**: The raw filesystem remains the permissive source of truth for incoming changes. Tools and agents can write to files directly without immediate VFS rejection.
+- **Permissive write path**: Standard tools still write to files directly, and Kin does not reject those writes at the VFS layer today. Graph authority is established by reconcile rather than at the moment of the write, so during this transition the window between a file edit and graph truth is real, and closing it is what hard enforcement does.
 - **Forensic Reconcile**: The Kin daemon asynchronously ingests these filesystem changes, rebuilding the semantic graph and detecting conflicts or contract violations *after* the fact.
 - **Advisory Governance**: Rather than blocking the write, the system generates downstream warnings, traffic collisions, or semantic review failures based on the updated graph state. 
 
@@ -25,4 +25,4 @@ Because completely blocking standard development tools (like Git, traditional ID
 
 This transitional posture is an intentional design choice for brownfield migration. It allows humans and agents to adopt Kin's semantic retrieval, memory, and coordination primitives (like intents and traces) without risking being immediately locked out by strict enforcement. 
 
-However, **this is migration debt**. The governance and audit pitch—providing a definitive, cryptographically verifiable record of who approved what, and proving that no contracts were bypassed—ultimately requires the hard enforcement of the destination state. Documenting this transition keeps our governance narrative honest: today we provide forensic visibility and advisory warnings; tomorrow we provide structural enforcement.
+However, **this is migration debt**. The governance and audit pitch is a definitive, cryptographically verifiable record of who approved what, proving that no contracts were bypassed. That record ultimately requires the hard enforcement of the destination state. Documenting this transition keeps our governance narrative honest. Today we provide forensic visibility and advisory warnings. Tomorrow we provide structural enforcement.
