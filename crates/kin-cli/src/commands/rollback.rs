@@ -332,11 +332,7 @@ pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<(
     let layout = crate::commands::require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for rollback but no daemon endpoint is available"
-            )
-        })?;
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("rollback", &layout))?;
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
     let response = daemon
         .rollback(&RollbackRequest {

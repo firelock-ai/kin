@@ -620,9 +620,7 @@ async fn run_daemon_resources(
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
     let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Kin daemon is required for resource inspection but no daemon endpoint is available"
-        )
+        crate::daemon_client::daemon_required_error("resource inspection", &layout)
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     // Resource sizing reflects the daemon worker's captured environment; warn

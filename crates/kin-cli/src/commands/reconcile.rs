@@ -224,7 +224,9 @@ pub async fn run_for_layout(
     let session_dir = resolve_session_directory(layout, session_id)?;
     let base_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
-        .ok_or_else(|| anyhow!("Kin daemon is required for exact session reconciliation"))?;
+        .ok_or_else(|| {
+            crate::daemon_client::daemon_required_error("exact session reconciliation", layout)
+        })?;
     let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)?;
     let summary = client
         .reconcile(&ReconcileRequest {

@@ -7,11 +7,7 @@ async fn daemon_base_url() -> Result<String> {
     let layout = crate::commands::require_repository_layout()?;
     crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for traffic commands but no daemon endpoint is available"
-            )
-        })
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("traffic commands", &layout))
 }
 
 /// `kin traffic show <scope>` — Show active traffic via daemon API.

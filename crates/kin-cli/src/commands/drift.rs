@@ -69,10 +69,7 @@ pub async fn run(json: bool) -> Result<()> {
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for projection drift reporting but no daemon endpoint is \
-                 available"
-            )
+            crate::daemon_client::daemon_required_error("projection drift reporting", &layout)
         })?;
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
     let response = daemon.drift(&DriftRequest { json }).await?;
@@ -128,9 +125,7 @@ pub async fn heal(json: bool) -> Result<()> {
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for projection healing but no daemon endpoint is available"
-            )
+            crate::daemon_client::daemon_required_error("projection healing", &layout)
         })?;
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
 
