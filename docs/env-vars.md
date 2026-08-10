@@ -253,7 +253,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_COMPANION_ENTITY_LIMIT` | usize | 24 | correctness | locate tuning knob: companion entity limit |
 | `KIN_LOCATE_CONTRIB_PATH_PENALTY` | float>=0 | 0.2 | correctness | locate tuning knob: contrib path penalty |
 | `KIN_LOCATE_CORROBORATED_RESOLVE_FLOOR_PCT` | float>=0 | 0.05 | correctness | locate tuning knob: corroborated resolve floor pct |
-| `KIN_LOCATE_CROSS_ENCODER_ENABLED` | bool | quality.cross_encoder_default(ce_model_cached | correctness | locate tuning knob: cross encoder enabled |
+| `KIN_LOCATE_CROSS_ENCODER_ENABLED` | bool | context-dependent | correctness | locate tuning knob: cross encoder enabled |
 | `KIN_LOCATE_CROSS_ENCODER_MODEL` | string | *(unset)* | correctness | override the cross-encoder rerank model id |
 | `KIN_LOCATE_CROSS_ENCODER_REVISION` | string | *(unset)* | correctness | override the cross-encoder rerank model revision |
 | `KIN_LOCATE_CURATED_TERM_LIMIT` | usize | 6 | correctness | locate tuning knob: curated term limit |
