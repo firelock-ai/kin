@@ -585,7 +585,19 @@ struct ReconcileProbesInner {
     /// moment the loop drains it, so the reported age is the age of one
     /// unbroken backlog rather than of the oldest one this daemon ever saw.
     backlog_since: Option<Instant>,
+    /// How many host paths the most recent complete scan observed that
+    /// repository authority does not track.
+    untracked_path_count: u64,
+    /// A bounded sample of those paths.
+    untracked_paths_sample: Vec<String>,
 }
+
+/// How many untracked paths a disclosure names outright.
+///
+/// A working copy can hold thousands of them, and a surface that printed every
+/// one would bury the count that matters. Five is enough to recognize the file
+/// you just wrote.
+const UNTRACKED_SAMPLE_LIMIT: usize = 5;
 
 impl ReconcileProbes {
     fn lock(&self) -> std::sync::MutexGuard<'_, ReconcileProbesInner> {
@@ -634,6 +646,29 @@ impl ReconcileProbes {
         }
     }
 
+    /// What one complete scan saw on the host that authority does not track.
+    ///
+    /// Replaces the previous record rather than accumulating. The scan behind it
+    /// is complete, so its answer is the current truth about the working copy,
+    /// and a count that only ever grew would keep naming files a commit has
+    /// since admitted or a delete has since removed.
+    pub fn record_untracked_observation<T: std::fmt::Display>(
+        &self,
+        paths: impl IntoIterator<Item = T>,
+    ) {
+        let mut count: u64 = 0;
+        let mut sample = Vec::new();
+        for path in paths {
+            count = count.saturating_add(1);
+            if sample.len() < UNTRACKED_SAMPLE_LIMIT {
+                sample.push(path.to_string());
+            }
+        }
+        let mut inner = self.lock();
+        inner.untracked_path_count = count;
+        inner.untracked_paths_sample = sample;
+    }
+
     /// The disclosure surfaces' view of all of it.
     pub fn report(&self, now: Instant) -> ReconcileHealth {
         let inner = self.lock();
@@ -660,6 +695,8 @@ impl ReconcileProbes {
             backlog_age_seconds: inner
                 .backlog_since
                 .map(|since| now.saturating_duration_since(since).as_secs()),
+            untracked_path_count: inner.untracked_path_count,
+            untracked_paths_sample: inner.untracked_paths_sample.clone(),
         }
     }
 }
