@@ -915,6 +915,13 @@ enum Command {
         #[arg(long)]
         confirm_mass_deletion: bool,
     },
+    /// Admit the complete exact working tree into graph authority now
+    ///
+    /// The daemon admits a complete tree on startup, on commit, and on what its
+    /// watcher observes. This is the trigger for the case none of those covers:
+    /// a graph that fell behind its working tree and is waiting for churn that
+    /// is not coming.
+    Admit,
     /// Admit one exact disposable-session observation into repository-v6 authority
     Reconcile {
         /// Session ID (defaults to most recent session)
@@ -3140,6 +3147,10 @@ fn main() -> Result<()> {
                 } => {
                     commands::capabilities::require_ready("purge-ignored")?;
                     commands::purge_ignored::run(confirm, confirm_mass_deletion).await
+                }
+                Command::Admit => {
+                    commands::capabilities::require_ready("admit")?;
+                    commands::admit::run().await
                 }
                 Command::Reconcile {
                     session,

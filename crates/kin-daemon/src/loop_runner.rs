@@ -76,15 +76,14 @@ impl Default for LoopConfig {
     }
 }
 
-/// Run the reconciliation loop until the cancellation token fires.
+/// Whether `dir` is a bare Git repository, which holds no working copy to
+/// reconcile or admit.
 ///
-/// This is the main loop of the daemon. It:
-/// 1. Watches the working directory for file changes (via `notify`)
-/// 2. Drains batches of events
-/// 3. For each event, runs the reconciler (file -> overlay)
-/// 4. Projects overlay mutations back to files (overlay -> file)
-///
-fn is_bare_repository(dir: &std::path::Path) -> bool {
+/// Crate-visible because the on-demand admission seam refuses the same
+/// condition. A second copy of the predicate would be a second set of rules to
+/// keep in step, and a divergence there would either refuse a store the seam
+/// would have admitted or report a skipped pass as a completed one.
+pub(crate) fn is_bare_repository(dir: &std::path::Path) -> bool {
     dir.join("config").is_file()
         && dir.join("objects").is_dir()
         && dir.join("refs").is_dir()

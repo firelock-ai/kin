@@ -40,14 +40,14 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["all_declared_command_surfaces_enabled"], true);
-    assert_eq!(report["enabled_commands"], 34);
+    assert_eq!(report["enabled_commands"], 35);
     assert_eq!(report["full_git_replacement_ready"], false);
     // Exact counts, so a silent re-seal cannot pass. They are also the reason
     // two lanes must never flip a gate in the same wave: both bumps merge
     // without conflict and main goes red with every pull request green.
     // Recount from the merged fixture rather than from either branch.
-    assert_eq!(report["ready_commands"], 33);
-    assert_eq!(report["command_total"], 34);
+    assert_eq!(report["ready_commands"], 34);
+    assert_eq!(report["command_total"], 35);
 
     let commands = report["commands"]
         .as_array()
