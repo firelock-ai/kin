@@ -540,12 +540,15 @@ fn exact_tree_admission(
         // scan behind this is complete, so it replaces the previous answer
         // instead of adding to it, and a path a commit later admits stops being
         // reported on the very next tick.
-        state.background_work.reconcile().record_untracked_observation(
-            observed
-                .entries()
-                .keys()
-                .filter(|path| previous.artifact_id_at_path(path).is_none()),
-        );
+        state
+            .background_work
+            .reconcile()
+            .record_untracked_observation(
+                observed
+                    .entries()
+                    .keys()
+                    .filter(|path| previous.artifact_id_at_path(path).is_none()),
+            );
         observed.retain(|path, _| previous.artifact_id_at_path(path).is_some());
     }
     // A bounded tick re-inserts every tracked path its observation did not
