@@ -1014,7 +1014,7 @@ pub(crate) fn read_entity_file_bytes_with_digest_from(
     })?;
     let artifact = workspace.tree.artifact_at_path(&path).ok_or_else(|| {
         anyhow::anyhow!(
-            "entity source '{}' is absent from repository-v6 workspace {} at generation {}",
+            "entity source '{}' is not in workspace {} at generation {}",
             file_id.0,
             workspace.workspace_id,
             workspace.generation
@@ -2041,7 +2041,7 @@ mod tests {
                 .to_string();
 
         assert!(
-            err.contains("source 'src/lib.rs' is absent from repository-v6 workspace"),
+            err.contains("source 'src/lib.rs' is not in workspace"),
             "{err}"
         );
     }

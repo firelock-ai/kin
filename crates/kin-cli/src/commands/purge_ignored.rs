@@ -17,7 +17,7 @@
 //! presence derived from it, because those are what let it rank. The file stays
 //! on disk; this untracks rather than deletes.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use kin_model::{AuthorId, OperationId, RepositoryId};
 use serde::{Deserialize, Serialize};
 
@@ -151,7 +151,9 @@ pub async fn run(confirm: bool, confirm_mass_deletion: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
     let base_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| anyhow!("Kin daemon is required to retire tracked paths"))?;
+        .ok_or_else(|| {
+            crate::daemon_client::daemon_required_error("retiring tracked paths", &layout)
+        })?;
     let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, &layout)?;
     let response = client
         .purge_ignored(&PurgeIgnoredRequest {

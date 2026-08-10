@@ -177,7 +177,7 @@ impl ActiveRepositoryAuthority {
             .cloned()
             .ok_or_else(|| {
                 anyhow!(
-                    "repository {} has no workspace {} in repository-v6 authority",
+                    "repository {} has no workspace {} in its authority",
                     self.repository_id,
                     self.workspace_id
                 )
@@ -205,7 +205,7 @@ impl ActiveRepositoryAuthority {
             .find(|workspace| workspace.workspace_id == self.workspace_id)
             .ok_or_else(|| {
                 anyhow!(
-                    "repository {} has no workspace {} in repository-v6 authority",
+                    "repository {} has no workspace {} in its authority",
                     self.repository_id,
                     self.workspace_id
                 )

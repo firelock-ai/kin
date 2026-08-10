@@ -57,7 +57,7 @@ pub fn durable_semantic_enrichment_summary(
         .find(|workspace| &workspace.workspace_id == workspace_id)
         .ok_or_else(|| {
             KinError::Graph(format!(
-                "repository-v6 authority has no workspace {workspace_id}"
+                "this repository's authority has no workspace {workspace_id}"
             ))
         })?;
     workspace

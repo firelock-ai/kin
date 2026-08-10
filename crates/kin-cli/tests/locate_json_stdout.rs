@@ -566,8 +566,12 @@ fn locate_ref_resolves_admitted_history_without_hydrating_from_git() {
     );
     let absent_stderr = String::from_utf8_lossy(&absent.stderr);
     assert!(
-        absent_stderr.contains("has no imported repository-v6 alias"),
+        absent_stderr.contains("was never imported into this repository"),
         "absent ref must fail as an explicit graph gap: {absent_stderr}"
+    );
+    assert!(
+        !absent_stderr.contains("repository-v6"),
+        "the on-disk layout version is not a noun the reader has: {absent_stderr}"
     );
 }
 

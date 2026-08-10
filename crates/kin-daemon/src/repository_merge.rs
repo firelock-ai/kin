@@ -576,7 +576,7 @@ fn three_way(
     if admission_policy_delta.is_some() || shared_policy != plan.ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
-             admission policy is not a proven repository-v6 shape",
+             admission policy is not a shape kin merges",
             request.source, plan.target_ref
         )));
     }
@@ -927,7 +927,7 @@ pub(crate) fn publish_resolved_merge(
     if admission_policy_delta.is_some() || shared_policy != ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
-             admission policy is not a proven repository-v6 shape",
+             admission policy is not a shape kin merges",
             record.binding.source_ref, record.binding.target_ref
         )));
     }

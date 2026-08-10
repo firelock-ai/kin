@@ -78,7 +78,7 @@ pub(crate) fn capture_export_snapshot_from_state(
         .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "repository {} has no workspace {} in repository-v6 authority",
+                "repository {} has no workspace {} in its authority",
                 repository_id,
                 workspace_id
             )

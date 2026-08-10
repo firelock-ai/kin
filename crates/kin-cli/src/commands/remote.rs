@@ -568,24 +568,24 @@ pub(crate) async fn load_push_plan(requested_remote: Option<&str>) -> Result<Pus
         .map(|target| target.repo_id.clone())
         .unwrap_or_else(|| fallback_repo_id.clone());
 
-    let (local_head, approved, semantic_state_note) = if let Some(head) =
-        authority.current_change_id()?
-    {
-        let approvals = graph.get_approvals_for_change(&head)?;
-        let approved = approvals
-            .iter()
-            .any(|approval| approval.decision == ApprovalDecision::Approved);
-        (Some(head.to_string()), approved, None)
-    } else {
-        (
+    let (local_head, approved, semantic_state_note) =
+        if let Some(head) = authority.current_change_id()? {
+            let approvals = graph.get_approvals_for_change(&head)?;
+            let approved = approvals
+                .iter()
+                .any(|approval| approval.decision == ApprovalDecision::Approved);
+            (Some(head.to_string()), approved, None)
+        } else {
+            (
             None,
             false,
             Some(
-                "The repository-v6 workspace head is unborn; there is no semantic change to publish."
+                "This workspace has no commits yet, so there is no semantic change to publish; \
+                 make one with `kin commit`."
                     .to_string(),
             ),
         )
-    };
+        };
 
     let (remote_head, remote_state_note) = if let Some(target) = native_target.as_ref() {
         let status = fetch_native_remote_status(target, &remote.name).await?;

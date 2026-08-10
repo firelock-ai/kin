@@ -82,7 +82,7 @@ pub fn inspect(
         .find(|workspace| workspace.workspace_id == authority.workspace_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "repository {} has no workspace {} in repository-v6 authority",
+                "repository {} has no workspace {} in its authority",
                 authority.repository_id,
                 authority.workspace_id
             )
