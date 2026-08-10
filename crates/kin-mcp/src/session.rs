@@ -419,8 +419,14 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
     }
 }
 
-/// The accepted `operations` element shapes, spelled out for a caller that has
+/// The complete `operations` element schema, spelled out for a caller that has
 /// to construct them without reading Kin's Rust types.
+///
+/// Every refusal from [`parse_staged_operations`] carries this whole text
+/// rather than the single field serde stopped on. A caller improvising the
+/// shape learns one missing field per attempt from a raw decode error, so it
+/// discovers the contract by looping on retries; naming the full schema once
+/// ends the loop on the first refusal.
 pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one of:\n  \
      - an entity source edit: {\"verb\": \"update\", \"target\": \"<entity uuid or exact name>\", \
      \"body\": \"<the entity's full new source text>\", \"description\": \"<why>\"}\n  \
@@ -430,7 +436,22 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = "each element of `operations` is one
      - a relation edit: {\"verb\": \"create\"|\"delete\", \"target\": \"\", \
      \"payload\": {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \"kind\": \"<relation kind>\"}}, \
      \"description\": \"<why>\"}\n\
-     Prefer the first shape: it needs only a target and the new source text";
+     Prefer the first shape: it needs only a target and the new source text.\n\
+     Every field of an operation, and nothing else is accepted:\n  \
+     - `verb` (string, REQUIRED): one of create/add/upsert/insert, update/modify, or \
+     delete/remove. Compared case-insensitively after trimming.\n  \
+     - `target` (string, REQUIRED): the entity this operation acts on, as either its uuid or \
+     its exact name. Empty string for relation payloads, which identify themselves by their \
+     endpoints and kind.\n  \
+     - `description` (string, REQUIRED): why this operation is being made.\n  \
+     - `body` (string, optional): the entity's complete new source text, never a fragment or a \
+     diff. New source text is carried by this field and no other; a key like `content`, \
+     `source`, or `new_body` is refused rather than accepted with the source dropped.\n  \
+     - `payload` (object, optional): omit it for a source edit. Otherwise exactly one of \
+     {\"Entity\": {<entity object>}}, {\"Relation\": {\"from\": \"<uuid>\", \"to\": \"<uuid>\", \
+     \"kind\": \"<relation kind>\"}}, or {\"Blob\": [<bytes>]}. Relation payloads accept only \
+     create/add/upsert/insert or delete/remove, and blob payloads are not committable through \
+     transactions yet";
 
 /// Every field an operation is allowed to carry.
 ///

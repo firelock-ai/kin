@@ -1400,13 +1400,19 @@ pub async fn forward_tool_call(
 /// argument map. A missing `operations` field is left for the daemon to report
 /// (so the missing-parameter message stays authoritative); a malformed array or
 /// a payload that would be silently dropped at commit fails loud here.
+///
+/// Decoding goes through [`crate::session::parse_staged_operations`] rather
+/// than serde directly. Product mode reaches this function and the in-process
+/// handler reaches that one, so decoding here by hand gave the two modes
+/// different refusals for the identical input: in-process named the whole
+/// operation schema and product mode answered with whichever single field
+/// serde stopped on. A caller improvising the shape against a real daemon
+/// learned one field per attempt and never saw the contract.
 fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> Result<(), String> {
     let Some(operations_val) = arguments.get("operations") else {
         return Ok(());
     };
-    let operations: Vec<crate::session::McpMutationOperation> =
-        serde_json::from_value(operations_val.clone())
-            .map_err(|e| format!("invalid operations array: {e}"))?;
+    let operations = crate::session::parse_staged_operations(operations_val)?;
     crate::session::validate_staged_operations(&operations)
 }
 
@@ -2661,6 +2667,55 @@ mod tests {
             to: kin_model::ids::EntityId::new(),
             kind: kin_model::relation::RelationKind::Calls,
         }
+    }
+
+    /// Product mode must teach the whole operation schema on a decode failure,
+    /// exactly as the in-process handler does. This path used to decode by hand
+    /// and answer with whichever single field serde stopped on, so a caller
+    /// improvising the shape against a real daemon learned one field per
+    /// attempt and never saw the contract it was failing.
+    #[test]
+    fn delegate_stage_decode_failure_names_the_whole_operation_schema() {
+        let mut args = HashMap::new();
+        args.insert("transaction_id".into(), serde_json::json!("tx-1"));
+        args.insert(
+            "operations".into(),
+            serde_json::json!([{ "target": "Foo::bar", "content": "new source" }]),
+        );
+        let err = validate_stage_arguments(&args).unwrap_err();
+        for expected in [
+            "each element of `operations` is one of",
+            "an entity source edit",
+            "`verb` (string, REQUIRED)",
+            "`target` (string, REQUIRED)",
+            "`description` (string, REQUIRED)",
+            "`body` (string, optional)",
+            "`payload` (object, optional)",
+            "create/add/upsert/insert, update/modify, or delete/remove",
+        ] {
+            assert!(err.contains(expected), "refusal omits {expected:?}: {err}");
+        }
+    }
+
+    /// The key a caller reaches for before it reaches for `body` is named in
+    /// the refusal rather than dropped, because silently discarding it commits
+    /// nothing while reporting success.
+    #[test]
+    fn delegate_stage_names_an_unknown_source_field_rather_than_dropping_it() {
+        let mut args = HashMap::new();
+        args.insert("transaction_id".into(), serde_json::json!("tx-1"));
+        args.insert(
+            "operations".into(),
+            serde_json::json!([{
+                "verb": "update",
+                "target": "Foo::bar",
+                "description": "why",
+                "new_body": "new source",
+            }]),
+        );
+        let err = validate_stage_arguments(&args).unwrap_err();
+        assert!(err.contains("'new_body'"), "{err}");
+        assert!(err.contains("New source text goes in `body`"), "{err}");
     }
 
     #[test]

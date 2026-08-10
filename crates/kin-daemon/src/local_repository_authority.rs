@@ -203,28 +203,45 @@ pub(crate) fn require_fresh_daemon_workspace(
 }
 
 /// Describe the first authority-owned entity or relation the daemon graph has
-/// dropped or rewritten, or `None` when authority is still fully retained.
+/// dropped, or `None` when authority is still fully retained.
 ///
-/// A derived view may hold more than authority owns. It may never hold less,
-/// and it may never hold a different value under an identity authority already
-/// published: either would mean the daemon is answering from something other
-/// than graph truth.
+/// A derived view may hold more than authority owns, and it may hold a richer
+/// value for something authority owns. It may never hold less: a dropped entity
+/// or relation means the daemon is answering from something other than graph
+/// truth, and no derived writer produces that.
+///
+/// A rewrite is deliberately not divergence. Parser reconciliation and the
+/// asynchronous LSP enrichment worker publish semantic facets onto existing
+/// authority-owned entities continuously and outside the coordination gate, so
+/// treating a rewritten value as divergence refuses every commit that follows
+/// any enrichment tick. That is the same unachievable invariant the equality
+/// check above was removed for, reintroduced one level down at entity
+/// granularity, and it fails the same way: a caller told to "re-send this
+/// commit unchanged once the daemon is reading current repository authority"
+/// races the worker and loses again, naming a different rewritten entity each
+/// attempt, until the daemon is recycled.
+///
+/// Tolerating the rewrite is safe because a derived lead cannot reach
+/// publication. [`crate::mcp_commit`] builds its prospective graph from the
+/// authority workspace snapshot and applies only the staged operations, so what
+/// the live graph holds never enters the committed change. Staleness, the
+/// failure this check is sometimes assumed to catch, is caught before it by the
+/// generation binding above: a daemon that missed an authority move fails there
+/// with both generations named. After the commit the live graph is corrected
+/// onto authority and verified, which is where a genuinely corrupt derived
+/// value is caught.
 fn authority_semantics_divergence(
     live: &kin_db::GraphSnapshot,
     authority: &kin_db::GraphSnapshot,
 ) -> Option<String> {
-    for (entity_id, entity) in &authority.entities {
-        match live.entities.get(entity_id) {
-            Some(live_entity) if live_entity == entity => {}
-            Some(_) => return Some(format!("entity {entity_id} was rewritten")),
-            None => return Some(format!("entity {entity_id} is missing")),
+    for entity_id in authority.entities.keys() {
+        if !live.entities.contains_key(entity_id) {
+            return Some(format!("entity {entity_id} is missing"));
         }
     }
-    for (relation_id, relation) in &authority.relations {
-        match live.relations.get(relation_id) {
-            Some(live_relation) if live_relation == relation => {}
-            Some(_) => return Some(format!("relation {relation_id} was rewritten")),
-            None => return Some(format!("relation {relation_id} is missing")),
+    for relation_id in authority.relations.keys() {
+        if !live.relations.contains_key(relation_id) {
+            return Some(format!("relation {relation_id} is missing"));
         }
     }
     None

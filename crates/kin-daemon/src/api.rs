@@ -7283,6 +7283,19 @@ async fn mcp_tools_call(
                 "missing required parameter: entity_id".to_string(),
             )));
         };
+        // A blank id is a caller bug, not a query, and it must fail closed like
+        // the missing one above. Resolution parses no uuid from it and falls
+        // through to ranked name selection, where an empty query still ranks
+        // every entity and returns whichever sorts best: the tool answers an
+        // arbitrary entity's body and reports success, so the caller cannot
+        // tell the accident from a real hit.
+        if entity_id.trim().is_empty() {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "invalid parameter: entity_id must not be empty; pass an entity uuid or its exact \
+                 name"
+                    .to_string(),
+            )));
+        }
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,
             Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
