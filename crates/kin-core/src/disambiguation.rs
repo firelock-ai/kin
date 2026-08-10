@@ -60,6 +60,53 @@ pub fn query_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<E
     Ok(matches)
 }
 
+/// Whether the name index rules out every resolver match for `query`.
+///
+/// `find_references` and `trace_data_flow` both resolve a caller's name through
+/// [`query_trace_matches`] and `kin_ranking::select_best_entity`, and both reach
+/// that resolution only after their route has built the state the answer would
+/// be read from: a detached graph snapshot with its merkle root recomputed, or a
+/// whole-store repository-authority open. Both are linear in store size, and a
+/// name that matches nothing pays all of it to conclude what one index lookup
+/// already knew.
+///
+/// Answering `true` promises that both resolvers would miss, so every branch
+/// that cannot promise it answers `false` and leaves the caller on the unchanged
+/// path. An id, a name the index knows, or a qualified name whose leaf the index
+/// knows are all "not certainly a miss" even where resolution would go on to
+/// reject them for some other reason.
+pub fn name_resolution_certainly_misses(
+    graph: &impl GraphStore,
+    query: &str,
+) -> Result<bool, KinError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || uuid::Uuid::parse_str(trimmed).is_ok() {
+        return Ok(false);
+    }
+    if !name_index_rules_out(graph, trimmed)? {
+        return Ok(false);
+    }
+    // `query_trace_matches` retries a qualified name against its leaf, so a leaf
+    // the index knows keeps the caller on the resolving path.
+    if let Some((_, leaf)) = trimmed.rsplit_once("::") {
+        if leaf != trimmed && !name_index_rules_out(graph, leaf)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn name_index_rules_out(graph: &impl GraphStore, name: &str) -> Result<bool, KinError> {
+    let filter = EntityFilter {
+        name_pattern: Some(name.to_string()),
+        ..Default::default()
+    };
+    graph
+        .query_entities(&filter)
+        .map(|matches| matches.is_empty())
+        .map_err(|e| KinError::Graph(e.to_string()))
+}
+
 /// Fallback: split on `::` or `.` and search for just the leaf name.
 ///
 /// Used when `query_trace_matches` returns empty. For example,
@@ -151,6 +198,37 @@ mod tests {
 
         let matches = query_trace_matches(&store, "$Config::run").unwrap();
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn name_resolution_certainly_misses_only_for_a_name_the_index_cannot_place() {
+        let store = InMemoryGraph::new();
+        store.upsert_entity(&make_entity("route")).unwrap();
+
+        assert!(
+            name_resolution_certainly_misses(&store, "no_such_symbol").unwrap(),
+            "a name no index entry carries is a certain miss"
+        );
+        assert!(
+            !name_resolution_certainly_misses(&store, "route").unwrap(),
+            "a name the index carries must stay on the resolving path"
+        );
+    }
+
+    /// The three shapes that must never be short-circuited, each of which the
+    /// bare name index cannot place on its own: a uuid the caller means as an
+    /// id, a qualified name whose leaf resolves, and an empty query whose own
+    /// error the resolver owns.
+    #[test]
+    fn name_resolution_certainly_misses_defers_what_the_name_index_cannot_decide() {
+        let store = InMemoryGraph::new();
+        let entity = make_entity("run");
+        let id = entity.id;
+        store.upsert_entity(&entity).unwrap();
+
+        assert!(!name_resolution_certainly_misses(&store, &id.to_string()).unwrap());
+        assert!(!name_resolution_certainly_misses(&store, "Config::run").unwrap());
+        assert!(!name_resolution_certainly_misses(&store, "   ").unwrap());
     }
 
     #[test]
