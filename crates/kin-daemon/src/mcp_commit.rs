@@ -78,9 +78,19 @@ fn commit_exact_transaction_inner(
         .ok_or_else(|| "missing required parameter: transaction_id".to_string())?
         .to_string();
 
-    let mut transaction = sessions
-        .get_transaction(&transaction_id)
-        .ok_or_else(|| format!("Transaction not found: {transaction_id}"))?;
+    let Some(mut transaction) = sessions.get_transaction(&transaction_id) else {
+        // A missing record is not proof the work never happened. A successful
+        // commit evicts its own transaction, and a client whose per-attempt
+        // HTTP budget expired during a long apply retries straight into that
+        // gap: the retry blocks on the coordination gate, the first attempt
+        // finishes and evicts, and the retry then reads a registry that no
+        // longer holds what it just applied. Answering "not found" there
+        // reports failure over a commit whose file, entity, and provenance
+        // all landed, which is a double-apply generator, because any correct
+        // agent retries a failure. Repository authority still holds the
+        // receipt for this caller-stable operation id, so ask it.
+        return replay_applied_commit(state, &transaction_id, coordination);
+    };
 
     // Operations handed to the commit call itself stage and publish in one
     // step. Once the transaction is fenced they are read as a restatement of
@@ -1188,6 +1198,68 @@ fn apply_relation_operations(
             .map_err(|error| format!("apply prospective relation operation: {error}"))?;
     }
     Ok(())
+}
+
+/// Answer a commit whose transaction record is gone by asking repository
+/// authority whether that transaction already landed.
+///
+/// The record is deliberately evicted once a commit succeeds, so its absence
+/// carries no information on its own: it is the state left behind by success
+/// and the state left behind by an id that never existed. Repository authority
+/// separates them, because the receipt is keyed by the same caller-stable
+/// operation id the transaction id derives from and it is published in the same
+/// atomic successor as the authority it moved. A receipt therefore proves the
+/// work applied, and its absence proves it did not.
+///
+/// Nothing here re-applies or re-installs anything. The reply is derived
+/// entirely from the persisted receipt, so a caller that retries an
+/// already-applied commit any number of times gets the same answer and moves
+/// authority exactly once.
+fn replay_applied_commit(
+    state: &Arc<DaemonState>,
+    transaction_id: &str,
+    coordination: Option<&kin_mcp::CoordinationWritePreflight>,
+) -> Result<kin_mcp::ToolCallResult, String> {
+    let Ok(operation_uuid) = uuid::Uuid::parse_str(transaction_id) else {
+        // Not a transaction id this daemon could ever have minted, so there is
+        // no receipt to look for and nothing to be idempotent about.
+        return Err(format!("Transaction not found: {transaction_id}"));
+    };
+    let authority_context = authority_context(state)?;
+    let Some(recovered) =
+        recover_native_commit(&authority_context, OperationId::from_uuid(operation_uuid))
+            .map_err(|error| format!("recover exact MCP repository receipt: {error}"))?
+    else {
+        return Err(format!(
+            "Transaction not found: {transaction_id}. Repository authority holds no receipt for \
+             it either, so nothing was published under this id and re-sending this commit cannot \
+             succeed. Begin a new transaction with kin_transaction_begin and stage the operations \
+             again."
+        ));
+    };
+
+    let modified_files = changed_file_ids(&recovered.change)?;
+    let result = serde_json::json!({
+        "transaction_id": transaction_id,
+        "state": "committed",
+        "status": "committed",
+        "already_applied": true,
+        "empty": false,
+        "entity_deltas": recovered.entity_count,
+        "relation_deltas": recovered.relation_count,
+        "change_id": recovered.change.id.to_string(),
+        "repository_generation": recovered.receipt.generation,
+        "repository_operation_id": recovered.receipt.operation_id.to_string(),
+        "new_root_hash": hex::encode(state.graph.compute_root_hash()),
+        "modified_files": modified_files.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "collision_warnings": [],
+        "conflicts": [],
+        "semantic_authority": "reparsed_exact_repository_bytes",
+        "coordination": coordination,
+    });
+    let json = serde_json::to_string_pretty(&result)
+        .map_err(|error| format!("serialize replayed exact MCP commit response: {error}"))?;
+    Ok(kin_mcp::ToolCallResult::text(json))
 }
 
 fn finalize_committed_transaction(

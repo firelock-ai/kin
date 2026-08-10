@@ -341,6 +341,16 @@ pub fn parse_batch_source_args(
             MAX_BULK_SOURCE_ENTITIES
         )));
     }
+    // A blank entry is a caller bug, not a query. It matches no uuid, so
+    // resolution falls through to ranked name selection, and ranking an empty
+    // query returns whichever entity sorts first: the row would carry an
+    // arbitrary entity's body under the caller's empty id. Refuse the batch
+    // rather than answer one of its rows with something nobody asked for.
+    if let Some(index) = entity_ids.iter().position(|id| id.trim().is_empty()) {
+        return Err(McpError::InvalidParams(format!(
+            "entity_ids[{index}] is empty; every entry must be an entity uuid or its exact name"
+        )));
+    }
     // `token_budget` stays optional (None = unbounded); the others default to
     // the single-tool body bounds so an unclamped batch matches get_entity_source.
     let token_budget = args

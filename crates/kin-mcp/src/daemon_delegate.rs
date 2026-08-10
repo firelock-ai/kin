@@ -1400,13 +1400,19 @@ pub async fn forward_tool_call(
 /// argument map. A missing `operations` field is left for the daemon to report
 /// (so the missing-parameter message stays authoritative); a malformed array or
 /// a payload that would be silently dropped at commit fails loud here.
+///
+/// Decoding goes through [`crate::session::parse_staged_operations`] rather
+/// than serde directly. Product mode reaches this function and the in-process
+/// handler reaches that one, so decoding here by hand gave the two modes
+/// different refusals for the identical input: in-process named the whole
+/// operation schema and product mode answered with whichever single field
+/// serde stopped on. A caller improvising the shape against a real daemon
+/// learned one field per attempt and never saw the contract.
 fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> Result<(), String> {
     let Some(operations_val) = arguments.get("operations") else {
         return Ok(());
     };
-    let operations: Vec<crate::session::McpMutationOperation> =
-        serde_json::from_value(operations_val.clone())
-            .map_err(|e| format!("invalid operations array: {e}"))?;
+    let operations = crate::session::parse_staged_operations(operations_val)?;
     crate::session::validate_staged_operations(&operations)
 }
 
