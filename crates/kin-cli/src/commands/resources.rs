@@ -259,6 +259,21 @@ pub struct ReconcileHealth {
     /// Absent when the backlog is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backlog_age_seconds: Option<u64>,
+    /// Host paths the most recent complete scan observed that repository
+    /// authority does not track.
+    ///
+    /// Ambient observation revises graph-owned history but never enlarges it, so
+    /// a path the workspace has never tracked stays untracked until an explicit
+    /// seam admits it. That is deliberate, and it is also the exact reason a
+    /// freshly written file is not queryable. Reported so the answer to "why is
+    /// my new file missing" is on the status surface instead of inferable only
+    /// from the loop's source.
+    #[serde(default)]
+    pub untracked_path_count: u64,
+    /// A bounded sample of `untracked_path_count`, so the notice names paths a
+    /// reader can act on without a large working copy flooding the surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked_paths_sample: Vec<String>,
 }
 
 impl ReconcileHealth {
@@ -317,6 +332,40 @@ impl ReconcileHealth {
     /// healthy daemon.
     pub fn degraded(&self) -> bool {
         !self.degraded_reasons().is_empty()
+    }
+
+    /// What the loop is deliberately not doing, stated so no surface has to
+    /// leave it unexplained.
+    ///
+    /// Separate from [`Self::degraded_reasons`] on purpose. Untracked host
+    /// content is the ordinary state of a working copy mid-edit, so calling it a
+    /// fault would put every healthy repository into `attention` and teach every
+    /// reader to ignore the field. It still has to be said: a path the loop
+    /// declines to admit is a path whose entities never appear, and silence
+    /// there is what made a deliberate refusal look like a stuck daemon.
+    pub fn notices(&self) -> Vec<String> {
+        let mut notices = Vec::new();
+        if self.untracked_path_count > 0 {
+            let sample = if self.untracked_paths_sample.is_empty() {
+                String::new()
+            } else {
+                let more = self
+                    .untracked_path_count
+                    .saturating_sub(self.untracked_paths_sample.len() as u64);
+                let listed = self.untracked_paths_sample.join(", ");
+                if more > 0 {
+                    format!(": {listed}, and {more} more")
+                } else {
+                    format!(": {listed}")
+                }
+            };
+            notices.push(format!(
+                "{} host path(s) observed but not tracked{sample}. Watching a file never enlarges \
+                 the repository, so these stay unqueryable until a commit admits them.",
+                self.untracked_path_count
+            ));
+        }
+        notices
     }
 }
 
@@ -654,6 +703,40 @@ mod tests {
             last_admission_success_at: Some("2026-08-06T09:00:00+00:00".to_string()),
             ..Default::default()
         }
+    }
+
+    /// Untracked host content is announced and is not a fault.
+    ///
+    /// Both halves matter. Without the notice, a file a reader can see on disk
+    /// has no entities and no surface says why, which is the question FIR-2152
+    /// arrived as. Without the second assertion, every working copy mid-edit
+    /// would report `attention`, and a health signal that is always on is one
+    /// nobody reads.
+    #[test]
+    fn untracked_paths_are_announced_without_degrading_the_daemon() {
+        let health = ReconcileHealth {
+            untracked_path_count: 7,
+            untracked_paths_sample: vec!["src/new.rs".to_string(), "notes.md".to_string()],
+            ..Default::default()
+        };
+        assert!(!health.degraded(), "{:?}", health.degraded_reasons());
+        let notices = health.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = &notices[0];
+        assert!(notice.contains('7'), "the count is the headline: {notice}");
+        assert!(
+            notice.contains("src/new.rs") && notice.contains("notes.md"),
+            "the sample must name paths a reader can act on: {notice}"
+        );
+        assert!(
+            notice.contains("5 more"),
+            "a sample that hid the remainder would understate it: {notice}"
+        );
+
+        assert!(
+            ReconcileHealth::default().notices().is_empty(),
+            "a working copy with nothing untracked says nothing"
+        );
     }
 
     #[test]

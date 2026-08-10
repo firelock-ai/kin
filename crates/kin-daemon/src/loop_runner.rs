@@ -112,6 +112,17 @@ enum AdmittedFileEvent {
         file_id: Option<FilePathId>,
         tree_changed: bool,
     },
+    /// Host content at a path repository authority does not track, which the
+    /// preceding complete admission deliberately declined to enlarge the
+    /// workspace with.
+    ///
+    /// Distinct from [`Self::Ignored`], which is a path the rules exclude. This
+    /// one is admissible content that simply has not been admitted yet, and the
+    /// distinction is what the status surfaces report: an ignored path is doing
+    /// what was asked of it, an untracked one is waiting for a commit.
+    Untracked {
+        repo_path: RepoPath,
+    },
     Ignored,
 }
 
@@ -121,7 +132,7 @@ impl AdmittedFileEvent {
             Self::Regular { tree_changed, .. }
             | Self::Symlink { tree_changed, .. }
             | Self::Removed { tree_changed, .. } => *tree_changed,
-            Self::Ignored => false,
+            Self::Untracked { .. } | Self::Ignored => false,
         }
     }
 }
@@ -521,6 +532,23 @@ fn exact_tree_admission(
             }
             observed.insert(artifact.path.clone(), artifact.entry);
         }
+        // Everything the walk met that authority does not carry is about to be
+        // dropped, because ambient observation may revise graph-owned history
+        // but never enlarge it. Publish the count and a sample before dropping
+        // them: this refusal is why a freshly written file is not queryable, and
+        // a surface that reports only what the loop admitted cannot say so. The
+        // scan behind this is complete, so it replaces the previous answer
+        // instead of adding to it, and the explicit seam below replaces it again
+        // as soon as a commit admits what was declined.
+        state
+            .background_work
+            .reconcile()
+            .record_untracked_observation(
+                observed
+                    .entries()
+                    .keys()
+                    .filter(|path| previous.artifact_id_at_path(path).is_none()),
+            );
         observed.retain(|path, _| previous.artifact_id_at_path(path).is_some());
     }
     // A bounded tick re-inserts every tracked path its observation did not
@@ -602,6 +630,22 @@ fn exact_tree_admission(
         })?;
     }
 
+    if observation.is_none() {
+        // An explicit seam admits every host path the complete walk met, so
+        // once it publishes, nothing the working copy holds is untracked. Say
+        // so here rather than waiting for the next ambient tick: a commit
+        // produces no watcher event of its own, since the daemon's own writes
+        // land under `.kin` and the watcher drops control paths before they
+        // reach the queue. On a quiescent working copy the next tick never
+        // arrives, and the surfaces would keep naming a path this admission
+        // just made queryable. It is recorded after publication, not before, so
+        // a refused observation leaves a still-true record standing.
+        state
+            .background_work
+            .reconcile()
+            .record_untracked_observation(std::iter::empty::<&RepoPath>());
+    }
+
     Ok(ExactTreeAdmission {
         deltas,
         changed_paths,
@@ -675,6 +719,25 @@ fn admit_file_event_with_exact_tree(
     };
 
     let file_type = metadata.file_type();
+    if !tracked && (file_type.is_file() || file_type.is_symlink()) {
+        // Admissible host content at a path repository authority does not carry.
+        // Ambient observation revises graph-owned history and never enlarges it,
+        // so the complete admission that just ran deliberately refused to plan
+        // this path in. Enriching it anyway is not available either: the
+        // revalidation below compares host bytes against the tree entry authority
+        // holds, and authority holds none, so this path can only ever fail that
+        // comparison.
+        //
+        // It is declined here rather than deferred because a deferral would be a
+        // promise the loop cannot keep. Every retry costs one complete exact-tree
+        // admission over the whole working copy and arrives at the identical
+        // refusal, so the ladder never converges: the backlog stays non-empty for
+        // as long as the daemon lives, reconciliation_status never returns to
+        // idle, backlog_age climbs without bound, and the store spends a core
+        // rescanning itself while admitting nothing. Declining once, out loud, is
+        // the fix.
+        return Ok(AdmittedFileEvent::Untracked { repo_path });
+    }
     let (content, blob_hash, entry, is_symlink) = if file_type.is_symlink() {
         let target = std::fs::read_link(path).map_err(DaemonError::Io)?;
         let content = symlink_target_bytes(&target).map_err(DaemonError::Io)?;
@@ -742,6 +805,21 @@ fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFi
     // Mirror production ordering: one complete-scan transaction crosses
     // authority first, then host events are classified against what it moved.
     let admission = exact_tree_admission(state, None)?;
+    admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
+}
+
+/// Mirror the reconcile loop's ambient tick rather than the explicit seam.
+///
+/// The distinction is the whole subject of the untracked-path tests: the same
+/// host event reaches a different verdict depending on whether an explicit
+/// admission asked for the working copy or a watcher merely noticed it.
+#[cfg(test)]
+fn admit_file_event_ambient(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
+    let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+    let observation = repo_path(path, state.layout.working_dir())?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let admission = exact_tree_admission(state, Some(&observation))?;
     admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
@@ -1445,6 +1523,18 @@ pub async fn run_loop(
             if matches!(admitted, AdmittedFileEvent::Ignored) {
                 continue;
             }
+            if let AdmittedFileEvent::Untracked { repo_path } = &admitted {
+                // Terminal for this tick, and deliberately not a deferral. The
+                // complete scan that ran above already counted every untracked
+                // path for the status surfaces, so this event has nothing left to
+                // contribute and nothing to retry. Leaving it out of the ladder is
+                // what lets the backlog drain and the loop go idle.
+                debug!(
+                    file = %repo_path,
+                    "observed untracked host content; leaving it for an explicit admission seam"
+                );
+                continue;
+            }
 
             let tree_changed = admitted.tree_changed();
             // Exact tree changes were admitted atomically for the whole batch
@@ -1459,7 +1549,9 @@ pub async fn run_loop(
                 AdmittedFileEvent::Regular { repo_path, .. }
                 | AdmittedFileEvent::Symlink { repo_path, .. }
                 | AdmittedFileEvent::Removed { repo_path, .. } => repo_path,
-                AdmittedFileEvent::Ignored => unreachable!(),
+                AdmittedFileEvent::Untracked { .. } | AdmittedFileEvent::Ignored => {
+                    unreachable!()
+                }
             };
             match host_entry_matches_graph(&state, path, admitted_repo_path) {
                 Ok(true) => {}
@@ -1652,7 +1744,9 @@ pub async fn run_loop(
                     }
                     continue;
                 }
-                AdmittedFileEvent::Ignored => unreachable!(),
+                AdmittedFileEvent::Untracked { .. } | AdmittedFileEvent::Ignored => {
+                    unreachable!()
+                }
             };
 
             match reconciler.reconcile_file_change(
@@ -2281,6 +2375,155 @@ mod tests {
             "{error}"
         );
         assert_eq!(tree_entry(&state, "tracked.sock"), Some(old_entry));
+    }
+
+    /// A watcher event for host content the repository has never tracked is
+    /// declined outright, and the decline is published.
+    ///
+    /// This is FIR-2152. The path could not be admitted, because ambient
+    /// observation may revise graph-owned history but never enlarge it, and it
+    /// could not be enriched either, because the revalidation compares host
+    /// bytes against a tree entry authority does not hold. The loop deferred it
+    /// instead, and every retry bought another complete exact-tree admission
+    /// over the whole working copy that arrived at the identical refusal: the
+    /// backlog never emptied, the status never returned to idle, the reported
+    /// backlog age climbed without bound, and a flagship store spent a core
+    /// rescanning itself for as long as the daemon lived.
+    #[test]
+    fn an_ambient_event_declines_untracked_host_content_and_says_so() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let untracked = repo.path().join("brand_new.rs");
+        std::fs::write(&untracked, b"pub fn brand_new() -> u32 { 2152 }\n").unwrap();
+
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(untracked)).unwrap();
+        let AdmittedFileEvent::Untracked { repo_path } = admitted else {
+            panic!("untracked host content must be declined, not admitted: {admitted:?}");
+        };
+        assert_eq!(repo_path, test_repo_path("brand_new.rs"));
+        assert!(
+            tree_entry(&state, "brand_new.rs").is_none(),
+            "a declined path must not enter repository authority"
+        );
+
+        // The surfaces have to be able to answer why the file is not queryable.
+        // Silence here is what made a deliberate refusal read as a wedged loop.
+        let report = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert_eq!(report.untracked_path_count, 1);
+        assert_eq!(report.untracked_paths_sample, vec!["brand_new.rs"]);
+        assert!(
+            !report.degraded(),
+            "untracked content is the ordinary state of a working copy and must not degrade the daemon"
+        );
+        assert!(
+            report
+                .notices()
+                .iter()
+                .any(|notice| notice.contains("brand_new.rs")),
+            "the notice must name the path a reader is looking for: {:?}",
+            report.notices()
+        );
+    }
+
+    /// Falsification: the identical file reaches the opposite verdict through an
+    /// explicit admission seam, so the decline above is about how the event
+    /// arrived and not about the file.
+    #[test]
+    fn an_explicit_seam_still_admits_the_same_untracked_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("brand_new.rs");
+        std::fs::write(&path, b"pub fn brand_new() -> u32 { 2152 }\n").unwrap();
+
+        let admitted = admit_file_event(&state, &FileEvent::Changed(path)).unwrap();
+        let AdmittedFileEvent::Regular { tree_changed, .. } = admitted else {
+            panic!("an explicit seam admits untracked host content: {admitted:?}");
+        };
+        assert!(tree_changed);
+        assert!(tree_entry(&state, "brand_new.rs").is_some());
+    }
+
+    /// The disclosure is the loop's answer to why a file is not queryable, so it
+    /// has to stop being that answer the moment a commit admits the path.
+    ///
+    /// Nothing else would clear it. A commit reaches authority through the
+    /// explicit seam and produces no watcher event of its own, so on a working
+    /// copy nobody is editing there is no next ambient tick to replace the
+    /// record. The surface would keep naming a path whose entities resolve,
+    /// which is the same misdirection FIR-2152 set out to remove.
+    #[test]
+    fn admitting_a_declined_path_clears_its_disclosure_without_another_host_event() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("brand_new.rs");
+        std::fs::write(&path, b"pub fn brand_new() -> u32 { 2152 }\n").unwrap();
+
+        admit_file_event_ambient(&state, &FileEvent::Changed(path)).unwrap();
+        let declined = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert_eq!(declined.untracked_path_count, 1);
+        assert_eq!(declined.untracked_paths_sample, vec!["brand_new.rs"]);
+
+        // The commit seam, and nothing after it: no watcher event is delivered,
+        // which is exactly the quiescent working copy the stale record survived
+        // on.
+        exact_tree_admission(&state, None).unwrap();
+        assert!(
+            tree_entry(&state, "brand_new.rs").is_some(),
+            "the seam must admit the path this disclosure was about"
+        );
+
+        let admitted = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert_eq!(
+            admitted.untracked_path_count, 0,
+            "a path repository authority now carries is not untracked host content"
+        );
+        assert!(admitted.untracked_paths_sample.is_empty());
+        assert!(
+            !admitted
+                .notices()
+                .iter()
+                .any(|notice| notice.contains("brand_new.rs")),
+            "no surface may keep calling an admitted path untracked: {:?}",
+            admitted.notices()
+        );
+    }
+
+    /// The control that keeps the decline narrow: once a path is tracked, an
+    /// ambient watcher event for it is admitted exactly as before.
+    #[test]
+    fn an_ambient_event_for_a_tracked_path_is_still_admitted() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("tracked.rs");
+        std::fs::write(&path, b"pub fn tracked() -> u32 { 1 }\n").unwrap();
+        admit_file_event(&state, &FileEvent::Changed(path.clone())).unwrap();
+        let admitted_entry = tree_entry(&state, "tracked.rs").unwrap();
+
+        std::fs::write(&path, b"pub fn tracked() -> u32 { 2 }\n").unwrap();
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(path)).unwrap();
+        let AdmittedFileEvent::Regular { tree_changed, .. } = admitted else {
+            panic!("an edit to a tracked path must still be admitted: {admitted:?}");
+        };
+        assert!(tree_changed);
+        assert_ne!(tree_entry(&state, "tracked.rs").unwrap(), admitted_entry);
+        assert_eq!(
+            state
+                .background_work
+                .reconcile()
+                .report(std::time::Instant::now())
+                .untracked_path_count,
+            0,
+            "a working copy holding only tracked paths reports none untracked"
+        );
     }
 
     #[test]
@@ -3572,7 +3815,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                 continue;
             }
         };
-        if matches!(admitted, AdmittedFileEvent::Ignored) {
+        if matches!(
+            admitted,
+            AdmittedFileEvent::Ignored | AdmittedFileEvent::Untracked { .. }
+        ) {
             continue;
         }
         let tree_changed = admitted.tree_changed();
@@ -3587,7 +3833,7 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
             AdmittedFileEvent::Regular { repo_path, .. }
             | AdmittedFileEvent::Symlink { repo_path, .. }
             | AdmittedFileEvent::Removed { repo_path, .. } => repo_path,
-            AdmittedFileEvent::Ignored => unreachable!(),
+            AdmittedFileEvent::Untracked { .. } | AdmittedFileEvent::Ignored => unreachable!(),
         };
         if !host_entry_matches_graph(state, path, admitted_repo_path)? {
             return Err(DaemonError::Io(std::io::Error::other(format!(
@@ -3725,7 +3971,7 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
                 }
                 continue;
             }
-            AdmittedFileEvent::Ignored => unreachable!(),
+            AdmittedFileEvent::Untracked { .. } | AdmittedFileEvent::Ignored => unreachable!(),
         };
 
         match reconciler.reconcile_file_change(&semantic_event, &state.blobs, state.graph.as_ref())

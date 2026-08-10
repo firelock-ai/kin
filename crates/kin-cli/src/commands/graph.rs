@@ -410,6 +410,17 @@ fn build_graph_status_response(
             lines.push(format!("⚠ {}", w));
         }
     }
+    // Printed beside the verdict rather than as part of it. Untracked host
+    // content is not a fault, so it withholds no all-clear; it is the answer to
+    // the question a reader actually arrives with, which is why a file they can
+    // see on disk has no entities in the graph.
+    let notices = reconcile.notices();
+    if !notices.is_empty() {
+        lines.push(String::new());
+        for notice in notices {
+            lines.push(format!("ℹ {notice}"));
+        }
+    }
     append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {
@@ -1225,6 +1236,53 @@ mod tests {
             degraded.error.is_none(),
             "a live runtime fault is not a defect in the graph this command \
              inspected, and must not change the exit code"
+        );
+    }
+
+    /// The command names host content the loop declined to track, and does not
+    /// call it a fault.
+    ///
+    /// This is the FIR-2152 shape from the reader's side. A file was written, no
+    /// entity for it ever appeared, and the only surface that could have
+    /// explained why said nothing about it at all. Naming it as a warning would
+    /// be the opposite error: a working copy mid-edit holds untracked files
+    /// constantly, and a status command that cries fault over every one of them
+    /// is one nobody reads.
+    #[test]
+    fn graph_status_names_untracked_paths_without_calling_them_a_fault() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_status_response(
+            &binding,
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                untracked_path_count: 1,
+                untracked_paths_sample: vec!["fir2152_probe.rs".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("fir2152_probe.rs")),
+            "the path a reader is looking for must be named: {:?}",
+            response.lines
+        );
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("reconcile loop degraded")),
+            "untracked content is not a degraded loop: {:?}",
+            response.lines
+        );
+        assert!(
+            response.error.is_none(),
+            "an ordinary working copy must not turn this command nonzero"
         );
     }
 
