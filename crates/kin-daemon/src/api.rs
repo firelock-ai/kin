@@ -6885,7 +6885,11 @@ fn build_semantic_locate_result(
             continue;
         };
         let LocateHitIdentity {
-            name, file, kind, signature, ..
+            name,
+            file,
+            kind,
+            signature,
+            ..
         } = identity.clone();
         let dedupe_id = identity.dedupe_key();
 
@@ -18400,10 +18404,7 @@ mod tests {
         );
         assert_eq!(hit["artifact_path"], json!("docs/design.md"));
         assert_eq!(hit["resolves_with"], json!("kin_artifact_read"));
-        assert!(hit["note"]
-            .as_str()
-            .unwrap()
-            .contains("get_entity_source"));
+        assert!(hit["note"].as_str().unwrap().contains("get_entity_source"));
     }
 
     /// The second dead-id path, and the one that produced the ticket's title.
@@ -18418,8 +18419,11 @@ mod tests {
     fn a_retired_entity_key_is_dropped_rather_than_served_as_a_dead_id() {
         let retired = test_entity("deleted_symbol", "src/gone.rs");
         assert!(
-            locate_hit_identity(&kin_db::ResolvedRetrievalItem::Entity(retired.clone()), false)
-                .is_none(),
+            locate_hit_identity(
+                &kin_db::ResolvedRetrievalItem::Entity(retired.clone()),
+                false
+            )
+            .is_none(),
             "an id the graph no longer holds must not reach a row"
         );
         // Falsification: the same item with liveness restored IS served, so the

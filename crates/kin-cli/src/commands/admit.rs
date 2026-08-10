@@ -259,7 +259,8 @@ mod tests {
             embeddings_total: 14187,
             reconcile: ReconcileHealth::default(),
             admitted,
-            failure: (!admitted).then(|| "host entry changed after exact-tree admission".to_string()),
+            failure: (!admitted)
+                .then(|| "host entry changed after exact-tree admission".to_string()),
         }
     }
 
