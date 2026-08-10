@@ -1239,6 +1239,53 @@ mod tests {
         );
     }
 
+    /// The command names host content the loop declined to track, and does not
+    /// call it a fault.
+    ///
+    /// This is the FIR-2152 shape from the reader's side. A file was written, no
+    /// entity for it ever appeared, and the only surface that could have
+    /// explained why said nothing about it at all. Naming it as a warning would
+    /// be the opposite error: a working copy mid-edit holds untracked files
+    /// constantly, and a status command that cries fault over every one of them
+    /// is one nobody reads.
+    #[test]
+    fn graph_status_names_untracked_paths_without_calling_them_a_fault() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        let entity = test_entity("run_task");
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_graph_status_response(
+            &binding,
+            &graph,
+            &crate::commands::resources::ReconcileHealth {
+                untracked_path_count: 1,
+                untracked_paths_sample: vec!["fir2152_probe.rs".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("fir2152_probe.rs")),
+            "the path a reader is looking for must be named: {:?}",
+            response.lines
+        );
+        assert!(
+            !response
+                .lines
+                .iter()
+                .any(|line| line.contains("reconcile loop degraded")),
+            "untracked content is not a degraded loop: {:?}",
+            response.lines
+        );
+        assert!(
+            response.error.is_none(),
+            "an ordinary working copy must not turn this command nonzero"
+        );
+    }
+
     /// A dropped reconcile event reaches the same verdict. This is the FIR-2145
     /// shape, where events errored and were skipped while every surface read
     /// clean.
