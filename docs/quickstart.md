@@ -67,9 +67,10 @@ archive under Windows emulation, but WSL2 is the recommended path. Follow the Li
 flow inside WSL2; see [windows-wsl2.md](./windows-wsl2.md).
 
 Git for Windows sets `core.autocrlf=true` in its system config, which rewrites line
-endings on checkout. `kin init` admits only a worktree whose bytes match the committed
-tree, so it will refuse a repository cloned that way with `tracked blob ... bytes differ
-from the committed tree`. Run `git config --global core.autocrlf false` and clone again.
+endings on checkout. `kin init` admits the committed tree, so a repository cloned that
+way still admits successfully. Init reports the rewritten files under `Uncommitted
+worktree state:` rather than treating them as your edits. To make the worktree match
+what Kin admitted, run `git config --global core.autocrlf false` and clone again.
 
 ### Installer options
 
@@ -155,9 +156,11 @@ kin init
 kin init path/to/project
 ```
 
-In a clean detected Git repository, `kin init` imports complete reachable
+In a detected Git repository, `kin init` imports complete reachable
 history, refs, raw objects, the exact workspace tree, and admission policy into
-graph-owned authority. It also derives the semantic entity and relation layer
+graph-owned authority. A worktree with uncommitted edits, staged changes, or
+untracked files still admits: `kin init` admits the committed state and
+discloses what it did not admit. It also derives the semantic entity and relation layer
 for every supported entity-source file in that history, and reports the durable,
 generation-bound counts it committed. Git stays in place as an explicit
 interoperability boundary; Kin runtime queries do not fall back to it.
@@ -182,12 +185,13 @@ memory while it runs.
 while that happens:
 
 ```
-  [ 1/15] capture Git repository 1.4s
-  [ 2/15] build Git authority 0.2s
-  [ 3/15] plan semantic import 3.1s
-  [ 4/15] derive semantic history 41.7s
+  [ 1/17] check admission blockers 0.2s
+  [ 2/17] capture Git repository 1.4s
+  [ 3/17] build Git authority 0.2s
+  [ 4/17] plan semantic import 3.1s
+  [ 5/17] derive semantic history 41.7s
   ...
-  [15/15] seal published content 12.9s
+  [17/17] seal published content 12.9s
   admitted exact Git repository in 118.3s
 ```
 
