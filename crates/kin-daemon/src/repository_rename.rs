@@ -793,7 +793,7 @@ fn stabilize_recovered_layout(
 }
 
 fn rename_error(error: anyhow::Error) -> (StatusCode, String) {
-    let message = format!("{error:#}");
+    let message = crate::error::cause_first(&error);
     let status = if message.contains("not a simple source identifier") {
         StatusCode::BAD_REQUEST
     } else {

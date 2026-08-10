@@ -1214,7 +1214,7 @@ fn render_list(report: &StashListReport) -> Vec<String> {
 
 fn classify_stash_error(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<StashConflict>().is_some() {
-        return (StatusCode::CONFLICT, format!("{error:#}"));
+        return (StatusCode::CONFLICT, crate::error::cause_first(&error));
     }
     if let Some(kin_core::KinError::ProjectionConflict(message)) =
         error.downcast_ref::<kin_core::KinError>()
@@ -1224,19 +1224,25 @@ fn classify_stash_error(error: anyhow::Error) -> (StatusCode, String) {
     for cause in error.chain() {
         if let Some(model) = cause.downcast_ref::<kin_model::ModelError>() {
             if matches!(model, kin_model::ModelError::Conflict(_)) {
-                return (StatusCode::CONFLICT, format!("{error:#}"));
+                return (StatusCode::CONFLICT, crate::error::cause_first(&error));
             }
         }
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 fn internal_stash_error(error: anyhow::Error) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn stash_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, String) {

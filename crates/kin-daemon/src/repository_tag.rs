@@ -527,13 +527,16 @@ fn require_tag_ref(name: &RefName) -> Result<()> {
 
 fn classify_tag_error(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<TagBadRequest>().is_some() {
-        return (StatusCode::BAD_REQUEST, format!("{error:#}"));
+        return (StatusCode::BAD_REQUEST, crate::error::cause_first(&error));
     }
     if error.downcast_ref::<TagPolicyRefusal>().is_some() {
-        return (StatusCode::PRECONDITION_FAILED, format!("{error:#}"));
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            crate::error::cause_first(&error),
+        );
     }
     if error.downcast_ref::<TagConflict>().is_some() {
-        return (StatusCode::CONFLICT, format!("{error:#}"));
+        return (StatusCode::CONFLICT, crate::error::cause_first(&error));
     }
     if let Some(model) = error.downcast_ref::<kin_model::ModelError>() {
         let status = match model {
@@ -546,14 +549,17 @@ fn classify_tag_error(error: anyhow::Error) -> (StatusCode, String) {
             | kin_model::ModelError::ChangeNotFound(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
     if let Some(database) = error.downcast_ref::<kin_db::KinDbError>() {
         if matches!(database, kin_db::KinDbError::Model(_)) {
-            return (StatusCode::CONFLICT, format!("{error:#}"));
+            return (StatusCode::CONFLICT, crate::error::cause_first(&error));
         }
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCode, String) {
@@ -570,8 +576,11 @@ fn tag_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, Str
     let identity = refusal.is_identity_refusal();
     let error = refusal.into_error();
     if identity {
-        (StatusCode::CONFLICT, format!("{error:#}"))
+        (StatusCode::CONFLICT, crate::error::cause_first(&error))
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::error::cause_first(&error),
+        )
     }
 }

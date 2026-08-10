@@ -5549,7 +5549,7 @@ async fn review(
     .await
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
         }
@@ -5815,7 +5815,7 @@ async fn blame(
     )
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
         }
@@ -5851,7 +5851,7 @@ async fn history(
     )
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
         }

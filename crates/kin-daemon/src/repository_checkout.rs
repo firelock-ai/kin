@@ -87,9 +87,12 @@ impl CheckoutCommandError {
 
     fn into_http(self) -> (StatusCode, String) {
         match self {
-            Self::BadRequest(error) => (StatusCode::BAD_REQUEST, format!("{error:#}")),
-            Self::Conflict(error) => (StatusCode::CONFLICT, format!("{error:#}")),
-            Self::Internal(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")),
+            Self::BadRequest(error) => (StatusCode::BAD_REQUEST, crate::error::cause_first(&error)),
+            Self::Conflict(error) => (StatusCode::CONFLICT, crate::error::cause_first(&error)),
+            Self::Internal(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::error::cause_first(&error),
+            ),
         }
     }
 }

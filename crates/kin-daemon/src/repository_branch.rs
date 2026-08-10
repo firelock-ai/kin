@@ -1311,17 +1311,17 @@ fn classify_branch_error(error: anyhow::Error) -> WorkspaceMutationRefusal {
     // pattern-match. It is raised only under `TransitionPolicy::FollowMovedRef`,
     // and it carries no status because no client is ever answered with it.
     if error.downcast_ref::<WorkspaceTracksAnotherRef>().is_some() {
-        return WorkspaceMutationRefusal::TracksAnotherRef(format!("{error:#}"));
+        return WorkspaceMutationRefusal::TracksAnotherRef(crate::error::cause_first(&error));
     }
     client_branch_refusal(error).into()
 }
 
 fn client_branch_refusal(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<BranchBadRequest>().is_some() {
-        return (StatusCode::BAD_REQUEST, format!("{error:#}"));
+        return (StatusCode::BAD_REQUEST, crate::error::cause_first(&error));
     }
     if error.downcast_ref::<BranchConflict>().is_some() {
-        return (StatusCode::CONFLICT, format!("{error:#}"));
+        return (StatusCode::CONFLICT, crate::error::cause_first(&error));
     }
     if let Some(core) = error.downcast_ref::<kin_core::KinError>() {
         let status = match core {
@@ -1333,7 +1333,7 @@ fn client_branch_refusal(error: anyhow::Error) -> (StatusCode, String) {
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
     if let Some(database) = error.downcast_ref::<kin_db::KinDbError>() {
         let status = match database {
@@ -1344,15 +1344,24 @@ fn client_branch_refusal(error: anyhow::Error) -> (StatusCode, String) {
             | kin_db::KinDbError::ConcurrentAccessError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
     if let Some(model) = error.downcast_ref::<kin_model::ModelError>() {
-        return (branch_model_status(model), format!("{error:#}"));
+        return (
+            branch_model_status(model),
+            crate::error::cause_first(&error),
+        );
     }
     if error.downcast_ref::<std::io::Error>().is_some() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::error::cause_first(&error),
+        );
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn branch_model_status(error: &kin_model::ModelError) -> StatusCode {
@@ -1395,8 +1404,8 @@ fn branch_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, 
     let identity = refusal.is_identity_refusal();
     let error = refusal.into_error();
     if identity {
-        (StatusCode::CONFLICT, format!("{error:#}"))
+        (StatusCode::CONFLICT, crate::error::cause_first(&error))
     } else {
-        internal_branch_error(format!("{error:#}"))
+        internal_branch_error(crate::error::cause_first(&error))
     }
 }
