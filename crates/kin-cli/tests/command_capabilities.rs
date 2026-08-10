@@ -40,14 +40,14 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["all_declared_command_surfaces_enabled"], true);
-    assert_eq!(report["enabled_commands"], 33);
+    assert_eq!(report["enabled_commands"], 34);
     assert_eq!(report["full_git_replacement_ready"], false);
     // Exact counts, so a silent re-seal cannot pass. They are also the reason
     // two lanes must never flip a gate in the same wave: both bumps merge
     // without conflict and main goes red with every pull request green.
     // Recount from the merged fixture rather than from either branch.
-    assert_eq!(report["ready_commands"], 32);
-    assert_eq!(report["command_total"], 33);
+    assert_eq!(report["ready_commands"], 33);
+    assert_eq!(report["command_total"], 34);
 
     let commands = report["commands"]
         .as_array()
@@ -136,6 +136,29 @@ fn exposed_mutation_commands_reach_repository_discovery() {
     assert!(
         !stderr.contains("is fail-closed on repository-v6"),
         "rename must no longer answer from the capability gate: {stderr}"
+    );
+    assert!(stderr.contains("not a Kin repository"), "{stderr}");
+
+    // `purge-ignored` was in the command tree with no inventory entry at all,
+    // so it took the undeclared arm and refused on every host, in every
+    // repository state. An undeclared command is unreachable rather than
+    // gated, which is why the absence of the gate message is not enough here:
+    // the discovery failure has to be present for this to mean the command
+    // runs.
+    let output = kin_command(&home)
+        .arg("purge-ignored")
+        .current_dir(root.path())
+        .output()
+        .expect("run purge-ignored outside a repository");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is not available in this build"),
+        "purge-ignored must be declared in the capability inventory: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is fail-closed on repository-v6"),
+        "purge-ignored must not answer from the capability gate: {stderr}"
     );
     assert!(stderr.contains("not a Kin repository"), "{stderr}");
 }

@@ -71,8 +71,14 @@ pub fn require_ready(command: &str) -> Result<()> {
         .iter()
         .find(|capability| capability.command == command)
         .ok_or_else(|| {
+            // An undeclared command cannot be satisfied by any repository
+            // state, so this arm is reached only on a build whose command tree
+            // and inventory disagree. It has to name the command and the one
+            // thing a caller can do about it. The old wording named an internal
+            // table nobody has seen and offered no remedy at all.
             anyhow::anyhow!(
-                "command capability '{}' is not declared; refusing an unversioned authority path",
+                "`kin {}` is not available in this build\n\
+                 hint: run `kin capabilities` to see which commands are ready",
                 command
             )
         })?;
@@ -264,6 +270,69 @@ mod tests {
                 "{command} must no longer refuse at the CLI boundary"
             );
         }
+    }
+
+    /// Every command that gates itself on the inventory must be in it.
+    ///
+    /// An undeclared command takes the not-found arm, which no repository state
+    /// can satisfy, so it is dead on every host rather than gated on one.
+    /// `purge-ignored` shipped that way: a complete implementation, a daemon
+    /// route, its own tests, and a root-help entry, refusing everywhere because
+    /// nothing named it here. The gate tests could not see it, because they all
+    /// start from the inventory and it was the inventory that was missing.
+    #[test]
+    fn every_gated_command_is_declared_in_the_inventory() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut gated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut files = 0usize;
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read source dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                files += 1;
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                for (_, rest) in text.match_indices("require_ready(\"").map(|(i, m)| (i, &text[i + m.len()..])) {
+                    if let Some(end) = rest.find('"') {
+                        gated.insert(rest[..end].to_string());
+                    }
+                }
+            }
+        }
+
+        // Positive controls. A wrong root or a changed call spelling would
+        // otherwise scan nothing and pass as "no undeclared commands".
+        assert!(files > 20, "scanned only {files} source files under {src:?}");
+        assert!(
+            gated.len() >= 20,
+            "found only {} gated commands, so the scan is not seeing the call sites: {gated:?}",
+            gated.len()
+        );
+        for expected in ["commit", "purge-ignored", "stash", "doctor --heal"] {
+            assert!(
+                gated.contains(expected),
+                "the scan must find the known call site {expected:?}: {gated:?}"
+            );
+        }
+
+        let declared: std::collections::BTreeSet<String> = inventory()
+            .unwrap()
+            .commands
+            .into_iter()
+            .map(|capability| capability.command)
+            .collect();
+        let undeclared: Vec<&String> = gated.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "these commands gate on the inventory but are not in it, so they refuse on every \
+             host: {undeclared:?}"
+        );
     }
 
     #[test]
