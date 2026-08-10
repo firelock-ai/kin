@@ -2233,6 +2233,17 @@ async fn mcp_find_references_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
+    // A name the index rules out is answered before the stable read builds the
+    // state that answer would have been read from. Each attempt detaches a graph
+    // snapshot, hashes a merkle root over it, hashes the live root again to
+    // compare, and rebuilds a query graph from the snapshot, all linear in store
+    // size and all spent to reach a resolver that one index lookup already knew
+    // would miss.
+    if find_references_focal_is_ruled_out(selected_graph.as_ref(), arguments) {
+        return Ok(kin_mcp::ToolCallResult::error(
+            kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
+        ));
+    }
     let spine = state.ensure_spine();
     let repository_authority = mcp_repository_authority_source(state)?;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
@@ -2264,6 +2275,26 @@ where
     Err(kin_mcp::McpError::Other(
         "graph authority changed repeatedly during find_references; retry".to_string(),
     ))
+}
+
+/// Whether this `find_references` request names something the graph cannot
+/// carry, decided from the name index alone.
+///
+/// Deliberately one-sided: anything it cannot rule out — an `entity_id` request,
+/// an absent or non-string query, a name the index knows, or a graph that could
+/// not answer — leaves the caller on the unchanged path, so a hit resolves
+/// through exactly the code it resolved through before.
+fn find_references_focal_is_ruled_out(
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> bool {
+    if arguments.contains_key("entity_id") {
+        return false;
+    }
+    let Some(query) = arguments.get("query").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    kin_core::name_resolution_certainly_misses(graph, query).unwrap_or(false)
 }
 
 fn mcp_local_repository_binding(
@@ -3365,6 +3396,14 @@ async fn command_trace_data_flow(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    // Same short-circuit the MCP route takes, for the same reason: the authority
+    // resolved below verifies the whole store to project step bodies no walk
+    // will produce.
+    if kin_core::name_resolution_certainly_misses(graph.as_ref(), &request.focal).unwrap_or(false) {
+        return Err(internal_error(
+            kin_cli::commands::trace_data_flow::focal_not_found_error(&request.focal),
+        ));
+    }
     let repository_authority = shared_command_authority(
         state
             .local_repository_authority_binding()
@@ -7331,6 +7370,16 @@ async fn mcp_tools_call(
             },
             None => None,
         };
+        // Answered before the authority resolve below, which loads and verifies
+        // the whole durable authority on a publication it turns out no step will
+        // be read through. The walk itself already resolves the focal before it
+        // opens anything; this route is what put a whole-store open in front of
+        // that resolution.
+        if kin_core::name_resolution_certainly_misses(graph.as_ref(), &focal).unwrap_or(false) {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                kin_cli::commands::trace_data_flow::focal_not_found_error(&focal).to_string(),
+            )));
+        }
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
             focal,
             depth,
@@ -21202,6 +21251,184 @@ mod tests {
         assert!(
             cancel.is_cancelled(),
             "dropping the request must stop the walk it started"
+        );
+    }
+
+    /// A name the index rules out is answered before the stable read builds the
+    /// state that answer would have been read from.
+    ///
+    /// Structural rather than timed, and the structure is the point: the attempt
+    /// hook fires only once a snapshot has been detached, two merkle roots
+    /// hashed, and a query graph rebuilt from it, so counting it says which work
+    /// ran rather than how long it took. A wall-clock assertion would pass on a
+    /// test-sized store whichever order the code ran in, which is exactly the
+    /// regression this has to catch.
+    #[tokio::test]
+    async fn a_find_references_name_miss_skips_the_stable_read() {
+        let state = test_state();
+        let target = test_entity("resolvable_target", "src/target.py");
+        state.graph.upsert_entity(&target).unwrap();
+
+        let miss_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let miss_hook = Arc::clone(&miss_attempts);
+        let miss_arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "query": "no_such_symbol_anywhere",
+        }))
+        .unwrap();
+        let miss = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &miss_arguments,
+            move |_| {
+                miss_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("a name miss is an answer, not a failure");
+        assert_eq!(
+            miss_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a name the index rules out must not detach, rehash, and rebuild the graph"
+        );
+        assert_eq!(miss.is_error, Some(true));
+        assert_eq!(
+            mcp_result_text(&miss),
+            kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
+            "the miss must keep the wording the negative envelope keys off"
+        );
+
+        let hit_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_hook = Arc::clone(&hit_attempts);
+        let hit_arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "query": "resolvable_target",
+        }))
+        .unwrap();
+        let hit = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &hit_arguments,
+            move |_| {
+                hit_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("a resolvable name still resolves");
+        assert_eq!(
+            hit_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a resolvable name must still be answered through the stable read"
+        );
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&hit)).unwrap();
+        assert_eq!(body["focal_entity"]["id"], json!(target.id.to_string()));
+        assert_eq!(body["focal_entity"]["name"], json!("resolvable_target"));
+    }
+
+    /// The cfg-twin shape from FIR-2146: one name, two entities, one of them the
+    /// ranked winner. The short-circuit decides only whether the index can place
+    /// a name at all, so an ambiguous name has to reach the ranker and come back
+    /// with the same choice it made before.
+    #[tokio::test]
+    async fn an_ambiguous_name_still_resolves_to_the_ranked_winner() {
+        let state = test_state();
+        let exported = test_entity("twin", "src/unix.py");
+        let mut shadowed = test_entity("twin", "src/windows.py");
+        shadowed.visibility = Visibility::Private;
+        state.graph.upsert_entity(&exported).unwrap();
+        state.graph.upsert_entity(&shadowed).unwrap();
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook = Arc::clone(&attempts);
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "query": "twin",
+        }))
+        .unwrap();
+        let result = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            move |_| {
+                hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("an ambiguous name resolves rather than missing");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a name two entities carry is not a miss and must reach the ranker"
+        );
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&result)).unwrap();
+        assert_eq!(
+            body["focal_entity"]["id"],
+            json!(exported.id.to_string()),
+            "the exported twin stays the ranked winner"
+        );
+    }
+
+    /// The trace half of the same ordering, on its own structural counter: the
+    /// route resolves a repository authority eagerly, and opening one loads and
+    /// verifies the whole durable authority. A focal the index rules out must
+    /// never reach that load, and a focal that resolves must still get it,
+    /// because its step bodies are read through it.
+    #[tokio::test]
+    async fn a_trace_focal_miss_skips_the_repository_authority_open() {
+        let state = test_state();
+        let source = "def handler():\n    return 1\n";
+        install_repository_file(&state, "src/lib.py", source.as_bytes());
+        let mut focal = test_entity("handler", "src/lib.py");
+        focal.span.as_mut().unwrap().end_byte = source.len();
+        focal.span.as_mut().unwrap().end_line = 2;
+        state.graph.upsert_entity(&focal).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(Arc::clone(&state));
+
+        let before = state.projection_authority.loads();
+        let miss = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/trace-data-flow")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "focal": "no_such_focal" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let miss_body = axum::body::to_bytes(miss.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&miss_body)
+                .contains("no entity found matching 'no_such_focal'"),
+            "the miss must keep the wording the negative envelope keys off"
+        );
+        assert_eq!(
+            state.projection_authority.loads(),
+            before,
+            "a focal the index rules out must not load and verify the whole authority"
+        );
+
+        let hit = app
+            .oneshot(
+                Request::post("/commands/trace-data-flow")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "focal": "handler" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert!(
+            state.projection_authority.loads() > before,
+            "a focal that resolves still opens the authority its bodies are read through"
         );
     }
 

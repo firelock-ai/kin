@@ -438,7 +438,7 @@ pub fn build_trace_data_flow_response_within(
 
     let focal_entity = match resolve_trace_focal(graph, trimmed)? {
         Some(entity) => entity,
-        None => anyhow::bail!("no entity found matching '{}'", trimmed),
+        None => return Err(focal_not_found_error(trimmed)),
     };
 
     let mut meter = TraceMeter::new(budget);
@@ -653,6 +653,16 @@ pub fn build_trace_data_flow_response_within(
         truncated,
         degradations,
     })
+}
+
+/// What a trace answers when the focal it was given resolves to nothing.
+///
+/// Public because a caller that has already ruled the focal out from the name
+/// index answers with this rather than a second wording: `kin_mcp::negative`
+/// keys the `focal_not_resolved` envelope off the text, so two producers
+/// drifting apart would silently drop the qualifier from one of them.
+pub fn focal_not_found_error(focal: &str) -> anyhow::Error {
+    anyhow::anyhow!("no entity found matching '{}'", focal.trim())
 }
 
 /// Resolve a trace focal by UUID, exact name, or the entity-ranking fallback.

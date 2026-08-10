@@ -91,7 +91,9 @@ pub use tree::{
 pub use workspace_semantics::diff_workspace_semantics;
 
 pub use diff::{compute_semantic_change_id, content_identity_from_deltas, whoami};
-pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
+pub use disambiguation::{
+    fallback_leaf_trace_matches, name_resolution_certainly_misses, query_trace_matches,
+};
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
 };

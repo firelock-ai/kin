@@ -1007,6 +1007,15 @@ fn daemon_spine_xref(
     Ok((repo_id, query))
 }
 
+/// What `find_references` answers when the name it was given resolves to
+/// nothing.
+///
+/// Public because a caller that has already ruled the name out from the name
+/// index answers with this rather than a second wording: `negative.rs` keys the
+/// `focal_not_resolved` envelope off the text, so two producers drifting apart
+/// would silently drop the qualifier from one of them.
+pub const FIND_REFERENCES_FOCAL_MISS: &str = "Entity not found";
+
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -1102,7 +1111,7 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     };
 
     let Some(target) = target else {
-        return Ok(ToolCallResult::error("Entity not found"));
+        return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
     };
 
     let mut rows =
