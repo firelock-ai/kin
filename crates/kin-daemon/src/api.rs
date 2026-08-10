@@ -6572,6 +6572,114 @@ fn semantic_locate_payload(
     }
 }
 
+/// The identity half of one `semantic_locate` row: which id space the hit
+/// belongs to, and the fields that follow from that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocateHitIdentity {
+    id_space: kin_cli::commands::locate::LocateIdSpace,
+    /// `Some` only for a live entity hit. An artifact hit has no entity id, and
+    /// this being `None` rather than a path is the whole contract.
+    entity_id: Option<String>,
+    name: String,
+    file: Option<String>,
+    kind: Option<String>,
+    signature: Option<String>,
+}
+
+impl LocateHitIdentity {
+    /// The stable string this hit dedupes on.
+    ///
+    /// Entity granularity collapses the two index keys per entity into one row,
+    /// and an artifact has no entity id to collapse on, so it falls back to its
+    /// path. Keeping this separate from `entity_id` is the fix: conflating the
+    /// two is what put a path in a field named `entity_id`.
+    fn dedupe_key(&self) -> String {
+        self.entity_id
+            .clone()
+            .or_else(|| self.file.clone())
+            .unwrap_or_else(|| self.name.clone())
+    }
+}
+
+/// Classify one resolved retrieval item into the row identity it should carry,
+/// or `None` when the hit must be dropped rather than served.
+///
+/// `entity_is_live` is passed in rather than looked up here because liveness is
+/// a graph question and this is a shaping decision; separating them is what
+/// lets the shaping be asserted directly instead of through a query that needs
+/// a live embedder.
+///
+/// Resolution is not liveness. A `RetrievalKey::EntityRevision` resolves
+/// against immutable revision history, and retiring an entity deliberately
+/// leaves that history in place, so the head revision of a deleted entity still
+/// resolves to an `Entity` whose id names nothing the graph holds. Serving that
+/// id is the reported defect: every id-consuming tool refuses it, and the
+/// caller can only discover that by calling one.
+fn locate_hit_identity(
+    item: &kin_db::ResolvedRetrievalItem,
+    entity_is_live: bool,
+) -> Option<LocateHitIdentity> {
+    match item {
+        kin_db::ResolvedRetrievalItem::Entity(entity) => {
+            if !entity_is_live {
+                return None;
+            }
+            Some(LocateHitIdentity {
+                id_space: kin_cli::commands::locate::LocateIdSpace::Entity,
+                entity_id: Some(entity.id.to_string()),
+                name: entity.name.clone(),
+                file: entity.file_origin.as_ref().map(|origin| origin.0.clone()),
+                kind: Some(format!("{:?}", entity.kind).to_lowercase()),
+                signature: Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
+            })
+        }
+        other => {
+            let file = other.file_path().map(|path| path.0.clone());
+            let name = file
+                .as_deref()
+                .and_then(|path| {
+                    FsPath::new(path)
+                        .file_name()
+                        .and_then(|component| component.to_str())
+                })
+                .unwrap_or_default()
+                .to_string();
+            Some(LocateHitIdentity {
+                id_space: kin_cli::commands::locate::LocateIdSpace::Artifact,
+                entity_id: None,
+                name,
+                file,
+                kind: None,
+                signature: None,
+            })
+        }
+    }
+}
+
+/// Write one row's identity fields, stating the id space either way.
+///
+/// An entity hit is unchanged. An artifact hit says what it is, carries its
+/// path under a field named for what it holds, and names the tool that reads
+/// it. The old shape put the path under `entity_id`, which reads as an
+/// actionable handle and is refused by every tool that takes one.
+fn write_locate_hit_identity(hit: &mut serde_json::Value, identity: &LocateHitIdentity) {
+    hit["id_space"] = json!(identity.id_space.as_str());
+    match &identity.entity_id {
+        Some(entity_id) => {
+            hit["entity_id"] = json!(entity_id);
+        }
+        None => {
+            hit["artifact_path"] = json!(identity.file);
+            hit["resolves_with"] = json!("kin_artifact_read");
+            hit["note"] = json!(
+                "artifact-level embedding: a tracked file with no parsed entities. It has no \
+                 entity id, so get_entity_source, get_context_pack, and graph_neighborhood \
+                 cannot take this hit; read it with kin_artifact_read."
+            );
+        }
+    }
+}
+
 fn build_semantic_locate_result(
     state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
@@ -6762,66 +6870,24 @@ fn build_semantic_locate_result(
             continue;
         };
         // Entity-centric projection: the ENTITY (kind + name + signature) is the
-        // result; the file is demoted to provenance.
-        let (id_space, entity_id, name, file, kind, signature) = match &item {
+        // result; the file is demoted to provenance. The snippet projection
+        // below already dropped retired entities, but only when snippets were
+        // on; under `include_snippet: false` or file granularity nothing
+        // filtered them at all.
+        let entity_is_live = match &item {
             kin_db::ResolvedRetrievalItem::Entity(entity) => {
-                // Resolution is not liveness. An `EntityRevision` key resolves
-                // against immutable revision history, and retiring an entity
-                // deliberately leaves that history behind, so the head revision
-                // of a deleted entity still resolves to an `Entity` whose id
-                // names nothing the graph holds. Every id-consuming tool then
-                // refuses that id, which is the whole reported defect. The
-                // snippet projection below already dropped these, but only when
-                // snippets were on; under `include_snippet: false` or file
-                // granularity nothing filtered them at all.
-                if graph
-                    .get_entity(&entity.id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-                {
-                    retired_entity_keys += 1;
-                    continue;
-                }
-                (
-                    kin_cli::commands::locate::LocateIdSpace::Entity,
-                    Some(entity.id.to_string()),
-                    entity.name.clone(),
-                    entity.file_origin.as_ref().map(|origin| origin.0.clone()),
-                    Some(format!("{:?}", entity.kind).to_lowercase()),
-                    Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
-                )
+                graph.get_entity(&entity.id).ok().flatten().is_some()
             }
-            other => {
-                let file = other.file_path().map(|path| path.0.clone());
-                let name = file
-                    .as_deref()
-                    .and_then(|path| {
-                        FsPath::new(path)
-                            .file_name()
-                            .and_then(|component| component.to_str())
-                    })
-                    .unwrap_or_default()
-                    .to_string();
-                // Deliberately no entity id. This hit is an artifact-level
-                // embedding: a tracked file the parsers produced no entities
-                // for. It previously carried its own path under `entity_id`,
-                // which reads as an actionable handle and is refused by every
-                // tool that takes one.
-                (
-                    kin_cli::commands::locate::LocateIdSpace::Artifact,
-                    None,
-                    name,
-                    file,
-                    None,
-                    None,
-                )
-            }
+            _ => false,
         };
-        // Dedupe still needs one stable string per hit. For an artifact that is
-        // its path, which is what made the old code put a path in `entity_id`
-        // in the first place; the two uses are now separate.
-        let dedupe_id = entity_id.clone().or_else(|| file.clone()).unwrap_or_else(|| name.clone());
+        let Some(identity) = locate_hit_identity(&item, entity_is_live) else {
+            retired_entity_keys += 1;
+            continue;
+        };
+        let LocateHitIdentity {
+            name, file, kind, signature, ..
+        } = identity.clone();
+        let dedupe_id = identity.dedupe_key();
 
         if file_granularity {
             match &file {
@@ -6895,7 +6961,6 @@ fn build_semantic_locate_result(
         let match_evidence =
             cosine_match_evidence(&query, &name, role, rerank_active, is_test_query);
         let mut hit = json!({
-            "id_space": id_space.as_str(),
             "kind": kind,
             "name": name,
             "signature": signature,
@@ -6903,26 +6968,7 @@ fn build_semantic_locate_result(
             "provenance": { "file": file },
             "match_evidence": match_evidence,
         });
-        match entity_id {
-            // An entity hit is unchanged: same key, same graph entity id, and
-            // every id-consuming tool resolves it.
-            Some(entity_id) => {
-                hit["entity_id"] = json!(entity_id);
-            }
-            // An artifact hit states what it is and what reads it. Omitting
-            // `entity_id` is the point: the field existed, held a path, and was
-            // refused by every tool that accepts one, so an agent could only
-            // discover the hit was not act-on-able by acting on it.
-            None => {
-                hit["artifact_path"] = json!(file);
-                hit["resolves_with"] = json!("kin_artifact_read");
-                hit["note"] = json!(
-                    "artifact-level embedding: a tracked file with no parsed entities. It has no \
-                     entity id, so get_entity_source, get_context_pack, and graph_neighborhood \
-                     cannot take this hit; read it with kin_artifact_read."
-                );
-            }
-        }
+        write_locate_hit_identity(&mut hit, &identity);
         if let Some(span) = span {
             let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
             hit["start_line"] = json!(start_line);
@@ -18258,6 +18304,317 @@ mod tests {
             .artifacts_by_path()
             .map(|artifact| artifact.path.to_string())
             .collect()
+    }
+
+    async fn admit_through_api(app: &axum::Router) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/commands/admit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "actor": AuthorId::new("admit-acceptance")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Every hit `semantic_locate` serves on a code store, unchanged.
+    ///
+    /// The healthy path is the thing a labeling change is most likely to break,
+    /// so it is pinned first: a live entity still carries its graph entity id
+    /// under `entity_id`, and now says which id space that is.
+    #[test]
+    fn a_live_entity_hit_keeps_its_entity_id_and_declares_the_entity_id_space() {
+        let entity = test_entity("resolve_retrieval_key", "src/engine/graph.rs");
+        let identity =
+            locate_hit_identity(&kin_db::ResolvedRetrievalItem::Entity(entity.clone()), true)
+                .expect("a live entity hit must be served");
+
+        assert_eq!(
+            identity.id_space,
+            kin_cli::commands::locate::LocateIdSpace::Entity
+        );
+        assert_eq!(identity.entity_id.as_deref(), Some(&*entity.id.to_string()));
+        assert_eq!(identity.file.as_deref(), Some("src/engine/graph.rs"));
+        assert_eq!(identity.kind.as_deref(), Some("function"));
+
+        let mut hit = json!({ "name": identity.name });
+        write_locate_hit_identity(&mut hit, &identity);
+        assert_eq!(hit["id_space"], json!("entity"));
+        assert_eq!(hit["entity_id"], json!(entity.id.to_string()));
+        assert!(
+            hit.get("artifact_path").is_none(),
+            "an entity hit must not carry artifact fields: {hit}"
+        );
+    }
+
+    /// The reported defect, on the artifact-only store shape.
+    ///
+    /// An artifact-level embedding is a tracked file the parsers produced no
+    /// entities for. It used to be served with its own path in a field named
+    /// `entity_id`, which every id-consuming tool refuses, so an agent could
+    /// only discover the id was dead by spending a call on it.
+    #[test]
+    fn an_artifact_hit_carries_no_entity_id_and_names_the_tool_that_reads_it() {
+        let artifact = kin_db::ResolvedRetrievalItem::OpaqueArtifact(kin_model::OpaqueArtifact {
+            file_id: kin_model::FilePathId::new("docs/design.md"),
+            content_hash: Hash256::from_bytes([0x07; 32]),
+            mime_type: Some("text/markdown".to_string()),
+            text_preview: None,
+        });
+        let identity =
+            locate_hit_identity(&artifact, false).expect("an artifact hit must still be served");
+
+        assert_eq!(
+            identity.id_space,
+            kin_cli::commands::locate::LocateIdSpace::Artifact
+        );
+        assert_eq!(
+            identity.entity_id, None,
+            "an artifact hit has no entity id, and a path in that field is the defect"
+        );
+        assert_eq!(identity.name, "design.md");
+        assert_eq!(identity.file.as_deref(), Some("docs/design.md"));
+        // It still dedupes, on its path rather than on an id it does not have.
+        assert_eq!(identity.dedupe_key(), "docs/design.md");
+
+        let mut hit = json!({ "name": identity.name });
+        write_locate_hit_identity(&mut hit, &identity);
+        assert_eq!(hit["id_space"], json!("artifact"));
+        assert!(
+            hit.get("entity_id").is_none(),
+            "the dead id must be absent, not merely labelled: {hit}"
+        );
+        assert_eq!(hit["artifact_path"], json!("docs/design.md"));
+        assert_eq!(hit["resolves_with"], json!("kin_artifact_read"));
+        assert!(hit["note"]
+            .as_str()
+            .unwrap()
+            .contains("get_entity_source"));
+    }
+
+    /// The second dead-id path, and the one that produced the ticket's title.
+    ///
+    /// A `RetrievalKey::EntityRevision` resolves through immutable revision
+    /// history, and retiring an entity deliberately leaves that history in
+    /// place, so a deleted entity's head revision still resolves to an `Entity`
+    /// whose id names nothing the graph holds. That id is entity-SHAPED — a
+    /// bare UUID — so no consumer can tell it from a live one. It must be
+    /// dropped rather than served under any label.
+    #[test]
+    fn a_retired_entity_key_is_dropped_rather_than_served_as_a_dead_id() {
+        let retired = test_entity("deleted_symbol", "src/gone.rs");
+        assert!(
+            locate_hit_identity(&kin_db::ResolvedRetrievalItem::Entity(retired.clone()), false)
+                .is_none(),
+            "an id the graph no longer holds must not reach a row"
+        );
+        // Falsification: the same item with liveness restored IS served, so the
+        // assertion above is about liveness and not about the fixture.
+        assert!(
+            locate_hit_identity(&kin_db::ResolvedRetrievalItem::Entity(retired), true).is_some()
+        );
+    }
+
+    /// The two id spaces are distinguishable in the output, which is the whole
+    /// point: `EntityId` and `ArtifactId` are both bare UUID newtypes, so
+    /// nothing about a rendered id says which space produced it.
+    #[test]
+    fn the_two_id_spaces_serialize_to_distinct_stable_tokens() {
+        assert_eq!(
+            kin_cli::commands::locate::LocateIdSpace::Entity.as_str(),
+            "entity"
+        );
+        assert_eq!(
+            kin_cli::commands::locate::LocateIdSpace::Artifact.as_str(),
+            "artifact"
+        );
+        assert_eq!(
+            serde_json::to_value(kin_cli::commands::locate::LocateIdSpace::Artifact).unwrap(),
+            json!("artifact"),
+            "the enum and the emitted token must be one spelling"
+        );
+    }
+
+    /// The gap `kin admit` exists to close: a working tree the daemon holds no
+    /// watcher event for, and therefore never admits on its own.
+    ///
+    /// The files are written to disk only. Nothing admits them, which is
+    /// precisely the state a store lands in when ingest was interrupted or when
+    /// a rule change made previously-excluded content admissible, and the
+    /// daemon has been quiet since.
+    #[tokio::test]
+    async fn admit_admits_a_complete_tree_no_watcher_event_ever_named() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for (path, content) in [
+            ("docs/design.md", &b"# design\n"[..]),
+            (".github/workflows/ci.yml", &b"name: ci\n"[..]),
+            ("scripts/deploy.sh", &b"#!/bin/sh\necho deploy\n"[..]),
+        ] {
+            install_working_copy_file(&state, path, content, false);
+        }
+
+        // Precondition, so a pass that admitted nothing cannot read as success:
+        // none of this is tracked yet.
+        let before = tracked_paths(&state);
+        assert!(
+            !before.contains("docs/design.md"),
+            "the fixture admitted the tree before the command ran: {before:?}"
+        );
+
+        let app = router(Arc::clone(&state));
+        let (_, response) = admit_through_api(&app).await;
+
+        assert_eq!(response["report"]["admitted"], json!(true));
+        assert_eq!(response["mutated"], json!(true));
+        let after = tracked_paths(&state);
+        for path in [
+            "docs/design.md",
+            ".github/workflows/ci.yml",
+            "scripts/deploy.sh",
+        ] {
+            assert!(after.contains(path), "{path} was not admitted: {after:?}");
+        }
+        assert_eq!(
+            response["report"]["tracked_before"],
+            json!(before.len()),
+            "the report must name the tree it started from"
+        );
+        assert_eq!(response["report"]["tracked_after"], json!(after.len()));
+
+        // A second pass observes the same tree and has nothing to do. This is
+        // what makes the route safe on the retrying poster the CLI uses.
+        let (_, replay) = admit_through_api(&app).await;
+        assert_eq!(replay["report"]["admitted"], json!(true));
+        assert_eq!(replay["mutated"], json!(false));
+        assert_eq!(
+            replay["report"]["tracked_before"],
+            replay["report"]["tracked_after"]
+        );
+    }
+
+    /// A requested admission has to reach the probes the health surfaces read.
+    ///
+    /// `kin graph status` and `/health` both answer from `ReconcileHealth`, so
+    /// an operator's own recovery pass being the one admission those surfaces
+    /// cannot see would reproduce the blindness the probes were added to fix.
+    #[tokio::test]
+    async fn admit_records_its_pass_on_the_probes_the_health_surfaces_read() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        install_working_copy_file(&state, "docs/notes.md", b"notes\n", false);
+
+        // Precondition: nothing has recorded a successful admission yet, so the
+        // assertion below cannot pass on a pre-existing mark.
+        let before = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert!(
+            before.last_admission_success_age_seconds.is_none(),
+            "the fixture recorded an admission before the command ran"
+        );
+
+        let app = router(Arc::clone(&state));
+        let (_, response) = admit_through_api(&app).await;
+        assert_eq!(response["report"]["admitted"], json!(true));
+        assert!(
+            response["report"]["reconcile"]["last_admission_success_age_seconds"].is_number(),
+            "the response must carry the probe reading: {response}"
+        );
+
+        let after = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert!(
+            after.last_admission_success_age_seconds.is_some(),
+            "the pass did not reach the probes the health surfaces read"
+        );
+        assert_eq!(after.admission_failure_streak, 0);
+    }
+
+    /// The idle window is what would otherwise end a long pass, so the lease the
+    /// CLI takes has to be the thing that suppresses it.
+    ///
+    /// `kin admit` registers a session before its request and releases it after.
+    /// This pins the daemon-side half of that contract: a CLI-vendored session
+    /// makes the daemon ineligible for idle shutdown, and ending it restores
+    /// eligibility so the lease cannot keep a daemon awake forever.
+    #[tokio::test]
+    async fn a_cli_session_suppresses_the_idle_shutdown_that_would_end_an_admission() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !state.has_external_sessions(),
+            "the fixture already held a session, so this cannot discriminate"
+        );
+
+        let app = router(Arc::clone(&state));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vendor": kin_cli::commands::admit::ADMIT_SESSION_VENDOR,
+                            "client_name": kin_cli::commands::admit::ADMIT_SESSION_CLIENT,
+                            "transport": "cli",
+                            "pid": std::process::id(),
+                            "cwd": state.layout.working_dir().display().to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = started["session_id"].as_str().unwrap().to_string();
+
+        assert!(
+            state.has_external_sessions(),
+            "a kin-cli session must pin the daemon against idle shutdown"
+        );
+
+        let response = app
+            .oneshot(
+                Request::delete(format!("/session/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state.has_external_sessions(),
+            "releasing the lease must restore idle eligibility"
+        );
     }
 
     /// A default exclude alone retires nothing, because ignore rules never hide

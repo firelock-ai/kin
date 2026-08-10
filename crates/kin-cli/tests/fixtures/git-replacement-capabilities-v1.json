@@ -403,7 +403,10 @@
         "kin_cli::commands::admit::tests::an_admission_that_changed_nothing_says_so_without_reading_as_a_failure",
         "kin_daemon::api::tests::admit_admits_a_complete_tree_no_watcher_event_ever_named",
         "kin_daemon::api::tests::admit_records_its_pass_on_the_probes_the_health_surfaces_read",
-        "kin_daemon::api::tests::a_cli_session_suppresses_the_idle_shutdown_that_would_end_an_admission"
+        "kin_daemon::api::tests::a_cli_session_suppresses_the_idle_shutdown_that_would_end_an_admission",
+        "kin_daemon::api::tests::a_live_entity_hit_keeps_its_entity_id_and_declares_the_entity_id_space",
+        "kin_daemon::api::tests::an_artifact_hit_carries_no_entity_id_and_names_the_tool_that_reads_it",
+        "kin_daemon::api::tests::a_retired_entity_key_is_dropped_rather_than_served_as_a_dead_id"
       ],
       "note": "The daemon admits a complete exact tree on startup, on commit, and on what its watcher observed, and none of those is a trigger an operator can pull, so a graph that fell behind its working tree waits for churn that may not come while a quiet daemon idles out first. This command is that trigger. It runs the daemon's own admission seam, so it inherits the same completion proof, authority compare-and-swap, and mass-deletion guard, and it carries no mass-deletion override of its own because the guard's override is read from the daemon's environment and a second control over one guard is two rules that can disagree."
     },
