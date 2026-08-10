@@ -758,13 +758,20 @@ pub async fn handle_transaction_validate(
 }
 
 pub const TRANSACTION_COMMIT_DESC: &str = "\
-Publish all staged mutations atomically through exact repository authority. The daemon \
-requires a clean exact workspace, loads source from repository CAS, splices existing entity \
+Publish all staged mutations atomically through exact repository authority. The daemon loads \
+source from repository CAS, splices existing entity \
 body edits in memory, reparses the final bytes, and journals semantic change, exact workspace \
 tree, and ref publication together. Relation-only transactions are supported. New or deleted \
 source entities, metadata-only source edits, ambiguous or overlapping spans, non-UTF-8 source, \
-gitlinks, and dirty or mismatched authority fail before mutation. On success the result names \
+gitlinks, and mismatched authority fail before mutation. On success the result names \
 status, ops_applied, empty, change_id, repository_generation, new_root_hash, and modified_files. \
+A workspace holding working-tree content its base change does not carry does not block the \
+commit and is not reverted by it: that content is published beside the staged operations and the \
+fold is declared rather than silent. The reply then adds staged_operation_files and \
+carried_pending_files beside modified_files, and the change message names the count and a sample \
+of what was carried. Neither key appears when nothing was carried. Carried files move bytes only: \
+their semantics are not re-derived by this commit, so the entities inside them keep the \
+authorship they already had. \
 Before graph application, exact entity/artifact intent conflicts and session write/commit \
 capabilities are attested; enforce mode rejects before graph truth changes. Contract-scope \
 coverage remains explicitly false until touched contracts can be derived from the semantic \
@@ -785,8 +792,9 @@ commit that already landed is safe and is answered, not refused: the reply carri
 already_applied true beside the original change_id, repository_generation, and modified_files, and \
 publishes nothing further. That answer is derived from the repository receipt rather than from any \
 in-memory record, so it survives the transaction being forgotten and stays correct however many \
-times it is retried. It omits ops_applied, which only the staged record could name. A commit that \
-never landed under this id still fails closed and says authority was consulted too.";
+times it is retried. It omits ops_applied and the staged_operation_files/carried_pending_files \
+split, which only the staged record could name; the change message still declares any fold. A \
+commit that never landed under this id still fails closed and says authority was consulted too.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {

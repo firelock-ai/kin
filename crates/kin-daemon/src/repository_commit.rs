@@ -15,10 +15,10 @@ use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, AuthorId, ChangeOrigin,
     EffectiveAdmissionPolicyStamp, Hash256, ModelError, OperationId, RefExpectation, RefMutation,
-    RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt,
-    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, SharedAdmissionPolicy,
-    Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId, WorkspaceMutation,
-    WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    RefName, RefTarget, RefUpdatePolicy, RepoPath, RepositoryCommitOutcome,
+    RepositoryCommitReceipt, RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId,
+    SharedAdmissionPolicy, Timestamp, WorkspaceExpectation, WorkspaceHead, WorkspaceId,
+    WorkspaceMutation, WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
@@ -39,6 +39,14 @@ pub struct NativeCommitPlan {
     pub entity_count: usize,
     pub relation_count: usize,
     pub file_count: usize,
+    /// Files this change publishes that the caller's own operations did not
+    /// author, carried in from working-tree content the workspace had already
+    /// admitted ahead of its base change.
+    ///
+    /// Always empty for a caller that does not declare which files it authored,
+    /// because a planner cannot tell an unclaimed file from an authored one,
+    /// and an unclaimed file must never be reported as carried on a guess.
+    pub carried_pending_files: Vec<RepoPath>,
     previous_tree: kin_model::ResolvedTree,
     target_tree: kin_model::ResolvedTree,
     source_hashes: Vec<Hash256>,
@@ -639,7 +647,8 @@ pub(crate) fn plan_native_commit(
         operation_id,
         timestamp,
         author,
-        message,
+        None,
+        &|_| message.clone(),
         None,
     )
 }
@@ -669,6 +678,49 @@ pub(crate) fn plan_native_commit_from_base(
         operation_id,
         timestamp,
         author,
+        None,
+        &|_| message.clone(),
+        Some(&base.roots),
+    )
+}
+
+/// Plan one exact native transaction whose message states which of the files it
+/// publishes the caller did not author.
+///
+/// A workspace can hold working-tree content its base change does not carry:
+/// the admission path advances the workspace tree without advancing its base,
+/// and it publishes no change, so that content sits ahead of history with no
+/// authorship attached to it. It is already inside the prospective graph a
+/// caller plans against, because the workspace graph takes its resolved tree
+/// from the workspace, so a commit either publishes it or reverts the working
+/// files that hold it. It gets published, and this is what makes that
+/// publication say so.
+///
+/// `authored_files` names the files the caller's own operations produced. Every
+/// other file this change publishes came from the pending tree, and the rendered
+/// message is handed exactly that list, so the record cannot name a different
+/// set than the one it published: the message is settled after the tree deltas
+/// are computed and before the change is identified by its hash.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_native_commit_from_base_declaring_carry(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    operation_id: OperationId,
+    timestamp: Timestamp,
+    author: AuthorId,
+    authored_files: &BTreeSet<RepoPath>,
+    message: &dyn Fn(&[RepoPath]) -> String,
+    base: &NativeCommitBase,
+) -> Result<NativeCommitPlan> {
+    plan_native_commit_inner(
+        graph,
+        blobs,
+        authority_context,
+        operation_id,
+        timestamp,
+        author,
+        Some(authored_files),
         message,
         Some(&base.roots),
     )
@@ -682,12 +734,10 @@ fn plan_native_commit_inner(
     operation_id: OperationId,
     timestamp: Timestamp,
     author: AuthorId,
-    message: String,
+    authored_files: Option<&BTreeSet<RepoPath>>,
+    message: &dyn Fn(&[RepoPath]) -> String,
     expected_roots: Option<&RootBundle>,
 ) -> Result<NativeCommitPlan> {
-    if message.trim().is_empty() {
-        return Err(invalid("native commit message must not be empty"));
-    }
     let repository_id = authority_context.repository_id().clone();
     let workspace_id = authority_context.workspace_id();
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
@@ -773,6 +823,34 @@ fn plan_native_commit_inner(
             Ok(length)
         },
     )?;
+
+    // Settled here, not before planning: the message may have to name what this
+    // change carried in, and that set is not known until the published tree
+    // deltas are. Computed once and used for both the record and the caller's
+    // reply, so the two cannot disagree about what was folded in.
+    let carried_pending_files = match authored_files {
+        Some(authored) => {
+            let mut carried = deltas
+                .tree_deltas
+                .iter()
+                // A pending deletion moves the tree exactly as a pending edit
+                // does, and is the transition a reader is least likely to
+                // expect, so it is named through its old state rather than
+                // dropped for having no new one.
+                .filter_map(|delta| delta.new_state().or_else(|| delta.old_state()))
+                .map(|located| located.path.clone())
+                .filter(|path| !authored.contains(path))
+                .collect::<Vec<_>>();
+            carried.sort();
+            carried.dedup();
+            carried
+        }
+        None => Vec::new(),
+    };
+    let message = message(&carried_pending_files);
+    if message.trim().is_empty() {
+        return Err(invalid("native commit message must not be empty"));
+    }
 
     let entity_count = deltas.entity_deltas.len();
     let relation_count = deltas.relation_deltas.len();
@@ -877,17 +955,32 @@ fn plan_native_commit_inner(
         entity_count,
         relation_count,
         file_count,
+        carried_pending_files,
         previous_tree: workspace.tree,
         target_tree: deltas.expected_tree,
         source_hashes: source_hashes.into_iter().collect(),
     })
 }
 
-/// Load one clean local workspace from repository-v6 authority.
+/// Load one local workspace from repository-v6 authority as a commit base.
 ///
-/// Dirty workspace authority is a separate uncommitted state and must never be
-/// folded into an MCP semantic commit implicitly. Callers must explicitly
-/// commit or discard it first.
+/// A workspace holding a pending tree is not refused here, and the difference
+/// between that and the rule this replaces is the difference between an agent
+/// that can write to a repository somebody works in and one that cannot.
+/// Admission advances the workspace tree without advancing its base and
+/// publishes no change, so ordinary editing leaves every used workspace ahead of
+/// its base change permanently: the state never clears itself, and the refusal's
+/// own remedy could not reach it, because there was no graph-owned change to
+/// seal.
+///
+/// Refusing it never kept that content out of a commit either. The workspace
+/// graph takes its resolved tree from the workspace, so the pending content is
+/// inside the prospective graph every caller plans against, and a commit that
+/// excluded it would have to revert the working files that hold it. What the
+/// refusal actually bought was silence about a fold that was going to happen
+/// anyway once the guard was lifted, which is why the caller that lifts it
+/// declares the fold instead: see
+/// [`plan_native_commit_from_base_declaring_carry`].
 pub(crate) fn load_native_commit_base(
     authority_context: &LocalRepositoryAuthorityContext,
 ) -> Result<NativeCommitBase> {
@@ -904,12 +997,6 @@ pub(crate) fn load_native_commit_base(
                 "repository authority has no local workspace {workspace_id}"
             ))
         })?;
-    if workspace.is_dirty() {
-        return Err(invalid(format!(
-            "MCP repository commit requires a clean exact workspace {}; commit or discard its pending tree first",
-            workspace.workspace_id
-        )));
-    }
     let tree = workspace.tree.clone();
     let snapshot = lease
         .workspace_graph_snapshot(&workspace_id)?
