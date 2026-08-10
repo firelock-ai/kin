@@ -32,8 +32,8 @@ pub enum FileClassification {
 /// (which resolve the adapter directly), producing a smaller graph for the same
 /// repo depending on ingest path.
 const ENTITY_SOURCE_EXTENSIONS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx", "cs",
-    "rb", "kt", "kts", "swift", "php", "tf", "tfvars",
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "pyi", "go", "java", "rs", "c", "h", "cpp",
+    "hpp", "cc", "cxx", "cs", "rb", "kt", "kts", "swift", "php", "tf", "tfvars",
 ];
 
 /// Extensions eligible for C2 shallow syntax extraction: a tree-sitter grammar
@@ -227,6 +227,49 @@ mod tests {
     }
 
     // ── EntitySource extensions ──────────────────────────────────────
+
+    /// Every extension the adapter registry claims must classify as an entity
+    /// source, computed by iterating the registry HERE rather than restating it.
+    ///
+    /// The registry is the supported set. An extension it parses but that this
+    /// list omits routes whole-repo ingest to a shallower tier than incremental
+    /// edits, so the same repository yields a smaller graph depending on which
+    /// path admitted it, and `kin languages` still advertises the extension as
+    /// supported. A test that spelled the extensions out would pass forever
+    /// while the two lists drifted, which is the drift it exists to prevent.
+    #[test]
+    fn every_registry_extension_is_an_entity_source() {
+        let registry = kin_parser::AdapterRegistry::new();
+        let registered = registry.supported_languages_with_extensions();
+        assert!(
+            !registered.is_empty(),
+            "an empty registry would make every assertion here vacuous"
+        );
+        for (language, extensions) in registered {
+            assert!(
+                !extensions.is_empty(),
+                "{language} claims no extension, so nothing could ever route to it"
+            );
+            for ext in extensions {
+                assert!(
+                    ENTITY_SOURCE_EXTENSIONS.contains(ext),
+                    "{language} parses .{ext} but whole-repo ingest would classify it \
+                     opaque, so the graph depends on the ingest path"
+                );
+                assert_eq!(
+                    FileClassifier::classify(Path::new(&format!("probe.{ext}"))),
+                    FileClassification::EntitySource,
+                    "{language} parses .{ext} but a path carrying it does not classify \
+                     as an entity source"
+                );
+            }
+        }
+        assert!(
+            !ENTITY_SOURCE_EXTENSIONS.contains(&"kin-not-a-real-extension"),
+            "the containment probe must be able to answer no, or the assertions above \
+             prove nothing"
+        );
+    }
 
     #[test]
     fn entity_source_ts() {
