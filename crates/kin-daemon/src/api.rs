@@ -4017,10 +4017,9 @@ async fn command_admit(
 /// store whose graph is still behind. Commit and stash refuse the disabled
 /// condition ahead of the same seam; this refuses both.
 ///
-/// The bare-repository question is asked here the way
-/// `loop_runner::is_bare_repository` asks it, and the two have to stay in step:
-/// a divergence would either refuse a store the seam would have admitted or
-/// admit a skip as a success again.
+/// The bare-repository question is the seam's own predicate rather than a copy
+/// of it, so the two cannot drift: a divergence would either refuse a store the
+/// seam would have admitted or admit a skip as a success again.
 fn admission_seam_would_skip(state: &DaemonState) -> Option<(StatusCode, String)> {
     let working_dir = state.layout.working_dir();
     if state.filesystem_reconcile_disabled() {
@@ -4029,11 +4028,7 @@ fn admission_seam_would_skip(state: &DaemonState) -> Option<(StatusCode, String)
             &working_dir.display().to_string(),
         ));
     }
-    let bare = working_dir.join("config").is_file()
-        && working_dir.join("objects").is_dir()
-        && working_dir.join("refs").is_dir()
-        && !working_dir.join(".git").exists();
-    if bare {
+    if crate::loop_runner::is_bare_repository(working_dir) {
         return Some((
             StatusCode::CONFLICT,
             json!({
