@@ -792,9 +792,9 @@ commit that already landed is safe and is answered, not refused: the reply carri
 already_applied true beside the original change_id, repository_generation, and modified_files, and \
 publishes nothing further. That answer is derived from the repository receipt rather than from any \
 in-memory record, so it survives the transaction being forgotten and stays correct however many \
-times it is retried. It omits ops_applied and the staged_operation_files/carried_pending_files \
-split, which only the staged record could name; the change message still declares any fold. A \
-commit that never landed under this id still fails closed and says authority was consulted too.";
+times it is retried, and it declares the same carried_pending_files split the original answer did. \
+It omits ops_applied, which only the staged record could name. A commit that never landed under \
+this id still fails closed and says authority was consulted too.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {

@@ -726,6 +726,32 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
     )
 }
 
+/// The paths one change publishes that its author's own operations did not
+/// write.
+///
+/// One definition, because two callers need the same answer from different
+/// starting points: the planner has the authored set in hand, and a commit
+/// resumed after an interruption recovers it from the staged operations. If
+/// these ever computed the fold differently, a resumed commit would describe
+/// itself differently from the one it is resuming.
+pub(crate) fn carried_pending_paths(
+    tree_deltas: &[kin_model::TreeDelta],
+    authored: &BTreeSet<RepoPath>,
+) -> Vec<RepoPath> {
+    let mut carried = tree_deltas
+        .iter()
+        // A pending deletion moves the tree exactly as a pending edit does, and
+        // is the transition a reader is least likely to expect, so it is named
+        // through its old state rather than dropped for having no new one.
+        .filter_map(|delta| delta.new_state().or_else(|| delta.old_state()))
+        .map(|located| located.path.clone())
+        .filter(|path| !authored.contains(path))
+        .collect::<Vec<_>>();
+    carried.sort();
+    carried.dedup();
+    carried
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_native_commit_inner(
     graph: &kin_db::InMemoryGraph,
@@ -826,27 +852,10 @@ fn plan_native_commit_inner(
 
     // Settled here, not before planning: the message may have to name what this
     // change carried in, and that set is not known until the published tree
-    // deltas are. Computed once and used for both the record and the caller's
-    // reply, so the two cannot disagree about what was folded in.
-    let carried_pending_files = match authored_files {
-        Some(authored) => {
-            let mut carried = deltas
-                .tree_deltas
-                .iter()
-                // A pending deletion moves the tree exactly as a pending edit
-                // does, and is the transition a reader is least likely to
-                // expect, so it is named through its old state rather than
-                // dropped for having no new one.
-                .filter_map(|delta| delta.new_state().or_else(|| delta.old_state()))
-                .map(|located| located.path.clone())
-                .filter(|path| !authored.contains(path))
-                .collect::<Vec<_>>();
-            carried.sort();
-            carried.dedup();
-            carried
-        }
-        None => Vec::new(),
-    };
+    // deltas are.
+    let carried_pending_files = authored_files
+        .map(|authored| carried_pending_paths(&deltas.tree_deltas, authored))
+        .unwrap_or_default();
     let message = message(&carried_pending_files);
     if message.trim().is_empty() {
         return Err(invalid("native commit message must not be empty"));

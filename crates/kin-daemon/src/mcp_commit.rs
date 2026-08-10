@@ -53,9 +53,114 @@ struct PlannedCommitFacts {
     carried_pending_files: Vec<RepoPath>,
 }
 
+/// How far back a commit looks in the audit log for attribution it may already
+/// have written, or for the fold declaration an earlier attempt recorded.
+///
+/// Queried without an actor filter deliberately. The store applies its limit
+/// with `take`, after any filter, so a filtered query short-circuits only once
+/// it has found that many matching events; a session with fewer commits than
+/// the limit never reaches it and the traversal runs the whole log. Unfiltered,
+/// the limit bounds the traversal itself, which is the property this needs. The
+/// derived event ids and the recorded change id do the matching.
+///
+/// MCP commits are serialized behind the coordination gate, so a resume or a
+/// retry sits within a handful of events of the attempt it is answering for,
+/// and the window is wide enough to absorb an interleaved restart.
+const ATTRIBUTION_WINDOW: usize = 1024;
+
 fn authority_context(state: &DaemonState) -> Result<LocalRepositoryAuthorityContext, String> {
     LocalRepositoryAuthorityContext::from_state(state)
         .map_err(|error| format!("open startup-pinned repository authority: {error}"))
+}
+
+/// The files this transaction's own operations wrote, resolved from the staged
+/// operations instead of from the plan.
+///
+/// The planner knows this set exactly, but a commit interrupted after its
+/// receipt and then resumed by id has no plan and still has to answer for the
+/// same change. The staged operations survive that interruption, and a body
+/// edit never moves an entity between files, so resolving the same targets
+/// against authority after the commit names the files the planner named.
+///
+/// Best effort on purpose: a target that no longer resolves gives `None`, and
+/// the caller then reports no split at all rather than a wrong one.
+fn authored_files_from_staged(
+    graph: &kin_db::InMemoryGraph,
+    operations: &[kin_mcp::McpMutationOperation],
+) -> Option<BTreeSet<RepoPath>> {
+    let mut authored = BTreeSet::new();
+    for operation in operations {
+        let entity = match operation.payload.as_ref() {
+            Some(kin_mcp::McpMutationPayload::Entity(payload)) => {
+                graph.get_entity(&payload.id).ok().flatten()?
+            }
+            // A relation operation writes no file, so it claims none.
+            Some(_) => continue,
+            None => {
+                kin_mcp::handlers::sessions::resolve_target_entity(graph, &operation.target).ok()?
+            }
+        };
+        authored.insert(RepoPath::from_utf8(entity.file_origin?.0).ok()?);
+    }
+    Some(authored)
+}
+
+/// The fold declaration a commit already recorded, read back from its own
+/// attribution.
+///
+/// This is how a retry answers the same way the original did. A commit that
+/// outran the caller's per-attempt budget is retried into a registry the first
+/// attempt has already emptied, so the retry has the change and nothing else,
+/// and the change alone cannot say which of its files an operation wrote.
+fn recorded_carried_files(
+    graph: &kin_db::InMemoryGraph,
+    change_id: &kin_model::SemanticChangeId,
+) -> Vec<String> {
+    let change_id = change_id.to_string();
+    graph
+        .query_audit_events(None, ATTRIBUTION_WINDOW)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|event| event.details)
+        .filter_map(|details| serde_json::from_str::<serde_json::Value>(&details).ok())
+        .find(|details| {
+            details.get("change_id").and_then(serde_json::Value::as_str) == Some(change_id.as_str())
+        })
+        .and_then(|details| {
+            Some(
+                details
+                    .get("carried_pending_files")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|file| file.as_str().map(str::to_string))
+                    .collect(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Attach the carried-file split to a commit reply, when there is one to
+/// attach.
+///
+/// `modified_files` stays exactly what it was, because it is what every
+/// existing caller reads. The split is added beside it and only when this
+/// commit folded pending working-tree content in, so a caller that sees these
+/// keys is being told its commit published files it did not write.
+fn declare_carried_split(
+    result: &mut serde_json::Value,
+    modified_files: &[FilePathId],
+    carried: &[String],
+) {
+    if carried.is_empty() {
+        return;
+    }
+    let staged = modified_files
+        .iter()
+        .map(ToString::to_string)
+        .filter(|file| !carried.contains(file))
+        .collect::<Vec<_>>();
+    result["staged_operation_files"] = serde_json::json!(staged);
+    result["carried_pending_files"] = serde_json::json!(carried);
 }
 
 /// Commit one daemon-owned MCP transaction through exact repository authority.
@@ -514,22 +619,8 @@ fn record_commit_provenance(
     actor: &CommitActor,
     transaction: &kin_mcp::McpTransaction,
     committed: &NativeCommitResult,
+    carried_pending_files: &[RepoPath],
 ) -> Result<(), String> {
-    /// How far back a resume looks for the attribution it may already have
-    /// written.
-    ///
-    /// Queried without an actor filter deliberately. The store applies its
-    /// limit with `take`, after any filter, so a filtered query short-circuits
-    /// only once it has found that many matching events; a session with fewer
-    /// commits than the limit never reaches it and the traversal runs the whole
-    /// log. Unfiltered, the limit bounds the traversal itself, which is the
-    /// property this needs. The derived event ids do the matching.
-    ///
-    /// MCP commits are serialized behind the coordination gate, so a resume
-    /// sits within a handful of events of the attempt it is resuming, and the
-    /// window is wide enough to absorb an interleaved restart.
-    const DEDUP_WINDOW: usize = 1024;
-
     graph
         .create_actor(&actor.actor)
         .map_err(|error| format!("record committing agent actor: {error}"))?;
@@ -598,13 +689,13 @@ fn record_commit_provenance(
     };
 
     let already_recorded = graph
-        .query_audit_events(None, DEDUP_WINDOW)
+        .query_audit_events(None, ATTRIBUTION_WINDOW)
         .map_err(|error| format!("read existing commit attribution: {error}"))?
         .into_iter()
         .map(|event| event.event_id)
         .collect::<HashSet<_>>();
 
-    let details = serde_json::json!({
+    let mut details = serde_json::json!({
         "schema": "kin.mcp.commit_audit.v1",
         "transaction_id": transaction.transaction_id,
         "session_id": actor.session_id,
@@ -612,8 +703,22 @@ fn record_commit_provenance(
         "change_id": committed.change.id.to_string(),
         "repository_generation": committed.receipt.generation,
         "repository_operation_id": committed.receipt.operation_id.to_string(),
-    })
-    .to_string();
+    });
+    // The durable home of the fold declaration, and the reason it survives.
+    // Only the process that planned or resumed this commit can tell a file its
+    // operations wrote from one the workspace carried in, and a retry that
+    // arrives after the transaction record is gone has neither. It reads the
+    // split back from here instead, so a caller whose commit outran its own
+    // request budget is told the same thing as one whose commit fit inside it.
+    // Absent entirely when nothing was carried, so a reader that finds no key
+    // on a commit is reading one that folded nothing.
+    if !carried_pending_files.is_empty() {
+        details["carried_pending_files"] = serde_json::json!(carried_pending_files
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>());
+    }
+    let details = details.to_string();
 
     for (event_id, scope) in scopes {
         if already_recorded.contains(&event_id) {
@@ -1109,9 +1214,9 @@ fn commit_message(transaction_id: &str, carried: &[RepoPath]) -> String {
         "MCP transaction {transaction_id} (also admitted {count} pending working-tree {files})\n\n\
          The workspace already held admitted working-tree content its base change did not carry, \
          so this change publishes that content beside the staged operations rather than reverting \
-         it. No operation in this transaction authored these {count} {files}, and their semantics \
-         are not re-derived here, so the entities inside them keep the authorship they already \
-         had: {sample}"
+         it. No operation in this transaction authored it, and its semantics are not re-derived \
+         here, so the entities inside it keep the authorship they already had.\n\
+         Carried: {sample}"
     )
 }
 
@@ -1327,7 +1432,7 @@ fn replay_applied_commit(
     };
 
     let modified_files = changed_file_ids(&recovered.change)?;
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "transaction_id": transaction_id,
         "state": "committed",
         "status": "committed",
@@ -1345,6 +1450,11 @@ fn replay_applied_commit(
         "semantic_authority": "reparsed_exact_repository_bytes",
         "coordination": coordination,
     });
+    declare_carried_split(
+        &mut result,
+        &modified_files,
+        &recorded_carried_files(state.graph.as_ref(), &recovered.change.id),
+    );
     let json = serde_json::to_string_pretty(&result)
         .map_err(|error| format!("serialize replayed exact MCP commit response: {error}"))?;
     Ok(kin_mcp::ToolCallResult::text(json))
@@ -1359,13 +1469,25 @@ fn finalize_committed_transaction(
     planned: Option<PlannedCommitFacts>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
 ) -> Result<kin_mcp::ToolCallResult, String> {
-    let (planned_layouts, carried_pending_files) = match planned {
-        Some(planned) => (planned.layouts, planned.carried_pending_files),
-        None => (Vec::new(), Vec::new()),
+    let (planned_layouts, planned_carry) = match planned {
+        Some(planned) => (planned.layouts, Some(planned.carried_pending_files)),
+        None => (Vec::new(), None),
     };
     let authority_context = authority_context(state)?;
     let authority = load_native_commit_base(&authority_context)
         .map_err(|error| format!("reload committed MCP repository authority: {error}"))?;
+    // A resume has no plan and still owes the same answer, so it recovers the
+    // split from the staged operations the interruption left behind.
+    let carried_pending_files = planned_carry.unwrap_or_else(|| {
+        authored_files_from_staged(&authority.graph, &transaction.staged_operations)
+            .map(|authored| {
+                crate::repository_commit::carried_pending_paths(
+                    &committed.change.tree_deltas,
+                    &authored,
+                )
+            })
+            .unwrap_or_default()
+    });
     if authority.roots != committed.receipt.roots_after {
         return Err(format!(
             "repository authority advanced beyond MCP receipt generation {}; reopen the daemon before finalizing transaction {}",
@@ -1390,7 +1512,13 @@ fn finalize_committed_transaction(
             transaction.transaction_id
         ));
     }
-    record_commit_provenance(state.graph.as_ref(), actor, &transaction, &committed)?;
+    record_commit_provenance(
+        state.graph.as_ref(),
+        actor,
+        &transaction,
+        &committed,
+        &carried_pending_files,
+    )?;
 
     let observed_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if observed_generation < committed.receipt.generation {
@@ -1431,24 +1559,14 @@ fn finalize_committed_transaction(
         "semantic_authority": "reparsed_exact_repository_bytes",
         "coordination": coordination,
     });
-    // Present only when something was carried in, so a commit from a workspace
-    // holding no pending tree answers exactly as it did before this split
-    // existed. A caller that sees these keys is being told its commit published
-    // files it did not write, which is the one case where a flat file list is a
-    // misleading answer.
-    if !carried_pending_files.is_empty() {
-        let carried = carried_pending_files
+    declare_carried_split(
+        &mut result,
+        &modified_files,
+        &carried_pending_files
             .iter()
             .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let staged = modified_files
-            .iter()
-            .map(ToString::to_string)
-            .filter(|file| !carried.contains(file))
-            .collect::<Vec<_>>();
-        result["staged_operation_files"] = serde_json::json!(staged);
-        result["carried_pending_files"] = serde_json::json!(carried);
-    }
+            .collect::<Vec<_>>(),
+    );
     let json = serde_json::to_string_pretty(&result)
         .map_err(|error| format!("serialize exact MCP commit response: {error}"))?;
     Ok(kin_mcp::ToolCallResult::text(json))
@@ -5167,6 +5285,68 @@ mod tests {
             change.message,
             format!("MCP transaction {transaction_id}"),
             "a clean commit's message stays byte-identical"
+        );
+    }
+
+    /// The retry that a slow commit guarantees is told about the fold too.
+    ///
+    /// This is the reply a real caller reads. The MCP client budgets 60 seconds
+    /// per attempt, a commit on a store of any size takes longer, and the
+    /// duplicate request that follows is answered from the repository receipt
+    /// after the first attempt has evicted its own transaction record. A split
+    /// that only the planning process could produce would therefore never reach
+    /// anyone, so the fold is recorded in the commit's own attribution and read
+    /// back here.
+    #[test]
+    fn a_retry_of_an_evicted_commit_still_declares_what_that_commit_carried() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        install_exact_source(
+            &state,
+            "src/other.rs",
+            b"pub fn other() -> u8 { 1 }\n",
+            "other",
+        );
+        admit_pending_working_tree_edit(&state, "src/other.rs", b"pub fn other() -> u8 { 7 }\n");
+
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let first = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
+        let first_reply = commit_reply(&first);
+
+        // Exactly what a successful commit leaves behind for the retry: the
+        // durable store and the live registry both forget the transaction.
+        state
+            .mcp_transactions
+            .lock()
+            .unwrap()
+            .remove(&transaction_id);
+        let retry_sessions = test_sessions();
+        assert!(retry_sessions.get_transaction(&transaction_id).is_none());
+
+        let retry = commit_exact_transaction(&state, &retry_sessions, &arguments, None);
+        assert_ne!(retry.is_error, Some(true), "{}", result_text(&retry));
+        let retry_reply = commit_reply(&retry);
+        assert_eq!(retry_reply["already_applied"], true);
+        assert_eq!(retry_reply["change_id"], first_reply["change_id"]);
+        assert_eq!(
+            retry_reply["carried_pending_files"], first_reply["carried_pending_files"],
+            "the retry must declare the same fold the first answer did: {retry_reply:#}"
+        );
+        assert_eq!(
+            retry_reply["staged_operation_files"],
+            first_reply["staged_operation_files"]
+        );
+        assert_eq!(
+            retry_reply["carried_pending_files"],
+            serde_json::json!(["src/other.rs"])
         );
     }
 
