@@ -1,0 +1,21 @@
+# Intentional exceptions for the `every_kin_db_env_read_is_registered` test in
+# src/env_registry.rs.
+#
+# That test enumerates every `KIN_*` name appearing in the pinned kin-db's own
+# `src/` and requires each one to be registered, because kin-db reads its
+# embedding surface out of the same process environment kin validates at startup.
+# An unregistered name there makes the startup audit call a live knob
+# "unrecognized ... no effect", and makes KIN_ENV_VALIDATION=strict refuse to
+# start.
+#
+# List one `KIN_*` name per line to exempt a name the scan finds but that is
+# genuinely not an operator-facing variable, such as a name assembled only for a
+# fixture or a string that is not a variable at all. `#` comments and blank
+# lines are ignored.
+#
+# The default and correct action is to register the variable in the DOWNSTREAM
+# table in env_registry.rs, with the kind, default, and sensitivity read off the
+# actual kin-db read site. An entry here is a conscious decision to keep a name
+# out of the registry, not a place to silence a real gap.
+#
+# (No exceptions are needed at the currently pinned kin-db.)

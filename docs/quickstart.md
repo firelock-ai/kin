@@ -257,8 +257,8 @@ index over them with:
 kin embed
 ```
 
-Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions). You can
-check coverage at any time:
+Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; override
+via `KIN_EMBED_MODEL_ID`). You can check coverage at any time:
 
 ```sh
 kin graph status   # "Embeddings: <indexed>/<total> indexed (<pending> pending)"

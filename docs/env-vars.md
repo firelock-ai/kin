@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (422 total, 310 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (442 total, 321 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -151,6 +151,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_EMBED_BACKEND` | enum | auto | correctness | kin-db embedding compute backend: auto (default) uses batched Metal, 'cpu' forces the SIMD/pure path, 'metal'/'gpu' forces Metal; cpu vs metal shifts embeddings in the last ULPs |
+| `KIN_EMBED_BASE_URL` | url | *(unset)* | operational | kin-db fallback endpoint base URL read only when KIN_EMBED_OPENAI_BASE_URL is unset |
+| `KIN_EMBED_BATCH_SIZE` | usize | *(unset)* | operational | kin-db entities drained per embedding chunk; must be > 0, and unset derives from the resource profile (cores x 16 clamped to 64..192, else 128) |
+| `KIN_EMBED_BATCH_TRACE` | bool | false | diagnostic | kin-db per-sub-batch embedding shape and forward-timing trace; any non-empty value other than '0' enables it |
 | `KIN_EMBED_CACHE` | bool | true | operational | kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on |
 | `KIN_EMBED_CACHE_BUDGET_GB` | float>=0 | *(unset)* | operational | kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing, so the cache is pruned only by an explicit budget or command |
 | `KIN_EMBED_CACHE_DIR` | path | *(unset)* | operational | kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings |
@@ -158,9 +161,25 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_EMBED_HYBRID` | string | off | correctness | kin-db hybrid CPU/GPU embedding split: off (default), 'seq'/'floor' for the sequence-length floor, or any other truthy value for the balanced split; engaging the CPU twin computes some vectors off the Metal device |
 | `KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN` | usize | 256 | correctness | kin-db hybrid CPU lane cutoff: entities tokenized at or below this sequence length embed on the CPU twin, heavier ones on Metal; 0 or invalid falls back to 256 |
 | `KIN_EMBED_HYBRID_GPU_TPUT_RATIO` | float>=0 | *(unset)* | correctness | kin-db hybrid split ratio: pins the GPU:CPU throughput ratio for the balanced split; unset (or <= 0) measures it adaptively per batch |
+| `KIN_EMBED_MAX_ATTENTION_AREA` | usize | *(unset)* | operational | kin-db attention-area ceiling (padded tokens x max sequence length) per embedding dispatch; must be > 0, unset is backend-dependent, and the request is still capped per backend |
+| `KIN_EMBED_MAX_BATCH_TOKENS` | usize | *(unset)* | operational | kin-db token-sum ceiling per embedding dispatch; must be > 0, and unset is backend-dependent (16384 Metal, 65536 CUDA). Raising it can exhaust GPU memory |
 | `KIN_EMBED_MAX_PASSES` | usize | *(unset)* | operational | cap on embedding passes per embed run |
 | `KIN_EMBED_MAX_TOTAL_SECONDS` | seconds>=0 | 600 | operational | total wall-clock budget for a single `kin embed` under the interactive/small resource profiles; the run stops at the budget with a resumable partial index; unconstrained profiles ignore it |
+| `KIN_EMBED_MODEL_ID` | string | nomic-ai/nomic-embed-text-v1.5 | correctness | kin-db local embedding model id (a Hugging Face repo id or a local model directory); also the fallback model for an OpenAI-compatible provider. Changing it changes every vector and can change the dimension |
+| `KIN_EMBED_MODEL_REVISION` | string | main | correctness | kin-db local embedding model revision resolved alongside KIN_EMBED_MODEL_ID; a different revision is a different set of weights |
+| `KIN_EMBED_OPENAI_API_KEY` | secret | *(unset)* | secret | kin-db credential for the OpenAI-compatible embedding endpoint; the openai profile falls back to OPENAI_API_KEY when this is unset |
+| `KIN_EMBED_OPENAI_BASE_URL` | url | *(unset)* | operational | kin-db OpenAI-compatible endpoint base URL; unset defaults per profile (https://api.openai.com/v1 for openai, http://localhost:1234/v1 otherwise) |
+| `KIN_EMBED_OPENAI_DIMENSIONS` | usize | *(unset)* | correctness | kin-db requested output dimension for an OpenAI-compatible provider; must be > 0, and unset uses the model's native dimension |
+| `KIN_EMBED_OPENAI_DOCUMENT_PREFIX` | string | *(unset)* | correctness | kin-db instruction prefix prepended to document text for an OpenAI-compatible provider; unset derives the model's documented prefix, and it must match the corpus a query is searched against |
+| `KIN_EMBED_OPENAI_MODEL` | string | *(unset)* | correctness | kin-db OpenAI-compatible embedding model, taking precedence over KIN_EMBED_MODEL_ID; unset defaults per profile (text-embedding-3-small for openai, text-embedding-nomic-embed-text-v1.5 otherwise) |
+| `KIN_EMBED_OPENAI_QUERY_PREFIX` | string | *(unset)* | correctness | kin-db instruction prefix prepended to query text for an OpenAI-compatible provider; unset derives the model's documented prefix, and a wrong prefix silently degrades retrieval |
+| `KIN_EMBED_OPENAI_REQUEST_JSON` | string | *(unset)* | correctness | kin-db JSON object merged into every OpenAI-compatible embedding request body; an invalid object fails the embed run, and the overrides can change the returned vectors |
+| `KIN_EMBED_OPENAI_SEND_DIMENSIONS` | bool | false | correctness | kin-db sends the requested dimension in the OpenAI-compatible request body, changing the vectors the endpoint returns; only 1/true/TRUE/yes/YES enable it at the read site |
+| `KIN_EMBED_OPENAI_TIMEOUT_SECS` | seconds>=0 | 120 | operational | kin-db per-request timeout for an OpenAI-compatible embedding call, in whole seconds; must be > 0 |
 | `KIN_EMBED_PASS_SECONDS` | seconds>=0 | *(unset)* | operational | per-pass wall-clock budget for an embed run |
+| `KIN_EMBED_PIPELINED` | bool | *(unset)* | correctness | kin-db staged embed pipeline overlapping prep, forward, and persist; unset engages it only under the throughput resource profile, and an explicit value overrides in either direction. The serial path is what keeps persisted vector order byte-for-byte, so forcing it on makes a run non-citable |
+| `KIN_EMBED_PROVIDER` | enum | local | correctness | kin-db embedding provider: 'local' (default) embeds in-process, 'openai'/'lmstudio'/'openai-compatible' call an OpenAI-compatible endpoint; an unrecognized value warns and falls back to local |
+| `KIN_EMBED_TEST_FORCE_METAL_OOM` | usize | *(unset)* | diagnostic | kin-db fault injection: replaces the first N Metal embedding dispatches with a synthetic out-of-memory so the CPU-degrade retry path can be exercised; unset or non-positive disarms it |
 
 ## Inference
 
@@ -495,6 +514,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_WEIGHT_COCHANGE` | float>=0 | 1.0 | correctness | locate tuning knob: weight cochange |
 | `KIN_LOCATE_WEIGHT_EMBEDDING` | float>=0 | 1.5 | correctness | locate tuning knob: weight embedding |
 | `KIN_LOCATE_WEIGHT_ERRORS` | float>=0 | 1.0 | correctness | locate tuning knob: weight errors |
+| `KIN_LOCATE_WEIGHT_FILE_PATH` | float>=0 | 0 | correctness | kin-db BM25 field weight for the file path; 0 (the default) keeps file paths out of lexical scoring so entities rank on names, signatures, and bodies, and any positive value indexes path text and changes ranking |
 | `KIN_LOCATE_WEIGHT_IMPORTS` | float>=0 | 1.2 | correctness | locate tuning knob: weight imports |
 | `KIN_LOCATE_WEIGHT_MULTIHOP` | float>=0 | 1.4 | correctness | locate tuning knob: weight multihop |
 | `KIN_LOCATE_WEIGHT_PROJECTION` | float>=0 | 5.0 | correctness | locate tuning knob: weight projection |

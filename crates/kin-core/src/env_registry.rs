@@ -309,14 +309,18 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
 /// even though setting them changes real behavior — the exact false negative this
 /// table removes.
 ///
-/// This list is necessarily **hand-maintained**: the sibling crates resolve through
-/// the private cargo registry, not a path dependency, so a build-time cross-repo
-/// scan is not possible from here. When a downstream crate adds, renames, or removes
-/// a `KIN_*` lever, update this table to match — the kind, default, and sensitivity
-/// are lifted from the actual read site so both the audit and `docs/env-vars.md`
-/// stay honest. `Correctness` marks a lever that shifts embedding/inference *output*
-/// (compute device, precision, or split); `Operational` marks a perf/cache/lifecycle
-/// lever that leaves numerical output identical.
+/// The kind, default, and sensitivity of each entry are lifted from the actual read
+/// site, so both the audit and `docs/env-vars.md` stay honest. `Correctness` marks a
+/// lever that shifts embedding/inference *output* (model, provider, prefix, compute
+/// device, precision, or split); `Operational` marks a perf/cache/lifecycle lever
+/// that leaves numerical output identical.
+///
+/// The kin-db rows are **machine-checked** against the pinned crate by
+/// `every_kin_db_env_read_is_registered`, which enumerates the vendored source of the
+/// exact version in `Cargo.lock`. The other rows are still hand-maintained: those
+/// crates resolve through the private cargo registry the same way, but their levers
+/// need the per-variable reachability judgement the kin-db sweep already has, so
+/// adding, renaming, or removing one there means updating this table by hand.
 #[rustfmt::skip]
 pub const DOWNSTREAM: &[EnvVarSpec] = &[
     // ---- kin-infer: compute backend / dispatch --------------------------------
@@ -331,6 +335,31 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on" },
     EnvVarSpec { name: "KIN_EMBED_CACHE_BUDGET_GB", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing, so the cache is pruned only by an explicit budget or command" },
     EnvVarSpec { name: "KIN_EMBED_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings" },
+    // ---- kin-db: provider and model selection (changes every vector) ----------
+    EnvVarSpec { name: "KIN_EMBED_PROVIDER", kind: Kind::OneOf(&["local", "hf", "huggingface", "bge", "openai", "lmstudio", "lm-studio", "openai-compat", "openai-compatible", "compatible"]), default: "local", sensitivity: Sensitivity::Correctness, summary: "kin-db embedding provider: 'local' (default) embeds in-process, 'openai'/'lmstudio'/'openai-compatible' call an OpenAI-compatible endpoint; an unrecognized value warns and falls back to local" },
+    EnvVarSpec { name: "KIN_EMBED_MODEL_ID", kind: Kind::Str, default: "nomic-ai/nomic-embed-text-v1.5", sensitivity: Sensitivity::Correctness, summary: "kin-db local embedding model id (a Hugging Face repo id or a local model directory); also the fallback model for an OpenAI-compatible provider. Changing it changes every vector and can change the dimension" },
+    EnvVarSpec { name: "KIN_EMBED_MODEL_REVISION", kind: Kind::Str, default: "main", sensitivity: Sensitivity::Correctness, summary: "kin-db local embedding model revision resolved alongside KIN_EMBED_MODEL_ID; a different revision is a different set of weights" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_MODEL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db OpenAI-compatible embedding model, taking precedence over KIN_EMBED_MODEL_ID; unset defaults per profile (text-embedding-3-small for openai, text-embedding-nomic-embed-text-v1.5 otherwise)" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_DIMENSIONS", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db requested output dimension for an OpenAI-compatible provider; must be > 0, and unset uses the model's native dimension" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_SEND_DIMENSIONS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-db sends the requested dimension in the OpenAI-compatible request body, changing the vectors the endpoint returns; only 1/true/TRUE/yes/YES enable it at the read site" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_QUERY_PREFIX", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db instruction prefix prepended to query text for an OpenAI-compatible provider; unset derives the model's documented prefix, and a wrong prefix silently degrades retrieval" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_DOCUMENT_PREFIX", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db instruction prefix prepended to document text for an OpenAI-compatible provider; unset derives the model's documented prefix, and it must match the corpus a query is searched against" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_REQUEST_JSON", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db JSON object merged into every OpenAI-compatible embedding request body; an invalid object fails the embed run, and the overrides can change the returned vectors" },
+    // ---- kin-db: OpenAI-compatible transport (endpoint, credential, timeout) --
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_BASE_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db OpenAI-compatible endpoint base URL; unset defaults per profile (https://api.openai.com/v1 for openai, http://localhost:1234/v1 otherwise)" },
+    EnvVarSpec { name: "KIN_EMBED_BASE_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db fallback endpoint base URL read only when KIN_EMBED_OPENAI_BASE_URL is unset" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_API_KEY", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "kin-db credential for the OpenAI-compatible embedding endpoint; the openai profile falls back to OPENAI_API_KEY when this is unset" },
+    EnvVarSpec { name: "KIN_EMBED_OPENAI_TIMEOUT_SECS", kind: Kind::Secs, default: "120", sensitivity: Sensitivity::Operational, summary: "kin-db per-request timeout for an OpenAI-compatible embedding call, in whole seconds; must be > 0" },
+    // ---- kin-db: batch shape and pipeline (throughput, memory headroom) -------
+    EnvVarSpec { name: "KIN_EMBED_BATCH_SIZE", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db entities drained per embedding chunk; must be > 0, and unset derives from the resource profile (cores x 16 clamped to 64..192, else 128)" },
+    EnvVarSpec { name: "KIN_EMBED_MAX_BATCH_TOKENS", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db token-sum ceiling per embedding dispatch; must be > 0, and unset is backend-dependent (16384 Metal, 65536 CUDA). Raising it can exhaust GPU memory" },
+    EnvVarSpec { name: "KIN_EMBED_MAX_ATTENTION_AREA", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db attention-area ceiling (padded tokens x max sequence length) per embedding dispatch; must be > 0, unset is backend-dependent, and the request is still capped per backend" },
+    EnvVarSpec { name: "KIN_EMBED_PIPELINED", kind: Kind::Bool, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db staged embed pipeline overlapping prep, forward, and persist; unset engages it only under the throughput resource profile, and an explicit value overrides in either direction. The serial path is what keeps persisted vector order byte-for-byte, so forcing it on makes a run non-citable" },
+    // ---- kin-db: embedding diagnostics and fault injection --------------------
+    EnvVarSpec { name: "KIN_EMBED_BATCH_TRACE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "kin-db per-sub-batch embedding shape and forward-timing trace; any non-empty value other than '0' enables it" },
+    EnvVarSpec { name: "KIN_EMBED_TEST_FORCE_METAL_OOM", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-db fault injection: replaces the first N Metal embedding dispatches with a synthetic out-of-memory so the CPU-degrade retry path can be exercised; unset or non-positive disarms it" },
+    // ---- kin-db: lexical ranking weight ---------------------------------------
+    EnvVarSpec { name: "KIN_LOCATE_WEIGHT_FILE_PATH", kind: Kind::NonNegF32, default: "0", sensitivity: Sensitivity::Correctness, summary: "kin-db BM25 field weight for the file path; 0 (the default) keeps file paths out of lexical scoring so entities rank on names, signatures, and bodies, and any positive value indexes path text and changes ranking" },
     // ---- kin-vfs shim: projection authority -----------------------------------
     EnvVarSpec { name: "KIN_NO_VFS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off" },
     EnvVarSpec { name: "KIN_VFS_DISABLE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off" },
@@ -1261,6 +1290,317 @@ mod tests {
         );
     }
 
+    // ---- strict mode against a real embedding configuration ----------------
+
+    /// Every `KIN_EMBED_*` / `KIN_LOCATE_*` name kin-db reads, with a value a real
+    /// operator could set. Kept as pairs so strict mode is exercised against values,
+    /// not just names: a registered variable whose documented kind contradicts its
+    /// read site would validate here and fail.
+    const KIN_DB_EMBED_CONFIGURATION: &[(&str, &str)] = &[
+        ("KIN_EMBED_PROVIDER", "openai-compatible"),
+        ("KIN_EMBED_MODEL_ID", "nomic-ai/nomic-embed-text-v1.5"),
+        ("KIN_EMBED_MODEL_REVISION", "main"),
+        ("KIN_EMBED_OPENAI_MODEL", "text-embedding-3-small"),
+        ("KIN_EMBED_OPENAI_BASE_URL", "http://localhost:1234/v1"),
+        ("KIN_EMBED_BASE_URL", "http://localhost:1234/v1"),
+        ("KIN_EMBED_OPENAI_API_KEY", "sk-not-a-real-key"),
+        ("KIN_EMBED_OPENAI_DIMENSIONS", "768"),
+        ("KIN_EMBED_OPENAI_SEND_DIMENSIONS", "1"),
+        ("KIN_EMBED_OPENAI_TIMEOUT_SECS", "120"),
+        ("KIN_EMBED_OPENAI_QUERY_PREFIX", "search_query: "),
+        ("KIN_EMBED_OPENAI_DOCUMENT_PREFIX", "search_document: "),
+        (
+            "KIN_EMBED_OPENAI_REQUEST_JSON",
+            "{\"encoding_format\":\"float\"}",
+        ),
+        ("KIN_EMBED_BACKEND", "cpu"),
+        ("KIN_EMBED_BATCH_SIZE", "128"),
+        ("KIN_EMBED_MAX_BATCH_TOKENS", "16384"),
+        ("KIN_EMBED_MAX_ATTENTION_AREA", "8388608"),
+        ("KIN_EMBED_PIPELINED", "1"),
+        ("KIN_EMBED_BATCH_TRACE", "1"),
+        ("KIN_EMBED_TEST_FORCE_METAL_OOM", "2"),
+        ("KIN_EMBED_CACHE", "0"),
+        ("KIN_EMBED_CACHE_DIR", "/tmp/kin-embed-cache"),
+        ("KIN_EMBED_CACHE_BUDGET_GB", "8"),
+        ("KIN_EMBED_HYBRID", "seq"),
+        ("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN", "256"),
+        ("KIN_EMBED_HYBRID_GPU_TPUT_RATIO", "3.5"),
+        ("KIN_LOCATE_WEIGHT_FILE_PATH", "2.0"),
+        ("KIN_RESOURCE_PROFILE", "throughput"),
+    ];
+
+    #[test]
+    fn strict_mode_accepts_a_full_non_default_embedding_configuration() {
+        // The bug this closes: `KIN_ENV_VALIDATION=strict` aborted startup for anyone
+        // running a non-default embedding setup, because the variables kin-db reads
+        // were unregistered. Strict mode must accept the whole configuration.
+        let env: Vec<(String, String)> = KIN_DB_EMBED_CONFIGURATION
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        let report = audit_env(env, true);
+        assert!(
+            report.unknown.is_empty(),
+            "a working embedding configuration must not be called a typo: {:?}",
+            report.unknown
+        );
+        assert!(
+            report.invalid.is_empty(),
+            "a working embedding configuration must validate under strict mode: {:?}",
+            report.invalid
+        );
+        assert!(
+            !report.has_hard_errors(),
+            "strict mode must not abort startup on a working embedding configuration"
+        );
+    }
+
+    #[test]
+    fn a_genuine_embed_typo_is_still_caught() {
+        // The other side of the same guard: widening the registry must not make it
+        // blind. A misspelling next to real variables is still unknown, still warns,
+        // and still aborts strict startup.
+        let typo = "KIN_EMBED_MODEL_IDD";
+        assert!(spec(typo).is_none(), "{typo} must not be registered");
+
+        let mut env: Vec<(String, String)> = vec![
+            ("KIN_EMBED_PROVIDER".to_string(), "local".to_string()),
+            (typo.to_string(), "some-model".to_string()),
+        ];
+        env.push(("KIN_EMBED_TYPO".to_string(), "1".to_string()));
+
+        let warn = audit_env(env.clone(), false);
+        assert_eq!(
+            warn.unknown,
+            vec![typo.to_string(), "KIN_EMBED_TYPO".to_string()],
+            "an unknown KIN_EMBED_* name must still be reported"
+        );
+
+        let strict = audit_env(env, true);
+        assert_eq!(
+            strict.unknown.len(),
+            2,
+            "strict mode must still see the typos"
+        );
+    }
+
+    #[test]
+    fn the_openai_credential_is_registered_as_a_secret() {
+        // A credential in the registry must be modeled as a secret, or a non-default
+        // finding would print the key. Both the kind and the sensitivity carry it.
+        let key = spec("KIN_EMBED_OPENAI_API_KEY").expect("credential must be registered");
+        assert!(
+            matches!(key.kind, Kind::Secret),
+            "the embedding API key must be Kind::Secret so it is never echoed"
+        );
+        assert_eq!(
+            key.sensitivity,
+            Sensitivity::Secret,
+            "the embedding API key must carry Sensitivity::Secret"
+        );
+        let report = audit_env(
+            [(
+                "KIN_EMBED_OPENAI_API_KEY".to_string(),
+                "sk-live-must-never-appear".to_string(),
+            )],
+            true,
+        );
+        assert!(report.invalid.is_empty());
+        assert!(
+            !format!("{report:?}").contains("sk-live-must-never-appear"),
+            "the embedding API key value must never reach a finding"
+        );
+    }
+
+    // ---- pinned-dependency env-read parity --------------------------------
+
+    /// Every `KIN_*` name that appears in the pinned kin-db's own `src/`. The
+    /// enumeration arm below rebuilds this from the vendored crate; this list is what
+    /// keeps the test non-vacuous where that source is not on disk, and it is also the
+    /// control that proves the enumeration found a real tree rather than an empty one.
+    ///
+    /// Regenerate with the pinned version from `Cargo.lock`:
+    ///
+    /// ```text
+    /// grep -rhoE '"KIN_[A-Z0-9_]+"' \
+    ///   "$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/kin-db-<version>)/src" \
+    ///   | tr -d '"' | sort -u
+    /// ```
+    const KIN_DB_ENV_READS: &[&str] = &[
+        "KIN_EMBED_BACKEND",
+        "KIN_EMBED_BASE_URL",
+        "KIN_EMBED_BATCH_SIZE",
+        "KIN_EMBED_BATCH_TRACE",
+        "KIN_EMBED_CACHE",
+        "KIN_EMBED_CACHE_BUDGET_GB",
+        "KIN_EMBED_CACHE_DIR",
+        "KIN_EMBED_HYBRID",
+        "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN",
+        "KIN_EMBED_HYBRID_GPU_TPUT_RATIO",
+        "KIN_EMBED_MAX_ATTENTION_AREA",
+        "KIN_EMBED_MAX_BATCH_TOKENS",
+        "KIN_EMBED_MODEL_ID",
+        "KIN_EMBED_MODEL_REVISION",
+        "KIN_EMBED_OPENAI_API_KEY",
+        "KIN_EMBED_OPENAI_BASE_URL",
+        "KIN_EMBED_OPENAI_DIMENSIONS",
+        "KIN_EMBED_OPENAI_DOCUMENT_PREFIX",
+        "KIN_EMBED_OPENAI_MODEL",
+        "KIN_EMBED_OPENAI_QUERY_PREFIX",
+        "KIN_EMBED_OPENAI_REQUEST_JSON",
+        "KIN_EMBED_OPENAI_SEND_DIMENSIONS",
+        "KIN_EMBED_OPENAI_TIMEOUT_SECS",
+        "KIN_EMBED_PIPELINED",
+        "KIN_EMBED_PROVIDER",
+        "KIN_EMBED_TEST_FORCE_METAL_OOM",
+        "KIN_LOCATE_WEIGHT_FILE_PATH",
+        "KIN_RESOURCE_PROFILE",
+    ];
+
+    /// The kin-db version this workspace pins, read from `Cargo.lock` so the scan can
+    /// never drift onto a different vendored copy than the one that gets linked.
+    fn pinned_kin_db_version(root: &std::path::Path) -> Option<String> {
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
+        let mut in_kin_db = false;
+        for line in lock.lines() {
+            let line = line.trim();
+            if line == "[[package]]" {
+                in_kin_db = false;
+            } else if line == "name = \"kin-db\"" {
+                in_kin_db = true;
+            } else if in_kin_db {
+                if let Some(rest) = line.strip_prefix("version = \"") {
+                    return rest.strip_suffix('"').map(str::to_string);
+                }
+            }
+        }
+        None
+    }
+
+    /// Locate the vendored source of a pinned registry crate under the cargo home.
+    /// Returns `None` when it is not on disk (a vendored or offline build layout).
+    fn vendored_crate_src(crate_dir: &str) -> Option<std::path::PathBuf> {
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo"))
+            })?;
+        let registries = std::fs::read_dir(cargo_home.join("registry/src")).ok()?;
+        for registry in registries.flatten() {
+            let candidate = registry.path().join(crate_dir).join("src");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Every `KIN_*` string literal under `dir`. Deliberately over-inclusive: it does
+    /// not try to recognize a read *shape*, because kin-db reads through several
+    /// helpers (`env_nonempty`, `env_flag`, a bare `env::var`, and a `const` holding
+    /// the name), and a shape-matching scan is exactly what under-counted this surface
+    /// in the first place. A name that turns up here and is registered nowhere is the
+    /// defect; a name that is genuinely not a variable belongs in the allowlist.
+    fn scan_kin_literals(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let bytes = text.as_bytes();
+                let mut from = 0;
+                while let Some(rel) = text[from..].find("\"KIN_") {
+                    let start = from + rel + 1;
+                    let mut end = start;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_uppercase()
+                            || bytes[end].is_ascii_digit()
+                            || bytes[end] == b'_')
+                    {
+                        end += 1;
+                    }
+                    if end < bytes.len() && bytes[end] == b'"' && end - start > "KIN_".len() {
+                        found.insert(text[start..end].to_string());
+                    }
+                    from = start;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn every_kin_db_env_read_is_registered() {
+        // The gap this closes: kin-db reads its embedding surface from the process
+        // environment, but the registry only knew a handful of those names, so the
+        // startup audit called a working OpenAI-compatible setup "unrecognized … no
+        // effect" and strict mode refused to start. A whole-repo grep in kin cannot
+        // see any of it, because the reads live in a pinned registry dependency.
+        let allow = load_dependency_env_allowlist(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        let unregistered = |names: &std::collections::BTreeSet<String>| {
+            names
+                .iter()
+                .filter(|n| !is_known(n) && !allow.contains(*n))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // Baseline arm: always runs, so the test can still fail where the vendored
+        // source is absent (a packaged or offline build layout).
+        let baseline: std::collections::BTreeSet<String> =
+            KIN_DB_ENV_READS.iter().map(|s| s.to_string()).collect();
+        assert!(
+            unregistered(&baseline).is_empty(),
+            "these KIN_* vars are read by the pinned kin-db but registered nowhere: {:?}",
+            unregistered(&baseline)
+        );
+
+        // Enumeration arm: rebuild the read set from the vendored crate so a kin-db
+        // that adds a variable, or a pin bump that brings one in, fails here instead
+        // of silently drifting.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Some(version) = pinned_kin_db_version(&root) else {
+            eprintln!("Cargo.lock not readable; kin-db enumeration arm did not run");
+            return;
+        };
+        let Some(src) = vendored_crate_src(&format!("kin-db-{version}")) else {
+            eprintln!("vendored kin-db-{version} source not on disk; enumeration arm did not run");
+            return;
+        };
+        let scanned = scan_kin_literals(&src);
+        // Control: an enumeration that found nothing, or lost names the pinned list
+        // already proves are there, means the scan pointed somewhere wrong. Without
+        // this, an empty result would read as a clean parity pass.
+        let lost: Vec<&String> = baseline.difference(&scanned).collect();
+        assert!(
+            lost.is_empty(),
+            "the kin-db source scan at {src:?} lost known-present names {lost:?}; \
+             the scan is not looking at the pinned crate"
+        );
+        assert!(
+            unregistered(&scanned).is_empty(),
+            "these KIN_* vars appear in kin-db-{version} source but are registered \
+             nowhere (register them in DOWNSTREAM in env_registry.rs, or, for a name \
+             that is genuinely not an operator-facing variable, add it to \
+             crates/kin-core/dependency_env_allowlist.txt): {:?}",
+            unregistered(&scanned)
+        );
+    }
+
     // ---- workspace env-read completeness ----------------------------------
 
     /// Extract every `KIN_*` name read through the direct `env::var` / `env::var_os`
@@ -1296,11 +1636,11 @@ mod tests {
         found
     }
 
-    /// Load the intentional-exception allowlist (one `KIN_*` name per line, `#`
+    /// Load an intentional-exception allowlist (one `KIN_*` name per line, `#`
     /// comments and blanks ignored). Missing file → empty set.
-    fn load_env_var_allowlist(manifest: &std::path::Path) -> std::collections::BTreeSet<String> {
+    fn load_allowlist(path: &std::path::Path) -> std::collections::BTreeSet<String> {
         let mut set = std::collections::BTreeSet::new();
-        if let Ok(text) = std::fs::read_to_string(manifest.join("env_var_allowlist.txt")) {
+        if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines() {
                 let line = line.trim();
                 if !line.is_empty() && !line.starts_with('#') {
@@ -1309,6 +1649,18 @@ mod tests {
             }
         }
         set
+    }
+
+    /// Exceptions for kin's own read sites.
+    fn load_env_var_allowlist(manifest: &std::path::Path) -> std::collections::BTreeSet<String> {
+        load_allowlist(&manifest.join("env_var_allowlist.txt"))
+    }
+
+    /// Exceptions for names appearing in a pinned dependency's source.
+    fn load_dependency_env_allowlist(
+        manifest: &std::path::Path,
+    ) -> std::collections::BTreeSet<String> {
+        load_allowlist(&manifest.join("dependency_env_allowlist.txt"))
     }
 
     #[test]
