@@ -57,11 +57,21 @@ def probe_tree(destination: Path) -> Path:
 
 
 def poison(tree: Path, relative: str, old: str, new: str) -> None:
+    """Plant one mutation at an anchor that appears exactly once.
+
+    Requiring uniqueness is not pedantry. The near-miss probe first landed on
+    the attestation list because the bare asset name appears in several lists,
+    which left the list under test untouched and the guard correctly green, so
+    the probe proved nothing while reporting that it had.
+    """
+
     path = tree / relative
     source = path.read_text(encoding="utf-8")
-    if source.count(old) < 1:
+    found = source.count(old)
+    if found != 1:
         raise FalsificationError(
-            f"probe could not plant its mutation: {relative} does not contain {old!r}"
+            f"probe could not plant its mutation: {relative} contains {found} "
+            f"occurrences of {old!r}, expected exactly one"
         )
     path.write_text(source.replace(old, new, 1), encoding="utf-8")
 

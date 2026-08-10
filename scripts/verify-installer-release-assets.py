@@ -317,15 +317,18 @@ def required_assets() -> dict[str, Requirement]:
                 posix_installer_asset(INSTALL_SH, platform),
                 f"scripts/install.sh on {platform.label}",
             )
+        # The npm launcher and the PowerShell installer detect their platform
+        # from the running process rather than from uname, so they are reported
+        # against the artifact they resolve instead of against a shell name.
         if platform.node is not None:
             record(
                 npm_launcher_asset(NPM_PROVISION, *platform.node),
-                f"packages/kin/lib/provision.mjs on {platform.label}",
+                f"packages/kin/lib/provision.mjs for {platform.artifact}",
             )
         if platform.powershell:
             record(
                 powershell_installer_asset(INSTALL_PS1),
-                f"scripts/install.ps1 on {platform.label}",
+                f"scripts/install.ps1 for {platform.artifact}",
             )
     if not required:
         raise GuardError("no installer asset names were derived; the check is vacuous")
