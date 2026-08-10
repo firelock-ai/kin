@@ -76,6 +76,12 @@ def poison(tree: Path, relative: str, old: str, new: str) -> None:
     path.write_text(source.replace(old, new, 1), encoding="utf-8")
 
 
+def append(tree: Path, relative: str, text: str) -> None:
+    """Add a decoy at the end of a file, leaving the real content in place."""
+    path = tree / relative
+    path.write_text(path.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+
 def run_guard(tree: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(tree / GUARD), *args],
@@ -237,6 +243,121 @@ def unreadable_installer_probe(tree: Path) -> None:
     )
 
 
+DECOY_PUBLISH_JOB = """
+  decoy-publisher:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload something unrelated
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            kin-linux-x86_64.tar.gz
+            kin-linux-aarch64.tar.gz
+            kin-macos-x86_64.tar.gz
+            kin-macos-aarch64.tar.gz
+            kin-windows-x86_64.zip
+            kin-windows-x86_64.tar.gz
+"""
+
+DECOY_INVENTORY_JOB = """
+  decoy-inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check something unrelated
+        run: |
+          set -euo pipefail
+          assets=(
+            kin-linux-x86_64.tar.gz
+            kin-linux-aarch64.tar.gz
+            kin-macos-x86_64.tar.gz
+            kin-macos-aarch64.tar.gz
+            kin-windows-x86_64.zip
+            kin-windows-x86_64.tar.gz
+          )
+          echo "${assets[@]}"
+"""
+
+
+def decoy_publish_list_elsewhere(tree: Path) -> None:
+    """A later job's identical key must not answer for this step's list.
+
+    `files: |` is generic, and this workflow already reuses `assets=(` and
+    `subject-path:` in its promotion job, so a reformat of the real key is an
+    ordinary edit rather than an exotic one. Reformat it, plant a complete list
+    under the same key in an unrelated job, and genuinely drop the Windows
+    tarball from the real list. A search that runs past the end of its own step
+    reads the decoy, answers that everything is published, and exits clean.
+    """
+
+    poison(
+        tree,
+        ".github/workflows/release.yml",
+        "            kin-windows-x86_64.tar.gz\n            kin-windows-x86_64.tar.gz.sha256\n",
+        "",
+    )
+    poison(tree, ".github/workflows/release.yml", "          files: |\n", "          files:  |\n")
+    append(tree, ".github/workflows/release.yml", DECOY_PUBLISH_JOB)
+    expect_failure(
+        "a later job's file list cannot answer for the release upload step",
+        tree,
+        "carries 0 'files: |' blocks",
+    )
+
+
+def decoy_inventory_elsewhere(tree: Path) -> None:
+    poison(
+        tree,
+        ".github/workflows/release.yml",
+        "            kin-windows-x86_64.zip\n            kin-windows-x86_64.tar.gz\n          )\n",
+        "            kin-windows-x86_64.zip\n          )\n",
+    )
+    poison(tree, ".github/workflows/release.yml", "          assets=(\n", "          assets=( \n")
+    append(tree, ".github/workflows/release.yml", DECOY_INVENTORY_JOB)
+    expect_failure(
+        "a later job's asset array cannot answer for the inventory step",
+        tree,
+        "declares 0 asset lists",
+    )
+
+
+def duplicated_release_step(tree: Path) -> None:
+    # Hardening rather than a fixed regression: a duplicated step name resolved
+    # to whichever copy came first, which is a coin flip about which list the
+    # guard read. Refuse instead of picking.
+    append(tree, ".github/workflows/release.yml", DECOY_PUBLISH_JOB.replace(
+        "      - name: Upload something unrelated",
+        "      - name: Create GitHub Release",
+    ))
+    expect_failure(
+        "two steps claiming the release upload name are refused",
+        tree,
+        "names the step 'Create GitHub Release' 2 times",
+    )
+    # The message has to name the step a reader can find, not the raw anchor.
+    completed = run_guard(tree)
+    if "- name:" in (completed.stdout + completed.stderr):
+        raise FalsificationError(
+            "the duplicate-step failure quotes its raw YAML anchor instead of the step name"
+        )
+
+
+def ambiguous_powershell_arch_mapping(tree: Path) -> None:
+    # A block comment that looks like the live mapping. `search` would take the
+    # first match and derive the Windows asset name from text PowerShell never
+    # runs, so the mapping has to be unique or refused.
+    poison(
+        tree,
+        "scripts/install.ps1",
+        "function Resolve-KinWindowsArchiveArchitecture",
+        '<#\n    "AMD64" { return "itanium" }\n#>\nfunction Resolve-KinWindowsArchiveArchitecture',
+    )
+    expect_failure(
+        "install.ps1 maps AMD64 more than once",
+        tree,
+        "maps an AMD64 process architecture 2 times",
+    )
+
+
 def staged_release_assets(tree: Path) -> None:
     # The mode the release itself runs in: check the bytes about to be uploaded,
     # not the workflow's intent.
@@ -271,6 +392,10 @@ PROBES: tuple[tuple[str, Callable[[Path], None]], ...] = (
     ("installer extension drift", installer_extension_drift),
     ("unguarded release platform", unguarded_release_platform),
     ("unreadable installer probe", unreadable_installer_probe),
+    ("decoy publish list in a later job", decoy_publish_list_elsewhere),
+    ("decoy asset inventory in a later job", decoy_inventory_elsewhere),
+    ("duplicated release upload step", duplicated_release_step),
+    ("ambiguous PowerShell arch mapping", ambiguous_powershell_arch_mapping),
     ("staged release assets", staged_release_assets),
 )
 

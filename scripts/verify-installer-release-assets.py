@@ -206,28 +206,72 @@ def powershell_installer_asset(install_ps1: Path) -> str:
             f"{install_ps1.name} no longer builds its archive as `kin-$Target.<ext>`; "
             "this guard cannot derive the asset name it requests"
         )
-    arch = PS1_ARCH.search(source)
-    if arch is None:
+    # Exactly one, like its two siblings above. A bare `search` takes the first
+    # match anywhere in the file, so a line inside a block comment that happens
+    # to look like the mapping would be read as the mapping, and the guard would
+    # derive its Windows asset name from text PowerShell never executes.
+    arch_matches = PS1_ARCH.findall(source)
+    if len(arch_matches) != 1:
         raise GuardError(
-            f"{install_ps1.name} no longer maps an AMD64 process architecture; "
-            "this guard cannot derive the asset name it requests"
+            f"{install_ps1.name} maps an AMD64 process architecture "
+            f"{len(arch_matches)} times, expected exactly one; this guard cannot "
+            "tell which mapping the installer would resolve"
         )
-    return f"kin-windows-{arch.group('arch')}.{archive.group('ext')}"
+    return f"kin-windows-{arch_matches[0]}.{archive.group('ext')}"
+
+
+def step_label(step: str) -> str:
+    """A step anchor as its name alone, for readable failures."""
+    return step.strip().removeprefix("- name: ")
+
+
+def workflow_step_lines(workflow: str, step: str) -> list[str]:
+    """The lines belonging to one workflow step, and nothing past its end.
+
+    `files: |`, `subject-path: |`, and `assets=(` are generic, reusable keys,
+    and `release.yml` already carries a second `assets=(` and a second
+    `subject-path:` in its promotion job. A forward search that is not bounded
+    to the step it started in therefore does not fail when its own key drifts by
+    a byte; it falls through to an unrelated job's identical key and answers
+    from the wrong list, which is a check reporting success about something it
+    never read.
+
+    A step's extent ends at the next sibling step or at the first line that
+    dedents out of it. A step name that appears more than once is refused rather
+    than resolved to whichever copy came first.
+    """
+
+    lines = workflow.splitlines()
+    occurrences = [index for index, line in enumerate(lines) if line == step]
+    if len(occurrences) != 1:
+        raise GuardError(
+            f"release workflow names the step {step_label(step)!r} {len(occurrences)} "
+            "times, expected exactly one"
+        )
+    start = occurrences[0]
+    indent = len(step) - len(step.lstrip())
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        current = len(line) - len(line.lstrip())
+        if current < indent or (current == indent and line.lstrip().startswith("- ")):
+            end = index
+            break
+    return lines[start:end]
 
 
 def workflow_step_block(workflow: str, step: str, key: str) -> list[str]:
-    """The indented block under `key` inside the named workflow step."""
-    lines = workflow.splitlines()
-    try:
-        start = lines.index(step)
-    except ValueError as error:
-        raise GuardError(f"release workflow has no step {step.strip()!r}") from error
-    try:
-        key_index = lines.index(key, start)
-    except ValueError as error:
+    """The indented block under `key`, read only from inside the named step."""
+    lines = workflow_step_lines(workflow, step)
+    occurrences = [index for index, line in enumerate(lines) if line == key]
+    if len(occurrences) != 1:
         raise GuardError(
-            f"release workflow step {step.strip()!r} has no {key.strip()!r} block"
-        ) from error
+            f"release workflow step {step_label(step)!r} carries {len(occurrences)} "
+            f"{key.strip()!r} blocks, expected exactly one"
+        )
+    key_index = occurrences[0]
     indent = len(key) - len(key.lstrip()) + 2
     block: list[str] = []
     for line in lines[key_index + 1 :]:
@@ -238,20 +282,28 @@ def workflow_step_block(workflow: str, step: str, key: str) -> list[str]:
         block.append(line.strip())
     if not block:
         raise GuardError(
-            f"release workflow step {step.strip()!r} publishes an empty {key.strip()!r} block"
+            f"release workflow step {step_label(step)!r} publishes an empty {key.strip()!r} block"
         )
     return block
 
 
 def inventory_assets(workflow_source: str) -> set[str]:
-    """The asset list the publish job asserts is complete before it uploads."""
-    if INVENTORY_STEP not in workflow_source:
-        raise GuardError(f"release workflow has no step {INVENTORY_STEP.strip()!r}")
-    tail = workflow_source[workflow_source.index(INVENTORY_STEP) :]
-    match = INVENTORY_ASSETS.search(tail)
-    if match is None:
-        raise GuardError("release workflow's asset inventory declares no asset list")
-    return {line.strip() for line in match.group("body").splitlines() if line.strip()}
+    """The asset list the publish job asserts is complete before it uploads.
+
+    Bounded to its own step for the same reason as `workflow_step_block`: the
+    promotion job further down this workflow opens its own `assets=(` array, and
+    an unbounded search would answer with that one the moment this step's array
+    stopped matching.
+    """
+
+    step_source = "\n".join(workflow_step_lines(workflow_source, INVENTORY_STEP))
+    bodies = INVENTORY_ASSETS.findall(step_source)
+    if len(bodies) != 1:
+        raise GuardError(
+            f"release workflow's asset inventory declares {len(bodies)} asset "
+            "lists, expected exactly one"
+        )
+    return {line.strip() for line in bodies[0].splitlines() if line.strip()}
 
 
 def asset_sources(assets_dir: Path | None, workflow_source: str) -> list[tuple[str, set[str]]]:
