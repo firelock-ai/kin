@@ -442,6 +442,25 @@ fn daemon_client_headers(
     Ok(headers)
 }
 
+/// What one admission dispatch established.
+///
+/// The daemon runs a complete exact-tree admission in a task of its own, so a
+/// request that goes unanswered says nothing about the pass: it is still
+/// running, and a later request joins it rather than starting a second one.
+/// Collapsing that into an ordinary transport error would let a caller read "no
+/// answer" as "nothing happened", which is the one reading that is never true
+/// here.
+pub enum AdmitDispatch {
+    /// The daemon answered with a report. Terminal, whatever the report says:
+    /// a refused admission is an answer and carries its cause.
+    Answered(crate::commands::admit::AdmitResponse),
+    /// The daemon refused the request itself, so no pass was started by it.
+    Refused(anyhow::Error),
+    /// Nothing usable came back. The pass may be running, and its outcome is
+    /// not established either way.
+    Unanswered(anyhow::Error),
+}
+
 impl DaemonClient {
     pub fn from_base_url(base_url: impl Into<String>) -> Result<Self> {
         Self::from_base_url_with_token(base_url, resolve_daemon_auth_token())
@@ -1467,16 +1486,84 @@ impl DaemonClient {
 
     /// Request one complete exact-tree admission.
     ///
-    /// Idempotent by construction rather than by convention: the pass observes
-    /// the whole working directory and publishes the difference, so a retried
-    /// request re-observes the tree the first one already admitted and finds
-    /// nothing to do. That is what makes it safe on the shared retrying poster.
-    pub async fn admit(
-        &self,
-        request: &crate::commands::admit::AdmitRequest,
-    ) -> Result<crate::commands::admit::AdmitResponse> {
-        self.post_idempotent_json("/commands/admit", request, "admit")
+    /// Deliberately not on the shared retrying poster. That poster retries a
+    /// transport failure with the same payload, and here the first attempt may
+    /// have left a pass running that already published the tree: the retry then
+    /// observes a tree with nothing to do, and the fast empty-delta answer it
+    /// gets back reports a complete admission for a pass whose enrichment never
+    /// ran. One dispatch keeps the two facts apart, and the caller waits by
+    /// asking again on purpose rather than by being retried silently.
+    pub async fn admit(&self, request: &crate::commands::admit::AdmitRequest) -> AdmitDispatch {
+        let url = format!("{}/commands/admit", self.base_url.trim_end_matches('/'));
+        let payload = match serde_json::to_vec(request) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return AdmitDispatch::Refused(
+                    anyhow::Error::new(error).context("encode the admission request"),
+                )
+            }
+        };
+        let response = match self
+            .one_dispatch_client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
+            .send()
             .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return AdmitDispatch::Unanswered(
+                    anyhow::Error::new(error)
+                        .context(daemon_send_failure_message(&self.base_url, "admit")),
+                )
+            }
+        };
+        if let Err(error) = check_response_build_match(response.headers()) {
+            return AdmitDispatch::Refused(error);
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return AdmitDispatch::Refused(daemon_http_error(
+                &self.base_url,
+                "admit",
+                status.as_u16(),
+                &body,
+            ));
+        }
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                return AdmitDispatch::Unanswered(
+                    anyhow::Error::new(error).context("read the admission response body"),
+                )
+            }
+        };
+        match serde_json::from_slice(&body) {
+            Ok(decoded) => AdmitDispatch::Answered(decoded),
+            Err(error) => AdmitDispatch::Unanswered(
+                anyhow::Error::new(error).context("decode the admission response"),
+            ),
+        }
+    }
+
+    /// Whether the daemon is answering at all, on a budget short enough to be
+    /// asked while another request is outstanding.
+    ///
+    /// A command waiting on work the daemon is doing has to tell "still
+    /// running" from "gone", and the request it is waiting on cannot answer
+    /// that: both look like nothing coming back. Deliberately a bool, because
+    /// the only thing it establishes is reachability, and a daemon that is
+    /// reachable has said nothing about the work.
+    pub async fn is_reachable(&self) -> bool {
+        self.one_dispatch_client
+            .get(format!("{}/health", self.base_url.trim_end_matches('/')))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
     }
 
     pub async fn rollback(

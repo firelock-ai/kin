@@ -1280,6 +1280,11 @@ pub struct DaemonState {
     /// process on a user's box, so nothing outside it can notice a wedged pass;
     /// this is where that noticing lives.
     pub background_work: Arc<crate::background_work::BackgroundWorkSupervisor>,
+    /// The requested complete exact-tree admission this daemon currently has in
+    /// flight, if any. Such a pass runs detached from the request that asked for
+    /// it, so it needs a home that outlives that request, and a second request
+    /// needs somewhere to find it rather than starting a competing pass.
+    pub(crate) admission_runs: crate::repository_admit::AdmissionRuns,
     /// Why the views this daemon derives from repository authority stopped
     /// matching it, or `None` when they match.
     ///
@@ -2223,6 +2228,7 @@ impl DaemonState {
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
+            admission_runs: crate::repository_admit::AdmissionRuns::default(),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
             #[cfg(all(test, feature = "embeddings"))]
@@ -2440,6 +2446,7 @@ impl DaemonState {
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
+            admission_runs: crate::repository_admit::AdmissionRuns::default(),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
             #[cfg(all(test, feature = "embeddings"))]

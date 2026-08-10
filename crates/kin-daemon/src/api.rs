@@ -3954,11 +3954,6 @@ async fn command_tag(
     Ok(Json(response))
 }
 
-/// POST /commands/purge-ignored — retire tracked paths that ignore rules cover.
-///
-/// Reports without mutating unless the request confirms. The coordination gate
-/// is held for both, so the watch loop cannot admit a competing observation
-/// between the tracked set this reports and the transition it publishes.
 /// POST /commands/admit — run one complete exact-tree admission on demand.
 ///
 /// The trigger the daemon otherwise does not have. Its ambient admissions are
@@ -3967,6 +3962,10 @@ async fn command_tag(
 /// daemon idles out before that happens, which is why the caller is expected to
 /// hold a registered session across this request: any session whose vendor is
 /// not `kin-daemon` suppresses idle shutdown for as long as it is held.
+///
+/// The pass this starts is not this request. It runs detached, so hanging up
+/// stops the waiting rather than the admission, and a second request joins the
+/// running pass instead of starting one.
 async fn command_admit(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -3994,6 +3993,9 @@ async fn command_admit(
                 .to_string(),
         ));
     }
+    if let Some(condition) = admission_seam_would_skip(&state) {
+        return Err(condition);
+    }
 
     // No coordination gate here: the admission seam takes it, and the mutex is
     // not reentrant.
@@ -4003,6 +4005,55 @@ async fn command_admit(
     Ok(Json(response))
 }
 
+/// The refusal for a daemon whose admission seam would return without running,
+/// or `None` where a requested pass is real work.
+///
+/// The seam skips silently in two conditions, and a silent skip is
+/// indistinguishable from a pass that ran and found nothing settled: filesystem
+/// reconcile disabled, and a working directory that is a bare Git repository
+/// with no working copy to admit. Answering either with a report would stamp a
+/// successful admission on the reconcile probes for a pass that never happened,
+/// and every health surface would then say a recent admission succeeded on a
+/// store whose graph is still behind. Commit and stash refuse the disabled
+/// condition ahead of the same seam; this refuses both.
+///
+/// The bare-repository question is asked here the way
+/// `loop_runner::is_bare_repository` asks it, and the two have to stay in step:
+/// a divergence would either refuse a store the seam would have admitted or
+/// admit a skip as a success again.
+fn admission_seam_would_skip(state: &DaemonState) -> Option<(StatusCode, String)> {
+    let working_dir = state.layout.working_dir();
+    if state.filesystem_reconcile_disabled() {
+        return Some(filesystem_ingest_disabled_response(
+            "/commands/admit",
+            &working_dir.display().to_string(),
+        ));
+    }
+    let bare = working_dir.join("config").is_file()
+        && working_dir.join("objects").is_dir()
+        && working_dir.join("refs").is_dir()
+        && !working_dir.join(".git").exists();
+    if bare {
+        return Some((
+            StatusCode::CONFLICT,
+            json!({
+                "error": "bare_repository_has_no_working_copy",
+                "endpoint": "/commands/admit",
+                "path": working_dir.display().to_string(),
+                "mutation_applied": false,
+                "authority": "repository_v6",
+            })
+            .to_string(),
+        ));
+    }
+    None
+}
+
+/// POST /commands/purge-ignored — retire tracked paths that ignore rules cover.
+///
+/// Reports without mutating unless the request confirms. The coordination gate
+/// is held for both, so the watch loop cannot admit a competing observation
+/// between the tracked set this reports and the transition it publishes.
 async fn command_purge_ignored(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -18310,23 +18361,21 @@ mod tests {
             .collect()
     }
 
+    fn admit_request() -> Request<Body> {
+        Request::post("/commands/admit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "operation_id": kin_model::OperationId::new(),
+                    "actor": AuthorId::new("admit-acceptance")
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
     async fn admit_through_api(app: &axum::Router) -> (StatusCode, serde_json::Value) {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/commands/admit")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operation_id": kin_model::OperationId::new(),
-                            "actor": AuthorId::new("admit-acceptance")
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = app.clone().oneshot(admit_request()).await.unwrap();
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
             .await
@@ -18510,6 +18559,175 @@ mod tests {
         assert_eq!(
             replay["report"]["tracked_before"],
             replay["report"]["tracked_after"]
+        );
+    }
+
+    /// A request that hangs up mid-pass must never become a retry that reports a
+    /// complete admission.
+    ///
+    /// The seam publishes repository authority before it enriches and has one
+    /// await between the two, so a client timeout could cancel the pass exactly
+    /// there, leaving the tree admitted with nothing parsed for it. Nothing
+    /// re-enriches a file that did not change, so the next request observed a
+    /// settled tree, found no deltas, and answered with a complete admission
+    /// that had skipped every entity in the backlog.
+    ///
+    /// This drives that sequence: the pass is parked at its one await, the
+    /// request waiting on it is dropped, and the attempt that follows has to
+    /// report the real transition rather than an empty one.
+    #[tokio::test]
+    async fn a_client_timeout_mid_pass_never_lets_a_retry_report_a_complete_admission() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        install_working_copy_file(
+            &state,
+            "src/admitted.rs",
+            b"pub fn admitted() -> u8 {\n    7\n}\n",
+            false,
+        );
+
+        // Precondition: nothing is admitted and nothing is enriched, so neither
+        // half of the assertion below can pass on the fixture.
+        assert!(tracked_paths(&state).is_empty(), "the fixture pre-admitted");
+        assert_eq!(state.graph.entity_count(), 0);
+
+        // The seam's single await is the reconciler write lock, so holding it
+        // parks the pass precisely where a hang-up used to cancel it.
+        let held = state.reconciler.write().await;
+
+        let mut abandoned = Box::pin(crate::repository_admit::execute(&state));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(abandoned.as_mut(), &mut context).is_pending(),
+            "the request must be waiting on a pass rather than running one"
+        );
+        // The client hung up: an HTTP timeout, or an interrupt.
+        drop(abandoned);
+
+        let retry = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { crate::repository_admit::execute(&state).await }
+        });
+        // Let the abandoned pass and the retry both reach the lock this test
+        // holds before releasing it.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        drop(held);
+
+        let response = retry.await.unwrap().expect("the pass reported an outcome");
+        let report = response.report.expect("a reported pass carries its report");
+        assert!(report.admitted, "{:?}", report.failure);
+        assert!(
+            tracked_paths(&state).contains("src/admitted.rs"),
+            "the abandoned request took its own admission down with it"
+        );
+        assert!(
+            report.entities_after > 0,
+            "an admission whose enrichment was skipped read as complete: {report:?}"
+        );
+        assert!(
+            response.mutated,
+            "the pass moved the graph and the report denied it: {report:?}"
+        );
+    }
+
+    /// A daemon whose admission seam would decline to run has to refuse, not
+    /// report.
+    ///
+    /// The seam returns without running when filesystem reconcile is disabled,
+    /// and that silent skip is indistinguishable from a pass that ran and found
+    /// a settled tree. Answering it with a report would stamp a successful
+    /// admission on the probes every health surface reads, on a daemon where no
+    /// admission can happen at all, while the locate degradation added beside
+    /// this command tells the operator to run exactly this.
+    #[tokio::test]
+    async fn an_admission_refuses_on_a_daemon_whose_seam_would_silently_skip() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        install_working_copy_file(&state, "docs/notes.md", b"notes\n", false);
+        state
+            .filesystem_reconcile_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(admit_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refusal["error"], json!("filesystem_admission_disabled"));
+        assert_eq!(refusal["mutation_applied"], json!(false));
+
+        // The refusal has to leave the health surfaces telling the truth: no
+        // admission succeeded here, because none ran.
+        let probes = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert!(
+            probes.last_admission_success_age_seconds.is_none(),
+            "a refused request stamped a successful admission on the probes"
+        );
+        assert!(tracked_paths(&state).is_empty());
+    }
+
+    /// The seam's other silent skip. A bare Git repository has no working copy
+    /// to admit, so the pass returns without running, and the refusal is what
+    /// keeps that from reading as an admission that succeeded.
+    ///
+    /// The predicate is asked here rather than shared with the seam, so this
+    /// pins both directions: an ordinary working directory is admitted, and one
+    /// carrying a bare repository's own layout is refused.
+    #[tokio::test]
+    async fn an_admission_refuses_on_a_bare_repository_the_seam_would_skip() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            admission_seam_would_skip(&state).is_none(),
+            "the fixture already refuses, so this cannot discriminate"
+        );
+
+        let working_dir = state.layout.working_dir().to_path_buf();
+        std::fs::write(working_dir.join("config"), b"[core]\n\tbare = true\n").unwrap();
+        std::fs::create_dir_all(working_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(working_dir.join("refs")).unwrap();
+        let git = working_dir.join(".git");
+        if git.is_dir() {
+            std::fs::remove_dir_all(&git).unwrap();
+        } else if git.exists() {
+            std::fs::remove_file(&git).unwrap();
+        }
+
+        let response = router(Arc::clone(&state))
+            .oneshot(admit_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refusal["error"],
+            json!("bare_repository_has_no_working_copy")
+        );
+
+        let probes = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert!(
+            probes.last_admission_success_age_seconds.is_none(),
+            "a refused request stamped a successful admission on the probes"
         );
     }
 
