@@ -538,8 +538,8 @@ fn exact_tree_admission(
         // them: this refusal is why a freshly written file is not queryable, and
         // a surface that reports only what the loop admitted cannot say so. The
         // scan behind this is complete, so it replaces the previous answer
-        // instead of adding to it, and a path a commit later admits stops being
-        // reported on the very next tick.
+        // instead of adding to it, and the explicit seam below replaces it again
+        // as soon as a commit admits what was declined.
         state
             .background_work
             .reconcile()
@@ -628,6 +628,22 @@ fn exact_tree_admission(
             tree_deltas: deltas.clone(),
             ..TransactionDelta::default()
         })?;
+    }
+
+    if observation.is_none() {
+        // An explicit seam admits every host path the complete walk met, so
+        // once it publishes, nothing the working copy holds is untracked. Say
+        // so here rather than waiting for the next ambient tick: a commit
+        // produces no watcher event of its own, since the daemon's own writes
+        // land under `.kin` and the watcher drops control paths before they
+        // reach the queue. On a quiescent working copy the next tick never
+        // arrives, and the surfaces would keep naming a path this admission
+        // just made queryable. It is recorded after publication, not before, so
+        // a refused observation leaves a still-true record standing.
+        state
+            .background_work
+            .reconcile()
+            .record_untracked_observation(std::iter::empty::<&RepoPath>());
     }
 
     Ok(ExactTreeAdmission {
@@ -2428,6 +2444,57 @@ mod tests {
         };
         assert!(tree_changed);
         assert!(tree_entry(&state, "brand_new.rs").is_some());
+    }
+
+    /// The disclosure is the loop's answer to why a file is not queryable, so it
+    /// has to stop being that answer the moment a commit admits the path.
+    ///
+    /// Nothing else would clear it. A commit reaches authority through the
+    /// explicit seam and produces no watcher event of its own, so on a working
+    /// copy nobody is editing there is no next ambient tick to replace the
+    /// record. The surface would keep naming a path whose entities resolve,
+    /// which is the same misdirection FIR-2152 set out to remove.
+    #[test]
+    fn admitting_a_declined_path_clears_its_disclosure_without_another_host_event() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let path = repo.path().join("brand_new.rs");
+        std::fs::write(&path, b"pub fn brand_new() -> u32 { 2152 }\n").unwrap();
+
+        admit_file_event_ambient(&state, &FileEvent::Changed(path)).unwrap();
+        let declined = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert_eq!(declined.untracked_path_count, 1);
+        assert_eq!(declined.untracked_paths_sample, vec!["brand_new.rs"]);
+
+        // The commit seam, and nothing after it: no watcher event is delivered,
+        // which is exactly the quiescent working copy the stale record survived
+        // on.
+        exact_tree_admission(&state, None).unwrap();
+        assert!(
+            tree_entry(&state, "brand_new.rs").is_some(),
+            "the seam must admit the path this disclosure was about"
+        );
+
+        let admitted = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert_eq!(
+            admitted.untracked_path_count, 0,
+            "a path repository authority now carries is not untracked host content"
+        );
+        assert!(admitted.untracked_paths_sample.is_empty());
+        assert!(
+            !admitted
+                .notices()
+                .iter()
+                .any(|notice| notice.contains("brand_new.rs")),
+            "no surface may keep calling an admitted path untracked: {:?}",
+            admitted.notices()
+        );
     }
 
     /// The control that keeps the decline narrow: once a path is tracked, an
