@@ -318,6 +318,9 @@ async fn resolve_feature_target(work_id: &str) -> Result<String> {
 }
 
 pub async fn run(change_id: Option<String>, feature: Option<String>) -> Result<()> {
+    // Clap refuses both arms below before dispatch, with a usage block and
+    // exit 2. They stay as the backstop for any other caller, and because they
+    // name the remedy and the command that supplies the missing value.
     let change_id = match (change_id, feature) {
         (Some(_), Some(_)) => {
             anyhow::bail!("name a change to roll back to, or a work item with --feature, not both")

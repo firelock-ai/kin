@@ -386,6 +386,28 @@
       "note": "The session scanner performs retained-root double observation and authority-root CAS, and its observation now owns the retained no-follow directory capability it was taken through. Every field is private, so the observation cannot be built outside the scanner, and planning re-proves the retained capability before anything is planned against it."
     },
     {
+      "command": "purge-ignored",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 authority transition published through the daemon coordination gate",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "report the tracked paths current ignore rules cover without changing anything unless --confirm is given",
+        "publish the retirement as one authority transition, holding the coordination gate so the watch loop cannot admit a competing observation between the reported set and the published change",
+        "evict the entities, layout, and index presence derived from a retired path so it stops ranking, leaving the file on disk",
+        "refuse a purge that removes more than 75% of a non-trivial tree unless --confirm-mass-deletion accepts it"
+      ],
+      "evidence_tests": [
+        "kin_cli::commands::purge_ignored::tests::dry_run_summary_names_counts_and_refuses_to_claim_a_change",
+        "kin_cli::commands::purge_ignored::tests::applied_summary_reports_the_published_transition_not_the_planned_set",
+        "kin_cli::commands::purge_ignored::tests::a_transition_wider_than_the_purge_set_is_reported_as_such",
+        "kin_daemon::api::tests::purge_ignored_untracks_admitted_derived_output_and_survives_restart",
+        "kin_daemon::api::tests::purge_ignored_honors_a_readmitted_default",
+        "kin_daemon::api::tests::purge_ignored_evicts_the_entities_that_made_a_path_rank"
+      ],
+      "note": "Admission retracts a tracked path once the rules cover it, so this exists for the operator who wants to see the covered set before the next observation clears it, or to retire it now. The default is a dry run naming counts and a bounded path sample. A confirmed purge plans from a complete working-directory walk and reports what the transition did rather than what was planned, because that walk can also carry an edit made since the last watch-loop tick."
+    },
+    {
       "command": "conflicts",
       "status": "ready",
       "exposure": "enabled",

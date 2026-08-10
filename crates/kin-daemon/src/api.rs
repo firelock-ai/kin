@@ -20304,7 +20304,7 @@ mod tests {
         std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let scope = ProcessScope::enter(state.layout.working_dir(), editor_dir.path());
-        let opened = kin_cli::commands::session_run::open("code".to_string(), false, false).await;
+        let opened = kin_cli::commands::session_run::open("code".to_string()).await;
         drop(scope);
         opened.expect("launch an allowlisted editor over a session projection");
 

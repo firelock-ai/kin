@@ -35,15 +35,45 @@ Start here:
 Ask the graph:
   kin locate / search / trace / impact / refs / context
 
-Commands marked [OPEN GATE] are fail-closed on repository-v6 and say why when
-run. `kin capabilities` prints the full readiness matrix, `--json` for machines.";
+`kin capabilities` prints the full readiness matrix, `--json` for machines.";
+
+/// The `[OPEN GATE]` legend, which is only true while something carries the
+/// marker.
+const OPEN_GATE_LEGEND: &str = "\n\nCommands marked [OPEN GATE] are fail-closed on \
+repository-v6 and say why when run.";
+
+/// Root after-help, with the open-gate legend appended only when the inventory
+/// actually reports a gate.
+///
+/// The legend teaches a marker, so printing it when nothing is marked tells a
+/// caller scanning the list for what works that everything is ready. It had
+/// been doing exactly that: the gates all closed, the markers came off, and the
+/// sentence describing them stayed, pinned by a test asserting the bare string.
+///
+/// An unreadable inventory drops the legend rather than failing, because help
+/// has to render; a broken inventory is reported by `kin capabilities`, which
+/// is the command that exists to read it.
+fn after_help() -> String {
+    let gated = commands::capabilities::inventory()
+        .map(|inventory| {
+            inventory.commands.iter().any(|capability| {
+                capability.status == commands::capabilities::CapabilityStatus::OpenGate
+            })
+        })
+        .unwrap_or(false);
+    if gated {
+        format!("{AFTER_HELP}{OPEN_GATE_LEGEND}")
+    } else {
+        AFTER_HELP.to_string()
+    }
+}
 
 #[derive(Parser)]
 #[command(
     name = "kin",
     version = kin_buildinfo::version(),
     about = "Kin semantic VCS",
-    after_help = AFTER_HELP,
+    after_help = after_help(),
 )]
 struct Cli {
     /// Write a machine-readable execution profile to this JSON file
@@ -65,6 +95,9 @@ enum Command {
         /// Output the versioned capability inventory as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Add the per-command notes under each matrix row
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Initialize a new Kin repository
     Init {
@@ -158,6 +191,9 @@ enum Command {
         /// Assistant hint for tuning context pack strategy
         #[arg(long)]
         assistant: Option<String>,
+        /// Emit the resolved target and the whole context pack as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Hidden ContextBench locate wrapper that keeps benchmark query shaping inside Kin
     #[command(hide = true)]
@@ -380,14 +416,14 @@ enum Command {
     /// Show upstream callers/importers/references for an entity
     Refs {
         /// Entity name or ID. Required unless --bulk-json + --entities is provided.
-        #[arg(default_value = "")]
-        entity: String,
+        #[arg(required_unless_present = "bulk_json")]
+        entity: Option<String>,
         /// Filter relation kinds: all, calls, imports, or references (or Any for bulk mode)
         #[arg(long, default_value = "all")]
         kind: String,
         /// Bulk mode: classify many entities by reachability in one daemon call.
         /// Outputs JSON to stdout. Requires --entities.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, requires = "entities")]
         bulk_json: bool,
         /// Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set.
         #[arg(long)]
@@ -504,6 +540,18 @@ enum Command {
         json: bool,
     },
     /// Resolve repository-v6 merge conflicts
+    ///
+    /// Nine flags name a resolution and at least one is required, which is a
+    /// group rather than a per-argument condition. `kin conflicts` is the
+    /// read-only view of the same transaction, so nothing here has to accept
+    /// an empty invocation in order to be inspectable.
+    #[command(group = clap::ArgGroup::new("resolution")
+        .required(true)
+        .multiple(true)
+        .args([
+            "ours", "theirs", "base", "remove", "keep_path",
+            "all_ours", "all_theirs", "do_continue", "abort",
+        ]))]
     Resolve {
         /// Keep your (target branch) version of a conflicting identity
         #[arg(long, value_name = "SELECTOR")]
@@ -760,6 +808,7 @@ enum Command {
     #[command(visible_alias = "revert")]
     Rollback {
         /// Change ID to rollback to. Omit when naming a work item with --feature.
+        #[arg(required_unless_present = "feature", conflicts_with = "feature")]
         change_id: Option<String>,
         /// Roll back every change the named work item records
         #[arg(long)]
@@ -836,31 +885,11 @@ enum Command {
     Open {
         /// Editor to launch: code or cursor
         editor: String,
-        /// In native mode, block filesystem discovery commands and require Kin discovery
-        #[arg(long)]
-        restrict_discovery: bool,
-        /// In native mode, block both filesystem discovery and direct file reads
-        #[arg(long, conflicts_with = "restrict_discovery")]
-        restrict_filesystem: bool,
     },
     /// Launch an assistant in an exact graph-derived session workspace
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
-        /// Launch inside a graph-backed session workspace: the assistant starts
-        /// with its cwd in the session, receives session/daemon env, and its
-        /// changes reconcile into the graph on a successful exit
-        #[arg(long)]
-        session: bool,
-        /// Pass the raw task only; keep AGENTS/bootstrap docs on disk but do not inject prompt guidance
-        #[arg(long)]
-        passive_guidance: bool,
-        /// In native mode, block filesystem discovery commands and require Kin discovery
-        #[arg(long)]
-        restrict_discovery: bool,
-        /// In native mode, block both filesystem discovery and direct file reads
-        #[arg(long, conflicts_with = "restrict_discovery")]
-        restrict_filesystem: bool,
         /// Deny the assistant's native discovery tools for this launch, leaving
         /// Kin's semantic tools as the only discovery surface; the enforcement
         /// tier is printed at launch and differs per assistant
@@ -899,12 +928,6 @@ enum Command {
         /// Materialization strategy
         #[arg(long)]
         strategy: Option<String>,
-        /// In native mode, block filesystem discovery commands and require Kin discovery
-        #[arg(long)]
-        restrict_discovery: bool,
-        /// In native mode, block both filesystem discovery and direct file reads
-        #[arg(long, conflicts_with = "restrict_discovery")]
-        restrict_filesystem: bool,
     },
     /// Show a quick codebase overview (entity counts by kind, language, top files)
     Overview {
@@ -1271,6 +1294,11 @@ enum CacheAction {
         /// Output machine-readable JSON instead of a human summary
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Stop scanning after this many entries and report the partial totals.
+        /// Unset scans the whole cache, which on a bench-scale tree takes minutes
+        /// but is the only way the totals are exact
+        #[arg(long, value_name = "ENTRIES")]
+        limit: Option<u64>,
     },
     /// Reclaim space: drop abandoned schema versions and/or evict oldest entries to a budget
     Gc {
@@ -1403,12 +1431,16 @@ enum ReviewAction {
     Shadow {
         /// Change range as <base>..<head>. Refs accept branch names,
         /// semantic change IDs, and imported Git commit SHAs.
+        #[arg(
+            required_unless_present = "base",
+            conflicts_with_all = ["base", "head"]
+        )]
         range: Option<String>,
-        /// Base ref (alternative to the positional range)
-        #[arg(long)]
+        /// Base ref (alternative to the positional range; pair with --head)
+        #[arg(long, requires = "head")]
         base: Option<String>,
-        /// Head ref (alternative to the positional range)
-        #[arg(long)]
+        /// Head ref (alternative to the positional range; pair with --base)
+        #[arg(long, requires = "base")]
         head: Option<String>,
         /// Change title for the report (e.g. PR title)
         #[arg(long)]
@@ -2220,7 +2252,9 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Capabilities { json } => commands::capabilities::run(json),
+                Command::Capabilities { json, verbose } => {
+                    commands::capabilities::run(json, verbose)
+                }
                 Command::Init { path, json } => commands::init::run(path, json).await,
                 Command::Status { json, wait_quiesce } => {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
@@ -2273,7 +2307,8 @@ fn main() -> Result<()> {
                     entity,
                     budget,
                     assistant,
-                } => commands::context::run(entity, budget, assistant).await,
+                    json,
+                } => commands::context::run(entity, budget, assistant, json).await,
                 Command::ContextbenchLocate {
                     task_file,
                     json,
@@ -2586,20 +2621,16 @@ fn main() -> Result<()> {
                     compact,
                     no_compact,
                 } => {
+                    // Both requirements are clap's now, so a caller who names
+                    // nothing to operate on gets a usage block and exit 2 like
+                    // the other 45 leaves, instead of exit 1 and one line.
                     if bulk_json {
-                        let entities = entities.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "--bulk-json requires --entities (comma-separated entity UUIDs)"
-                            )
-                        })?;
+                        let entities =
+                            entities.expect("clap requires --entities alongside --bulk-json");
                         let effective_compact = compact && !no_compact;
                         commands::refs::run_bulk(entities, kind, effective_compact).await
                     } else {
-                        if entity.is_empty() {
-                            anyhow::bail!(
-                                "missing positional entity argument (or use --bulk-json --entities)"
-                            );
-                        }
+                        let entity = entity.expect("clap requires an entity without --bulk-json");
                         commands::refs::run(entity, kind).await
                     }
                 }
@@ -2622,8 +2653,14 @@ fn main() -> Result<()> {
                                 author,
                                 json,
                             } => {
+                                // Clap owns the choice between the positional
+                                // range and the --base/--head pair, and pairs
+                                // the two flags. What it cannot own is the
+                                // shape of the range string, which is checked
+                                // here because a value parser is the only other
+                                // place to put it.
                                 let (base, head) = match (range, base, head) {
-                                    (Some(range), None, None) => match range.split_once("..") {
+                                    (Some(range), _, _) => match range.split_once("..") {
                                         Some((base, head))
                                             if !base.is_empty() && !head.is_empty() =>
                                         {
@@ -2635,8 +2672,8 @@ fn main() -> Result<()> {
                                         ),
                                     },
                                     (None, Some(base), Some(head)) => (base, head),
-                                    _ => anyhow::bail!(
-                                        "provide a <base>..<head> range or both --base and --head"
+                                    _ => unreachable!(
+                                        "clap requires a range or both --base and --head"
                                     ),
                                 };
                                 commands::review::shadow_report(
@@ -2980,7 +3017,9 @@ fn main() -> Result<()> {
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
-                    CacheAction::Status { json } => commands::cache::status(json).await,
+                    CacheAction::Status { json, limit } => {
+                        commands::cache::status(json, limit).await
+                    }
                     CacheAction::Gc {
                         dry_run,
                         budget_gb,
@@ -3091,14 +3130,9 @@ fn main() -> Result<()> {
                 Command::Todo { action } => match action {
                     TodoAction::Import { path } => commands::note::todo_import(path).await,
                 },
-                Command::Open {
-                    editor,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => {
+                Command::Open { editor } => {
                     commands::capabilities::require_ready("open")?;
-                    commands::session_run::open(editor, restrict_discovery, restrict_filesystem)
-                        .await
+                    commands::session_run::open(editor).await
                 }
                 Command::PurgeIgnored {
                     confirm,
@@ -3116,43 +3150,19 @@ fn main() -> Result<()> {
                 }
                 Command::With {
                     assistant,
-                    session,
-                    passive_guidance,
-                    restrict_discovery,
-                    restrict_filesystem,
                     semantic_only,
                     task,
                 } => {
                     commands::capabilities::require_ready("with")?;
-                    commands::session_run::with(
-                        assistant,
-                        session,
-                        passive_guidance,
-                        restrict_discovery,
-                        restrict_filesystem,
-                        semantic_only,
-                        task,
-                    )
-                    .await
+                    commands::session_run::with(assistant, semantic_only, task).await
                 }
                 // Adjudicated before the runtime starts; see the early return
                 // at the top of `main`.
                 Command::SemanticOnlyGuard => {
                     commands::assistant_adapter::run_semantic_only_guard()
                 }
-                Command::Shell {
-                    strategy,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => {
+                Command::Shell { strategy } => {
                     commands::capabilities::require_ready("shell")?;
-                    if restrict_discovery || restrict_filesystem {
-                        anyhow::bail!(
-                            "--restrict-discovery and --restrict-filesystem belonged to the \
-                             discontinued native editor fork and are fail-closed; the session \
-                             projection is the boundary now"
-                        );
-                    }
                     commands::session_run::shell(strategy).await
                 }
                 Command::Overview { compact, json } => {
@@ -3881,6 +3891,78 @@ mod tests {
         });
     }
 
+    /// Not supplying the thing to operate on is one mistake, and it produced
+    /// two contracts: 45 leaves exited 2 with a usage block through clap, and a
+    /// handful exited 1 with a bare line. A caller keying on exit 2 for "I
+    /// called this wrong" misclassified the second set.
+    ///
+    /// These four moved to clap. `kin locate` and `kin scope` deliberately did
+    /// not: `locate --next` takes its query from a persisted cursor and `scope`
+    /// reads KIN_SESSION_ID, so a parse-time requirement would reject
+    /// invocations that work. Their argument is not optional to the command,
+    /// only to the command line, which is not something clap can express.
+    #[test]
+    fn a_missing_required_argument_is_a_usage_error_not_a_runtime_one() {
+        on_cli_test_stack(|| {
+            for argv in [
+                &["kin", "refs"][..],
+                &["kin", "rollback"][..],
+                &["kin", "resolve"][..],
+                &["kin", "review", "shadow"][..],
+            ] {
+                let error = Cli::try_parse_from(argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{argv:?} must not parse"));
+                assert_eq!(
+                    error.exit_code(),
+                    2,
+                    "{argv:?} must fail the way every other misuse does"
+                );
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains("Usage:"),
+                    "{argv:?} must print usage: {rendered}"
+                );
+            }
+
+            // Every shape that did work still parses. A required-group that
+            // over-reaches would take these with it, and each is the reason its
+            // command's requirement is conditional rather than plain.
+            for argv in [
+                &["kin", "refs", "Foo"][..],
+                &["kin", "refs", "--bulk-json", "--entities", "a,b"][..],
+                &["kin", "resolve", "--abort"][..],
+                &["kin", "resolve", "--all-ours", "--json"][..],
+                &["kin", "resolve", "--ours", "x", "--theirs", "y"][..],
+                &["kin", "review", "shadow", "main..head"][..],
+                &["kin", "review", "shadow", "--base", "a", "--head", "b"][..],
+                // Untouched on purpose: both take their input from somewhere
+                // the command line cannot see.
+                &["kin", "locate", "--next"][..],
+                &["kin", "scope"][..],
+            ] {
+                assert!(
+                    Cli::try_parse_from(argv).is_ok(),
+                    "{argv:?} must stay a complete invocation"
+                );
+            }
+
+            // Half-supplied pairs are refused at parse time too, rather than
+            // reaching a command body that has to re-derive what is missing.
+            for argv in [
+                &["kin", "refs", "--bulk-json"][..],
+                &["kin", "review", "shadow", "--base", "a"][..],
+                &["kin", "review", "shadow", "--head", "b"][..],
+                &["kin", "rollback", "abc123", "--feature", "w-1"][..],
+            ] {
+                let error = Cli::try_parse_from(argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{argv:?} must not parse"));
+                assert_eq!(error.exit_code(), 2, "{argv:?} must be a usage error");
+            }
+        });
+    }
+
     #[test]
     fn every_retired_command_path_names_its_replacement() {
         on_cli_test_stack(|| {
@@ -3991,13 +4073,46 @@ mod tests {
                 "kin status",
                 "kin commit",
                 "kin capabilities",
-                "[OPEN GATE]",
             ] {
                 assert!(
                     help.contains(anchor),
                     "help must orient a caller with {anchor:?}"
                 );
             }
+        });
+    }
+
+    /// The legend teaches a marker, so it may only appear while a marker does.
+    ///
+    /// Asserting the bare string was what let it outlive the thing it
+    /// describes: every gate closed, every marker came off, and the sentence
+    /// stayed, telling a caller to look for a signal that no command carried.
+    #[test]
+    fn the_open_gate_legend_appears_exactly_when_a_gate_does() {
+        on_cli_test_stack(|| {
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            let inventory =
+                commands::capabilities::inventory().expect("capability inventory must parse");
+            let gated = inventory.commands.iter().any(|capability| {
+                capability.status == commands::capabilities::CapabilityStatus::OpenGate
+            });
+
+            assert_eq!(
+                help.contains(OPEN_GATE_MARKER),
+                gated,
+                "the legend must track the inventory, which reports gated={gated}"
+            );
+
+            // The conditional is what is under test, so exercise both arms
+            // rather than only the one this inventory happens to select.
+            assert!(after_help().contains("Start here:"));
+            assert!(!AFTER_HELP.contains(OPEN_GATE_MARKER));
+            assert!(OPEN_GATE_LEGEND.contains(OPEN_GATE_MARKER));
+            assert!(
+                format!("{AFTER_HELP}{OPEN_GATE_LEGEND}").contains(OPEN_GATE_MARKER),
+                "the gated arm must carry the legend it exists to add"
+            );
         });
     }
 

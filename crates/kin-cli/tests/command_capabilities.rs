@@ -40,14 +40,14 @@ fn capability_json_keeps_the_bounded_dogfood_bar_explicit() {
     assert_eq!(report["bounded_dogfood_required_ready"], 12);
     assert_eq!(report["bounded_dogfood_required_total"], 12);
     assert_eq!(report["all_declared_command_surfaces_enabled"], true);
-    assert_eq!(report["enabled_commands"], 33);
+    assert_eq!(report["enabled_commands"], 34);
     assert_eq!(report["full_git_replacement_ready"], false);
     // Exact counts, so a silent re-seal cannot pass. They are also the reason
     // two lanes must never flip a gate in the same wave: both bumps merge
     // without conflict and main goes red with every pull request green.
     // Recount from the merged fixture rather than from either branch.
-    assert_eq!(report["ready_commands"], 32);
-    assert_eq!(report["command_total"], 33);
+    assert_eq!(report["ready_commands"], 33);
+    assert_eq!(report["command_total"], 34);
 
     let commands = report["commands"]
         .as_array()
@@ -136,6 +136,29 @@ fn exposed_mutation_commands_reach_repository_discovery() {
     assert!(
         !stderr.contains("is fail-closed on repository-v6"),
         "rename must no longer answer from the capability gate: {stderr}"
+    );
+    assert!(stderr.contains("not a Kin repository"), "{stderr}");
+
+    // `purge-ignored` was in the command tree with no inventory entry at all,
+    // so it took the undeclared arm and refused on every host, in every
+    // repository state. An undeclared command is unreachable rather than
+    // gated, which is why the absence of the gate message is not enough here:
+    // the discovery failure has to be present for this to mean the command
+    // runs.
+    let output = kin_command(&home)
+        .arg("purge-ignored")
+        .current_dir(root.path())
+        .output()
+        .expect("run purge-ignored outside a repository");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("is not available in this build"),
+        "purge-ignored must be declared in the capability inventory: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is fail-closed on repository-v6"),
+        "purge-ignored must not answer from the capability gate: {stderr}"
     );
     assert!(stderr.contains("not a Kin repository"), "{stderr}");
 }
@@ -231,10 +254,11 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
         );
     }
 
-    // The discontinued native-fork flags still refuse before anything runs, and
-    // so does `--session`: every launch is a session projection now, so a flag
-    // that used to select one can only mean something it no longer selects.
-    // Accepting and ignoring it would let a caller believe it chose something.
+    // The discontinued native-fork flags are gone rather than refused. A flag
+    // clap accepts and the body then rejects is advertised in help as though it
+    // works, which is what these four did: `--session` even described the
+    // current default, so its page sold an opt-in for something already true.
+    // Removal makes the parser the only answer, and it answers before launch.
     for args in [
         &["shell", "--restrict-discovery"][..],
         &["open", "code", "--restrict-filesystem"][..],
@@ -246,11 +270,59 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
             .current_dir(root.path())
             .output()
             .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
-        assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "kin {args:?} must exit 2 through clap, not 1 from a command body: {stderr}"
+        );
         assert!(
-            stderr.contains("fail-closed"),
-            "kin {args:?} must stay fail-closed: {stderr}"
+            stderr.contains("unexpected argument"),
+            "kin {args:?} must be refused by the parser: {stderr}"
+        );
+        assert!(
+            !stderr.contains("fail-closed"),
+            "kin {args:?} must no longer be advertised then refused: {stderr}"
+        );
+    }
+
+    // And they are absent from the pages that used to advertise them, which is
+    // the half a caller reads before typing anything.
+    for (command, gone) in [
+        (
+            &["shell", "--help"][..],
+            &["--restrict-discovery", "--restrict-filesystem"][..],
+        ),
+        (
+            &["open", "--help"][..],
+            &["--restrict-discovery", "--restrict-filesystem"][..],
+        ),
+        (
+            &["with", "--help"][..],
+            &[
+                "--session",
+                "--passive-guidance",
+                "--restrict-discovery",
+                "--restrict-filesystem",
+            ][..],
+        ),
+    ] {
+        let output = kin_command(&home)
+            .args(command)
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {command:?}: {error}"));
+        let help = String::from_utf8_lossy(&output.stdout);
+        for flag in gone {
+            assert!(
+                !help.contains(flag),
+                "kin {command:?} must not advertise {flag}: {help}"
+            );
+        }
+        // A positive control: the page still renders the flags it does carry,
+        // so an empty or failed render cannot pass this as an absence.
+        assert!(
+            help.contains("--help"),
+            "kin {command:?} must still render its options: {help}"
         );
     }
 
@@ -262,6 +334,104 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
         .expect("run kin open rm");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown editor"));
+}
+
+/// All three `kin stash` verbs name the same cause outside a repository.
+///
+/// `push` asked for a typed confirmation first, so it demanded consent to
+/// discard projected working files that do not exist, in a directory with
+/// nothing to seal. Its two siblings already reported discovery, which is what
+/// makes this a divergence rather than a house style.
+#[test]
+fn stash_push_names_the_missing_repository_before_asking_for_consent() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    for args in [
+        &["stash", "push"][..],
+        &["stash", "push", "--yes"][..],
+        &["stash", "list"][..],
+        &["stash", "pop"][..],
+    ] {
+        let output = kin_command(&home)
+            .args(args)
+            .current_dir(root.path())
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
+        assert!(!output.status.success(), "kin {args:?} must fail here");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not a Kin repository"),
+            "kin {args:?} must name the missing repository: {stderr}"
+        );
+        assert!(
+            !stderr.contains("pass --yes"),
+            "kin {args:?} must not ask for consent it cannot act on: {stderr}"
+        );
+    }
+}
+
+/// `kin capabilities` is where root help sends a caller to learn what works.
+/// It answered with 27KB of prose, one line of it past three thousand
+/// characters, which no terminal presents as an answer.
+#[test]
+fn capabilities_defaults_to_the_matrix_and_keeps_the_prose_behind_verbose() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let render = |args: &[&str]| {
+        let output = kin_command(&home)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
+        assert!(output.status.success(), "kin {args:?} must succeed");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+
+    let default = render(&["capabilities"]);
+    let verbose = render(&["capabilities", "--verbose"]);
+
+    // One row per command, and every row fits a terminal.
+    let widest = default.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        widest <= 80,
+        "the default view must fit a terminal; widest line is {widest} chars"
+    );
+    assert!(
+        default.len() < verbose.len() / 4,
+        "the default view must be far smaller than the prose one: {} vs {}",
+        default.len(),
+        verbose.len()
+    );
+
+    // Both views still answer the question, and both list every command.
+    for view in [&default, &verbose] {
+        assert!(view.contains("Bounded dogfood ready:"), "{view}");
+        for command in ["commit", "stash", "purge-ignored"] {
+            assert!(view.contains(command), "missing {command}: {view}");
+        }
+    }
+    assert!(
+        default.contains("--verbose"),
+        "the default view must say where the notes went: {default}"
+    );
+
+    // The notes are intact behind --verbose and complete in --json, which is
+    // what keeps this a change of default rather than a loss of detail.
+    let json = render(&["capabilities", "--json"]);
+    let report: Value = serde_json::from_str(&json).expect("capabilities --json must be JSON");
+    let note = report["commands"][0]["note"]
+        .as_str()
+        .expect("every command carries a note")
+        .to_string();
+    assert!(!note.is_empty());
+    assert!(verbose.contains(&note), "--verbose must render the note");
+    assert!(
+        !default.contains(&note),
+        "the default view must not render the note"
+    );
 }
 
 #[test]

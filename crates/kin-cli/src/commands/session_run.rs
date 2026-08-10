@@ -546,17 +546,7 @@ pub fn editor_program(editor: &str) -> Result<&'static str> {
 /// automatic admission on. `kin reconcile <session>` is both the admission and
 /// the collector: it removes the projection once the daemon has taken its
 /// delta, so a retained projection lives exactly until its changes land.
-pub async fn open(
-    editor: String,
-    restrict_discovery: bool,
-    restrict_filesystem: bool,
-) -> Result<()> {
-    if restrict_discovery || restrict_filesystem {
-        bail!(
-            "--restrict-discovery and --restrict-filesystem belonged to the discontinued native \
-             editor fork and are fail-closed; the session projection is the boundary now"
-        );
-    }
+pub async fn open(editor: String) -> Result<()> {
     let program = editor_program(&editor)?;
     let layout = discover_layout()?;
     let projection = materialize(layout, None, None).await?;
@@ -589,35 +579,7 @@ pub fn assistant_program(assistant: &str) -> Result<&'static str> {
 }
 
 /// `kin with <assistant> [-- <task...>]`.
-pub async fn with(
-    assistant: String,
-    session: bool,
-    passive_guidance: bool,
-    restrict_discovery: bool,
-    restrict_filesystem: bool,
-    semantic_only: bool,
-    task: Vec<String>,
-) -> Result<()> {
-    if restrict_discovery || restrict_filesystem {
-        bail!(
-            "--restrict-discovery and --restrict-filesystem belonged to the discontinued native \
-             editor fork and are fail-closed; the session projection is the boundary now"
-        );
-    }
-    if passive_guidance {
-        bail!(
-            "--passive-guidance is fail-closed: prompt-guidance injection was removed with the \
-             legacy assistant path, so there is no guidance to suppress"
-        );
-    }
-    if session {
-        bail!(
-            "--session is fail-closed: it was the opt-in when an unprojected assistant launch \
-             existed, and every launch is now a session projection, so the flag can only mean \
-             something it no longer selects"
-        );
-    }
-
+pub async fn with(assistant: String, semantic_only: bool, task: Vec<String>) -> Result<()> {
     let adapter = super::assistant_adapter::adapter_for(&assistant)?;
     let program = adapter.program();
 

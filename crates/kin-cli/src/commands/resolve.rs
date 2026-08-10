@@ -237,6 +237,9 @@ fn plan_action(
     if abort {
         return Ok(ResolveAction::Abort);
     }
+    // Clap's `resolution` group refuses this before dispatch, so a caller gets
+    // a usage block and exit 2. This stays as the backstop for any other caller
+    // of this function, and because it names the full remedy set inline.
     if !settling {
         bail!(
             "nothing to resolve; name a conflict with --ours/--theirs/--base/--remove/--keep-path, \
