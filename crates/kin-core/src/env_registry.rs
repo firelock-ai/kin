@@ -1309,7 +1309,10 @@ mod tests {
         ("KIN_EMBED_OPENAI_TIMEOUT_SECS", "120"),
         ("KIN_EMBED_OPENAI_QUERY_PREFIX", "search_query: "),
         ("KIN_EMBED_OPENAI_DOCUMENT_PREFIX", "search_document: "),
-        ("KIN_EMBED_OPENAI_REQUEST_JSON", "{\"encoding_format\":\"float\"}"),
+        (
+            "KIN_EMBED_OPENAI_REQUEST_JSON",
+            "{\"encoding_format\":\"float\"}",
+        ),
         ("KIN_EMBED_BACKEND", "cpu"),
         ("KIN_EMBED_BATCH_SIZE", "128"),
         ("KIN_EMBED_MAX_BATCH_TOKENS", "16384"),
@@ -1480,7 +1483,9 @@ mod tests {
     fn vendored_crate_src(crate_dir: &str) -> Option<std::path::PathBuf> {
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo")))?;
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo"))
+            })?;
         let registries = std::fs::read_dir(cargo_home.join("registry/src")).ok()?;
         for registry in registries.flatten() {
             let candidate = registry.path().join(crate_dir).join("src");
@@ -1545,9 +1550,7 @@ mod tests {
         // startup audit called a working OpenAI-compatible setup "unrecognized … no
         // effect" and strict mode refused to start. A whole-repo grep in kin cannot
         // see any of it, because the reads live in a pinned registry dependency.
-        let allow = load_dependency_env_allowlist(std::path::Path::new(env!(
-            "CARGO_MANIFEST_DIR"
-        )));
+        let allow = load_dependency_env_allowlist(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
         let unregistered = |names: &std::collections::BTreeSet<String>| {
             names
                 .iter()
@@ -1575,9 +1578,7 @@ mod tests {
             return;
         };
         let Some(src) = vendored_crate_src(&format!("kin-db-{version}")) else {
-            eprintln!(
-                "vendored kin-db-{version} source not on disk; enumeration arm did not run"
-            );
+            eprintln!("vendored kin-db-{version} source not on disk; enumeration arm did not run");
             return;
         };
         let scanned = scan_kin_literals(&src);
