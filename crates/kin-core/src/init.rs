@@ -23,7 +23,8 @@ use kin_model::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use tracing::{debug, info, info_span};
+use tracing::debug;
+use tracing::{info, info_span};
 
 use crate::config::KinConfig;
 use crate::error::{KinError, Result};
