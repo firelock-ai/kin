@@ -89,6 +89,35 @@ fn open_authority(
     (repository_id, manager)
 }
 
+/// Wait until the workspace tree is level with its base, or give up.
+///
+/// A watcher that admits observed host content leaves the workspace ahead of
+/// its base for as long as it takes the loop to drain a tick, and several
+/// repository transitions refuse over exactly that state. Polling authority is
+/// how a test asks "has the loop finished" without asserting on a clock.
+fn wait_for_level_workspace(layout: &kin_core::KinLayout, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        let (_, manager) = open_authority(layout);
+        let level = {
+            let lease = manager.read_authority();
+            lease
+                .metadata()
+                .workspaces
+                .first()
+                .map(|workspace| workspace.base_tree_hash == Some(workspace.tree_hash))
+                .unwrap_or(false)
+        };
+        if level {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn run_git(path: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -1067,6 +1096,28 @@ fn branch_switch_preserves_graph_only_gitlinks_without_traversing_nested_checkou
         [0_u8, 0xff, 0x44]
     );
     assert_workspace_has_no_path(&open_authority(&layout).1, b"vendor/dependency");
+
+    // Let the watcher finish with the events these switches produced before
+    // asking for another one. A switch refuses over a workspace holding content
+    // ahead of its base, and admitting observed host content is what the
+    // watcher now does, so a second switch issued while the loop is still
+    // draining is racing the product rather than testing it.
+    //
+    // The wait is bounded and its failure is specific. If the loop settles and
+    // the workspace is still ahead of its base, that is the one corner this
+    // pairing has: events beneath a graph-only member are dropped against the
+    // tree as it stands when they are drained, so events that outlive the
+    // member's removal are no longer recognised as belonging to an independent
+    // checkout, and the content underneath it is admitted like any other new
+    // file. The message says so rather than leaving a later reader to rediscover
+    // it from a timeout.
+    let settled = wait_for_level_workspace(&layout, Duration::from_secs(30));
+    assert!(
+        settled,
+        "the workspace never came level with its base. Host content beneath the removed Gitlink \
+         was admitted as ordinary new content, which happens when its watcher events are drained \
+         after the member is gone rather than while it is still there"
+    );
 
     let add_retained = run_kin(&runtime, &repo, &["branch", "switch", "gitlink-a"]);
     assert!(
