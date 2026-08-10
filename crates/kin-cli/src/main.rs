@@ -95,6 +95,9 @@ enum Command {
         /// Output the versioned capability inventory as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Add the per-command notes under each matrix row
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Initialize a new Kin repository
     Init {
@@ -2229,7 +2232,9 @@ fn main() -> Result<()> {
     let result = runtime.block_on(
         (async move {
             match cli.command {
-                Command::Capabilities { json } => commands::capabilities::run(json),
+                Command::Capabilities { json, verbose } => {
+                    commands::capabilities::run(json, verbose)
+                }
                 Command::Init { path, json } => commands::init::run(path, json).await,
                 Command::Status { json, wait_quiesce } => {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await

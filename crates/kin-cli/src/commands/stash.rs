@@ -131,6 +131,12 @@ pub async fn list(json: bool) -> Result<()> {
 
 pub async fn push(message: Option<String>, yes: bool) -> Result<()> {
     super::capabilities::require_ready("stash")?;
+    // Discover before asking for consent. Outside a repository there is nothing
+    // to seal and nothing to discard, so the confirmation named a cause that
+    // was not the cause: a caller who supplied --yes learned the real problem
+    // on the second try. `stash list` and `stash pop` already fail on
+    // discovery here, and this is what puts `push` back beside them.
+    let _ = crate::commands::require_repository_layout()?;
     if !yes {
         confirm_workspace_reset()?;
     }

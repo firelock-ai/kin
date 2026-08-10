@@ -336,6 +336,104 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown editor"));
 }
 
+/// All three `kin stash` verbs name the same cause outside a repository.
+///
+/// `push` asked for a typed confirmation first, so it demanded consent to
+/// discard projected working files that do not exist, in a directory with
+/// nothing to seal. Its two siblings already reported discovery, which is what
+/// makes this a divergence rather than a house style.
+#[test]
+fn stash_push_names_the_missing_repository_before_asking_for_consent() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    for args in [
+        &["stash", "push"][..],
+        &["stash", "push", "--yes"][..],
+        &["stash", "list"][..],
+        &["stash", "pop"][..],
+    ] {
+        let output = kin_command(&home)
+            .args(args)
+            .current_dir(root.path())
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
+        assert!(!output.status.success(), "kin {args:?} must fail here");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not a Kin repository"),
+            "kin {args:?} must name the missing repository: {stderr}"
+        );
+        assert!(
+            !stderr.contains("pass --yes"),
+            "kin {args:?} must not ask for consent it cannot act on: {stderr}"
+        );
+    }
+}
+
+/// `kin capabilities` is where root help sends a caller to learn what works.
+/// It answered with 27KB of prose, one line of it past three thousand
+/// characters, which no terminal presents as an answer.
+#[test]
+fn capabilities_defaults_to_the_matrix_and_keeps_the_prose_behind_verbose() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+
+    let render = |args: &[&str]| {
+        let output = kin_command(&home)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
+        assert!(output.status.success(), "kin {args:?} must succeed");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+
+    let default = render(&["capabilities"]);
+    let verbose = render(&["capabilities", "--verbose"]);
+
+    // One row per command, and every row fits a terminal.
+    let widest = default.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        widest <= 80,
+        "the default view must fit a terminal; widest line is {widest} chars"
+    );
+    assert!(
+        default.len() < verbose.len() / 4,
+        "the default view must be far smaller than the prose one: {} vs {}",
+        default.len(),
+        verbose.len()
+    );
+
+    // Both views still answer the question, and both list every command.
+    for view in [&default, &verbose] {
+        assert!(view.contains("Bounded dogfood ready:"), "{view}");
+        for command in ["commit", "stash", "purge-ignored"] {
+            assert!(view.contains(command), "missing {command}: {view}");
+        }
+    }
+    assert!(
+        default.contains("--verbose"),
+        "the default view must say where the notes went: {default}"
+    );
+
+    // The notes are intact behind --verbose and complete in --json, which is
+    // what keeps this a change of default rather than a loss of detail.
+    let json = render(&["capabilities", "--json"]);
+    let report: Value = serde_json::from_str(&json).expect("capabilities --json must be JSON");
+    let note = report["commands"][0]["note"]
+        .as_str()
+        .expect("every command carries a note")
+        .to_string();
+    assert!(!note.is_empty());
+    assert!(verbose.contains(&note), "--verbose must render the note");
+    assert!(
+        !default.contains(&note),
+        "the default view must not render the note"
+    );
+}
+
 #[test]
 fn top_level_help_marks_open_git_replacement_surfaces() {
     let root = tempdir().expect("temp root");

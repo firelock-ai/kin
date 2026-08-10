@@ -97,7 +97,7 @@ pub fn require_ready(command: &str) -> Result<()> {
     )
 }
 
-pub fn run(json: bool) -> Result<()> {
+pub fn run(json: bool, verbose: bool) -> Result<()> {
     let inventory = inventory()?;
     let required = inventory
         .commands
@@ -182,15 +182,24 @@ pub fn run(json: bool) -> Result<()> {
             CapabilityStatus::OpenGate => "OPEN ",
         };
         let dogfood = if capability.required_for_bounded_dogfood {
-            " required"
+            "  required"
         } else {
             ""
         };
-        println!(
-            "{status}  {:18}  {}{dogfood}",
-            capability.command, capability.authority
-        );
-        println!("       {}", capability.note);
+        // Root help sends every caller here to answer "what works", and status
+        // against command name is that answer. Authority and note are prose,
+        // several of them running past a terminal width and one past three
+        // thousand characters on a single line, and printing them by default
+        // buried the answer under 27KB.
+        println!("{status}  {:18}{dogfood}", capability.command);
+        if verbose {
+            println!("       authority: {}", capability.authority);
+            println!("       {}", capability.note);
+        }
+    }
+    if !verbose {
+        println!();
+        println!("`--verbose` adds authority and notes per command, `--json` the full inventory.");
     }
     Ok(())
 }
