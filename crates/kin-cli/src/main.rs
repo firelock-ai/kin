@@ -35,15 +35,45 @@ Start here:
 Ask the graph:
   kin locate / search / trace / impact / refs / context
 
-Commands marked [OPEN GATE] are fail-closed on repository-v6 and say why when
-run. `kin capabilities` prints the full readiness matrix, `--json` for machines.";
+`kin capabilities` prints the full readiness matrix, `--json` for machines.";
+
+/// The `[OPEN GATE]` legend, which is only true while something carries the
+/// marker.
+const OPEN_GATE_LEGEND: &str = "\n\nCommands marked [OPEN GATE] are fail-closed on \
+repository-v6 and say why when run.";
+
+/// Root after-help, with the open-gate legend appended only when the inventory
+/// actually reports a gate.
+///
+/// The legend teaches a marker, so printing it when nothing is marked tells a
+/// caller scanning the list for what works that everything is ready. It had
+/// been doing exactly that: the gates all closed, the markers came off, and the
+/// sentence describing them stayed, pinned by a test asserting the bare string.
+///
+/// An unreadable inventory drops the legend rather than failing, because help
+/// has to render; a broken inventory is reported by `kin capabilities`, which
+/// is the command that exists to read it.
+fn after_help() -> String {
+    let gated = commands::capabilities::inventory()
+        .map(|inventory| {
+            inventory.commands.iter().any(|capability| {
+                capability.status == commands::capabilities::CapabilityStatus::OpenGate
+            })
+        })
+        .unwrap_or(false);
+    if gated {
+        format!("{AFTER_HELP}{OPEN_GATE_LEGEND}")
+    } else {
+        AFTER_HELP.to_string()
+    }
+}
 
 #[derive(Parser)]
 #[command(
     name = "kin",
     version = kin_buildinfo::version(),
     about = "Kin semantic VCS",
-    after_help = AFTER_HELP,
+    after_help = after_help(),
 )]
 struct Cli {
     /// Write a machine-readable execution profile to this JSON file
@@ -3943,13 +3973,46 @@ mod tests {
                 "kin status",
                 "kin commit",
                 "kin capabilities",
-                "[OPEN GATE]",
             ] {
                 assert!(
                     help.contains(anchor),
                     "help must orient a caller with {anchor:?}"
                 );
             }
+        });
+    }
+
+    /// The legend teaches a marker, so it may only appear while a marker does.
+    ///
+    /// Asserting the bare string was what let it outlive the thing it
+    /// describes: every gate closed, every marker came off, and the sentence
+    /// stayed, telling a caller to look for a signal that no command carried.
+    #[test]
+    fn the_open_gate_legend_appears_exactly_when_a_gate_does() {
+        on_cli_test_stack(|| {
+            let mut command = Cli::command();
+            let help = command.render_long_help().to_string();
+            let inventory =
+                commands::capabilities::inventory().expect("capability inventory must parse");
+            let gated = inventory.commands.iter().any(|capability| {
+                capability.status == commands::capabilities::CapabilityStatus::OpenGate
+            });
+
+            assert_eq!(
+                help.contains(OPEN_GATE_MARKER),
+                gated,
+                "the legend must track the inventory, which reports gated={gated}"
+            );
+
+            // The conditional is what is under test, so exercise both arms
+            // rather than only the one this inventory happens to select.
+            assert!(after_help().contains("Start here:"));
+            assert!(!AFTER_HELP.contains(OPEN_GATE_MARKER));
+            assert!(OPEN_GATE_LEGEND.contains(OPEN_GATE_MARKER));
+            assert!(
+                format!("{AFTER_HELP}{OPEN_GATE_LEGEND}").contains(OPEN_GATE_MARKER),
+                "the gated arm must carry the legend it exists to add"
+            );
         });
     }
 
