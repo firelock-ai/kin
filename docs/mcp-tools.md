@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 62 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 64 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -67,12 +67,13 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 ---
 
 ## 1. Retrieval & Codebase Exploration
-*Tools:* `semantic_search`, `semantic_locate`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
+*Tools:* `semantic_search`, `semantic_locate`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_entity_sources`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
 
 - **`semantic_search`**: Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations rather than raw string occurrences like grep, and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
 - **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage`, and requires the running daemon.
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
+- **`get_entity_sources`**: The batch form of `get_entity_source`. Hand it up to 50 entity IDs in priority order and it returns each entity's metadata plus its body in one budgeted call, which replaces the N separate round-trips and N response envelopes those reads would otherwise cost. Bodies fill in the order you list the IDs until the shared `token_budget` is reached, and entities past that point come back signature-only with `omitted=true`.
 - **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle.
 - **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
 - **`graph_neighborhood`**: Return the dependency neighborhood of an entity, traversed to a given depth. The neighborhood covers what it depends on and what depends on it. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
@@ -91,11 +92,12 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 ---
 
 ## 3. Semantic Change, Impact & Review
-*Tools:* `impact_analysis`, `semantic_diff`, `semantic_review`
+*Tools:* `impact_analysis`, `semantic_diff`, `semantic_review`, `shadow_gate_report`
 
 - **`semantic_diff`**: Compute an entity-level diff of which declarations were added, removed, or changed, rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, file paths, or a list of change IDs.
 - **`impact_analysis`**: Walk the relation graph from what changed to find the downstream entities that could be affected ("if I change this, what else might break?").
 - **`semantic_review`**: Produce a complete review of a change in one call. It covers entity-level diff, downstream impact, and an overall risk assessment, in `text` or `json` form.
+- **`shadow_gate_report`**: Run the shadow-mode merge gate over a PR-shaped change (`base` ref to `head` ref) and return one report covering changed entities, graph-proven blast radius, the verdict the gate would have issued, the repair context needed to fix findings, explicit evidence gaps, and audit evidence. Shadow mode is report-only and never blocks. Refs accept branch names and semantic change IDs, and imported Git commit SHAs resolve once their history is in the graph. Where the graph cannot prove something, the report says so in `evidence_gaps` rather than passing silently.
 
 ---
 
@@ -166,3 +168,14 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 - **`dead_code` / `find_dead_code_seeded`**: Identify unreachable or orphaned entities (whole-repo or seeded by a semantic query).
 - **`benchmark`**: Run Kin's retrieval/locate benchmarks.
 - **`kin_graph_status`**: Report one schema-bound, point-in-time status view of the exact daemon graph selected for the call, covering entity and relation counts, selected-graph embedding coverage (indexed / total / pending), temporal-session versus HEAD scope, a process-local authority epoch, and backing authority. The daemon holds its normal embedding-work fence while reading internally synchronized coverage counters, then revalidates graph/scope authority before publishing; observed counts still do not attest enrichment completeness.
+
+---
+
+## 11. Repository Artifacts
+*Tools:* `kin_artifact_list`, `kin_artifact_read`
+
+Both tools ship in the `agent-default` profile, so an agent configured with
+`kin setup --intent agent` already has them.
+
+- **`kin_artifact_list`**: List the exact graph-owned repository artifacts at one semantic change. This is the repository-membership surface, so it covers code and every non-code tracked object, including Docker Compose files, Dockerfiles, lockfiles, configuration, binary assets, unsupported languages, symlinks, executable files, and gitlinks. Identity comes from `artifact_id` and never from a path. Paths are returned as canonical lowercase `bytes_hex` objects, with `path_label` as presentation only. Omit `source_change_id` to read the exact current workspace tree.
+- **`kin_artifact_read`**: Read one exact graph-owned repository artifact by stable `artifact_id` or canonical byte-exact `path`. Blob and symlink bytes come back losslessly as base64, and as `text_utf8` only when they are valid UTF-8. Gitlinks return their external object identity and have no repository-owned body. The read is bound to the resolved tree entry and fails loudly when the tree, identity, or content-addressed blob is missing. It never reads the working directory.

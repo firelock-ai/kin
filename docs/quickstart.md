@@ -1,7 +1,8 @@
 # Kin Quickstart Guide
 
 This is the recommended first-run path for Kin. One flow works on macOS, Linux, and
-Windows (via WSL2):
+Windows. On native Windows the support boundary is narrower, and WSL2 remains the
+recommended path for the full Kin experience. See step 1.
 
 1. **Install** the binaries with the one-line installer.
 2. **`kin setup`** asks a couple of questions, and the guided wizard configures your
@@ -256,8 +257,8 @@ index over them with:
 kin embed
 ```
 
-Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; override
-via `KIN_EMBED_MODEL_ID`). You can check coverage at any time:
+Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions). You can
+check coverage at any time:
 
 ```sh
 kin graph status   # "Embeddings: <indexed>/<total> indexed (<pending> pending)"
@@ -367,7 +368,8 @@ kin locate "users can't reset their password" --explain
 
 If you chose the **AI agents** intent in step 2, `kin setup` already wrote Kin's MCP
 server entry into every detected AI client (Claude Code, Cursor, Codex CLI, Gemini CLI,
-Windsurf) and added a Kin-first discovery reminder to your agent instruction files. There
+Windsurf, Google Antigravity) and added a Kin-first discovery reminder to your agent
+instruction files. There
 is **nothing else to configure**. Open your agent in a Kin repository and ask it to use
 the semantic tools:
 
@@ -497,6 +499,7 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | Codex CLI | `~/.codex/config.toml` (TOML, see below) |
 | Gemini CLI | `~/.gemini/settings.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Google Antigravity | `~/.gemini/config/mcp_config.json` (global) and `<repo>/.agents/mcp_config.json` (workspace) |
 
 Codex is the exception: it reads TOML (`[mcp_servers.<name>]` tables), not JSON. The wizard
 merges this table into `~/.codex/config.toml`, leaving the rest of the file untouched:
