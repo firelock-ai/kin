@@ -307,7 +307,10 @@ mod tests {
                 }
                 files += 1;
                 let text = std::fs::read_to_string(&path).expect("read source file");
-                for (_, rest) in text.match_indices("require_ready(\"").map(|(i, m)| (i, &text[i + m.len()..])) {
+                for (_, rest) in text
+                    .match_indices("require_ready(\"")
+                    .map(|(i, m)| (i, &text[i + m.len()..]))
+                {
                     if let Some(end) = rest.find('"') {
                         gated.insert(rest[..end].to_string());
                     }
@@ -317,7 +320,10 @@ mod tests {
 
         // Positive controls. A wrong root or a changed call spelling would
         // otherwise scan nothing and pass as "no undeclared commands".
-        assert!(files > 20, "scanned only {files} source files under {src:?}");
+        assert!(
+            files > 20,
+            "scanned only {files} source files under {src:?}"
+        );
         assert!(
             gated.len() >= 20,
             "found only {} gated commands, so the scan is not seeing the call sites: {gated:?}",

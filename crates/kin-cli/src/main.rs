@@ -2625,8 +2625,8 @@ fn main() -> Result<()> {
                     // nothing to operate on gets a usage block and exit 2 like
                     // the other 45 leaves, instead of exit 1 and one line.
                     if bulk_json {
-                        let entities = entities
-                            .expect("clap requires --entities alongside --bulk-json");
+                        let entities =
+                            entities.expect("clap requires --entities alongside --bulk-json");
                         let effective_compact = compact && !no_compact;
                         commands::refs::run_bulk(entities, kind, effective_compact).await
                     } else {

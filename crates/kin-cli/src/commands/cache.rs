@@ -124,7 +124,9 @@ const AGE_BANDS: &[(&str, Option<u64>)] = &[
 enum ScanBound {
     Complete,
     /// Stopped after `limit` entries; every total covers only those entries.
-    Truncated { limit: u64 },
+    Truncated {
+        limit: u64,
+    },
 }
 
 #[cfg(feature = "embeddings")]
@@ -202,7 +204,10 @@ fn visit_bounded(
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            f(meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+            f(
+                meta.len(),
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            );
             if let Some(left) = remaining.as_mut() {
                 *left -= 1;
             }
@@ -244,22 +249,27 @@ fn scan_cache_streaming(
         let mut sv_bytes = 0u64;
         let mut sv_count = 0u64;
         if walking {
-            walking = visit_bounded(&dir, &mut remaining, &mut truncated, &mut |bytes, modified| {
-                sv_bytes += bytes;
-                sv_count += 1;
-                total_bytes += bytes;
-                entry_count += 1;
-                oldest = Some(oldest.map_or(modified, |o| o.min(modified)));
-                newest = Some(newest.map_or(modified, |n| n.max(modified)));
-                let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-                let band = &mut bands[age_band_index(age)];
-                band.0 += bytes;
-                band.1 += 1;
-                if entry_count >= next_report {
-                    on_progress(entry_count, total_bytes);
-                    next_report += SCAN_PROGRESS_INTERVAL;
-                }
-            });
+            walking = visit_bounded(
+                &dir,
+                &mut remaining,
+                &mut truncated,
+                &mut |bytes, modified| {
+                    sv_bytes += bytes;
+                    sv_count += 1;
+                    total_bytes += bytes;
+                    entry_count += 1;
+                    oldest = Some(oldest.map_or(modified, |o| o.min(modified)));
+                    newest = Some(newest.map_or(modified, |n| n.max(modified)));
+                    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+                    let band = &mut bands[age_band_index(age)];
+                    band.0 += bytes;
+                    band.1 += 1;
+                    if entry_count >= next_report {
+                        on_progress(entry_count, total_bytes);
+                        next_report += SCAN_PROGRESS_INTERVAL;
+                    }
+                },
+            );
         }
         schema_versions.push(SchemaVersionStats {
             is_current: version == current,
@@ -370,12 +380,7 @@ fn print_status_header(base: &Path) {
 }
 
 #[cfg(feature = "embeddings")]
-fn print_status_body(
-    stats: &CacheStats,
-    budget: Option<u64>,
-    now: SystemTime,
-    bound: ScanBound,
-) {
+fn print_status_body(stats: &CacheStats, budget: Option<u64>, now: SystemTime, bound: ScanBound) {
     if let ScanBound::Truncated { limit } = bound {
         println!(
             "  WARNING: stopped at the --limit of {limit} entries; every number below covers \
@@ -459,12 +464,7 @@ fn print_status_body(
 }
 
 #[cfg(feature = "embeddings")]
-fn print_status_json(
-    stats: &CacheStats,
-    budget: Option<u64>,
-    now: SystemTime,
-    bound: ScanBound,
-) {
+fn print_status_json(stats: &CacheStats, budget: Option<u64>, now: SystemTime, bound: ScanBound) {
     let schema_versions: Vec<_> = stats
         .schema_versions
         .iter()
@@ -662,8 +662,11 @@ mod tests {
         for (version, name, bytes) in entries {
             let shard = dir.path().join(version).join(&name[..2]);
             std::fs::create_dir_all(&shard).expect("mkdir");
-            std::fs::write(shard.join(format!("{name}.bin")), vec![0u8; *bytes as usize])
-                .expect("write entry");
+            std::fs::write(
+                shard.join(format!("{name}.bin")),
+                vec![0u8; *bytes as usize],
+            )
+            .expect("write entry");
             // An in-flight write is not a finalized entry and must not count.
             std::fs::write(shard.join(format!("{name}.tmp-1")), b"partial").expect("write tmp");
         }
@@ -704,7 +707,10 @@ mod tests {
         let (stats, bound) = scan(dir.path(), None);
         assert_eq!(stats.entry_count, 0);
         assert_eq!(bound, ScanBound::Complete);
-        assert_eq!(stats, cache_admin::scan_cache(dir.path(), SystemTime::now()));
+        assert_eq!(
+            stats,
+            cache_admin::scan_cache(dir.path(), SystemTime::now())
+        );
     }
 
     /// The bound stops the walk and says so. Without the [`ScanBound`] the
@@ -759,12 +765,10 @@ mod tests {
         }
 
         let mut seen: Vec<(u64, u64)> = Vec::new();
-        let (stats, _) = scan_cache_streaming(
-            dir.path(),
-            SystemTime::now(),
-            None,
-            &mut |count, bytes| seen.push((count, bytes)),
-        );
+        let (stats, _) =
+            scan_cache_streaming(dir.path(), SystemTime::now(), None, &mut |count, bytes| {
+                seen.push((count, bytes))
+            });
 
         assert_eq!(
             seen.len(),
