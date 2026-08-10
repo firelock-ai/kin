@@ -594,7 +594,7 @@ pub(crate) fn observed_tree_from_complete_scan(
         // second read would re-derive a digest nothing is waiting for and rewrite
         // a blob that is already there.
         //
-        // The re-read is kept exactly where it earns its place. An entry that
+        // The re-read is kept where it can still catch something. An entry that
         // does differ is about to cross the compare-and-swap, so its bytes are
         // read and their digest is checked against the walk's, which is what
         // catches a file rewritten between the walk and the publication and
