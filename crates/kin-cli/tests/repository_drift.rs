@@ -107,8 +107,18 @@ fn drift_paths(report: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Host content the graph does not own has no bearing on a drift answer.
+///
+/// The content used here is content the rules exclude, which is now the whole
+/// of that population: a watcher admits an ordinary new file into the workspace
+/// shortly after it is written, so writing one and asserting the graph ignored
+/// it would be asserting against the product rather than against a raw
+/// filesystem walk, and it would race the watcher besides. Excluded content
+/// never enters a walk at all, so it is the deterministic form of the same
+/// question, and the same question is still worth asking: a drift report that
+/// grows here is answering from the host instead of from graph truth.
 #[test]
-fn drift_reads_graph_truth_and_never_answers_from_untracked_host_files() {
+fn drift_reads_graph_truth_and_never_answers_from_excluded_host_files() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
@@ -135,15 +145,17 @@ fn drift_reads_graph_truth_and_never_answers_from_untracked_host_files() {
         "compared entries cannot exceed tracked artifacts"
     );
 
-    // Untracked host content is not graph-owned, so it cannot drift. A drift
-    // report that grows here is answering from a raw filesystem walk.
-    fs::write(repo.join("untracked.rs"), b"pub fn ghost() {}\n").expect("write untracked source");
-    fs::create_dir_all(repo.join("scratch")).expect("create untracked directory");
-    fs::write(repo.join("scratch/notes.txt"), b"scratch\n").expect("write untracked note");
+    // Excluded host content is not graph-owned, so it cannot drift. A drift
+    // report that grows here is answering from a raw filesystem walk. `target`
+    // is excluded by the built-in rules, so nothing admits this however long
+    // the watcher runs.
+    fs::create_dir_all(repo.join("target")).expect("create excluded directory");
+    fs::write(repo.join("target/ghost.rs"), b"pub fn ghost() {}\n").expect("write excluded source");
+    fs::write(repo.join("target/notes.txt"), b"scratch\n").expect("write excluded note");
     let with_untracked = drift_report(&runtime, &repo);
     assert_eq!(
         with_untracked["clean"], true,
-        "untracked host files must never be reported as drift"
+        "excluded host files must never be reported as drift"
     );
     assert_eq!(with_untracked["drift_count"], 0);
     assert_eq!(
