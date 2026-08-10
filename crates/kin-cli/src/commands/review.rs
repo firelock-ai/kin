@@ -423,7 +423,12 @@ fn compute_review(
         ),
         None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
             .current_change_id()?
-            .ok_or_else(|| anyhow::anyhow!("repository-v6 workspace head is unborn"))?,
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this workspace has no commits yet, so there is nothing to review; make one \
+                     with `kin commit`"
+                )
+            })?,
     };
 
     let semantic_change = graph

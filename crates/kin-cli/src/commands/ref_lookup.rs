@@ -266,7 +266,7 @@ where
     let authority = ActiveRepositoryAuthority::open(binding).map_err(|error| {
         ref_error(
             original,
-            format!("repository-v6 authority is unavailable: {error:#}"),
+            format!("this repository's authority could not be opened: {error:#}"),
         )
     })?;
 
@@ -276,10 +276,16 @@ where
             .map_err(|error| {
                 ref_error(
                     original,
-                    format!("repository-v6 workspace head is invalid: {error:#}"),
+                    format!("this workspace's head could not be read: {error:#}"),
                 )
             })?
-            .ok_or_else(|| ref_error(original, "repository-v6 workspace head is unborn"))?
+            .ok_or_else(|| {
+                ref_error(
+                    original,
+                    "this workspace has no commits yet, so HEAD names nothing; make one with \
+                     `kin commit`",
+                )
+            })?
     } else if let Some(branch_name) = core.strip_prefix("branch:") {
         resolve_named_authority_ref(&authority, original, branch_name)?
     } else if let Some(git_oid) = core.strip_prefix("git:") {
@@ -305,7 +311,9 @@ where
         return Err(ref_error(
             original,
             format!(
-                "repository-v6 authority resolves to semantic change {resolved}, but the active graph projection does not contain it"
+                "this repository's authority resolves to semantic change {resolved}, which the \
+                 active graph projection does not hold; run `kin status`, then `kin health` if it \
+                 repeats"
             ),
         ));
     }
@@ -641,7 +649,10 @@ mod tests {
         let binding = absent_binding(&layout);
         let error = resolve_ref(&graph, &binding, None).unwrap_err();
         assert!(is_ref_resolution_error(&error));
-        assert!(error.to_string().contains("repository-v6 authority"));
+        assert!(
+            error.to_string().contains("this repository's authority"),
+            "the layout version is not a noun the reader has: {error:#}"
+        );
     }
 
     #[test]
@@ -663,7 +674,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("has no imported repository-v6 alias"),
+                .contains("was never imported into this repository"),
             "{error:#}"
         );
     }

@@ -225,7 +225,13 @@ impl ActiveRepositoryAuthority {
             .iter()
             .find(|alias| &alias.oid == oid)
             .map(|alias| alias.change_id)
-            .ok_or_else(|| anyhow!("Git commit '{oid}' has no imported repository-v6 alias"))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Git commit '{oid}' was never imported into this repository, so kin holds no \
+                     semantic change for it; import it with `kin init` in the source checkout, or \
+                     name a ref kin already holds"
+                )
+            })
     }
 
     pub(crate) fn load_source_blob(&self, digest: kin_model::Hash256) -> Result<Vec<u8>> {

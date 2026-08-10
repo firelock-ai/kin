@@ -783,7 +783,12 @@ where
         Some(hash) => parse_change_id(hash)?,
         None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
             .current_change_id()?
-            .ok_or_else(|| anyhow!("repository-v6 workspace head is unborn"))?,
+            .ok_or_else(|| {
+                anyhow!(
+                    "this workspace has no commits yet, so there is nothing to verify; make one \
+                     with `kin commit`"
+                )
+            })?,
     };
 
     graph

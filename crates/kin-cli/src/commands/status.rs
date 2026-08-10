@@ -772,14 +772,18 @@ pub fn inspect(
         .find(|workspace| workspace.workspace_id == authority.workspace_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "repository {} has no workspace {} in repository-v6 authority",
+                "repository {} has no workspace {} in its authority",
                 authority.repository_id,
                 authority.workspace_id
             )
         })?;
     let roots = lease.roots().clone();
     if roots.generation != metadata.roots.generation {
-        anyhow::bail!("repository-v6 lease exposed inconsistent root generations");
+        anyhow::bail!(
+            "this repository's store reported two different root generations for one lease, which \
+             means another process wrote it while this command was reading; re-run `kin status`, \
+             and run `kin health` if it repeats"
+        );
     }
 
     let artifact_count = workspace.tree.artifacts().len();
@@ -819,9 +823,13 @@ pub fn inspect(
     // refuses an illegal report; running the same check here means a future
     // coverage source that publishes an impossible triple fails in the process
     // that built it rather than in every consumer that parses it.
-    report
-        .validate()
-        .map_err(|error| anyhow::anyhow!("repository-v6 status report is invalid: {error}"))?;
+    report.validate().map_err(|error| {
+        anyhow::anyhow!(
+            "kin built a status report this build considers invalid ({error}), so it refused \
+                 to print it; run `kin health`, and `kin --version` against `kin daemon status` if \
+                 the two are on different builds"
+        )
+    })?;
     Ok(report)
 }
 

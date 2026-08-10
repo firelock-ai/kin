@@ -184,16 +184,18 @@ fn plan_and_publish(
     let base = match bases.as_slice() {
         [] => {
             return Err(merge_conflict(format!(
-                "branch {} and the active branch {} share no common change; merging unrelated \
-                 histories is not a proven repository-v6 shape",
+                "branch {} and the active branch {} share no common ancestor, and kin does not \
+                 merge unrelated histories; rebase the source onto the target first, or import \
+                 them separately",
                 request.source, plan.target_ref
             )))
         }
         [base] => *base,
         multiple => {
             return Err(merge_conflict(format!(
-                "branch {} and the active branch {} have {} merge bases; a criss-cross merge is \
-                 not a proven repository-v6 shape",
+                "branch {} and the active branch {} have {} merge bases, and kin does not \
+                 resolve a criss-cross merge; merge one of the intermediate branches first so a \
+                 single base remains",
                 request.source,
                 plan.target_ref,
                 multiple.len()

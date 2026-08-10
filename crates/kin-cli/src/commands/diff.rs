@@ -171,7 +171,7 @@ pub fn inspect_with_endpoint_entities(
         .find(|workspace| workspace.workspace_id == authority.workspace_id)
         .ok_or_else(|| {
             anyhow!(
-                "repository {} has no workspace {} in repository-v6 authority",
+                "repository {} has no workspace {} in its authority",
                 authority.repository_id,
                 authority.workspace_id
             )
@@ -428,7 +428,13 @@ fn state_at_git_object(
                 .find(|alias| alias.oid == oid)
                 .map(|alias| RefTarget::change(alias.change_id))
         })
-        .ok_or_else(|| anyhow!("Git object '{oid}' is absent from repository-v6 authority"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Git object '{oid}' was never imported into this repository, so there is nothing \
+                 to diff it against; import it with `kin init` in the source checkout, or name a \
+                 ref kin already holds"
+            )
+        })?;
     let change_id = lease
         .resolve_target_change_id(&target)
         .with_context(|| format!("resolve Git object '{oid}' semantic target"))?;
@@ -499,7 +505,10 @@ fn require_change(history: &kin_db::InMemoryGraph, change_id: SemanticChangeId) 
         .with_context(|| format!("read immutable semantic change {change_id}"))?
         .is_none()
     {
-        bail!("semantic change '{change_id}' is absent from repository-v6 authority");
+        bail!(
+            "semantic change '{change_id}' is not in this repository's authority, so there is \
+             nothing to diff it against; run `kin log` to see the changes kin holds"
+        );
     }
     Ok(())
 }
