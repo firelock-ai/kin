@@ -1668,6 +1668,17 @@ pub fn background_work_health_from_state(
         .map(str::to_string)
         .collect();
     reasons.extend(work.reconcile.degraded_reasons());
+    // Carried on the detail of whichever verdict follows, never into `reasons`.
+    // A working copy holding untracked files is the normal state of one being
+    // edited, so it must not move this check off `Healthy`; it still has to be
+    // said, because the paths it names are precisely the ones whose entities a
+    // reader will go looking for and not find.
+    let notices = work.reconcile.notices();
+    let notice_detail = if notices.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", notices.join("; "))
+    };
     if reasons.is_empty() {
         let working = work
             .passes
@@ -1680,7 +1691,7 @@ pub fn background_work_health_from_state(
             HealthStatus::Healthy,
             format!(
                 "{cpu}; {} background pass(es), {working} working, none stopped; reconcile \
-                 admitting normally",
+                 admitting normally{notice_detail}",
                 work.passes.len()
             ),
         );
@@ -1689,7 +1700,7 @@ pub fn background_work_health_from_state(
         "background_work",
         "Background work",
         HealthStatus::Stale,
-        format!("{cpu}; {}", reasons.join("; ")),
+        format!("{cpu}; {}{notice_detail}", reasons.join("; ")),
     )
     .with_manual_fix(
         "restart the daemon (`kin daemon restart`) to retry the stopped pass, and report the \

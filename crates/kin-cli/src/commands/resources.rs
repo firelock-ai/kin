@@ -705,6 +705,40 @@ mod tests {
         }
     }
 
+    /// Untracked host content is announced and is not a fault.
+    ///
+    /// Both halves matter. Without the notice, a file a reader can see on disk
+    /// has no entities and no surface says why, which is the question FIR-2152
+    /// arrived as. Without the second assertion, every working copy mid-edit
+    /// would report `attention`, and a health signal that is always on is one
+    /// nobody reads.
+    #[test]
+    fn untracked_paths_are_announced_without_degrading_the_daemon() {
+        let health = ReconcileHealth {
+            untracked_path_count: 7,
+            untracked_paths_sample: vec!["src/new.rs".to_string(), "notes.md".to_string()],
+            ..Default::default()
+        };
+        assert!(!health.degraded(), "{:?}", health.degraded_reasons());
+        let notices = health.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = &notices[0];
+        assert!(notice.contains('7'), "the count is the headline: {notice}");
+        assert!(
+            notice.contains("src/new.rs") && notice.contains("notes.md"),
+            "the sample must name paths a reader can act on: {notice}"
+        );
+        assert!(
+            notice.contains("5 more"),
+            "a sample that hid the remainder would understate it: {notice}"
+        );
+
+        assert!(
+            ReconcileHealth::default().notices().is_empty(),
+            "a working copy with nothing untracked says nothing"
+        );
+    }
+
     #[test]
     fn a_failing_admission_streak_is_a_degraded_reason_that_names_its_threshold() {
         let reasons = failing_admission().degraded_reasons();

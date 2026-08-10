@@ -410,6 +410,17 @@ fn build_graph_status_response(
             lines.push(format!("⚠ {}", w));
         }
     }
+    // Printed beside the verdict rather than as part of it. Untracked host
+    // content is not a fault, so it withholds no all-clear; it is the answer to
+    // the question a reader actually arrives with, which is why a file they can
+    // see on disk has no entities in the graph.
+    let notices = reconcile.notices();
+    if !notices.is_empty() {
+        lines.push(String::new());
+        for notice in notices {
+            lines.push(format!("ℹ {notice}"));
+        }
+    }
     append_health_notes(&mut lines, &health.notes);
 
     Ok(GraphCommandResponse {

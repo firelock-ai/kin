@@ -575,22 +575,45 @@ pub(crate) fn observed_tree_from_complete_scan(
     }
 
     for scanned in scan.entries() {
-        let content = read_scanned_entry(scanned)?;
-        let blob_digest = blobs.write(&content).map_err(DaemonError::from)?;
-        if blob_digest.0 != scanned.content_hash {
-            return Err(DaemonError::Io(std::io::Error::other(format!(
-                "repository entry changed after complete scan: {}",
-                scanned.repo_path
-            ))));
-        }
         let entry = match scanned.kind {
             kin_index::ScannedEntryKind::Regular { executable } => {
-                TreeEntry::blob(Hash256::from_bytes(blob_digest.0), executable)
+                TreeEntry::blob(Hash256::from_bytes(scanned.content_hash), executable)
             }
             kin_index::ScannedEntryKind::Symlink => {
-                TreeEntry::symlink(Hash256::from_bytes(blob_digest.0))
+                TreeEntry::symlink(Hash256::from_bytes(scanned.content_hash))
             }
         };
+        // Only an entry that differs from authority is read a second time.
+        //
+        // The walk has already opened, read, and hashed every leaf; reading each
+        // one again here made the cost of observing a working copy proportional
+        // to the whole working copy rather than to what moved in it, and the
+        // reconcile loop pays this on every tick. When the scanned identity
+        // matches the entry authority already carries at that path, the bytes
+        // behind it are by definition already a blob this store resolves, so the
+        // second read would re-derive a digest nothing is waiting for and rewrite
+        // a blob that is already there.
+        //
+        // The re-read is kept exactly where it earns its place. An entry that
+        // does differ is about to cross the compare-and-swap, so its bytes are
+        // read and their digest is checked against the walk's, which is what
+        // catches a file rewritten between the walk and the publication and
+        // refuses the whole observation rather than admitting a hash for content
+        // the store never held.
+        if previous
+            .artifact_at_path(&scanned.repo_path)
+            .map(|artifact| artifact.entry)
+            != Some(entry)
+        {
+            let content = read_scanned_entry(scanned)?;
+            let blob_digest = blobs.write(&content).map_err(DaemonError::from)?;
+            if blob_digest.0 != scanned.content_hash {
+                return Err(DaemonError::Io(std::io::Error::other(format!(
+                    "repository entry changed after complete scan: {}",
+                    scanned.repo_path
+                ))));
+            }
+        }
         observed.insert(scanned.repo_path.clone(), entry);
     }
 
@@ -1526,6 +1549,105 @@ mod tests {
             delta,
             TreeDelta::Removed { old, .. } if old.path == gone
         )));
+    }
+
+    /// An entry the walk found identical to authority is observed from the
+    /// walk's own proof, with no second read of the host.
+    ///
+    /// Asserted by deleting the file between the scan and the observation. The
+    /// walk already opened, read, and hashed it, and authority already holds a
+    /// blob for those exact bytes, so nothing is left to read and this succeeds;
+    /// the earlier code read every leaf a second time and fails here.
+    ///
+    /// This is the whole-store phase FIR-2152 found inside the per-event path.
+    /// The reconcile loop runs this on every tick, so a working copy of twenty
+    /// thousand files paid two complete reads of itself to observe that one file
+    /// had moved. What it costs now is proportional to what moved.
+    #[test]
+    fn an_unchanged_entry_is_observed_without_a_second_host_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let working = layout.working_dir();
+
+        let bytes = b"pub fn unchanged() {}\n";
+        std::fs::write(working.join("unchanged.rs"), bytes).unwrap();
+        let hash = Hash256::from_bytes(blobs.write(bytes).unwrap().0);
+        let path = RepoPath::from_utf8("unchanged.rs").unwrap();
+        let previous = resolved_tree(vec![(
+            ArtifactId::new(),
+            path.clone(),
+            TreeEntry::blob(hash, false),
+        )]);
+
+        let ignore = kin_index::RepositoryIgnore::load(&working).unwrap();
+        let scan = kin_index::scan_repository(
+            &working,
+            &ignore,
+            previous.artifacts_by_path().map(|artifact| &artifact.path),
+        )
+        .unwrap();
+
+        std::fs::remove_file(working.join("unchanged.rs")).unwrap();
+
+        let observed = observed_tree_from_complete_scan(&blobs, &scan, &previous).unwrap();
+        assert_eq!(
+            observed.entries().get(&path),
+            Some(&TreeEntry::blob(hash, false)),
+            "an unchanged entry is carried by the walk's hash, not by reading it again"
+        );
+        let deltas =
+            kin_core::plan_observed_tree_deltas(&previous, observed.entries().clone()).unwrap();
+        assert!(
+            deltas.is_empty(),
+            "an unchanged working copy plans no transition: {deltas:?}"
+        );
+    }
+
+    /// Falsification: an entry that differs from authority is still read, and
+    /// its bytes are still checked against the digest the walk recorded.
+    ///
+    /// Without this the saving above would be a hole rather than an economy: a
+    /// file rewritten between the walk and the publication would reach authority
+    /// as a hash for content the store never held.
+    #[test]
+    fn a_changed_entry_is_still_read_and_checked_against_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init = kin_core::init(tmp.path()).unwrap();
+        let layout = init.layout;
+        let blobs = BlobStore::new(layout.ingest_cas_dir()).unwrap();
+        let working = layout.working_dir();
+
+        std::fs::write(working.join("changed.rs"), b"pub fn before() {}\n").unwrap();
+        let stale = Hash256::from_bytes(blobs.write(b"pub fn stale() {}\n").unwrap().0);
+        let path = RepoPath::from_utf8("changed.rs").unwrap();
+        let previous = resolved_tree(vec![(
+            ArtifactId::new(),
+            path.clone(),
+            TreeEntry::blob(stale, false),
+        )]);
+
+        let ignore = kin_index::RepositoryIgnore::load(&working).unwrap();
+        let scan = kin_index::scan_repository(
+            &working,
+            &ignore,
+            previous.artifacts_by_path().map(|artifact| &artifact.path),
+        )
+        .unwrap();
+
+        // Rewritten after the walk hashed it, which is the race the check exists
+        // for. The observation must refuse rather than publish the stale digest.
+        std::fs::write(working.join("changed.rs"), b"pub fn after() {}\n").unwrap();
+
+        let Err(error) = observed_tree_from_complete_scan(&blobs, &scan, &previous) else {
+            panic!("a changed entry must still be read and refused when it moved mid-pass");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("changed.rs") || error.contains("changed after"),
+            "{error}"
+        );
     }
 
     /// A file whose content changed since the last commit appears as Modified.
