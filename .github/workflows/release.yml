@@ -943,7 +943,7 @@ jobs:
           # the zip. The zip stays the primary archive: the PowerShell
           # installer, the npm launcher, and `kin update` all resolve Windows by
           # that name, and anything already depending on it keeps working.
-          tar -czf "$env:ARTIFACT.tar.gz" $env:ARTIFACT
+          tar -czf "$env:ARTIFACT.tar.gz" "$env:ARTIFACT"
           if ($LASTEXITCODE -ne 0) {
             Write-Error "tar failed to package $env:ARTIFACT.tar.gz"
             exit 1
