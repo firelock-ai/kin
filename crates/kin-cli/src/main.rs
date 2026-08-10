@@ -1271,6 +1271,11 @@ enum CacheAction {
         /// Output machine-readable JSON instead of a human summary
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Stop scanning after this many entries and report the partial totals.
+        /// Unset scans the whole cache, which on a bench-scale tree takes minutes
+        /// but is the only way the totals are exact
+        #[arg(long, value_name = "ENTRIES")]
+        limit: Option<u64>,
     },
     /// Reclaim space: drop abandoned schema versions and/or evict oldest entries to a budget
     Gc {
@@ -2980,7 +2985,9 @@ fn main() -> Result<()> {
                 Command::Bench { args } => commands::bench::bench_proxy(&args),
                 Command::Migrate { source, target } => commands::migrate::run(source, target).await,
                 Command::Cache { action } => match action {
-                    CacheAction::Status { json } => commands::cache::status(json).await,
+                    CacheAction::Status { json, limit } => {
+                        commands::cache::status(json, limit).await
+                    }
                     CacheAction::Gc {
                         dry_run,
                         budget_gb,
