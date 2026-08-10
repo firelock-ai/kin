@@ -361,7 +361,8 @@ impl ReconcileHealth {
             };
             notices.push(format!(
                 "{} host path(s) observed but not tracked{sample}. Watching a file never enlarges \
-                 the repository, so these stay unqueryable until a commit admits them.",
+                 the repository, so these stay unqueryable until a commit admits them or kin \
+                 admit does it on demand.",
                 self.untracked_path_count
             ));
         }

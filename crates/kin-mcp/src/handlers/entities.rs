@@ -114,7 +114,14 @@ returns its best candidates: each hit carries `match_kind` (`name` when a query 
 that entity's name, else `semantic` or `text_fallback`), and the response carries \
 `all_fallback: true` when NOT ONE returned entity was named by the query. Asking for a \
 symbol that does not exist yields a full, confident-looking page with `all_fallback` set \
-— treat that as \"this symbol was not found\" rather than as the answer.";
+— treat that as \"this symbol was not found\" rather than as the answer. Every hit also \
+states which id space it belongs to, because the retrieval index spans two and their ids \
+look alike. `id_space: \"entity\"` means the hit carries an `entity_id` that resolves in \
+the graph, so get_entity_source, get_context_pack, graph_neighborhood, and find_references \
+all take it. `id_space: \"artifact\"` means the hit is an artifact-level embedding — a \
+tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
+`entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
+not synthesize an entity id from an artifact hit's path.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
