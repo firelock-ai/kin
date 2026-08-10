@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-08-10
+
+### Changed
+
+- Stop the reconcile loop retrying host content it will never admit (#733)
+- Make the MCP write path land in one pass and answer truthfully when it already has (#735)
+
+
 ## [0.5.16] - 2026-08-10
 
 ### Changed
