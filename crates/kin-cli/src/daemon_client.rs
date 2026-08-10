@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub(crate) mod probe_process;
@@ -2832,8 +2832,11 @@ fn retire_daemon_endpoint_with_probe(
         Some(pid) => {
             warn!(
                 pid,
-                repo = %kin_root.display(),
-                "preserving daemon endpoint because its recorded owner may still be alive"
+                pid_path = %repo_daemon_pid_path(kin_root).display(),
+                "the endpoint record at {} still names pid {pid}, which this machine will not \
+                 confirm dead, so kin left it published; if that pid belongs to something else, \
+                 remove the file and re-run",
+                repo_daemon_pid_path(kin_root).display()
             );
             Some(format!(
                 "recorded owner pid {pid} never became affirmatively dead"
@@ -2842,8 +2845,11 @@ fn retire_daemon_endpoint_with_probe(
         None if !recorded.pid_exists => retire_within_budget(kin_root, teardown_budget),
         None => {
             warn!(
-                repo = %kin_root.display(),
-                "preserving daemon endpoint because its PID record is unparseable"
+                pid_path = %repo_daemon_pid_path(kin_root).display(),
+                "the endpoint record at {} does not hold a pid kin can read, so kin left it \
+                 published rather than retiring an endpoint it cannot identify; remove the file \
+                 if no kin daemon is running for this repository",
+                repo_daemon_pid_path(kin_root).display()
             );
             Some("its PID record is unparseable".to_string())
         }
@@ -3158,19 +3164,21 @@ where
     let _authority = match try_acquire_daemon_endpoint_authority(kin_root) {
         Ok(authority) => authority,
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
-                "preserving daemon endpoint because lifecycle authority is contended"
+                "another kin command holds daemon lifecycle authority for this repository, so \
+                 this one left the published endpoint alone"
             );
             return DaemonEndpointRetirement::LifecycleContended;
         }
         Err(error) => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
                 %error,
-                "preserving daemon endpoint because lifecycle authority is unavailable"
+                "daemon lifecycle authority could not be taken for this repository, so this \
+                 command left the published endpoint alone"
             );
             return DaemonEndpointRetirement::CoordinationUnavailable(error.to_string());
         }
@@ -3196,11 +3204,12 @@ where
 
     let current = daemon_endpoint_snapshot(kin_root);
     if current != judged {
-        warn!(
-            ?judged,
-            ?current,
-            "endpoint files changed while this daemon was being judged; \
-             leaving the successor's endpoint intact"
+        debug!(
+            judged_pid = ?judged.pid,
+            successor_pid = ?current.pid,
+            repo = %kin_root.display(),
+            "a successor kin daemon published its own endpoint for this repository while the \
+             previous one was being retired; the successor's record is correct and was left intact"
         );
         return DaemonEndpointRetirement::Changed { current };
     }
@@ -3210,10 +3219,11 @@ where
     match singleton.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
-                "preserving daemon endpoint because the daemon singleton is held"
+                "the per-repository daemon singleton is still held, so this command left the \
+                 published endpoint alone"
             );
             return DaemonEndpointRetirement::SingletonHeld;
         }
@@ -3233,11 +3243,12 @@ where
     match remove_stale_daemon_files_uncoordinated_with(kin_root, remove_file) {
         Ok(()) => DaemonEndpointRetirement::Retired,
         Err(error) => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
                 %error,
-                "preserving daemon startup authority because endpoint retirement failed"
+                "the endpoint files for this repository could not be removed, so kin kept its \
+                 startup authority rather than leaving a half-retired endpoint"
             );
             DaemonEndpointRetirement::CoordinationUnavailable(error.to_string())
         }
@@ -3349,17 +3360,19 @@ pub fn remove_stale_supervisor_files() {
     let startup_authority = match try_acquire_supervisor_startup_lock_for_cleanup(&dir) {
         Ok(authority) => authority,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            warn!(
+            debug!(
                 dir = %dir.display(),
-                "preserving supervisor endpoint because cross-version startup authority is held"
+                "another kin command holds supervisor startup authority, so this one left the \
+                 published supervisor endpoint alone"
             );
             return;
         }
         Err(error) => {
-            warn!(
+            debug!(
                 dir = %dir.display(),
                 %error,
-                "preserving supervisor endpoint because cross-version startup authority is unavailable"
+                "supervisor startup authority could not be taken, so this command left the \
+                 published supervisor endpoint alone"
             );
             return;
         }
@@ -3386,23 +3399,27 @@ pub fn remove_stale_supervisor_files() {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
         Some(_) => {
-            warn!(
-                ?recorded,
-                "preserving supervisor endpoint because its owner is live or indeterminate"
+            debug!(
+                pid = ?recorded.pid,
+                dir = %dir.display(),
+                "the supervisor endpoint still names an owner this machine will not confirm \
+                 dead, so kin left it published"
             );
         }
         None if recorded.pid_exists => {
-            warn!(
-                ?recorded,
-                "preserving supervisor endpoint because its owner is live or indeterminate"
+            debug!(
+                dir = %dir.display(),
+                "the supervisor endpoint still names an owner this machine will not confirm \
+                 dead, so kin left it published"
             );
         }
         None if owner_is_gone => {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
-        None => warn!(
-            ?recorded,
-            "preserving supervisor endpoint because its ownership record is incomplete"
+        None => debug!(
+            dir = %dir.display(),
+            "the supervisor endpoint carries no complete ownership record, so kin left it \
+             published rather than retiring an endpoint it cannot identify"
         ),
     }
 }
@@ -3570,11 +3587,12 @@ where
     match remove_supervisor_endpoint_files_with(dir, remove_file) {
         Ok(()) => SupervisorEndpointRetirement::Retired,
         Err(error) => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 dir = %dir.display(),
                 %error,
-                "preserving supervisor startup authority because endpoint retirement failed"
+                "the supervisor endpoint files could not be removed, so kin kept its startup \
+                 authority rather than leaving a half-retired endpoint"
             );
             SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string())
         }
@@ -4887,7 +4905,10 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 if startup_lock_is_stale(&path, stale_after) {
-                    warn!(path = %path.display(), "removing stale daemon startup lock");
+                    debug!(
+                        path = %path.display(),
+                        "cleared a startup lock left by an interrupted kin command"
+                    );
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
@@ -6202,11 +6223,43 @@ async fn follow_existing_supervisor_publication(
     }
 }
 
+fn supervisor_log_path() -> PathBuf {
+    supervisor_dir().join("supervisor.log")
+}
+
+fn supervisor_log_len() -> u64 {
+    std::fs::metadata(supervisor_log_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// Render the supervisor output produced by this start attempt only, mirroring
+/// [`daemon_log_tail_since`]. The exit status of a supervisor that died on
+/// launch is a symptom; the reason is in this log and was previously never read.
+fn supervisor_log_tail_since(since_offset: u64) -> String {
+    let path = supervisor_log_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return format!("supervisor log unavailable at {}", path.display());
+    };
+    let fresh = content
+        .get(since_offset as usize..)
+        .unwrap_or(&content)
+        .trim();
+    if fresh.is_empty() {
+        return format!(
+            "no fresh supervisor output captured for this start attempt at {}",
+            path.display()
+        );
+    }
+    let lines: Vec<&str> = fresh.lines().rev().take(20).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
 fn open_supervisor_log() -> Result<File> {
     let dir = supervisor_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
-    let log_path = dir.join("supervisor.log");
+    let log_path = supervisor_log_path();
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -6218,6 +6271,7 @@ async fn wait_for_supervisor_ready(
     child: &mut Child,
     deadline: Instant,
     startup_authority: &mut SupervisorStartupLock,
+    log_offset: u64,
 ) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
@@ -6226,7 +6280,12 @@ async fn wait_for_supervisor_ready(
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check supervisor child status")? {
-            bail!("supervisor exited during startup with status {status}");
+            bail!(
+                "the kin supervisor exited during startup with status {status}; recent log from \
+                 {}:\n{}",
+                supervisor_log_path().display(),
+                supervisor_log_tail_since(log_offset)
+            );
         }
         if Instant::now() >= next_startup_heartbeat {
             if !startup_authority
@@ -6348,6 +6407,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         SUPERVISOR_STARTUP_GENERATION_ENV,
         startup_authority.generation(),
     );
+    let log_offset = supervisor_log_len();
     let log = open_supervisor_log()?;
     let stderr = log
         .try_clone()
@@ -6365,7 +6425,8 @@ pub async fn ensure_supervisor_running() -> Result<String> {
 
     let mut child = cmd.spawn().context("spawn kin supervisor")?;
     let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
-    let base_url = wait_for_supervisor_ready(&mut child, deadline, &mut startup_authority).await?;
+    let base_url =
+        wait_for_supervisor_ready(&mut child, deadline, &mut startup_authority, log_offset).await?;
     if let Err(error) = startup_authority.verify_adoption(child.id()) {
         let _ = child.kill();
         let _ = child.wait();

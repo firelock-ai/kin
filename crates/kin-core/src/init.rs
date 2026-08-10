@@ -23,8 +23,7 @@ use kin_model::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use tracing::warn;
-use tracing::{info, info_span};
+use tracing::{debug, info, info_span};
 
 use crate::config::KinConfig;
 use crate::error::{KinError, Result};
@@ -2204,6 +2203,7 @@ fn recover_orphaned_repository_stages(
             .map_err(|error| KinError::io(staging_parent, error))?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
         let mut recovered = 0;
+        let mut retained = 0;
         for entry in entries {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -2215,11 +2215,12 @@ fn recover_orphaned_repository_stages(
             let owner_file = match open_stage_owner_for_recovery(&owner_path) {
                 Ok(file) => file,
                 Err(error) => {
-                    warn!(
+                    debug!(
                         path = %owner_path.display(),
                         %error,
                         "retaining unprovable repository stage owner"
                     );
+                    retained += 1;
                     continue;
                 }
             };
@@ -2229,11 +2230,12 @@ fn recover_orphaned_repository_stages(
             let record = match read_stage_owner_record(&owner_file, &owner_path) {
                 Ok(record) => record,
                 Err(error) => {
-                    warn!(
+                    debug!(
                         path = %owner_path.display(),
                         %error,
                         "retaining repository stage with invalid owner record"
                     );
+                    retained += 1;
                     continue;
                 }
             };
@@ -2258,31 +2260,34 @@ fn recover_orphaned_repository_stages(
             let stage_exists = match filesystem_entry_exists(&stage_root) {
                 Ok(exists) => exists,
                 Err(error) => {
-                    warn!(
+                    debug!(
                         path = %stage_root.display(),
                         %error,
                         "retaining repository stage whose presence is not provable"
                     );
+                    retained += 1;
                     continue;
                 }
             };
             let reap_exists = match filesystem_entry_exists(&reap_root) {
                 Ok(exists) => exists,
                 Err(error) => {
-                    warn!(
+                    debug!(
                         path = %reap_root.display(),
                         %error,
                         "retaining repository stage whose recovery state is not provable"
                     );
+                    retained += 1;
                     continue;
                 }
             };
             if stage_exists && reap_exists {
-                warn!(
+                debug!(
                     stage = %stage_root.display(),
                     reap = %reap_root.display(),
                     "retaining ambiguous repository stage recovery state"
                 );
+                retained += 1;
                 continue;
             }
             let owned_root = if reap_exists {
@@ -2306,19 +2311,21 @@ fn recover_orphaned_repository_stages(
                         .map_err(|error| KinError::io(owned_root, error))?,
                 ) != record.stage_identity
             {
-                warn!(
+                debug!(
                     path = %owned_root.display(),
                     "retaining repository stage whose filesystem identity is not provable"
                 );
+                retained += 1;
                 continue;
             }
             if owned_root == &stage_root {
                 if let Err(error) = rename_directory_noreplace(&stage_root, &reap_root) {
-                    warn!(
+                    debug!(
                         path = %stage_root.display(),
                         %error,
                         "retaining repository stage after failed recovery claim"
                     );
+                    retained += 1;
                     continue;
                 }
                 let reaped_identity = recoverable_path_identity(
@@ -2327,10 +2334,11 @@ fn recover_orphaned_repository_stages(
                         .map_err(|error| KinError::io(&reap_root, error))?,
                 );
                 if reaped_identity != record.stage_identity {
-                    warn!(
+                    debug!(
                         path = %reap_root.display(),
                         "retaining claimed repository stage after identity changed"
                     );
+                    retained += 1;
                     continue;
                 }
             }
@@ -2348,6 +2356,21 @@ fn recover_orphaned_repository_stages(
                 count = recovered,
                 destination = %final_kin_dir.display(),
                 "recovered inactive repository initialization stages"
+            );
+        }
+        if retained > 0 {
+            let (noun, pronoun) = if retained == 1 {
+                ("staging directory", "it")
+            } else {
+                ("staging directories", "them")
+            };
+            info!(
+                count = retained,
+                parent = %staging_parent.display(),
+                "kin init kept {retained} earlier {noun} under {} because it could not prove \
+                 {pronoun} unused; that costs disk and nothing else, and {pronoun} can be deleted \
+                 by hand once no kin init is running here",
+                staging_parent.display()
             );
         }
         Ok(recovered)
