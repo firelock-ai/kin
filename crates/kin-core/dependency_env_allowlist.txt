@@ -9,8 +9,8 @@
 # start.
 #
 # List one `KIN_*` name per line to exempt a name the scan finds but that is
-# genuinely not an operator-facing variable — a name assembled only for a
-# fixture, or a string that is not a variable at all. `#` comments and blank
+# genuinely not an operator-facing variable, such as a name assembled only for a
+# fixture or a string that is not a variable at all. `#` comments and blank
 # lines are ignored.
 #
 # The default and correct action is to register the variable in the DOWNSTREAM
