@@ -1468,6 +1468,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/resolve", post(command_resolve))
         .route("/commands/drift", post(command_drift))
         .route("/commands/tag", post(command_tag))
+        .route("/commands/admit", post(command_admit))
         .route("/commands/purge-ignored", post(command_purge_ignored))
         .route("/commands/rollback", post(command_rollback))
         .route("/commands/checkout", post(command_checkout))
@@ -3958,6 +3959,50 @@ async fn command_tag(
 /// Reports without mutating unless the request confirms. The coordination gate
 /// is held for both, so the watch loop cannot admit a competing observation
 /// between the tracked set this reports and the transition it publishes.
+/// POST /commands/admit — run one complete exact-tree admission on demand.
+///
+/// The trigger the daemon otherwise does not have. Its ambient admissions are
+/// driven by startup, by commit, and by whatever the watcher observed, so a
+/// graph that fell behind its working tree waits for churn to arrive. A quiet
+/// daemon idles out before that happens, which is why the caller is expected to
+/// hold a registered session across this request: any session whose vendor is
+/// not `kin-daemon` suppresses idle shutdown for as long as it is held.
+async fn command_admit(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(_request): Json<kin_cli::commands::admit::AdmitRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    if state.storage_backend.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "local exact-tree admission is unavailable for hosted snapshot authority".to_string(),
+        ));
+    }
+    if extract_session_id_from_headers(&headers)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "admission publishes against HEAD authority; run it without ambient session scope"
+                .to_string(),
+        ));
+    }
+
+    // No coordination gate here: the admission seam takes it, and the mutex is
+    // not reentrant.
+    let response = crate::repository_admit::execute(&state)
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    Ok(Json(response))
+}
+
 async fn command_purge_ignored(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -6702,23 +6747,51 @@ fn build_semantic_locate_result(
     // about test code (so Test-role hits are not treated as demoted).
     let rerank_active = semloc_rerank_enabled();
     let is_test_query = semloc_query_is_test_related(&query);
+    // Sidecar keys that named nothing this graph still holds. Counted rather
+    // than passed over, because a ranking that quietly drops most of its
+    // candidates and a ranking that genuinely found little look identical from
+    // the outside, and the difference is the whole diagnosis.
+    let mut unresolved_keys = 0usize;
+    let mut retired_entity_keys = 0usize;
     for (key, distance) in raw {
         if rows.len() >= max_rows {
             break;
         }
         let Some(item) = graph.resolve_retrieval_key(&key) else {
+            unresolved_keys += 1;
             continue;
         };
         // Entity-centric projection: the ENTITY (kind + name + signature) is the
         // result; the file is demoted to provenance.
-        let (entity_id, name, file, kind, signature) = match &item {
-            kin_db::ResolvedRetrievalItem::Entity(entity) => (
-                entity.id.to_string(),
-                entity.name.clone(),
-                entity.file_origin.as_ref().map(|origin| origin.0.clone()),
-                Some(format!("{:?}", entity.kind).to_lowercase()),
-                Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
-            ),
+        let (id_space, entity_id, name, file, kind, signature) = match &item {
+            kin_db::ResolvedRetrievalItem::Entity(entity) => {
+                // Resolution is not liveness. An `EntityRevision` key resolves
+                // against immutable revision history, and retiring an entity
+                // deliberately leaves that history behind, so the head revision
+                // of a deleted entity still resolves to an `Entity` whose id
+                // names nothing the graph holds. Every id-consuming tool then
+                // refuses that id, which is the whole reported defect. The
+                // snippet projection below already dropped these, but only when
+                // snippets were on; under `include_snippet: false` or file
+                // granularity nothing filtered them at all.
+                if graph
+                    .get_entity(&entity.id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    retired_entity_keys += 1;
+                    continue;
+                }
+                (
+                    kin_cli::commands::locate::LocateIdSpace::Entity,
+                    Some(entity.id.to_string()),
+                    entity.name.clone(),
+                    entity.file_origin.as_ref().map(|origin| origin.0.clone()),
+                    Some(format!("{:?}", entity.kind).to_lowercase()),
+                    Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
+                )
+            }
             other => {
                 let file = other.file_path().map(|path| path.0.clone());
                 let name = file
@@ -6730,10 +6803,25 @@ fn build_semantic_locate_result(
                     })
                     .unwrap_or_default()
                     .to_string();
-                let id = file.clone().unwrap_or_else(|| name.clone());
-                (id, name, file, None, None)
+                // Deliberately no entity id. This hit is an artifact-level
+                // embedding: a tracked file the parsers produced no entities
+                // for. It previously carried its own path under `entity_id`,
+                // which reads as an actionable handle and is refused by every
+                // tool that takes one.
+                (
+                    kin_cli::commands::locate::LocateIdSpace::Artifact,
+                    None,
+                    name,
+                    file,
+                    None,
+                    None,
+                )
             }
         };
+        // Dedupe still needs one stable string per hit. For an artifact that is
+        // its path, which is what made the old code put a path in `entity_id`
+        // in the first place; the two uses are now separate.
+        let dedupe_id = entity_id.clone().or_else(|| file.clone()).unwrap_or_else(|| name.clone());
 
         if file_granularity {
             match &file {
@@ -6745,7 +6833,7 @@ fn build_semantic_locate_result(
                 // File granularity requires a file path; skip pathless hits.
                 None => continue,
             }
-        } else if !seen_entities.insert(entity_id.clone()) {
+        } else if !seen_entities.insert(dedupe_id.clone()) {
             // Collapse the two index keys per entity (`Entity(E)` +
             // `EntityRevision(head)`) into a single result. `raw` is rank-ordered
             // by distance, so the first occurrence of an entity is its best hit.
@@ -6807,7 +6895,7 @@ fn build_semantic_locate_result(
         let match_evidence =
             cosine_match_evidence(&query, &name, role, rerank_active, is_test_query);
         let mut hit = json!({
-            "entity_id": entity_id,
+            "id_space": id_space.as_str(),
             "kind": kind,
             "name": name,
             "signature": signature,
@@ -6815,6 +6903,26 @@ fn build_semantic_locate_result(
             "provenance": { "file": file },
             "match_evidence": match_evidence,
         });
+        match entity_id {
+            // An entity hit is unchanged: same key, same graph entity id, and
+            // every id-consuming tool resolves it.
+            Some(entity_id) => {
+                hit["entity_id"] = json!(entity_id);
+            }
+            // An artifact hit states what it is and what reads it. Omitting
+            // `entity_id` is the point: the field existed, held a path, and was
+            // refused by every tool that accepts one, so an agent could only
+            // discover the hit was not act-on-able by acting on it.
+            None => {
+                hit["artifact_path"] = json!(file);
+                hit["resolves_with"] = json!("kin_artifact_read");
+                hit["note"] = json!(
+                    "artifact-level embedding: a tracked file with no parsed entities. It has no \
+                     entity id, so get_entity_source, get_context_pack, and graph_neighborhood \
+                     cannot take this hit; read it with kin_artifact_read."
+                );
+            }
+        }
         if let Some(span) = span {
             let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
             hit["start_line"] = json!(start_line);
@@ -6824,6 +6932,43 @@ fn build_semantic_locate_result(
             hit["snippet"] = json!(snippet);
         }
         rows.push(hit);
+    }
+
+    // Report the sidecar/graph gap rather than serving a short page as if the
+    // index had simply ranked little. A store whose graph fell behind its
+    // embeddings answers every query this way, and without this the only
+    // symptom is an empty result that looks like an honest negative.
+    if unresolved_keys > 0 {
+        kin_cli::commands::locate::record_degradation(
+            &mut degradations,
+            kin_cli::commands::locate::RetrievalDegradation {
+                component: "vector_sidecar".to_string(),
+                reason: "keys_not_in_graph".to_string(),
+                detail: format!(
+                    "{unresolved_keys} ranked vector key(s) named no object this graph holds, so \
+                     they were dropped from the ranking"
+                ),
+                remediation: "run 'kin admit' to admit the complete exact tree, then let the \
+                              embed pass re-index"
+                    .to_string(),
+            },
+        );
+    }
+    if retired_entity_keys > 0 {
+        kin_cli::commands::locate::record_degradation(
+            &mut degradations,
+            kin_cli::commands::locate::RetrievalDegradation {
+                component: "vector_sidecar".to_string(),
+                reason: "retired_entity_keys".to_string(),
+                detail: format!(
+                    "{retired_entity_keys} ranked vector key(s) resolved through revision history \
+                     to entities the graph no longer holds, so they were dropped rather than \
+                     served as ids no graph tool can take"
+                ),
+                remediation: "run 'kin embed' to re-index this graph's current entities"
+                    .to_string(),
+            },
+        );
     }
 
     // Cache the full ranking under the paging key, then return page 0.
@@ -6922,6 +7067,17 @@ fn fused_semantic_locate_payload(
                 map.insert(
                     "match_evidence".to_string(),
                     fused_match_evidence(query, entity),
+                );
+                // Constant-true here, and stated anyway. The fused pipeline
+                // re-projects its page from live graph entities, so a hit on
+                // this arm cannot be artifact-level or retired. A caller that
+                // reads `id_space` should not have to know which arm answered
+                // to know whether the field is present, and a label that
+                // appears on one arm only is a label a consumer learns to
+                // ignore.
+                map.insert(
+                    "id_space".to_string(),
+                    json!(kin_cli::commands::locate::LocateIdSpace::Entity.as_str()),
                 );
                 // The two `semantic_locate` arms carried the same graph-owned
                 // excerpt under different names: the cosine arm called it

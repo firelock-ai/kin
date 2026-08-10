@@ -1465,6 +1465,20 @@ impl DaemonClient {
             .await
     }
 
+    /// Request one complete exact-tree admission.
+    ///
+    /// Idempotent by construction rather than by convention: the pass observes
+    /// the whole working directory and publishes the difference, so a retried
+    /// request re-observes the tree the first one already admitted and finds
+    /// nothing to do. That is what makes it safe on the shared retrying poster.
+    pub async fn admit(
+        &self,
+        request: &crate::commands::admit::AdmitRequest,
+    ) -> Result<crate::commands::admit::AdmitResponse> {
+        self.post_idempotent_json("/commands/admit", request, "admit")
+            .await
+    }
+
     pub async fn rollback(
         &self,
         request: &crate::commands::rollback::RollbackRequest,

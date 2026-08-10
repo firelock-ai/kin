@@ -266,6 +266,44 @@ pub enum LocateMatchKind {
     TextFallback,
 }
 
+/// Which id space a located hit's identifier belongs to.
+///
+/// The retrieval spine is keyed by `kin_model::RetrievalKey`, which spans four
+/// variants across two id spaces: entities and their revisions on one side,
+/// artifacts and their revisions on the other. `EntityId` and `ArtifactId` are
+/// both bare UUID newtypes, and an artifact hit that carries a path instead is
+/// still just a string, so nothing about a rendered id says which space it came
+/// from. A consumer therefore cannot tell an id it may pass to
+/// `get_entity_source`, `get_context_pack`, or `graph_neighborhood` from one
+/// those tools will reject, and it finds out by making the call and being
+/// refused.
+///
+/// This states it up front. It never affects ranking or ordering, and it is a
+/// fact about the hit rather than about the query, which is the distinction
+/// [`LocateMatchKind`] draws on the other axis.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateIdSpace {
+    /// The hit's `entity_id` names a live entity in the graph. Every
+    /// id-consuming graph tool resolves it.
+    Entity,
+    /// The hit names an artifact-level embedding: a tracked file with no parsed
+    /// entities. It carries `artifact_path` and deliberately carries no
+    /// `entity_id`, because there is no entity id to carry and a field named
+    /// one holding a path is precisely how a dead id reaches an agent.
+    Artifact,
+}
+
+impl LocateIdSpace {
+    /// The serialized token, so callers can assert against one spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Artifact => "artifact",
+        }
+    }
+}
+
 /// Whether a query token IS this entity's name (or its last dotted segment).
 ///
 /// The single definition of "the query named this symbol". `kin-daemon`'s

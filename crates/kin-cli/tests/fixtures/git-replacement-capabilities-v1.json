@@ -386,6 +386,28 @@
       "note": "The session scanner performs retained-root double observation and authority-root CAS, and its observation now owns the retained no-follow directory capability it was taken through. Every field is private, so the observation cannot be built outside the scanner, and planning re-proves the retained capability before anything is planned against it."
     },
     {
+      "command": "admit",
+      "status": "ready",
+      "exposure": "enabled",
+      "authority": "repository-v6 authority transition published through the daemon's own complete exact-tree admission seam",
+      "required_for_bounded_dogfood": false,
+      "acceptance_spec": [
+        "run the same complete exact-tree admission the watch loop and commit run, rather than a second admission implementation that could admit differently",
+        "hold a registered daemon session for the duration so the idle window cannot end the pass in flight, and release it on every exit path",
+        "report the outcome from the reconcile probes rather than from the request succeeding, because a pass can fail inside a request that returns cleanly",
+        "exit nonzero on a failed pass, leading with the recorded cause and stating that graph authority is unchanged"
+      ],
+      "evidence_tests": [
+        "kin_cli::commands::admit::tests::a_successful_admission_names_both_sides_of_the_transition",
+        "kin_cli::commands::admit::tests::a_failed_admission_leads_with_its_cause_and_refuses_to_claim_a_change",
+        "kin_cli::commands::admit::tests::an_admission_that_changed_nothing_says_so_without_reading_as_a_failure",
+        "kin_daemon::api::tests::admit_admits_a_complete_tree_no_watcher_event_ever_named",
+        "kin_daemon::api::tests::admit_records_its_pass_on_the_probes_the_health_surfaces_read",
+        "kin_daemon::api::tests::a_cli_session_suppresses_the_idle_shutdown_that_would_end_an_admission"
+      ],
+      "note": "The daemon admits a complete exact tree on startup, on commit, and on what its watcher observed, and none of those is a trigger an operator can pull, so a graph that fell behind its working tree waits for churn that may not come while a quiet daemon idles out first. This command is that trigger. It runs the daemon's own admission seam, so it inherits the same completion proof, authority compare-and-swap, and mass-deletion guard, and it carries no mass-deletion override of its own because the guard's override is read from the daemon's environment and a second control over one guard is two rules that can disagree."
+    },
+    {
       "command": "purge-ignored",
       "status": "ready",
       "exposure": "enabled",
