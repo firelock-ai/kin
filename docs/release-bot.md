@@ -89,7 +89,7 @@ changelog against newer code.
 
 ## Tag admission (fail-closed checks, in order)
 
-The single job refuses — before any tag is created — unless **all** hold:
+Before creating any tag, the single job refuses unless **all** hold:
 
 1. **Trusted trigger or authorized break-glass actor.** Scheduled and
    `workflow_run` events use workflow code from protected default-branch
@@ -113,7 +113,7 @@ The single job refuses — before any tag is created — unless **all** hold:
    `repos/<owner>/<repo>/commits/<sha>/check-runs`. A required-context guard and
    an advisory-evidence audit run. Every context in the
    **presence-required release-critical set**
-   (`REQUIRED_CHECKS`) must be present and green — a SHA missing any of these is
+   (`REQUIRED_CHECKS`) must be present and green. A SHA missing any of these is
    refused even if nothing failed (a SHA that never ran CI is refused, not passed
    vacuously). Required contexts are bound to the GitHub Actions App identity,
    so another check-writing App cannot satisfy one by copying its name. Every
@@ -289,8 +289,8 @@ These steps require the founder / org owner and gate the bot going live.
      Note the **App ID**.
 2. **Install the App.** App → Install App → install on the `firelock-ai` org.
    Scoping the install to **Only select repositories → `kin`** is the tightest
-   posture, but the App is currently installed **org-wide** (founder decision) —
-   see "Install scope and token narrowing" below for why that is still safe.
+   posture, but the App is currently installed **org-wide** (founder decision).
+   See "Install scope and token narrowing" below for why that is still safe.
 3. **Create the protected `release-tag` Environment.** Give it a custom
    deployment-branch policy that allows **only `main`**, with no required
    reviewer so trusted automatic reconciliation remains unattended.
@@ -303,8 +303,8 @@ These steps require the founder / org owner and gate the bot going live.
    repository could explicitly request a broadly scoped secret. The Environment
    is therefore a required credential boundary, not optional hardening.
 4. **Add the App credentials only as `release-tag` Environment secrets:**
-   - `KIN_RELEASE_BOT_APP_ID` — the App ID (numeric).
-   - `KIN_RELEASE_BOT_PRIVATE_KEY` — the full PEM contents, including the
+   - `KIN_RELEASE_BOT_APP_ID`: the App ID (numeric).
+   - `KIN_RELEASE_BOT_PRIVATE_KEY`: the full PEM contents, including the
       `-----BEGIN...-----` / `-----END...-----` lines.
    Remove or rotate away every repository- or organization-level copy visible
    to `kin`. GitHub makes repository secrets available to every workflow in the
@@ -337,7 +337,7 @@ narrowed token, so it must exist only as a secret in the main-only
 consume it.
 Extending bot-mediated tagging to another repo is a deliberate act: replicate
 this workflow and its protected Environment in that repo and widen or duplicate
-the `repositories:` narrowing to name the new repo explicitly — never drop the
+the `repositories:` narrowing to name the new repo explicitly. Never drop the
 `owner`/`repositories` inputs, since without them a single token would span
 every repository the org-wide install can reach.
 

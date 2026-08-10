@@ -21,9 +21,9 @@ export, but not yet projected by the UTF-8 workspace boundary) and gitlinks
 (retained exactly as imported targets, but awaiting the graph-native
 cross-repository model and recursive materialization).
 
-Kin's session runtime is the venv-like execution contract for a Kin repository:
-you (or an agent) run normal project commands — `npm test`, `make`,
-`docker compose config`, an editor, a coding assistant — without knowing which
+Kin's session runtime is the venv-like execution contract for a Kin repository.
+You, or an agent, run normal project commands such as `npm test`, `make`,
+`docker compose config`, an editor, or a coding assistant, without knowing which
 files are graph-owned, projected, or materialized. Kin materializes graph truth
 into a **session workspace**, the tool runs there like in any ordinary checkout,
 and Kin reconciles the results back into the semantic graph when the session
@@ -42,16 +42,16 @@ Three surfaces share this contract:
 installs Kin's MCP server entry into your AI clients (Claude Code, Cursor,
 Codex, Gemini, Windsurf) and your shell hook. In short:
 
-- **`kin setup`** — configure clients once (MCP install, shell hook).
-- **`kin exec` / `kin shell`** — run ordinary commands through a session workspace.
-- **`kin with`** — launch an assistant inside a
+- **`kin setup`**: configure clients once (MCP install, shell hook).
+- **`kin exec` / `kin shell`**: run ordinary commands through a session workspace.
+- **`kin with`**: launch an assistant inside a
   session workspace with session-coherent MCP.
 
 ## The execution contract
 
 1. **Materialize.** The repo daemon materializes graph-owned truth into
-   `.kin/runs/session-<id>/`. This is a real directory containing real files —
-   any tool works unchanged. Scoped materialization (`--scope file:<path>`,
+   `.kin/runs/session-<id>/`. This is a real directory containing real files,
+   so any tool works unchanged. Scoped materialization (`--scope file:<path>`,
    `--scope entity:<name>`) materializes a subset; `entity:` scopes are
    resolved against the graph and fail loudly if the entity does not exist.
 2. **Run.** The command executes locally in that workspace (never through the
@@ -62,10 +62,10 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
    projection, and repository-path authority is removed before the child
    starts.
 3. **Reconcile.** On success, Kin reconciles the workspace's own changes into
-   the graph — a change-set replay against the base state it was materialized
-   from, not a whole-tree overwrite — then removes the workspace.
-4. **Fail loud, lose nothing.** On a non-zero exit — or if reconcile itself
-   fails — the workspace is **preserved** and Kin prints the recovery
+   the graph as a change-set replay against the base state it was materialized
+   from, not a whole-tree overwrite, and then removes the workspace.
+4. **Fail loud, lose nothing.** On a non-zero exit, or if reconcile itself
+   fails, the workspace is **preserved** and Kin prints the recovery
    commands:
 
    ```
@@ -83,10 +83,10 @@ commands under its **Session runtime** check.
 
 ### Closeout flags (`kin exec`)
 
-- default — reconcile on success, clean up; preserve on failure.
-- `--keep` — keep the workspace and defer reconcile (`kin reconcile <id>`
+- default: reconcile on success, clean up; preserve on failure.
+- `--keep`: keep the workspace and defer reconcile (`kin reconcile <id>`
   when ready, which admits it and then removes it).
-- `--discard` — throw the workspace away without reconciling (pure scratch
+- `--discard`: throw the workspace away without reconciling (pure scratch
   run).
 
 Put kin flags **before** the command; everything after belongs to the command:
@@ -94,7 +94,7 @@ Put kin flags **before** the command; everything after belongs to the command:
 
 ### Generated files and tool output
 
-Reconcile skips generated and vendored directories by policy —
+Reconcile skips generated and vendored directories by policy:
 `node_modules/`, `target/`, `__pycache__/`, `vendor/`, `.next/`, `dist/`,
 `build/`, `out/`, and hidden directories. So:
 
@@ -108,7 +108,7 @@ do not want, or `--keep` to inspect before reconciling.
 
 ### External tools and scoped execution
 
-Some tools read far more than the files you name — package managers resolve
+Some tools read far more than the files you name: package managers resolve
 manifests, lockfiles, and workspaces; `make` follows arbitrary prerequisites;
 Docker sends a whole build context to the daemon. Running these in a partially
 materialized workspace produces confusing failures, so Kin detects them and
@@ -122,7 +122,7 @@ widens scoped execution to a **full** workspace under the default
   `corepack`
 
 Under the `strict` policy Kin refuses instead of widening, and tells you to
-drop `--scope` or switch policy. Either way the decision is printed — scoped
+drop `--scope` or switch policy. Either way, the decision is printed, so scoped
 materialization never silently surprises you.
 
 ## Docker and Compose caveats
@@ -131,7 +131,7 @@ Container workflows cross a process boundary (the Docker daemon), so a few
 session-workspace realities matter:
 
 - **Build context.** `docker build` from a session workspace sends the
-  *materialized* workspace as the build context. That is graph truth — but it
+  *materialized* workspace as the build context. That is graph truth, but it
   is a copy. Absolute `COPY`/`ADD` assumptions about your repo's on-disk path
   do not apply.
 - **Bind mounts.** `-v $(pwd):/app` style mounts point at
@@ -143,8 +143,8 @@ session-workspace realities matter:
   the session workspace and follow normal reconcile rules (generated dirs are
   skipped; everything else reconciles on success).
 - **Safe validation.** `kin exec -- docker compose config` validates your
-  compose file against materialized graph truth without starting anything —
-  it's the recommended smoke check.
+  compose file against materialized graph truth without starting anything,
+  which makes it the recommended smoke check.
 - **Cleanup.** Kin removes the workspace, not your containers/volumes/images.
   Stop containers that reference a session path before closeout.
 
@@ -168,7 +168,7 @@ session workspace:
 **MCP session coherence.** The MCP server ships inside the `kin` binary
 (`kin mcp start`) and binds per invocation:
 
-1. If `KIN_DAEMON_URL` is set — which a session launch guarantees — the MCP
+1. If `KIN_DAEMON_URL` is set, which a session launch guarantees, the MCP
    server forwards every graph tool call to exactly that daemon. No cwd
    guessing, no stale global config.
 2. Otherwise it discovers the repository by walking up from the working
@@ -207,8 +207,8 @@ The repo daemon is a long-lived, per-user singleton. The **first** `kin` command
 that needs it spawns it, and the daemon inherits **that** command's environment.
 Every later command reaches the already-running daemon over HTTP and does **not**
 re-export its own environment into the worker. So a behavior-relevant knob that
-is read inside the daemon worker — or in the embedding / inference substrate it
-hosts — is fixed at whatever value the daemon captured when it started.
+is read inside the daemon worker, or in the embedding / inference substrate it
+hosts, is fixed at whatever value the daemon captured when it started.
 
 The consequence is a quiet footgun: running
 
@@ -248,20 +248,20 @@ and the CLI (which compares them), so the two sides cannot drift apart.
 | Reconcile failed | keep workspace, print recovery | `kin reconcile <id>` after resolving, then clean up |
 | Ran with `--keep` | keep workspace, defer reconcile | `kin reconcile <id>` when ready |
 | Ran with `--discard` | delete workspace, no reconcile | nothing |
-| Not sure what's pending | — | `kin doctor` lists leftover session workspaces |
+| Not sure what's pending | n/a | `kin doctor` lists leftover session workspaces |
 
 One reconcile semantic to know: reconcile replays the **workspace's own
 change-set**, not a whole-tree state sync. When a workspace is materialized Kin
 records the base graph version it started from; at reconcile it applies only the
 edits the workspace itself made relative to that base and leaves files the
-workspace never touched alone — even if the source advanced in the meantime. So a
+workspace never touched alone, even if the source advanced in the meantime. So a
 kept workspace reconciled late does **not** revert source changes made since it
 was materialized, and does not delete files created in the source afterward.
 
 If the workspace and the source both changed the same file, reconcile merges
-them when they agree and **fails loud** — naming the conflicting files and
-exiting non-zero — when they do not, rather than overwriting newer source truth.
-The workspace is preserved on conflict so you can resolve it by hand or discard
-it. Workspaces materialized before base tracking carry no recorded base;
+them when they agree. When they do not, it **fails loud**, naming the
+conflicting files and exiting non-zero, rather than overwriting newer source
+truth. The workspace is preserved on conflict so you can resolve it by hand or
+discard it. Workspaces materialized before base tracking carry no recorded base;
 reconcile refuses them unless they are already identical to the source, and asks
 you to re-run the work in a fresh session or discard the workspace.
