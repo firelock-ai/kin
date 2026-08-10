@@ -836,31 +836,11 @@ enum Command {
     Open {
         /// Editor to launch: code or cursor
         editor: String,
-        /// In native mode, block filesystem discovery commands and require Kin discovery
-        #[arg(long)]
-        restrict_discovery: bool,
-        /// In native mode, block both filesystem discovery and direct file reads
-        #[arg(long, conflicts_with = "restrict_discovery")]
-        restrict_filesystem: bool,
     },
     /// Launch an assistant in an exact graph-derived session workspace
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
-        /// Launch inside a graph-backed session workspace: the assistant starts
-        /// with its cwd in the session, receives session/daemon env, and its
-        /// changes reconcile into the graph on a successful exit
-        #[arg(long)]
-        session: bool,
-        /// Pass the raw task only; keep AGENTS/bootstrap docs on disk but do not inject prompt guidance
-        #[arg(long)]
-        passive_guidance: bool,
-        /// In native mode, block filesystem discovery commands and require Kin discovery
-        #[arg(long)]
-        restrict_discovery: bool,
-        /// In native mode, block both filesystem discovery and direct file reads
-        #[arg(long, conflicts_with = "restrict_discovery")]
-        restrict_filesystem: bool,
         /// Deny the assistant's native discovery tools for this launch, leaving
         /// Kin's semantic tools as the only discovery surface; the enforcement
         /// tier is printed at launch and differs per assistant
@@ -899,12 +879,6 @@ enum Command {
         /// Materialization strategy
         #[arg(long)]
         strategy: Option<String>,
-        /// In native mode, block filesystem discovery commands and require Kin discovery
-        #[arg(long)]
-        restrict_discovery: bool,
-        /// In native mode, block both filesystem discovery and direct file reads
-        #[arg(long, conflicts_with = "restrict_discovery")]
-        restrict_filesystem: bool,
     },
     /// Show a quick codebase overview (entity counts by kind, language, top files)
     Overview {
@@ -3098,14 +3072,9 @@ fn main() -> Result<()> {
                 Command::Todo { action } => match action {
                     TodoAction::Import { path } => commands::note::todo_import(path).await,
                 },
-                Command::Open {
-                    editor,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => {
+                Command::Open { editor } => {
                     commands::capabilities::require_ready("open")?;
-                    commands::session_run::open(editor, restrict_discovery, restrict_filesystem)
-                        .await
+                    commands::session_run::open(editor).await
                 }
                 Command::PurgeIgnored {
                     confirm,
@@ -3123,43 +3092,19 @@ fn main() -> Result<()> {
                 }
                 Command::With {
                     assistant,
-                    session,
-                    passive_guidance,
-                    restrict_discovery,
-                    restrict_filesystem,
                     semantic_only,
                     task,
                 } => {
                     commands::capabilities::require_ready("with")?;
-                    commands::session_run::with(
-                        assistant,
-                        session,
-                        passive_guidance,
-                        restrict_discovery,
-                        restrict_filesystem,
-                        semantic_only,
-                        task,
-                    )
-                    .await
+                    commands::session_run::with(assistant, semantic_only, task).await
                 }
                 // Adjudicated before the runtime starts; see the early return
                 // at the top of `main`.
                 Command::SemanticOnlyGuard => {
                     commands::assistant_adapter::run_semantic_only_guard()
                 }
-                Command::Shell {
-                    strategy,
-                    restrict_discovery,
-                    restrict_filesystem,
-                } => {
+                Command::Shell { strategy } => {
                     commands::capabilities::require_ready("shell")?;
-                    if restrict_discovery || restrict_filesystem {
-                        anyhow::bail!(
-                            "--restrict-discovery and --restrict-filesystem belonged to the \
-                             discontinued native editor fork and are fail-closed; the session \
-                             projection is the boundary now"
-                        );
-                    }
                     commands::session_run::shell(strategy).await
                 }
                 Command::Overview { compact, json } => {

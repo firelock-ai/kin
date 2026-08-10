@@ -231,10 +231,11 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
         );
     }
 
-    // The discontinued native-fork flags still refuse before anything runs, and
-    // so does `--session`: every launch is a session projection now, so a flag
-    // that used to select one can only mean something it no longer selects.
-    // Accepting and ignoring it would let a caller believe it chose something.
+    // The discontinued native-fork flags are gone rather than refused. A flag
+    // clap accepts and the body then rejects is advertised in help as though it
+    // works, which is what these four did: `--session` even described the
+    // current default, so its page sold an opt-in for something already true.
+    // Removal makes the parser the only answer, and it answers before launch.
     for args in [
         &["shell", "--restrict-discovery"][..],
         &["open", "code", "--restrict-filesystem"][..],
@@ -246,11 +247,59 @@ fn session_commands_reach_the_session_surface_instead_of_the_capability_gate() {
             .current_dir(root.path())
             .output()
             .unwrap_or_else(|error| panic!("run kin {args:?}: {error}"));
-        assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "kin {args:?} must exit 2 through clap, not 1 from a command body: {stderr}"
+        );
         assert!(
-            stderr.contains("fail-closed"),
-            "kin {args:?} must stay fail-closed: {stderr}"
+            stderr.contains("unexpected argument"),
+            "kin {args:?} must be refused by the parser: {stderr}"
+        );
+        assert!(
+            !stderr.contains("fail-closed"),
+            "kin {args:?} must no longer be advertised then refused: {stderr}"
+        );
+    }
+
+    // And they are absent from the pages that used to advertise them, which is
+    // the half a caller reads before typing anything.
+    for (command, gone) in [
+        (
+            &["shell", "--help"][..],
+            &["--restrict-discovery", "--restrict-filesystem"][..],
+        ),
+        (
+            &["open", "--help"][..],
+            &["--restrict-discovery", "--restrict-filesystem"][..],
+        ),
+        (
+            &["with", "--help"][..],
+            &[
+                "--session",
+                "--passive-guidance",
+                "--restrict-discovery",
+                "--restrict-filesystem",
+            ][..],
+        ),
+    ] {
+        let output = kin_command(&home)
+            .args(command)
+            .output()
+            .unwrap_or_else(|error| panic!("run kin {command:?}: {error}"));
+        let help = String::from_utf8_lossy(&output.stdout);
+        for flag in gone {
+            assert!(
+                !help.contains(flag),
+                "kin {command:?} must not advertise {flag}: {help}"
+            );
+        }
+        // A positive control: the page still renders the flags it does carry,
+        // so an empty or failed render cannot pass this as an absence.
+        assert!(
+            help.contains("--help"),
+            "kin {command:?} must still render its options: {help}"
         );
     }
 

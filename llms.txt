@@ -19,7 +19,7 @@ Native Windows x86_64 support is early. Repository admission works: `kin init` i
 - `kin setup` — configure your shell and connect agents (Claude, Cursor, Codex, Gemini) to the MCP server.
 - `kin doctor` — verify the install and daemon health.
 - `kin init` turns a Git repo into a Kin workspace. `kin status` and `kin search` require the bundled `kin-daemon` runtime (installed by every channel above).
-- `kin exec -- <cmd>` runs ordinary project tools (npm, make, docker) through a graph-backed session workspace; `kin shell` opens an interactive one; `kin with --session <assistant>` launches an agent inside one.
+- `kin exec -- <cmd>` runs ordinary project tools (npm, make, docker) through a graph-backed session workspace; `kin shell` opens an interactive one; `kin with <assistant>` launches an agent inside one.
 
 ## For AI agents (MCP)
 
