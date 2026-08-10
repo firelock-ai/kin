@@ -25,6 +25,14 @@ per-artifact SHA-256 file:
 | macOS x86_64 | `kin-macos-x86_64.tar.gz` | `.tar.gz.sha256` |
 | macOS aarch64 | `kin-macos-aarch64.tar.gz` | `.tar.gz.sha256` |
 | Windows x86_64 | `kin-windows-x86_64.zip` | `.zip.sha256` |
+| Windows x86_64 | `kin-windows-x86_64.tar.gz` | `.tar.gz.sha256` |
+
+Windows ships the same components in two containers. The zip is the name the
+PowerShell installer, the npm launcher, and `kin update` resolve; the tarball is
+the name the POSIX installer builds on every platform it supports, including the
+MSYS, MINGW, and CYGWIN shells, so piping the documented curl command into a
+shell on Windows resolves instead of 404ing. Both are checksummed, attested, and
+verified against one content inventory, so they cannot ship different bytes.
 
 A convenience `checksums-sha256.txt` aggregating every per-artifact file is also
 attached to the release, but the installer verifies against the per-artifact

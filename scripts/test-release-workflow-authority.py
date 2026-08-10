@@ -59,6 +59,10 @@ ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
 TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
 ASSERTION_REACHABILITY = ROOT / "scripts" / "test-assertion-reachability.py"
 ASSERTION_REACHABILITY_POLICY = "scripts/test-assertion-reachability.py"
+INSTALLER_ASSET_GUARD = ROOT / "scripts" / "verify-installer-release-assets.py"
+INSTALLER_ASSET_GUARD_POLICY = "scripts/verify-installer-release-assets.py"
+INSTALLER_ASSET_FALSIFIER = ROOT / "scripts" / "falsify-installer-release-assets.py"
+INSTALLER_ASSET_FALSIFIER_POLICY = "scripts/falsify-installer-release-assets.py"
 TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
 TAG_LISTING_FORMAT = (
     "--format='%(refname:strip=2) "
@@ -3198,6 +3202,59 @@ def assert_assertion_reachability_gate_wired(workflow: str) -> None:
         raise AssertionError(
             f"{ASSERTION_REACHABILITY_POLICY} is missing; the release gates "
             "would no longer prove their own checks run"
+        )
+
+
+def assert_installer_asset_guard_wired(ci: str, release: str) -> None:
+    """Keep the check that every installer asset name is one the release ships.
+
+    Each install surface builds a release asset name out of the platform it
+    detects, and the release publishes a fixed list of names. Nothing compared
+    the two lists, so a disagreement rode every release to date: the POSIX
+    installer asks `windows` for a `.tar.gz`, mapping the MSYS, MINGW, and
+    CYGWIN shells onto it, while the Windows leg published only a `.zip`. The
+    documented curl command 404'd there and every check stayed green.
+
+    The guard runs on pull requests against the workflow's own asset lists and
+    again inside the release against the bytes staged for upload. The falsifier
+    runs beside it because a guard nobody has watched fail is not evidence that
+    it can, and this defect is exactly what a check that cannot fail looks like.
+    """
+
+    for path, policy in (
+        (INSTALLER_ASSET_GUARD, INSTALLER_ASSET_GUARD_POLICY),
+        (INSTALLER_ASSET_FALSIFIER, INSTALLER_ASSET_FALSIFIER_POLICY),
+    ):
+        if not path.is_file():
+            raise AssertionError(
+                f"{policy} is missing; an installer could ask a release for an "
+                "asset it does not publish and nothing would notice"
+            )
+
+    # Match whole invocations rather than searching for the path, which a
+    # commented-out line would still satisfy.
+    ci_lines = {line.strip() for line in ci.splitlines()}
+    missing = sorted(
+        command
+        for command in (
+            f"python3 ./{INSTALLER_ASSET_GUARD_POLICY}",
+            f"python3 ./{INSTALLER_ASSET_FALSIFIER_POLICY}",
+        )
+        if command not in ci_lines
+    )
+    if missing:
+        raise AssertionError(
+            "ci.yml must run " + " and ".join(missing) + "; without both, an "
+            "installer asset name can stop being published and no pull request "
+            "would go red"
+        )
+
+    release_command = f"run: python3 ./{INSTALLER_ASSET_GUARD_POLICY} --assets-dir ."
+    if release_command not in {line.strip() for line in release.splitlines()}:
+        raise AssertionError(
+            f"release.yml must run {INSTALLER_ASSET_GUARD_POLICY} against the "
+            "staged assets; the workflow's intent is not the same evidence as "
+            "the bytes about to be uploaded"
         )
 
 
@@ -9014,6 +9071,7 @@ def main() -> None:
         "kin-macos-x86_64.tar.gz",
         "kin-macos-aarch64.tar.gz",
         "kin-windows-x86_64.zip",
+        "kin-windows-x86_64.tar.gz",
         "release-provenance.json",
         "Fail closed",
     ):
@@ -9119,6 +9177,31 @@ def main() -> None:
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
+    assert_installer_asset_guard_wired(ci_workflow, release)
+    expect_assertion(
+        "ci.yml drops the guard that installer asset names are published",
+        "ci.yml must run",
+        lambda: assert_installer_asset_guard_wired(
+            ci_workflow.replace(INSTALLER_ASSET_GUARD_POLICY, "scripts/absent.py"),
+            release,
+        ),
+    )
+    expect_assertion(
+        "ci.yml keeps the guard but drops its falsification",
+        "ci.yml must run",
+        lambda: assert_installer_asset_guard_wired(
+            ci_workflow.replace(INSTALLER_ASSET_FALSIFIER_POLICY, "scripts/absent.py"),
+            release,
+        ),
+    )
+    expect_assertion(
+        "the release stops checking installer asset names against its own assets",
+        "must run",
+        lambda: assert_installer_asset_guard_wired(
+            ci_workflow,
+            release.replace(f"./{INSTALLER_ASSET_GUARD_POLICY} --assets-dir .", "true"),
+        ),
+    )
     expect_assertion(
         "ci.yml drops the step that proves every assertion still runs",
         "ci.yml must run",
