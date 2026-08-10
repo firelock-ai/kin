@@ -5243,6 +5243,81 @@ mod tests {
         );
     }
 
+    /// The closing arm: a file nothing did but write is carried by the next
+    /// commit and named as carried.
+    ///
+    /// The pending content here comes from the real watcher path rather than
+    /// from a delta assembled to look like one, because the composition is the
+    /// claim. Writing the file is the whole of the user's action: ambient
+    /// admission puts it in the workspace tree without moving the base, and the
+    /// commit that follows publishes it while stating plainly that its author
+    /// did not write it. Either half alone is defensible and useless; a file
+    /// that becomes queryable and then gets published as somebody's work is
+    /// worse than one that never appeared.
+    #[test]
+    fn a_commit_declares_a_watcher_admitted_file_as_carried() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+
+        // Nothing here but a write and the notification it produces.
+        let written = state.layout.working_dir().join("src/brand_new.rs");
+        std::fs::write(&written, b"pub fn brand_new() -> u8 { 1 }\n").unwrap();
+        crate::loop_runner::admit_one_ambient_host_event(&state, written).unwrap();
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&RepoPath::from_utf8("src/brand_new.rs").unwrap())
+                .is_some(),
+            "the watcher pass must have admitted the new file before the commit sees it"
+        );
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a workspace carrying a watcher-admitted file must still commit: {}",
+            result_text(&result)
+        );
+
+        let reply = commit_reply(&result);
+        assert_eq!(
+            reply["staged_operation_files"],
+            serde_json::json!(["src/lib.rs"]),
+            "the reply must keep the operations' own file separate: {reply:#}"
+        );
+        assert_eq!(
+            reply["carried_pending_files"],
+            serde_json::json!(["src/brand_new.rs"]),
+            "a file the watcher admitted is carried, not authored: {reply:#}"
+        );
+
+        let change_id = reply["change_id"].as_str().unwrap().to_string();
+        let change = state
+            .graph
+            .get_entity_history(&entity.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the entity the operation wrote");
+        assert!(
+            change.message.contains("src/brand_new.rs"),
+            "the permanent record must name what it carried: {}",
+            change.message
+        );
+        assert!(
+            !workspace_is_dirty(&state),
+            "the commit must leave the workspace level with its base"
+        );
+    }
+
     /// A workspace with nothing pending answers exactly as it did before the
     /// fold existed.
     ///

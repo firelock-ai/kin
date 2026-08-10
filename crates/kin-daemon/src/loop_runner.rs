@@ -867,6 +867,18 @@ fn admit_file_event_ambient(state: &DaemonState, event: &FileEvent) -> Result<Ad
     admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
+/// Run one ambient watcher tick over a single host path and keep only what it
+/// left behind.
+///
+/// For tests in other modules that need the state a watcher produces rather
+/// than the verdict it reached, so the pending content a commit folds can come
+/// from the real path instead of from a delta assembled to resemble it.
+#[cfg(test)]
+pub(crate) fn admit_one_ambient_host_event(state: &DaemonState, path: PathBuf) -> Result<()> {
+    admit_file_event_ambient(state, &FileEvent::Changed(path))?;
+    Ok(())
+}
+
 fn clear_incompatible_facets(
     state: &DaemonState,
     file_id: &FilePathId,
