@@ -413,14 +413,14 @@ enum Command {
     /// Show upstream callers/importers/references for an entity
     Refs {
         /// Entity name or ID. Required unless --bulk-json + --entities is provided.
-        #[arg(default_value = "")]
-        entity: String,
+        #[arg(required_unless_present = "bulk_json")]
+        entity: Option<String>,
         /// Filter relation kinds: all, calls, imports, or references (or Any for bulk mode)
         #[arg(long, default_value = "all")]
         kind: String,
         /// Bulk mode: classify many entities by reachability in one daemon call.
         /// Outputs JSON to stdout. Requires --entities.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, requires = "entities")]
         bulk_json: bool,
         /// Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set.
         #[arg(long)]
@@ -537,6 +537,18 @@ enum Command {
         json: bool,
     },
     /// Resolve repository-v6 merge conflicts
+    ///
+    /// Nine flags name a resolution and at least one is required, which is a
+    /// group rather than a per-argument condition. `kin conflicts` is the
+    /// read-only view of the same transaction, so nothing here has to accept
+    /// an empty invocation in order to be inspectable.
+    #[command(group = clap::ArgGroup::new("resolution")
+        .required(true)
+        .multiple(true)
+        .args([
+            "ours", "theirs", "base", "remove", "keep_path",
+            "all_ours", "all_theirs", "do_continue", "abort",
+        ]))]
     Resolve {
         /// Keep your (target branch) version of a conflicting identity
         #[arg(long, value_name = "SELECTOR")]
@@ -793,6 +805,7 @@ enum Command {
     #[command(visible_alias = "revert")]
     Rollback {
         /// Change ID to rollback to. Omit when naming a work item with --feature.
+        #[arg(required_unless_present = "feature", conflicts_with = "feature")]
         change_id: Option<String>,
         /// Roll back every change the named work item records
         #[arg(long)]
@@ -1415,12 +1428,16 @@ enum ReviewAction {
     Shadow {
         /// Change range as <base>..<head>. Refs accept branch names,
         /// semantic change IDs, and imported Git commit SHAs.
+        #[arg(
+            required_unless_present = "base",
+            conflicts_with_all = ["base", "head"]
+        )]
         range: Option<String>,
-        /// Base ref (alternative to the positional range)
-        #[arg(long)]
+        /// Base ref (alternative to the positional range; pair with --head)
+        #[arg(long, requires = "head")]
         base: Option<String>,
-        /// Head ref (alternative to the positional range)
-        #[arg(long)]
+        /// Head ref (alternative to the positional range; pair with --base)
+        #[arg(long, requires = "base")]
         head: Option<String>,
         /// Change title for the report (e.g. PR title)
         #[arg(long)]
@@ -2600,20 +2617,16 @@ fn main() -> Result<()> {
                     compact,
                     no_compact,
                 } => {
+                    // Both requirements are clap's now, so a caller who names
+                    // nothing to operate on gets a usage block and exit 2 like
+                    // the other 45 leaves, instead of exit 1 and one line.
                     if bulk_json {
-                        let entities = entities.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "--bulk-json requires --entities (comma-separated entity UUIDs)"
-                            )
-                        })?;
+                        let entities = entities
+                            .expect("clap requires --entities alongside --bulk-json");
                         let effective_compact = compact && !no_compact;
                         commands::refs::run_bulk(entities, kind, effective_compact).await
                     } else {
-                        if entity.is_empty() {
-                            anyhow::bail!(
-                                "missing positional entity argument (or use --bulk-json --entities)"
-                            );
-                        }
+                        let entity = entity.expect("clap requires an entity without --bulk-json");
                         commands::refs::run(entity, kind).await
                     }
                 }
@@ -2636,8 +2649,14 @@ fn main() -> Result<()> {
                                 author,
                                 json,
                             } => {
+                                // Clap owns the choice between the positional
+                                // range and the --base/--head pair, and pairs
+                                // the two flags. What it cannot own is the
+                                // shape of the range string, which is checked
+                                // here because a value parser is the only other
+                                // place to put it.
                                 let (base, head) = match (range, base, head) {
-                                    (Some(range), None, None) => match range.split_once("..") {
+                                    (Some(range), _, _) => match range.split_once("..") {
                                         Some((base, head))
                                             if !base.is_empty() && !head.is_empty() =>
                                         {
@@ -2649,8 +2668,8 @@ fn main() -> Result<()> {
                                         ),
                                     },
                                     (None, Some(base), Some(head)) => (base, head),
-                                    _ => anyhow::bail!(
-                                        "provide a <base>..<head> range or both --base and --head"
+                                    _ => unreachable!(
+                                        "clap requires a range or both --base and --head"
                                     ),
                                 };
                                 commands::review::shadow_report(
@@ -3865,6 +3884,78 @@ mod tests {
                     feature: None,
                 } if change == "abc123"
             ));
+        });
+    }
+
+    /// Not supplying the thing to operate on is one mistake, and it produced
+    /// two contracts: 45 leaves exited 2 with a usage block through clap, and a
+    /// handful exited 1 with a bare line. A caller keying on exit 2 for "I
+    /// called this wrong" misclassified the second set.
+    ///
+    /// These four moved to clap. `kin locate` and `kin scope` deliberately did
+    /// not: `locate --next` takes its query from a persisted cursor and `scope`
+    /// reads KIN_SESSION_ID, so a parse-time requirement would reject
+    /// invocations that work. Their argument is not optional to the command,
+    /// only to the command line, which is not something clap can express.
+    #[test]
+    fn a_missing_required_argument_is_a_usage_error_not_a_runtime_one() {
+        on_cli_test_stack(|| {
+            for argv in [
+                &["kin", "refs"][..],
+                &["kin", "rollback"][..],
+                &["kin", "resolve"][..],
+                &["kin", "review", "shadow"][..],
+            ] {
+                let error = Cli::try_parse_from(argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{argv:?} must not parse"));
+                assert_eq!(
+                    error.exit_code(),
+                    2,
+                    "{argv:?} must fail the way every other misuse does"
+                );
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains("Usage:"),
+                    "{argv:?} must print usage: {rendered}"
+                );
+            }
+
+            // Every shape that did work still parses. A required-group that
+            // over-reaches would take these with it, and each is the reason its
+            // command's requirement is conditional rather than plain.
+            for argv in [
+                &["kin", "refs", "Foo"][..],
+                &["kin", "refs", "--bulk-json", "--entities", "a,b"][..],
+                &["kin", "resolve", "--abort"][..],
+                &["kin", "resolve", "--all-ours", "--json"][..],
+                &["kin", "resolve", "--ours", "x", "--theirs", "y"][..],
+                &["kin", "review", "shadow", "main..head"][..],
+                &["kin", "review", "shadow", "--base", "a", "--head", "b"][..],
+                // Untouched on purpose: both take their input from somewhere
+                // the command line cannot see.
+                &["kin", "locate", "--next"][..],
+                &["kin", "scope"][..],
+            ] {
+                assert!(
+                    Cli::try_parse_from(argv).is_ok(),
+                    "{argv:?} must stay a complete invocation"
+                );
+            }
+
+            // Half-supplied pairs are refused at parse time too, rather than
+            // reaching a command body that has to re-derive what is missing.
+            for argv in [
+                &["kin", "refs", "--bulk-json"][..],
+                &["kin", "review", "shadow", "--base", "a"][..],
+                &["kin", "review", "shadow", "--head", "b"][..],
+                &["kin", "rollback", "abc123", "--feature", "w-1"][..],
+            ] {
+                let error = Cli::try_parse_from(argv)
+                    .err()
+                    .unwrap_or_else(|| panic!("{argv:?} must not parse"));
+                assert_eq!(error.exit_code(), 2, "{argv:?} must be a usage error");
+            }
         });
     }
 
