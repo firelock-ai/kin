@@ -429,9 +429,15 @@ pub(crate) fn commit_session_workspace_admission(
 ///
 /// The caller has already performed the explicit filesystem-ingestion scan and
 /// carries its completion proof in `admitted`. This boundary consumes only that
-/// admitted exact tree plus bodies in the non-authoritative ingestion CAS,
-/// copies newly referenced bodies into repository CAS, and compare-and-swaps
-/// the workspace. It never creates a history node or advances a ref.
+/// admitted exact tree plus bodies the repository already owns or the
+/// non-authoritative ingestion CAS still stages, copies newly referenced bodies
+/// into repository CAS, and compare-and-swaps the workspace. It never creates a
+/// history node or advances a ref.
+///
+/// Bodies are read from ingestion staging first and from repository CAS when
+/// staging no longer has them. Staging is not authority and promises no
+/// retention, so a source the repository already published stays publishable
+/// whether or not its staged copy survives.
 ///
 /// Authority that moved after the observation was planned fails the whole
 /// publication. The desired tree describes one transition out of one observed
@@ -493,13 +499,30 @@ pub(crate) fn publish_workspace_tree(
             if let Some(length) = source_lengths.get(&hash) {
                 return Ok(*length);
             }
-            let body = blobs
-                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
-                .map_err(|error| {
-                    ModelError::InvalidOperation(format!(
-                        "read admitted workspace policy source {hash}: {error}"
-                    ))
-                })?;
+            // Every rule file in the desired tree is measured here, changed or
+            // not, because the policy is derived from the whole tree. Ingestion
+            // staging is not authority and carries no retention promise, while
+            // a source the repository already published is durable in its own
+            // CAS. Reading staging first and authority second is what keeps an
+            // untouched `.gitignore` from making publication depend on a
+            // staging directory that any restore or cleanup may have dropped.
+            let body = match blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes())) {
+                Ok(body) => body,
+                Err(ingestion_error) => authority
+                    .load_source_blob(hash)
+                    .map_err(|error| {
+                        ModelError::InvalidOperation(format!(
+                            "read repository source {hash} while deriving the admitted workspace \
+                             policy: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        ModelError::InvalidOperation(format!(
+                            "admitted workspace policy source {hash} is absent from both \
+                             ingestion and repository CAS ({ingestion_error})"
+                        ))
+                    })?,
+            };
             let length = u64::try_from(body.len()).map_err(|_| {
                 ModelError::InvalidOperation(format!(
                     "admitted workspace policy source {hash} exceeds u64"
@@ -573,8 +596,19 @@ pub(crate) fn publish_workspace_tree(
     drop(lease);
 
     for hash in source_hashes {
-        let body = blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))?;
-        authority.save_source_blob(hash, &body)?;
+        // Copying a staged body into repository CAS is how a newly referenced
+        // source becomes durable. An unchanged rule source is already there and
+        // needs no copy, so staging having dropped it is not a failure. A body
+        // neither store holds still fails the publication, as the typed blob
+        // absence a caller can match on.
+        match blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes())) {
+            Ok(body) => authority.save_source_blob(hash, &body)?,
+            Err(ingestion_error) => {
+                if authority.load_source_blob(hash)?.is_none() {
+                    return Err(DaemonError::from(ingestion_error));
+                }
+            }
+        }
     }
     let receipt = authority.commit_repository_transaction(transaction)?;
     receipt.validate()?;
@@ -1517,6 +1551,95 @@ mod tests {
         .unwrap()
         .is_none());
         assert_eq!(reopen(&init).read_authority().roots().generation, 2);
+    }
+
+    /// Publication must not depend on ingestion staging still holding a body the
+    /// repository already owns.
+    ///
+    /// Every `.gitignore` and `.kinignore` blob in the desired tree is measured
+    /// on every publication, because the shared admission policy is derived from
+    /// the whole tree and not from what changed. Bounding one tick to what moved
+    /// removed the per-scan rewrite that used to restage every leaf ahead of
+    /// every publication, so that read now has to reach the store that actually
+    /// promises the body. Staging is not authority and keeps no retention
+    /// promise; a store that loses it while its authority survives must still
+    /// publish, instead of failing every admission until someone happens to edit
+    /// a rule file.
+    #[test]
+    fn an_unchanged_rule_source_publishes_after_ingestion_staging_is_lost() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        let rules = add_artifact(&graph, &blobs, b".gitignore", b"target/\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let first = add_artifact(
+            &graph,
+            &blobs,
+            b"first.rs",
+            b"pub fn first() {}\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+        publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &ResolvedTree::from_artifacts([rules.clone(), first.clone()]).unwrap(),
+            OperationId::new(),
+            AuthorId::new("fir2152"),
+        )
+        .unwrap()
+        .expect("the first transition must advance workspace authority");
+
+        // Lose the staging directory the way a restore that carries the
+        // authority database but not a directory named like a cache does.
+        let rules_hash = rules.entry.blob_identity().unwrap();
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        assert!(
+            blobs.read(&rules_hash).is_err(),
+            "the fixture only proves anything while the staged rule body is genuinely gone"
+        );
+
+        let second = add_artifact(
+            &graph,
+            &blobs,
+            b"second.rs",
+            b"pub fn second() {}\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+        let desired = ResolvedTree::from_artifacts([rules.clone(), first, second]).unwrap();
+        let result = publish_workspace_tree(
+            &init.layout,
+            &blobs,
+            &desired,
+            OperationId::new(),
+            AuthorId::new("fir2152"),
+        )
+        .unwrap()
+        .expect("a transition that leaves the rule file untouched must still advance authority");
+        assert_eq!(result.receipt.generation, 3);
+
+        let authority = reopen(&init);
+        let lease = authority.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap();
+        assert_eq!(workspace.tree, desired);
+        assert_eq!(
+            workspace
+                .shared_admission_policy
+                .sources
+                .iter()
+                .map(|source| source.path.clone())
+                .collect::<Vec<_>>(),
+            vec![rules.path.clone()],
+            "the derived policy still names the rule file whose body only authority holds"
+        );
     }
 
     #[test]
