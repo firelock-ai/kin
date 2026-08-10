@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::commands::reconcile::ReconcileRequest;
 use crate::commands::session_workspace::SessionWorkspaceRequest;
@@ -192,7 +192,10 @@ pub async fn materialize(
     let base_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {
-            anyhow!("Kin daemon is required to materialize an exact session workspace")
+            crate::daemon_client::daemon_required_error(
+                "session workspace materialization",
+                &layout,
+            )
         })?;
     let client = DaemonClient::from_base_url_for_layout(base_url, &layout)?;
 

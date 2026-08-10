@@ -434,10 +434,12 @@ fn push(
         workspace_mutation: Some(WorkspaceMutation {
             workspace_id: workspace.workspace_id,
             expected: expect_exact(&workspace),
-            new_generation: workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+                crate::error::workspace_generation_exhausted(
+                    workspace.workspace_id,
+                    workspace.generation,
+                )
+            })?,
             new_head: kin_model::WorkspaceHead::Detached {
                 target: RefTarget::change(sealed_change_id),
             },
@@ -580,44 +582,48 @@ fn return_to_base(
         admission_policy_delta: None,
         external_reference_deltas: Vec::new(),
     };
-    let transaction = RepositoryTransaction {
-        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
-        operation_id: OperationId::new(),
-        repository_id: authority.repository_id.clone(),
-        expected_generation: roots.generation,
-        expected_roots: roots,
-        actor: plan.actor.clone(),
-        reason: RETURN_REASON.to_string(),
-        external_objects: Vec::new(),
-        git_authority_delta: None,
-        changes: Vec::new(),
-        aliases: Vec::new(),
-        ref_mutations: Vec::new(),
-        default_ref_mutation: None,
-        workspace_mutation: Some(WorkspaceMutation {
-            workspace_id: plan.sealed_workspace.workspace_id,
-            expected: expect_exact(&plan.sealed_workspace),
-            new_generation: plan
-                .sealed_workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
-            new_head: plan.base_head,
-            new_base_target: Some(plan.base_target),
-            new_base_tree_hash: Some(base_tree_hash),
-            tree_deltas,
-            new_tree_hash: base_tree_hash,
-            semantic_delta,
-            new_shared_admission_policy: plan.base_policy.clone(),
-            new_admission_policy: EffectiveAdmissionPolicyStamp {
-                shared: plan.base_policy.stamp(),
-                local: plan.sealed_workspace.admission_policy.local,
-            },
-        }),
-        local_overlay_delta: None,
-        merge_transaction_delta: None,
-        sealed_observation: None,
-    };
+    let transaction =
+        RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: authority.repository_id.clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: plan.actor.clone(),
+            reason: RETURN_REASON.to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(WorkspaceMutation {
+                workspace_id: plan.sealed_workspace.workspace_id,
+                expected: expect_exact(&plan.sealed_workspace),
+                new_generation: plan.sealed_workspace.generation.checked_add(1).ok_or_else(
+                    || {
+                        crate::error::workspace_generation_exhausted(
+                            plan.sealed_workspace.workspace_id,
+                            plan.sealed_workspace.generation,
+                        )
+                    },
+                )?,
+                new_head: plan.base_head,
+                new_base_target: Some(plan.base_target),
+                new_base_tree_hash: Some(base_tree_hash),
+                tree_deltas,
+                new_tree_hash: base_tree_hash,
+                semantic_delta,
+                new_shared_admission_policy: plan.base_policy.clone(),
+                new_admission_policy: EffectiveAdmissionPolicyStamp {
+                    shared: plan.base_policy.stamp(),
+                    local: plan.sealed_workspace.admission_policy.local,
+                },
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
     transaction
         .validate()
         .context("validate the exact workspace return transaction")?;
@@ -810,10 +816,12 @@ fn pop(
         workspace_mutation: Some(WorkspaceMutation {
             workspace_id: workspace.workspace_id,
             expected: expect_exact(&workspace),
-            new_generation: workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+                crate::error::workspace_generation_exhausted(
+                    workspace.workspace_id,
+                    workspace.generation,
+                )
+            })?,
             new_head: workspace.head.clone(),
             new_base_target: workspace.base_target.clone(),
             new_base_tree_hash: workspace.base_tree_hash,
@@ -1096,9 +1104,13 @@ fn next_stash_ordinal(metadata: &kin_db::PersistedRepositoryAuthority) -> Result
         .filter_map(|repository_ref| stash_ref_ordinal(&repository_ref.name))
         .max();
     match highest {
-        Some(highest) => highest
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("repository stash ordinals are exhausted")),
+        Some(highest) => highest.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "this repository has used every stash ordinal kin can record, so it cannot \
+                     take another stash; nothing was written, so drop stashes you no longer need \
+                     with `kin stash pop`"
+            )
+        }),
         None => Ok(0),
     }
 }
@@ -1214,7 +1226,7 @@ fn render_list(report: &StashListReport) -> Vec<String> {
 
 fn classify_stash_error(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<StashConflict>().is_some() {
-        return (StatusCode::CONFLICT, format!("{error:#}"));
+        return (StatusCode::CONFLICT, crate::error::cause_first(&error));
     }
     if let Some(kin_core::KinError::ProjectionConflict(message)) =
         error.downcast_ref::<kin_core::KinError>()
@@ -1224,19 +1236,25 @@ fn classify_stash_error(error: anyhow::Error) -> (StatusCode, String) {
     for cause in error.chain() {
         if let Some(model) = cause.downcast_ref::<kin_model::ModelError>() {
             if matches!(model, kin_model::ModelError::Conflict(_)) {
-                return (StatusCode::CONFLICT, format!("{error:#}"));
+                return (StatusCode::CONFLICT, crate::error::cause_first(&error));
             }
         }
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 fn internal_stash_error(error: anyhow::Error) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn stash_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, String) {

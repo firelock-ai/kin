@@ -215,7 +215,7 @@ const RECOMMENDED_EMBED_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// covers a connection that was refused outright, and a daemon that never
 /// accepted the request was not lost during this pass, whatever the machine's
 /// memory says. An HTTP status the daemon returned reaches the caller as
-/// `daemon embed error (HTTP ...)` and matches nothing here either, and neither
+/// `kin embed refused (HTTP ...)` and matches nothing here either, and neither
 /// does a client-side timeout, so each keeps its own diagnosis.
 const LOST_CONNECTION_MARKERS: &[&str] = &[
     "connection closed before message completed",
@@ -477,9 +477,8 @@ async fn run_daemon_embed(
         .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for embed but no daemon endpoint is available")
-    })?;
+    let base_url =
+        daemon_url.ok_or_else(|| crate::daemon_client::daemon_required_error("embed", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     // Embedding behavior is decided in the long-lived daemon worker; warn loudly
     // (or fail under KIN_STRICT_BEHAVIOR_ENV) if this command's environment
@@ -755,8 +754,9 @@ mod tests {
     /// The exact failure a 512 MB cgroup produced: the daemon is OOM-killed
     /// mid-pass and the CLI is handed a closed connection.
     const OOM_KILLED_MID_PASS: &str =
-        "send daemon embed request: error sending request for url (http://127.0.0.1:7654/embed): \
-         connection closed before message completed";
+        "the kin daemon at http://127.0.0.1:7654 stopped answering while the embed request was in \
+         flight: error sending request for url (http://127.0.0.1:7654/embed): connection closed \
+         before message completed";
 
     #[test]
     fn a_recorded_oom_kill_is_reported_as_observed_with_the_limit_and_the_remedy() {
@@ -815,7 +815,7 @@ mod tests {
         );
         assert!(
             embed_resource_exhaustion(
-                "daemon embed error (HTTP 500): Graph error: kindb foo",
+                "kin embed refused (HTTP 500): Graph error: kindb foo",
                 &evidence(512 * 1024 * 1024, Some(3)),
             )
             .is_none(),
@@ -823,7 +823,8 @@ mod tests {
         );
         assert!(
             embed_resource_exhaustion(
-                "send daemon embed request: operation timed out",
+                "the kin daemon at http://127.0.0.1:7654 stopped answering while the embed \
+                 request was in flight: operation timed out",
                 &evidence(512 * 1024 * 1024, Some(3)),
             )
             .is_none(),
@@ -831,7 +832,8 @@ mod tests {
         );
         assert!(
             embed_resource_exhaustion(
-                "send daemon embed request: error sending request for url \
+                "the kin daemon at http://127.0.0.1:7654 stopped answering while the embed \
+                 request was in flight: error sending request for url \
                  (http://127.0.0.1:7654/embed): tcp connect error: Connection refused (os error 61)",
                 &evidence(512 * 1024 * 1024, Some(3)),
             )

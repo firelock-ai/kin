@@ -93,11 +93,8 @@ async fn run_daemon_dead_code(layout: &kin_core::KinLayout) -> Result<DeadCodeRe
         .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Kin daemon is required for dead-code scan but no daemon endpoint is available"
-        )
-    })?;
+    let base_url = daemon_url
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("dead-code scan", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client
         .dead_code(&DeadCodeRequest::default())
@@ -115,9 +112,7 @@ async fn run_daemon_dead_code_seeded(
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
     let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Kin daemon is required for seeded dead-code scan but no daemon endpoint is available"
-        )
+        crate::daemon_client::daemon_required_error("seeded dead-code scan", layout)
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client

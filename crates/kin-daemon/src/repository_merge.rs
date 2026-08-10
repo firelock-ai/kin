@@ -184,16 +184,18 @@ fn plan_and_publish(
     let base = match bases.as_slice() {
         [] => {
             return Err(merge_conflict(format!(
-                "branch {} and the active branch {} share no common change; merging unrelated \
-                 histories is not a proven repository-v6 shape",
+                "branch {} and the active branch {} share no common ancestor, and kin does not \
+                 merge unrelated histories; rebase the source onto the target first, or import \
+                 them separately",
                 request.source, plan.target_ref
             )))
         }
         [base] => *base,
         multiple => {
             return Err(merge_conflict(format!(
-                "branch {} and the active branch {} have {} merge bases; a criss-cross merge is \
-                 not a proven repository-v6 shape",
+                "branch {} and the active branch {} have {} merge bases, and kin does not \
+                 resolve a criss-cross merge; merge one of the intermediate branches first so a \
+                 single base remains",
                 request.source,
                 plan.target_ref,
                 multiple.len()
@@ -574,7 +576,7 @@ fn three_way(
     if admission_policy_delta.is_some() || shared_policy != plan.ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
-             admission policy is not a proven repository-v6 shape",
+             admission policy is not a shape kin merges",
             request.source, plan.target_ref
         )));
     }
@@ -621,7 +623,14 @@ fn three_way(
         .resolve_graph_at(&change.id)
         .context("replay the exact merge change")?;
     if authoritative.tree != desired_tree {
-        bail!("replaying the merge change did not reproduce the composed merged tree");
+        bail!(
+            "merging {} into {} produced a change that does not replay to the same tree, so kin \
+             refused to publish it; nothing was written, so re-run `kin merge {}` and report the \
+             mismatch if it repeats",
+            request.source,
+            plan.target_ref,
+            request.source
+        );
     }
     let desired_tree_hash =
         compute_resolved_tree_hash(&desired_tree).context("hash exact merged tree")?;
@@ -918,7 +927,7 @@ pub(crate) fn publish_resolved_merge(
     if admission_policy_delta.is_some() || shared_policy != ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
-             admission policy is not a proven repository-v6 shape",
+             admission policy is not a shape kin merges",
             record.binding.source_ref, record.binding.target_ref
         )));
     }
@@ -964,7 +973,13 @@ pub(crate) fn publish_resolved_merge(
         .resolve_graph_at(&change.id)
         .context("replay the exact merge change")?;
     if authoritative.tree != desired_tree {
-        bail!("replaying the merge change did not reproduce the resolved merged tree");
+        bail!(
+            "the resolution of {} into {} produced a change that does not replay to the same \
+             tree, so kin refused to publish it; nothing was written, and your recorded conflict \
+             resolutions are still there for another `kin resolve`",
+            record.binding.source_ref,
+            record.binding.target_ref
+        );
     }
     let desired_tree_hash =
         compute_resolved_tree_hash(&desired_tree).context("hash exact merged tree")?;
@@ -1502,10 +1517,12 @@ fn workspace_mutation(
             semantic_overlay_hash: workspace.semantic_overlay_hash,
             admission_policy: workspace.admission_policy,
         },
-        new_generation: workspace
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+        new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+            crate::error::workspace_generation_exhausted(
+                workspace.workspace_id,
+                workspace.generation,
+            )
+        })?,
         new_head: workspace.head.clone(),
         new_base_target: Some(new_base_target),
         new_base_tree_hash: Some(new_tree_hash),
@@ -1546,10 +1563,17 @@ fn preflight_merge_delta(
         .context("apply merge daemon graph preflight")?;
     let snapshot = preflight.to_snapshot();
     if snapshot.resolved_tree != *desired_tree {
-        bail!("merge daemon graph preflight did not produce the exact merged tree");
+        bail!(
+            "the merge preflighted to a tree that does not match the one it composed, so kin \
+             refused to publish it; your workspace is unchanged, so run `kin status` and try again"
+        );
     }
     if snapshot.entities != *desired_entities || snapshot.relations != *desired_relations {
-        bail!("merge daemon graph preflight did not produce the exact merged semantics");
+        bail!(
+            "the merge preflighted to graph semantics that do not match the ones it composed, so \
+             kin refused to publish it; your workspace is unchanged, so run `kin status` and try \
+             again"
+        );
     }
     Ok(())
 }
@@ -1938,10 +1962,10 @@ pub(crate) fn local_workspace<'a>(
 
 pub(crate) fn classify_merge_error(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<MergeBadRequest>().is_some() {
-        return (StatusCode::BAD_REQUEST, format!("{error:#}"));
+        return (StatusCode::BAD_REQUEST, crate::error::cause_first(&error));
     }
     if error.downcast_ref::<MergeConflictRefusal>().is_some() {
-        return (StatusCode::CONFLICT, format!("{error:#}"));
+        return (StatusCode::CONFLICT, crate::error::cause_first(&error));
     }
     if let Some(core) = error.downcast_ref::<kin_core::KinError>() {
         let status = match core {
@@ -1950,19 +1974,22 @@ pub(crate) fn classify_merge_error(error: anyhow::Error) -> (StatusCode, String)
             | kin_core::KinError::ProjectionConflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
     if let Some(database) = error.downcast_ref::<kin_db::KinDbError>() {
         let status = match database {
             kin_db::KinDbError::Model(model) => merge_model_status(model),
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
     if let Some(model) = error.downcast_ref::<kin_model::ModelError>() {
-        return (merge_model_status(model), format!("{error:#}"));
+        return (merge_model_status(model), crate::error::cause_first(&error));
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn merge_model_status(error: &kin_model::ModelError) -> StatusCode {
@@ -2000,9 +2027,12 @@ pub(crate) fn merge_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (St
     let identity = refusal.is_identity_refusal();
     let error = refusal.into_error();
     if identity {
-        (StatusCode::CONFLICT, format!("{error:#}"))
+        (StatusCode::CONFLICT, crate::error::cause_first(&error))
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::error::cause_first(&error),
+        )
     }
 }
 

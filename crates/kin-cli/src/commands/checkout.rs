@@ -52,11 +52,7 @@ pub async fn run(
     let layout = crate::commands::require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for checkout but no daemon endpoint is available"
-            )
-        })?;
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("checkout", &layout))?;
     let request = CheckoutRequest {
         path,
         path_hex,

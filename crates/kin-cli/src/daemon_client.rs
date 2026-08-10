@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub(crate) mod probe_process;
@@ -509,11 +509,21 @@ impl DaemonClient {
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
-        context: &'static str,
+        leaf: &str,
     ) -> Result<reqwest::Response> {
-        let resp = request.send().await.context(context)?;
+        let resp = request
+            .send()
+            .await
+            .with_context(|| daemon_send_failure_message(&self.base_url, leaf))?;
         check_response_build_match(resp.headers())?;
         Ok(resp)
+    }
+
+    /// Turn a non-success daemon response into the error the user reads.
+    async fn http_refusal(&self, leaf: &str, response: reqwest::Response) -> anyhow::Error {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        daemon_http_error(&self.base_url, leaf, status, &body)
     }
 
     /// Try to connect to the daemon. Returns `None` if the daemon is
@@ -545,13 +555,11 @@ impl DaemonClient {
         let resp = self
             .send(
                 self.client.get(format!("{}/health", self.base_url)),
-                "send daemon health request",
+                "health",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("health", resp).await);
         }
         Ok(resp.json().await?)
     }
@@ -601,13 +609,9 @@ impl DaemonClient {
         if let Some(q) = query {
             url = format!("{}?query={}", url, urlencoding::encode(q));
         }
-        let resp = self
-            .send(self.client.get(&url), "send daemon entity search request")
-            .await?;
+        let resp = self.send(self.client.get(&url), "entity search").await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("daemon error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("entity search", resp).await);
         }
         let body: DaemonEntitiesResponse = resp.json().await?;
         Ok(body.entities)
@@ -634,7 +638,7 @@ impl DaemonClient {
         &self,
         path: &str,
         payload: &Req,
-        context: &'static str,
+        leaf: &str,
     ) -> Result<Resp>
     where
         Req: serde::Serialize + ?Sized,
@@ -655,7 +659,7 @@ impl DaemonClient {
                         .post(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
                         .body(payload.clone()),
-                    context,
+                    leaf,
                 )
                 .await
             {
@@ -699,12 +703,20 @@ impl DaemonClient {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if status.is_server_error() && attempt == 0 {
-                last_error = Some(anyhow::anyhow!(
-                    "daemon command returned HTTP {status}: {body}"
+                last_error = Some(daemon_http_error(
+                    &self.base_url,
+                    leaf,
+                    status.as_u16(),
+                    &body,
                 ));
                 continue;
             }
-            anyhow::bail!("daemon command failed (HTTP {status}): {body}");
+            return Err(daemon_http_error(
+                &self.base_url,
+                leaf,
+                status.as_u16(),
+                &body,
+            ));
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon command produced no response")))
     }
@@ -724,7 +736,7 @@ impl DaemonClient {
         path: &str,
         payload: &Req,
         operation_id: OperationId,
-        context: &'static str,
+        leaf: &str,
     ) -> Result<Resp>
     where
         Req: serde::Serialize + ?Sized,
@@ -743,7 +755,7 @@ impl DaemonClient {
                     .post(&url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(payload),
-                context,
+                leaf,
             )
             .await
             .map_err(|error| {
@@ -820,13 +832,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/locate", self.base_url))
                     .json(request),
-                "send daemon locate request",
+                "locate",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon locate error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("locate", resp).await);
         }
         resp.json().await.context("parse daemon locate response")
     }
@@ -840,13 +850,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/search", self.base_url))
                     .json(request),
-                "send daemon search request",
+                "search",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon search error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("search", resp).await);
         }
         resp.json().await.context("parse daemon search response")
     }
@@ -855,13 +863,11 @@ impl DaemonClient {
         let resp = self
             .send(
                 self.client.get(format!("{}/support", self.base_url)),
-                "send daemon support request",
+                "support",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon support error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("support", resp).await);
         }
         resp.json().await.context("parse daemon support response")
     }
@@ -875,13 +881,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/context", self.base_url))
                     .json(request),
-                "send daemon context request",
+                "context",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon context error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("context", resp).await);
         }
         resp.json().await.context("parse daemon context response")
     }
@@ -895,13 +899,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/trace", self.base_url))
                     .json(request),
-                "send daemon trace request",
+                "trace",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon trace error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("trace", resp).await);
         }
         resp.json().await.context("parse daemon trace response")
     }
@@ -915,13 +917,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/impact", self.base_url))
                     .json(request),
-                "send daemon impact request",
+                "impact",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon impact error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("impact", resp).await);
         }
         resp.json().await.context("parse daemon impact response")
     }
@@ -935,13 +935,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/review", self.base_url))
                     .json(request),
-                "send daemon review request",
+                "review",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon review error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("review", resp).await);
         }
         resp.json().await.context("parse daemon review response")
     }
@@ -978,13 +976,11 @@ impl DaemonClient {
                     .post(format!("{}/embed", self.base_url))
                     .timeout(embed_timeout)
                     .json(request),
-                "send daemon embed request",
+                "embed",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon embed error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("embed", resp).await);
         }
         resp.json().await.context("parse daemon embed response")
     }
@@ -998,13 +994,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/blame", self.base_url))
                     .json(request),
-                "send daemon blame request",
+                "blame",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon blame error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("blame", resp).await);
         }
         resp.json().await.context("parse daemon blame response")
     }
@@ -1018,13 +1012,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/history", self.base_url))
                     .json(request),
-                "send daemon history request",
+                "history",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon history error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("history", resp).await);
         }
         resp.json().await.context("parse daemon history response")
     }
@@ -1038,13 +1030,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/verify/run", self.base_url))
                     .json(request),
-                "send daemon verify run request",
+                "verify run",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon verify run error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("verify run", resp).await);
         }
         resp.json()
             .await
@@ -1060,13 +1050,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/verify", self.base_url))
                     .json(request),
-                "send daemon verify request",
+                "verify",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon verify error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("verify", resp).await);
         }
         resp.json().await.context("parse daemon verify response")
     }
@@ -1080,13 +1068,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/reconcile", self.base_url))
                     .json(request),
-                "send daemon reconcile request",
+                "reconcile",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon reconcile error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("reconcile", resp).await);
         }
         resp.json().await.context("parse daemon reconcile response")
     }
@@ -1100,13 +1086,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/status", self.base_url))
                     .json(request),
-                "send daemon command status request",
+                "command status",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon command status error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("command status", resp).await);
         }
         resp.json()
             .await
@@ -1149,13 +1133,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/{leaf}", self.base_url))
                     .json(request),
-                "send daemon transfer command",
+                leaf,
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("kin {leaf} refused (HTTP {status}): {body}");
+            return Err(self.http_refusal(leaf, resp).await);
         }
         resp.json()
             .await
@@ -1171,13 +1153,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/resources", self.base_url))
                     .json(request),
-                "send daemon command resources request",
+                "resources",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon command resources error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("resources", resp).await);
         }
         resp.json()
             .await
@@ -1193,13 +1173,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/graph", self.base_url))
                     .json(request),
-                "send daemon graph command request",
+                "graph",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon graph command error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("graph", resp).await);
         }
         resp.json()
             .await
@@ -1215,13 +1193,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/overview", self.base_url))
                     .json(request),
-                "send daemon overview request",
+                "overview",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon overview error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("overview", resp).await);
         }
         resp.json().await.context("parse daemon overview response")
     }
@@ -1235,13 +1211,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/dead-code", self.base_url))
                     .json(request),
-                "send daemon dead-code request",
+                "dead-code",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon dead-code error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("dead-code", resp).await);
         }
         resp.json().await.context("parse daemon dead-code response")
     }
@@ -1255,13 +1229,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/dead-code-seeded", self.base_url))
                     .json(request),
-                "send daemon seeded dead-code request",
+                "seeded dead-code",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon seeded dead-code error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("seeded dead-code", resp).await);
         }
         resp.json()
             .await
@@ -1277,13 +1249,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/trace-data-flow", self.base_url))
                     .json(request),
-                "send daemon trace-data-flow request",
+                "trace-data-flow",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon trace-data-flow error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("trace-data-flow", resp).await);
         }
         resp.json()
             .await
@@ -1299,13 +1269,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/refs", self.base_url))
                     .json(request),
-                "send daemon refs request",
+                "refs",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon refs error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("refs", resp).await);
         }
         resp.json().await.context("parse daemon refs response")
     }
@@ -1319,13 +1287,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/bulk-refs", self.base_url))
                     .json(request),
-                "send daemon bulk-refs request",
+                "bulk refs",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon bulk-refs error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("bulk refs", resp).await);
         }
         resp.json().await.context("parse daemon bulk-refs response")
     }
@@ -1339,13 +1305,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/xref", self.base_url))
                     .json(request),
-                "send daemon xref request",
+                "xref",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon xref error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("xref", resp).await);
         }
         resp.json().await.context("parse daemon xref response")
     }
@@ -1359,13 +1323,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/diff", self.base_url))
                     .json(request),
-                "send daemon diff request",
+                "diff",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon diff error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("diff", resp).await);
         }
         resp.json().await.context("parse daemon diff response")
     }
@@ -1379,13 +1341,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/log", self.base_url))
                     .json(request),
-                "send daemon log request",
+                "log",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon log error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("log", resp).await);
         }
         resp.json().await.context("parse daemon log response")
     }
@@ -1399,13 +1359,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/audit", self.base_url))
                     .json(request),
-                "send daemon audit request",
+                "audit",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon audit error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("audit", resp).await);
         }
         resp.json().await.context("parse daemon audit response")
     }
@@ -1419,13 +1377,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/approvals", self.base_url))
                     .json(request),
-                "send daemon approvals request",
+                "approvals",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon approvals error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("approvals", resp).await);
         }
         resp.json().await.context("parse daemon approvals response")
     }
@@ -1439,13 +1395,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/security", self.base_url))
                     .json(request),
-                "send daemon security request",
+                "security",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon security error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("security", resp).await);
         }
         resp.json().await.context("parse daemon security response")
     }
@@ -1454,37 +1408,24 @@ impl DaemonClient {
         &self,
         request: &crate::commands::branch::BranchRequest,
     ) -> Result<crate::commands::branch::BranchResponse> {
-        self.post_idempotent_json(
-            "/commands/branch",
-            request,
-            "send daemon-owned repository branch request",
-        )
-        .await
+        self.post_idempotent_json("/commands/branch", request, "branch")
+            .await
     }
 
     pub async fn merge(
         &self,
         request: &crate::commands::merge::MergeRequest,
     ) -> Result<crate::commands::merge::MergeResponse> {
-        self.post_non_idempotent_json(
-            "/commands/merge",
-            request,
-            request.operation_id,
-            "send daemon-owned repository merge request",
-        )
-        .await
+        self.post_non_idempotent_json("/commands/merge", request, request.operation_id, "merge")
+            .await
     }
 
     pub async fn conflicts(
         &self,
         request: &crate::commands::conflicts::ConflictsRequest,
     ) -> Result<crate::commands::conflicts::ConflictsResponse> {
-        self.post_idempotent_json(
-            "/commands/conflicts",
-            request,
-            "send daemon-owned merge conflict listing request",
-        )
-        .await
+        self.post_idempotent_json("/commands/conflicts", request, "conflicts")
+            .await
     }
 
     pub async fn resolve(
@@ -1495,7 +1436,7 @@ impl DaemonClient {
             "/commands/resolve",
             request,
             request.operation_id,
-            "send daemon-owned merge resolution request",
+            "resolve",
         )
         .await
     }
@@ -1504,48 +1445,32 @@ impl DaemonClient {
         &self,
         request: &crate::commands::tag::TagRequest,
     ) -> Result<crate::commands::tag::TagResponse> {
-        self.post_idempotent_json(
-            "/commands/tag",
-            request,
-            "send daemon-owned repository tag request",
-        )
-        .await
+        self.post_idempotent_json("/commands/tag", request, "tag")
+            .await
     }
 
     pub async fn stash(
         &self,
         request: &crate::commands::stash::StashRequest,
     ) -> Result<crate::commands::stash::StashResponse> {
-        self.post_idempotent_json(
-            "/commands/stash",
-            request,
-            "send daemon-owned repository stash request",
-        )
-        .await
+        self.post_idempotent_json("/commands/stash", request, "stash")
+            .await
     }
 
     pub async fn purge_ignored(
         &self,
         request: &crate::commands::purge_ignored::PurgeIgnoredRequest,
     ) -> Result<crate::commands::purge_ignored::PurgeIgnoredResponse> {
-        self.post_idempotent_json(
-            "/commands/purge-ignored",
-            request,
-            "send daemon-owned tracked-path purge request",
-        )
-        .await
+        self.post_idempotent_json("/commands/purge-ignored", request, "purge-ignored")
+            .await
     }
 
     pub async fn rollback(
         &self,
         request: &crate::commands::rollback::RollbackRequest,
     ) -> Result<crate::commands::rollback::RollbackResponse> {
-        self.post_idempotent_json(
-            "/commands/rollback",
-            request,
-            "send daemon-owned repository rollback request",
-        )
-        .await
+        self.post_idempotent_json("/commands/rollback", request, "rollback")
+            .await
     }
 
     pub async fn drift(
@@ -1557,13 +1482,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/drift", self.base_url))
                     .json(request),
-                "send daemon-owned projection drift request",
+                "drift",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon drift error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("drift", resp).await);
         }
         resp.json().await.context("parse daemon drift response")
     }
@@ -1572,24 +1495,16 @@ impl DaemonClient {
         &self,
         request: &crate::commands::checkout::CheckoutRequest,
     ) -> Result<crate::commands::checkout::CheckoutResponse> {
-        self.post_idempotent_json(
-            "/commands/checkout",
-            request,
-            "send daemon-owned exact checkout request",
-        )
-        .await
+        self.post_idempotent_json("/commands/checkout", request, "checkout")
+            .await
     }
 
     pub async fn rename(
         &self,
         request: &crate::commands::rename::RenameRequest,
     ) -> Result<crate::commands::rename::RenameResponse> {
-        self.post_idempotent_json(
-            "/commands/rename",
-            request,
-            "send daemon-owned exact rename request",
-        )
-        .await
+        self.post_idempotent_json("/commands/rename", request, "rename")
+            .await
     }
 
     pub async fn session_workspace(
@@ -1601,13 +1516,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/commands/session-workspace", self.base_url))
                     .json(request),
-                "send daemon session workspace request",
+                "session workspace",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon session workspace error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("session workspace", resp).await);
         }
         resp.json()
             .await
@@ -1640,13 +1553,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/session", self.base_url))
                     .json(&body),
-                "send daemon session registration",
+                "session start",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon session registration error (HTTP {status}): {body}");
+            return Err(self.http_refusal("session start", resp).await);
         }
         let value: serde_json::Value = resp
             .json()
@@ -1665,13 +1576,11 @@ impl DaemonClient {
             .send(
                 self.client
                     .delete(format!("{}/session/{}", self.base_url, session_id)),
-                "send daemon session end",
+                "session end",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon session end error (HTTP {status}): {body}");
+            return Err(self.http_refusal("session end", resp).await);
         }
         Ok(())
     }
@@ -1685,13 +1594,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/work", self.base_url))
                     .json(request),
-                "send daemon work request",
+                "work",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon work error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("work", resp).await);
         }
         resp.json().await.context("parse daemon work response")
     }
@@ -1705,13 +1612,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/note", self.base_url))
                     .json(request),
-                "send daemon note request",
+                "note",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon note error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("note", resp).await);
         }
         resp.json().await.context("parse daemon note response")
     }
@@ -1722,13 +1627,11 @@ impl DaemonClient {
                 self.client
                     .post(format!("{}/session/{}/scope", self.base_url, session_id))
                     .json(&serde_json::json!({ "ref_string": ref_string })),
-                "send set_scope request",
+                "scope update",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("scope update", resp).await);
         }
         resp.json().await.context("parse scope response")
     }
@@ -1738,13 +1641,11 @@ impl DaemonClient {
             .send(
                 self.client
                     .delete(format!("{}/session/{}/scope", self.base_url, session_id)),
-                "send clear_scope request",
+                "scope clear",
             )
             .await?;
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("scope clear", resp).await);
         }
         Ok(())
     }
@@ -1754,16 +1655,14 @@ impl DaemonClient {
             .send(
                 self.client
                     .get(format!("{}/session/{}/scope", self.base_url, session_id)),
-                "send get_scope request",
+                "scope read",
             )
             .await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("daemon error (HTTP {}): {}", status, body);
+            return Err(self.http_refusal("scope read", resp).await);
         }
         Ok(Some(resp.json().await.context("parse scope response")?))
     }
@@ -1850,6 +1749,35 @@ fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Diverg
          Set KIN_STRICT_BEHAVIOR_ENV=1 to make this a hard error.",
     );
     message
+}
+
+/// The headline a dropped daemon request leads with.
+///
+/// The worker exits after its idle window, so the ordinary cause of a request
+/// that never lands is a daemon that retired between URL resolution and this
+/// dispatch. Naming the endpoint and the command keeps the plumbing verb out of
+/// the headline.
+fn daemon_send_failure_message(base_url: &str, leaf: &str) -> String {
+    format!(
+        "the kin daemon at {base_url} stopped answering while the {leaf} request was in flight; \
+         it exits after its idle window, so re-run the command and kin will start a fresh one"
+    )
+}
+
+/// The error a non-success daemon response becomes.
+///
+/// An empty body is its own outcome rather than a refusal with nothing to say,
+/// so that branch names the log to read instead of rendering a status code and
+/// a colon with nothing after it.
+fn daemon_http_error(base_url: &str, leaf: &str, status: u16, body: &str) -> anyhow::Error {
+    if body.trim().is_empty() {
+        anyhow::anyhow!(
+            "the kin daemon at {base_url} answered HTTP {status} with an empty body for {leaf}; \
+             read .kin/daemon.log, then stop it with `kin daemon stop` and re-run"
+        )
+    } else {
+        anyhow::anyhow!("kin {leaf} refused (HTTP {status}): {body}")
+    }
 }
 
 fn check_response_build_match(headers: &reqwest::header::HeaderMap) -> Result<()> {
@@ -2904,8 +2832,11 @@ fn retire_daemon_endpoint_with_probe(
         Some(pid) => {
             warn!(
                 pid,
-                repo = %kin_root.display(),
-                "preserving daemon endpoint because its recorded owner may still be alive"
+                pid_path = %repo_daemon_pid_path(kin_root).display(),
+                "the endpoint record at {} still names pid {pid}, which this machine will not \
+                 confirm dead, so kin left it published; if that pid belongs to something else, \
+                 remove the file and re-run",
+                repo_daemon_pid_path(kin_root).display()
             );
             Some(format!(
                 "recorded owner pid {pid} never became affirmatively dead"
@@ -2914,8 +2845,11 @@ fn retire_daemon_endpoint_with_probe(
         None if !recorded.pid_exists => retire_within_budget(kin_root, teardown_budget),
         None => {
             warn!(
-                repo = %kin_root.display(),
-                "preserving daemon endpoint because its PID record is unparseable"
+                pid_path = %repo_daemon_pid_path(kin_root).display(),
+                "the endpoint record at {} does not hold a pid kin can read, so kin left it \
+                 published rather than retiring an endpoint it cannot identify; remove the file \
+                 if no kin daemon is running for this repository",
+                repo_daemon_pid_path(kin_root).display()
             );
             Some("its PID record is unparseable".to_string())
         }
@@ -3230,19 +3164,21 @@ where
     let _authority = match try_acquire_daemon_endpoint_authority(kin_root) {
         Ok(authority) => authority,
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
-                "preserving daemon endpoint because lifecycle authority is contended"
+                "another kin command holds daemon lifecycle authority for this repository, so \
+                 this one left the published endpoint alone"
             );
             return DaemonEndpointRetirement::LifecycleContended;
         }
         Err(error) => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
                 %error,
-                "preserving daemon endpoint because lifecycle authority is unavailable"
+                "daemon lifecycle authority could not be taken for this repository, so this \
+                 command left the published endpoint alone"
             );
             return DaemonEndpointRetirement::CoordinationUnavailable(error.to_string());
         }
@@ -3268,11 +3204,12 @@ where
 
     let current = daemon_endpoint_snapshot(kin_root);
     if current != judged {
-        warn!(
-            ?judged,
-            ?current,
-            "endpoint files changed while this daemon was being judged; \
-             leaving the successor's endpoint intact"
+        debug!(
+            judged_pid = ?judged.pid,
+            successor_pid = ?current.pid,
+            repo = %kin_root.display(),
+            "a successor kin daemon published its own endpoint for this repository while the \
+             previous one was being retired; the successor's record is correct and was left intact"
         );
         return DaemonEndpointRetirement::Changed { current };
     }
@@ -3282,10 +3219,11 @@ where
     match singleton.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
-                "preserving daemon endpoint because the daemon singleton is held"
+                "the per-repository daemon singleton is still held, so this command left the \
+                 published endpoint alone"
             );
             return DaemonEndpointRetirement::SingletonHeld;
         }
@@ -3305,11 +3243,12 @@ where
     match remove_stale_daemon_files_uncoordinated_with(kin_root, remove_file) {
         Ok(()) => DaemonEndpointRetirement::Retired,
         Err(error) => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 repo = %kin_root.display(),
                 %error,
-                "preserving daemon startup authority because endpoint retirement failed"
+                "the endpoint files for this repository could not be removed, so kin kept its \
+                 startup authority rather than leaving a half-retired endpoint"
             );
             DaemonEndpointRetirement::CoordinationUnavailable(error.to_string())
         }
@@ -3421,17 +3360,19 @@ pub fn remove_stale_supervisor_files() {
     let startup_authority = match try_acquire_supervisor_startup_lock_for_cleanup(&dir) {
         Ok(authority) => authority,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            warn!(
+            debug!(
                 dir = %dir.display(),
-                "preserving supervisor endpoint because cross-version startup authority is held"
+                "another kin command holds supervisor startup authority, so this one left the \
+                 published supervisor endpoint alone"
             );
             return;
         }
         Err(error) => {
-            warn!(
+            debug!(
                 dir = %dir.display(),
                 %error,
-                "preserving supervisor endpoint because cross-version startup authority is unavailable"
+                "supervisor startup authority could not be taken, so this command left the \
+                 published supervisor endpoint alone"
             );
             return;
         }
@@ -3458,23 +3399,27 @@ pub fn remove_stale_supervisor_files() {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
         Some(_) => {
-            warn!(
-                ?recorded,
-                "preserving supervisor endpoint because its owner is live or indeterminate"
+            debug!(
+                pid = ?recorded.pid,
+                dir = %dir.display(),
+                "the supervisor endpoint still names an owner this machine will not confirm \
+                 dead, so kin left it published"
             );
         }
         None if recorded.pid_exists => {
-            warn!(
-                ?recorded,
-                "preserving supervisor endpoint because its owner is live or indeterminate"
+            debug!(
+                dir = %dir.display(),
+                "the supervisor endpoint still names an owner this machine will not confirm \
+                 dead, so kin left it published"
             );
         }
         None if owner_is_gone => {
             let _ = retire_supervisor_endpoint_if_unchanged(&dir, recorded, &startup_authority);
         }
-        None => warn!(
-            ?recorded,
-            "preserving supervisor endpoint because its ownership record is incomplete"
+        None => debug!(
+            dir = %dir.display(),
+            "the supervisor endpoint carries no complete ownership record, so kin left it \
+             published rather than retiring an endpoint it cannot identify"
         ),
     }
 }
@@ -3642,11 +3587,12 @@ where
     match remove_supervisor_endpoint_files_with(dir, remove_file) {
         Ok(()) => SupervisorEndpointRetirement::Retired,
         Err(error) => {
-            warn!(
-                ?judged,
+            debug!(
+                judged_pid = ?judged.pid,
                 dir = %dir.display(),
                 %error,
-                "preserving supervisor startup authority because endpoint retirement failed"
+                "the supervisor endpoint files could not be removed, so kin kept its startup \
+                 authority rather than leaving a half-retired endpoint"
             );
             SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string())
         }
@@ -4959,7 +4905,10 @@ async fn acquire_startup_lock(kin_root: &Path) -> Result<StartupLock> {
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 if startup_lock_is_stale(&path, stale_after) {
-                    warn!(path = %path.display(), "removing stale daemon startup lock");
+                    debug!(
+                        path = %path.display(),
+                        "cleared a startup lock left by an interrupted kin command"
+                    );
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
@@ -6274,11 +6223,43 @@ async fn follow_existing_supervisor_publication(
     }
 }
 
+fn supervisor_log_path() -> PathBuf {
+    supervisor_dir().join("supervisor.log")
+}
+
+fn supervisor_log_len() -> u64 {
+    std::fs::metadata(supervisor_log_path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// Render the supervisor output produced by this start attempt only, mirroring
+/// [`daemon_log_tail_since`]. The exit status of a supervisor that died on
+/// launch is a symptom; the reason is in this log and was previously never read.
+fn supervisor_log_tail_since(since_offset: u64) -> String {
+    let path = supervisor_log_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return format!("supervisor log unavailable at {}", path.display());
+    };
+    let fresh = content
+        .get(since_offset as usize..)
+        .unwrap_or(&content)
+        .trim();
+    if fresh.is_empty() {
+        return format!(
+            "no fresh supervisor output captured for this start attempt at {}",
+            path.display()
+        );
+    }
+    let lines: Vec<&str> = fresh.lines().rev().take(20).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
 fn open_supervisor_log() -> Result<File> {
     let dir = supervisor_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
-    let log_path = dir.join("supervisor.log");
+    let log_path = supervisor_log_path();
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -6290,6 +6271,7 @@ async fn wait_for_supervisor_ready(
     child: &mut Child,
     deadline: Instant,
     startup_authority: &mut SupervisorStartupLock,
+    log_offset: u64,
 ) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
@@ -6298,7 +6280,12 @@ async fn wait_for_supervisor_ready(
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check supervisor child status")? {
-            bail!("supervisor exited during startup with status {status}");
+            bail!(
+                "the kin supervisor exited during startup with status {status}; recent log from \
+                 {}:\n{}",
+                supervisor_log_path().display(),
+                supervisor_log_tail_since(log_offset)
+            );
         }
         if Instant::now() >= next_startup_heartbeat {
             if !startup_authority
@@ -6420,6 +6407,7 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         SUPERVISOR_STARTUP_GENERATION_ENV,
         startup_authority.generation(),
     );
+    let log_offset = supervisor_log_len();
     let log = open_supervisor_log()?;
     let stderr = log
         .try_clone()
@@ -6437,7 +6425,8 @@ pub async fn ensure_supervisor_running() -> Result<String> {
 
     let mut child = cmd.spawn().context("spawn kin supervisor")?;
     let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
-    let base_url = wait_for_supervisor_ready(&mut child, deadline, &mut startup_authority).await?;
+    let base_url =
+        wait_for_supervisor_ready(&mut child, deadline, &mut startup_authority, log_offset).await?;
     if let Err(error) = startup_authority.verify_adoption(child.id()) {
         let _ = child.kill();
         let _ = child.wait();
@@ -6897,6 +6886,34 @@ pub async fn resolve_daemon_url_if_running_async(layout: &KinLayout) -> Option<S
 
 pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
     resolve_daemon_url_inner(layout, None).await
+}
+
+/// The refusal a command gets when daemon resolution produced no endpoint.
+///
+/// [`resolve_daemon_url`] answers `Ok(None)` in exactly one situation:
+/// `KIN_NO_DAEMON` is set and no supervisor route is already published for this
+/// repository. Every other outcome returns `Err` carrying its own reason, so
+/// this branch is the one case where the cause is known exactly.
+pub fn daemon_required_error(command: &str, layout: &KinLayout) -> anyhow::Error {
+    anyhow::anyhow!(
+        "KIN_NO_DAEMON is set and no kin daemon is already running for {}, so there is no \
+         repository authority to answer {command}; unset KIN_NO_DAEMON and re-run, and kin will \
+         start one",
+        layout.root().display()
+    )
+}
+
+/// The refusal a caller gets when it needs a daemon that is already serving.
+///
+/// [`resolve_daemon_url_if_running_async`] never starts one, so an absent
+/// endpoint here means no daemon holds this repository yet rather than anything
+/// the caller asked for wrongly.
+pub fn running_daemon_required_error(command: &str, layout: &KinLayout) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no kin daemon is serving {}, so there is no repository authority to record {command}; run \
+         `kin status` in that repository to start one, then re-run",
+        layout.root().display()
+    )
 }
 
 /// Like [`resolve_daemon_url`] but uses the 30-minute MCP idle timeout instead
@@ -10728,5 +10745,96 @@ mod tests {
         assert_eq!(idle_timeout_to_carry(Some(""), false), None);
         assert_eq!(idle_timeout_to_carry(Some("later"), false), None);
         assert_eq!(idle_timeout_to_carry(Some(" 900 "), false), Some(900));
+    }
+
+    #[test]
+    fn a_dropped_request_names_the_endpoint_the_command_and_the_way_back() {
+        let message = daemon_send_failure_message("http://127.0.0.1:51234", "locate");
+        assert!(
+            message.contains("http://127.0.0.1:51234"),
+            "the reader cannot tell which daemon went away without its endpoint: {message}"
+        );
+        assert!(
+            message.contains("locate"),
+            "the command in flight is the subject of this failure: {message}"
+        );
+        assert!(
+            message.contains("idle window") && message.contains("re-run"),
+            "an idle-window exit is recoverable and the message must say how: {message}"
+        );
+        assert!(
+            !message.starts_with("send "),
+            "the dispatch verb was the defect being fixed: {message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_refusal_body_names_the_log_instead_of_rendering_a_bare_colon() {
+        let message = daemon_http_error("http://127.0.0.1:51234", "locate", 500, "   ").to_string();
+        assert!(
+            !message.ends_with(": "),
+            "a status code with nothing after the colon is the shape being removed: {message}"
+        );
+        assert!(
+            message.contains(".kin/daemon.log"),
+            "a body-less refusal leaves the log as the only remaining evidence: {message}"
+        );
+        assert!(
+            message.contains("500") && message.contains("http://127.0.0.1:51234"),
+            "{message}"
+        );
+    }
+
+    /// A refusal the daemon stayed alive to explain is surfaced verbatim: it has
+    /// already mapped its own error class onto a status and a body, and
+    /// rewording it here would hide which authority refused and why.
+    #[test]
+    fn a_refusal_with_a_body_keeps_the_daemons_own_words() {
+        let message = daemon_http_error(
+            "http://127.0.0.1:51234",
+            "merge",
+            409,
+            "branch main is ahead",
+        )
+        .to_string();
+        assert_eq!(
+            message,
+            "kin merge refused (HTTP 409): branch main is ahead"
+        );
+    }
+
+    #[test]
+    fn the_one_endpointless_resolution_names_the_variable_that_caused_it() {
+        let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
+        let message = daemon_required_error("commit", &layout).to_string();
+        assert!(
+            message.contains("KIN_NO_DAEMON"),
+            "this branch is reached only when KIN_NO_DAEMON is set, so it must say so: {message}"
+        );
+        assert!(
+            message.contains("/tmp/kin-fixture-repo"),
+            "the repository with no authority is the subject: {message}"
+        );
+        assert!(
+            message.contains("commit"),
+            "the command that went unanswered belongs in the message: {message}"
+        );
+        assert!(
+            message.contains("unset KIN_NO_DAEMON"),
+            "the remedy is one word away and must be stated: {message}"
+        );
+    }
+
+    /// The autostart path and the already-running path fail for different
+    /// reasons, so naming `KIN_NO_DAEMON` in the second would be a fabrication.
+    #[test]
+    fn a_caller_needing_a_live_daemon_is_not_told_an_unset_variable_caused_it() {
+        let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
+        let message = running_daemon_required_error("semantic graph commits", &layout).to_string();
+        assert!(!message.contains("KIN_NO_DAEMON"), "{message}");
+        assert!(
+            message.contains("/tmp/kin-fixture-repo") && message.contains("kin status"),
+            "{message}"
+        );
     }
 }

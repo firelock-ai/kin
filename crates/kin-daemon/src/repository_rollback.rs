@@ -381,10 +381,12 @@ fn plan_and_commit(
                 semantic_overlay_hash: workspace.semantic_overlay_hash,
                 admission_policy: workspace.admission_policy,
             },
-            new_generation: workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+                crate::error::workspace_generation_exhausted(
+                    workspace.workspace_id,
+                    workspace.generation,
+                )
+            })?,
             new_head: workspace.head.clone(),
             new_base_target: Some(new_target),
             new_base_tree_hash: Some(target_tree_hash),
@@ -788,7 +790,11 @@ fn preflight_rollback_delta(
         || snapshot.entities != desired.entities
         || snapshot.relations != desired.relations
     {
-        bail!("rollback daemon graph preflight did not produce the exact restored graph and tree");
+        bail!(
+            "the rollback preflighted to a graph and tree that do not match the state it is \
+             restoring, so kin refused to publish it; your workspace is unchanged, so run \
+             `kin status` and try again"
+        );
     }
     Ok(())
 }
@@ -809,10 +815,10 @@ fn parse_change_id(value: &str) -> Result<SemanticChangeId> {
 
 fn classify_rollback_error(error: anyhow::Error) -> (StatusCode, String) {
     if error.downcast_ref::<RollbackBadRequest>().is_some() {
-        return (StatusCode::BAD_REQUEST, format!("{error:#}"));
+        return (StatusCode::BAD_REQUEST, crate::error::cause_first(&error));
     }
     if error.downcast_ref::<RollbackConflict>().is_some() {
-        return (StatusCode::CONFLICT, format!("{error:#}"));
+        return (StatusCode::CONFLICT, crate::error::cause_first(&error));
     }
     if let Some(core) = error.downcast_ref::<kin_core::KinError>() {
         let status = match core {
@@ -820,7 +826,7 @@ fn classify_rollback_error(error: anyhow::Error) -> (StatusCode, String) {
             | kin_core::KinError::ProjectionConflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
     if let Some(model) = error.downcast_ref::<kin_model::ModelError>() {
         let status = match model {
@@ -833,9 +839,12 @@ fn classify_rollback_error(error: anyhow::Error) -> (StatusCode, String) {
             | kin_model::ModelError::ChangeNotFound(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        return (status, format!("{error:#}"));
+        return (status, crate::error::cause_first(&error));
     }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::error::cause_first(&error),
+    )
 }
 
 fn repository_finalization_error(error: crate::error::DaemonError) -> (StatusCode, String) {
@@ -852,8 +861,11 @@ fn rollback_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode
     let identity = refusal.is_identity_refusal();
     let error = refusal.into_error();
     if identity {
-        (StatusCode::CONFLICT, format!("{error:#}"))
+        (StatusCode::CONFLICT, crate::error::cause_first(&error))
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::error::cause_first(&error),
+        )
     }
 }

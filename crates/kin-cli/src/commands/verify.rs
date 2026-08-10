@@ -124,9 +124,8 @@ async fn run_daemon_verify_run(
         .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for verify run but no daemon endpoint is available")
-    })?;
+    let base_url = daemon_url
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("verify run", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client
         .verify_run(request)
@@ -143,9 +142,8 @@ async fn run_daemon_verify_command(
         .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for verify but no daemon endpoint is available")
-    })?;
+    let base_url =
+        daemon_url.ok_or_else(|| crate::daemon_client::daemon_required_error("verify", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client
         .verify_command(request)
@@ -785,7 +783,12 @@ where
         Some(hash) => parse_change_id(hash)?,
         None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
             .current_change_id()?
-            .ok_or_else(|| anyhow!("repository-v6 workspace head is unborn"))?,
+            .ok_or_else(|| {
+                anyhow!(
+                    "this workspace has no commits yet, so there is nothing to verify; make one \
+                     with `kin commit`"
+                )
+            })?,
     };
 
     graph

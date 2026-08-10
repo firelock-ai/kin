@@ -149,11 +149,7 @@ async fn execute(request: MergeRequest) -> Result<MergeResponse> {
     let layout = require_repository_layout()?;
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for merge operations but no daemon endpoint is available"
-            )
-        })?;
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("merge operations", &layout))?;
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
     daemon.merge(&request).await
 }

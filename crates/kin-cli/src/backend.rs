@@ -371,7 +371,9 @@ pub async fn require_daemon_update_head(
 ) -> anyhow::Result<()> {
     let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
         .await
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for branch head updates"))?;
+        .ok_or_else(|| {
+            crate::daemon_client::running_daemon_required_error("branch head updates", layout)
+        })?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
@@ -412,7 +414,9 @@ pub async fn require_daemon_commit(
 ) -> anyhow::Result<()> {
     let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
         .await
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for semantic graph commits"))?;
+        .ok_or_else(|| {
+            crate::daemon_client::running_daemon_required_error("semantic graph commits", layout)
+        })?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -684,7 +688,7 @@ pub async fn require_daemon_graph_mutations(
 ) -> anyhow::Result<()> {
     let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for graph mutations"))?;
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("graph mutations", layout))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;

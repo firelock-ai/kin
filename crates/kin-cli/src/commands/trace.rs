@@ -117,9 +117,8 @@ async fn run_daemon_trace(
         .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for trace but no daemon endpoint is available")
-    })?;
+    let base_url =
+        daemon_url.ok_or_else(|| crate::daemon_client::daemon_required_error("trace", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client.trace(request).await.context("daemon trace failed")
 }

@@ -68,10 +68,7 @@ async fn execute(request: ConflictsRequest) -> Result<ConflictsResponse> {
     let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required to read merge conflict state but no daemon endpoint is \
-                 available"
-            )
+            crate::daemon_client::daemon_required_error("merge conflict state", &layout)
         })?;
     let daemon = crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, &layout)?;
     daemon.conflicts(&request).await

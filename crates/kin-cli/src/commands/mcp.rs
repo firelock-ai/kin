@@ -593,7 +593,7 @@ async fn bind_daemon_for_repo_dir(dir: &Path) -> std::result::Result<String, Str
         .await
         .map_err(|e| format!("{e:#}"))?
         .ok_or_else(|| {
-            "Kin daemon is required for MCP startup but no daemon endpoint is available".to_string()
+            crate::daemon_client::daemon_required_error("MCP startup", &layout).to_string()
         })?;
     std::env::set_var("KIN_DAEMON_URL", &url);
     Ok(url)

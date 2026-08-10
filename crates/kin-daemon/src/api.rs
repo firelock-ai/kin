@@ -96,7 +96,7 @@ impl ActiveApiRepositoryAuthority {
                 (
                     StatusCode::FAILED_DEPENDENCY,
                     format!(
-                        "repository-v6 authority has no workspace {}",
+                        "this repository's authority has no workspace {}",
                         self.workspace_id
                     ),
                 )
@@ -107,7 +107,7 @@ impl ActiveApiRepositoryAuthority {
 fn repository_authority_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (
         StatusCode::FAILED_DEPENDENCY,
-        format!("repository-v6 authority unavailable: {error}"),
+        format!("this repository's authority could not be opened: {error}"),
     )
 }
 
@@ -5588,7 +5588,7 @@ async fn review(
     .await
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
         }
@@ -5854,7 +5854,7 @@ async fn blame(
     )
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
         }
@@ -5890,7 +5890,7 @@ async fn history(
     )
     .map_err(|error| {
         if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
-            (StatusCode::BAD_REQUEST, format!("{error:#}"))
+            (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
         }
@@ -9359,7 +9359,10 @@ async fn vfs_read(
             .ok_or_else(|| {
                 vfs_read_error(
                     StatusCode::NOT_FOUND,
-                    format!("file not found in repository-v6 workspace tree: {path}"),
+                    format!(
+                        "this workspace holds no file at {path}; run `kin status` to see what it \
+                         does hold"
+                    ),
                 )
             })?;
         let digest = artifact.entry.blob_identity().ok_or_else(|| {

@@ -4,6 +4,35 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// The refusal a workspace whose generation counter cannot advance produces.
+///
+/// Shared because the same three words, "workspace generation overflow", stood
+/// alone at seven call sites across merge, switch, checkout, rollback, and
+/// stash, naming no workspace and offering nothing to do.
+pub fn workspace_generation_exhausted(
+    workspace_id: impl std::fmt::Display,
+    generation: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "workspace {workspace_id} is at generation {generation}, the highest kin can record, so \
+         this command cannot advance it; nothing was written, and a fresh checkout initialized \
+         with `kin init` will carry the work forward"
+    )
+}
+
+/// Render an error chain with its root cause as the headline.
+///
+/// `{error:#}` prints the outermost context first, which on the repository
+/// routes is an internal step description such as "resolve exact graph for
+/// branch main", leaving the reason the caller needs at the far end of the
+/// line. Reversing the chain puts the cause where a reader looks for it and
+/// keeps the steps that led there behind it.
+pub fn cause_first(error: &anyhow::Error) -> String {
+    let mut frames: Vec<String> = error.chain().map(ToString::to_string).collect();
+    frames.reverse();
+    frames.join(": ")
+}
+
 #[derive(Error, Debug)]
 pub enum DaemonError {
     #[error("Graph error: {0}")]
@@ -132,3 +161,37 @@ impl From<kin_model::ModelError> for DaemonError {
 }
 
 pub type Result<T> = std::result::Result<T, DaemonError>;
+
+#[cfg(test)]
+mod tests {
+    use super::cause_first;
+
+    #[test]
+    fn the_root_cause_leads_and_the_steps_that_reached_it_follow() {
+        let error = anyhow::anyhow!("branch main has no graph snapshot")
+            .context("resolve exact graph for branch main")
+            .context("prepare merge replay validation");
+        assert_eq!(
+            cause_first(&error),
+            "branch main has no graph snapshot: resolve exact graph for branch main: prepare \
+             merge replay validation"
+        );
+        assert_ne!(
+            cause_first(&error),
+            format!("{error:#}"),
+            "leading with the outermost step is the rendering being replaced"
+        );
+    }
+
+    /// Classification by substring survives the reordering: the repository
+    /// routes read their own refusal text to pick a status code, and a chain
+    /// rendered in either direction contains the same frames.
+    #[test]
+    fn an_uncontextualized_error_renders_exactly_as_itself() {
+        let error = anyhow::anyhow!("rename target is not a simple source identifier");
+        assert_eq!(
+            cause_first(&error),
+            "rename target is not a simple source identifier"
+        );
+    }
+}

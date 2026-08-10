@@ -108,9 +108,8 @@ async fn run_daemon_review(request: &ReviewRequest) -> Result<ReviewResponse> {
         .filter(|value| !value.trim().is_empty())
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
-    let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for review but no daemon endpoint is available")
-    })?;
+    let base_url =
+        daemon_url.ok_or_else(|| crate::daemon_client::daemon_required_error("review", &layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client.review(request).await.context("daemon review failed")
 }
@@ -424,7 +423,12 @@ fn compute_review(
         ),
         None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
             .current_change_id()?
-            .ok_or_else(|| anyhow::anyhow!("repository-v6 workspace head is unborn"))?,
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this workspace has no commits yet, so there is nothing to review; make one \
+                     with `kin commit`"
+                )
+            })?,
     };
 
     let semantic_change = graph

@@ -188,7 +188,9 @@ fn plan_commit_and_retain_authority(
     .context("plan one exact repository-v6 rename transaction")?;
     if native.change.tree_deltas.is_empty() || native.change.entity_deltas.is_empty() {
         bail!(
-            "rename transaction did not carry both exact tree and semantic deltas; refusing a partial publication"
+            "the rename produced only half of the change it has to publish, either the file edits \
+             or the graph edits but not both, so kin refused a partial publication; nothing was \
+             written, so re-run the rename and report it if it repeats"
         );
     }
     let planned_delta = TransactionDelta {
@@ -597,12 +599,21 @@ fn prove_plan_postconditions(
     after: &kin_db::InMemoryGraph,
     plan: &RenamePlan,
 ) -> Result<()> {
-    let old = before
-        .get_entity(&plan.entity_id)?
-        .ok_or_else(|| anyhow::anyhow!("rename target disappeared from its authority base"))?;
-    let new = after
-        .get_entity(&plan.entity_id)?
-        .ok_or_else(|| anyhow::anyhow!("rename target identity disappeared after reparse"))?;
+    let old = before.get_entity(&plan.entity_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the entity {} being renamed is no longer in this repository's authority base, so \
+                 kin refused the rename; nothing was written, so run `kin status` and try again",
+            plan.entity_id
+        )
+    })?;
+    let new = after.get_entity(&plan.entity_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the entity {} being renamed did not survive reparsing the edited source, so kin \
+                 refused the rename; nothing was written, so check the file still parses and try \
+                 again",
+            plan.entity_id
+        )
+    })?;
     if old.name != plan.old_name || new.name != plan.new_name || old.kind != new.kind {
         bail!(
             "rename did not preserve graph identity {} across '{}' -> '{}'",
@@ -633,9 +644,9 @@ fn prove_plan_postconditions(
             .copied()
             .collect::<Vec<_>>();
         bail!(
-            "rename reparse changed graph relation identity topology (dropped: {:?}, added: {:?}); refusing semantic drift",
-            dropped,
-            added
+            "reparsing the renamed source changed which relations this repository holds, \
+             dropping {dropped:?} and adding {added:?}, so kin refused the rename rather than \
+             publish semantic drift; nothing was written"
         );
     }
     for (relation_id, prior) in &before_snapshot.relations {
@@ -661,7 +672,11 @@ fn prove_plan_postconditions(
         .iter()
         .any(|relation_id| !after_snapshot.relations.contains_key(relation_id))
     {
-        bail!("rename reparse lost a graph relation that selected an edit site");
+        bail!(
+            "reparsing the renamed source lost a relation that had selected one of the edit \
+             sites, so kin refused the rename rather than publish an incomplete one; nothing was \
+             written"
+        );
     }
     Ok(())
 }
@@ -793,7 +808,7 @@ fn stabilize_recovered_layout(
 }
 
 fn rename_error(error: anyhow::Error) -> (StatusCode, String) {
-    let message = format!("{error:#}");
+    let message = crate::error::cause_first(&error);
     let status = if message.contains("not a simple source identifier") {
         StatusCode::BAD_REQUEST
     } else {
