@@ -621,7 +621,14 @@ fn three_way(
         .resolve_graph_at(&change.id)
         .context("replay the exact merge change")?;
     if authoritative.tree != desired_tree {
-        bail!("replaying the merge change did not reproduce the composed merged tree");
+        bail!(
+            "merging {} into {} produced a change that does not replay to the same tree, so kin \
+             refused to publish it; nothing was written, so re-run `kin merge {}` and report the \
+             mismatch if it repeats",
+            request.source,
+            plan.target_ref,
+            request.source
+        );
     }
     let desired_tree_hash =
         compute_resolved_tree_hash(&desired_tree).context("hash exact merged tree")?;
@@ -964,7 +971,13 @@ pub(crate) fn publish_resolved_merge(
         .resolve_graph_at(&change.id)
         .context("replay the exact merge change")?;
     if authoritative.tree != desired_tree {
-        bail!("replaying the merge change did not reproduce the resolved merged tree");
+        bail!(
+            "the resolution of {} into {} produced a change that does not replay to the same \
+             tree, so kin refused to publish it; nothing was written, and your recorded conflict \
+             resolutions are still there for another `kin resolve`",
+            record.binding.source_ref,
+            record.binding.target_ref
+        );
     }
     let desired_tree_hash =
         compute_resolved_tree_hash(&desired_tree).context("hash exact merged tree")?;
@@ -1502,10 +1515,12 @@ fn workspace_mutation(
             semantic_overlay_hash: workspace.semantic_overlay_hash,
             admission_policy: workspace.admission_policy,
         },
-        new_generation: workspace
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+        new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+            crate::error::workspace_generation_exhausted(
+                workspace.workspace_id,
+                workspace.generation,
+            )
+        })?,
         new_head: workspace.head.clone(),
         new_base_target: Some(new_base_target),
         new_base_tree_hash: Some(new_tree_hash),
@@ -1546,10 +1561,17 @@ fn preflight_merge_delta(
         .context("apply merge daemon graph preflight")?;
     let snapshot = preflight.to_snapshot();
     if snapshot.resolved_tree != *desired_tree {
-        bail!("merge daemon graph preflight did not produce the exact merged tree");
+        bail!(
+            "the merge preflighted to a tree that does not match the one it composed, so kin \
+             refused to publish it; your workspace is unchanged, so run `kin status` and try again"
+        );
     }
     if snapshot.entities != *desired_entities || snapshot.relations != *desired_relations {
-        bail!("merge daemon graph preflight did not produce the exact merged semantics");
+        bail!(
+            "the merge preflighted to graph semantics that do not match the ones it composed, so \
+             kin refused to publish it; your workspace is unchanged, so run `kin status` and try \
+             again"
+        );
     }
     Ok(())
 }

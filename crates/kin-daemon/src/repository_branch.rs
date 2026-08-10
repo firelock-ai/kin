@@ -913,10 +913,12 @@ fn switch(
                 semantic_overlay_hash: workspace.semantic_overlay_hash,
                 admission_policy: workspace.admission_policy,
             },
-            new_generation: workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+                crate::error::workspace_generation_exhausted(
+                    workspace.workspace_id,
+                    workspace.generation,
+                )
+            })?,
             new_head: WorkspaceHead::Symbolic {
                 target: name.clone(),
             },
@@ -1162,7 +1164,9 @@ fn preflight_switch_delta(
         || snapshot.relations != desired.relations
     {
         bail!(
-            "branch-switch daemon graph preflight did not produce the exact target graph and tree"
+            "the switch preflighted to a graph and tree that do not match the target branch's \
+             head, so kin refused the switch; your workspace is unchanged, so run `kin status` \
+             and try again"
         );
     }
     Ok(())

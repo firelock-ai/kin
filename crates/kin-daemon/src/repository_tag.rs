@@ -272,7 +272,11 @@ fn bind_snapshot(
     }
     let artifact_count = source.tree.artifacts().len();
     let [mutation] = receipt.operation.ref_mutations.as_slice() else {
-        bail!("a released tag receipt must carry exactly one ref mutation");
+        bail!(
+            "the release for {change_id} recorded something other than exactly one ref change, so \
+             kin refused to publish the tag; nothing was written, so re-run `kin tag` and report \
+             it if it repeats"
+        );
     };
     ReleaseSnapshot {
         schema: RELEASE_SNAPSHOT_SCHEMA.to_string(),

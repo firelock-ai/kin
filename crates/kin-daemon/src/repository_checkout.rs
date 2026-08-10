@@ -344,7 +344,12 @@ fn plan_and_commit(
             .workspace_mutation
             .as_ref()
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("checkout receipt has no workspace mutation"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the recorded checkout carries no workspace change to replay, so kin cannot \
+                     resume it; your workspace is unchanged, so run `kin status` and try again"
+                )
+            })?;
         if mutation.workspace_id != workspace.workspace_id
             || mutation.new_generation != workspace.generation
             || mutation.new_tree_hash != workspace.tree_hash
@@ -370,7 +375,9 @@ fn plan_and_commit(
         } = &mutation.expected
         else {
             return Err(CheckoutCommandError::internal(anyhow::anyhow!(
-                "checkout receipt unexpectedly creates a new workspace"
+                "the recorded checkout would create a workspace rather than move this one, so \
+                 kin refused to replay it; your workspace is unchanged, so run `kin status` and \
+                 try again"
             )));
         };
         if previous_tree_hash != *expected_tree_hash {
@@ -437,7 +444,14 @@ fn plan_and_commit(
             .workspaces
             .iter()
             .find(|candidate| candidate.workspace_id == workspace.workspace_id)
-            .ok_or_else(|| anyhow::anyhow!("checkout workspace disappeared after recovery"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workspace {} is no longer in this repository's authority after the checkout \
+                     was recovered, so kin cannot confirm the result; run `kin status`, then \
+                     `kin health` if it still does not resolve",
+                    workspace.workspace_id
+                )
+            })?;
         if current.generation != mutation.new_generation
             || current.tree_hash != mutation.new_tree_hash
             || current.tree != graph_plan.desired_tree
@@ -505,12 +519,16 @@ fn plan_and_commit(
     })?;
     if daemon_delta.admission_policy_delta.is_some() {
         return Err(CheckoutCommandError::internal(anyhow::anyhow!(
-            "checkout graph preflight unexpectedly changed repository admission policy"
+            "the checkout preflight would have changed this repository's admission policy, \
+             which a checkout never does, so kin refused it; your workspace is unchanged, so run \
+             `kin status` and try again"
         )));
     }
     if daemon_delta.tree_deltas != tree_deltas {
         return Err(CheckoutCommandError::internal(anyhow::anyhow!(
-            "checkout graph preflight was not bound to the exact repository tree transition"
+            "the checkout preflight produced a tree transition that does not match the one \
+             authority planned, so kin refused it; your workspace is unchanged, so run \
+             `kin status` and try again"
         )));
     }
     // The authority-side transition is planned from the workspace lease, not
@@ -519,7 +537,9 @@ fn plan_and_commit(
     // would ask authority to publish or retract semantics it never owned.
     let workspace_graph = workspace_graph.ok_or_else(|| {
         CheckoutCommandError::internal(anyhow::anyhow!(
-            "checkout planning reached the authority transition without a workspace authority graph"
+            "the checkout reached the point of publishing without a workspace authority graph \
+             to publish against, so kin refused it; your workspace is unchanged, so run \
+             `kin status` and try again"
         ))
     })?;
     let authority_graph = kin_db::InMemoryGraph::from_snapshot(workspace_graph)
@@ -666,10 +686,12 @@ fn plan_and_commit(
                 semantic_overlay_hash: workspace.semantic_overlay_hash,
                 admission_policy: workspace.admission_policy,
             },
-            new_generation: workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+                crate::error::workspace_generation_exhausted(
+                    workspace.workspace_id,
+                    workspace.generation,
+                )
+            })?,
             new_head: workspace.head.clone(),
             new_base_target: workspace.base_target.clone(),
             new_base_tree_hash: workspace.base_tree_hash,

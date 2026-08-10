@@ -381,10 +381,12 @@ fn plan_and_commit(
                 semantic_overlay_hash: workspace.semantic_overlay_hash,
                 admission_policy: workspace.admission_policy,
             },
-            new_generation: workspace
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("workspace generation overflow"))?,
+            new_generation: workspace.generation.checked_add(1).ok_or_else(|| {
+                crate::error::workspace_generation_exhausted(
+                    workspace.workspace_id,
+                    workspace.generation,
+                )
+            })?,
             new_head: workspace.head.clone(),
             new_base_target: Some(new_target),
             new_base_tree_hash: Some(target_tree_hash),
@@ -788,7 +790,11 @@ fn preflight_rollback_delta(
         || snapshot.entities != desired.entities
         || snapshot.relations != desired.relations
     {
-        bail!("rollback daemon graph preflight did not produce the exact restored graph and tree");
+        bail!(
+            "the rollback preflighted to a graph and tree that do not match the state it is \
+             restoring, so kin refused to publish it; your workspace is unchanged, so run \
+             `kin status` and try again"
+        );
     }
     Ok(())
 }

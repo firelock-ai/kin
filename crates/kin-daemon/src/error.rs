@@ -4,6 +4,22 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// The refusal a workspace whose generation counter cannot advance produces.
+///
+/// Shared because the same three words, "workspace generation overflow", stood
+/// alone at seven call sites across merge, switch, checkout, rollback, and
+/// stash, naming no workspace and offering nothing to do.
+pub fn workspace_generation_exhausted(
+    workspace_id: impl std::fmt::Display,
+    generation: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "workspace {workspace_id} is at generation {generation}, the highest kin can record, so \
+         this command cannot advance it; nothing was written, and a fresh checkout initialized \
+         with `kin init` will carry the work forward"
+    )
+}
+
 /// Render an error chain with its root cause as the headline.
 ///
 /// `{error:#}` prints the outermost context first, which on the repository
@@ -149,7 +165,6 @@ pub type Result<T> = std::result::Result<T, DaemonError>;
 #[cfg(test)]
 mod tests {
     use super::cause_first;
-    use anyhow::Context;
 
     #[test]
     fn the_root_cause_leads_and_the_steps_that_reached_it_follow() {
