@@ -54,12 +54,44 @@ pub struct ContextRequest {
     pub assistant: Option<String>,
 }
 
+/// Names the structured half of [`ContextResponse`]. A daemon predating it
+/// answers with `lines` only and leaves this empty, which is what lets `--json`
+/// refuse loudly instead of emitting a document missing everything it promises.
+pub const CONTEXT_RESPONSE_SCHEMA_VERSION: &str = "kin-context-response-v1";
+
+/// What the pack was built for. The human rendering opens with the same three
+/// facts, so a structured caller is not reading a different resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTarget {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub budget_tokens: usize,
+}
+
+/// The context response, structured half added alongside the rendered lines.
+///
+/// `lines` stays first and required so an older client keeps decoding this, and
+/// the structured fields default so this client keeps decoding an older daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextResponse {
     pub lines: Vec<String>,
+    #[serde(default)]
+    pub schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ContextTarget>,
+    /// Absent when the entity did not resolve, which is the one case the human
+    /// rendering answers with guidance rather than a pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<kin_model::context::ContextPack>,
 }
 
-pub async fn run(entity: String, budget: String, assistant: Option<String>) -> Result<()> {
+pub async fn run(
+    entity: String,
+    budget: String,
+    assistant: Option<String>,
+    json: bool,
+) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "context").await?;
     let response = run_daemon_context(
@@ -71,8 +103,17 @@ pub async fn run(entity: String, budget: String, assistant: Option<String>) -> R
         },
     )
     .await?;
-    for line in response.lines {
-        println!("{line}");
+    if json {
+        if response.schema_version.is_empty() {
+            anyhow::bail!(
+                "the running daemon does not support structured context packs; restart it with the current Kin build"
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        for line in response.lines {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -116,6 +157,11 @@ pub fn build_context_response(
     let Some(target) = resolve_context_target(graph, &request.entity)? else {
         return Ok(ContextResponse {
             lines: context_not_found_guidance(&request.entity),
+            // Stamped even here: an unresolved entity is an answer, and leaving
+            // this empty would report it as a daemon too old to answer at all.
+            schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
+            target: None,
+            pack: None,
         });
     };
     let opts = kin_context::ContextOptions {
@@ -158,7 +204,17 @@ pub fn build_context_response(
         lines.push(entry.content.clone());
     }
 
-    Ok(ContextResponse { lines })
+    Ok(ContextResponse {
+        lines,
+        schema_version: CONTEXT_RESPONSE_SCHEMA_VERSION.to_string(),
+        target: Some(ContextTarget {
+            id: target.id.to_string(),
+            name: target.name.clone(),
+            kind: format!("{:?}", target.kind),
+            budget_tokens: token_budget.max_tokens(),
+        }),
+        pack: Some(pack),
+    })
 }
 
 fn resolve_context_target(
@@ -307,6 +363,82 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// `--json` is why the structured half exists, and it must carry the pack
+    /// rather than the rendered lines. Serializing `lines` alone would be human
+    /// text in a JSON envelope, which is what the surface already had.
+    #[test]
+    fn a_resolved_context_carries_its_pack_and_target_for_machines() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("checkout");
+        graph.upsert_entity(&entity).unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "checkout".to_string(),
+                budget: "8k".to_string(),
+                assistant: None,
+            },
+        )
+        .expect("a resolved entity builds a context response");
+
+        assert_eq!(response.schema_version, CONTEXT_RESPONSE_SCHEMA_VERSION);
+        let target = response.target.as_ref().expect("a resolved target");
+        assert_eq!(target.name, "checkout");
+        assert_eq!(target.kind, "Function");
+        assert_eq!(target.budget_tokens, 8000);
+        let pack = response.pack.as_ref().expect("a resolved pack");
+        assert!(!pack.focal_entities.is_empty(), "the pack names its focus");
+
+        // The document a caller receives holds the structure, not just prose.
+        let rendered = serde_json::to_string(&response).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("parse");
+        assert_eq!(value["target"]["name"], "checkout");
+        assert!(
+            value["pack"]["focal_entities"].is_array(),
+            "the pack must survive serialization: {rendered}"
+        );
+        assert!(value["pack"]["actual_tokens"].is_number());
+    }
+
+    /// An unresolved entity is an answer, so it is stamped. Leaving the version
+    /// empty there would make `--json` report it as a daemon too old to answer.
+    #[test]
+    fn an_unresolved_entity_is_stamped_but_carries_no_pack() {
+        let graph = kin_db::InMemoryGraph::new();
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "frobnicate".to_string(),
+                budget: "8k".to_string(),
+                assistant: None,
+            },
+        )
+        .expect("an unresolved entity still answers");
+
+        assert_eq!(response.schema_version, CONTEXT_RESPONSE_SCHEMA_VERSION);
+        assert!(response.pack.is_none());
+        assert!(response.target.is_none());
+        assert!(!response.lines.is_empty(), "guidance is still rendered");
+    }
+
+    /// The version guard has to be able to fire, which means an older daemon's
+    /// reply must still decode and must still leave the version empty. If the
+    /// field were required, this would be a decode error and `--json` would
+    /// report a transport failure for a version skew.
+    #[test]
+    fn an_older_daemons_reply_still_decodes_and_reports_no_schema() {
+        let older: ContextResponse =
+            serde_json::from_str(r#"{"lines":["Context pack for 'Foo' (Function):"]}"#)
+                .expect("a lines-only reply must still decode");
+        assert!(
+            older.schema_version.is_empty(),
+            "an unstamped reply is what makes `--json` refuse rather than emit an empty document"
+        );
+        assert!(older.pack.is_none());
+        assert_eq!(older.lines.len(), 1);
     }
 
     #[test]

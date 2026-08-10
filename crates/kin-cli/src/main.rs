@@ -191,6 +191,9 @@ enum Command {
         /// Assistant hint for tuning context pack strategy
         #[arg(long)]
         assistant: Option<String>,
+        /// Emit the resolved target and the whole context pack as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Hidden ContextBench locate wrapper that keeps benchmark query shaping inside Kin
     #[command(hide = true)]
@@ -2304,7 +2307,8 @@ fn main() -> Result<()> {
                     entity,
                     budget,
                     assistant,
-                } => commands::context::run(entity, budget, assistant).await,
+                    json,
+                } => commands::context::run(entity, budget, assistant, json).await,
                 Command::ContextbenchLocate {
                     task_file,
                     json,
