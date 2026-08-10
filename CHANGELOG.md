@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.15] - 2026-08-10
+
+### Changed
+
+- Answer an unresolvable name from the name index instead of after the expensive read (#726)
+- Restore adapter and classifier parity, and correct the docs against source (#727)
+
+
 ## [0.5.14] - 2026-08-09
 
 ### Changed
