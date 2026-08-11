@@ -1801,7 +1801,16 @@ fn untolerable_worktree_state(
             "finish or abort that worktree's Git operation, then run kin init again".to_string(),
         )));
     }
-    if let Some(private) = first_private_worktree_ref(git_dir)? {
+    // Which namespaces count as private depends on which git dir this is. A
+    // linked sibling's git dir holds only per-worktree refs, so everything
+    // loose under it is private. The main worktree's git dir IS the shared
+    // store, so walking its whole refs tree would misread every loose branch
+    // as private; only bisect and worktree refs belong to that checkout alone.
+    let private = match worktree.kind {
+        RegisteredGitWorktreeKind::Linked => first_private_worktree_ref(git_dir)?,
+        RegisteredGitWorktreeKind::Main => first_private_main_worktree_ref(git_dir)?,
+    };
+    if let Some(private) = private {
         return Ok(Some((
             format!(
                 "carries its own ref {}, which this repository's shared reference store does not \
@@ -1896,40 +1905,59 @@ fn shared_branch_exists(repo: &gix::Repository, name: &[u8]) -> bool {
     repo.find_reference(name).is_ok()
 }
 
-/// The first ref one worktree keeps privately, if it keeps any.
+/// The first ref one linked worktree keeps privately, if it keeps any.
 ///
 /// `.git/worktrees/<id>/refs` is where Git puts `refs/bisect/*` and
 /// `refs/worktree/*`, which belong to that worktree alone. Packed refs are
-/// always shared, so a loose walk here is the complete private set.
+/// always shared, so a loose walk here is the complete private set. Only a
+/// linked sibling's git dir has this shape; the main worktree's git dir is
+/// the shared store and goes through [`first_private_main_worktree_ref`].
 fn first_private_worktree_ref(git_dir: &Path) -> Result<Option<PathBuf>> {
-    fn walk(root: &Path) -> Result<Option<PathBuf>> {
-        let entries = match fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(GitError::io(root, error)),
-        };
-        let entries = entries
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| GitError::io(root, error))?;
-        let mut paths = entries
-            .into_iter()
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        paths.sort();
-        for path in paths {
-            let metadata =
-                fs::symlink_metadata(&path).map_err(|error| GitError::io(&path, error))?;
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                if let Some(found) = walk(&path)? {
-                    return Ok(Some(found));
-                }
-            } else {
-                return Ok(Some(path));
-            }
+    first_loose_ref_under(&git_dir.join("refs"))
+}
+
+/// The first per-worktree ref the main worktree keeps, if it keeps any.
+///
+/// The main worktree's git dir is the shared reference store: `refs/heads/*`
+/// under it are the repository's published branches, loose or packed by pack
+/// state alone, so a whole-tree walk would refuse ordinary branches as
+/// private and flip admission on packing. Git scopes exactly `refs/bisect/*`
+/// and `refs/worktree/*` to the main checkout, so those are the complete
+/// private set here.
+fn first_private_main_worktree_ref(git_dir: &Path) -> Result<Option<PathBuf>> {
+    for namespace in ["refs/bisect", "refs/worktree"] {
+        if let Some(found) = first_loose_ref_under(&git_dir.join(namespace))? {
+            return Ok(Some(found));
         }
-        Ok(None)
     }
-    walk(&git_dir.join("refs"))
+    Ok(None)
+}
+
+fn first_loose_ref_under(root: &Path) -> Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(GitError::io(root, error)),
+    };
+    let entries = entries
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| GitError::io(root, error))?;
+    let mut paths = entries
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| GitError::io(&path, error))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if let Some(found) = first_loose_ref_under(&path)? {
+                return Ok(Some(found));
+            }
+        } else {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
@@ -4722,6 +4750,73 @@ mod tests {
         assert!(
             rendered.contains("bisecting-worktree") && rendered.contains("bisect"),
             "the refusal names the worktree and the ref: {rendered}"
+        );
+    }
+
+    /// Init from inside a linked worktree tolerates an idle main worktree.
+    ///
+    /// The main sibling's git dir is the shared reference store, where every
+    /// ordinary branch sits loose until a pack runs. A private-ref walk over
+    /// that whole store reads the repository's own branches as the main
+    /// checkout's private refs and refuses with a false reason, which is the
+    /// defect this test pins: admission must not flip on pack state.
+    #[test]
+    fn init_from_a_linked_worktree_tolerates_an_idle_main_worktree() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("lane-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+
+        let (snapshot, plan) = snapshot_plan(&other, &fixture.store);
+        let proof = preflight_git_migration(&other, &snapshot, &plan, &fixture.store)
+            .expect("an idle main sibling with loose shared branches is tolerated");
+        assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
+        assert_eq!(
+            stable_path(&proof.compatibility.other_registered_worktrees[0].path),
+            stable_path(&fixture.repo),
+            "the tolerated sibling is the main worktree"
+        );
+    }
+
+    /// Init from inside a linked worktree still refuses a main worktree
+    /// mid-bisect, naming the per-worktree ref.
+    #[test]
+    fn init_from_a_linked_worktree_refuses_a_main_worktree_mid_bisect() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("lane-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        let private = fixture.repo.join(".git/refs/bisect");
+        fs::create_dir_all(&private).expect("main per-worktree ref directory");
+        fs::write(
+            private.join("bad"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("main per-worktree ref");
+
+        let (snapshot, plan) = snapshot_plan(&other, &fixture.store);
+        let rendered = preflight_git_migration(&other, &snapshot, &plan, &fixture.store)
+            .expect_err("a main sibling mid-bisect is refused")
+            .to_string();
+        assert!(
+            rendered.contains("bisect"),
+            "the refusal names the per-worktree ref: {rendered}"
         );
     }
 
