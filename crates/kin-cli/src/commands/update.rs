@@ -1264,7 +1264,30 @@ fn run_chain_tail() -> Result<()> {
         ChainStep::RepairConfigs,
         &["setup", "doctor", "--fix"],
     )?;
+    report_chain_outcome(&kin_home);
     Ok(())
+}
+
+/// Say what the chain landed on, after it has landed.
+///
+/// The notification this replaces announced a task list before any work
+/// happened. This one reports the version and build the machine is actually
+/// running, which is the only form of the message a reader can check. Delivery
+/// is best-effort on purpose: the chain already succeeded by the time this
+/// runs, and a notification that could not be posted must not turn a finished
+/// update into a failed command.
+fn report_chain_outcome(kin_home: &Path) {
+    let build = kin_buildinfo::get();
+    let body = format!(
+        "This machine is current at v{} ({}).",
+        CURRENT_VERSION,
+        &build.sha[..build.sha.len().min(12)]
+    );
+    println!("{body}");
+    let notification = kin_notify::Notification::new("Kin update", body, kin_notify::Level::Info)
+        .with_key("install-drift");
+    let _ = kin_notify::Notifier::with_home(kin_home.to_path_buf())
+        .send(&notification, kin_notify::Suppression::None);
 }
 
 fn registry_authority_preflight() -> Result<()> {
