@@ -2,7 +2,9 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::{EntityStore, GraphStats, Hash256, RepoPath, ResolvedTree, TreeEntry};
+use kin_model::{
+    ArtifactKind, EntityStore, FilePathId, GraphStats, Hash256, RepoPath, ResolvedTree, TreeEntry,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -114,7 +116,15 @@ pub(crate) fn inspect_graph(
 #[derive(Default)]
 struct EnrichmentFacets {
     count: usize,
-    content_hashes: Vec<Hash256>,
+    /// Opaque facets record the exact blob identity of the bytes they describe,
+    /// so a stored hash that differs from the tree's is a disagreement.
+    opaque_hashes: Vec<Hash256>,
+    /// Structured facets record the hash of NORMALIZED content, not of the
+    /// bytes. The extractors exist to make formatting-only changes invisible to
+    /// the dependency graph, so this hash is not blob identity and equals it
+    /// only when a file's normalization happens to be the identity. Checking it
+    /// means re-deriving the same normalization from the authoritative body.
+    structured: Vec<(ArtifactKind, Hash256)>,
 }
 
 fn collect_repository_artifact_coverage(
@@ -124,12 +134,34 @@ fn collect_repository_artifact_coverage(
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let workspace = authority.workspace()?;
     workspace.validate()?;
-    collect_repository_artifact_coverage_for_tree(&workspace.tree, graph)
+    collect_repository_artifact_coverage_for_tree(&workspace.tree, graph, &|hash| {
+        authority.load_source_blob(hash)
+    })
+}
+
+/// Whether a structured facet still describes the body the tree names.
+///
+/// Re-derives the extractor's own normalization from the authoritative body and
+/// compares that, because the stored hash is the normalized hash. Extraction
+/// failure falls back to blob identity exactly as the writer does, so a file the
+/// extractor cannot read is checked on the same terms it was written on.
+fn structured_facet_disagrees(
+    kind: ArtifactKind,
+    stored: Hash256,
+    path: &str,
+    blob_hash: Hash256,
+    body: &[u8],
+) -> bool {
+    let expected = kin_index::extract_artifact(kind, body, &FilePathId::new(path))
+        .map(|artifact| artifact.content_hash)
+        .unwrap_or(blob_hash);
+    stored != expected
 }
 
 fn collect_repository_artifact_coverage_for_tree(
     authority_tree: &ResolvedTree,
     graph: &kin_db::InMemoryGraph,
+    read_body: &dyn Fn(Hash256) -> Result<Vec<u8>>,
 ) -> Result<RepositoryArtifactCoverage> {
     let graph_tree = graph.resolved_tree();
     let repository_tree_in_sync = graph_tree == *authority_tree;
@@ -149,12 +181,14 @@ fn collect_repository_artifact_coverage_for_tree(
     for artifact in graph.list_structured_artifacts()? {
         let facet = facets.entry(artifact.file_id.0).or_default();
         facet.count += 1;
-        facet.content_hashes.push(artifact.content_hash);
+        facet
+            .structured
+            .push((artifact.kind, artifact.content_hash));
     }
     for artifact in graph.list_opaque_artifacts()? {
         let facet = facets.entry(artifact.file_id.0).or_default();
         facet.count += 1;
-        facet.content_hashes.push(artifact.content_hash);
+        facet.opaque_hashes.push(artifact.content_hash);
     }
 
     let mut enrichable_artifact_count = 0usize;
@@ -180,11 +214,19 @@ fn collect_repository_artifact_coverage_for_tree(
                 if facet.count != 1 {
                     conflicting_enrichment_paths.insert(path.to_string());
                 }
-                if facet
-                    .content_hashes
+                let mut disagrees = facet
+                    .opaque_hashes
                     .iter()
-                    .any(|content_hash| *content_hash != hash)
-                {
+                    .any(|content_hash| *content_hash != hash);
+                if !disagrees && !facet.structured.is_empty() {
+                    // Read only for the few kinds that carry a normalized hash,
+                    // and only once per path however many facets it has.
+                    let body = read_body(hash)?;
+                    disagrees = facet.structured.iter().any(|(kind, stored)| {
+                        structured_facet_disagrees(*kind, *stored, path, hash, &body)
+                    });
+                }
+                if disagrees {
                     content_mismatch_paths.insert(path.to_string());
                 }
             }
@@ -495,6 +537,29 @@ fn build_graph_health_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve exactly the bodies a fixture stages, and refuse anything else.
+    ///
+    /// A coverage pass reads a body only to re-derive a structured facet's
+    /// normalization, so an unexpected read fails the test rather than being
+    /// answered with something invented.
+    fn staged_bodies(bodies: [(Hash256, &'static [u8]); 1]) -> impl Fn(Hash256) -> Result<Vec<u8>> {
+        let bodies: BTreeMap<Hash256, Vec<u8>> = bodies
+            .into_iter()
+            .map(|(hash, body)| (hash, body.to_vec()))
+            .collect();
+        move |hash| {
+            bodies
+                .get(&hash)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("fixture stages no body for {hash}"))
+        }
+    }
+
+    /// No body is available, so any read at all fails the test.
+    fn no_bodies() -> impl Fn(Hash256) -> Result<Vec<u8>> {
+        |hash| Err(anyhow::anyhow!("fixture stages no body for {hash}"))
+    }
     use std::collections::HashMap;
 
     fn complete_coverage() -> RepositoryArtifactCoverage {
@@ -826,10 +891,15 @@ mod tests {
     fn arbitrary_repository_members_are_covered_without_relationships() {
         use kin_model::{
             ArtifactId, ArtifactKind, FilePathId, LocatedEntry, OpaqueArtifact, ResolvedArtifact,
-            StructuredArtifact, TransactionDelta, TreeDelta,
+            TransactionDelta, TreeDelta,
         };
 
-        let compose_hash = Hash256::from_bytes([0x11; 32]);
+        // A real body, because the facet under test is derived from one. A
+        // fabricated hash could only be checked against a fabricated facet, and
+        // that pairing is what let an impossible expectation stand.
+        let compose_body: &[u8] =
+            b"# operational compose\nservices:\n  app:\n    image: kin:test\n";
+        let compose_hash = kin_blobs::digest(compose_body);
         let unknown_hash = Hash256::from_bytes([0x22; 32]);
         let symlink_target_hash = Hash256::from_bytes([0x33; 32]);
         let compose_id = ArtifactId::new();
@@ -882,14 +952,18 @@ mod tests {
                 external_reference_deltas: Vec::new(),
             })
             .unwrap();
-        graph
-            .upsert_structured_artifact(&StructuredArtifact {
-                file_id: FilePathId::new("compose.yaml"),
-                kind: ArtifactKind::ComposeFile,
-                content_hash: compose_hash,
-                text_preview: Some("services:".to_string()),
-            })
-            .unwrap();
+        // Exactly the facet the extractor writes for these bytes, hash and all.
+        let compose_facet = kin_index::extract_artifact(
+            ArtifactKind::ComposeFile,
+            compose_body,
+            &FilePathId::new("compose.yaml"),
+        )
+        .unwrap();
+        assert_ne!(
+            compose_facet.content_hash, compose_hash,
+            "the fixture only proves anything while normalization actually moves the hash"
+        );
+        graph.upsert_structured_artifact(&compose_facet).unwrap();
         graph
             .upsert_opaque_artifact(&OpaqueArtifact {
                 file_id: FilePathId::new("assets/unknown.custom"),
@@ -899,7 +973,12 @@ mod tests {
             })
             .unwrap();
 
-        let coverage = collect_repository_artifact_coverage_for_tree(&tree, &graph).unwrap();
+        let coverage = collect_repository_artifact_coverage_for_tree(
+            &tree,
+            &graph,
+            &staged_bodies([(compose_hash, compose_body)]),
+        )
+        .unwrap();
 
         assert!(coverage.complete);
         assert!(coverage.repository_tree_in_sync);
@@ -973,7 +1052,8 @@ mod tests {
             })
             .unwrap();
 
-        let coverage = collect_repository_artifact_coverage_for_tree(&tree, &graph).unwrap();
+        let coverage =
+            collect_repository_artifact_coverage_for_tree(&tree, &graph, &no_bodies()).unwrap();
 
         assert!(!coverage.complete);
         assert_eq!(coverage.conflicting_enrichment_path_count, 1);
@@ -1051,9 +1131,124 @@ mod tests {
         )])
         .unwrap();
         let coverage =
-            collect_repository_artifact_coverage_for_tree(&authority_tree, &graph).unwrap();
+            collect_repository_artifact_coverage_for_tree(&authority_tree, &graph, &no_bodies())
+                .unwrap();
         assert_eq!(coverage.missing_enrichment_path_count, 1);
         assert_eq!(coverage.content_mismatch_path_count, 0);
         assert_eq!(coverage.stale_enrichment_path_count, 0);
+    }
+
+    /// Build the tree and graph for one structured file, with the facet the
+    /// caller supplies rather than the one the extractor would write.
+    fn workflow_coverage(body: &'static [u8], facet_hash: Hash256) -> RepositoryArtifactCoverage {
+        use kin_model::{
+            ArtifactId, LocatedEntry, ResolvedArtifact, StructuredArtifact, TransactionDelta,
+            TreeDelta,
+        };
+
+        let path = RepoPath::from_utf8(".github/workflows/ci.yml").unwrap();
+        let artifact_id = ArtifactId::new();
+        let hash = kin_blobs::digest(body);
+        let tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            artifact_id,
+            path.clone(),
+            TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(path, TreeEntry::blob(hash, false)),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        graph
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: FilePathId::new(".github/workflows/ci.yml"),
+                kind: ArtifactKind::CiConfig,
+                content_hash: facet_hash,
+                text_preview: None,
+            })
+            .unwrap();
+        collect_repository_artifact_coverage_for_tree(&tree, &graph, &staged_bodies([(hash, body)]))
+            .unwrap()
+    }
+
+    /// An admitted workflow file whose facet is exactly what its extractor
+    /// wrote is healthy.
+    ///
+    /// The extractors normalize on purpose, so that formatting-only edits do not
+    /// move the dependency graph, and a CI config's stored hash is the hash of
+    /// that normalized text. Comparing it to blob identity asserted an equality
+    /// the facet never claimed, and every real workflow file failed it: a single
+    /// trailing newline is enough to separate the two hashes.
+    #[test]
+    fn a_workflow_facet_written_by_its_own_extractor_agrees_with_the_tree() {
+        let body: &[u8] = b"# a comment normalization drops\nname: CI\non:\n  push:\n";
+        let facet = kin_index::extract_artifact(
+            ArtifactKind::CiConfig,
+            body,
+            &FilePathId::new(".github/workflows/ci.yml"),
+        )
+        .unwrap();
+        assert_ne!(
+            facet.content_hash,
+            kin_blobs::digest(body),
+            "the fixture only proves anything while normalization actually moves the hash"
+        );
+
+        let coverage = workflow_coverage(body, facet.content_hash);
+        assert_eq!(coverage.content_mismatch_path_count, 0);
+        assert!(coverage.complete);
+    }
+
+    /// The control. A facet left behind by an edit describes bytes the tree no
+    /// longer names, and that still has to be loud: the check keeps its whole
+    /// point, which is catching enrichment that has fallen behind authority.
+    #[test]
+    fn a_workflow_facet_left_behind_by_an_edit_still_disagrees() {
+        let stale = kin_index::extract_artifact(
+            ArtifactKind::CiConfig,
+            b"name: CI\non:\n  pull_request:\n",
+            &FilePathId::new(".github/workflows/ci.yml"),
+        )
+        .unwrap();
+
+        let coverage = workflow_coverage(
+            b"# a comment normalization drops\nname: CI\non:\n  push:\n",
+            stale.content_hash,
+        );
+        assert_eq!(coverage.content_mismatch_path_count, 1);
+        assert!(!coverage.complete);
+        assert_eq!(
+            coverage.issue_paths_sample,
+            vec![".github/workflows/ci.yml".to_string()]
+        );
+    }
+
+    /// Formatting-only edits are what the normalization exists to absorb, so a
+    /// facet stays valid across one. This is the behavior that makes the exact
+    /// comparison wrong rather than merely strict.
+    #[test]
+    fn a_workflow_facet_survives_a_formatting_only_edit() {
+        let facet = kin_index::extract_artifact(
+            ArtifactKind::CiConfig,
+            b"name: CI\non:\n  push:\n",
+            &FilePathId::new(".github/workflows/ci.yml"),
+        )
+        .unwrap();
+
+        let coverage = workflow_coverage(
+            b"# added a comment\n\nname: CI   \non:\n  push:\n",
+            facet.content_hash,
+        );
+        assert_eq!(
+            coverage.content_mismatch_path_count, 0,
+            "a comment, a blank line, and trailing spaces are exactly what the extractor absorbs"
+        );
+        assert!(coverage.complete);
     }
 }
