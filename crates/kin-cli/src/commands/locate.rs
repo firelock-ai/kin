@@ -281,11 +281,12 @@ pub enum LocateMatchKind {
 /// This states it up front. It never affects ranking or ordering, and it is a
 /// fact about the hit rather than about the query, which is the distinction
 /// [`LocateMatchKind`] draws on the other axis.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocateIdSpace {
     /// The hit's `entity_id` names a live entity in the graph. Every
     /// id-consuming graph tool resolves it.
+    #[default]
     Entity,
     /// The hit names an artifact-level embedding: a tracked file with no parsed
     /// entities. It carries `artifact_path` and deliberately carries no
@@ -301,6 +302,12 @@ impl LocateIdSpace {
             Self::Entity => "entity",
             Self::Artifact => "artifact",
         }
+    }
+
+    /// `serde` skip predicate: the entity space is the default, so an entity hit
+    /// serializes byte-identically to what it did before artifacts could rank.
+    fn is_entity(&self) -> bool {
+        matches!(self, Self::Entity)
     }
 }
 
@@ -351,7 +358,23 @@ fn classify_locate_match(query: &str, name: &str, origin: &str) -> LocateMatchKi
 pub struct LocateEntity {
     /// Stable graph entity id. The handle for every follow-up graph query
     /// (`get_entity_source`, `get_context_pack`, `find_references`, `declare`).
+    ///
+    /// Empty, and omitted from the wire, on an artifact hit: a tracked file with
+    /// no parsed entities has no entity id to carry, and a field named one
+    /// holding anything else is exactly how a dead handle reaches an agent. See
+    /// [`LocateEntity::id_space`], which states which case this is without the
+    /// caller having to probe.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub entity_id: String,
+    /// Which id space this hit's identifier belongs to. Defaults to
+    /// [`LocateIdSpace::Entity`] and is omitted when it is, so every hit that
+    /// could rank before this field existed serializes unchanged.
+    #[serde(default, skip_serializing_if = "LocateIdSpace::is_entity")]
+    pub id_space: LocateIdSpace,
+    /// Repo-relative path of the ranked artifact. Present only on an artifact
+    /// hit, where it is the handle `kin_artifact_read` takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
     /// Entity kind (function, method, class, …), lowercased.
     pub kind: String,
     /// Entity name (the symbol identifier).
@@ -388,6 +411,23 @@ pub struct LocateEntity {
     /// Empty (and omitted) for a single-query locate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_queries: Vec<String>,
+}
+
+impl LocateEntity {
+    /// The stable string this hit dedupes on.
+    ///
+    /// An artifact hit has no entity id to collapse on, so it falls back to its
+    /// path. Every de-duplication over ranked hits has to ask for this rather
+    /// than read `entity_id` directly: keyed on the raw field, every artifact in
+    /// a ranking shares the empty string and all but the first are silently
+    /// dropped, which looks exactly like artifacts still not being candidates.
+    pub fn identity_key(&self) -> &str {
+        if self.entity_id.is_empty() {
+            self.artifact_path.as_deref().unwrap_or(&self.name)
+        } else {
+            &self.entity_id
+        }
+    }
 }
 
 /// Provenance for a [`LocateEntity`]: the file (and resolution origin) the entity
@@ -2755,6 +2795,20 @@ fn run_with_graph_capture_budgeted(
 
     let mut retained_priority_paths =
         retained_priority_paths(&priority_traces, text_lower.contains("test"));
+    // Retention asks whether a path is signal-bearing SOURCE, which no tracked
+    // artifact can be, so an artifact the query's own text matched would be
+    // pruned by the cap the moment anything admitted it. On a docs-and-config
+    // repo that is the answer being thrown away. Retain the ones a text search
+    // actually hit, from the same list the admission stage draws from and under
+    // the same bound, so the pool and the retention set cannot disagree about
+    // which artifacts this query found.
+    let artifact_candidates = text_matched_artifact_candidates(graph, &priority_traces);
+    retained_priority_paths.extend(
+        artifact_candidates
+            .iter()
+            .take(artifact_admit_limit())
+            .map(|(path, _)| path.clone()),
+    );
     let priority_relation_paths =
         priority_relation_retention_paths(graph, &retained_priority_paths)?;
     retained_priority_paths.extend(priority_relation_paths);
@@ -3700,6 +3754,22 @@ fn run_with_graph_capture_budgeted(
         }
     }
 
+    // FIR-2183. Runs on every profile and outside the floor's lever, because the
+    // floor is a re-ranking choice for code files while this is the only door a
+    // tracked artifact has at all. It runs after the floor so that when both can
+    // admit the same path the floor's placement wins and nothing is admitted
+    // twice.
+    admit_text_matched_artifacts(&mut fused, &artifact_candidates, &mut degradations);
+    record_artifact_absence(graph, &fused, &artifact_candidates, &mut degradations);
+    if explain {
+        record_debug_stage(
+            &mut score_breakdown,
+            &mut debug_info,
+            &fused,
+            "after_artifact_admit",
+        );
+    }
+
     if explain {
         record_full_debug_stage(&mut debug_info, &fused, "pre_cap_full");
     }
@@ -4377,6 +4447,167 @@ fn query_priority_retention_paths(
         .take(limit)
         .map(|(path, _)| path)
         .collect()
+}
+
+/// Tracked artifacts the query's own text matched, strongest first.
+///
+/// Drawn only from priority traces that already carry a text-search reason, so
+/// this can never name a file the query did not hit, and intersected with the
+/// tracked-artifact set so it can only ever name a file the graph holds no
+/// entities for. Deliberately unbounded: admission and cap retention both read
+/// it and apply the same bound, and the count of what the bound cut is what the
+/// short page is attributed with.
+fn text_matched_artifact_candidates(
+    graph: &kin_db::InMemoryGraph,
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+) -> Vec<(String, f32)> {
+    let text_matched: Vec<(String, f32)> = ranked_priority_traces(priority_traces, 0.0)
+        .into_iter()
+        .filter(|(path, trace)| {
+            !is_test_path(path)
+                && !is_license_or_notice_path(path)
+                && trace.reasons.iter().any(|reason| {
+                    matches!(
+                        reason.kind.as_str(),
+                        "tracked_text_search" | "tracked_text_term"
+                    )
+                })
+        })
+        .map(|(path, trace)| (path, trace.score))
+        .collect();
+    if text_matched.is_empty() {
+        return Vec::new();
+    }
+    let artifacts = tracked_artifact_paths(graph);
+    text_matched
+        .into_iter()
+        .filter(|(path, _)| artifacts.contains(path))
+        .collect()
+}
+
+/// How many text-matched artifacts may enter one ranking.
+///
+/// One bound, read by admission and by cap retention alike, so a candidate can
+/// never be admitted into the pool and then dropped by a retention set that
+/// counted differently.
+fn artifact_admit_limit() -> usize {
+    locate_env_usize("KIN_LOCATE_ARTIFACT_ADMIT_LIMIT", 3)
+}
+
+/// Admit text-matched tracked artifacts into the ranked pool.
+///
+/// A tracked artifact has no entities, so no signal in the fusion can produce
+/// it and `priority_reason_allows_injection` does not list the two reason kinds
+/// a text match records. `priority_reason_allows_retention` does list them,
+/// which for this file class is unreachable by construction: retention protects
+/// a candidate the pool already holds, and nothing else can put one there. This
+/// is the door that makes that retention mean something.
+///
+/// It runs after every penalty and demotion, which is what keeps it additive.
+/// The same admission at the priority stage would arrive in front of
+/// `KIN_LOCATE_DOCS_PATH_PENALTY`, a blanket hundredth that every code ranking
+/// depends on, and buying an artifact past it would mean relaxing it for
+/// everything. Here nothing already ranked is rescored: the stage only appends.
+///
+/// A candidate's score is its own text-match strength as a share of the ranking
+/// it is joining, so an artifact cannot displace the strongest entity-backed
+/// answer on a code repo. A ranking holding nothing scales every share to zero
+/// and a zero-scored file is dropped downstream as signal-less, so an empty
+/// ranking takes the strength directly: on a store whose only match IS the
+/// artifact, that artifact is the whole answer.
+fn admit_text_matched_artifacts(
+    fused: &mut Vec<(String, f32)>,
+    candidates: &[(String, f32)],
+    degradations: &mut Vec<RetrievalDegradation>,
+) {
+    let limit = artifact_admit_limit();
+    let present: HashSet<&str> = fused.iter().map(|(path, _)| path.as_str()).collect();
+    let admittable: Vec<&(String, f32)> = candidates
+        .iter()
+        .filter(|(path, _)| !present.contains(path.as_str()))
+        .collect();
+    if admittable.is_empty() || limit == 0 {
+        return;
+    }
+
+    // The score one rank-0 text hit earns in the priority space. Dividing by it
+    // turns a priority score into "how strongly the query's own text hit this
+    // file", which is the only quantity comparable across the two spaces.
+    let full_strength = locate_env_f32("KIN_LOCATE_ARTIFACT_FULL_PRIORITY", 72.0).max(1.0);
+    let share = locate_env_f32("KIN_LOCATE_ARTIFACT_ADMIT_SHARE", 0.5);
+    let top = fused
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0_f32, f32::max);
+
+    for (path, priority) in admittable.iter().take(limit) {
+        let strength = (priority / full_strength).clamp(0.0, 1.0);
+        let score = if top > 0.0 {
+            top * share * strength
+        } else {
+            strength
+        };
+        fused.push(((*path).clone(), score));
+    }
+
+    if admittable.len() > limit {
+        record_degradation(
+            degradations,
+            RetrievalDegradation {
+                component: "artifact_candidates".to_string(),
+                reason: "over_admit_limit".to_string(),
+                detail: format!(
+                    "{} tracked artifacts matched this query's text; {} were admitted to the \
+                     ranking",
+                    admittable.len(),
+                    limit
+                ),
+                remediation: "raise KIN_LOCATE_ARTIFACT_ADMIT_LIMIT, or read a specific file with \
+                              kin_artifact_read"
+                    .to_string(),
+            },
+        );
+    }
+
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+/// Say so when a store holds tracked artifacts and the query's text hit none of
+/// them, leaving nothing ranked.
+///
+/// An empty page is an honest answer and stays one. What it cannot do on its own
+/// is tell an agent whether this repository has no documents or whether its
+/// documents do not say that, and those are different facts to act on.
+fn record_artifact_absence(
+    graph: &kin_db::InMemoryGraph,
+    fused: &[(String, f32)],
+    candidates: &[(String, f32)],
+    degradations: &mut Vec<RetrievalDegradation>,
+) {
+    if !fused.is_empty() || !candidates.is_empty() {
+        return;
+    }
+    let tracked = tracked_artifact_paths(graph).len();
+    if tracked == 0 {
+        return;
+    }
+    record_degradation(
+        degradations,
+        RetrievalDegradation {
+            component: "artifact_candidates".to_string(),
+            reason: "no_text_match".to_string(),
+            detail: format!(
+                "{tracked} tracked artifacts were searched and none of them carries this query's \
+                 text"
+            ),
+            remediation: "list them with kin_artifact_list, or read one with kin_artifact_read"
+                .to_string(),
+        },
+    );
 }
 
 fn retained_priority_paths(
@@ -5699,6 +5930,15 @@ fn lexical_parity_matches(
     matches
 }
 
+/// Tracked files the graph holds no entities for: the artifact set whose only
+/// retrievable signal is its own text.
+fn tracked_artifact_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
+    tracked_non_entity_files(graph)
+        .into_iter()
+        .map(|tracked| tracked.path)
+        .collect()
+}
+
 fn apply_lexical_parity_floor(
     fused: &mut Vec<(String, f32)>,
     graph: &kin_db::InMemoryGraph,
@@ -5748,6 +5988,12 @@ fn apply_lexical_parity_floor(
 
     let mut admitted: Vec<(String, f32)> = Vec::new();
     for (path, record) in &matches {
+        // The floor anchors on a term matching an entity NAME, which a tracked
+        // artifact can never satisfy, and this is deliberately still where that
+        // ends. Admitting artifacts here too would give one file class two doors
+        // with two different scores on one profile and none on the other;
+        // `admit_text_matched_artifacts` is the single door instead, and it runs
+        // whatever the profile.
         if record.name_terms.is_empty() {
             continue;
         }
@@ -15868,6 +16114,45 @@ fn bounded_entity_body_with_note(
 /// authority and committed state already derived; deriving them again per
 /// definition symbol is the FIR-1897 shape, and it reaches every locate entry
 /// point because they all funnel through [`run_with_graph_capture_budgeted`].
+/// Project one ranked artifact file into a [`LocateEntity`] row.
+///
+/// The row deliberately carries no `entity_id`: there is no entity behind it,
+/// and `id_space` plus `artifact_path` say so up front rather than letting a
+/// caller discover it by handing the id to a tool that refuses it. `name` is the
+/// basename, which is what a query naming the file would have named, so the
+/// match classification this row reports is decided by the same rule every
+/// entity row uses.
+fn artifact_locate_entity(file: &LocateFileEntry, query: &str) -> LocateEntity {
+    let name = std::path::Path::new(&file.path)
+        .file_name()
+        .and_then(|component| component.to_str())
+        .unwrap_or(&file.path)
+        .to_string();
+    let match_kind = Some(classify_locate_match(query, &name, "text"));
+    LocateEntity {
+        entity_id: String::new(),
+        id_space: LocateIdSpace::Artifact,
+        artifact_path: Some(file.path.clone()),
+        kind: "artifact".to_string(),
+        name,
+        signature: String::new(),
+        score: file.score,
+        // Definitions rank ahead of references, and an artifact is neither: it
+        // is a tracked file, so it sorts with the references rather than
+        // displacing a real declaration the query may actually have wanted.
+        definition: false,
+        span: None,
+        body: None,
+        match_kind,
+        provenance: LocateProvenance {
+            file: Some(file.path.clone()),
+            origin: "text".to_string(),
+            cosine: None,
+        },
+        matched_queries: Vec::new(),
+    }
+}
+
 pub fn build_entity_view(
     result: &mut LocateResult,
     held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
@@ -15882,16 +16167,39 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Built once on the first ranked file that resolves to no entity, because
+    // it walks every tracked artifact and most rankings never need it.
+    let mut tracked_artifacts: Option<HashSet<String>> = None;
     for (file_rank, file) in result.files.iter().enumerate() {
-        if file.symbols.is_empty() {
-            continue;
-        }
         let filter = EntityFilter {
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
         };
-        let entities = graph.query_entities(&filter)?;
+        let entities = if file.symbols.is_empty() {
+            Vec::new()
+        } else {
+            graph.query_entities(&filter)?
+        };
+        // A ranked file the graph holds no entities for is not a dead end: on a
+        // docs-and-config repo it is the answer. The projection used to skip it
+        // for want of a symbol to resolve, so an artifact could rank into
+        // `files` on its own text and still be unrepresentable on the surface an
+        // agent reads, which is why a store proven by `kin_artifact_read` to
+        // hold a phrase answered queries for that phrase with function names.
         if entities.is_empty() {
+            let tracked = tracked_artifacts.get_or_insert_with(|| {
+                tracked_non_entity_files(graph)
+                    .into_iter()
+                    .map(|tracked| tracked.path)
+                    .collect()
+            });
+            if !tracked.contains(&file.path) {
+                continue;
+            }
+            if !seen.insert(file.path.clone()) {
+                continue;
+            }
+            ranked.push((file_rank, artifact_locate_entity(file, query)));
             continue;
         }
         for sym in &file.symbols {
@@ -15928,6 +16236,8 @@ pub fn build_entity_view(
                 file_rank,
                 LocateEntity {
                     entity_id,
+                    id_space: LocateIdSpace::Entity,
+                    artifact_path: None,
                     kind: format!("{:?}", entity.kind).to_lowercase(),
                     name: entity.name.clone(),
                     signature: entity.signature.clone(),
@@ -15959,7 +16269,7 @@ pub fn build_entity_view(
             })
             .then_with(|| a_rank.cmp(b_rank))
             .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.entity_id.cmp(&b.entity_id))
+            .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
@@ -16168,12 +16478,12 @@ pub fn fuse_locate_results(
     let entity_lists: Vec<Vec<LocateEntity>> = results.iter().map(|r| r.entities.clone()).collect();
     let file_lists: Vec<Vec<LocateFileEntry>> = results.iter().map(|r| r.files.clone()).collect();
 
-    let mut fused_entities = rrf_fuse(&entity_lists, |e| e.entity_id.clone(), rrf_k);
+    let mut fused_entities = rrf_fuse(&entity_lists, |e| e.identity_key().to_string(), rrf_k);
     fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
         sb.partial_cmp(sa)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
-            .then_with(|| a.entity_id.cmp(&b.entity_id))
+            .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
     let entities: Vec<LocateEntity> = fused_entities
         .into_iter()
@@ -16738,6 +17048,403 @@ mod tests {
         }
     }
 
+    /// The dogfood store's shape: a docs artifact carrying the phrase, and a
+    /// code entity whose NAME shares a word with it. That entity is what the
+    /// ranking answered with while the artifact holding the actual sentence was
+    /// unrepresentable, so the fixture keeps the competitor rather than testing
+    /// against an empty field.
+    fn artifact_shaped_graph() -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("fail", "bin/extract_workflow_steps.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+        admit_test_source(
+            &graph,
+            "bin/extract_workflow_steps.py",
+            "def fail(message):\n    raise SystemExit(message)\n",
+        );
+        admit_test_source(
+            &graph,
+            "AGENTS.md",
+            "# Verification Rule\n\nChecks That Cannot Fail\n\nFourteen traps have already \
+             produced confident wrong answers in this workspace.\n",
+        );
+        // Text-index upserts are buffered; without the commit `text_search`
+        // answers every term with zero hits and the fixture would prove nothing
+        // about ranking.
+        graph.flush_text_index().unwrap();
+        graph
+    }
+
+    /// Run the fused pipeline exactly as the default serving profile does.
+    ///
+    /// Nothing is pinned on purpose. The parked attempt at this pinned
+    /// `KIN_LOCATE_LEXICAL_FLOOR_READMIT=1`, which is the accuracy profile's
+    /// default and not the shipped one, so its evidence read greener than the
+    /// product could ever be: the stage it was asserting does not run for a real
+    /// caller. A test for this ticket has to be able to fail the way the dogfood
+    /// session failed.
+    fn agent_locate(graph: &kin_db::InMemoryGraph, query: &str) -> LocateResult {
+        run_with_graph_capture_budgeted(
+            graph,
+            None,
+            query,
+            false,
+            10,
+            true,
+            Vec::new(),
+            None,
+            SnippetOptions::enabled(None),
+            None,
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            LocateBudget::unbounded(),
+        )
+        .unwrap()
+    }
+
+    fn artifact_row<'a>(result: &'a LocateResult, path: &str) -> Option<&'a LocateEntity> {
+        result
+            .entities
+            .iter()
+            .find(|entity| entity.artifact_path.as_deref() == Some(path))
+    }
+
+    fn degradation<'a>(result: &'a LocateResult, reason: &str) -> Option<&'a RetrievalDegradation> {
+        result
+            .degradations
+            .iter()
+            .find(|event| event.component == "artifact_candidates" && event.reason == reason)
+    }
+
+    /// FIR-2183, the ticket's own battery: a store whose answer lives in an
+    /// artifact must be able to say so on the surface an agent reads. This is the
+    /// dogfood session's exact failure, where a store proven by
+    /// `kin_artifact_read` to hold a phrase answered queries for that phrase with
+    /// Python function names.
+    #[test]
+    #[serial_test::serial]
+    fn a_ranked_artifact_reaches_the_graph_native_entity_surface() {
+        let graph = artifact_shaped_graph();
+        let result = agent_locate(&graph, "Checks That Cannot Fail");
+
+        let artifact = result
+            .entities
+            .iter()
+            .find(|entity| entity.artifact_path.as_deref() == Some("AGENTS.md"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the artifact holding the phrase must be a candidate; got {:?} from files {:?}",
+                    result
+                        .entities
+                        .iter()
+                        .map(|entity| (entity.name.as_str(), entity.id_space))
+                        .collect::<Vec<_>>(),
+                    result
+                        .files
+                        .iter()
+                        .map(|file| file.path.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            });
+        assert_eq!(artifact.id_space, LocateIdSpace::Artifact);
+        assert_eq!(artifact.kind, "artifact");
+        // No entity id, because there is no entity: a field named one holding
+        // anything else is how a dead handle reaches an agent.
+        assert!(artifact.entity_id.is_empty());
+        assert_eq!(artifact.name, "AGENTS.md");
+    }
+
+    /// The control that keeps the change additive: an ordinary code query still
+    /// answers with entities, each carrying a real id and the entity id space.
+    #[test]
+    #[serial_test::serial]
+    fn entity_hits_are_unchanged_when_artifacts_can_also_rank() {
+        let graph = artifact_shaped_graph();
+        let result = agent_locate(&graph, "fail");
+
+        let entity = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "fail")
+            .expect("a code query must still answer with its entity");
+        assert_eq!(entity.id_space, LocateIdSpace::Entity);
+        assert!(!entity.entity_id.is_empty());
+        assert!(entity.artifact_path.is_none());
+    }
+
+    /// An artifact row serializes as the identity contract states: no
+    /// `entity_id` key at all, an `artifact_path`, and an explicit `id_space`.
+    /// Asserted on the JSON rather than the struct, because the omission is a
+    /// serde attribute and the struct cannot show whether it took effect.
+    #[test]
+    fn artifact_rows_omit_entity_id_on_the_wire() {
+        let file = LocateFileEntry {
+            path: "docs/guide.md".to_string(),
+            score: 12.5,
+            signals: Vec::new(),
+            spans: Vec::new(),
+            symbols: Vec::new(),
+            provenance: None,
+            explain: Vec::new(),
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let row = serde_json::to_value(artifact_locate_entity(&file, "guide")).unwrap();
+        assert!(row.get("entity_id").is_none(), "serialized row: {row}");
+        assert_eq!(row["id_space"], serde_json::json!("artifact"));
+        assert_eq!(row["artifact_path"], serde_json::json!("docs/guide.md"));
+
+        // The entity space is the default and stays off the wire, so every hit
+        // that could rank before this field existed serializes unchanged.
+        let mut entity = artifact_locate_entity(&file, "guide");
+        entity.entity_id = "e1".to_string();
+        entity.id_space = LocateIdSpace::Entity;
+        entity.artifact_path = None;
+        let row = serde_json::to_value(&entity).unwrap();
+        assert_eq!(row["entity_id"], serde_json::json!("e1"));
+        assert!(row.get("id_space").is_none());
+        assert!(row.get("artifact_path").is_none());
+    }
+
+    /// Two artifacts in one ranking must both survive. Keyed on the raw
+    /// `entity_id`, they share the empty string and all but the first are
+    /// dropped, which looks exactly like artifacts still not being candidates.
+    #[test]
+    fn artifact_rows_dedupe_on_their_path_not_their_empty_id() {
+        let row = |path: &str| {
+            let file = LocateFileEntry {
+                path: path.to_string(),
+                score: 1.0,
+                signals: Vec::new(),
+                spans: Vec::new(),
+                symbols: Vec::new(),
+                provenance: None,
+                explain: Vec::new(),
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            };
+            artifact_locate_entity(&file, "guide")
+        };
+        let first = row("docs/one.md");
+        let second = row("docs/two.md");
+        assert_ne!(first.identity_key(), second.identity_key());
+        assert_eq!(first.identity_key(), "docs/one.md");
+    }
+
+    /// A multi-query fan-out fuses its variants by a per-row key. Keyed on the
+    /// raw `entity_id`, every artifact in the ranking shares the empty string, so
+    /// RRF collapses them all into one row and the rest vanish, which on the wire
+    /// is indistinguishable from artifacts still being excluded. This is where
+    /// that collapse actually happens, so this is where it is asserted.
+    #[test]
+    fn fusion_keeps_every_artifact_rather_than_collapsing_their_empty_ids() {
+        let artifact = |path: &str| {
+            let file = LocateFileEntry {
+                path: path.to_string(),
+                score: 1.0,
+                signals: Vec::new(),
+                spans: Vec::new(),
+                symbols: Vec::new(),
+                provenance: None,
+                explain: Vec::new(),
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            };
+            artifact_locate_entity(&file, "doctrine")
+        };
+        let page = |entities: Vec<LocateEntity>| LocateResult {
+            entities,
+            ..Default::default()
+        };
+        let fused = fuse_locate_results(
+            vec!["doctrine".to_string(), "doctrine traps".to_string()],
+            vec![
+                page(vec![artifact("AGENTS.md"), artifact("docs/traps.md")]),
+                page(vec![artifact("docs/traps.md")]),
+            ],
+            locate_rrf_k(),
+        );
+        let paths: Vec<&str> = fused
+            .entities
+            .iter()
+            .filter_map(|entity| entity.artifact_path.as_deref())
+            .collect();
+        assert_eq!(paths.len(), 2, "fused rows: {paths:?}");
+        assert!(paths.contains(&"AGENTS.md"));
+        assert!(paths.contains(&"docs/traps.md"));
+    }
+
+    /// Two matching artifacts in one ranking both reach the page, end to end.
+    #[test]
+    #[serial_test::serial]
+    fn two_matching_artifacts_both_reach_the_page() {
+        let graph = kin_db::InMemoryGraph::new();
+        admit_test_source(
+            &graph,
+            "AGENTS.md",
+            "Checks That Cannot Fail is doctrine.\n",
+        );
+        admit_test_source(
+            &graph,
+            "docs/traps.md",
+            "More on Checks That Cannot Fail.\n",
+        );
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "Checks That Cannot Fail");
+        assert!(
+            artifact_row(&result, "AGENTS.md").is_some(),
+            "entities: {:?}",
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(artifact_row(&result, "docs/traps.md").is_some());
+    }
+
+    /// The F15 shape, and the reason this ticket names the admit disclosure:
+    /// `kin admit` promises the files it admits become queryable, and files with
+    /// no entities and no embeddings answered nothing at all. They are their own
+    /// text and nothing else, which is exactly the evidence this door opens on.
+    #[test]
+    #[serial_test::serial]
+    fn admitted_entity_free_files_answer_for_their_own_text() {
+        let graph = kin_db::InMemoryGraph::new();
+        admit_test_source(
+            &graph,
+            "dogfood-note-1.md",
+            "A dogfood note about admission.\n",
+        );
+        admit_test_source(&graph, "dogfood-sub/nested.md", "Nested dogfood note.\n");
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "dogfood note");
+        assert!(
+            !result.entities.is_empty(),
+            "an admitted file must answer for its own text; files: {:?}",
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(result
+            .entities
+            .iter()
+            .all(|entity| entity.id_space == LocateIdSpace::Artifact));
+    }
+
+    /// The bound holds, and a short page says it was short. A page cut to its
+    /// limit with nothing said reads as the store having only that much.
+    #[test]
+    #[serial_test::serial]
+    fn the_artifact_admit_bound_holds_and_is_disclosed() {
+        let _limit = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_ARTIFACT_ADMIT_LIMIT", "2");
+        let graph = kin_db::InMemoryGraph::new();
+        for index in 0..5 {
+            admit_test_source(
+                &graph,
+                &format!("docs/trap-{index}.md"),
+                "Checks That Cannot Fail, recorded here.\n",
+            );
+        }
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "Checks That Cannot Fail");
+        let artifacts = result
+            .entities
+            .iter()
+            .filter(|entity| entity.id_space == LocateIdSpace::Artifact)
+            .count();
+        assert_eq!(artifacts, 2, "entities: {:?}", result.entities.len());
+        let event = degradation(&result, "over_admit_limit")
+            .expect("a bounded page must say what the bound cut");
+        assert!(event.detail.contains('5'), "detail: {}", event.detail);
+        assert!(!event.remediation.is_empty());
+    }
+
+    /// An empty page over a store that HOLDS documents is an honest negative and
+    /// stays one, but it must be able to say which honest negative it is: no
+    /// documents here, or documents that do not say that.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_page_over_an_artifact_store_says_the_artifacts_were_searched() {
+        let graph = kin_db::InMemoryGraph::new();
+        admit_test_source(
+            &graph,
+            "AGENTS.md",
+            "Checks That Cannot Fail is doctrine.\n",
+        );
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "photosynthesis chloroplast thylakoid");
+        assert!(result.entities.is_empty());
+        let event = degradation(&result, "no_text_match")
+            .expect("an empty page over an artifact store must qualify itself");
+        assert!(event.detail.contains('1'), "detail: {}", event.detail);
+    }
+
+    /// Controls that must hold or the change is not additive: a store with no
+    /// artifacts is untouched, a query matching no artifact text admits none, and
+    /// neither control raises the artifact disclosure.
+    #[test]
+    #[serial_test::serial]
+    fn artifact_admission_leaves_unmatched_and_entity_only_rankings_alone() {
+        let graph = artifact_shaped_graph();
+        let unmatched = agent_locate(&graph, "photosynthesis chloroplast thylakoid");
+        assert!(unmatched
+            .entities
+            .iter()
+            .all(|entity| entity.id_space == LocateIdSpace::Entity));
+        assert!(degradation(&unmatched, "over_admit_limit").is_none());
+
+        let entity_only = kin_db::InMemoryGraph::new();
+        let entity = test_entity("fail", "src/lib.rs", 1, 5);
+        entity_only.upsert_entity(&entity).unwrap();
+        entity_only.flush_text_index().unwrap();
+        let result = agent_locate(&entity_only, "Checks That Cannot Fail");
+        assert!(result
+            .entities
+            .iter()
+            .all(|entity| entity.id_space == LocateIdSpace::Entity));
+        assert!(degradation(&result, "no_text_match").is_none());
+    }
+
+    /// Test fixtures and licence text are tracked artifacts too, and a query
+    /// term landing in one is never the answer. They are excluded where the
+    /// candidate list is built, so no later stage has to know about them.
+    #[test]
+    #[serial_test::serial]
+    fn test_and_licence_artifacts_are_never_admitted() {
+        let graph = kin_db::InMemoryGraph::new();
+        admit_test_source(
+            &graph,
+            "tests/fixtures/doctrine.md",
+            "Checks That Cannot Fail, in a fixture.\n",
+        );
+        admit_test_source(
+            &graph,
+            "LICENSE",
+            "Checks That Cannot Fail, in a licence.\n",
+        );
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "Checks That Cannot Fail");
+        assert!(
+            result.entities.is_empty(),
+            "admitted: {:?}",
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.artifact_path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn test_artifact_id(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
         let path = RepoPath::from_utf8(path).expect("valid test repository path");
         graph
@@ -16836,6 +17543,8 @@ mod tests {
     fn mk_locate_entity(name: &str, score: f32, definition: bool) -> LocateEntity {
         LocateEntity {
             entity_id: format!("id-{name}"),
+            id_space: LocateIdSpace::Entity,
+            artifact_path: None,
             kind: "function".to_string(),
             name: name.to_string(),
             signature: format!("fn {name}()"),
@@ -17051,6 +17760,8 @@ mod tests {
     fn fusion_entity(id: &str, path: &str, score: f32) -> LocateEntity {
         LocateEntity {
             entity_id: id.to_string(),
+            id_space: LocateIdSpace::Entity,
+            artifact_path: None,
             kind: "function".to_string(),
             name: id.to_string(),
             signature: String::new(),
