@@ -599,7 +599,11 @@ fn handle_response(
 
     match run_action(action) {
         Ok(binary) => {
-            println!("KinNotifier: running {} {}", binary.display(), action.command().join(" "));
+            println!(
+                "KinNotifier: running {} {}",
+                binary.display(),
+                action.command().join(" ")
+            );
             ExitCode::SUCCESS
         }
         Err(message) => {
@@ -638,10 +642,8 @@ pub fn run() -> ExitCode {
     // is the only window in which the system will hand over a pending
     // response; deciding later would mean deciding after the response was
     // already dropped.
-    let handling_response = args.title.is_none()
-        && args.body.is_none()
-        && !args.status
-        && !args.request_authorization;
+    let handling_response =
+        args.title.is_none() && args.body.is_none() && !args.status && !args.request_authorization;
     let response_identifier = Arc::new(Mutex::new(None));
     let response_done = Arc::new(AtomicBool::new(false));
     let delegate = handling_response.then(|| {

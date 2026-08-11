@@ -576,12 +576,7 @@ fn print_chain_plan(plan: &[ChainStep]) {
     }
     println!("kin update --apply would run {} step(s):", plan.len());
     for (index, step) in plan.iter().enumerate() {
-        println!(
-            "  {}. {} ({})",
-            index + 1,
-            step.describe(),
-            step.command()
-        );
+        println!("  {}. {} ({})", index + 1, step.describe(), step.command());
     }
     println!(
         "Steps after the install run from the newly installed binary, because the restart fence \
@@ -18563,21 +18558,21 @@ cwd = {:?}
         assert!(AutoDecision::Proceed.reason().is_none());
         for policy in [UpdatePolicy::Manual, UpdatePolicy::Prompt] {
             assert!(
-                decide_auto_update(policy, idle_machine()).reason().is_some(),
+                decide_auto_update(policy, idle_machine())
+                    .reason()
+                    .is_some(),
                 "{policy:?} must say why it did not install"
             );
         }
-        assert!(
-            decide_auto_update(
-                UpdatePolicy::Auto,
-                MachineActivity {
-                    readable: false,
-                    ..idle_machine()
-                }
-            )
-            .reason()
-            .is_some()
-        );
+        assert!(decide_auto_update(
+            UpdatePolicy::Auto,
+            MachineActivity {
+                readable: false,
+                ..idle_machine()
+            }
+        )
+        .reason()
+        .is_some());
     }
 
     #[test]
@@ -18617,7 +18612,10 @@ cwd = {:?}
         assert!(!ChainStep::Install.needs_installed_binary());
         assert!(ChainStep::AcknowledgeRestart.needs_installed_binary());
         assert!(ChainStep::RepairConfigs.needs_installed_binary());
-        assert_eq!(ChainStep::AcknowledgeRestart.command(), "kin update --ack-restart");
+        assert_eq!(
+            ChainStep::AcknowledgeRestart.command(),
+            "kin update --ack-restart"
+        );
         assert_eq!(ChainStep::RepairConfigs.command(), "kin setup doctor --fix");
     }
 
