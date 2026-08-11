@@ -1052,10 +1052,12 @@ fn plan_switch_carry(
         return Ok(None);
     }
     let base_tree = match base_change_id {
-        Some(change_id) => graph
-            .resolve_graph_at(change_id)
-            .context("resolve the exact graph this workspace is based on")?
-            .tree,
+        Some(change_id) => {
+            graph
+                .resolve_graph_at(change_id)
+                .context("resolve the exact graph this workspace is based on")?
+                .tree
+        }
         None => ResolvedTree::default(),
     };
     match kin_core::plan_workspace_carry(
@@ -1069,9 +1071,9 @@ fn plan_switch_carry(
     .context("plan pending workspace state against the branch being switched to")?
     {
         kin_core::WorkspaceCarry::Carried(plan) => Ok(Some(plan)),
-        kin_core::WorkspaceCarry::Refused(conflicts) => Err(pending_state_conflict(
-            workspace, name, &conflicts, policy,
-        )),
+        kin_core::WorkspaceCarry::Refused(conflicts) => {
+            Err(pending_state_conflict(workspace, name, &conflicts, policy))
+        }
     }
 }
 

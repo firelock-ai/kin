@@ -149,7 +149,9 @@ pub fn plan_workspace_carry(
                     );
                 }
             },
-            TreeDelta::Updated { artifact_id, old, .. }
+            TreeDelta::Updated {
+                artifact_id, old, ..
+            }
             | TreeDelta::Removed { artifact_id, old } => {
                 let held_identically = destination_tree
                     .get(artifact_id)
@@ -351,7 +353,10 @@ mod tests {
         let plan = carried(&plan);
 
         assert_eq!(
-            plan.carried.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            plan.carried
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             vec!["note.md".to_string()]
         );
         assert!(plan.absorbed.is_empty());
@@ -364,7 +369,10 @@ mod tests {
             ArtifactId(uuid::Uuid::from_u128(2)),
             "carrying preserves the identity the entry was admitted under"
         );
-        assert!(plan.tree.artifact_at_path(&path("only-there.txt")).is_some());
+        assert!(plan
+            .tree
+            .artifact_at_path(&path("only-there.txt"))
+            .is_some());
     }
 
     #[test]
@@ -393,7 +401,10 @@ mod tests {
 
         assert!(plan.carried.is_empty());
         assert_eq!(
-            plan.absorbed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            plan.absorbed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             vec!["Dockerfile".to_string()]
         );
         assert_eq!(
@@ -412,7 +423,10 @@ mod tests {
         let plan = carried(&plan);
 
         assert_eq!(
-            plan.carried.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            plan.carried
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             vec!["shared.txt".to_string()]
         );
         assert_eq!(

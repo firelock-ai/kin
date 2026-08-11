@@ -1247,7 +1247,15 @@ fn admit_uncommitted_workspace_addition(
         artifact_id,
         new: kin_model::LocatedEntry::new(target, entry),
     }];
-    publish_uncommitted_workspace_deltas(repository_id, manager, repo, workspace, deltas, path, body);
+    publish_uncommitted_workspace_deltas(
+        repository_id,
+        manager,
+        repo,
+        workspace,
+        deltas,
+        path,
+        body,
+    );
     artifact_id
 }
 
@@ -1276,7 +1284,15 @@ fn admit_uncommitted_workspace_edit(
         old: artifact.located_entry(),
         new: kin_model::LocatedEntry::new(target, entry),
     }];
-    publish_uncommitted_workspace_deltas(repository_id, manager, repo, workspace, deltas, path, body);
+    publish_uncommitted_workspace_deltas(
+        repository_id,
+        manager,
+        repo,
+        workspace,
+        deltas,
+        path,
+        body,
+    );
 }
 
 #[cfg(unix)]
