@@ -1115,6 +1115,19 @@ async fn stop_all(scope: StopScope, json: bool, quiet: bool) -> Result<()> {
     stop_all_inner(scope, json, quiet, None).await
 }
 
+/// Whether the current-repo fallback may stop `pid`. The fallback exists for a
+/// worker no supervisor knows about, so a pid already covered by a stop report
+/// is declined for the ordinary reason, and a pid the home partition skipped
+/// must be declined too: stopping it would undo the partition the sweep just
+/// disclosed, and the command's own output would contradict itself.
+fn fallback_may_stop(
+    pid: u32,
+    reported: impl IntoIterator<Item = u32>,
+    skipped: impl IntoIterator<Item = u32>,
+) -> bool {
+    !reported.into_iter().any(|p| p == pid) && !skipped.into_iter().any(|p| p == pid)
+}
+
 async fn stop_all_inner(
     scope: StopScope,
     json: bool,
@@ -1221,14 +1234,21 @@ async fn stop_all_inner(
     }
 
     // Also stop the current repo's worker if it is not registered with the
-    // supervisor (e.g. supervisor down but a worker process lingering).
+    // supervisor (e.g. supervisor down but a worker process lingering). The
+    // repo-local pid file is home-agnostic, so this fallback is where a scoped
+    // sweep could otherwise reach a daemon the partition skipped;
+    // `fallback_may_stop` is what keeps the disclosure and the kill agreeing.
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(layout) = kin_core::KinLayout::discover(&cwd) {
             let kin_root = layout.root().to_path_buf();
             let (pid, _) = repo_daemon_recorded_endpoint(&kin_root);
             if let Some(pid) = pid {
-                let already = reports.iter().any(|r| r.pid == pid);
-                if !already && is_process_alive(pid) {
+                let may_stop = fallback_may_stop(
+                    pid,
+                    reports.iter().map(|r| r.pid),
+                    foreign.iter().map(|skipped| skipped.pid),
+                );
+                if may_stop && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
                     let outcome = stop_worker_at(
                         &kin_root,
@@ -2309,6 +2329,54 @@ mod tests {
         assert!(
             foreign.is_empty(),
             "nothing skipped, so the shared supervisor has no other dependant"
+        );
+    }
+
+    /// The current-repo fallback must not undo the partition.
+    ///
+    /// That fallback exists for a worker no supervisor knows about, and it keys
+    /// on "this pid is not already in the reports". A skipped daemon is not in
+    /// the reports either, so keying on that alone would stop the daemon the
+    /// sweep had just named as another home's and print both facts about it.
+    #[test]
+    fn the_current_repo_fallback_skips_a_daemon_the_partition_excluded() {
+        let (targets, foreign) = partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
+        let reported: Vec<u32> = targets.iter().map(|d| d.pid).collect();
+
+        // The foreign daemon happens to serve the repository the caller stands
+        // in, so the fallback would reach for it, and the reports cannot be
+        // what protects it: the partition excluded it from them.
+        let current_repo_pid = 202;
+        assert!(!reported.contains(&current_repo_pid));
+        assert!(
+            !fallback_may_stop(
+                current_repo_pid,
+                reported.iter().copied(),
+                foreign.iter().map(|skipped| skipped.pid),
+            ),
+            "a daemon named as skipped must not then be stopped by the fallback"
+        );
+
+        // The caller's own daemon is in the reports, so the fallback declines
+        // it for the ordinary reason.
+        assert!(
+            !fallback_may_stop(
+                101,
+                reported.iter().copied(),
+                foreign.iter().map(|skipped| skipped.pid),
+            ),
+            "an already-reported daemon is not the fallback's business"
+        );
+
+        // A worker neither reported nor skipped is exactly what the fallback
+        // exists for, so the guard must not over-prune it.
+        assert!(
+            fallback_may_stop(
+                999,
+                reported.iter().copied(),
+                foreign.iter().map(|skipped| skipped.pid),
+            ),
+            "an unknown lingering worker must remain stoppable"
         );
     }
 
