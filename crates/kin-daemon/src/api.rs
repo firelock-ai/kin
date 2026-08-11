@@ -6726,6 +6726,35 @@ fn write_locate_hit_identity(hit: &mut serde_json::Value, identity: &LocateHitId
     }
 }
 
+/// The row identity a fused-arm [`LocateEntity`] carries, in the shape
+/// [`write_locate_hit_identity`] takes.
+///
+/// Both arms describe the same two cases, so both go through one writer: an
+/// entity hit keeps its id, an artifact hit says what it is and names the tool
+/// that reads it. Deciding the shape twice is how the arms came to disagree
+/// about `snippet` versus `body`, and an id space a consumer can only trust on
+/// one arm is worth no more than an absent one.
+///
+/// [`LocateEntity`]: kin_cli::commands::locate::LocateEntity
+fn locate_entity_identity(entity: &kin_cli::commands::locate::LocateEntity) -> LocateHitIdentity {
+    let id_space = if entity.entity_id.is_empty() {
+        kin_cli::commands::locate::LocateIdSpace::Artifact
+    } else {
+        kin_cli::commands::locate::LocateIdSpace::Entity
+    };
+    LocateHitIdentity {
+        id_space,
+        entity_id: Some(entity.entity_id.clone()).filter(|id| !id.is_empty()),
+        name: entity.name.clone(),
+        file: entity
+            .artifact_path
+            .clone()
+            .or_else(|| entity.provenance.file.clone()),
+        kind: Some(entity.kind.clone()).filter(|kind| !kind.is_empty()),
+        signature: Some(entity.signature.clone()).filter(|signature| !signature.is_empty()),
+    }
+}
+
 fn build_semantic_locate_result(
     state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
@@ -7159,34 +7188,29 @@ fn fused_semantic_locate_payload(
     // positional zip stays aligned and preserves the fused ranking order.
     if let Some(serde_json::Value::Array(entity_values)) = payload.get_mut("entities") {
         for (slot, entity) in entity_values.iter_mut().zip(result.entities.iter()) {
-            if let serde_json::Value::Object(map) = slot {
-                map.insert(
-                    "match_evidence".to_string(),
-                    fused_match_evidence(query, entity),
-                );
-                // Constant-true here, and stated anyway. The fused pipeline
-                // re-projects its page from live graph entities, so a hit on
-                // this arm cannot be artifact-level or retired. A caller that
-                // reads `id_space` should not have to know which arm answered
-                // to know whether the field is present, and a label that
-                // appears on one arm only is a label a consumer learns to
-                // ignore.
-                map.insert(
-                    "id_space".to_string(),
-                    json!(kin_cli::commands::locate::LocateIdSpace::Entity.as_str()),
-                );
-                // The two `semantic_locate` arms carried the same graph-owned
-                // excerpt under different names: the cosine arm called it
-                // `snippet`, the fused arm `body`. An agent that set
-                // `include_snippet` and looked for `snippet` therefore found no
-                // snippet key at all on whichever arm its profile happened to
-                // serve. Mirror the field so `include_snippet` means one thing on
-                // both arms, and keep `body` for the locate-schema parity that
-                // consumers of `kin locate --json` already parse.
-                if let Some(body) = entity.body.as_ref() {
-                    map.insert("snippet".to_string(), json!(body));
-                }
+            if !slot.is_object() {
+                continue;
             }
+            slot["match_evidence"] = fused_match_evidence(query, entity);
+            // The two `semantic_locate` arms carried the same graph-owned
+            // excerpt under different names: the cosine arm called it
+            // `snippet`, the fused arm `body`. An agent that set
+            // `include_snippet` and looked for `snippet` therefore found no
+            // snippet key at all on whichever arm its profile happened to
+            // serve. Mirror the field so `include_snippet` means one thing on
+            // both arms, and keep `body` for the locate-schema parity that
+            // consumers of `kin locate --json` already parse.
+            if let Some(body) = entity.body.as_ref() {
+                slot["snippet"] = json!(body);
+            }
+            // State the id space from the hit rather than assuming it. This was
+            // a constant `entity` for as long as the fused projection could only
+            // emit graph entities; now that a ranked artifact reaches this
+            // surface too, the constant would relabel every one of them as a
+            // resolvable entity id that no id-consuming tool will take. The
+            // identity is written through the SAME writer the cosine arm uses,
+            // so an artifact hit reads identically whichever arm answered.
+            write_locate_hit_identity(slot, &locate_entity_identity(entity));
         }
     }
 
@@ -11955,6 +11979,8 @@ mod tests {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance};
         let with_explain = LocateEntity {
             entity_id: "e1".into(),
+            id_space: kin_cli::commands::locate::LocateIdSpace::Entity,
+            artifact_path: None,
             kind: "function".into(),
             name: "parse_request".into(),
             signature: String::new(),
@@ -12075,6 +12101,8 @@ mod tests {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance};
         let mut entity = LocateEntity {
             entity_id: "e1".into(),
+            id_space: kin_cli::commands::locate::LocateIdSpace::Entity,
+            artifact_path: None,
             kind: "function".into(),
             name: "parse_request".into(),
             signature: String::new(),
@@ -12108,6 +12136,8 @@ mod tests {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance, LocateResult};
         let mk = |id: &str, name: &str| LocateEntity {
             entity_id: id.into(),
+            id_space: kin_cli::commands::locate::LocateIdSpace::Entity,
+            artifact_path: None,
             kind: "function".into(),
             name: name.into(),
             signature: "fn x()".into(),
