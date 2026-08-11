@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.18] - 2026-08-11
+
+### Changed
+
+- Admit observed new files into the workspace as they are written (#739)
+- Publish a Windows tarball and guard installer asset names (#738)
+- Qualify fused and unnamed semantic_locate pages with the negative envelope (#741)
+- Register the inference and retrieval environment the pinned dependencies read (#742)
+- Split the Windows authority job and budget its steps (#743)
+- Account for Windows binary suffixes in the installer post-extract path (#744)
+- Verify MCP bindings against what setup recorded and name the repository setup binds (#745)
+- Scope daemon stop and the daemon census by KIN_HOME, with the supervisor machine-wide by contract (#746)
+- Derive reranker candidate text from graph entities so accuracy-v1 reranks (#749)
+- Remove the Git capture directory however kin init ends (#752)
+- Report already_applied and session capabilities truthfully on the MCP write path (#747)
+- Narrow kin init admission to the state exact proving cannot tolerate (#750)
+- Read unchanged source bodies from the store that promises them (#754)
+- Bump kin-db to 0.7.20 for entity-granular embedding invalidation (#758)
+
+
 ## [0.5.17] - 2026-08-10
 
 ### Changed
