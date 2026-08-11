@@ -794,7 +794,10 @@ publishes nothing further. That answer is derived from the repository receipt ra
 in-memory record, so it survives the transaction being forgotten and stays correct however many \
 times it is retried, and it declares the same carried_pending_files split the original answer did. \
 It omits ops_applied, which only the staged record could name. A commit that never landed under \
-this id still fails closed and says authority was consulted too.";
+this id still fails closed and says authority was consulted too. already_applied is present on \
+every successful commit and is the one field that separates these two answers: false means this \
+call moved authority, true means an earlier call did and this one published nothing. Read it to \
+decide whether a retry double-applied, because every other field is identical across both.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {
