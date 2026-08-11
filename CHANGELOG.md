@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Derive reranker candidate text from graph entities so accuracy-v1 reranks (#749)
 - Remove the Git capture directory however kin init ends (#752)
 - Report already_applied and session capabilities truthfully on the MCP write path (#747)
+- Narrow kin init admission to the state exact proving cannot tolerate (#750)
+- Read unchanged source bodies from the store that promises them (#754)
+- Bump kin-db to 0.7.20 for entity-granular embedding invalidation (#758)
 
 
 ## [0.5.17] - 2026-08-10
