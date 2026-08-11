@@ -12154,6 +12154,104 @@ mod tests {
         serde_json::to_value(result).unwrap()
     }
 
+    /// The JSON body the fused arm actually puts on the wire, parsed out of the
+    /// tool result's text block.
+    fn fused_locate_body(
+        result: kin_cli::commands::locate::LocateResult,
+        query: &str,
+    ) -> serde_json::Value {
+        let tool = fused_semantic_locate_payload(result, query, false);
+        serde_json::from_str(
+            tool_result_json(&tool)["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn fused_locate_entity(name: &str) -> kin_cli::commands::locate::LocateEntity {
+        kin_cli::commands::locate::LocateEntity {
+            entity_id: "00000000-0000-0000-0000-0000000000aa".into(),
+            kind: "function".into(),
+            name: name.into(),
+            signature: String::new(),
+            score: 0.4,
+            definition: true,
+            span: None,
+            body: None,
+            match_kind: None,
+            provenance: kin_cli::commands::locate::LocateProvenance {
+                file: Some("src/lib.rs".into()),
+                origin: String::new(),
+                cosine: None,
+            },
+            matched_queries: Vec::new(),
+        }
+    }
+
+    /// FIR-2170, asserted against the serializer rather than a hand-written
+    /// payload. `LocateResult` skips `entities` when the vector is empty, so an
+    /// empty fused page reaches the negative machinery carrying `files` and no
+    /// `entities` key at all — the shape that has to be recognized, and the one
+    /// a fixture written from the struct definition would miss.
+    #[test]
+    fn empty_fused_locate_body_is_qualified_by_the_negative_contract() {
+        let body = fused_locate_body(
+            kin_cli::commands::locate::LocateResult::default(),
+            "where does the daemon start",
+        );
+        assert!(
+            body.get("entities").is_none(),
+            "an empty fused page omits `entities` entirely: {body}"
+        );
+        assert_eq!(body["files"], json!([]));
+        let negative =
+            kin_mcp::negative::negative_for("semantic_locate", &body, &kin_mcp::Envelope::daemon())
+                .expect("an empty fused page must carry a negative");
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
+    }
+
+    /// FIR-2178 on the same serialized shape: a full page for a symbol the
+    /// ranking never names is qualified, and every row it served is still
+    /// counted, because the contract reports and never filters.
+    #[test]
+    fn unnamed_fused_locate_body_is_qualified_without_dropping_rows() {
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("neighbor_one")],
+            all_fallback: true,
+            total_ranked: 9,
+            ..Default::default()
+        };
+        let body = fused_locate_body(result, "zzqqxx_nonexistent_symbol_9f3a");
+        assert_eq!(body["all_fallback"], json!(true));
+        let negative =
+            kin_mcp::negative::negative_for("semantic_locate", &body, &kin_mcp::Envelope::daemon())
+                .expect("a ranking that names nothing must be qualified");
+        assert_eq!(negative["kind"], json!("no_named_match"));
+        assert_eq!(negative["interpretation"], json!("unnamed_ranking"));
+        assert_eq!(negative["result_count"], json!(1));
+        assert_eq!(body["entities"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// The control: a page holding the symbol the query named is not qualified
+    /// at all, so the label keeps meaning something.
+    #[test]
+    fn named_fused_locate_body_carries_no_negative() {
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("run_fused_locate_for_state")],
+            total_ranked: 4,
+            ..Default::default()
+        };
+        let body = fused_locate_body(result, "run_fused_locate_for_state");
+        assert!(kin_mcp::negative::negative_for(
+            "semantic_locate",
+            &body,
+            &kin_mcp::Envelope::daemon()
+        )
+        .is_none());
+    }
+
     #[test]
     fn entity_source_tool_result_not_found_surfaces_error_not_missing_source() {
         use kin_cli::commands::graph::EntitySourceOutcome;
