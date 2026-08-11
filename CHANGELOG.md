@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Verify MCP bindings against what setup recorded and name the repository setup binds (#745)
 - Scope daemon stop and the daemon census by KIN_HOME, with the supervisor machine-wide by contract (#746)
 - Derive reranker candidate text from graph entities so accuracy-v1 reranks (#749)
+- Remove the Git capture directory however kin init ends (#752)
 
 
 ## [0.5.17] - 2026-08-10
