@@ -2711,8 +2711,8 @@ mod tests {
             "only the subject's own write belongs in its provenance: {provenance}"
         );
         assert_eq!(
-            events[0]["target_scope"]["Entity"],
-            serde_json::json!(subject.id.to_string()),
+            events[0]["target_scope"],
+            serde_json::json!(format!("entity:{}", subject.id)),
             "the surviving event must name the entity that was asked about"
         );
         let details: serde_json::Value =
