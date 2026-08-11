@@ -40,6 +40,7 @@ pub mod sync_state;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod tree;
+pub mod workspace_carry;
 pub mod workspace_semantics;
 
 pub use assistant::{
@@ -87,6 +88,10 @@ pub use tree::{
     ExactProjectionEjectOutcome, ExactProjectionFreeze, ExactProjectionGitStage,
     ExactProjectionVerification, ExactSessionProjection, SourceProjectionDisposition,
     WorkspaceProjectionDrift,
+};
+pub use workspace_carry::{
+    plan_workspace_carry, WorkspaceCarry, WorkspaceCarryConflict, WorkspaceCarryConflictKind,
+    WorkspaceCarryPlan,
 };
 pub use workspace_semantics::diff_workspace_semantics;
 
