@@ -71,7 +71,9 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             class: NegativeClass::Semantic,
         },
         // Daemon-only: offline returns an error (no payload), so this fires only
-        // on the daemon path, where the payload carries `results`.
+        // on the daemon path. `field` is the cosine arm's collection; the fused
+        // arm answers under a different key and is resolved by
+        // [`locate_result_count`], which this spec defers to.
         "semantic_locate" => RetrievalSpec {
             field: "results",
             kind: "no_ranked_match",
@@ -153,6 +155,106 @@ fn collection_len(payload: &Value, field: &str) -> Option<usize> {
     } else {
         payload.get(field).and_then(Value::as_array).map(Vec::len)
     }
+}
+
+/// Rows a `semantic_locate` page actually returned, whichever arm answered.
+///
+/// The two arms publish their hits under different keys, and the negative
+/// contract used to be written against the cosine arm's alone. The fused arm
+/// serializes a `LocateResult`, whose `entities` field is skipped when empty, so
+/// the exact page that most needs qualifying — a fused answer with nothing in it
+/// — carried neither an `entities` key nor a `results` one. [`collection_len`]
+/// therefore returned `None` and the whole payload was skipped, leaving an empty
+/// fused page reading as a bare, unqualified negative on the arm that serves
+/// every code-bearing store by default.
+///
+/// `files` is the discriminator rather than `entities`: `LocateResult`
+/// serializes it unconditionally, so its presence as an array is what proves a
+/// fused locate payload is in hand and an absent `entities` means "empty" rather
+/// than "not this shape". Absence is still never guessed — a payload carrying
+/// neither key returns `None` exactly as before.
+///
+/// Both surfaces count toward the total because both are answers: a store whose
+/// files rank but whose entities do not project has returned rows, and calling
+/// that an absence would certify a gap the ranking did not report.
+fn locate_result_count(payload: &Value) -> Option<usize> {
+    if payload.get("routing").and_then(Value::as_str) == Some("fused-v1") {
+        let files = payload.get("files").and_then(Value::as_array).map(Vec::len)?;
+        let entities = payload
+            .get("entities")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        return Some(files + entities);
+    }
+    collection_len(payload, "results")
+}
+
+/// True when a query token is identifier-shaped: the caller named a symbol
+/// rather than describing one in prose.
+///
+/// Deliberately narrower than the `is_symbolic_search_term` rule `kin-cli` uses
+/// to distill retrieval variants, and deliberately a separate copy: this one
+/// gates a claim in the response, never a ranking input, so it must not be able
+/// to drift into retrieval by being shared with it. Hyphens are excluded because
+/// ordinary prose hyphenates, and a rule that reads `graph-native` as a symbol
+/// name would qualify half of all English queries.
+fn query_names_a_symbol(query: &str) -> bool {
+    query.split_whitespace().any(|token| {
+        let core = token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'));
+        core.len() >= 3
+            && (core.contains('_')
+                || core.contains("::")
+                || core.contains('.')
+                || core.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2)
+    })
+}
+
+/// True when the query named a symbol and nothing in the ranking carries that
+/// name — a populated page that is not the answer it looks like.
+///
+/// Cosine ranking always returns its best candidates, so a query for a symbol
+/// that exists nowhere comes back as a full page of confidently-scored hits that
+/// is indistinguishable, field for field, from a page that found the symbol. The
+/// scores cannot separate them: they are ranks within a result set, not evidence
+/// that anything matched.
+///
+/// The verdict is read from what each arm already publishes about its FULL
+/// ranking, never from the page alone, because a page is a window: an exact name
+/// match sitting on page two would otherwise be reported as absent from the
+/// whole ranking.
+///
+/// - Fused arm: `all_fallback` is computed over the full ranking before paging
+///   and means precisely this, so it is used verbatim.
+/// - Cosine arm: every row's `match_evidence.name_match` is inspected, and only
+///   when the page holds the entire ranking. A row that reports no
+///   `match_evidence` at all leaves the question unanswered, so nothing is
+///   qualified — the same refusal to guess the rest of the module makes.
+fn locate_ranking_names_nothing(payload: &Value) -> bool {
+    if !payload
+        .get("query")
+        .and_then(Value::as_str)
+        .is_some_and(query_names_a_symbol)
+    {
+        return false;
+    }
+    if payload.get("routing").and_then(Value::as_str) == Some("fused-v1") {
+        return payload.get("all_fallback").and_then(Value::as_bool) == Some(true);
+    }
+    let Some(rows) = payload.get("results").and_then(Value::as_array) else {
+        return false;
+    };
+    let whole_ranking = payload
+        .get("total_ranked")
+        .and_then(Value::as_u64)
+        .is_some_and(|total| total <= rows.len() as u64);
+    whole_ranking
+        && !rows.is_empty()
+        && rows.iter().all(|row| {
+            row.get("match_evidence")
+                .and_then(|evidence| evidence.get("name_match"))
+                .and_then(Value::as_str)
+                .is_some_and(|name_match| name_match != "exact")
+        })
 }
 
 /// Render the envelope's embedding coverage as a compact, agent-readable object
@@ -339,6 +441,19 @@ fn absence_consequence(always: bool, trustworthy: bool) -> &'static str {
     }
 }
 
+/// The consequence sentence for a locate page that ranked hits but none the
+/// query named. Distinct from [`absence_consequence`], which speaks about an
+/// empty result: here the rows are real and stay ranked, and what is absent is
+/// the NAME, so the advice has to separate "these are neighbors" from "the
+/// symbol does not exist" instead of collapsing them into one verdict.
+fn unnamed_ranking_consequence(trustworthy: bool) -> &'static str {
+    if trustworthy {
+        "These hits are neighbors, not the symbol: no ranked entity carries the name the query asked for, and on a complete graph that means no entity carries it at all. Do not treat the top hit as the requested symbol."
+    } else {
+        "These hits are neighbors, not the symbol: no ranked entity carries the name the query asked for. The name's absence is NOT authoritative — it may simply not be indexed yet — so do not conclude the symbol does not exist. Re-check after embedding is complete and the daemon is healthy."
+    }
+}
+
 /// The kind the payload reports for its focal entity, whichever shape carries
 /// it: `find_references` nests the focal under `focal_entity`, `trace_data_flow`
 /// reports it flat as `focal_kind`.
@@ -496,8 +611,18 @@ fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
 /// beside the existing payload keys, never replacing them.
 pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<Value> {
     let spec = spec_for(tool)?;
-    let count = collection_len(payload, spec.field)?;
-    if count != 0 && !spec.always {
+    let count = if tool == "semantic_locate" {
+        locate_result_count(payload)?
+    } else {
+        collection_len(payload, spec.field)?
+    };
+    // A locate page has a second way of being a negative: it came back full, and
+    // not one hit is the symbol the query named. Qualifying that page is the
+    // whole point — the rows are real neighbors and stay exactly as ranked, so
+    // this reports rather than filters, and a weak-but-real hit is never dropped
+    // to hide a wrong one.
+    let ranking_names_nothing = tool == "semantic_locate" && locate_ranking_names_nothing(payload);
+    if count != 0 && !spec.always && !ranking_names_nothing {
         return None;
     }
 
@@ -544,6 +669,11 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     // the traversal never reached.
     let mut kind = spec.kind;
     let mut subject = spec.subject;
+    if ranking_names_nothing {
+        kind = "no_named_match";
+        subject = "the query named a symbol and no ranked entity carries that name; \
+                   every hit was surfaced by content or embedding similarity";
+    }
     if tool == "graph_neighborhood" {
         // The emitted edge array is capped by the caller's `limit`, and a
         // `limit` of zero empties it while the walk still found neighbors. The
@@ -616,10 +746,17 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         }
     }
 
-    let interpretation = if spec.always {
+    let interpretation = if ranking_names_nothing {
+        "unnamed_ranking"
+    } else if spec.always {
         "qualified_verdicts"
     } else {
         "absent_as_indexed"
+    };
+    let consequence = if ranking_names_nothing {
+        unnamed_ranking_consequence(trustworthy)
+    } else {
+        absence_consequence(spec.always, trustworthy)
     };
 
     let mut negative = Map::new();
@@ -648,11 +785,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     );
     negative.insert(
         "advice".to_string(),
-        json!(build_advice(
-            subject,
-            absence_consequence(spec.always, trustworthy),
-            envelope
-        )),
+        json!(build_advice(subject, consequence, envelope)),
     );
     Some(Value::Object(negative))
 }
@@ -1624,5 +1757,237 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("structural_authoritative"));
+    }
+
+    /// An empty fused `semantic_locate` page exactly as the daemon serializes
+    /// it: `LocateResult` skips `entities` when the vector is empty, so the key
+    /// is ABSENT rather than an empty array, and `files` is the only collection
+    /// on the wire.
+    fn empty_fused_locate_page(query: &str) -> Value {
+        json!({
+            "query": query,
+            "granularity": "entity",
+            "routing": "fused-v1",
+            "page": 0,
+            "files": [],
+        })
+    }
+
+    fn fused_locate_hit(name: &str) -> Value {
+        json!({
+            "entity_id": "00000000-0000-0000-0000-0000000000aa",
+            "kind": "function",
+            "name": name,
+            "score": 0.42,
+            "definition": true,
+            "provenance": { "file": "src/lib.rs" },
+        })
+    }
+
+    fn cosine_locate_hit(name: &str, name_match: &str) -> Value {
+        json!({
+            "kind": "function",
+            "name": name,
+            "score": 0.31,
+            "id_space": "entity",
+            "entity_id": "00000000-0000-0000-0000-0000000000bb",
+            "provenance": { "file": "src/lib.rs" },
+            "match_evidence": {
+                "ranker": "cosine-v0",
+                "score_source": "vector_cosine",
+                "name_match": name_match,
+                "reranked": false,
+            },
+        })
+    }
+
+    #[test]
+    fn empty_fused_locate_page_carries_the_negative() {
+        // FIR-2170: the fused arm is the default for code-bearing stores, and
+        // its empty page used to reach an agent as a bare `files: []` with no
+        // qualification at all — an honest-looking negative that had qualified
+        // nothing.
+        let payload = empty_fused_locate_page("where does the daemon start");
+        let negative =
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
+        assert_eq!(negative["interpretation"], json!("absent_as_indexed"));
+        assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    #[test]
+    fn empty_cosine_locate_page_keeps_its_negative() {
+        // The control the fix must not break: the arm that already qualified.
+        let payload = json!({
+            "query": "where does the daemon start",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 0,
+            "results": [],
+        });
+        let negative =
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
+    }
+
+    #[test]
+    fn populated_fused_locate_page_carries_no_negative() {
+        // The other control: a page that answered is not qualified at all.
+        let mut payload = empty_fused_locate_page("run_fused_locate_for_state");
+        payload["entities"] = json!([fused_locate_hit("run_fused_locate_for_state")]);
+        payload["total_ranked"] = json!(1);
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn fused_page_with_ranked_files_but_no_entities_is_not_an_absence() {
+        // Rows came back. Calling that an absence would certify a gap the
+        // ranking never reported.
+        let mut payload = empty_fused_locate_page("where does the daemon start");
+        payload["files"] = json!([{ "path": "src/lib.rs", "score": 0.5 }]);
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn locate_payload_carrying_neither_collection_yields_no_negative() {
+        // Absence is never guessed: without `results` and without the `files`
+        // that proves a fused page, emptiness is unknown, not zero.
+        let payload = json!({ "query": "x", "routing": "fused-v1", "page": 0 });
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn fabricated_symbol_gets_a_full_fused_page_qualified_as_unnamed() {
+        // FIR-2178: five confidently-scored hits for a symbol that exists
+        // nowhere. The page is real and stays whole; what it is NOT is the
+        // symbol that was asked for, and that is now stated.
+        let mut payload = empty_fused_locate_page("zzqqxx_nonexistent_symbol_9f3a");
+        payload["entities"] = json!((0..5)
+            .map(|index| fused_locate_hit(&format!("neighbor_{index}")))
+            .collect::<Vec<_>>());
+        payload["total_ranked"] = json!(9);
+        payload["all_fallback"] = json!(true);
+        let negative =
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        assert_eq!(negative["kind"], json!("no_named_match"));
+        assert_eq!(negative["interpretation"], json!("unnamed_ranking"));
+        // Qualification, never filtering: every row served is still counted.
+        assert_eq!(negative["result_count"], json!(5));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("neighbors, not the symbol"));
+    }
+
+    #[test]
+    fn real_symbol_page_stays_unqualified() {
+        // The control that keeps the qualifier meaningful: a query naming a
+        // symbol the ranking holds gets no negative at all.
+        let mut payload = empty_fused_locate_page("run_fused_locate_for_state");
+        payload["entities"] = json!([fused_locate_hit("run_fused_locate_for_state")]);
+        payload["total_ranked"] = json!(4);
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn prose_query_over_fallback_hits_is_not_qualified_as_unnamed() {
+        // `all_fallback` fires on natural-language queries whose top hits are
+        // correct, so it cannot be the whole rule. A qualifier that fired there
+        // too is one an agent learns to ignore.
+        let mut payload = empty_fused_locate_page("merge queue captain lane arbitration");
+        payload["entities"] = json!([fused_locate_hit("submit_to_queue")]);
+        payload["total_ranked"] = json!(3);
+        payload["all_fallback"] = json!(true);
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn cosine_page_naming_nothing_is_qualified() {
+        let payload = json!({
+            "query": "zzqqxx_nonexistent_symbol_9f3a",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 2,
+            "results": [
+                cosine_locate_hit("neighbor_one", "none"),
+                cosine_locate_hit("neighbor_two", "partial"),
+            ],
+        });
+        let negative =
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        assert_eq!(negative["kind"], json!("no_named_match"));
+        assert_eq!(negative["result_count"], json!(2));
+    }
+
+    #[test]
+    fn cosine_page_holding_an_exact_name_match_is_not_qualified() {
+        let payload = json!({
+            "query": "locate_result_count",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 2,
+            "results": [
+                cosine_locate_hit("locate_result_count", "exact"),
+                cosine_locate_hit("neighbor_two", "none"),
+            ],
+        });
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn cosine_page_shorter_than_its_ranking_is_not_qualified() {
+        // A page is a window. An exact name match on page two must not be
+        // reported as absent from the whole ranking.
+        let payload = json!({
+            "query": "zzqqxx_nonexistent_symbol_9f3a",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 9,
+            "results": [cosine_locate_hit("neighbor_one", "none")],
+        });
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn cosine_row_without_match_evidence_leaves_the_page_unqualified() {
+        let payload = json!({
+            "query": "zzqqxx_nonexistent_symbol_9f3a",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 1,
+            "results": [{ "name": "neighbor_one", "score": 0.2 }],
+        });
+        assert!(
+            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
+        );
+    }
+
+    #[test]
+    fn symbol_shape_rule_separates_identifiers_from_prose() {
+        assert!(query_names_a_symbol("zzqqxx_nonexistent_symbol_9f3a"));
+        assert!(query_names_a_symbol("where is semantic_locate defined"));
+        assert!(query_names_a_symbol("LocateResult"));
+        assert!(query_names_a_symbol("kin_mcp::negative"));
+        assert!(query_names_a_symbol("AGENTS.md"));
+        assert!(!query_names_a_symbol("merge queue captain lane arbitration"));
+        assert!(!query_names_a_symbol("Checks That Cannot Fail"));
+        assert!(!query_names_a_symbol("graph-native repo substrate"));
+        assert!(!query_names_a_symbol(""));
     }
 }
