@@ -2619,10 +2619,7 @@ mod tests {
     #[test]
     fn a_missing_home_keeps_its_literal_identity() {
         let missing = PathBuf::from("/definitely/not/present/.kin");
-        assert_eq!(
-            managed_kin_home_id(&missing),
-            missing.display().to_string()
-        );
+        assert_eq!(managed_kin_home_id(&missing), missing.display().to_string());
     }
 
     #[test]

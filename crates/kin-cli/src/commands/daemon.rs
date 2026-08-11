@@ -1367,9 +1367,7 @@ impl StopDisclosure {
             );
         }
         if self.supervisor_retained {
-            println!(
-                "  Supervisor left running: it is shared with the daemons above."
-            );
+            println!("  Supervisor left running: it is shared with the daemons above.");
         }
     }
 }
@@ -1777,7 +1775,7 @@ mod tests {
             false,
             &StopDisclosure::default(),
         )
-            .expect("a retired endpoint is a clean stop");
+        .expect("a retired endpoint is a clean stop");
     }
 
     /// Full uninstall's nested stop must not be blocked by a leftover pid file.
@@ -1797,7 +1795,7 @@ mod tests {
             true,
             &StopDisclosure::default(),
         )
-            .expect("a leftover endpoint record does not keep an install alive");
+        .expect("a leftover endpoint record does not keep an install alive");
     }
 
     #[cfg(windows)]
@@ -2217,13 +2215,9 @@ mod tests {
     /// own daemons, and the neighbour's survives.
     #[test]
     fn a_home_scoped_sweep_stops_only_its_own_daemons() {
-        let (targets, foreign) =
-            partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
+        let (targets, foreign) = partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
 
-        assert_eq!(
-            targets.iter().map(|d| d.pid).collect::<Vec<_>>(),
-            vec![101]
-        );
+        assert_eq!(targets.iter().map(|d| d.pid).collect::<Vec<_>>(), vec![101]);
         assert_eq!(foreign.len(), 1);
         assert_eq!(foreign[0].pid, 202);
         assert_eq!(foreign[0].home, "/homes/b/.kin");
@@ -2235,13 +2229,9 @@ mod tests {
     /// pass the test above.
     #[test]
     fn the_scoped_sweep_follows_the_callers_home() {
-        let (targets, foreign) =
-            partition_by_home(two_homes(), "/homes/b/.kin", StopScope::Home);
+        let (targets, foreign) = partition_by_home(two_homes(), "/homes/b/.kin", StopScope::Home);
 
-        assert_eq!(
-            targets.iter().map(|d| d.pid).collect::<Vec<_>>(),
-            vec![202]
-        );
+        assert_eq!(targets.iter().map(|d| d.pid).collect::<Vec<_>>(), vec![202]);
         assert_eq!(foreign.len(), 1);
         assert_eq!(foreign[0].pid, 101);
     }
@@ -2255,7 +2245,11 @@ mod tests {
             targets.iter().map(|d| d.pid).collect::<Vec<_>>(),
             vec![101, 202]
         );
-        assert_eq!(foreign.len(), 1, "the sweep must disclose what it took down");
+        assert_eq!(
+            foreign.len(),
+            1,
+            "the sweep must disclose what it took down"
+        );
         assert_eq!(foreign[0].pid, 202);
     }
 
@@ -2265,8 +2259,7 @@ mod tests {
     #[test]
     fn an_unrecorded_home_is_not_treated_as_the_callers() {
         let daemons = vec![registered("legacy", 303, "")];
-        let (targets, foreign) =
-            partition_by_home(daemons, "/homes/a/.kin", StopScope::Home);
+        let (targets, foreign) = partition_by_home(daemons, "/homes/a/.kin", StopScope::Home);
 
         assert!(targets.is_empty());
         assert_eq!(foreign.len(), 1);

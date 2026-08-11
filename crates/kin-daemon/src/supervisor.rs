@@ -497,9 +497,7 @@ fn repo_registration_payload(state: &DaemonState, port: u16) -> RepoDaemonRegist
         port,
         endpoint: format!("http://127.0.0.1:{port}"),
         graph_entity_count: Some(state.graph.entity_count()),
-        kin_home: kin_core::registry::managed_kin_home_id(
-            &kin_core::registry::managed_kin_home(),
-        ),
+        kin_home: kin_core::registry::managed_kin_home_id(&kin_core::registry::managed_kin_home()),
     }
 }
 
