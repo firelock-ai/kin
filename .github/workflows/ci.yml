@@ -111,6 +111,7 @@ jobs:
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
           bash -n ./scripts/assert-windows-init-contract.sh
+          bash -n ./scripts/windows-authority-legs.sh
           bash -n ./scripts/verify-base-image-pins.sh
           # install.sh is the public installer users pipe straight into a shell,
           # and the one with no pull-request syntax check. Its only `sh -n` runs
@@ -131,13 +132,39 @@ jobs:
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
     #
-    # This job stays on every event on purpose, and the authority test enforces
-    # that it carries no job-level `if:`. It is the merge group's only proof of
-    # the native Windows admission contract, so taking it off the queue to reclaim its
+    # This job and the two Windows authority jobs below stay on every event on
+    # purpose, and the authority test enforces that none of them carries a
+    # job-level `if:`. Together they are the merge group's only proof of the
+    # native Windows admission contract, so taking them off the queue to reclaim
     # runner minutes would trade a reviewable pre-landing signal for a required
     # context that first fails on main.
+    #
+    # The legs were split three ways by compilation unit because one job could
+    # not finish inside any cap worth setting. Across 119 sampled runs, 32 of
+    # the 106 allowed to finish were destroyed by the 60-minute limit, and on
+    # pull requests that was half of them. The 70 survivors averaged 52.6
+    # minutes and reached 59.7, so the sample is censored by the cap itself and
+    # the real mean is near 57. This job keeps the admission contract, both npm
+    # surfaces, and the library legs that build no test binary; the CLI and
+    # runtime jobs below take the rest. Each compiles one kind of artifact, so
+    # none waits on another's build.
+    #
+    # The binary build, the admission assertion, and the npm first-run proof run
+    # ahead of the library legs rather than after them. They used to be the last
+    # three steps, which is exactly where every cap-out landed, so an admission
+    # regression could not be reported until fifty minutes of unrelated tests
+    # had passed first.
     runs-on: windows-latest
-    timeout-minutes: 60
+    # This is a backstop, not the budget. The step budgets below are the real
+    # caps, and they sum to less than this on purpose. A step that overruns its
+    # budget FAILS, and a failed step names itself on the check. A job that hits
+    # its own cap is CANCELLED, and a cancellation on a check no ruleset
+    # requires says nothing at all: every sampled cap-out carried green
+    # substantive steps and was found by reading run durations rather than by
+    # anything going red. Keeping the sum under this number is what makes the
+    # loud failure arrive first whichever step is the slow one, and the
+    # authority test holds that arithmetic.
+    timeout-minutes: 80
     steps:
       - name: Preserve tracked bytes on Windows
         shell: bash
@@ -181,134 +208,69 @@ jobs:
       # warm start for one entry every pull request restores from push 1.
       # The tradeoff is real and measured: see the trusted-ref note in
       # scripts/test-release-workflow-authority.py.
+      #
+      # `cache-on-failure` is what stops a bad run from compounding into the
+      # next one. The save is a post step and rust-cache gates it on
+      # `success() || env.CACHE_ON_FAILURE == 'true'`, so at the default every
+      # run that does not end green discards everything it compiled. That is not
+      # theoretical: all four sampled red runs and every one of the 32 sampled
+      # cap-outs skipped the save, which is why a slow afternoon left each
+      # following run colder than the one before it. Setting this makes the
+      # condition unconditional, so the artifacts survive a red run or a
+      # cancelled one.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
 
-      # `daemon_status_and_stop_lifecycle` drives a real daemon, and the harness
-      # takes it from the `kin-daemon` beside the `kin` binary the test was
-      # built with. Every other `kin-daemon` invocation below compiles `--lib`,
-      # and the step that builds the binary runs after the tests, so nothing put
-      # a `kin-daemon.exe` in the msvc directory before the test read it. The
-      # harness covers a missing daemon by rebuilding one, which lands beside
-      # the test only when it carries the same `--target`, so a leg that omits
-      # this build depends on that rebuild rather than on its own inputs. The
-      # feature set matches the binary build below, so both produce one artifact.
-      - name: Build the sibling Windows daemon the authority tests drive
+      # The three steps below are the pull-request half of the Windows admission
+      # contract. The installer leg asserts the same behavior against the
+      # release binary, but it runs only on the landing push, so on its own it
+      # can report an admission change no earlier than a required check
+      # failing on a release commit. This leg builds without default features
+      # and the installer leg builds with them, so the shared script asserts
+      # the same refusals against both feature sets of the command.
+      - name: Build the Windows binaries the admission and npm assertions drive
         shell: bash
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           cargo build --locked --target x86_64-pc-windows-msvc \
-            -p kin-daemon --no-default-features --bin kin-daemon
+            -p kin-cli -p kin-daemon --no-default-features \
+            --bin kin --bin kin-daemon
 
-      - name: Compile and run native Windows authority tests
+      - name: Assert the Windows admission contract
         shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          bash ./scripts/assert-windows-init-contract.sh \
+            "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/debug/kin.exe" \
+            "$RUNNER_TEMP/kin-windows-admission"
+
+      - name: Prove both npm surfaces from built Windows binaries
+        shell: bash
+        timeout-minutes: 10
+        env:
+          KIN_NPM_PROOF_KIN_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin.exe
+          KIN_NPM_PROOF_DAEMON_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin-daemon.exe
+        run: |
+          set -euo pipefail
+          node ./scripts/prove-windows-npm-first-run.mjs
+
+      # Library legs only: every invocation here compiles a `--lib` test binary
+      # or nothing at all. The kin-cli unit legs and the integration-test
+      # binaries live in the two jobs below because they are the expensive
+      # compilation units, and keeping them here is what made one job unable to
+      # finish inside any cap worth setting.
+      - name: Compile and run native Windows core authority tests
+        shell: bash
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           export RUST_BACKTRACE=1
-
-          list_tests() {
-            CARGO_TERM_COLOR=never cargo test "$@" -- --list | tr -d '\r'
-          }
-
-          assert_nonempty_listing() {
-            local label="$1"
-            local listing="$2"
-            local count
-            count="$(printf '%s\n' "$listing" \
-              | awk '/: test$/ { count += 1 } END { print count + 0 }')"
-            if [[ "$count" -eq 0 ]]; then
-              echo "::error title=Missing native Windows tests::$label listed zero tests"
-              printf '%s\n' "$listing"
-              exit 1
-            fi
-            echo "$label: listed $count test(s)"
-          }
-
-          run_nonempty_target() {
-            local label="$1"
-            shift
-            local listing
-            listing="$(list_tests "$@")"
-            assert_nonempty_listing "$label" "$listing"
-            cargo test "$@" -- --test-threads=1
-          }
-
-          run_required_filter() {
-            local label="$1"
-            local filter="$2"
-            shift 2
-            local listing
-            local matches
-            listing="$(list_tests "$@")"
-            matches="$(printf '%s\n' "$listing" \
-              | awk -v needle="$filter" \
-                'index($0, needle) > 0 && /: test$/ { count += 1 } END { print count + 0 }')"
-            if [[ "$matches" -eq 0 ]]; then
-              echo "::error title=Missing native Windows tests::$label filter '$filter' matched zero listed tests"
-              printf '%s\n' "$listing"
-              exit 1
-            fi
-            echo "$label: filter '$filter' matched $matches test(s)"
-            cargo test "$@" "$filter" -- --test-threads=1
-          }
-
-          run_required_exact() {
-            local label="$1"
-            local test_name="$2"
-            shift 2
-            local listing
-            local matches
-            listing="$(list_tests "$@")"
-            matches="$(printf '%s\n' "$listing" \
-              | awk -v expected="$test_name: test" \
-                '$0 == expected { count += 1 } END { print count + 0 }')"
-            if [[ "$matches" -ne 1 ]]; then
-              echo "::error title=Missing native Windows test::$label expected exactly one '$test_name', found $matches"
-              printf '%s\n' "$listing"
-              exit 1
-            fi
-            cargo test "$@" "$test_name" -- --exact --test-threads=1
-          }
-
-          run_required_target() {
-            local label="$1"
-            local required_test="$2"
-            shift 2
-            local listing
-            local matches
-            listing="$(list_tests "$@")"
-            assert_nonempty_listing "$label" "$listing"
-            matches="$(printf '%s\n' "$listing" \
-              | awk -v expected="$required_test: test" \
-                '$0 == expected { count += 1 } END { print count + 0 }')"
-            if [[ "$matches" -ne 1 ]]; then
-              echo "::error title=Missing native Windows test::$label expected exactly one '$required_test', found $matches"
-              printf '%s\n' "$listing"
-              exit 1
-            fi
-            cargo test "$@" -- --test-threads=1
-          }
-
-          compile_required_target() {
-            local label="$1"
-            local required_test="$2"
-            shift 2
-            local listing
-            local matches
-            listing="$(list_tests "$@")"
-            assert_nonempty_listing "$label" "$listing"
-            matches="$(printf '%s\n' "$listing" \
-              | awk -v expected="$required_test: test" \
-                '$0 == expected { count += 1 } END { print count + 0 }')"
-            if [[ "$matches" -ne 1 ]]; then
-              echo "::error title=Missing native Windows compile target::$label expected exactly one '$required_test', found $matches"
-              printf '%s\n' "$listing"
-              exit 1
-            fi
-            echo "$label: compiled and listed required test '$required_test'"
-          }
+          source ./scripts/windows-authority-legs.sh
 
           run_nonempty_target "kin-registry library" \
             --locked --target x86_64-pc-windows-msvc \
@@ -335,35 +297,82 @@ jobs:
           run_nonempty_target "kin-git library" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-git --lib
-          run_required_filter "kin-cli Windows modules" "windows" \
-            --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --lib
+          # Stays in this job rather than moving to the CLI one: the npm proof
+          # above asserts that the compatibility wrapper finds its sibling
+          # daemon, and this is the unit case for the discovery it depends on.
+          # Separating them would let one job claim a runtime behavior whose
+          # only unit proof lives in a job that can go red on its own.
           run_required_exact "MCP Windows sibling daemon discovery" \
             "daemon_delegate::tests::windows_daemon_discovery_finds_platform_sibling_without_path" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-mcp --no-default-features --lib
-          # Full uninstall owns native Windows process handles, directory
-          # identity, and deferred self-deletion. Compiling these paths on a
-          # non-Windows host cannot prove their runtime contract, so keep both
-          # the focused unit surface and the real daemon lifecycle in the
-          # permanent Windows authority leg.
-          run_required_filter "full managed uninstall safety" \
-            "commands::setup::tests::full_uninstall" \
-            --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --lib
           # Admission itself, in process. `kin init` is the transaction the
-          # contract script drives end to end, but that script runs two steps
-          # later and reports one line naming a path that two different
-          # components can report. These cases stage, publish, seal, and
-          # promote a repository through the same code the binary does, so a
-          # refusal names a test and a line instead of a path. Until this
-          # existed, `init.rs` had no native Windows coverage at all, which is
-          # why a refusal in it could only be seen by a thirty-minute job that
-          # then could not say which call refused.
+          # contract script drives end to end, but that script reports one line
+          # naming a path that two different components can report. These cases
+          # stage, publish, seal, and promote a repository through the same code
+          # the binary does, so a refusal names a test and a line instead of a
+          # path. Until this existed, `init.rs` had no native Windows coverage
+          # at all, which is why a refusal in it could only be seen by a
+          # thirty-minute job that then could not say which call refused.
           run_required_filter "kin-core repository initialization" \
             "init::tests" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-core --lib
+          run_required_filter "managed-install spawn fence" \
+            "managed_spawn_fence" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon-spawn --lib
+          run_required_filter "daemon shutdown identity" "shutdown" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --lib
+
+  windows-authority-cli-tests:
+    name: Windows authority CLI tests
+    # Every leg here is `-p kin-cli --no-default-features --lib`, which is one
+    # compilation unit and the single most expensive one in the Windows set.
+    # Splitting on that boundary is why the three jobs do not duplicate each
+    # other's compile: this one builds the CLI unit-test binary, the job above
+    # builds the library ones, and the job below builds the integration ones.
+    #
+    # Full uninstall owns native Windows process handles, directory identity,
+    # and deferred self-deletion. Compiling these paths on a non-Windows host
+    # cannot prove their runtime contract, so they stay on a permanent native
+    # Windows leg.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Preserve tracked bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Compile and run native Windows CLI authority tests
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          export RUST_BACKTRACE=1
+          source ./scripts/windows-authority-legs.sh
+
+          run_required_filter "kin-cli Windows modules" "windows" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
+          run_required_filter "full managed uninstall safety" \
+            "commands::setup::tests::full_uninstall" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
           run_required_exact "native full managed uninstall lifecycle" \
             "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup" \
             --locked --target x86_64-pc-windows-msvc \
@@ -380,17 +389,6 @@ jobs:
             "commands::update::tests::managed_daemon_spawn_lease_blocks_uninstall_authority_until_readiness" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
-          run_required_filter "managed-install spawn fence" \
-            "managed_spawn_fence" \
-            --locked --target x86_64-pc-windows-msvc \
-            -p kin-daemon-spawn --lib
-          run_required_filter "daemon shutdown identity" "shutdown" \
-            --locked --target x86_64-pc-windows-msvc \
-            -p kin-daemon --no-default-features --lib
-          run_required_target "daemon status and stop lifecycle" \
-            "daemon_status_and_stop_lifecycle" \
-            --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli --no-default-features --test daemon_stop
           run_required_filter "bounded CLI test subprocesses" \
             "commands::test_subprocess::tests" \
             --locked --target x86_64-pc-windows-msvc \
@@ -399,6 +397,62 @@ jobs:
             "daemon_client::probe_process::tests" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
+
+  windows-authority-runtime-tests:
+    name: Windows authority runtime tests
+    # The integration-test binaries: real daemons, real process trees, real
+    # containment. These are the legs that spend their time running rather than
+    # compiling, which is why they belong away from the unit legs instead of
+    # queued behind them.
+    runs-on: windows-latest
+    timeout-minutes: 70
+    steps:
+      - name: Preserve tracked bytes on Windows
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      # `daemon_status_and_stop_lifecycle` drives a real daemon, and the harness
+      # takes it from the `kin-daemon` beside the `kin` binary the test was
+      # built with. Every other `kin-daemon` invocation in this job compiles a
+      # test binary, which writes no `kin-daemon.exe`, so nothing else puts one
+      # in the msvc directory before the test reads it. The harness covers a
+      # missing daemon by rebuilding one, which lands beside the test only when
+      # it carries the same `--target`, so a leg that omits this build depends
+      # on that rebuild rather than on its own inputs. The feature set matches
+      # the binary build in the admission job, so both produce one artifact.
+      - name: Build the sibling Windows daemon the authority tests drive
+        shell: bash
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          cargo build --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --bin kin-daemon
+
+      - name: Compile and run native Windows runtime authority tests
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          export RUST_BACKTRACE=1
+          source ./scripts/windows-authority-legs.sh
+
+          run_required_target "daemon status and stop lifecycle" \
+            "daemon_status_and_stop_lifecycle" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test daemon_stop
           run_required_target "spawned-child Windows authority ordering" \
             "spawned_child_observes_case_insensitive_authority_order" \
             --locked --target x86_64-pc-windows-msvc \
@@ -422,38 +476,6 @@ jobs:
             "concurrent_resolutions_from_one_view_leave_one_winner" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test repository_merge_resolution
-
-      # The two steps below are the pull-request half of the Windows admission
-      # contract. The installer leg asserts the same behavior against the
-      # release binary, but it runs only on the landing push, so on its own it
-      # can report an admission change no earlier than a required check
-      # failing on a release commit. This leg builds without default features
-      # and the installer leg builds with them, so the shared script asserts
-      # the same refusals against both feature sets of the command.
-      - name: Build the Windows binaries the admission and npm assertions drive
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --locked --target x86_64-pc-windows-msvc \
-            -p kin-cli -p kin-daemon --no-default-features \
-            --bin kin --bin kin-daemon
-
-      - name: Assert the Windows admission contract
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash ./scripts/assert-windows-init-contract.sh \
-            "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/debug/kin.exe" \
-            "$RUNNER_TEMP/kin-windows-admission"
-
-      - name: Prove both npm surfaces from built Windows binaries
-        shell: bash
-        env:
-          KIN_NPM_PROOF_KIN_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin.exe
-          KIN_NPM_PROOF_DAEMON_BIN: ${{ github.workspace }}/target/x86_64-pc-windows-msvc/debug/kin-daemon.exe
-        run: |
-          set -euo pipefail
-          node ./scripts/prove-windows-npm-first-run.mjs
 
   windows-installer:
     # Renamed from "Windows installer + vector-free release build" when native
