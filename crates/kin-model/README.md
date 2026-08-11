@@ -49,8 +49,10 @@ types. Downstream crates (`kin`, `kin-db`, `kin-bench`, and more) pin it from th
 overwritten. So **every change you intend to publish must carry a new, not-yet-
 published version**. There is no way to ship a fix under an already-published
 number. `scripts/publish-kinlab-crates.sh` refuses to re-publish an existing
-version (it reads the index first and skips), and `scripts/check-version-bump.sh`
-fails CI when `src/` changes without a version move.
+version (it reads the index first and skips), and CI fails the release run when
+`src/` changes without a version move: `registry-publish.yml` delegates to
+kin-actions' shared `cargo-registry-release.yml` workflow, whose
+`check-version-bump.py` gate enforces the bump.
 
 **Downstream bump + smoke process.** When you make a breaking (MINOR) bump:
 
@@ -66,8 +68,13 @@ fails CI when `src/` changes without a version move.
    consumer against the published registry from an empty cache, proving the new
    release actually resolves and builds, not just that it packaged.
 
-These three scripts (version-bump gate, downstream-pin compatibility, fresh-cache
-consumer smoke) run in CI; see `.github/workflows/`.
+Two of these gates run in this repository's CI, both through
+`registry-publish.yml`: the version-bump check (kin-actions'
+`check-version-bump.py` inside the shared `cargo-registry-release.yml`
+workflow) and `scripts/check-downstream-pins.sh` in the workflow's test
+command. `scripts/check-version-bump.sh` and `scripts/registry-consumer-smoke.sh`
+are local and downstream tools, useful before you push and after a publish;
+neither is wired into CI here.
 
 ## License
 

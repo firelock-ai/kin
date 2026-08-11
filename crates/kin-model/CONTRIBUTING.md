@@ -5,12 +5,10 @@ conventions this repository follows, and how to get changes reviewed.
 
 ## Development Setup
 
-kin-model is a Rust crate. CI builds on **stable** Rust, so a current stable
-toolchain via [rustup](https://rustup.rs/) is all you need:
-
-```sh
-rustup toolchain install stable
-```
+kin-model is a Rust crate. The Rust toolchain is pinned by
+[`rust-toolchain.toml`](rust-toolchain.toml), and [rustup](https://rustup.rs/)
+honors that pin automatically: with rustup installed, your first `cargo`
+invocation fetches the pinned toolchain and its components.
 
 Build and test:
 
