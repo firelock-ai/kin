@@ -34,12 +34,13 @@ const FOLLOW_REASON: &str = "follow exact repository ref admitted by transfer";
 /// compare-and-swap; they differ in what a caller asked for, and therefore in
 /// which refusal is the honest one.
 ///
-/// A switch is a request to leave the current head, so uncommitted graph-owned
-/// state is a reason to refuse before anything is resolved: the caller can
-/// commit and ask again, and nothing has happened in the meantime. A follow is
-/// the second half of a transfer whose history is already durable, so the same
-/// state is not a reason to refuse the transfer that already landed. It is
-/// reported once the transition is known to be needed, which is why the
+/// A switch is a gesture someone typed, with a caller standing by to resolve
+/// whatever it reports, so it carries uncommitted graph-owned state onto the
+/// branch being entered and refuses only where the carry would lose work. A
+/// follow is the second half of a transfer whose history is already durable and
+/// which nobody is watching, so it keeps the stricter rule and refuses over any
+/// uncommitted state rather than replaying it unattended. The follow reports
+/// that once the transition is known to be needed, which is why the
 /// already-at-target case is settled first here and last there.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransitionPolicy {
@@ -171,10 +172,14 @@ fn transition_operation(policy: TransitionPolicy) -> &'static str {
     }
 }
 
-/// Refuse a transition over uncommitted state that graph authority already
-/// owns. Only admitted state reaches this: unadmitted working-copy bytes are
-/// reported as projection drift instead, so the wording never describes host
-/// content that has not crossed the repository-v6 compare-and-swap.
+/// Refuse a follow over uncommitted state that graph authority already owns.
+///
+/// Only a follow reaches this. A switch plans the same state against the branch
+/// it was asked for and refuses through [`pending_state_conflict`], naming the
+/// paths that actually block it. Only admitted state reaches either: unadmitted
+/// working-copy bytes are reported as projection drift instead, so the wording
+/// never describes host content that has not crossed the repository-v6
+/// compare-and-swap.
 fn graph_owned_changes(
     workspace: &kin_model::WorkspaceState,
     policy: TransitionPolicy,
@@ -748,19 +753,20 @@ fn switch(
     let roots = lease.roots().clone();
     let metadata = lease.metadata();
     let workspace = local_workspace(authority, metadata)?.clone();
-    // A transition admits nothing, so this reads persisted authority alone. It
-    // fires only where graph authority already owns uncommitted state: a
-    // non-empty semantic overlay, or a workspace tree that admission moved off
-    // its base. Admission only ever moves members the workspace already
-    // tracks, so untracked host content can never reach this refusal, and the
-    // wording never describes bytes that have not crossed the compare-and-swap.
+    // A switch no longer refuses merely because the workspace holds pending
+    // state. Ambient observation admits every new non-ignored file, so a
+    // scratch note is uncommitted graph truth within seconds of being written,
+    // and refusing on that alone would block the most frequent gesture of a
+    // working day over a file Git would have carried without comment. The
+    // pending state is planned against the destination further down instead,
+    // and only the cases that would actually lose work refuse.
     //
-    // A follow defers this until the transition is known to be needed, because
-    // the history it would refuse over is already durable and a workspace that
-    // is already at the moved ref has nothing to refuse about.
-    if policy == TransitionPolicy::Switch && workspace.is_dirty() {
-        return Err(graph_owned_changes(&workspace, policy));
-    }
+    // A follow keeps the older, stricter rule. It is the second half of a
+    // transfer rather than a gesture anyone typed, so there is no muscle memory
+    // to honour and no caller standing by to resolve a conflict; it defers the
+    // refusal until the transition is known to be needed, because the history
+    // it would refuse over is already durable and a workspace already at the
+    // moved ref has nothing to refuse about.
     if policy == TransitionPolicy::FollowMovedRef
         && !matches!(&workspace.head, WorkspaceHead::Symbolic { target } if target == name)
     {
@@ -777,6 +783,15 @@ fn switch(
     let target_change_id = lease
         .resolve_target_change_id(&target)
         .with_context(|| format!("resolve exact semantic target for branch {name}"))?;
+    // The workspace's own base, so the difference between it and the workspace
+    // tree is exactly the pending work a switch has to decide about. An unborn
+    // symbolic head has no base, and every member of its tree is pending.
+    let base_change_id = workspace
+        .base_target
+        .as_ref()
+        .map(|base| lease.resolve_target_change_id(base))
+        .transpose()
+        .context("resolve the exact authority target this workspace is based on")?;
     let target_shared_policy = metadata
         .admission_policies
         .iter()
@@ -817,25 +832,46 @@ fn switch(
 
     let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
         .context("prepare graph-owned branch target")?;
-    let target_state = graph
+    let mut desired_state = graph
         .resolve_graph_at(&target_change_id)
         .with_context(|| format!("resolve exact graph for branch {name}"))?;
-    let target_tree = target_state.tree.clone();
+    let target_tree = desired_state.tree.clone();
     let target_tree_hash =
         compute_resolved_tree_hash(&target_tree).context("hash exact branch target tree")?;
-    let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &target_tree)
+    // Plan what the pending workspace does across the transition. The result
+    // replaces the desired state wholesale, so everything downstream (the
+    // preflight, the published mutation, and the materialization) works from
+    // one description of where this workspace lands: the destination branch's
+    // members with the pending work replayed on top.
+    let carried = plan_switch_carry(
+        &graph,
+        &workspace,
+        base_change_id.as_ref(),
+        &desired_state,
+        name,
+        policy,
+    )?;
+    if let Some(plan) = &carried {
+        desired_state.tree = plan.tree.clone();
+        desired_state.entities = plan.entities.clone();
+        desired_state.relations = plan.relations.clone();
+    }
+    let desired_tree = desired_state.tree.clone();
+    let desired_tree_hash = compute_resolved_tree_hash(&desired_tree)
+        .context("hash the exact tree this branch transition lands on")?;
+    let tree_deltas = kin_core::exact_tree_correction(&workspace.tree, &desired_tree)
         .context("plan exact branch workspace transition")?;
     let semantic_delta = kin_core::diff_workspace_semantics(
         &current_workspace_graph.entities,
         &current_workspace_graph.relations,
-        &target_state.entities,
-        &target_state.relations,
+        &desired_state.entities,
+        &desired_state.relations,
     )
     .context("plan exact branch semantic transition")?;
     let daemon_semantic_delta = crate::local_repository_authority::plan_daemon_semantic_delta(
         state,
-        &target_state.entities,
-        &target_state.relations,
+        &desired_state.entities,
+        &desired_state.relations,
     )
     .context("plan the branch semantic transition for the daemon view")?;
     let daemon_delta = TransactionDelta {
@@ -845,12 +881,12 @@ fn switch(
         admission_policy_delta: None,
         external_reference_deltas: Vec::new(),
     };
-    preflight_switch_delta(state, &workspace.tree, &target_state, &daemon_delta)?;
+    preflight_switch_delta(state, &workspace.tree, &desired_state, &daemon_delta)?;
     let already_active = matches!(
         &workspace.head,
         WorkspaceHead::Symbolic { target } if target == name
     ) && workspace.base_target.as_ref() == Some(&target)
-        && workspace.tree_hash == target_tree_hash
+        && workspace.tree_hash == desired_tree_hash
         && tree_deltas.is_empty()
         && semantic_delta.is_empty()
         && workspace.shared_admission_policy == target_shared_policy
@@ -923,9 +959,12 @@ fn switch(
                 target: name.clone(),
             },
             new_base_target: Some(target),
+            // The base is always the branch that was entered. The tree may sit
+            // ahead of it, which is precisely what a carried pending workspace
+            // is: work that has not been committed to the branch now under it.
             new_base_tree_hash: Some(target_tree_hash),
             tree_deltas,
-            new_tree_hash: target_tree_hash,
+            new_tree_hash: desired_tree_hash,
             semantic_delta,
             new_shared_admission_policy: target_shared_policy.clone(),
             new_admission_policy: EffectiveAdmissionPolicyStamp {
@@ -962,7 +1001,7 @@ fn switch(
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),
             &workspace.tree,
-            &target_tree,
+            &desired_tree,
             &authority.manager,
             transaction,
         )
@@ -970,7 +1009,7 @@ fn switch(
     Ok(BranchCommandOutcome::Commit(BranchExecution {
         response: BranchResponse {
             lines: vec![format!(
-                "{} {} at change {} ({} projected entries, authority generation {})",
+                "{} {} at change {} ({} projected entries, authority generation {}){}",
                 match policy {
                     TransitionPolicy::Switch => "Switched to",
                     TransitionPolicy::FollowMovedRef => "Followed",
@@ -978,7 +1017,8 @@ fn switch(
                 name,
                 target_change_id,
                 materialized,
-                receipt.generation
+                receipt.generation,
+                carried.as_deref().map_or_else(String::new, render_carried)
             )],
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
             report: None,
@@ -990,9 +1030,117 @@ fn switch(
         authority_freeze,
         daemon_delta,
         previous_tree: workspace.tree,
-        desired_tree: target_tree,
+        desired_tree,
         projection_changed: true,
     }))
+}
+
+/// Decide what a switch does with pending workspace state, or refuse.
+///
+/// Returns `None` when there is nothing pending, or when the policy is a follow
+/// rather than a switch. A follow is handled by the older refusal further down
+/// and never carries: see the note at the head of [`switch`].
+fn plan_switch_carry(
+    graph: &kin_db::InMemoryGraph,
+    workspace: &kin_model::WorkspaceState,
+    base_change_id: Option<&kin_model::SemanticChangeId>,
+    target_state: &kin_model::graph::ResolvedGraphState,
+    name: &RefName,
+    policy: TransitionPolicy,
+) -> Result<Option<Box<kin_core::WorkspaceCarryPlan>>> {
+    if policy != TransitionPolicy::Switch || !workspace.is_dirty() {
+        return Ok(None);
+    }
+    let base_tree = match base_change_id {
+        Some(change_id) => graph
+            .resolve_graph_at(change_id)
+            .context("resolve the exact graph this workspace is based on")?
+            .tree,
+        None => ResolvedTree::default(),
+    };
+    match kin_core::plan_workspace_carry(
+        &base_tree,
+        &workspace.tree,
+        &workspace.semantic_overlay,
+        &target_state.tree,
+        &target_state.entities,
+        &target_state.relations,
+    )
+    .context("plan pending workspace state against the branch being switched to")?
+    {
+        kin_core::WorkspaceCarry::Carried(plan) => Ok(Some(plan)),
+        kin_core::WorkspaceCarry::Refused(conflicts) => Err(pending_state_conflict(
+            workspace, name, &conflicts, policy,
+        )),
+    }
+}
+
+/// Refuse a switch that would lose pending work, naming every blocked path.
+///
+/// The message states which side each path would have cost, because "commit or
+/// stash" is only actionable once a caller knows whether the obstacle is their
+/// own edit or a member of the branch they asked for.
+fn pending_state_conflict(
+    workspace: &kin_model::WorkspaceState,
+    name: &RefName,
+    conflicts: &[kin_core::WorkspaceCarryConflict],
+    policy: TransitionPolicy,
+) -> anyhow::Error {
+    let detail = conflicts
+        .iter()
+        .map(|conflict| format!("{} ({})", conflict.path, conflict.kind.reason()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    branch_conflict(format!(
+        "workspace {} holds pending changes that cannot move onto {name}: {detail}. Pending work \
+         at any other path moves across with you. Commit these, or set them aside with `kin stash \
+         push`, {}",
+        workspace.workspace_id,
+        transition_remedy(policy)
+    ))
+}
+
+/// Report what a carry did, so the switch line says where pending work went.
+///
+/// A caller who just moved branches with uncommitted work needs to see that it
+/// came along, and needs the absorbed case named separately: those paths are
+/// tracked members of the branch now rather than pending work, which is a real
+/// change in what a later commit would publish.
+fn render_carried(plan: &kin_core::WorkspaceCarryPlan) -> String {
+    let mut clauses = Vec::new();
+    if !plan.carried.is_empty() {
+        clauses.push(format!(
+            "{} pending path(s) carried across and still uncommitted: {}",
+            plan.carried.len(),
+            render_paths(&plan.carried)
+        ));
+    }
+    if !plan.absorbed.is_empty() {
+        clauses.push(format!(
+            "{} pending path(s) already tracked at identical content on this branch: {}",
+            plan.absorbed.len(),
+            render_paths(&plan.absorbed)
+        ));
+    }
+    if clauses.is_empty() {
+        return String::new();
+    }
+    format!("; {}", clauses.join("; "))
+}
+
+/// At most five paths, so one crowded switch cannot bury its own headline.
+fn render_paths(paths: &[kin_model::RepoPath]) -> String {
+    const SHOWN: usize = 5;
+    let listed = paths
+        .iter()
+        .take(SHOWN)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match paths.len().checked_sub(SHOWN) {
+        Some(remaining) if remaining > 0 => format!("{listed} and {remaining} more"),
+        _ => listed,
+    }
 }
 
 fn replay_switch(
