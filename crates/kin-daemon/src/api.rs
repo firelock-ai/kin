@@ -839,8 +839,11 @@ struct StartSessionRequest {
     #[serde(default)]
     pid: Option<u32>,
     cwd: String,
+    /// What the client restricts itself to, when it says. Absent means the
+    /// client declared nothing, which is different from declaring read-only
+    /// and must not be collapsed into it.
     #[serde(default)]
-    capabilities: SessionCapabilities,
+    capabilities: Option<SessionCapabilities>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -858,6 +861,10 @@ struct SessionStartResponse {
     transport: SessionTransport,
     started_at: kin_model::timestamp::Timestamp,
     capabilities: SessionCapabilities,
+    /// What produced each capability bit, so a reader can tell a store
+    /// permission from a client's own restriction from a bit Kin gates on
+    /// nothing.
+    capability_policy: CapabilityPolicy,
     status: String,
     /// How long the session may go idle before the sweeper may reap it.
     idle_timeout_secs: u64,
@@ -2657,6 +2664,85 @@ async fn list_sessions(
     Ok(Json(sessions))
 }
 
+/// What decided one capability bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CapabilitySource {
+    /// This store decides the bit, and the value reported is what it permits.
+    Store,
+    /// The client restricted itself below what the store permits.
+    ClientDeclared,
+    /// Kin gates nothing on this bit today. It carries the client's own
+    /// declaration and no Kin surface checks it.
+    Ungated,
+}
+
+/// What produced each bit of a session's capability report.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct CapabilityPolicy {
+    can_read: CapabilitySource,
+    can_write: CapabilitySource,
+    can_execute: CapabilitySource,
+    can_branch: CapabilitySource,
+    can_commit: CapabilitySource,
+}
+
+fn capability_source(store_permits: bool, declared: Option<bool>) -> CapabilitySource {
+    if !store_permits {
+        CapabilitySource::Store
+    } else if declared == Some(false) {
+        CapabilitySource::ClientDeclared
+    } else {
+        CapabilitySource::Store
+    }
+}
+
+/// Resolve what a session may actually do on this store.
+///
+/// The report used to echo the request's capabilities straight back, and the
+/// MCP layer materialized a read-only declaration for a client that sent none,
+/// so a session that could write and commit was told it could do neither. An
+/// agent that honors its declared capabilities then refuses work it is
+/// permitted to perform, which silently disables the write path for exactly the
+/// well-behaved callers.
+///
+/// Writes and commits follow the one condition the write path really enforces:
+/// exact repository commits are refused while a hosted snapshot backend is
+/// attached. A client that declares less than the store permits keeps its own
+/// restriction, because a declaration is a self-limit and outranks a
+/// permission. Execution and branching gate nothing in Kin today, so they carry
+/// the declaration unchanged and the policy map labels them `ungated` rather
+/// than dressing an unchecked bit as a grant.
+fn resolve_session_capabilities(
+    commits_permitted: bool,
+    declared: Option<&SessionCapabilities>,
+) -> (SessionCapabilities, CapabilityPolicy) {
+    let capabilities = SessionCapabilities {
+        can_read: declared.map_or(true, |declared| declared.can_read),
+        can_write: declared.map_or(commits_permitted, |declared| declared.can_write)
+            && commits_permitted,
+        can_execute: declared.is_some_and(|declared| declared.can_execute),
+        can_branch: declared.is_some_and(|declared| declared.can_branch),
+        can_commit: declared.map_or(commits_permitted, |declared| declared.can_commit)
+            && commits_permitted,
+        max_concurrent_intents: declared.map_or(1, |declared| declared.max_concurrent_intents),
+    };
+    let policy = CapabilityPolicy {
+        can_read: capability_source(true, declared.map(|declared| declared.can_read)),
+        can_write: capability_source(
+            commits_permitted,
+            declared.map(|declared| declared.can_write),
+        ),
+        can_execute: CapabilitySource::Ungated,
+        can_branch: CapabilitySource::Ungated,
+        can_commit: capability_source(
+            commits_permitted,
+            declared.map(|declared| declared.can_commit),
+        ),
+    };
+    (capabilities, policy)
+}
+
 /// POST /session — register a rich session and return its authoritative state.
 async fn start_session(
     State(state): State<Arc<DaemonState>>,
@@ -2681,6 +2767,13 @@ async fn start_session(
             ));
         }
     }
+    // The resolved set is what gets registered, not the request's, so the
+    // capability violations the write preflight records and the report handed
+    // to the caller describe one session rather than two.
+    let (capabilities, capability_policy) = resolve_session_capabilities(
+        state.storage_backend.is_none(),
+        request.capabilities.as_ref(),
+    );
     let session_id = state
         .coordinator
         .register_session_with_id(
@@ -2690,7 +2783,7 @@ async fn start_session(
             transport,
             request.pid,
             PathBuf::from(request.cwd),
-            request.capabilities,
+            capabilities,
         )
         .map_err(internal_error)?;
     let session = state
@@ -2713,6 +2806,7 @@ async fn start_session(
         transport: session.transport,
         started_at: session.started_at,
         capabilities: session.capabilities,
+        capability_policy,
         status: "active".to_string(),
         idle_timeout_secs: idle_ttl.as_secs(),
         idle_reap_eligible_at,
@@ -23371,6 +23465,134 @@ mod tests {
         // reconcile loop, so the list contains exactly that one session.
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].vendor, "kin-daemon");
+    }
+
+    /// A session that declares nothing must be reported able to do what this
+    /// store lets it do.
+    ///
+    /// The report echoed the request straight back, and the MCP layer
+    /// materialized a read-only declaration for a client that sent none, so a
+    /// session that went on to stage and commit entity edits was told
+    /// can_write false and can_commit false. An agent that honors its declared
+    /// capabilities refuses the write it is permitted to make, which disables
+    /// the write path for exactly the well-behaved callers.
+    #[tokio::test]
+    async fn an_undeclared_session_is_reported_able_to_write_and_commit() {
+        let state = test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "vendor": "claude-code",
+                            "client_name": "undeclared",
+                            "transport": "mcp",
+                            "cwd": "/project"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let started: SessionStartResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            started.capabilities.can_write,
+            "this store accepts commits, so the session may write"
+        );
+        assert!(started.capabilities.can_commit);
+        assert_eq!(started.capability_policy.can_write, CapabilitySource::Store);
+        assert_eq!(started.capability_policy.can_commit, CapabilitySource::Store);
+        assert_eq!(
+            started.capability_policy.can_execute,
+            CapabilitySource::Ungated,
+            "Kin gates nothing on can_execute, and the report must not dress it as a grant"
+        );
+    }
+
+    /// A client that restricts itself keeps that restriction, and the report
+    /// says the client is what produced it.
+    ///
+    /// Without this the fix would be indistinguishable from hardcoding the bits
+    /// true, which is the same defect facing the other way.
+    #[tokio::test]
+    async fn a_self_declared_read_only_session_keeps_its_restriction() {
+        let state = test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "vendor": "claude-code",
+                            "client_name": "reader",
+                            "transport": "mcp",
+                            "cwd": "/project",
+                            "capabilities": {
+                                "can_read": true,
+                                "can_write": false,
+                                "can_execute": false,
+                                "can_branch": false,
+                                "can_commit": false,
+                                "max_concurrent_intents": 1
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let started: SessionStartResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(!started.capabilities.can_write);
+        assert!(!started.capabilities.can_commit);
+        assert_eq!(
+            started.capability_policy.can_write,
+            CapabilitySource::ClientDeclared,
+            "the store permits writes here, so the client is what made this false"
+        );
+    }
+
+    /// A store that refuses commits reports it, and names itself as the cause.
+    ///
+    /// Exact repository commits are refused while a hosted snapshot backend is
+    /// attached, so a session there genuinely cannot write however it declared
+    /// itself.
+    #[test]
+    fn a_store_that_refuses_commits_reports_no_write_capability() {
+        let declared = SessionCapabilities {
+            can_read: true,
+            can_write: true,
+            can_execute: false,
+            can_branch: false,
+            can_commit: true,
+            max_concurrent_intents: 1,
+        };
+
+        let (permitted, permitted_policy) = resolve_session_capabilities(true, Some(&declared));
+        assert!(permitted.can_write);
+        assert!(permitted.can_commit);
+        assert_eq!(permitted_policy.can_write, CapabilitySource::Store);
+
+        let (refused, refused_policy) = resolve_session_capabilities(false, Some(&declared));
+        assert!(
+            !refused.can_write,
+            "a declaration cannot grant what the store refuses"
+        );
+        assert!(!refused.can_commit);
+        assert_eq!(refused_policy.can_write, CapabilitySource::Store);
+        assert_eq!(refused_policy.can_commit, CapabilitySource::Store);
     }
 
     #[tokio::test]
