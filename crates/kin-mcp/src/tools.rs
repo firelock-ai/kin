@@ -874,9 +874,13 @@ pub fn tool_definitions() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity UUID to query provenance for" }
+                        "entity_id": { "type": "string", "description": "Entity UUID to query provenance for" },
+                        "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Index into the entity's changes, newest first. Follow a prior result's next_offset to reach older changes." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Max changes per page. Default 20." },
+                        "compact": { "type": "boolean", "default": true, "description": "If true (default), each change reports its entity/relation/tree deltas by count. If false, the full delta payloads are included, which is unbounded in size and not for agent context." }
                     },
-                    "required": ["entity_id"]
+                    "required": ["entity_id"],
+                    "additionalProperties": false
                 }),
             },
             // Phase 11: Review mutation tools

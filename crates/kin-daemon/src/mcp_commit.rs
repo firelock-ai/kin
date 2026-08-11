@@ -2744,8 +2744,8 @@ mod tests {
             "only the subject's own write belongs in its provenance: {provenance}"
         );
         assert_eq!(
-            events[0]["target_scope"]["Entity"],
-            serde_json::json!(subject.id.to_string()),
+            events[0]["target_scope"],
+            serde_json::json!(format!("entity:{}", subject.id)),
             "the surviving event must name the entity that was asked about"
         );
         let details: serde_json::Value =
@@ -2772,6 +2772,95 @@ mod tests {
         let other_details: serde_json::Value =
             serde_json::from_str(other_events[0]["details"].as_str().unwrap()).unwrap();
         assert_eq!(other_details["actor"], "codex/cleanup");
+    }
+
+    /// The newest write is the one provenance reports, through the real commit path.
+    ///
+    /// `get_entity_history` hands back an entity's changes oldest first, so
+    /// reading the head of that list named the change that introduced the entity
+    /// and dropped every write since. An entity with one change cannot show
+    /// that, which is why this commits twice: the second agent's write is the
+    /// answer, and the first agent's is what the defect returned instead. The
+    /// same selector picks the change whose approvals are reported, so a stale
+    /// pick answers "has this been signed off" about the wrong change too.
+    #[test]
+    fn provenance_reports_the_newest_write_not_the_change_that_introduced_the_entity() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = kin_mcp::SessionRegistry::new();
+
+        let first = start_agent_session(&sessions, "claude-code", "earlier-session");
+        let first_result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &first.session_id.to_string(),
+            &entity,
+            "pub fn value() -> u8 { 2 }",
+        );
+        assert_ne!(
+            first_result.is_error,
+            Some(true),
+            "first commit failed: {}",
+            result_text(&first_result)
+        );
+        let first_body: serde_json::Value =
+            serde_json::from_str(result_text(&first_result)).unwrap();
+
+        let second = start_agent_session(&sessions, "codex", "later-session");
+        let second_result = commit_one_entity_edit(
+            &state,
+            &sessions,
+            &second.session_id.to_string(),
+            &entity,
+            "pub fn value() -> u8 { 3 }",
+        );
+        assert_ne!(
+            second_result.is_error,
+            Some(true),
+            "second commit failed: {}",
+            result_text(&second_result)
+        );
+        let second_body: serde_json::Value =
+            serde_json::from_str(result_text(&second_result)).unwrap();
+        assert_ne!(
+            first_body["change_id"], second_body["change_id"],
+            "the two commits must be distinct changes for this to discriminate"
+        );
+
+        let provenance = kin_mcp::handlers::provenance::handle_provenance_query(
+            &HashMap::from([(
+                "entity_id".to_string(),
+                serde_json::json!(entity.id.to_string()),
+            )]),
+            state.graph.as_ref(),
+        )
+        .unwrap();
+        let provenance: serde_json::Value = serde_json::from_str(result_text(&provenance)).unwrap();
+
+        assert_eq!(
+            provenance["latest_change"]["id"], second_body["change_id"],
+            "latest_change must be the write that landed last: {provenance}"
+        );
+        assert!(
+            provenance["latest_change"]["author"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("mcp-agent:{}", second.session_id)),
+            "latest_change must carry the agent that made it: {provenance}"
+        );
+        assert_eq!(
+            provenance["changes"][0]["id"], second_body["change_id"],
+            "the change page is newest first: {provenance}"
+        );
+        assert_eq!(
+            provenance["changes"][1]["id"], first_body["change_id"],
+            "the earlier write is still reachable, one page down: {provenance}"
+        );
     }
 
     /// A payload field the commit cannot honor is refused, not dropped.

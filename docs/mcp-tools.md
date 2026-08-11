@@ -148,7 +148,7 @@ falls back to `agent-default` and says on stderr what it was asked for and what 
 - **`kin_security_scan`**: Run a graph-based security/quality scan that returns findings with severity (today it surfaces dead/unreachable code; `propagate=true` also computes each finding's downstream impact).
 - **`kin_release_check`**: Run a graph-only advisory against a named branch and immutable source change. It checks exact history/tree completeness and an optional source entity count; `require_approval` covers every reachable non-root change, while `require_proof` currently fails closed for every non-empty source because verification runs are not yet source-bound. Final object availability and mutation CAS remain daemon `kin release` authority.
 - **`kin_contract_check`**: Check whether a specific behavioral contract has backing tests (which tests cover it, and whether it is covered).
-- **`kin_provenance_query`**: Answer who-changed-and-whether-approved for an entity, returning its change count, latest change, recorded approvals, and recent audit events.
+- **`kin_provenance_query`**: Answer who-changed-and-whether-approved for an entity, returning its change count, latest change, recorded approvals, a bounded page of its changes newest first, and recent audit events. `latest_change` is the newest change by timestamp across every origin, so a native or agent write that lands after an imported Git commit is the one reported. Changes come back as summaries carrying delta counts, and every hash is hex, so ids match what `kin log` prints. Page with `offset`/`limit` (default 20, max 200) and follow `next_offset`; `compact=false` adds the full delta payloads and is unbounded in size.
 
 ---
 
