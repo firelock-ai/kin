@@ -179,8 +179,9 @@ coordination metadata rather than claiming zero residual bytes.
 For manual installation, each archive and its `.sha256` file is published under
 `https://github.com/firelock-ai/kin/releases/latest/download/`. The moving asset
 names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,
-`kin-linux-x86_64`, and `kin-windows-x86_64`; use the Unix `.tar.gz` or Windows
-`.zip` suffix shown on the latest release page.
+`kin-linux-x86_64`, and `kin-windows-x86_64`; use the `.tar.gz` suffix shown on
+the latest release page. Windows also publishes `kin-windows-x86_64.zip`, which
+is what the PowerShell installer and the npm launcher fetch.
 
 The npm entry point resolves the same public release channel:
 

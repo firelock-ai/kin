@@ -86,6 +86,13 @@ jobs:
           python3 ./scripts/test-release-workflow-authority.py
           python3 ./scripts/test_install_optional_vfs.py
           python3 ./scripts/test_installer_parity.py
+          # Every install surface builds a release asset name; the release
+          # publishes a fixed list of them. Nothing compared the two lists, and
+          # a Windows disagreement 404'd through every release to date. The
+          # falsifier runs beside the guard because a guard nobody has seen fail
+          # is not evidence that it can.
+          python3 ./scripts/verify-installer-release-assets.py
+          python3 ./scripts/falsify-installer-release-assets.py
           python3 ./scripts/test-npm-automatic-release.py
           python3 ./scripts/test-verify-npm-release.py
           node --test \

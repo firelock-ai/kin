@@ -934,9 +934,60 @@ jobs:
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip — refusing to publish a daemon-less archive"
             exit 1
           }
-          $ArchivePath = "$env:ARTIFACT.zip"
-          $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
-          "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
+          # The POSIX installer builds one archive name for every platform it
+          # detects, "kin-<os>-<arch>.tar.gz", and it detects windows from the
+          # MSYS, MINGW, and CYGWIN uname strings. Piping the documented curl
+          # command into a shell on Windows therefore asked for a tarball this
+          # leg never produced, and every release to date answered that request
+          # with a 404. Publish the same components under that exact name beside
+          # the zip. The zip stays the primary archive: the PowerShell
+          # installer, the npm launcher, and `kin update` all resolve Windows by
+          # that name, and anything already depending on it keeps working.
+          tar -czf "$env:ARTIFACT.tar.gz" "$env:ARTIFACT"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tar failed to package $env:ARTIFACT.tar.gz"
+            exit 1
+          }
+          $members = @(tar -tzf "$env:ARTIFACT.tar.gz")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tar failed to list $env:ARTIFACT.tar.gz"
+            exit 1
+          }
+          $members = @($members | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+          # The Unix legs wrap their contents in a single "<artifact>/" root and
+          # the release shape rules refuse a member carrying a backslash, so
+          # assert both here rather than discovering a Windows path separator in
+          # the publish job after the archive is already built.
+          $prefix = "$env:ARTIFACT/"
+          foreach ($member in $members) {
+            if ($member.Contains("\")) {
+              Write-Error "$env:ARTIFACT.tar.gz member '$member' uses a Windows path separator"
+              exit 1
+            }
+            if (-not $member.StartsWith($prefix)) {
+              Write-Error "$env:ARTIFACT.tar.gz member '$member' is not under $prefix"
+              exit 1
+            }
+          }
+          $TarNames = @(
+            $members |
+              Where-Object { -not $_.EndsWith("/") } |
+              ForEach-Object { $_.Substring($prefix.Length) } |
+              Sort-Object
+          )
+          $ZipNames = @($entries | Sort-Object)
+          if (Compare-Object -ReferenceObject $ZipNames -DifferenceObject $TarNames) {
+            Write-Error "$env:ARTIFACT.tar.gz and $env:ARTIFACT.zip do not carry the same components"
+            exit 1
+          }
+          if ($TarNames -notcontains "kin-daemon.exe") {
+            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.tar.gz"
+            exit 1
+          }
+          foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {
+            $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
+            "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
+          }
         env:
           TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
@@ -991,11 +1042,29 @@ jobs:
             throw new Error("embedded build provenance does not match the tagged Kin source and Cargo.lock");
           }
 
-          const archives = [`${artifact}.tar.gz`, `${artifact}.zip`].filter((file) => fs.existsSync(file));
-          if (archives.length !== 1) {
-            throw new Error(`expected exactly one final archive for ${artifact}, found ${archives.join(", ") || "none"}`);
+          // Windows publishes two containers of the same components: the zip
+          // every Windows resolver already asks for, and the tarball the POSIX
+          // installer builds its name from. The zip stays the manifest's
+          // primary archive because `kin update` and the public install proof
+          // both find the platform record by that exact name; the tarball is
+          // inventoried beside it so its bytes are covered by the same
+          // provenance rather than published unaccounted for.
+          const windowsTarget = target.includes("-windows-");
+          const primaryArchive = windowsTarget ? `${artifact}.zip` : `${artifact}.tar.gz`;
+          const additionalArchiveNames = windowsTarget ? [`${artifact}.tar.gz`] : [];
+          const expectedArchives = [primaryArchive, ...additionalArchiveNames].sort();
+          const archives = [`${artifact}.tar.gz`, `${artifact}.zip`]
+            .filter((file) => fs.existsSync(file))
+            .sort();
+          if (JSON.stringify(archives) !== JSON.stringify(expectedArchives)) {
+            throw new Error(`expected final archives ${expectedArchives.join(", ")} for ${artifact}, found ${archives.join(", ") || "none"}`);
           }
-          const archive = archives[0];
+          const archive = primaryArchive;
+          const archiveRecord = (name) => ({
+            name,
+            sha256: sha256(name),
+            size_bytes: fs.statSync(name).size,
+          });
           // The content inventory covers the archive's component files. The macOS
           // notification bundle is a sealed directory rather than a component, so
           // it is classified and shape-checked here but stays out of the manifest:
@@ -1059,11 +1128,10 @@ jobs:
               dirty: false,
               cargo_lock_sha256: vfsLockSha,
             },
-            archive: {
-              name: archive,
-              sha256: sha256(archive),
-              size_bytes: fs.statSync(archive).size,
-            },
+            archive: archiveRecord(archive),
+            ...(additionalArchiveNames.length
+              ? { additional_archives: additionalArchiveNames.map(archiveRecord) }
+              : {}),
             archive_contents: contents,
             workflow: {
               repository: process.env.GITHUB_REPOSITORY,
@@ -1262,6 +1330,7 @@ jobs:
             kin-macos-x86_64.tar.gz
             kin-macos-aarch64.tar.gz
             kin-windows-x86_64.zip
+            kin-windows-x86_64.tar.gz
           )
           for asset in "${assets[@]}"; do
             test -s "$asset"
@@ -1274,6 +1343,15 @@ jobs:
             test -s "$artifact.provenance.json"
           done
           test -s checksums-sha256.txt
+
+      # The inventory above asserts the assets this workflow means to publish.
+      # This asserts the other direction, which is the one that shipped broken:
+      # every asset name a public installer builds for a supported platform has
+      # to be among the bytes staged here. It derives those names by running the
+      # installers rather than by restating them, so a list that quietly stops
+      # matching an installer fails the release instead of a user's install.
+      - name: Verify every installer asset name is published
+        run: python3 ./scripts/verify-installer-release-assets.py --assets-dir .
 
       - name: Verify and aggregate release provenance
         env:
@@ -1299,6 +1377,31 @@ jobs:
             childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
           const fail = (condition, message) => {
             if (!condition) throw new Error(message);
+          };
+          // Judge an archive's declared member paths before extracting it. A
+          // member that escapes the extraction root has already been written
+          // somewhere else by the time the extracted tree can be inspected.
+          // Every published container goes through here, so a second container
+          // of the same components is judged by the same rules as the first.
+          const extractArchive = (archiveName, spec) => {
+            const listing = archiveName.endsWith(".zip")
+              ? childProcess.execFileSync("unzip", ["-Z1", archiveName], { encoding: "utf8" })
+              : childProcess.execFileSync("tar", ["-tzf", archiveName], { encoding: "utf8" });
+            assertReleaseArchiveMemberPaths(
+              listing.split("\n").filter((member) => member !== ""),
+              { artifact: spec.artifact, target: spec.target }
+            );
+            const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${spec.artifact}-`));
+            if (archiveName.endsWith(".zip")) {
+              childProcess.execFileSync("unzip", ["-q", archiveName, "-d", extractRoot]);
+            } else {
+              childProcess.execFileSync("tar", ["-xzf", archiveName, "-C", extractRoot]);
+            }
+            const nested = path.join(extractRoot, spec.artifact);
+            return {
+              extractRoot,
+              contentRoot: fs.existsSync(nested) ? nested : extractRoot,
+            };
           };
           const specs = [
             {
@@ -1332,6 +1435,11 @@ jobs:
             {
               artifact: "kin-windows-x86_64",
               archive: "kin-windows-x86_64.zip",
+              // The POSIX installer asks Windows for this tarball by name. It
+              // carries the same components as the zip and is verified against
+              // the same content records below, so the two containers cannot
+              // drift into shipping different bytes under one release.
+              additionalArchives: ["kin-windows-x86_64.tar.gz"],
               target: "x86_64-pc-windows-msvc",
               vfsTarget: "x86_64-pc-windows-msvc",
               required: ["kin.exe", "kin-daemon.exe"],
@@ -1371,6 +1479,18 @@ jobs:
               `${manifestPath} archive hash does not match the final archive`);
             fail(manifest.archive?.size_bytes === fs.statSync(spec.archive).size,
               `${manifestPath} archive size does not match the final archive`);
+            const additionalArchives = manifest.additional_archives ?? [];
+            fail(
+              JSON.stringify(additionalArchives.map((entry) => entry.name)) ===
+                JSON.stringify(spec.additionalArchives ?? []),
+              `${manifestPath} does not declare exactly the additional archives ${(spec.additionalArchives ?? []).join(", ") || "(none)"}`);
+            for (const entry of additionalArchives) {
+              fail(fs.existsSync(entry.name), `${entry.name} is declared but was not published`);
+              fail(entry.sha256 === sha256(entry.name),
+                `${manifestPath} hash does not match the final ${entry.name}`);
+              fail(entry.size_bytes === fs.statSync(entry.name).size,
+                `${manifestPath} size does not match the final ${entry.name}`);
+            }
             fail(Array.isArray(manifest.archive_contents), `${manifestPath} has no archive content hashes`);
             fail(manifest.workflow?.repository === process.env.GITHUB_REPOSITORY,
               `${manifestPath} repository identity does not match this run`);
@@ -1398,25 +1518,8 @@ jobs:
                 manifestAttempt <= currentAttempt,
               `${manifestPath} run attempt ${manifest.workflow?.run_attempt} is not an attempt of this run (current attempt ${process.env.GITHUB_RUN_ATTEMPT})`);
 
-            // Judge the archive's declared member paths before extracting it. A
-            // member that escapes the extraction root has already been written
-            // somewhere else by the time the extracted tree can be inspected.
-            const listing = spec.archive.endsWith(".zip")
-              ? childProcess.execFileSync("unzip", ["-Z1", spec.archive], { encoding: "utf8" })
-              : childProcess.execFileSync("tar", ["-tzf", spec.archive], { encoding: "utf8" });
-            assertReleaseArchiveMemberPaths(
-              listing.split("\n").filter((member) => member !== ""),
-              { artifact: spec.artifact, target: spec.target }
-            );
-            const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${spec.artifact}-`));
+            const { extractRoot, contentRoot } = extractArchive(spec.archive, spec);
             try {
-              if (spec.archive.endsWith(".zip")) {
-                childProcess.execFileSync("unzip", ["-q", spec.archive, "-d", extractRoot]);
-              } else {
-                childProcess.execFileSync("tar", ["-xzf", spec.archive, "-C", extractRoot]);
-              }
-              const nested = path.join(extractRoot, spec.artifact);
-              const contentRoot = fs.existsSync(nested) ? nested : extractRoot;
               // Component files carry per-file provenance; the macOS notification
               // bundle is admitted as a sealed directory and is inventoried by the
               // archive digest instead. Everything else is refused.
@@ -1466,6 +1569,27 @@ jobs:
                 `${spec.archive} is missing a static build-identity authority`);
               fail(graphVersions.size === 1,
                 `${spec.archive} CLI and daemon graph snapshot identities disagree`);
+              // A second container is only honest if it carries the first one's
+              // bytes. Compare the extracted components name for name and hash
+              // for hash against the records already proven above, so a Windows
+              // tarball built from a stale or partial directory fails the
+              // release instead of installing something the zip never shipped.
+              for (const entry of additionalArchives) {
+                const extra = extractArchive(entry.name, spec);
+                try {
+                  const extraNames = classifyReleaseArchiveRoot(extra.contentRoot, {
+                    target: spec.target,
+                  }).files;
+                  fail(JSON.stringify(extraNames) === JSON.stringify(manifestNames),
+                    `${entry.name} does not carry the same components as ${spec.archive}`);
+                  for (const name of extraNames) {
+                    fail(sha256(path.join(extra.contentRoot, name)) === records.get(name)?.sha256,
+                      `${entry.name} ${name} bytes differ from ${spec.archive}`);
+                  }
+                } finally {
+                  fs.rmSync(extra.extractRoot, { recursive: true, force: true });
+                }
+              }
             } finally {
               fs.rmSync(extractRoot, { recursive: true, force: true });
             }
@@ -1537,6 +1661,7 @@ jobs:
             kin-macos-x86_64.tar.gz
             kin-macos-aarch64.tar.gz
             kin-windows-x86_64.zip
+            kin-windows-x86_64.tar.gz
             release-provenance.json
 
       - name: Create GitHub Release
@@ -1564,6 +1689,8 @@ jobs:
             kin-macos-aarch64.tar.gz.sha256
             kin-windows-x86_64.zip
             kin-windows-x86_64.zip.sha256
+            kin-windows-x86_64.tar.gz
+            kin-windows-x86_64.tar.gz.sha256
             checksums-sha256.txt
             kin-linux-x86_64.provenance.json
             kin-linux-aarch64.provenance.json

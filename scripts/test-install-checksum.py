@@ -130,8 +130,12 @@ def check_product_wiring() -> None:
             "through Start-Process rather than session-wide $LASTEXITCODE"
         )
 
+    # Both Windows containers get the same filename-bound sidecar. Binding the
+    # hash to the archive's own name is what lets install.ps1 refuse a checksum
+    # file that names a different archive, so a second published container that
+    # skipped this line would ship a sidecar nothing could match.
     release_requirements = (
-        '$ArchivePath = "$env:ARTIFACT.zip"',
+        'foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {',
         "$Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()",
         '"$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"',
     )

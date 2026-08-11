@@ -22,7 +22,8 @@ Two parts of Kin are built around Unix runtime mechanics:
   `kin init` admits a Git repository on native Windows and publishes graph
   authority, and graph, lexical, and daemon-backed queries answer from it.
 - **Semantic vector search** ships enabled on every published platform. The
-  native Windows CLI artifact (`kin-windows-x86_64.zip`) is built with the same
+  native Windows CLI artifact (`kin-windows-x86_64.zip`, published as
+  `kin-windows-x86_64.tar.gz` as well) is built with the same
   default feature set as Linux and macOS, so semantic search and embedding are
   compiled in rather than stripped. Embedding runs on the portable CPU backend;
   the Metal GPU backend is macOS-only and is not part of any Windows build.
