@@ -23499,7 +23499,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let started: SessionStartResponse = serde_json::from_slice(&body).unwrap();
 
         assert!(
@@ -23508,7 +23510,10 @@ mod tests {
         );
         assert!(started.capabilities.can_commit);
         assert_eq!(started.capability_policy.can_write, CapabilitySource::Store);
-        assert_eq!(started.capability_policy.can_commit, CapabilitySource::Store);
+        assert_eq!(
+            started.capability_policy.can_commit,
+            CapabilitySource::Store
+        );
         assert_eq!(
             started.capability_policy.can_execute,
             CapabilitySource::Ungated,
@@ -23552,7 +23557,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let started: SessionStartResponse = serde_json::from_slice(&body).unwrap();
 
         assert!(!started.capabilities.can_write);

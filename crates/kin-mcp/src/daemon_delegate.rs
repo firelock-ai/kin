@@ -421,7 +421,9 @@ async fn forward_entity_source_memoized(
 /// declared none. See the sibling in `handlers::common` for why the two must
 /// not collapse into one.
 fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> Option<SessionCapabilities> {
-    let obj = args.get("capabilities").and_then(|value| value.as_object())?;
+    let obj = args
+        .get("capabilities")
+        .and_then(|value| value.as_object())?;
     Some(SessionCapabilities {
         can_read: obj
             .get("can_read")
@@ -1304,9 +1306,9 @@ pub async fn forward_tool_call(
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
             forward_session_start(&assistant_name, &assistant_name, "mcp", None, &cwd, None)
-            .await?
-            .map(text_result_from_value)
-            .transpose()
+                .await?
+                .map(text_result_from_value)
+                .transpose()
         }
         "kin_session_start" => {
             let vendor = required_string(arguments, "vendor")?;
@@ -1323,9 +1325,9 @@ pub async fn forward_tool_call(
                 &cwd,
                 capabilities.as_ref(),
             )
-                .await?
-                .map(text_result_from_value)
-                .transpose()
+            .await?
+            .map(text_result_from_value)
+            .transpose()
         }
         "kin_session_heartbeat" => {
             let session_id = required_string(arguments, "session_id")?;
