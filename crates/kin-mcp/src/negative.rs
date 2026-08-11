@@ -179,7 +179,10 @@ fn collection_len(payload: &Value, field: &str) -> Option<usize> {
 /// that an absence would certify a gap the ranking did not report.
 fn locate_result_count(payload: &Value) -> Option<usize> {
     if payload.get("routing").and_then(Value::as_str) == Some("fused-v1") {
-        let files = payload.get("files").and_then(Value::as_array).map(Vec::len)?;
+        let files = payload
+            .get("files")
+            .and_then(Value::as_array)
+            .map(Vec::len)?;
         let entities = payload
             .get("entities")
             .and_then(Value::as_array)
@@ -1808,8 +1811,12 @@ mod tests {
         // qualification at all — an honest-looking negative that had qualified
         // nothing.
         let payload = empty_fused_locate_page("where does the daemon start");
-        let negative =
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
         assert_eq!(negative["kind"], json!("no_ranked_match"));
         assert_eq!(negative["result_count"], json!(0));
         assert_eq!(negative["interpretation"], json!("absent_as_indexed"));
@@ -1826,8 +1833,12 @@ mod tests {
             "total_ranked": 0,
             "results": [],
         });
-        let negative =
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
         assert_eq!(negative["kind"], json!("no_ranked_match"));
         assert_eq!(negative["result_count"], json!(0));
     }
@@ -1838,9 +1849,12 @@ mod tests {
         let mut payload = empty_fused_locate_page("run_fused_locate_for_state");
         payload["entities"] = json!([fused_locate_hit("run_fused_locate_for_state")]);
         payload["total_ranked"] = json!(1);
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1849,9 +1863,12 @@ mod tests {
         // ranking never reported.
         let mut payload = empty_fused_locate_page("where does the daemon start");
         payload["files"] = json!([{ "path": "src/lib.rs", "score": 0.5 }]);
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1859,9 +1876,12 @@ mod tests {
         // Absence is never guessed: without `results` and without the `files`
         // that proves a fused page, emptiness is unknown, not zero.
         let payload = json!({ "query": "x", "routing": "fused-v1", "page": 0 });
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1875,8 +1895,12 @@ mod tests {
             .collect::<Vec<_>>());
         payload["total_ranked"] = json!(9);
         payload["all_fallback"] = json!(true);
-        let negative =
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
         assert_eq!(negative["kind"], json!("no_named_match"));
         assert_eq!(negative["interpretation"], json!("unnamed_ranking"));
         // Qualification, never filtering: every row served is still counted.
@@ -1894,9 +1918,12 @@ mod tests {
         let mut payload = empty_fused_locate_page("run_fused_locate_for_state");
         payload["entities"] = json!([fused_locate_hit("run_fused_locate_for_state")]);
         payload["total_ranked"] = json!(4);
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1908,9 +1935,12 @@ mod tests {
         payload["entities"] = json!([fused_locate_hit("submit_to_queue")]);
         payload["total_ranked"] = json!(3);
         payload["all_fallback"] = json!(true);
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1925,8 +1955,12 @@ mod tests {
                 cosine_locate_hit("neighbor_two", "partial"),
             ],
         });
-        let negative =
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).unwrap();
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
         assert_eq!(negative["kind"], json!("no_named_match"));
         assert_eq!(negative["result_count"], json!(2));
     }
@@ -1943,9 +1977,12 @@ mod tests {
                 cosine_locate_hit("neighbor_two", "none"),
             ],
         });
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1959,9 +1996,12 @@ mod tests {
             "total_ranked": 9,
             "results": [cosine_locate_hit("neighbor_one", "none")],
         });
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1973,9 +2013,12 @@ mod tests {
             "total_ranked": 1,
             "results": [{ "name": "neighbor_one", "score": 0.2 }],
         });
-        assert!(
-            negative_for("semantic_locate", &payload, &semantic_authoritative_envelope()).is_none()
-        );
+        assert!(negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1985,7 +2028,9 @@ mod tests {
         assert!(query_names_a_symbol("LocateResult"));
         assert!(query_names_a_symbol("kin_mcp::negative"));
         assert!(query_names_a_symbol("AGENTS.md"));
-        assert!(!query_names_a_symbol("merge queue captain lane arbitration"));
+        assert!(!query_names_a_symbol(
+            "merge queue captain lane arbitration"
+        ));
         assert!(!query_names_a_symbol("Checks That Cannot Fail"));
         assert!(!query_names_a_symbol("graph-native repo substrate"));
         assert!(!query_names_a_symbol(""));
