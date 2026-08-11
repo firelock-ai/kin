@@ -1202,13 +1202,16 @@ fn render_base(change_id: Option<SemanticChangeId>) -> String {
 
 fn render_list(report: &StashListReport) -> Vec<String> {
     if report.entries.is_empty() {
+        // Phrased as a comparison against the base change for the same reason
+        // `kin status` is: "clean" reads as "everything on disk is in the
+        // graph", which this flag does not mean and cannot answer.
         return vec![format!(
             "(no sealed stashes; workspace {} is {})",
             report.workspace_id,
             if report.workspace_dirty {
-                "dirty"
+                "ahead of its base change"
             } else {
-                "clean"
+                "matching its base change"
             }
         )];
     }

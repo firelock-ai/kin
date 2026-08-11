@@ -604,6 +604,17 @@ pub struct WorkspaceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_tree_hash: Option<Hash256>,
     pub tree_hash: Hash256,
+    /// Whether the workspace tree sits ahead of `base_target`, or carries
+    /// uncommitted semantics.
+    ///
+    /// This answers "does my workspace differ from the change it is based on",
+    /// and it is the only question it answers. It is emphatically not "is
+    /// everything on disk in the graph": a file the graph has never admitted
+    /// contributes nothing to this flag, so a workspace can be dirty with no
+    /// untracked file in sight and can match its base while non-ignored host
+    /// paths sit outside graph truth. `kin graph status` is what reports the
+    /// second question, and the rendered wording here avoids the bare words
+    /// clean and dirty so the two cannot be read as one.
     pub dirty: bool,
     pub artifact_count: usize,
 }
@@ -999,10 +1010,15 @@ fn render_text(
     build: Option<&BuildStatus>,
     footprint: Option<&StoreFootprint>,
 ) -> String {
+    // Named as a comparison against the base change rather than as "clean" or
+    // "dirty". Both bare words invite the reading "everything on disk is in the
+    // graph", which this flag has never meant and cannot answer: untracked host
+    // paths do not move it in either direction. `kin graph status` reports
+    // those, and saying what this line compares keeps the two questions apart.
     let workspace_state = if report.workspace.dirty {
-        "dirty"
+        "ahead of its base change"
     } else {
-        "clean"
+        "matching its base change"
     };
     let enrichment = match report.semantic_enrichment.presence {
         SemanticEnrichmentPresence::Absent => "absent",

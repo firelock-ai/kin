@@ -919,9 +919,15 @@ fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
     );
 }
 
+/// A pending edit to a member both branches hold identically moves across.
+///
+/// `unchanged.txt` is byte-identical on `main` and `feature`, so replaying the
+/// edit onto the destination cannot overwrite anything the branch being entered
+/// holds differently. This is the Git rule: a local change carries when the
+/// branches agree about what it was changing.
 #[cfg(unix)]
 #[test]
-fn branch_switch_rejects_admitted_graph_owned_workspace_changes() {
+fn branch_switch_carries_an_admitted_edit_to_a_member_both_branches_hold_identically() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
@@ -929,15 +935,93 @@ fn branch_switch_rejects_admitted_graph_owned_workspace_changes() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
     let (repository_id, manager) = open_authority(&layout);
-    admit_uncommitted_workspace_edit(&repository_id, &manager, b"unchanged.txt", b"admitted\n");
+    admit_uncommitted_workspace_edit(
+        &repository_id,
+        &manager,
+        &repo,
+        b"unchanged.txt",
+        b"admitted\n",
+    );
+
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
+    assert!(
+        switched.status.success(),
+        "a pending edit to a member both branches share must carry: stdout={} stderr={}",
+        String::from_utf8_lossy(&switched.stdout),
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    assert_eq!(
+        fs::read(repo.join("unchanged.txt")).unwrap(),
+        b"admitted\n",
+        "the carried edit must survive on disk"
+    );
+    assert_eq!(
+        fs::read(repo.join("compose.yaml")).unwrap(),
+        b"services:\n  api:\n    build: .\n",
+        "members the workspace never touched must take the destination's content"
+    );
+
+    let workspace = reopened_workspace(&layout);
+    assert!(
+        workspace.is_dirty(),
+        "carried work stays uncommitted on the destination branch"
+    );
+    assert_eq!(
+        workspace
+            .tree
+            .artifact_at_path(&repo_path(b"unchanged.txt"))
+            .expect("carried member")
+            .entry,
+        kin_model::TreeEntry::blob(
+            kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(b"admitted\n")),
+            false
+        )
+    );
+}
+
+/// A pending edit to a member the branches disagree about refuses.
+///
+/// `compose.yaml` differs between `main` and `feature`, so replaying the edit
+/// would silently drop whichever side lost. Git refuses this as "your local
+/// changes would be overwritten by checkout"; so does Kin, by exact path.
+#[cfg(unix)]
+#[test]
+fn branch_switch_refuses_an_admitted_edit_to_a_member_the_branches_disagree_about() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    let (repository_id, manager) = open_authority(&layout);
+    admit_uncommitted_workspace_edit(
+        &repository_id,
+        &manager,
+        &repo,
+        b"compose.yaml",
+        b"services:\n  mine: {}\n",
+    );
     let before = manager.read_authority().roots().clone();
 
     let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
     assert!(!switched.status.success());
     let stderr = String::from_utf8_lossy(&switched.stderr);
     assert!(
-        stderr.contains("has graph-owned changes"),
-        "admitted workspace state must refuse as graph-owned, got {stderr}"
+        stderr.contains("compose.yaml"),
+        "the refusal must name the exact blocked path, got {stderr}"
+    );
+    assert!(
+        stderr.contains("holds this member differently"),
+        "the refusal must say which side the path would have cost, got {stderr}"
+    );
+    assert!(
+        stderr.contains("Commit these") && stderr.contains("kin stash push"),
+        "the refusal must name both remedies, got {stderr}"
+    );
+    assert_eq!(
+        fs::read(repo.join("compose.yaml")).unwrap(),
+        b"services:\n  mine: {}\n",
+        "a refused switch leaves the workspace exactly as it was"
     );
     assert_eq!(
         manager.read_authority().roots(),
@@ -946,48 +1030,289 @@ fn branch_switch_rejects_admitted_graph_owned_workspace_changes() {
     );
 }
 
-/// Publish one uncommitted edit to a tracked workspace member straight through
-/// repository authority, exactly as an admission seam does. This produces the
-/// graph-owned dirty state a transition must refuse without depending on
-/// whichever host events a watcher happens to deliver.
+/// A pending addition at a path the destination does not track carries.
+///
+/// This is the case the whole change exists for: ambient observation admits
+/// every new non-ignored file, so a scratch note is uncommitted graph truth
+/// within seconds of being written, and Git would have carried it in silence.
 #[cfg(unix)]
-fn admit_uncommitted_workspace_edit(
-    repository_id: &RepositoryId,
+#[test]
+fn branch_switch_carries_an_admitted_addition_the_destination_does_not_track() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    let (repository_id, manager) = open_authority(&layout);
+    let admitted = admit_uncommitted_workspace_addition(
+        &repository_id,
+        &manager,
+        &repo,
+        b"scratch-note.md",
+        b"thinking out loud\n",
+    );
+
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
+    assert!(
+        switched.status.success(),
+        "a pending addition the destination does not track must carry: stdout={} stderr={}",
+        String::from_utf8_lossy(&switched.stdout),
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    assert_eq!(
+        fs::read(repo.join("scratch-note.md")).unwrap(),
+        b"thinking out loud\n",
+        "the carried addition must survive on disk"
+    );
+    assert!(
+        String::from_utf8_lossy(&switched.stdout).contains("scratch-note.md"),
+        "the switch must say where the pending work went, got {}",
+        String::from_utf8_lossy(&switched.stdout)
+    );
+
+    let workspace = reopened_workspace(&layout);
+    assert!(
+        workspace.is_dirty(),
+        "a carried addition is still uncommitted on the destination branch"
+    );
+    let carried = workspace
+        .tree
+        .artifact_at_path(&repo_path(b"scratch-note.md"))
+        .expect("carried addition stays in the workspace tree");
+    assert_eq!(
+        carried.artifact_id, admitted,
+        "carrying preserves the identity the entry was admitted under"
+    );
+    assert!(
+        workspace
+            .tree
+            .artifact_at_path(&repo_path(b"Dockerfile"))
+            .is_some(),
+        "the destination branch's own members arrive alongside the carried work"
+    );
+}
+
+/// A pending addition the destination tracks with different content refuses.
+///
+/// `Dockerfile` exists only on `feature`, so admitting one on `main` and then
+/// switching is exactly Git's "untracked working tree file would be overwritten
+/// by checkout".
+#[cfg(unix)]
+#[test]
+fn branch_switch_refuses_an_admitted_addition_the_destination_tracks_differently() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    let (repository_id, manager) = open_authority(&layout);
+    admit_uncommitted_workspace_addition(
+        &repository_id,
+        &manager,
+        &repo,
+        b"Dockerfile",
+        b"FROM mine\n",
+    );
+    let before = manager.read_authority().roots().clone();
+
+    let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
+    assert!(!switched.status.success());
+    let stderr = String::from_utf8_lossy(&switched.stderr);
+    assert!(
+        stderr.contains("Dockerfile"),
+        "the refusal must name the exact blocked path, got {stderr}"
+    );
+    assert!(
+        stderr.contains("would overwrite"),
+        "the refusal must say what carrying would have cost, got {stderr}"
+    );
+    assert!(
+        stderr.contains("Commit these") && stderr.contains("kin stash push"),
+        "the refusal must name both remedies, got {stderr}"
+    );
+    assert_eq!(
+        fs::read(repo.join("Dockerfile")).unwrap(),
+        b"FROM mine\n",
+        "a refused switch leaves the workspace exactly as it was"
+    );
+    assert_eq!(
+        manager.read_authority().roots(),
+        &before,
+        "refused switch advanced repository authority"
+    );
+}
+
+/// Switching away and back leaves the pending tree byte-identical.
+///
+/// A carry that quietly re-identified or re-encoded the pending entry would
+/// still pass the single-hop tests. Only the round trip proves the entry that
+/// comes home is the one that left.
+#[cfg(unix)]
+#[test]
+fn branch_switch_round_trip_leaves_the_carried_workspace_byte_identical() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    initialize_git_repo(&repo);
+    add_feature_branch(&repo);
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    let (repository_id, manager) = open_authority(&layout);
+    admit_uncommitted_workspace_addition(
+        &repository_id,
+        &manager,
+        &repo,
+        b"scratch-note.md",
+        b"thinking out loud\n",
+    );
+    let departed = reopened_workspace(&layout);
+
+    for branch in ["feature", "main"] {
+        let switched = run_kin(&runtime, &repo, &["branch", "switch", branch]);
+        assert!(
+            switched.status.success(),
+            "switch to {branch} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&switched.stdout),
+            String::from_utf8_lossy(&switched.stderr)
+        );
+    }
+
+    let returned = reopened_workspace(&layout);
+    assert_eq!(
+        returned.tree, departed.tree,
+        "a round trip must reproduce the pending tree exactly"
+    );
+    assert_eq!(returned.tree_hash, departed.tree_hash);
+    assert_eq!(returned.base_tree_hash, departed.base_tree_hash);
+    assert_eq!(
+        fs::read(repo.join("scratch-note.md")).unwrap(),
+        b"thinking out loud\n"
+    );
+}
+
+#[cfg(unix)]
+fn repo_path(path: &[u8]) -> kin_model::RepoPath {
+    kin_model::RepoPath::from_bytes(path.to_vec()).expect("repository path")
+}
+
+#[cfg(unix)]
+fn current_workspace(
     manager: &RepositoryAuthorityManager<LocalFileBackend>,
-    path: &[u8],
-    body: &[u8],
-) {
+) -> kin_model::WorkspaceState {
     let lease = manager.read_authority();
-    let roots = lease.roots().clone();
     let workspace = lease
         .metadata()
         .workspaces
         .first()
         .expect("local workspace")
         .clone();
-    drop(lease);
+    workspace
+}
 
-    let repo_path =
-        kin_model::RepoPath::from_bytes(path.to_vec()).expect("tracked repository path");
+/// Read the workspace through a manager opened after the command under test.
+///
+/// A handle opened before a switch keeps answering from the lease it already
+/// holds, so asserting post-switch state through it reads the state the test
+/// set up and passes whether or not the switch did anything. Reopening is what
+/// makes these assertions able to disagree.
+#[cfg(unix)]
+fn reopened_workspace(layout: &kin_core::KinLayout) -> kin_model::WorkspaceState {
+    let (_, manager) = open_authority(layout);
+    current_workspace(&manager)
+}
+
+/// Publish one uncommitted addition at an untracked path, exactly as ambient
+/// observation does, and leave the bytes on disk where it found them.
+///
+/// Returns the artifact identity the entry was admitted under, so a caller can
+/// prove a carry preserved it rather than minting a fresh one.
+#[cfg(unix)]
+fn admit_uncommitted_workspace_addition(
+    repository_id: &RepositoryId,
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    repo: &Path,
+    path: &[u8],
+    body: &[u8],
+) -> kin_model::ArtifactId {
+    let workspace = current_workspace(manager);
+    let target = repo_path(path);
+    assert!(
+        workspace.tree.artifact_at_path(&target).is_none(),
+        "an addition fixture must name a path the workspace does not already track"
+    );
+    let artifact_id = kin_model::ArtifactId::new();
+    let entry = save_admitted_bytes(manager, body);
+    let deltas = vec![kin_model::TreeDelta::Added {
+        artifact_id,
+        new: kin_model::LocatedEntry::new(target, entry),
+    }];
+    publish_uncommitted_workspace_deltas(repository_id, manager, repo, workspace, deltas, path, body);
+    artifact_id
+}
+
+/// Publish one uncommitted edit to a tracked workspace member straight through
+/// repository authority, exactly as an admission seam does. This produces the
+/// graph-owned pending state a transition must decide about without depending
+/// on whichever host events a watcher happens to deliver.
+#[cfg(unix)]
+fn admit_uncommitted_workspace_edit(
+    repository_id: &RepositoryId,
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    repo: &Path,
+    path: &[u8],
+    body: &[u8],
+) {
+    let workspace = current_workspace(manager);
+    let target = repo_path(path);
     let artifact = workspace
         .tree
-        .artifact_at_path(&repo_path)
+        .artifact_at_path(&target)
         .expect("tracked workspace member")
         .clone();
+    let entry = save_admitted_bytes(manager, body);
+    let deltas = vec![kin_model::TreeDelta::Updated {
+        artifact_id: artifact.artifact_id,
+        old: artifact.located_entry(),
+        new: kin_model::LocatedEntry::new(target, entry),
+    }];
+    publish_uncommitted_workspace_deltas(repository_id, manager, repo, workspace, deltas, path, body);
+}
+
+#[cfg(unix)]
+fn save_admitted_bytes(
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    body: &[u8],
+) -> kin_model::TreeEntry {
     let digest = kin_model::Hash256::from_bytes(kin_blobs::digest_bytes(body));
     manager
         .save_source_blob(digest, body)
         .expect("save admitted source bytes");
-    let entry = kin_model::TreeEntry::blob(digest, false);
-    let deltas = vec![kin_model::TreeDelta::Updated {
-        artifact_id: artifact.artifact_id,
-        old: artifact.located_entry(),
-        new: kin_model::LocatedEntry::new(repo_path, entry),
-    }];
+    kin_model::TreeEntry::blob(digest, false)
+}
+
+/// Commit the admission, then leave the working copy agreeing with it.
+///
+/// Authority moves first on purpose. The projection drift check reads every
+/// tracked path before a transition, so a fixture that wrote the file first
+/// would be racing the daemon's own observation of it; admitting first and
+/// writing second means both orders end at the same agreeing state.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn publish_uncommitted_workspace_deltas(
+    repository_id: &RepositoryId,
+    manager: &RepositoryAuthorityManager<LocalFileBackend>,
+    repo: &Path,
+    workspace: kin_model::WorkspaceState,
+    deltas: Vec<kin_model::TreeDelta>,
+    path: &[u8],
+    body: &[u8],
+) {
+    let roots = manager.read_authority().roots().clone();
     let tree = workspace
         .tree
         .apply(&deltas)
-        .expect("apply admitted workspace edit");
+        .expect("apply admitted workspace change");
     let tree_hash = kin_model::compute_resolved_tree_hash(&tree).expect("hash admitted tree");
     manager
         .commit_repository_transaction(RepositoryTransaction {
@@ -1029,7 +1354,13 @@ fn admit_uncommitted_workspace_edit(
             merge_transaction_delta: None,
             sealed_observation: None,
         })
-        .expect("commit admitted workspace edit");
+        .expect("commit admitted workspace change");
+
+    let host_path = repo.join(String::from_utf8(path.to_vec()).expect("utf-8 fixture path"));
+    if let Some(parent) = host_path.parent() {
+        fs::create_dir_all(parent).expect("create admitted parent directory");
+    }
+    fs::write(&host_path, body).expect("leave the working copy agreeing with the admission");
 }
 
 #[cfg(unix)]
