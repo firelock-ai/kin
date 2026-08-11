@@ -949,6 +949,81 @@ fn check_shell_path() -> HealthCheck {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
 
+    shell_path_check_from(ShellIntegrationState {
+        shell,
+        hook_path: &hook_path,
+        rc_display: &rc_display,
+        bin_dir: &bin_dir,
+        hook_installed,
+        rc_sources,
+        on_path,
+        rc_sets_path,
+        recorded_by_setup: shell_integration_recorded_by_setup(),
+    })
+}
+
+/// Whether `kin setup` recorded installing any part of the shell integration.
+///
+/// A hook Kin never claimed to install is not Kin's failure. The install ledger
+/// is the record of having claimed it, and it is what separates the two meanings
+/// of "no hook here": a machine where setup has not run, where nothing of Kin's
+/// is broken, from one where setup wrote a hook that has since been removed or
+/// unsourced, which is a real regression.
+///
+/// An unreadable or absent ledger yields false, which is the conservative
+/// direction: it can only report an unconfigured shell as unconfigured.
+fn shell_integration_recorded_by_setup() -> bool {
+    use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
+
+    let Ok(path) = ledger_path() else {
+        return false;
+    };
+    let Ok(ledger) = SetupLedger::load(&path) else {
+        return false;
+    };
+    ledger.entries.iter().any(|entry| {
+        matches!(
+            entry.kind,
+            ArtifactKind::ShellHook | ArtifactKind::ShellRcLine | ArtifactKind::ShellPathLine
+        )
+    })
+}
+
+/// Probed shell-integration facts, separated from the environment that produced
+/// them so both directions of the verdict are testable without a real `$HOME`.
+struct ShellIntegrationState<'a> {
+    shell: &'a str,
+    hook_path: &'a Path,
+    rc_display: &'a str,
+    bin_dir: &'a Path,
+    hook_installed: bool,
+    rc_sources: bool,
+    on_path: bool,
+    rc_sets_path: bool,
+    recorded_by_setup: bool,
+}
+
+/// Build the shell integration check from probed state.
+///
+/// `recorded_by_setup` decides the severity of an absent hook, and only that.
+/// The installer publishes `KIN_NO_SETUP=1` on its own install page and then
+/// says to run `kin setup` when ready, so a machine that took that path has no
+/// hook by instruction. Scoring it a failure told every such user their healthy
+/// install was broken. A hook setup did write and that is now gone stays a
+/// failure, because that is Kin's own artifact missing.
+fn shell_path_check_from(state: ShellIntegrationState<'_>) -> HealthCheck {
+    let ShellIntegrationState {
+        shell,
+        hook_path,
+        rc_display,
+        bin_dir,
+        hook_installed,
+        rc_sources,
+        on_path,
+        rc_sets_path,
+        recorded_by_setup,
+    } = state;
+
     if hook_installed && rc_sources && (on_path || rc_sets_path) {
         let detail = match (on_path, rc_sets_path) {
             (true, _) => {
@@ -972,6 +1047,15 @@ fn check_shell_path() -> HealthCheck {
             detail,
         )
         .fixable()
+    } else if !recorded_by_setup {
+        HealthCheck::new(
+            "shell_path",
+            "Shell integration",
+            HealthStatus::Unsupported,
+            format!("{shell}: kin setup has not installed a shell hook yet"),
+        )
+        .fixable()
+        .with_manual_fix("run `kin setup` (or `kin doctor --fix`) to install the shell hook")
     } else {
         let mut missing = Vec::new();
         if !hook_installed {
@@ -2490,6 +2574,95 @@ mod tests {
         );
         assert!(is_failing(&broken.status));
         assert!(broken.detail.contains("--global"));
+    }
+
+    fn shell_state(
+        hook_installed: bool,
+        recorded_by_setup: bool,
+    ) -> ShellIntegrationState<'static> {
+        ShellIntegrationState {
+            shell: "zsh",
+            hook_path: Path::new("/home/u/.kin/shell/kin-vfs.zsh"),
+            rc_display: "/home/u/.zshrc",
+            bin_dir: Path::new("/home/u/.kin/bin"),
+            hook_installed,
+            rc_sources: hook_installed,
+            on_path: hook_installed,
+            rc_sets_path: hook_installed,
+            recorded_by_setup,
+        }
+    }
+
+    /// The install page publishes `KIN_NO_SETUP=1`, the installer honors it and
+    /// says to run `kin setup` when ready, and this check then scored that exact
+    /// state a failure. A hook Kin never claimed to install is not Kin's
+    /// failure; one it did claim and that is now gone is.
+    #[test]
+    fn a_shell_hook_setup_never_installed_does_not_fail_kin() {
+        let unconfigured = shell_path_check_from(shell_state(false, false));
+        assert_eq!(unconfigured.id, "shell_path");
+        assert!(
+            matches!(unconfigured.status, HealthStatus::Unsupported),
+            "a shell setup never touched must not fail Kin, got {:?}",
+            unconfigured.status
+        );
+        assert!(!is_failing(&unconfigured.status));
+        assert!(
+            unconfigured.fixable && unconfigured.manual_fix.is_some(),
+            "the offer to install the hook must survive the reclassification"
+        );
+        assert!(
+            unconfigured
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("kin setup")),
+            "the remedy must name the command that installs the hook"
+        );
+
+        // Falsification: flip only the ledger record.
+        let removed = shell_path_check_from(shell_state(false, true));
+        assert!(
+            matches!(removed.status, HealthStatus::Misconfigured),
+            "a hook setup recorded installing and that is now gone must stay a \
+             failure, got {:?}",
+            removed.status
+        );
+        assert!(is_failing(&removed.status));
+        assert!(removed.detail.contains("hook missing at"));
+
+        // A working integration is healthy whether or not a ledger records it:
+        // an older install predates the ledger and is not broken by its absence.
+        for recorded in [false, true] {
+            let healthy = shell_path_check_from(shell_state(true, recorded));
+            assert!(
+                matches!(healthy.status, HealthStatus::Healthy),
+                "an installed and sourced hook is healthy, got {:?}",
+                healthy.status
+            );
+        }
+    }
+
+    /// The sixth check of this class. A machine healthy except for never having
+    /// run setup must tally no failures, or the footer still closes red on a
+    /// perfectly good install.
+    #[test]
+    fn a_never_configured_shell_leaves_the_summary_without_failures() {
+        let report = HealthReport {
+            platform: "test".to_string(),
+            checks: vec![
+                check_with("kin_binary", HealthStatus::Healthy),
+                check_with("kin_daemon_binary", HealthStatus::Healthy),
+                shell_path_check_from(shell_state(false, false)),
+            ],
+        };
+        let summary = report.summary();
+        assert_eq!(
+            summary.attention, 0,
+            "a healthy install that has not run setup must report nothing needing attention"
+        );
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.skipped, 1);
+        assert!(!report.checks.iter().any(|check| is_failing(&check.status)));
     }
 
     #[cfg(feature = "vector")]
