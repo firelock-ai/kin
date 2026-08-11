@@ -24,6 +24,7 @@ pub mod git_init;
 pub mod hooks;
 pub mod init;
 mod init_progress;
+mod init_staging;
 pub mod layout;
 pub mod manifest;
 pub mod ranking;
