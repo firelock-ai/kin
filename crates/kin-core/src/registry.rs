@@ -1580,6 +1580,11 @@ fn write_registry_atomically(
 }
 
 /// `~/.kin/registry.toml` path (cross-platform).
+///
+/// This also fixes the supervisor directory, which is this path's parent. That
+/// makes the supervisor a machine-level singleton keyed on the real home (or an
+/// explicit `KIN_REGISTRY_PATH`), deliberately *not* on `KIN_HOME`: see
+/// [`managed_kin_home`] for the boundary each variable actually draws.
 pub fn registry_path() -> PathBuf {
     if let Some(path) = std::env::var_os("KIN_REGISTRY_PATH") {
         return PathBuf::from(path);
@@ -1590,6 +1595,71 @@ pub fn registry_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".kin")
         .join("registry.toml")
+}
+
+/// The managed Kin install root this process resolves: `KIN_HOME`, then the
+/// `KIN_DIR` compatibility alias, then `<home>/.kin`.
+///
+/// This is the boundary `KIN_HOME` genuinely draws. It bounds store and install
+/// state; it does not move the supervisor, whose directory comes from
+/// [`registry_path`] and therefore from the real home. One supervisor can
+/// consequently hold daemons launched under several managed homes, so every
+/// daemon records the value this returns and the census partitions on it.
+///
+/// Both the CLI and the daemon call this same function, so two processes that
+/// resolve independently agree by construction.
+pub fn managed_kin_home() -> PathBuf {
+    resolve_managed_kin_home(
+        cfg!(windows),
+        |key| std::env::var_os(key),
+        || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+        || directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
+    )
+}
+
+/// The policy behind [`managed_kin_home`], with the platform, the environment,
+/// and both OS home lookups taken as arguments.
+///
+/// The Windows arm is a runtime branch rather than a `#[cfg]` block so it is
+/// compiled and tested on every host, including the ones this fleet actually
+/// builds on.
+pub(crate) fn resolve_managed_kin_home(
+    windows: bool,
+    var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
+    known_profile_root: impl FnOnce() -> Option<PathBuf>,
+    base_dirs_home: impl FnOnce() -> Option<PathBuf>,
+) -> PathBuf {
+    for key in ["KIN_HOME", "KIN_DIR"] {
+        if let Some(value) = var_os(key).filter(|value| !value.is_empty()) {
+            return PathBuf::from(value);
+        }
+    }
+
+    let home = if windows {
+        var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(known_profile_root)
+            .or_else(base_dirs_home)
+    } else {
+        base_dirs_home()
+    };
+
+    home.unwrap_or_else(|| PathBuf::from(".")).join(".kin")
+}
+
+/// Stable string identity for a managed home, for comparison between processes
+/// that resolved it independently.
+///
+/// A home that does not exist yet cannot be canonicalized; its literal path is
+/// used instead. Two processes that disagree about whether it existed therefore
+/// compare as *different* homes, which is the safe direction: an unrecognized
+/// home is skipped and named rather than silently swept up.
+pub fn managed_kin_home_id(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -2467,5 +2537,100 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&Path::new("/a")));
         assert!(paths.contains(&Path::new("/b")));
+    }
+
+    /// Resolve against a stated environment, so no test reads ambient state.
+    fn managed_home_with(windows: bool, env: &[(&str, &str)]) -> PathBuf {
+        let owned: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        resolve_managed_kin_home(
+            windows,
+            |key| {
+                owned
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            },
+            || Some(PathBuf::from("/profile-root")),
+            || Some(PathBuf::from("/base-home")),
+        )
+    }
+
+    #[test]
+    fn kin_home_wins_over_kin_dir_and_the_home_fallback() {
+        assert_eq!(
+            managed_home_with(false, &[("KIN_HOME", "/pinned"), ("KIN_DIR", "/alias")]),
+            PathBuf::from("/pinned")
+        );
+    }
+
+    #[test]
+    fn kin_dir_is_the_compatibility_alias() {
+        assert_eq!(
+            managed_home_with(false, &[("KIN_DIR", "/alias")]),
+            PathBuf::from("/alias")
+        );
+    }
+
+    #[test]
+    fn an_empty_pin_is_not_a_home() {
+        assert_eq!(
+            managed_home_with(false, &[("KIN_HOME", ""), ("KIN_DIR", "")]),
+            PathBuf::from("/base-home/.kin")
+        );
+    }
+
+    #[test]
+    fn unpinned_falls_back_to_the_real_home() {
+        assert_eq!(
+            managed_home_with(false, &[]),
+            PathBuf::from("/base-home/.kin")
+        );
+    }
+
+    #[test]
+    fn windows_prefers_the_user_profile_for_the_fallback_home() {
+        assert_eq!(
+            managed_home_with(true, &[("USERPROFILE", "/users/kin")]),
+            PathBuf::from("/users/kin/.kin")
+        );
+        assert_eq!(
+            managed_home_with(true, &[]),
+            PathBuf::from("/profile-root/.kin")
+        );
+    }
+
+    /// The distinction the supervisor scoping contract rests on: a pinned
+    /// `KIN_HOME` moves the managed home while the supervisor's own directory,
+    /// which hangs off [`registry_path`], stays put.
+    #[test]
+    fn pinning_kin_home_does_not_move_the_registry_path() {
+        let pinned = managed_home_with(false, &[("KIN_HOME", "/scratch/home")]);
+        let unpinned = managed_home_with(false, &[]);
+        assert_ne!(pinned, unpinned);
+
+        // `registry_path` reads only `KIN_REGISTRY_PATH` and the real home, so
+        // no value of `KIN_HOME` can appear in it.
+        assert!(!registry_path().starts_with("/scratch/home"));
+    }
+
+    #[test]
+    fn a_missing_home_keeps_its_literal_identity() {
+        let missing = PathBuf::from("/definitely/not/present/.kin");
+        assert_eq!(
+            managed_kin_home_id(&missing),
+            missing.display().to_string()
+        );
+    }
+
+    #[test]
+    fn identity_is_stable_for_a_home_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            managed_kin_home_id(dir.path()),
+            managed_kin_home_id(dir.path())
+        );
     }
 }

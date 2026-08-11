@@ -63,6 +63,17 @@ pub struct RepoDaemonRegistration {
     pub endpoint: String,
     #[serde(default)]
     pub graph_entity_count: Option<usize>,
+    /// The managed Kin home this daemon runs under, as
+    /// `kin_core::registry::managed_kin_home` resolved it in this process.
+    ///
+    /// The supervisor is machine-wide, so one registry legitimately holds
+    /// daemons from several homes. This is what lets a census partition them
+    /// and lets a home-scoped stop tell its own daemons from a neighbour's. A
+    /// daemon registered by a binary predating the field sends nothing, and an
+    /// empty value stays empty rather than being resolved from the
+    /// supervisor's environment, which is a different process's home.
+    #[serde(default)]
+    pub kin_home: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +89,10 @@ pub struct RegisteredRepoDaemon {
     pub endpoint: String,
     #[serde(default)]
     pub graph_entity_count: Option<usize>,
+    /// See [`RepoDaemonRegistration::kin_home`]. Empty means "not recorded",
+    /// which is never the same answer as "matches the caller".
+    #[serde(default)]
+    pub kin_home: String,
     pub registered_at: String,
     pub last_heartbeat_at: String,
     #[serde(skip)]
@@ -459,6 +474,17 @@ fn instance_id_for_payload(payload: &RepoDaemonRegistration) -> String {
     instance_id_for(payload.pid, payload.port)
 }
 
+/// The managed home a registering daemon reports, trimmed and never guessed.
+///
+/// An older daemon sends nothing here. The supervisor deliberately does not
+/// substitute its own resolved home: the supervisor is machine-wide and its
+/// environment says nothing about the environment its workers were launched
+/// with, so filling the gap would manufacture exactly the false match this
+/// field exists to prevent.
+fn kin_home_for_payload(payload: &RepoDaemonRegistration) -> String {
+    payload.kin_home.trim().to_string()
+}
+
 fn repo_registration_payload(state: &DaemonState, port: u16) -> RepoDaemonRegistration {
     let working_dir = state.layout.working_dir();
     let pid = std::process::id();
@@ -471,6 +497,9 @@ fn repo_registration_payload(state: &DaemonState, port: u16) -> RepoDaemonRegist
         port,
         endpoint: format!("http://127.0.0.1:{port}"),
         graph_entity_count: Some(state.graph.entity_count()),
+        kin_home: kin_core::registry::managed_kin_home_id(
+            &kin_core::registry::managed_kin_home(),
+        ),
     }
 }
 
@@ -1202,6 +1231,8 @@ async fn register_daemon(
     let now = chrono::Utc::now().to_rfc3339();
     let heartbeat_ms = state.elapsed_ms();
     let instance_id = instance_id_for_payload(&payload);
+    let display_name = display_name_for_payload(&payload);
+    let kin_home = kin_home_for_payload(&payload);
     let mut repos = state.repo_daemons.write().await;
     if let Some(existing) = repos.get(&payload.repo_id) {
         if existing.instance_id != instance_id {
@@ -1210,13 +1241,14 @@ async fn register_daemon(
     }
     let record = RegisteredRepoDaemon {
         repo_id: payload.repo_id.clone(),
-        display_name: display_name_for_payload(&payload),
+        display_name,
         instance_id,
         repo_root: payload.repo_root,
         pid: payload.pid,
         port: payload.port,
         endpoint: payload.endpoint,
         graph_entity_count: payload.graph_entity_count,
+        kin_home,
         registered_at: now.clone(),
         last_heartbeat_at: now,
         last_heartbeat_elapsed_ms: heartbeat_ms,
@@ -1235,6 +1267,8 @@ async fn heartbeat_daemon(
     let now = chrono::Utc::now().to_rfc3339();
     let heartbeat_ms = state.elapsed_ms();
     let instance_id = instance_id_for_payload(&payload);
+    let display_name = display_name_for_payload(&payload);
+    let kin_home = kin_home_for_payload(&payload);
     let mut repos = state.repo_daemons.write().await;
     if let Some(existing) = repos.get(&repo_id) {
         if existing.instance_id != instance_id {
@@ -1245,24 +1279,26 @@ async fn heartbeat_daemon(
         .entry(repo_id.clone())
         .or_insert_with(|| RegisteredRepoDaemon {
             repo_id: repo_id.clone(),
-            display_name: display_name_for_payload(&payload),
+            display_name: display_name.clone(),
             instance_id: instance_id.clone(),
             repo_root: payload.repo_root.clone(),
             pid: payload.pid,
             port: payload.port,
             endpoint: payload.endpoint.clone(),
             graph_entity_count: payload.graph_entity_count,
+            kin_home: kin_home.clone(),
             registered_at: now.clone(),
             last_heartbeat_at: now.clone(),
             last_heartbeat_elapsed_ms: heartbeat_ms,
         });
-    record.display_name = display_name_for_payload(&payload);
+    record.display_name = display_name;
     record.instance_id = instance_id;
     record.repo_root = payload.repo_root;
     record.pid = payload.pid;
     record.port = payload.port;
     record.endpoint = payload.endpoint;
     record.graph_entity_count = payload.graph_entity_count;
+    record.kin_home = kin_home;
     record.last_heartbeat_at = now;
     record.last_heartbeat_elapsed_ms = heartbeat_ms;
     (StatusCode::OK, Json(record.clone()))
@@ -2074,6 +2110,11 @@ async fn adopt_daemon(state: &SupervisorState, daemon: &DiscoveredDaemon, reason
         port,
         endpoint: format!("http://127.0.0.1:{port}"),
         graph_entity_count: None,
+        // An adopted daemon never registered, so nothing told the supervisor
+        // which managed home it runs under. Left unrecorded on purpose: a
+        // home-scoped stop then skips and names it instead of assuming it is
+        // the caller's.
+        kin_home: String::new(),
         registered_at: now.clone(),
         last_heartbeat_at: now,
         last_heartbeat_elapsed_ms: heartbeat_ms,
@@ -2407,6 +2448,14 @@ mod tests {
     }
 
     fn repo_payload(instance_id: &str, port: u16) -> RepoDaemonRegistration {
+        repo_payload_in_home(instance_id, port, "/homes/a/.kin")
+    }
+
+    fn repo_payload_in_home(
+        instance_id: &str,
+        port: u16,
+        kin_home: &str,
+    ) -> RepoDaemonRegistration {
         RepoDaemonRegistration {
             repo_id: "demo".to_string(),
             display_name: "demo".to_string(),
@@ -2416,6 +2465,7 @@ mod tests {
             port,
             endpoint: format!("http://127.0.0.1:{port}"),
             graph_entity_count: Some(12),
+            kin_home: kin_home.to_string(),
         }
     }
 
@@ -3740,5 +3790,100 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn registry_records_the_managed_home_a_daemon_reports() {
+        let state = Arc::new(SupervisorState::new());
+        let payload = repo_payload_in_home("instance-a", 49152, "/scratch/home/.kin");
+
+        let response = register_repo(router(Arc::clone(&state)), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let repos = state.repo_daemons.read().await;
+        assert_eq!(repos.get("demo").unwrap().kin_home, "/scratch/home/.kin");
+    }
+
+    /// One machine-wide supervisor legitimately holds daemons from several
+    /// managed homes. That is the whole premise of the scoping contract, so it
+    /// is asserted rather than assumed.
+    #[tokio::test]
+    async fn one_supervisor_holds_daemons_from_two_homes() {
+        let state = Arc::new(SupervisorState::new());
+        let app = router(Arc::clone(&state));
+
+        let mut a = repo_payload_in_home("instance-a", 49152, "/homes/a/.kin");
+        a.repo_id = "repo-a".to_string();
+        let mut b = repo_payload_in_home("instance-b", 49153, "/homes/b/.kin");
+        b.repo_id = "repo-b".to_string();
+
+        assert_eq!(
+            register_repo(app.clone(), &a).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(register_repo(app, &b).await.status(), StatusCode::OK);
+
+        let repos = state.repo_daemons.read().await;
+        assert_eq!(repos.get("repo-a").unwrap().kin_home, "/homes/a/.kin");
+        assert_eq!(repos.get("repo-b").unwrap().kin_home, "/homes/b/.kin");
+    }
+
+    /// A daemon that reports no home must stay unrecorded. The supervisor's own
+    /// environment is a different process's home, and substituting it would
+    /// manufacture a match that lets a scoped stop reach a foreign daemon.
+    #[tokio::test]
+    async fn an_unreported_home_is_never_filled_in_from_the_supervisor() {
+        let state = Arc::new(SupervisorState::new());
+        let payload = repo_payload_in_home("instance-a", 49152, "   ");
+
+        let response = register_repo(router(Arc::clone(&state)), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let repos = state.repo_daemons.read().await;
+        assert!(repos.get("demo").unwrap().kin_home.is_empty());
+    }
+
+    /// A registration from a binary predating the field omits it entirely.
+    #[test]
+    fn a_registration_without_the_field_deserializes_as_unrecorded() {
+        let json = serde_json::json!({
+            "repo_id": "demo",
+            "repo_root": "/tmp/demo",
+            "pid": 1234,
+            "port": 49152,
+            "endpoint": "http://127.0.0.1:49152",
+        });
+        let payload: RepoDaemonRegistration = serde_json::from_value(json).unwrap();
+        assert!(payload.kin_home.is_empty());
+        assert!(kin_home_for_payload(&payload).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_keeps_the_recorded_home_current() {
+        let state = Arc::new(SupervisorState::new());
+        let app = router(Arc::clone(&state));
+        let payload = repo_payload_in_home("instance-a", 49152, "/homes/a/.kin");
+        assert_eq!(
+            register_repo(app.clone(), &payload).await.status(),
+            StatusCode::OK
+        );
+
+        let moved = RepoDaemonRegistration {
+            kin_home: "/homes/moved/.kin".to_string(),
+            ..payload.clone()
+        };
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::post("/daemons/demo/heartbeat")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&moved).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let repos = state.repo_daemons.read().await;
+        assert_eq!(repos.get("demo").unwrap().kin_home, "/homes/moved/.kin");
     }
 }

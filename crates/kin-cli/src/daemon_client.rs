@@ -174,10 +174,68 @@ pub struct RegisteredRepoDaemon {
     pub endpoint: String,
     #[serde(default)]
     pub graph_entity_count: Option<usize>,
+    /// The managed Kin home the daemon reported at registration, empty when it
+    /// is not recorded (an older daemon, or one the supervisor adopted rather
+    /// than received a registration from).
+    ///
+    /// The supervisor is machine-wide while `KIN_HOME` bounds store and install
+    /// state, so a single registry legitimately lists daemons from several
+    /// homes. This is what the census labels and what a home-scoped
+    /// `kin daemon stop --all` partitions on.
+    #[serde(default)]
+    pub kin_home: String,
     #[serde(default)]
     pub registered_at: Option<String>,
     #[serde(default)]
     pub last_heartbeat_at: String,
+}
+
+/// How a registered daemon's home relates to the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonHomeScope {
+    /// The daemon recorded the same managed home the caller resolves.
+    Own,
+    /// The daemon recorded a different managed home.
+    Foreign,
+    /// No home was recorded, so the relationship cannot be established.
+    ///
+    /// Deliberately distinct from [`DaemonHomeScope::Foreign`]: both are
+    /// excluded from a home-scoped sweep, but only one of them can be reported
+    /// with a home to name.
+    Unrecorded,
+}
+
+impl RegisteredRepoDaemon {
+    /// Classify this daemon against a caller's resolved managed home.
+    ///
+    /// An unrecorded home is never treated as a match. Failing to stop a daemon
+    /// is visible and recoverable; stopping a neighbour's is neither.
+    pub fn home_scope(&self, caller_home_id: &str) -> DaemonHomeScope {
+        let recorded = self.kin_home.trim();
+        if recorded.is_empty() {
+            DaemonHomeScope::Unrecorded
+        } else if recorded == caller_home_id {
+            DaemonHomeScope::Own
+        } else {
+            DaemonHomeScope::Foreign
+        }
+    }
+
+    /// The recorded home to show an operator, or a stated absence.
+    pub fn home_label(&self) -> &str {
+        let recorded = self.kin_home.trim();
+        if recorded.is_empty() {
+            "unrecorded"
+        } else {
+            recorded
+        }
+    }
+}
+
+/// The managed Kin home this process resolves, in the string form recorded by
+/// registering daemons.
+pub fn caller_home_id() -> String {
+    kin_core::registry::managed_kin_home_id(&kin_core::registry::managed_kin_home())
 }
 
 /// Fetch the repo daemons registered with a running supervisor via `GET
