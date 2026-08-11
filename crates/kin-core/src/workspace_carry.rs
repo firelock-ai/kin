@@ -618,7 +618,10 @@ mod tests {
             (1, "shared.txt", "shared"),
             (2, "vendor/dependency/nested/owned.txt", "independent"),
         ]);
-        let destination = tree(&[(1, "shared.txt", "shared"), (3, "vendor/dependency", "link")]);
+        let destination = tree(&[
+            (1, "shared.txt", "shared"),
+            (3, "vendor/dependency", "link"),
+        ]);
 
         assert_eq!(
             conflicts(&plan(&base, &pending, &destination)),
@@ -674,7 +677,10 @@ mod tests {
             (1, "shared.txt", "shared"),
             (2, "vendor/dependency2/note.md", "beside"),
         ]);
-        let destination = tree(&[(1, "shared.txt", "shared"), (3, "vendor/dependency", "link")]);
+        let destination = tree(&[
+            (1, "shared.txt", "shared"),
+            (3, "vendor/dependency", "link"),
+        ]);
 
         let plan = plan(&base, &pending, &destination);
         assert_eq!(
