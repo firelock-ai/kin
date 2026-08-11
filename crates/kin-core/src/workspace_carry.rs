@@ -61,6 +61,17 @@ pub enum WorkspaceCarryConflictKind {
     /// change was made against, or does not hold it at all, so replaying the
     /// change would discard whichever side the transition landed on.
     MemberDiffersBetweenBranches,
+    /// The destination holds a member at an enclosing path, so the carried path
+    /// would have to live inside a file or a Gitlink.
+    ///
+    /// The common case is a Gitlink: content written beneath an independent
+    /// checkout is ordinary new content once that checkout stops being a member,
+    /// and carrying it onto a branch that has the Gitlink back would build a
+    /// tree with a path underneath a non-directory. Git refuses the same shape.
+    PathIsInsideADestinationMember,
+    /// The destination holds members beneath this path, so the carried entry
+    /// would have to replace a directory with a file.
+    PathIsADestinationDirectory,
 }
 
 impl WorkspaceCarryConflictKind {
@@ -75,6 +86,14 @@ impl WorkspaceCarryConflictKind {
             Self::MemberDiffersBetweenBranches => {
                 "the destination branch holds this member differently from the state the pending \
                  change was made against"
+            }
+            Self::PathIsInsideADestinationMember => {
+                "the destination branch tracks a file or an independent checkout at an enclosing \
+                 path, so this path cannot exist there"
+            }
+            Self::PathIsADestinationDirectory => {
+                "the destination branch tracks members beneath this path, so a file cannot take \
+                 its place"
             }
         }
     }
@@ -133,13 +152,24 @@ pub fn plan_workspace_carry(
     let mut replay = Vec::new();
     let mut carried = Vec::new();
     let mut absorbed = Vec::new();
+    let destination_paths = destination_tree
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
 
     for delta in &pending {
         match delta {
             TreeDelta::Added { new, .. } => match destination_tree.artifact_at_path(&new.path) {
                 None => {
-                    replay.push(delta.clone());
-                    carried.push(new.path.clone());
+                    match path_shape_conflict(&new.path, destination_tree, &destination_paths) {
+                        Some(kind) => {
+                            conflicts.insert(new.path.clone(), kind);
+                        }
+                        None => {
+                            replay.push(delta.clone());
+                            carried.push(new.path.clone());
+                        }
+                    }
                 }
                 Some(member) if member.entry == new.entry => absorbed.push(new.path.clone()),
                 Some(_) => {
@@ -156,16 +186,40 @@ pub fn plan_workspace_carry(
                 let held_identically = destination_tree
                     .get(artifact_id)
                     .is_some_and(|member| member.located_entry() == *old);
-                if held_identically {
-                    replay.push(delta.clone());
-                    if matches!(delta, TreeDelta::Updated { .. }) {
-                        carried.push(old.path.clone());
-                    }
-                } else {
+                if !held_identically {
                     conflicts.insert(
                         old.path.clone(),
                         WorkspaceCarryConflictKind::MemberDiffersBetweenBranches,
                     );
+                    continue;
+                }
+                // A pending move lands the member somewhere the destination
+                // never held it, so its new location needs the same shape and
+                // occupancy checks an addition gets. A same-path edit does not:
+                // the destination already holds this member right there.
+                let moved_to = match delta {
+                    TreeDelta::Updated { new, .. } if new.path != old.path => Some(&new.path),
+                    _ => None,
+                };
+                if let Some(destination_path) = moved_to {
+                    let blocked = destination_tree
+                        .artifact_at_path(destination_path)
+                        .map(|_| WorkspaceCarryConflictKind::AdditionWouldOverwriteMember)
+                        .or_else(|| {
+                            path_shape_conflict(
+                                destination_path,
+                                destination_tree,
+                                &destination_paths,
+                            )
+                        });
+                    if let Some(kind) = blocked {
+                        conflicts.insert(destination_path.clone(), kind);
+                        continue;
+                    }
+                }
+                replay.push(delta.clone());
+                if matches!(delta, TreeDelta::Updated { .. }) {
+                    carried.push(old.path.clone());
                 }
             }
         }
@@ -195,6 +249,43 @@ pub fn plan_workspace_carry(
         carried,
         absorbed,
     })))
+}
+
+/// Whether the destination's own members leave room for a path at all.
+///
+/// A tree is a flat set of paths, so nothing in [`ResolvedTree::apply`] stops a
+/// carried entry from landing beneath a member that is a file or an independent
+/// checkout, or on top of a path the destination uses as a directory. Both
+/// produce a tree that no filesystem can hold, and the failure surfaces much
+/// later as a materialization error naming two paths and no remedy. Deciding it
+/// here keeps it a refusal a caller can act on.
+///
+/// `destination_paths` is the destination's paths in sorted order, so the
+/// descendant test is a range probe rather than a scan per candidate.
+fn path_shape_conflict(
+    path: &RepoPath,
+    destination_tree: &ResolvedTree,
+    destination_paths: &[RepoPath],
+) -> Option<WorkspaceCarryConflictKind> {
+    let bytes = path.as_bytes();
+    let mut boundary = 0;
+    while let Some(offset) = bytes[boundary..].iter().position(|byte| *byte == b'/') {
+        boundary += offset;
+        let ancestor = RepoPath::from_bytes(bytes[..boundary].to_vec())
+            .expect("a prefix of a valid repository path up to a separator is itself valid");
+        if destination_tree.artifact_at_path(&ancestor).is_some() {
+            return Some(WorkspaceCarryConflictKind::PathIsInsideADestinationMember);
+        }
+        boundary += 1;
+    }
+
+    let mut prefix = bytes.to_vec();
+    prefix.push(b'/');
+    let first = destination_paths.partition_point(|held| held.as_bytes() < prefix.as_slice());
+    destination_paths
+        .get(first)
+        .is_some_and(|held| held.as_bytes().starts_with(&prefix))
+        .then_some(WorkspaceCarryConflictKind::PathIsADestinationDirectory)
 }
 
 /// Replay the overlay's entity deltas onto the destination's live entities.
@@ -515,6 +606,84 @@ mod tests {
                 ),
             ],
             "a caller must learn about every blocked path from one refusal"
+        );
+    }
+
+    /// The shape a Gitlink produces, which reached materialization before this
+    /// rule existed and failed there as an unactionable internal error.
+    #[test]
+    fn an_addition_beneath_a_destination_member_refuses() {
+        let base = tree(&[(1, "shared.txt", "shared")]);
+        let pending = tree(&[
+            (1, "shared.txt", "shared"),
+            (2, "vendor/dependency/nested/owned.txt", "independent"),
+        ]);
+        let destination = tree(&[(1, "shared.txt", "shared"), (3, "vendor/dependency", "link")]);
+
+        assert_eq!(
+            conflicts(&plan(&base, &pending, &destination)),
+            vec![(
+                "vendor/dependency/nested/owned.txt".to_string(),
+                WorkspaceCarryConflictKind::PathIsInsideADestinationMember
+            )]
+        );
+    }
+
+    #[test]
+    fn an_addition_over_a_destination_directory_refuses() {
+        let base = tree(&[(1, "shared.txt", "shared")]);
+        let pending = tree(&[(1, "shared.txt", "shared"), (2, "src", "a file now")]);
+        let destination = tree(&[(1, "shared.txt", "shared"), (3, "src/lib.rs", "a module")]);
+
+        assert_eq!(
+            conflicts(&plan(&base, &pending, &destination)),
+            vec![(
+                "src".to_string(),
+                WorkspaceCarryConflictKind::PathIsADestinationDirectory
+            )]
+        );
+    }
+
+    /// A path that merely shares a textual prefix with a destination member is
+    /// not inside it, so the shape rule must not fire on `src-notes.md` because
+    /// the destination happens to track `src/lib.rs`.
+    #[test]
+    fn a_sibling_sharing_a_textual_prefix_still_carries() {
+        let base = tree(&[(1, "shared.txt", "shared")]);
+        let pending = tree(&[(1, "shared.txt", "shared"), (2, "src-notes.md", "notes")]);
+        let destination = tree(&[(1, "shared.txt", "shared"), (3, "src/lib.rs", "a module")]);
+
+        let plan = plan(&base, &pending, &destination);
+        assert_eq!(
+            carried(&plan)
+                .carried
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["src-notes.md".to_string()]
+        );
+    }
+
+    /// The mirror of the above on the ancestor side: `vendor/dependency2` is not
+    /// inside `vendor/dependency`, and a byte-prefix test with no separator
+    /// boundary would wrongly refuse it.
+    #[test]
+    fn an_addition_beside_a_destination_member_still_carries() {
+        let base = tree(&[(1, "shared.txt", "shared")]);
+        let pending = tree(&[
+            (1, "shared.txt", "shared"),
+            (2, "vendor/dependency2/note.md", "beside"),
+        ]);
+        let destination = tree(&[(1, "shared.txt", "shared"), (3, "vendor/dependency", "link")]);
+
+        let plan = plan(&base, &pending, &destination);
+        assert_eq!(
+            carried(&plan)
+                .carried
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["vendor/dependency2/note.md".to_string()]
         );
     }
 
