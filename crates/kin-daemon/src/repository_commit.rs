@@ -1694,14 +1694,19 @@ mod tests {
         );
     }
 
-    /// The same loss on the native commit path, which reads unchanged bodies
-    /// twice: once to measure every rule file while deriving the policy, and
-    /// once to copy every source the change references into repository CAS.
-    /// Neither read is bounded to what moved, so an untouched `.gitignore` is
-    /// consulted by every commit forever, and before this both reads went to
-    /// ingestion staging alone.
-    #[test]
-    fn a_native_commit_publishes_after_ingestion_staging_is_lost() {
+    /// Publish a rule file and one source, lose the whole staging directory,
+    /// then publish a second source through `publish`.
+    ///
+    /// The second transition has to read one body from each store: the new
+    /// file's is staged, and the untouched `.gitignore` the policy still
+    /// measures is only in repository CAS.
+    fn publish_across_a_lost_staging_directory(
+        publish: fn(
+            &kin_core::KinLayout,
+            &kin_blobs::BlobStore,
+            NativeCommitPlan,
+        ) -> Result<NativeCommitResult>,
+    ) -> (tempfile::TempDir, kin_core::InitResult) {
         let root = tempfile::tempdir().unwrap();
         let init = kin_core::init(root.path()).unwrap();
         let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
@@ -1727,7 +1732,7 @@ mod tests {
             "publish the rule file and one source".to_string(),
         )
         .unwrap();
-        commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        publish(&init.layout, &blobs, plan).unwrap();
 
         // Lose the staging directory the way a restore that carries the
         // authority database but not a directory named like a cache does.
@@ -1741,8 +1746,6 @@ mod tests {
             "the fixture only proves anything while the staged rule body is genuinely gone"
         );
 
-        // The new file's body is staged, the rule file's is not. One commit has
-        // to read both stores to publish.
         add_artifact(
             &graph,
             &blobs,
@@ -1760,18 +1763,44 @@ mod tests {
             "publish a change that leaves the rule file untouched".to_string(),
         )
         .unwrap();
-        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        let result = publish(&init.layout, &blobs, plan).unwrap();
         assert_eq!(result.receipt.generation, 3);
-        assert_eq!(
-            std::fs::read(root.path().join("second.rs")).unwrap(),
-            b"pub fn second() {}\n"
-        );
 
         let authority = reopen(&init);
         assert_eq!(
             authority.load_source_blob(rules_hash).unwrap().as_deref(),
             Some(b"target/\n".as_slice()),
             "the rule body the commit measured is the one authority already held"
+        );
+        (root, init)
+    }
+
+    /// The same loss on the native commit path, which reads unchanged bodies
+    /// twice: once to measure every rule file while deriving the policy, and
+    /// once to copy every source the change references into repository CAS.
+    /// Neither read is bounded to what moved, so an untouched `.gitignore` is
+    /// consulted by every commit forever, and before this both reads went to
+    /// ingestion staging alone.
+    #[test]
+    fn a_native_commit_publishes_after_ingestion_staging_is_lost() {
+        let (root, _init) =
+            publish_across_a_lost_staging_directory(commit_native_plan_with_projection);
+        assert_eq!(
+            std::fs::read(root.path().join("second.rs")).unwrap(),
+            b"pub fn second() {}\n",
+            "the projecting path still materializes what it published"
+        );
+    }
+
+    /// The bare publication path carries its own copy loop, and tests reach
+    /// authority through it. A test helper that reads one store where product
+    /// code reads two would pass while the thing it stands in for fails.
+    #[test]
+    fn a_bare_native_publication_publishes_after_ingestion_staging_is_lost() {
+        let (root, _init) = publish_across_a_lost_staging_directory(commit_native_plan);
+        assert!(
+            !root.path().join("second.rs").exists(),
+            "publication without projection is what distinguishes this path from the other"
         );
     }
 
