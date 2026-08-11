@@ -19227,6 +19227,15 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         fs::create_dir_all(elsewhere.join(".kin")).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        // The workspace binding refuses a repository without trusted Git
+        // authority, so the fixture is a real one.
+        for repo in [&bound, &elsewhere] {
+            let git = crate::commands::test_subprocess::fixture_git(repo)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(git.status.success());
+        }
 
         let _home = EnvVarGuard::set("HOME", &home);
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
