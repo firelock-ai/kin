@@ -741,6 +741,42 @@ fn relation_is_entity_only(relation: &Relation) -> bool {
     relation.src.as_entity().is_some() && relation.dst.as_entity().is_some()
 }
 
+/// Whether a modified entity would embed to byte-identical text.
+///
+/// An entity re-embeds iff the text that would be embedded for it changed.
+/// That is narrower than "the entity payload changed": a transaction stamps
+/// every entity in an edited file with the file's new blob hash and advances
+/// the spans below an insertion, so a one-line comment produces a `Modified`
+/// delta for every entity the file declares while leaving nearly all of their
+/// embed text untouched. Those payload fields are real provenance and must
+/// advance, but none of them reaches [`format_graph_entity_text`], so keying
+/// invalidation on the formatted text keeps provenance whole while re-embedding
+/// only what an embedder would actually read differently.
+///
+/// The comparison deliberately excludes graph-derived context lines. Those come
+/// from the neighborhood at embed time, and every transition that changes them
+/// arrives as a relation delta, which invalidates both endpoints on its own.
+///
+/// That relation-delta guarantee is a producer contract, not an engine one:
+/// today's delta builders retire an entity's id on rename, so a neighbor whose
+/// context line quotes the old name always sees relation rewrites in the same
+/// transaction. A producer that instead emitted `Modified` with a changed name
+/// under the SAME id, and no relation deltas, would leave skipped neighbors
+/// holding context lines that quote the old name until something else
+/// invalidates them. Any such producer must expand invalidation to the renamed
+/// entity's graph neighbors itself.
+#[cfg(feature = "vector")]
+fn entity_embedding_text_unchanged(old: &Entity, new: &Entity) -> bool {
+    crate::embed::format_graph_entity_text(old) == crate::embed::format_graph_entity_text(new)
+}
+
+/// Without the vector feature nothing is embedded, so nothing can be skipped
+/// and the formatting work is not worth doing.
+#[cfg(not(feature = "vector"))]
+fn entity_embedding_text_unchanged(_old: &Entity, _new: &Entity) -> bool {
+    false
+}
+
 fn entity_neighbor_for_relation(relation: &Relation, entity_id: &EntityId) -> Option<EntityId> {
     let current = GraphNodeId::Entity(*entity_id);
     if relation.src == current {
@@ -7110,6 +7146,12 @@ impl EntityStore for InMemoryGraph {
             ));
         }
         let mut affected = HashSet::new();
+        // Affected entities whose embed text this transaction leaves byte
+        // identical. They still refresh the text index and the merkle, because
+        // their spans and blob provenance did move; they simply keep the vector
+        // they already have. A later relation delta takes an id back out of
+        // this set, since graph context does reach embed text.
+        let mut embedding_text_unchanged: HashSet<EntityId> = HashSet::new();
         let mut deleted_entities = HashSet::new();
         let mut merkle_seeds = HashSet::new();
         let mut retired_artifact_indexes = HashSet::new();
@@ -7393,6 +7435,10 @@ impl EntityStore for InMemoryGraph {
                         delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
+                        // Upstream validation permits one delta per entity, but
+                        // the skip set must stay correct even for a caller that
+                        // bypasses it: an addition is never skippable.
+                        embedding_text_unchanged.remove(&entity.id);
                     }
                     EntityDelta::Modified { old, new: entity } => {
                         if ent.entities.remove(&entity.id).is_some() {
@@ -7420,6 +7466,14 @@ impl EntityStore for InMemoryGraph {
                         delta_map_upsert(&mut pending.delta.entities, entity.id, entity.clone());
                         affected.insert(entity.id);
                         merkle_seeds.insert(entity.id);
+                        if entity_embedding_text_unchanged(old, entity) {
+                            embedding_text_unchanged.insert(entity.id);
+                        } else {
+                            // Keep the set correct under duplicate deltas for
+                            // one id from a caller that skipped validation: a
+                            // text-changing delta always wins over a skip.
+                            embedding_text_unchanged.remove(&entity.id);
+                        }
                     }
                     EntityDelta::Removed { old } => {
                         ent.entities.remove(&old.id);
@@ -7493,6 +7547,25 @@ impl EntityStore for InMemoryGraph {
                     }
                 }
             }
+            // Embed text carries graph-derived context lines drawn from the
+            // neighborhood, so an endpoint of any relation this transaction
+            // touched embeds differently even when its own payload formats the
+            // same. Take those ids back out of the skip set rather than
+            // reasoning about them inside each relation arm.
+            for rel_delta in &delta.relation_deltas {
+                let endpoints = match rel_delta {
+                    RelationDelta::Added { new } => entity_ids_for_relation(new),
+                    RelationDelta::Removed { old } => entity_ids_for_relation(old),
+                    RelationDelta::Modified { old, new } => entity_ids_for_relation(old)
+                        .into_iter()
+                        .chain(entity_ids_for_relation(new))
+                        .collect(),
+                };
+                for entity_id in endpoints {
+                    embedding_text_unchanged.remove(&entity_id);
+                }
+            }
+
             deleted_entities.retain(|entity_id| !ent.entities.contains_key(entity_id));
             self.refresh_merkle_for_entities(&ent, merkle_seeds.iter().copied());
         }
@@ -7589,8 +7662,17 @@ impl EntityStore for InMemoryGraph {
         affected_list.sort_unstable();
         if !affected_list.is_empty() {
             self.refresh_text_index_for_entities(&affected_list);
-            if vector_quarantine_error.is_none() {
-                if let Err(error) = self.invalidate_entities_for_embedding(&affected_list) {
+            // The text index refreshes for everything affected; embeddings do
+            // not. Re-embedding is the expensive half by orders of magnitude,
+            // and an entity whose embed text is byte identical would only get
+            // its own vector back.
+            let embed_list: Vec<EntityId> = affected_list
+                .iter()
+                .copied()
+                .filter(|entity_id| !embedding_text_unchanged.contains(entity_id))
+                .collect();
+            if vector_quarantine_error.is_none() && !embed_list.is_empty() {
+                if let Err(error) = self.invalidate_entities_for_embedding(&embed_list) {
                     vector_quarantine_error = Some(error);
                 }
             }
@@ -14943,6 +15025,293 @@ mod tests {
             graph.pending_embeddings(),
             2,
             "reset must re-queue every entity for a clean dimension rebuild"
+        );
+    }
+
+    /// One entity carrying the provenance a file-wide edit stamps on every
+    /// declaration in the file: the file's blob hash and a concrete span.
+    #[cfg(feature = "vector")]
+    fn entity_in_edited_file(name: &str, file: &str, blob_hash: &str, start_line: u32) -> Entity {
+        let mut entity = test_entity(name, file);
+        entity
+            .metadata
+            .extra
+            .insert("blob_hash".into(), serde_json::json!(blob_hash));
+        entity.span = Some(kin_model::SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: start_line as usize * 40,
+            end_byte: start_line as usize * 40 + 30,
+            start_line,
+            start_col: 0,
+            end_line: start_line + 3,
+            end_col: 1,
+        });
+        entity
+    }
+
+    /// Re-stamp an entity the way a comment-only edit does: the file's blob
+    /// hash is new and every declaration below the insertion shifts down. No
+    /// name, signature, doc summary, or body preview moves, so nothing that
+    /// reaches embed text changes.
+    #[cfg(feature = "vector")]
+    fn restamp_for_unrelated_file_edit(
+        entity: &Entity,
+        blob_hash: &str,
+        line_shift: u32,
+    ) -> Entity {
+        let mut moved = entity.clone();
+        moved
+            .metadata
+            .extra
+            .insert("blob_hash".into(), serde_json::json!(blob_hash));
+        moved.span = entity.span.as_ref().map(|span| kin_model::SourceSpan {
+            start_byte: span.start_byte + line_shift as usize * 40,
+            end_byte: span.end_byte + line_shift as usize * 40,
+            start_line: span.start_line + line_shift,
+            end_line: span.end_line + line_shift,
+            ..span.clone()
+        });
+        moved
+    }
+
+    #[cfg(feature = "vector")]
+    fn modified_delta(old: &Entity, new: &Entity) -> TransactionDelta {
+        TransactionDelta {
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old.clone(),
+                new: new.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        }
+    }
+
+    /// A comment-only edit stamps a new blob hash on every entity the file
+    /// declares and shifts the spans below it, so the transaction carries one
+    /// `Modified` delta per entity in the file. That provenance is real and must
+    /// advance. Re-embedding all of it is not: an entity whose embed text is
+    /// byte identical would only get its own vector back.
+    ///
+    /// This is FIR-2181's mechanism at its narrowest. On the measured store a
+    /// seven-line comment produced 633 entity deltas and 633 pending
+    /// embeddings, of which exactly 2 had any embed text change at all.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn file_wide_edit_reembeds_only_entities_whose_embed_text_changed() {
+        let graph = InMemoryGraph::new();
+        let file = "src/engine/graph.rs";
+        let untouched_a = entity_in_edited_file("prune_orphaned_vectors", file, "blob-1", 10);
+        let untouched_b = entity_in_edited_file("process_embedding_queue", file, "blob-1", 200);
+        let edited = entity_in_edited_file("apply_transaction_delta", file, "blob-1", 400);
+        graph
+            .batch_upsert_entities(&[untouched_a.clone(), untouched_b.clone(), edited.clone()])
+            .unwrap();
+        graph.admit_artifact_for_test(
+            file,
+            TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false),
+        );
+        graph.embedding_queue.lock().clear();
+        assert_eq!(graph.pending_embeddings(), 0);
+
+        // The two entities the comment did not touch: new blob hash, shifted
+        // span, nothing else.
+        let moved_a = restamp_for_unrelated_file_edit(&untouched_a, "blob-2", 7);
+        let moved_b = restamp_for_unrelated_file_edit(&untouched_b, "blob-2", 7);
+        // The one entity whose source actually changed, which also carries the
+        // same new blob hash and shift.
+        let mut rewritten = restamp_for_unrelated_file_edit(&edited, "blob-2", 7);
+        rewritten.signature = "fn apply_transaction_delta(&self, delta: &TransactionDelta)".into();
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![
+                    EntityDelta::Modified {
+                        old: untouched_a.clone(),
+                        new: moved_a.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: untouched_b.clone(),
+                        new: moved_b.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: edited.clone(),
+                        new: rewritten.clone(),
+                    },
+                ],
+                relation_deltas: Vec::new(),
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            graph.pending_embeddings(),
+            1,
+            "only the entity whose embed text changed may re-embed"
+        );
+        let queue = graph.embedding_queue.lock();
+        assert!(queue.contains(&RetrievalKey::Entity(rewritten.id)));
+        assert!(!queue.contains(&RetrievalKey::Entity(moved_a.id)));
+        assert!(!queue.contains(&RetrievalKey::Entity(moved_b.id)));
+        drop(queue);
+
+        // Provenance still advanced for all three. The graph holds the new
+        // blob hash and the shifted spans even for the entities that kept
+        // their vectors, which is what makes this a narrowing of invalidation
+        // rather than a dropped write.
+        for expected in [&moved_a, &moved_b, &rewritten] {
+            let stored = graph.get_entity(&expected.id).unwrap().unwrap();
+            assert_eq!(
+                stored.metadata.extra.get("blob_hash"),
+                Some(&serde_json::json!("blob-2"))
+            );
+            assert_eq!(stored.span.as_ref().map(|s| s.start_line), {
+                expected.span.as_ref().map(|s| s.start_line)
+            });
+        }
+    }
+
+    /// The control that keeps the fix from over-pruning. Every field that
+    /// reaches embed text must still invalidate on its own, or the narrowing
+    /// silently serves stale vectors.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn every_embed_text_field_still_invalidates_on_its_own() {
+        let file = "src/engine/graph.rs";
+        let cases: Vec<(&str, Box<dyn Fn(&mut Entity)>)> = vec![
+            (
+                "name",
+                Box::new(|e: &mut Entity| e.name = "renamed_symbol".into()),
+            ),
+            (
+                "signature",
+                Box::new(|e: &mut Entity| e.signature = "fn changed(arg: usize)".into()),
+            ),
+            (
+                "doc_summary",
+                Box::new(|e: &mut Entity| e.doc_summary = Some("A new summary line.".into())),
+            ),
+            (
+                "body_preview",
+                Box::new(|e: &mut Entity| {
+                    e.metadata.extra.insert(
+                        crate::embed::EMBEDDING_BODY_PREVIEW_KEY.into(),
+                        serde_json::json!("let next = compute();"),
+                    );
+                }),
+            ),
+            (
+                "kind",
+                Box::new(|e: &mut Entity| e.kind = EntityKind::Class),
+            ),
+            (
+                "file_origin",
+                Box::new(|e: &mut Entity| e.file_origin = Some(FilePathId::new("src/moved.rs"))),
+            ),
+            (
+                "file_import_context",
+                Box::new(|e: &mut Entity| {
+                    e.metadata.extra.insert(
+                        crate::embed::FILE_IMPORT_CONTEXT_KEY.into(),
+                        serde_json::json!("use crate::engine::graph::GraphTruth;"),
+                    );
+                }),
+            ),
+            (
+                "file_surface_context",
+                Box::new(|e: &mut Entity| {
+                    e.metadata.extra.insert(
+                        crate::embed::FILE_SURFACE_CONTEXT_KEY.into(),
+                        serde_json::json!("pub fn surface_shape() -> Shape"),
+                    );
+                }),
+            ),
+        ];
+
+        for (label, mutate) in cases {
+            let graph = InMemoryGraph::new();
+            let before = entity_in_edited_file("target_symbol", file, "blob-1", 10);
+            graph.batch_upsert_entities(&[before.clone()]).unwrap();
+            for path in [file, "src/moved.rs"] {
+                graph.admit_artifact_for_test(
+                    path,
+                    TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false),
+                );
+            }
+            graph.embedding_queue.lock().clear();
+            assert_eq!(
+                graph.pending_embeddings(),
+                0,
+                "{label}: queue must start dry"
+            );
+
+            let mut after = restamp_for_unrelated_file_edit(&before, "blob-2", 7);
+            mutate(&mut after);
+
+            graph
+                .apply_transaction_delta(&modified_delta(&before, &after))
+                .unwrap();
+
+            assert_eq!(
+                graph.pending_embeddings(),
+                1,
+                "{label} reaches embed text and must still invalidate"
+            );
+        }
+    }
+
+    /// Embed text carries graph-derived context lines, so an entity whose own
+    /// payload formats identically still embeds differently when a relation it
+    /// takes part in changes. The skip set must yield to that.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_relation_delta_invalidates_an_endpoint_whose_own_text_is_unchanged() {
+        let graph = InMemoryGraph::new();
+        let file = "src/engine/graph.rs";
+        let caller = entity_in_edited_file("caller", file, "blob-1", 10);
+        let callee = entity_in_edited_file("callee", file, "blob-1", 90);
+        graph
+            .batch_upsert_entities(&[caller.clone(), callee.clone()])
+            .unwrap();
+        graph.admit_artifact_for_test(
+            file,
+            TreeEntry::blob(Hash256::from_bytes([0x11; 32]), false),
+        );
+        graph.embedding_queue.lock().clear();
+        assert_eq!(graph.pending_embeddings(), 0);
+
+        let moved_caller = restamp_for_unrelated_file_edit(&caller, "blob-2", 7);
+        let moved_callee = restamp_for_unrelated_file_edit(&callee, "blob-2", 7);
+        let relation = test_relation(caller.id, callee.id, RelationKind::Calls);
+
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![
+                    EntityDelta::Modified {
+                        old: caller.clone(),
+                        new: moved_caller.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: callee.clone(),
+                        new: moved_callee.clone(),
+                    },
+                ],
+                relation_deltas: vec![RelationDelta::Added {
+                    new: relation.clone(),
+                }],
+                tree_deltas: Vec::new(),
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            graph.pending_embeddings(),
+            2,
+            "both endpoints of a changed relation re-embed even with identical own text"
         );
     }
 

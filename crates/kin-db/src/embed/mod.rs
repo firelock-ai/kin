@@ -631,8 +631,8 @@ const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-05-31-swerank";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
-const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
-const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
+pub(crate) const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
+pub(crate) const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
 /// Practical per-entity tokenization ceiling for embeddings. Bounded *well below*
 /// the model's trained range so a single entity can never dominate GPU cost — and,
