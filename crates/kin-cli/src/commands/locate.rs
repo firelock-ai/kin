@@ -3618,19 +3618,27 @@ fn run_with_graph_capture_budgeted(
                         }
                     }
                 } else {
+                    // Reached only when the graph holds neither artifacts nor
+                    // entities, which is an empty or unopened store. Say that,
+                    // and do not tell an operator whose repository is fully
+                    // ingested to ingest it again: that advice was false on
+                    // every healthy store and cost a full re-ingest to learn.
                     tracing::warn!(
-                        "skipping cross-encoder rerank because the graph has no entities \
-                     to derive candidate text from"
+                        "skipping cross-encoder rerank because the graph holds no entities \
+                     or artifacts to derive candidate text from"
                     );
                     record_degradation(
                         &mut degradations,
                         RetrievalDegradation {
                             component: "cross_encoder".to_string(),
                             reason: "no_candidates".to_string(),
-                            detail:
-                                "graph has no retrievable artifacts to derive candidate text from"
-                                    .to_string(),
-                            remediation: "re-ingest the repo so graph artifacts exist".to_string(),
+                            detail: "graph holds no entities or artifacts to derive candidate \
+                                     text from"
+                                .to_string(),
+                            remediation: "open a repository whose graph is populated; if this \
+                                          store was ingested, report the empty graph rather than \
+                                          re-ingesting"
+                                .to_string(),
                         },
                     );
                 }
@@ -9603,33 +9611,94 @@ fn graph_source_text(graph: &kin_db::InMemoryGraph, path: &str) -> Result<String
     })
 }
 
-/// Candidate text for `path`, served from graph-owned body (the opaque
-/// artifact's stored source). A graph miss is reported as a typed graph gap and
-/// yields no text, so the cross-encoder never reranks a candidate from raw
-/// workspace disk contents.
+/// Bound on one composed candidate document handed to the reranker. The
+/// cross-encoder truncates to its own sequence length anyway, so the cap exists
+/// to keep a large file from dominating the batch's allocation.
+#[cfg(feature = "embeddings")]
+const CANDIDATE_TEXT_MAX_CHARS: usize = 4096;
+
+/// Compose candidate text for `path` from the entities graph truth holds for it.
+///
+/// Same fields the embedder reads: name, signature, and doc summary. This is
+/// graph-owned truth, not a workspace read, so it keeps the reranker inside the
+/// zero-file-search rule.
+#[cfg(feature = "embeddings")]
+fn graph_entity_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> String {
+    let Ok(entities) = graph.query_entities(&EntityFilter {
+        file_path: Some(kin_model::FilePathId::new(path)),
+        ..Default::default()
+    }) else {
+        return String::new();
+    };
+    let mut composed = String::new();
+    for entity in entities {
+        if composed.len() >= CANDIDATE_TEXT_MAX_CHARS {
+            break;
+        }
+        for field in [
+            Some(entity.name.as_str()),
+            Some(entity.signature.as_str()),
+            entity.doc_summary.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|field| !field.is_empty())
+        {
+            if !composed.is_empty() {
+                composed.push('\n');
+            }
+            composed.push_str(field);
+        }
+    }
+    if composed.len() > CANDIDATE_TEXT_MAX_CHARS {
+        let mut cut = CANDIDATE_TEXT_MAX_CHARS;
+        while cut > 0 && !composed.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        composed.truncate(cut);
+    }
+    composed
+}
+
+/// Candidate text for `path`, served from graph truth only.
+///
+/// A stored opaque body is preferred where the graph holds one. Nothing on the
+/// ingest path writes opaque artifacts for source files, so on a real store that
+/// lookup misses for every candidate and the reranker used to score a batch of
+/// empty documents. The entity payloads the graph does hold for the path carry
+/// the same text the embedder reads, so they stand in rather than reranking
+/// nothing. Both sources are graph-owned, so the cross-encoder still never reads
+/// raw workspace contents; a path the graph knows nothing about yields no text
+/// and is reported as a typed graph gap.
 #[cfg(feature = "embeddings")]
 fn graph_derived_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> String {
     match graph_source_text(graph, path) {
         Ok(body) => body,
         Err(gap) => {
-            record_graph_source_gap(&gap.path);
-            String::new()
+            let composed = graph_entity_candidate_text(graph, path);
+            if composed.is_empty() {
+                record_graph_source_gap(&gap.path);
+            }
+            composed
         }
     }
 }
 
 /// Whether the cross-encoder rerank stage has graph truth to rerank against.
 ///
-/// The reranker scores `graph_derived_candidate_text`, whose bodies are resolved
-/// from graph-owned artifacts (`get_opaque_artifact`), so its only data
-/// precondition is that the graph holds those retrievable artifacts. It is
-/// deliberately independent of any live `workspace_root`: scoped sessions run
-/// with `workspace_root = None` while keeping a populated graph, and the
-/// candidate text is graph-owned, so keying the gate on the graph keeps the
-/// reranker effective in scoped mode.
+/// This has to agree with what `graph_derived_candidate_text` actually reads, or
+/// the stage is gated on one thing and fed by another. It used to count
+/// artifacts alone while the producer read opaque bodies alone, and since the
+/// ingest path writes neither for source files, a fully ingested repository at
+/// 100 percent embedding coverage reported that it held nothing to rerank. The
+/// gate now admits the entity payloads the producer composes from.
+///
+/// It stays deliberately independent of any live `workspace_root`: scoped
+/// sessions run with `workspace_root = None` while keeping a populated graph,
+/// and the candidate text is graph-owned either way.
 #[cfg(feature = "embeddings")]
 fn cross_encoder_has_graph_candidates(graph: &kin_db::InMemoryGraph) -> bool {
-    graph.artifact_count() > 0
+    graph.artifact_count() > 0 || graph.entity_count() > 0
 }
 
 fn extract_code_snippets(text: &str) -> Vec<String> {
@@ -17587,6 +17656,126 @@ mod tests {
             "GRAPH_BODY_MARKER",
             "graph-owned body is the only authority for candidate text"
         );
+    }
+
+    /// FIR-2179. Nothing on the ingest path writes an opaque artifact for a
+    /// source file, so on a real store the body lookup misses for every
+    /// candidate and the reranker used to score a batch of empty documents.
+    /// The entities the graph does hold for the path carry the same text the
+    /// embedder reads, so they stand in.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn graph_derived_candidate_text_composes_entity_text_when_the_graph_holds_no_body() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut entity = test_entity("prune_orphaned_vectors", "src/engine/graph.rs", 10, 40);
+        entity.doc_summary = Some("Drop vector sidecar keys with no live entity.".into());
+        graph.upsert_entity(&entity).unwrap();
+
+        // Precondition: this is exactly the store shape the dogfood hit. No
+        // opaque artifact exists, so the previous implementation returned "".
+        assert!(graph
+            .get_opaque_artifact(&FilePathId::new("src/engine/graph.rs"))
+            .unwrap()
+            .is_none());
+
+        let candidate = graph_derived_candidate_text(&graph, "src/engine/graph.rs");
+        assert!(
+            candidate.contains("prune_orphaned_vectors"),
+            "composed candidate text must carry the entity name, got {candidate:?}"
+        );
+        assert!(
+            candidate.contains("Drop vector sidecar keys"),
+            "composed candidate text must carry the doc summary, got {candidate:?}"
+        );
+        // Text under the cap must survive whole. An off-by-one in the char
+        // boundary cap silently ate the final byte here, which every
+        // `contains` assertion in this file would have passed straight over.
+        assert!(
+            candidate.ends_with("Drop vector sidecar keys with no live entity."),
+            "text under the cap must not be truncated, got {candidate:?}"
+        );
+    }
+
+    /// Composition is bounded, and the bound lands on a character boundary
+    /// rather than splitting a multi-byte character.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn graph_entity_candidate_text_caps_without_splitting_a_character() {
+        let graph = kin_db::InMemoryGraph::new();
+        for index in 0..400 {
+            let mut entity = test_entity(&format!("fn_{index}"), "src/big.rs", 1, 2);
+            entity.doc_summary = Some("é".repeat(64));
+            graph.upsert_entity(&entity).unwrap();
+        }
+
+        let candidate = graph_entity_candidate_text(&graph, "src/big.rs");
+        assert!(
+            candidate.len() <= CANDIDATE_TEXT_MAX_CHARS,
+            "composed candidate text must respect its cap, got {} bytes",
+            candidate.len()
+        );
+        // A split multi-byte character would make this a different string than
+        // the bytes it was cut from, and `String` would have panicked on the
+        // truncate itself if the cut were mid-character.
+        assert!(candidate.chars().count() > 0);
+    }
+
+    /// The stored body still wins where the graph has one, so this narrows
+    /// nothing that already worked.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn graph_derived_candidate_text_prefers_a_stored_body_over_composed_entity_text() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("helper", "src/foo.rs", 1, 5))
+            .unwrap();
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("src/foo.rs"),
+                content_hash: Hash256::from_bytes([7; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some("GRAPH_BODY_MARKER".into()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            graph_derived_candidate_text(&graph, "src/foo.rs"),
+            "GRAPH_BODY_MARKER"
+        );
+    }
+
+    /// The gate has to agree with what the producer reads. A fully ingested
+    /// repository holds entities and no opaque source bodies, and used to
+    /// report that it had nothing to rerank.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn cross_encoder_gate_admits_an_entity_only_graph() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity(
+                "prune_orphaned_vectors",
+                "src/engine/graph.rs",
+                10,
+                40,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            graph.artifact_count(),
+            0,
+            "the store shape under test holds no artifacts at all"
+        );
+        assert!(
+            cross_encoder_has_graph_candidates(&graph),
+            "a graph holding entities can derive candidate text and must not be \
+             reported as having none"
+        );
+
+        // The control that lets this check fail: a graph holding nothing at all
+        // still closes the gate.
+        assert!(!cross_encoder_has_graph_candidates(
+            &kin_db::InMemoryGraph::new()
+        ));
     }
 
     #[cfg(feature = "embeddings")]
