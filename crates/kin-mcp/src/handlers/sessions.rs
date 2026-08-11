@@ -68,7 +68,13 @@ expiry (a live registered PID is stronger liveness evidence). If your next step 
 phase that could outlast that boundary, send kin_session_heartbeat; any session-bound call \
 also refreshes the window. A call on an already-reaped session fails saying so and names \
 kin_session_start as the recovery. An in-process session returns neither field; heartbeat \
-it on the same cadence rather than reading a boundary off the response.";
+it on the same cadence rather than reading a boundary off the response. The capabilities \
+in the response are what this session may actually do on this store, not an echo of what \
+you sent: declaring nothing gets you what the store permits, and declaring less than that \
+keeps your own restriction. capability_policy names what decided each bit, so you can tell \
+a store permission (`store`) from your own self-limit (`client_declared`) from a bit Kin \
+checks nowhere today (`ungated`). Read can_write and can_commit before deciding a write is \
+forbidden; they now report false only when this store really refuses it.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -96,7 +102,7 @@ pub async fn handle_session_start(
             transport_str,
             pid,
             &cwd_str,
-            &capabilities,
+            capabilities.as_ref(),
         )
         .await;
         match daemon_result {
@@ -115,6 +121,17 @@ pub async fn handle_session_start(
         }
     }
 
+    // This surface accepts kin_transaction_commit, so a session that declared
+    // nothing is not a read-only session and must not be reported as one. The
+    // daemon resolves the same question against its store.
+    let capabilities = capabilities.unwrap_or(kin_model::SessionCapabilities {
+        can_read: true,
+        can_write: true,
+        can_execute: false,
+        can_branch: false,
+        can_commit: true,
+        max_concurrent_intents: 1,
+    });
     let session =
         sessions.start_agent_session(&vendor, &client_name, transport, pid, cwd, capabilities);
 
@@ -794,7 +811,10 @@ publishes nothing further. That answer is derived from the repository receipt ra
 in-memory record, so it survives the transaction being forgotten and stays correct however many \
 times it is retried, and it declares the same carried_pending_files split the original answer did. \
 It omits ops_applied, which only the staged record could name. A commit that never landed under \
-this id still fails closed and says authority was consulted too.";
+this id still fails closed and says authority was consulted too. already_applied is present on \
+every successful commit and is the one field that separates these two answers: false means this \
+call moved authority, true means an earlier call did and this one published nothing. Read it to \
+decide whether a retry double-applied, because every other field is identical across both.";
 
 fn push_scope_once(scopes: &mut Vec<kin_model::IntentScope>, scope: kin_model::IntentScope) {
     if !scopes.contains(&scope) {

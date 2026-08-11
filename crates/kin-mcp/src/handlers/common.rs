@@ -2519,12 +2519,19 @@ pub fn get_json_object<'a>(
         .ok_or_else(|| McpError::InvalidParams(format!("{} must be a valid JSON object", key)))
 }
 
-pub fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionCapabilities {
-    let Some(obj) = args.get("capabilities").and_then(|v| v.as_object()) else {
-        return SessionCapabilities::default();
-    };
+/// Read the capabilities a client declared for itself, or `None` when it
+/// declared none.
+///
+/// Materializing the read-only default here loses the distinction the daemon
+/// needs: a client that says nothing is not a client that says it cannot write,
+/// and the session report is only able to tell the truth about what the session
+/// may do if the two arrive differently.
+pub fn parse_capabilities(
+    args: &HashMap<String, serde_json::Value>,
+) -> Option<SessionCapabilities> {
+    let obj = args.get("capabilities").and_then(|v| v.as_object())?;
 
-    SessionCapabilities {
+    Some(SessionCapabilities {
         can_read: obj
             .get("can_read")
             .and_then(|v| v.as_bool())
@@ -2549,7 +2556,7 @@ pub fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionC
             .get("max_concurrent_intents")
             .and_then(|v| v.as_u64())
             .unwrap_or(1) as usize,
-    }
+    })
 }
 
 // ── Search filter helpers ──

@@ -417,11 +417,14 @@ async fn forward_entity_source_memoized(
     Ok(result)
 }
 
-fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionCapabilities {
-    let Some(obj) = args.get("capabilities").and_then(|value| value.as_object()) else {
-        return SessionCapabilities::default();
-    };
-    SessionCapabilities {
+/// Read the capabilities a client declared for itself, or `None` when it
+/// declared none. See the sibling in `handlers::common` for why the two must
+/// not collapse into one.
+fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> Option<SessionCapabilities> {
+    let obj = args
+        .get("capabilities")
+        .and_then(|value| value.as_object())?;
+    Some(SessionCapabilities {
         can_read: obj
             .get("can_read")
             .and_then(|value| value.as_bool())
@@ -447,7 +450,7 @@ fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionCapab
             .and_then(|value| value.as_u64())
             .map(|value| value as usize)
             .unwrap_or(1),
-    }
+    })
 }
 
 fn scope_to_string(value: &serde_json::Value) -> Result<String, String> {
@@ -1302,18 +1305,10 @@ pub async fn forward_tool_call(
             let cwd = std::env::current_dir()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| ".".to_string());
-            let capabilities = SessionCapabilities::default();
-            forward_session_start(
-                &assistant_name,
-                &assistant_name,
-                "mcp",
-                None,
-                &cwd,
-                &capabilities,
-            )
-            .await?
-            .map(text_result_from_value)
-            .transpose()
+            forward_session_start(&assistant_name, &assistant_name, "mcp", None, &cwd, None)
+                .await?
+                .map(text_result_from_value)
+                .transpose()
         }
         "kin_session_start" => {
             let vendor = required_string(arguments, "vendor")?;
@@ -1322,10 +1317,17 @@ pub async fn forward_tool_call(
             let transport = optional_string(arguments, "transport").unwrap_or("mcp");
             let pid = optional_u32(arguments, "pid");
             let capabilities = parse_capabilities(arguments);
-            forward_session_start(&vendor, &client_name, transport, pid, &cwd, &capabilities)
-                .await?
-                .map(text_result_from_value)
-                .transpose()
+            forward_session_start(
+                &vendor,
+                &client_name,
+                transport,
+                pid,
+                &cwd,
+                capabilities.as_ref(),
+            )
+            .await?
+            .map(text_result_from_value)
+            .transpose()
         }
         "kin_session_heartbeat" => {
             let session_id = required_string(arguments, "session_id")?;
@@ -1567,7 +1569,7 @@ pub async fn forward_session_start(
     transport: &str,
     pid: Option<u32>,
     cwd: &str,
-    capabilities: &SessionCapabilities,
+    capabilities: Option<&SessionCapabilities>,
 ) -> Result<Option<serde_json::Value>, String> {
     let Some(base) = daemon_base_url() else {
         return Ok(None);
@@ -1577,8 +1579,12 @@ pub async fn forward_session_start(
         "client_name": client_name,
         "transport": transport,
         "cwd": cwd,
-        "capabilities": capabilities,
     });
+    // Omitted rather than defaulted, so the daemon can tell a client that
+    // declared nothing from one that declared itself read-only.
+    if let Some(capabilities) = capabilities {
+        body["capabilities"] = serde_json::json!(capabilities);
+    }
     if let Some(p) = pid {
         body["pid"] = serde_json::json!(p);
     }
