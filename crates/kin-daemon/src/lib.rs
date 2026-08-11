@@ -137,6 +137,7 @@ mod repository_rollback;
 mod repository_stash;
 mod repository_tag;
 pub mod session_registry;
+mod source_cas;
 pub mod state;
 pub mod supervisor;
 pub mod traffic_adapter;
