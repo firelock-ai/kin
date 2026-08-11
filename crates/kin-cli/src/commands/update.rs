@@ -555,10 +555,12 @@ fn set_update_policy(policy: UpdatePolicy) -> Result<()> {
         policy_name(policy),
         policy_name(stored.policy)
     );
-    if policy == UpdatePolicy::Auto {
+    if policy != UpdatePolicy::Prompt {
         println!(
-            "Unattended installs run only when no agent session, managed Kin process, or \
-             part-way indexing job is detected. When that cannot be determined, Kin asks instead."
+            "Recorded, not yet enforced: every mode behaves as prompt today. The recorded \
+             choice takes effect when the notifier honors it; unattended installs will run \
+             only when no agent session, managed Kin process, or part-way indexing job is \
+             detected, and Kin asks instead when that cannot be determined."
         );
     }
     Ok(())
@@ -978,17 +980,12 @@ async fn run_update_flow(
         let restart_ack_required = restart_pending_path(&kin_home).exists();
         if !update_available {
             println!("Already up to date (v{CURRENT_VERSION}).");
-            if restart_ack_required {
-                println!(
-                    "Runtime restart acknowledgement remains required: {}",
-                    restart_pending_path(&kin_home).display()
-                );
-            }
-            if mcp_repair_pending_path(&kin_home).exists() {
-                println!(
-                    "MCP launcher repair remains pending: {}",
-                    mcp_repair_pending_path(&kin_home).display()
-                );
+            // Current bytes with open markers is the exact state the update
+            // notification names bare `kin update` for, so bare `kin update`
+            // finishes the chain here instead of printing marker paths and
+            // leaving the named remedy a no-op.
+            if restart_ack_required || mcp_repair_pending_path(&kin_home).exists() {
+                return run_chain_tail();
             }
             return Ok(());
         }
@@ -1113,17 +1110,12 @@ async fn run_update_flow(
 
     if !update_available {
         println!("Already up to date (v{CURRENT_VERSION}).");
-        if restart_ack_required {
-            println!(
-                "Runtime restart acknowledgement remains required: {}",
-                restart_pending_path(&kin_home).display()
-            );
-        }
-        if mcp_repair_pending_path(&kin_home).exists() {
-            println!(
-                "MCP launcher repair remains pending: {}",
-                mcp_repair_pending_path(&kin_home).display()
-            );
+        // Same contract as the pinned arm: open markers mean the one-gesture
+        // promise is still unfinished, and bare `kin update` is the command
+        // the notification teaches, so it finishes the chain rather than
+        // naming paths.
+        if restart_ack_required || mcp_repair_pending_path(&kin_home).exists() {
+            return run_chain_tail();
         }
         return Ok(());
     }
@@ -1244,6 +1236,10 @@ fn run_chain_tail() -> Result<()> {
         );
     }
 
+    // Read the fence record before the acknowledgement consumes it: this
+    // process is still the pre-install binary, so the record is the only
+    // truthful source for what the chain installed.
+    let installed = pending_install_identity(&kin_home);
     if restart_pending_path(&kin_home).exists() {
         run_chain_step(
             &binary,
@@ -1259,8 +1255,45 @@ fn run_chain_tail() -> Result<()> {
         ChainStep::RepairConfigs,
         &["setup", "doctor", "--fix"],
     )?;
-    report_chain_outcome(&kin_home);
+    report_chain_outcome(&kin_home, installed);
     Ok(())
+}
+
+/// What the pending fence says was installed, if a fence is pending.
+///
+/// Absence and unreadability both read as None: the outcome message then
+/// falls back to the running binary's own identity, which is exactly right
+/// when nothing was installed, and merely less specific when the marker
+/// could not be read.
+fn pending_install_identity(kin_home: &Path) -> Option<(String, String)> {
+    let bytes = std::fs::read(restart_pending_path(kin_home)).ok()?;
+    let record: RestartPending = serde_json::from_slice(&bytes).ok()?;
+    Some((record.installed_version, record.kin_commit))
+}
+
+/// The outcome sentence, split from delivery so its truth is testable.
+///
+/// A chain that installed something reports the transition it made, from the
+/// version this process was compiled as to the version the fence recorded.
+/// A chain that only converged markers reports the one version the machine
+/// runs, which the running binary's constants state correctly in that case.
+fn compose_chain_outcome_body(installed: Option<(&str, &str)>) -> String {
+    match installed {
+        Some((version, commit)) => format!(
+            "Updated v{} to v{} ({}); the restart fence is acknowledged and agent configs are repaired.",
+            CURRENT_VERSION,
+            version,
+            &commit[..commit.len().min(12)]
+        ),
+        None => {
+            let build = kin_buildinfo::get();
+            format!(
+                "This machine is current at v{} ({}).",
+                CURRENT_VERSION,
+                &build.sha[..build.sha.len().min(12)]
+            )
+        }
+    }
 }
 
 /// Say what the chain landed on, after it has landed.
@@ -1271,12 +1304,11 @@ fn run_chain_tail() -> Result<()> {
 /// is best-effort on purpose: the chain already succeeded by the time this
 /// runs, and a notification that could not be posted must not turn a finished
 /// update into a failed command.
-fn report_chain_outcome(kin_home: &Path) {
-    let build = kin_buildinfo::get();
-    let body = format!(
-        "This machine is current at v{} ({}).",
-        CURRENT_VERSION,
-        &build.sha[..build.sha.len().min(12)]
+fn report_chain_outcome(kin_home: &Path, installed: Option<(String, String)>) {
+    let body = compose_chain_outcome_body(
+        installed
+            .as_ref()
+            .map(|(version, commit)| (version.as_str(), commit.as_str())),
     );
     println!("{body}");
     let notification = kin_notify::Notification::new("Kin update", body, kin_notify::Level::Info)
@@ -12010,6 +12042,40 @@ mod tests {
     use crate::commands::test_subprocess::{output_with_timeout, DEFAULT_TEST_SUBPROCESS_TIMEOUT};
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    /// A chain that installed something must report the transition, not the
+    /// pre-install binary's own constants: the tail runs in the old process,
+    /// so its compile-time version is exactly the wrong single answer after
+    /// an install.
+    #[test]
+    fn chain_outcome_reports_the_transition_when_an_install_happened() {
+        let body =
+            compose_chain_outcome_body(Some(("9.9.9", "abcdef1234567890deadbeef")));
+        assert!(
+            body.contains(&format!("Updated v{CURRENT_VERSION} to v9.9.9")),
+            "the transition names old and new: {body}"
+        );
+        assert!(
+            body.contains("(abcdef123456)"),
+            "the sha is the fence record's, truncated to twelve: {body}"
+        );
+        assert!(
+            !body.contains("current at"),
+            "an install outcome must not claim a single current version: {body}"
+        );
+    }
+
+    /// A markers-only chain installed nothing, so the running binary's own
+    /// identity is the truthful report.
+    #[test]
+    fn chain_outcome_reports_the_running_identity_when_nothing_installed() {
+        let body = compose_chain_outcome_body(None);
+        assert!(
+            body.contains(&format!("current at v{CURRENT_VERSION}")),
+            "the no-install outcome names the running version: {body}"
+        );
+        assert!(!body.contains("Updated"), "nothing was installed: {body}");
+    }
 
     #[cfg(windows)]
     const WINDOWS_INSTALL_AUTHORITY_CHILD_MODE: &str =

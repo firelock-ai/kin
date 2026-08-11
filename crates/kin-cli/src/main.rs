@@ -1022,11 +1022,11 @@ enum Command {
             value_name = "KIND=PID"
         )]
         runtime_sessions: Vec<String>,
-        /// Set how an available update reaches this machine and exit.
+        /// Set how an available update should reach this machine and exit.
         /// `prompt` (the default) notifies with the remedy attached and waits
-        /// to be told; `auto` installs unattended, but only when no agent
-        /// session, managed Kin process, or part-way indexing job is detected;
-        /// `manual` never notifies.
+        /// to be told. `auto` and `manual` are recorded preferences whose
+        /// enforcement has not shipped: today every mode behaves as `prompt`,
+        /// and the recorded choice takes effect when the notifier honors it.
         #[arg(
             long,
             value_enum,
