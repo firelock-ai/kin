@@ -159,11 +159,11 @@ jobs:
     # caps, and they sum to less than this on purpose. A step that overruns its
     # budget FAILS, and a failed step names itself on the check. A job that hits
     # its own cap is CANCELLED, and a cancellation on a check no ruleset
-    # requires says nothing at all: the four cap-outs found on 2026-08-10 each
-    # had every substantive step green and were noticed only by reading run
-    # durations. Keeping the sum under this number is what makes the loud
-    # failure arrive first whichever step is the slow one, and the authority
-    # test holds that arithmetic.
+    # requires says nothing at all: every sampled cap-out carried green
+    # substantive steps and was found by reading run durations rather than by
+    # anything going red. Keeping the sum under this number is what makes the
+    # loud failure arrive first whichever step is the slow one, and the
+    # authority test holds that arithmetic.
     timeout-minutes: 80
     steps:
       - name: Preserve tracked bytes on Windows
