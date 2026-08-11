@@ -143,7 +143,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- validation control ---------------------------------------------------
     EnvVarSpec { name: "KIN_ENV_VALIDATION", kind: Kind::OneOf(&["off", "warn", "strict"]), default: "warn", sensitivity: Sensitivity::Operational, summary: "startup env validation mode: off, warn (default), or strict" },
     // ---- install / setup root -------------------------------------------------
-    EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the managed Kin install used by the launcher, setup, and shell hooks" },
+    EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the managed Kin install used by the launcher, setup, and shell hooks; bounds install and store state, NOT the machine-wide daemon supervisor" },
     EnvVarSpec { name: "KIN_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "compatibility alias for the managed Kin install root; KIN_HOME wins when both are set" },
     EnvVarSpec { name: "KIN_VERSION", kind: Kind::Str, default: "latest", sensitivity: Sensitivity::Operational, summary: "release version selected by the shell and PowerShell installers" },
     EnvVarSpec { name: "KIN_BASE_URL", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "release mirror base URL used by the shell and PowerShell installers" },

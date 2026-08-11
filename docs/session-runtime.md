@@ -239,6 +239,57 @@ The authoritative list of behavior-relevant variables is defined once in
 `kin-core` (`behavior_env`) and shared by both the daemon (which reports them)
 and the CLI (which compares them), so the two sides cannot drift apart.
 
+## Supervisor scope: what `KIN_HOME` does and does not bound
+
+Kin runs one worker daemon per repository and one **supervisor** per machine.
+The supervisor directory hangs off the registry path, which resolves from the
+real home directory (or an explicit `KIN_REGISTRY_PATH`). It is deliberately
+**not** derived from `KIN_HOME`.
+
+That split is the contract:
+
+- `KIN_HOME` (and its `KIN_DIR` alias) bounds the managed install root and store
+  state.
+- The supervisor layer is machine-wide by design. One supervisor per box keeps
+  the number of inference-capable daemons bounded; a supervisor per pinned home
+  would multiply them.
+- Consequently a single supervisor legitimately holds daemons launched under
+  several managed homes, and a session that pins `KIN_HOME` still registers into
+  the machine's supervisor.
+
+Because that surprises operators who read a pinned `KIN_HOME` as full isolation,
+the surfaces above it partition by home rather than hiding the seam:
+
+- Every daemon records the managed home it was launched under at registration.
+  A daemon that reports none stays **unrecorded**, which is a distinct answer
+  from matching or not matching; the supervisor never fills the gap from its own
+  environment, which describes a different process.
+- `kin daemon status` and `kin registry daemons` label each daemon with its home
+  and whether that is the caller's, and state that the supervisor is
+  machine-wide.
+- `kin daemon stop --all` stops only daemons under the caller's `KIN_HOME`. It
+  names what it skipped, and it leaves the shared supervisor running while any
+  skipped daemon still depends on it.
+- `kin daemon stop --all --machine` performs the machine-wide sweep and names
+  the daemons from other homes it is taking down.
+- Full uninstall stays machine-wide with no opt-out, because it removes the
+  binaries every daemon on the box is running from.
+
+An unrecorded home is excluded from a scoped sweep rather than assumed to match.
+Failing to stop a daemon is visible and recoverable; stopping a daemon that
+belongs to another session is neither.
+
+### What this means for supervisor-level policies
+
+Supervisor-level behavior still sees every registered daemon regardless of home:
+the rogue-daemon reaper, idle accounting, and the stop-before-update preflight
+census all operate on the machine-wide registry. That is correct for the
+machine-level jobs among them (an install-wide update must account for every
+process running the binaries it replaces) and worth revisiting for the ones that
+act on an individual daemon's behalf. The recorded home is now available to
+those paths; using it is deliberately left to follow-up work rather than folded
+into the scoping change.
+
 ## Recovery reference
 
 | Situation | What Kin does | Your move |

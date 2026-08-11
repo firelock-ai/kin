@@ -64,7 +64,7 @@ pub async fn run(yes: bool) -> Result<()> {
 
     // The daemon is the only long-lived writer allowed to observe this
     // workspace. Stop it before the final root comparison and namespace swap.
-    crate::commands::daemon::stop(false, false)
+    crate::commands::daemon::stop(false, false, false)
         .await
         .context("stop repository daemon before eject")?;
     drop(authority);

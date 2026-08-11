@@ -25,13 +25,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::daemon_client::{
-    fetch_registered_daemons, is_port_open, is_process_alive, process_identity,
+    caller_home_id, fetch_registered_daemons, is_port_open, is_process_alive, process_identity,
     process_identity_is_current, read_endpoint_owner_record, read_supervisor_owner_record,
     remove_stale_daemon_files, remove_stale_supervisor_files, repo_daemon_owner_path,
     repo_daemon_pid_path, repo_daemon_port_path, repo_daemon_recorded_endpoint,
     retire_stopped_daemon_endpoint, supervisor_owner_path, supervisor_pid_path,
     supervisor_port_path, supervisor_recorded_endpoint, try_acquire_supervisor_startup_lock_in_dir,
-    PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon, SupervisorStartupLock,
+    DaemonHomeScope, PreservedDaemonEndpoint, ProcessIdentity, RegisteredRepoDaemon,
+    SupervisorStartupLock,
 };
 
 /// Liveness of a recorded daemon/supervisor endpoint. Pure classification of the
@@ -634,6 +635,12 @@ pub async fn status(json: bool) -> Result<()> {
     // stale local endpoint is visible even when the supervisor has pruned it.
     let current = current_repo_status();
 
+    // The supervisor is machine-wide, so this listing can span managed homes.
+    // Every entry is labelled with the home it belongs to and whether that is
+    // the caller's, which is what makes a pinned session able to see which
+    // daemons are its own.
+    let caller_home = caller_home_id();
+
     if json {
         let daemons_json: Vec<_> = daemons
             .iter()
@@ -651,17 +658,21 @@ pub async fn status(json: bool) -> Result<()> {
                     "graph_entity_count": d.graph_entity_count,
                     "last_heartbeat_at": d.last_heartbeat_at,
                     "state": state.label(),
+                    "kin_home": d.kin_home,
+                    "home_scope": home_scope_label(d.home_scope(&caller_home)),
                 })
             })
             .collect();
         let payload = serde_json::json!({
             "schema": "kin.daemon-status.v1",
+            "caller_kin_home": caller_home,
             "supervisor": {
                 "state": sup_state.label(),
                 "pid": sup_pid,
                 "port": sup_port,
                 "pid_file": supervisor_pid_path().display().to_string(),
                 "port_file": supervisor_port_path().display().to_string(),
+                "scope": "machine",
             },
             "repo_daemons": daemons_json,
             "current_repo": current.as_ref().map(|c| serde_json::json!({
@@ -691,9 +702,11 @@ pub async fn status(json: bool) -> Result<()> {
     }
     println!("  pid file:  {}", supervisor_pid_path().display());
     println!("  port file: {}", supervisor_port_path().display());
+    println!("  scope:     machine-wide (one per machine, not per KIN_HOME)");
     if sup_state.is_stale() {
         println!("  note: supervisor endpoint files are stale; run `kin daemon stop --all` to clear them");
     }
+    println!("  this KIN_HOME: {caller_home}");
 
     println!();
     if supervisor_url.is_none() {
@@ -726,6 +739,11 @@ pub async fn status(json: bool) -> Result<()> {
             );
             println!("    route:     {}", daemon.repo_id);
             println!("    endpoint:  {}", daemon.endpoint);
+            println!(
+                "    kin home:  {} ({})",
+                daemon.home_label(),
+                home_scope_label(daemon.home_scope(&caller_home))
+            );
             if !daemon.last_heartbeat_at.trim().is_empty() {
                 println!("    heartbeat: {}", daemon.last_heartbeat_at);
             }
@@ -779,13 +797,117 @@ fn current_repo_status() -> Option<CurrentRepoStatus> {
 
 // ── stop ────────────────────────────────────────────────────────────────────
 
+/// Which daemons a `--all` sweep is entitled to stop.
+///
+/// The supervisor is a machine-level singleton: its directory hangs off
+/// `registry_path()`, which resolves from the real home, while `KIN_HOME` moves
+/// only store and install state. One supervisor therefore holds daemons from
+/// several managed homes, and an unscoped `--all` reaches every one of them.
+/// That is how a pinned session stopped daemons it did not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopScope {
+    /// Only daemons recording the caller's managed home. The default, because
+    /// pinning `KIN_HOME` reads everywhere else as "bound to my own state".
+    Home,
+    /// Every daemon this supervisor knows about, whichever home it belongs to.
+    /// The operator gesture, and it names what it is taking down.
+    Machine,
+}
+
+impl StopScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Machine => "machine",
+        }
+    }
+}
+
 /// `kin daemon stop` — gracefully stop the current repo's worker daemon, or with
-/// `--all` every worker plus the supervisor (supervisor last).
-pub async fn stop(all: bool, json: bool) -> Result<()> {
+/// `--all` every worker under this managed home plus the supervisor (supervisor
+/// last). `--machine` widens the sweep to the whole box.
+pub async fn stop(all: bool, machine: bool, json: bool) -> Result<()> {
     if all {
-        stop_all(json, false).await
+        let scope = if machine {
+            StopScope::Machine
+        } else {
+            StopScope::Home
+        };
+        stop_all(scope, json, false).await
     } else {
         stop_current_repo(json).await
+    }
+}
+
+/// A registered daemon that does not belong to the caller's managed home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForeignDaemon {
+    label: String,
+    pid: u32,
+    /// The recorded home, or `unrecorded`.
+    home: String,
+    /// False when the daemon reported no home at all, which is a different
+    /// answer from reporting one that does not match.
+    recorded: bool,
+}
+
+impl ForeignDaemon {
+    fn description(&self) -> String {
+        if self.recorded {
+            format!("{} (pid {}, home {})", self.label, self.pid, self.home)
+        } else {
+            format!("{} (pid {}, home unrecorded)", self.label, self.pid)
+        }
+    }
+}
+
+/// Split a supervisor's registry into what this sweep will stop and what does
+/// not belong to the caller's home.
+///
+/// The second list is returned for both scopes and means different things:
+/// under [`StopScope::Home`] it is what was skipped, under
+/// [`StopScope::Machine`] it is what is being taken down on someone else's
+/// behalf. Either way it gets named, because a sweep that silently omits or
+/// silently includes a daemon is the failure this partition exists to end.
+pub(crate) fn partition_by_home(
+    daemons: Vec<RegisteredRepoDaemon>,
+    caller_home: &str,
+    scope: StopScope,
+) -> (Vec<RegisteredRepoDaemon>, Vec<ForeignDaemon>) {
+    let mut targets = Vec::new();
+    let mut foreign = Vec::new();
+
+    for daemon in daemons {
+        let relation = daemon.home_scope(caller_home);
+        if relation != DaemonHomeScope::Own {
+            foreign.push(ForeignDaemon {
+                label: daemon_label(&daemon),
+                pid: daemon.pid,
+                home: daemon.home_label().to_string(),
+                recorded: relation == DaemonHomeScope::Foreign,
+            });
+        }
+        if scope == StopScope::Machine || relation == DaemonHomeScope::Own {
+            targets.push(daemon);
+        }
+    }
+
+    (targets, foreign)
+}
+
+fn daemon_label(daemon: &RegisteredRepoDaemon) -> String {
+    if daemon.display_name.trim().is_empty() {
+        daemon.repo_id.clone()
+    } else {
+        daemon.display_name.clone()
+    }
+}
+
+fn home_scope_label(scope: DaemonHomeScope) -> &'static str {
+    match scope {
+        DaemonHomeScope::Own => "this KIN_HOME",
+        DaemonHomeScope::Foreign => "other KIN_HOME",
+        DaemonHomeScope::Unrecorded => "home unrecorded",
     }
 }
 
@@ -794,7 +916,10 @@ pub async fn stop(all: bool, json: bool) -> Result<()> {
 /// failures still propagate so it never removes binaries out from under a live
 /// daemon.
 pub(crate) async fn stop_all_quiet() -> Result<()> {
-    stop_all(false, true).await
+    // Machine scope on purpose: uninstall removes the binaries every daemon on
+    // this box is running from, so leaving another home's daemon alive would
+    // strand a live process on a deleted install.
+    stop_all(StopScope::Machine, true, true).await
 }
 
 /// Startup authority retained by full uninstall until the install root is
@@ -871,7 +996,7 @@ pub(crate) async fn stop_all_for_uninstall(install_root: &Path) -> Result<Uninst
             }
         }
     };
-    stop_all_inner(false, true, Some(install_root)).await?;
+    stop_all_inner(StopScope::Machine, false, true, Some(install_root)).await?;
     let fence = UninstallDaemonFence {
         _startup_authority: startup_authority,
     };
@@ -986,11 +1111,29 @@ async fn resolve_repo_worker_pid(kin_root: &Path, working_dir: &Path) -> Result<
         .map(|d| d.pid))
 }
 
-async fn stop_all(json: bool, quiet: bool) -> Result<()> {
-    stop_all_inner(json, quiet, None).await
+async fn stop_all(scope: StopScope, json: bool, quiet: bool) -> Result<()> {
+    stop_all_inner(scope, json, quiet, None).await
 }
 
-async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) -> Result<()> {
+/// Whether the current-repo fallback may stop `pid`. The fallback exists for a
+/// worker no supervisor knows about, so a pid already covered by a stop report
+/// is declined for the ordinary reason, and a pid the home partition skipped
+/// must be declined too: stopping it would undo the partition the sweep just
+/// disclosed, and the command's own output would contradict itself.
+fn fallback_may_stop(
+    pid: u32,
+    reported: impl IntoIterator<Item = u32>,
+    skipped: impl IntoIterator<Item = u32>,
+) -> bool {
+    !reported.into_iter().any(|p| p == pid) && !skipped.into_iter().any(|p| p == pid)
+}
+
+async fn stop_all_inner(
+    scope: StopScope,
+    json: bool,
+    quiet: bool,
+    uninstall_root: Option<&Path>,
+) -> Result<()> {
     // One budget for the whole sweep. Each identity below waits only for what
     // is left of it, so this command's bound is the budget rather than the
     // budget multiplied by however many daemons happen to be running.
@@ -1063,12 +1206,16 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
         }
     }
 
+    // Full uninstall is machine-wide by construction: it must leave no process
+    // running before it removes the binaries, so it never partitions.
+    let (daemons, foreign) = if uninstall_root.is_some() {
+        (daemons, Vec::new())
+    } else {
+        partition_by_home(daemons, &caller_home_id(), scope)
+    };
+
     for daemon in daemons {
-        let label = if daemon.display_name.trim().is_empty() {
-            daemon.repo_id.clone()
-        } else {
-            daemon.display_name.clone()
-        };
+        let label = daemon_label(&daemon);
         let kin_root = Path::new(&daemon.repo_root).join(".kin");
         let outcome = stop_worker_at(
             &kin_root,
@@ -1087,14 +1234,21 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
     }
 
     // Also stop the current repo's worker if it is not registered with the
-    // supervisor (e.g. supervisor down but a worker process lingering).
+    // supervisor (e.g. supervisor down but a worker process lingering). The
+    // repo-local pid file is home-agnostic, so this fallback is where a scoped
+    // sweep could otherwise reach a daemon the partition skipped;
+    // `fallback_may_stop` is what keeps the disclosure and the kill agreeing.
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(layout) = kin_core::KinLayout::discover(&cwd) {
             let kin_root = layout.root().to_path_buf();
             let (pid, _) = repo_daemon_recorded_endpoint(&kin_root);
             if let Some(pid) = pid {
-                let already = reports.iter().any(|r| r.pid == pid);
-                if !already && is_process_alive(pid) {
+                let may_stop = fallback_may_stop(
+                    pid,
+                    reports.iter().map(|r| r.pid),
+                    foreign.iter().map(|skipped| skipped.pid),
+                );
+                if may_stop && is_process_alive(pid) {
                     let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
                     let outcome = stop_worker_at(
                         &kin_root,
@@ -1115,9 +1269,15 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
         }
     }
 
+    // The supervisor is shared. Stopping it while daemons from other homes are
+    // still registered would take away the routing they depend on, which is the
+    // same boundary violation as stopping them outright. A home-scoped sweep
+    // that left anything behind therefore retains it and says so.
+    let supervisor_retained = scope == StopScope::Home && !foreign.is_empty();
+
     // The ordinary `kin daemon stop --all` path keeps the historical order:
     // workers first, supervisor last. Full uninstall already stopped it above.
-    if uninstall_root.is_none() {
+    if uninstall_root.is_none() && !supervisor_retained {
         if let (Some(pid), Some(identity)) = (sup_pid, supervisor_identity.as_ref()) {
             let outcome = stop_supervisor_identity(identity, remaining_budget(deadline));
             if outcome.is_success() {
@@ -1137,25 +1297,99 @@ async fn stop_all_inner(json: bool, quiet: bool, uninstall_root: Option<&Path>) 
         stop_install_owned_daemons(install_root, deadline, &mut reports)?;
     }
 
+    let disclosure = StopDisclosure {
+        scope: Some(scope),
+        foreign,
+        supervisor_retained,
+    };
+
     if reports.is_empty() {
         if quiet {
             // The absence of managed daemons is a successful precondition for
             // full uninstall and needs no nested command output.
         } else if json {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "schema": "kin.daemon-stop.v1",
-                "scope": "all",
+                "scope": scope.label(),
                 "stopped": [],
                 "all_stopped": true,
             });
+            disclosure.write_json(&mut payload);
             println!("{}", serde_json::to_string_pretty(&payload)?);
-        } else {
+        } else if disclosure.foreign.is_empty() {
             println!("No Kin daemons running.");
+        } else {
+            // Never "no daemons running": daemons ARE running, and this scope
+            // is simply not entitled to them. Collapsing the two is how a
+            // scoped sweep would start reading as an empty machine.
+            println!("No Kin daemons running under this KIN_HOME.");
+            disclosure.write_text();
         }
         return Ok(());
     }
 
-    finish_stop_with_output("all", &reports, json, quiet)
+    finish_stop_with_output(scope.label(), &reports, json, quiet, &disclosure)
+}
+
+/// What a sweep must say about daemons outside its scope.
+#[derive(Debug, Default)]
+pub(crate) struct StopDisclosure {
+    scope: Option<StopScope>,
+    foreign: Vec<ForeignDaemon>,
+    /// The supervisor was deliberately left running because other homes still
+    /// depend on it.
+    supervisor_retained: bool,
+}
+
+impl StopDisclosure {
+    fn write_json(&self, payload: &mut serde_json::Value) {
+        let Some(scope) = self.scope else {
+            return;
+        };
+        let listed: Vec<_> = self
+            .foreign
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "label": d.label,
+                    "pid": d.pid,
+                    "kin_home": d.home,
+                    "home_recorded": d.recorded,
+                })
+            })
+            .collect();
+        let key = match scope {
+            StopScope::Home => "skipped_other_homes",
+            StopScope::Machine => "stopped_other_homes",
+        };
+        payload[key] = serde_json::Value::Array(listed);
+        payload["supervisor_retained"] = serde_json::Value::Bool(self.supervisor_retained);
+    }
+
+    fn write_text(&self) {
+        let Some(scope) = self.scope else {
+            return;
+        };
+        if self.foreign.is_empty() {
+            return;
+        }
+        let lead = match scope {
+            StopScope::Home => "Skipped (other KIN_HOME)",
+            StopScope::Machine => "Also stopped (other KIN_HOME)",
+        };
+        println!("{lead}:");
+        for daemon in &self.foreign {
+            println!("  {}", daemon.description());
+        }
+        if scope == StopScope::Home {
+            println!(
+                "  KIN_HOME bounds store state; the supervisor is machine-wide. Use `kin daemon stop --all --machine` to stop these too."
+            );
+        }
+        if self.supervisor_retained {
+            println!("  Supervisor left running: it is shared with the daemons above.");
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1398,7 +1632,7 @@ fn stop_install_owned_daemons(
 /// Emit the stop report and fail loud (nonzero exit) if any endpoint would not
 /// die, so scripts can trust the exit code.
 fn finish_stop(scope: &str, reports: &[StopReport], json: bool) -> Result<()> {
-    finish_stop_with_output(scope, reports, json, false)
+    finish_stop_with_output(scope, reports, json, false, &StopDisclosure::default())
 }
 
 fn finish_stop_with_output(
@@ -1406,6 +1640,7 @@ fn finish_stop_with_output(
     reports: &[StopReport],
     json: bool,
     quiet: bool,
+    disclosure: &StopDisclosure,
 ) -> Result<()> {
     let all_stopped = reports.iter().all(|r| r.outcome.is_success());
     // Reported separately from `all_stopped`, which stays a statement about
@@ -1436,13 +1671,14 @@ fn finish_stop_with_output(
                 entry
             })
             .collect();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "schema": "kin.daemon-stop.v1",
             "scope": scope,
             "stopped": stopped,
             "all_stopped": all_stopped,
             "endpoints_retired": endpoints_retired,
         });
+        disclosure.write_json(&mut payload);
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         for r in reports {
@@ -1471,7 +1707,10 @@ fn finish_stop_with_output(
                 );
             }
         }
+        disclosure.write_text();
         if all_stopped && endpoints_retired {
+            // "Targeted" is load-bearing now that a sweep can be scoped: the
+            // disclosure above names what was outside the target.
             println!("All targeted Kin daemons stopped.");
         }
     }
@@ -1537,6 +1776,7 @@ mod tests {
             &[stop_report(Some(preserved))],
             false,
             false,
+            &StopDisclosure::default(),
         )
         .expect_err("a published endpoint outliving a confirmed stop is a failure");
         let rendered = format!("{error:#}");
@@ -1548,8 +1788,14 @@ mod tests {
         // The falsification: the identical report with nothing preserved passes,
         // so the assertion above is about the survivor and not about the shape
         // of the report.
-        finish_stop_with_output("current-repo", &[stop_report(None)], false, false)
-            .expect("a retired endpoint is a clean stop");
+        finish_stop_with_output(
+            "current-repo",
+            &[stop_report(None)],
+            false,
+            false,
+            &StopDisclosure::default(),
+        )
+        .expect("a retired endpoint is a clean stop");
     }
 
     /// Full uninstall's nested stop must not be blocked by a leftover pid file.
@@ -1562,8 +1808,14 @@ mod tests {
             Path::new("/repo/.kin/daemon.pid"),
             "recorded owner pid 4242 never became affirmatively dead",
         );
-        finish_stop_with_output("all", &[stop_report(Some(preserved))], false, true)
-            .expect("a leftover endpoint record does not keep an install alive");
+        finish_stop_with_output(
+            "all",
+            &[stop_report(Some(preserved))],
+            false,
+            true,
+            &StopDisclosure::default(),
+        )
+        .expect("a leftover endpoint record does not keep an install alive");
     }
 
     #[cfg(windows)]
@@ -1954,5 +2206,202 @@ mod tests {
         let _ = reaper.join();
 
         assert_eq!(outcome, StopOutcome::Stopped);
+    }
+
+    fn registered(label: &str, pid: u32, kin_home: &str) -> RegisteredRepoDaemon {
+        RegisteredRepoDaemon {
+            repo_id: format!("local-{label}"),
+            display_name: label.to_string(),
+            instance_id: format!("pid-{pid}"),
+            repo_root: format!("/repos/{label}"),
+            pid,
+            port: 49152,
+            endpoint: "http://127.0.0.1:49152".to_string(),
+            graph_entity_count: None,
+            kin_home: kin_home.to_string(),
+            registered_at: None,
+            last_heartbeat_at: String::new(),
+        }
+    }
+
+    fn two_homes() -> Vec<RegisteredRepoDaemon> {
+        vec![
+            registered("mine", 101, "/homes/a/.kin"),
+            registered("theirs", 202, "/homes/b/.kin"),
+        ]
+    }
+
+    /// The FIR-2167 refusal: a pinned session sweeping `--all` reaches only its
+    /// own daemons, and the neighbour's survives.
+    #[test]
+    fn a_home_scoped_sweep_stops_only_its_own_daemons() {
+        let (targets, foreign) = partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
+
+        assert_eq!(targets.iter().map(|d| d.pid).collect::<Vec<_>>(), vec![101]);
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].pid, 202);
+        assert_eq!(foreign[0].home, "/homes/b/.kin");
+        assert!(foreign[0].recorded);
+    }
+
+    /// The same registry read from the other home reaches the other daemon.
+    /// Without this, a partition that simply always kept the first entry would
+    /// pass the test above.
+    #[test]
+    fn the_scoped_sweep_follows_the_callers_home() {
+        let (targets, foreign) = partition_by_home(two_homes(), "/homes/b/.kin", StopScope::Home);
+
+        assert_eq!(targets.iter().map(|d| d.pid).collect::<Vec<_>>(), vec![202]);
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].pid, 101);
+    }
+
+    #[test]
+    fn a_machine_sweep_stops_both_and_names_the_foreign_one() {
+        let (targets, foreign) =
+            partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Machine);
+
+        assert_eq!(
+            targets.iter().map(|d| d.pid).collect::<Vec<_>>(),
+            vec![101, 202]
+        );
+        assert_eq!(
+            foreign.len(),
+            1,
+            "the sweep must disclose what it took down"
+        );
+        assert_eq!(foreign[0].pid, 202);
+    }
+
+    /// A daemon that recorded no home is excluded from a scoped sweep. Treating
+    /// an unknown as a match is exactly the assumption that made `--all`
+    /// machine-wide in the first place.
+    #[test]
+    fn an_unrecorded_home_is_not_treated_as_the_callers() {
+        let daemons = vec![registered("legacy", 303, "")];
+        let (targets, foreign) = partition_by_home(daemons, "/homes/a/.kin", StopScope::Home);
+
+        assert!(targets.is_empty());
+        assert_eq!(foreign.len(), 1);
+        assert!(!foreign[0].recorded);
+        assert!(foreign[0].description().contains("home unrecorded"));
+    }
+
+    #[test]
+    fn a_machine_sweep_still_reaches_an_unrecorded_daemon() {
+        let daemons = vec![registered("legacy", 303, "")];
+        let (targets, _) = partition_by_home(daemons, "/homes/a/.kin", StopScope::Machine);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn home_scope_distinguishes_own_foreign_and_unrecorded() {
+        assert_eq!(
+            registered("a", 1, "/homes/a/.kin").home_scope("/homes/a/.kin"),
+            DaemonHomeScope::Own
+        );
+        assert_eq!(
+            registered("b", 2, "/homes/b/.kin").home_scope("/homes/a/.kin"),
+            DaemonHomeScope::Foreign
+        );
+        assert_eq!(
+            registered("c", 3, "  ").home_scope("/homes/a/.kin"),
+            DaemonHomeScope::Unrecorded
+        );
+        assert_eq!(registered("c", 3, "").home_label(), "unrecorded");
+    }
+
+    /// The census must be able to say which daemons are the caller's, which is
+    /// the FIR-2180 visibility half of the contract.
+    #[test]
+    fn the_census_labels_every_home() {
+        let labels: Vec<_> = two_homes()
+            .iter()
+            .map(|d| home_scope_label(d.home_scope("/homes/a/.kin")))
+            .collect();
+        assert_eq!(labels, vec!["this KIN_HOME", "other KIN_HOME"]);
+    }
+
+    #[test]
+    fn a_scoped_sweep_that_skips_nothing_may_stop_the_supervisor() {
+        let daemons = vec![registered("mine", 101, "/homes/a/.kin")];
+        let (_, foreign) = partition_by_home(daemons, "/homes/a/.kin", StopScope::Home);
+        assert!(
+            foreign.is_empty(),
+            "nothing skipped, so the shared supervisor has no other dependant"
+        );
+    }
+
+    /// The current-repo fallback must not undo the partition.
+    ///
+    /// That fallback exists for a worker no supervisor knows about, and it keys
+    /// on "this pid is not already in the reports". A skipped daemon is not in
+    /// the reports either, so keying on that alone would stop the daemon the
+    /// sweep had just named as another home's and print both facts about it.
+    #[test]
+    fn the_current_repo_fallback_skips_a_daemon_the_partition_excluded() {
+        let (targets, foreign) = partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
+        let reported: Vec<u32> = targets.iter().map(|d| d.pid).collect();
+
+        // The foreign daemon happens to serve the repository the caller stands
+        // in, so the fallback would reach for it, and the reports cannot be
+        // what protects it: the partition excluded it from them.
+        let current_repo_pid = 202;
+        assert!(!reported.contains(&current_repo_pid));
+        assert!(
+            !fallback_may_stop(
+                current_repo_pid,
+                reported.iter().copied(),
+                foreign.iter().map(|skipped| skipped.pid),
+            ),
+            "a daemon named as skipped must not then be stopped by the fallback"
+        );
+
+        // The caller's own daemon is in the reports, so the fallback declines
+        // it for the ordinary reason.
+        assert!(
+            !fallback_may_stop(
+                101,
+                reported.iter().copied(),
+                foreign.iter().map(|skipped| skipped.pid),
+            ),
+            "an already-reported daemon is not the fallback's business"
+        );
+
+        // A worker neither reported nor skipped is exactly what the fallback
+        // exists for, so the guard must not over-prune it.
+        assert!(
+            fallback_may_stop(
+                999,
+                reported.iter().copied(),
+                foreign.iter().map(|skipped| skipped.pid),
+            ),
+            "an unknown lingering worker must remain stoppable"
+        );
+    }
+
+    #[test]
+    fn the_disclosure_json_separates_skipped_from_stopped() {
+        let (_, foreign) = partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
+        let skipped = StopDisclosure {
+            scope: Some(StopScope::Home),
+            foreign: foreign.clone(),
+            supervisor_retained: true,
+        };
+        let mut payload = serde_json::json!({});
+        skipped.write_json(&mut payload);
+        assert_eq!(payload["skipped_other_homes"][0]["pid"], 202);
+        assert_eq!(payload["supervisor_retained"], true);
+        assert!(payload.get("stopped_other_homes").is_none());
+
+        let taken = StopDisclosure {
+            scope: Some(StopScope::Machine),
+            foreign,
+            supervisor_retained: false,
+        };
+        let mut payload = serde_json::json!({});
+        taken.write_json(&mut payload);
+        assert_eq!(payload["stopped_other_homes"][0]["pid"], 202);
+        assert!(payload.get("skipped_other_homes").is_none());
     }
 }

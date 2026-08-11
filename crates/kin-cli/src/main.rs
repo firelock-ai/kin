@@ -1931,9 +1931,17 @@ enum DaemonAction {
     },
     /// Gracefully stop the current repo's worker daemon (or every daemon with --all)
     Stop {
-        /// Stop every worker daemon and the supervisor (supervisor last)
+        /// Stop every worker daemon under this KIN_HOME, then the supervisor
+        ///
+        /// The supervisor is machine-wide, so it can hold daemons from other
+        /// managed homes. Those are skipped and named rather than stopped, and
+        /// the supervisor itself is left running while any of them remain. Use
+        /// --machine to stop every daemon on the box regardless of home.
         #[arg(long)]
         all: bool,
+        /// Widen --all to every daemon on this machine, whatever KIN_HOME it runs under
+        #[arg(long, requires = "all")]
+        machine: bool,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -3230,7 +3238,9 @@ fn main() -> Result<()> {
                 },
                 Command::Daemon { action } => match action {
                     DaemonAction::Status { json } => commands::daemon::status(json).await,
-                    DaemonAction::Stop { all, json } => commands::daemon::stop(all, json).await,
+                    DaemonAction::Stop { all, machine, json } => {
+                        commands::daemon::stop(all, machine, json).await
+                    }
                 },
                 Command::Doctor {
                     fix,

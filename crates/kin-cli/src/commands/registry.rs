@@ -5,7 +5,7 @@ use anyhow::Result;
 use kin_core::registry::KinRegistry;
 use std::collections::HashSet;
 
-use crate::daemon_client::RegisteredRepoDaemon;
+use crate::daemon_client::{DaemonHomeScope, RegisteredRepoDaemon};
 
 use super::deps;
 
@@ -109,7 +109,12 @@ pub async fn daemons(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Kin supervisor: {}", supervisor_url);
+    // One supervisor per machine, so this listing can span managed homes. Each
+    // entry states which home it belongs to and whether that is the caller's.
+    let caller_home = crate::daemon_client::caller_home_id();
+
+    println!("Kin supervisor: {} (machine-wide)", supervisor_url);
+    println!("This KIN_HOME:  {caller_home}");
     if daemons.is_empty() {
         println!("No repo daemons registered.");
         return Ok(());
@@ -138,6 +143,15 @@ pub async fn daemons(json: bool) -> Result<()> {
             println!("  instance: {}", daemon.instance_id);
         }
         println!("  endpoint: {}", daemon.endpoint);
+        println!(
+            "  kin home: {} ({})",
+            daemon.home_label(),
+            match daemon.home_scope(&caller_home) {
+                DaemonHomeScope::Own => "this KIN_HOME",
+                DaemonHomeScope::Foreign => "other KIN_HOME",
+                DaemonHomeScope::Unrecorded => "home unrecorded",
+            }
+        );
         println!("  heartbeat: {}", daemon.last_heartbeat_at);
     }
     Ok(())

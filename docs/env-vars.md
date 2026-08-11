@@ -31,7 +31,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the shell and PowerShell installers |
 | `KIN_BINARY_PATH` | path | *(unset)* | operational | override the kin binary path for bench dispatch |
 | `KIN_DIR` | path | *(unset)* | operational | compatibility alias for the managed Kin install root; KIN_HOME wins when both are set |
-| `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks |
+| `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks; bounds install and store state, NOT the machine-wide daemon supervisor |
 | `KIN_LAUNCHER_ADOPT` | bool | false | operational | force the @kinlab/kin launcher to provision its pinned release, including an intentional downgrade |
 | `KIN_MANAGED_BIN` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin launcher instead of provisioning |
 | `KIN_MCP_AUTO_INIT` | bool | false | operational | allow the @kinlab/kin-mcp wrapper to initialize a missing repository before startup |
