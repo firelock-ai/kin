@@ -63,6 +63,10 @@ INSTALLER_ASSET_GUARD = ROOT / "scripts" / "verify-installer-release-assets.py"
 INSTALLER_ASSET_GUARD_POLICY = "scripts/verify-installer-release-assets.py"
 INSTALLER_ASSET_FALSIFIER = ROOT / "scripts" / "falsify-installer-release-assets.py"
 INSTALLER_ASSET_FALSIFIER_POLICY = "scripts/falsify-installer-release-assets.py"
+INSTALLER_BINARY_GUARD = ROOT / "scripts" / "verify-installer-archive-binaries.py"
+INSTALLER_BINARY_GUARD_POLICY = "scripts/verify-installer-archive-binaries.py"
+INSTALLER_BINARY_FALSIFIER = ROOT / "scripts" / "falsify-installer-archive-binaries.py"
+INSTALLER_BINARY_FALSIFIER_POLICY = "scripts/falsify-installer-archive-binaries.py"
 TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
 TAG_LISTING_FORMAT = (
     "--format='%(refname:strip=2) "
@@ -3360,6 +3364,50 @@ def assert_installer_asset_guard_wired(ci: str, release: str) -> None:
             f"release.yml must run {INSTALLER_ASSET_GUARD_POLICY} against the "
             "staged assets; the workflow's intent is not the same evidence as "
             "the bytes about to be uploaded"
+        )
+
+
+def assert_installer_archive_binary_guard_wired(ci: str) -> None:
+    """Keep the check that the installer names binaries the archive carries.
+
+    Resolving the right archive name is only half an install. Once the download
+    lands, the installer names the binaries inside it, and a Windows archive
+    carries `.exe`-suffixed names. The installer named the bare form on every
+    platform, so its mandatory-daemon assertion failed against an archive that
+    was present, complete, and checksum-verified, aborting after the user had
+    already waited for the download.
+
+    This guard reads source rather than staged bytes, so it belongs on pull
+    requests alone. The falsifier runs beside it because a guard nobody has
+    watched fail is not evidence that it can.
+    """
+
+    for path, policy in (
+        (INSTALLER_BINARY_GUARD, INSTALLER_BINARY_GUARD_POLICY),
+        (INSTALLER_BINARY_FALSIFIER, INSTALLER_BINARY_FALSIFIER_POLICY),
+    ):
+        if not path.is_file():
+            raise AssertionError(
+                f"{policy} is missing; the installer could name a binary the "
+                "release archive does not carry and nothing would notice"
+            )
+
+    # Match whole invocations rather than searching for the path, which a
+    # commented-out line would still satisfy.
+    ci_lines = {line.strip() for line in ci.splitlines()}
+    missing = sorted(
+        command
+        for command in (
+            f"python3 ./{INSTALLER_BINARY_GUARD_POLICY}",
+            f"python3 ./{INSTALLER_BINARY_FALSIFIER_POLICY}",
+        )
+        if command not in ci_lines
+    )
+    if missing:
+        raise AssertionError(
+            "ci.yml must run " + " and ".join(missing) + "; without both, the "
+            "installer can abort on a complete archive and no pull request "
+            "would go red"
         )
 
 
@@ -6744,7 +6792,7 @@ def main() -> None:
 
     require(
         install_sh,
-        '"$EXTRACT_DIR/kin" registry authority --initialize',
+        '"$EXTRACT_DIR/kin$BIN_EXT" registry authority --initialize',
         "content-free Unix installer registry-authority initialization",
     )
     require(
@@ -9362,6 +9410,21 @@ def main() -> None:
         lambda: assert_installer_asset_guard_wired(
             ci_workflow,
             release.replace(f"./{INSTALLER_ASSET_GUARD_POLICY} --assets-dir .", "true"),
+        ),
+    )
+    assert_installer_archive_binary_guard_wired(ci_workflow)
+    expect_assertion(
+        "ci.yml drops the guard that installer binary names match the archive",
+        "ci.yml must run",
+        lambda: assert_installer_archive_binary_guard_wired(
+            ci_workflow.replace(INSTALLER_BINARY_GUARD_POLICY, "scripts/absent.py")
+        ),
+    )
+    expect_assertion(
+        "ci.yml keeps the binary-name guard but drops its falsification",
+        "ci.yml must run",
+        lambda: assert_installer_archive_binary_guard_wired(
+            ci_workflow.replace(INSTALLER_BINARY_FALSIFIER_POLICY, "scripts/absent.py")
         ),
     )
     expect_assertion(
