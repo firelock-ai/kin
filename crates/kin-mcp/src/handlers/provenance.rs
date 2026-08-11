@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use kin_model::change::{ChangeOrigin, SemanticChange};
 use kin_model::graph::GraphStore;
-use kin_model::provenance::AuditEvent;
+use kin_model::provenance::{Approval, AuditEvent};
 use kin_model::work::WorkScope;
 
 use crate::error::{McpError, Result};
@@ -139,9 +139,29 @@ fn audit_event_json(event: &AuditEvent) -> serde_json::Value {
         "event_id": event.event_id.to_string(),
         "actor_id": event.actor_id.to_string(),
         "action": event.action,
-        "target_scope": event.target_scope,
+        // A Change-scoped event would otherwise externally tag a Hash256 and
+        // ship {"Change": [32 integers]}; Display prints change:<hex> and
+        // entity:<uuid>, which a caller can match against the changes page.
+        "target_scope": event.target_scope.as_ref().map(|scope| scope.to_string()),
         "timestamp": event.timestamp,
         "details": event.details,
+    })
+}
+
+/// An approval with its content-addressed ids rendered as hex.
+///
+/// `approval_id`, `change_id`, and `approver` are all `Hash256` newtypes, so
+/// model serde turns each into 32 integers. The change id in particular is what
+/// a caller compares against `latest_change.id` to confirm which change was
+/// signed off, and a string can never equal an integer array.
+fn approval_json(approval: &Approval) -> serde_json::Value {
+    serde_json::json!({
+        "approval_id": approval.approval_id.to_string(),
+        "change_id": approval.change_id.to_string(),
+        "approver": approval.approver.to_string(),
+        "decision": approval.decision,
+        "reason": approval.reason,
+        "timestamp": approval.timestamp,
     })
 }
 
@@ -182,7 +202,8 @@ pub fn handle_provenance_query<G: GraphStore>(
         let approvals = store
             .get_approvals_for_change(&latest.id)
             .map_err(McpError::graph)?;
-        approvals_json = serde_json::json!(approvals);
+        approvals_json =
+            serde_json::Value::Array(approvals.iter().map(approval_json).collect());
     }
 
     let changes = ordered
@@ -257,7 +278,9 @@ mod tests {
     };
     use kin_model::graph::{ChangeStore, ProvenanceStore};
     use kin_model::ids::{AuthorId, EntityId, GitObjectId, Hash256, LanguageId, SemanticChangeId};
-    use kin_model::provenance::{ActorId, AuditEvent, AuditEventId};
+    use kin_model::provenance::{
+        ActorId, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
+    };
     use kin_model::timestamp::Timestamp;
 
     /// A timestamp written the way the response prints it, so a test's intended
@@ -474,7 +497,7 @@ mod tests {
 
     #[test]
     fn every_hash_the_tool_reports_is_hex() {
-        let (store, entity, _) = git_then_agent_store();
+        let (store, entity, agent_change) = git_then_agent_store();
         store
             .record_audit_event(&AuditEvent {
                 event_id: AuditEventId::from_hash(Hash256::from_bytes([0x5c; 32])),
@@ -483,6 +506,33 @@ mod tests {
                 target_scope: Some(WorkScope::Entity(entity)),
                 timestamp: at("2026-08-10T22:45:27Z"),
                 details: None,
+            })
+            .unwrap();
+        // A Change-scoped event is the shape a relation-only commit records,
+        // and the handler's filter deliberately keeps it; without one in the
+        // fixture the target_scope rendering could regress to tagged byte
+        // arrays with every assertion below still green.
+        store
+            .record_audit_event(&AuditEvent {
+                event_id: AuditEventId::from_hash(Hash256::from_bytes([0x5d; 32])),
+                actor_id: ActorId::from_hash(Hash256::from_bytes([0x9a; 32])),
+                action: "kin_transaction_commit".into(),
+                target_scope: Some(WorkScope::Change(agent_change)),
+                timestamp: at("2026-08-10T22:46:01Z"),
+                details: None,
+            })
+            .unwrap();
+        // An approval on the newest change, for the same reason: its three ids
+        // ride model serde unless the handler renders them, and the caller's
+        // whole use of change_id is equality against latest_change.id.
+        store
+            .create_approval(&Approval {
+                approval_id: ApprovalId::from_hash(Hash256::from_bytes([0x77; 32])),
+                change_id: agent_change,
+                approver: ActorId::from_hash(Hash256::from_bytes([0x9a; 32])),
+                decision: ApprovalDecision::Approved,
+                reason: "reviewed".into(),
+                timestamp: at("2026-08-10T22:47:00Z"),
             })
             .unwrap();
 
@@ -501,10 +551,37 @@ mod tests {
                 "a change id must be hex: {response}"
             );
         }
-        let event = &response["recent_audit_events"][0];
+        let events = response["recent_audit_events"].as_array().unwrap();
+        assert!(!events.is_empty(), "the fixture recorded events: {response}");
+        for event in events {
+            assert!(
+                is_hex_hash(&event["event_id"]) && is_hex_hash(&event["actor_id"]),
+                "audit ids must be hex so they can be carried back to get_actor: {response}"
+            );
+            assert!(
+                event["target_scope"].is_string() || event["target_scope"].is_null(),
+                "a target scope must be printable, never a tagged byte array: {response}"
+            );
+        }
         assert!(
-            is_hex_hash(&event["event_id"]) && is_hex_hash(&event["actor_id"]),
-            "audit ids must be hex so they can be carried back to get_actor: {response}"
+            events.iter().any(|event| event["target_scope"]
+                .as_str()
+                .is_some_and(|scope| scope.starts_with("change:"))),
+            "the Change-scoped event must render as change:<hex>: {response}"
+        );
+
+        let approvals = response["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 1, "the seeded approval must appear: {response}");
+        let approval = &approvals[0];
+        assert!(
+            is_hex_hash(&approval["approval_id"])
+                && is_hex_hash(&approval["change_id"])
+                && is_hex_hash(&approval["approver"]),
+            "approval ids must be hex: {response}"
+        );
+        assert_eq!(
+            approval["change_id"], response["latest_change"]["id"],
+            "the approval must be comparable to the change it approves: {response}"
         );
     }
 
