@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Admit observed new files into the workspace as they are written (#739)
 - Publish a Windows tarball and guard installer asset names (#738)
+- Qualify fused and unnamed semantic_locate pages with the negative envelope (#741)
+- Register the inference and retrieval environment the pinned dependencies read (#742)
+- Split the Windows authority job and budget its steps (#743)
+- Account for Windows binary suffixes in the installer post-extract path (#744)
+- Verify MCP bindings against what setup recorded and name the repository setup binds (#745)
 
 
 ## [0.5.17] - 2026-08-10
