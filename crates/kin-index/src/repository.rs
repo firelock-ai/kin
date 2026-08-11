@@ -654,6 +654,13 @@ fn is_control_component(component: &[u8]) -> bool {
         || component == b".kin-shadow"
         || component.starts_with(b".kin-reconcile-")
         || component.starts_with(b".kin-checkout-")
+        // Init's own staging directories. Both are created beside the
+        // repository being admitted, which is inside the enclosing repository
+        // whenever one is nested under another, so an interrupted init in a
+        // sibling checkout would otherwise offer its entire captured object
+        // closure to this repository as content on the next whole-tree pass.
+        || component.starts_with(b".kin-git-capture-")
+        || component.starts_with(b".kin.init-")
 }
 
 /// Whether a repository path names Kin/Git control metadata.
@@ -1177,6 +1184,34 @@ mod tests {
         assert!(!paths.iter().any(is_repository_control_path));
         assert_eq!(scan.len(), admitted.len() + 1);
         assert_eq!(scan.diagnostics().admitted_entries, admitted.len() + 1);
+    }
+
+    /// Init's own staging directories never become repository content.
+    ///
+    /// A repository nested under another sees its sibling's init staging as
+    /// ordinary untracked directories, and a capture directory an interrupted
+    /// init left behind carries the whole object closure of whatever it was
+    /// admitting. Admitting that as content would offer another repository's
+    /// history to this one as files.
+    #[test]
+    fn init_staging_directories_are_control_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("kept.rs"), b"fn main() {}").unwrap();
+        for staging in [".kin-git-capture-IuJspS", ".kin.init-not-a-uuid"] {
+            fs::create_dir_all(root.join(staging).join("objects")).unwrap();
+            fs::write(root.join(staging).join("objects/body"), b"closure").unwrap();
+        }
+
+        let scan = scan(root);
+        let paths = scan.paths().cloned().collect::<BTreeSet<_>>();
+        assert!(paths.contains(&path("kept.rs")));
+        assert_eq!(scan.len(), 1, "{paths:?}");
+        for staging in [".kin-git-capture-IuJspS", ".kin.init-not-a-uuid"] {
+            assert!(is_repository_control_path(&path(&format!(
+                "{staging}/objects/body"
+            ))));
+        }
     }
 
     #[cfg(unix)]

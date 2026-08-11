@@ -215,19 +215,17 @@ fn init_from_git_with_hooks(
             source.display()
         ))
     })?;
-    let capture_dir = tempfile::Builder::new()
-        .prefix(".kin-git-capture-")
-        .tempdir_in(source_parent)
-        .map_err(|error| KinError::io(source_parent, error))?;
+    let capture_dir = crate::init_staging::GitCaptureStaging::claim(source_parent)?;
     // The capture store lives and dies inside this call, so its bodies are
     // written without device barriers. Its root is the per-init `capture_dir`
-    // above, removed when that handle drops; every later init mints a fresh
-    // random name rather than reopening this one; and nothing durable ever
-    // records a path inside it. Every body that has to outlive init is copied
-    // into the repository's own source-blob store by `copy_captured_authority`,
-    // under that store's unchanged durability. A crash that could tear these
-    // bytes therefore destroys the only reader they ever had, and leaves no
-    // published `.kin` behind to reference them.
+    // above, removed when that handle drops, when a terminating signal reaches
+    // this process, or by the next init's reap when neither ran; every later
+    // init mints a fresh random name rather than reopening this one; and
+    // nothing durable ever records a path inside it. Every body that has to
+    // outlive init is copied into the repository's own source-blob store by
+    // `copy_captured_authority`, under that store's unchanged durability. A
+    // crash that could tear these bytes therefore destroys the only reader they
+    // ever had, and leaves no published `.kin` behind to reference them.
     let capture_store = BlobStore::new_ephemeral(capture_dir.path().join("objects"))
         .map_err(|error| git_boundary_error("create capture CAS", error))?;
 
@@ -1130,6 +1128,159 @@ mod tests {
             b"edited after the commit\n"
         );
         assert!(source.join("init.log").exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    /// An init killed mid-capture leaves neither `.kin` nor a capture directory.
+    ///
+    /// The reported failure was exactly this: a `SIGTERM` left no `.kin`, so
+    /// the store stayed atomic, and stranded the whole captured object closure
+    /// beside the repository where nothing named it for a day. The parent waits
+    /// until it can see the capture directory before signalling, so a child
+    /// that died before staging anything fails this test rather than passing
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn an_init_killed_mid_capture_leaves_no_kin_and_no_capture_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        // Enough distinct bodies that capture is still running when the parent
+        // notices the directory and signals.
+        for index in 0..400 {
+            std::fs::write(
+                source.join(format!("body-{index:04}.txt")),
+                format!("exact source body {index}\n").repeat(64),
+            )
+            .unwrap();
+        }
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("git_init::tests::interrupted_init_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Wait until the capture is actually filling the directory, not merely
+        // until it exists. Removing a tree a live writer is still extending is
+        // the case the signal path has to survive, and killing the child the
+        // instant the directory appears would never reach it.
+        let staged = wait_for_filling_capture(root.path(), 20, &mut child);
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+            0,
+            "deliver SIGTERM to the interrupted init"
+        );
+        let status = child.wait().unwrap();
+
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the interrupted init must still die of its signal: {status:?}"
+        );
+        assert!(
+            !source.join(".kin").exists(),
+            "an interrupted init must publish nothing"
+        );
+        assert!(
+            !staged.exists(),
+            "{} survived the interrupted init",
+            staged.display()
+        );
+        assert_no_staging_directories(root.path());
+    }
+
+    /// Poll until the child's capture directory holds at least `wanted` files,
+    /// failing loudly if the child finishes or stalls before it gets there.
+    #[cfg(unix)]
+    fn wait_for_filling_capture(
+        parent: &Path,
+        wanted: usize,
+        child: &mut std::process::Child,
+    ) -> std::path::PathBuf {
+        fn count_files(root: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .map(|entry| match entry.path() {
+                    path if path.is_dir() => count_files(&path),
+                    _ => 1,
+                })
+                .sum()
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".kin-git-capture-"))
+                        && path.is_dir()
+                        && count_files(&path) >= wanted
+                    {
+                        return path;
+                    }
+                }
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the init subprocess exited before it filled a capture: {status:?}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("the init subprocess never filled a capture directory");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Child half of
+    /// [`an_init_killed_mid_capture_leaves_no_kin_and_no_capture_directory`].
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_init_subprocess() {
+        let Some(source) = std::env::var_os("KIN_INIT_INTERRUPTED_TEST_SOURCE") else {
+            return;
+        };
+        let _ = init_from_git(Path::new(&source));
+    }
+
+    /// A capture directory a previous interrupted init left behind is removed
+    /// by the next real init rather than accumulating beside the repository.
+    #[test]
+    fn a_stale_capture_directory_is_reaped_by_the_next_init() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(&source, ["commit", "-m", "initial"]);
+        let stale = root.path().join(".kin-git-capture-Stranded");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("capture.lease"), b"").unwrap();
+        std::fs::create_dir(stale.join("objects")).unwrap();
+        std::fs::write(stale.join("objects/body"), b"orphaned closure").unwrap();
+
+        init_from_git(&source).unwrap();
+
+        assert!(source.join(".kin").exists());
+        assert!(
+            !stale.exists(),
+            "an abandoned capture directory must not survive the next init"
+        );
         assert_no_staging_directories(root.path());
     }
 
