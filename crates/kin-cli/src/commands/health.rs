@@ -2115,6 +2115,7 @@ mod tests {
             progress: 128,
             progress_age_seconds: Some(4),
             working_seconds: Some(9),
+            deferred_seconds: None,
             stopped_reason: stopped_reason.map(str::to_string),
         }
     }

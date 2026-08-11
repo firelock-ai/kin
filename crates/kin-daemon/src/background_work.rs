@@ -130,6 +130,14 @@ struct PassInner {
     progress_at: Option<Instant>,
     /// Start of the current uninterrupted working stretch; `None` while idle.
     working_since: Option<Instant>,
+    /// Start of the current stretch with deferred work owed; `None` when the
+    /// pass's retry queue is empty.
+    ///
+    /// Deliberately independent of `working_since`. A retry ladder that keeps
+    /// widening leaves the pass alternating between working on other paths and
+    /// having nothing it may admit, so tying this clock to pass activity would
+    /// reset it on exactly the ticks a livelock produces.
+    deferred_since: Option<Instant>,
     /// Why this pass stopped, once it has.
     halt: Option<String>,
     /// Cumulative delay charged to the retry ladder since the last success.
@@ -146,6 +154,7 @@ impl BackgroundPass {
                 progress: 0,
                 progress_at: None,
                 working_since: None,
+                deferred_since: None,
                 halt: None,
                 retry_spent: Duration::ZERO,
             }),
@@ -189,6 +198,35 @@ impl BackgroundPass {
     /// wedged loop still reaches would clear the very stretch being measured.
     pub fn idle(&self) {
         self.lock().working_since = None;
+    }
+
+    /// Record whether deferred work is still owed to this pass, and since when.
+    ///
+    /// Call it once per loop turn with the pass's own answer to "is my retry
+    /// queue non-empty", including on the turns that find nothing to do. That is
+    /// what separates the two ways a pass can have no admittable work: a drained
+    /// queue is [`idle`](Self::idle), and a queue whose entries are all waiting
+    /// out a retry ladder is `waiting_deferred`.
+    ///
+    /// The distinction exists because the reconcile loop reports itself idle on
+    /// every tick of a ladder wait. A path that never stabilizes keeps the loop
+    /// deferring and re-deferring forever while each individual tick truthfully
+    /// finds nothing it may admit, so the pass reads as idle throughout a
+    /// livelock that is spending real CPU.
+    ///
+    /// This deliberately does not feed the stall watchdog. Holding the working
+    /// stretch open across ladder waits would make any flapping file eventually
+    /// halt the loop, which is a worse failure than the blind spot. The livelock
+    /// becomes visible as a state and an age instead of as a stop.
+    pub fn set_deferred(&self, owed: bool, now: Instant) {
+        let mut inner = self.lock();
+        if owed {
+            if inner.deferred_since.is_none() {
+                inner.deferred_since = Some(now);
+            }
+        } else {
+            inner.deferred_since = None;
+        }
     }
 
     /// Record `units` of newly persisted work.
@@ -274,10 +312,16 @@ impl BackgroundPass {
 
     fn report(&self, now: Instant) -> BackgroundPassReport {
         let inner = self.lock();
+        // `working` outranks `waiting_deferred`: a pass burning CPU on this tick
+        // is described by that, not by the queue it also owes. `waiting_deferred`
+        // outranks `idle`, which is the whole correction: a pass waiting out a
+        // ladder is not a pass with nothing to do.
         let state = if inner.halt.is_some() {
             "stopped"
         } else if inner.working_since.is_some() {
             "working"
+        } else if inner.deferred_since.is_some() {
+            "waiting_deferred"
         } else {
             "idle"
         };
@@ -290,6 +334,9 @@ impl BackgroundPass {
                 .map(|at| now.saturating_duration_since(at).as_secs()),
             working_seconds: inner
                 .working_since
+                .map(|since| now.saturating_duration_since(since).as_secs()),
+            deferred_seconds: inner
+                .deferred_since
                 .map(|since| now.saturating_duration_since(since).as_secs()),
             stopped_reason: inner.halt.clone(),
         }
@@ -770,6 +817,114 @@ mod tests {
             Some(Duration::from_secs(86_400)),
             Duration::from_secs(60)
         ));
+    }
+
+    fn reconcile_pass() -> Arc<BackgroundPass> {
+        BackgroundWorkSupervisor::default().pass(PASS_RECONCILE)
+    }
+
+    /// The FIR-2165 correction. A pass with deferred work owed reports a state
+    /// of its own, so a retry ladder that never converges stops reading as a
+    /// pass with nothing to do.
+    #[test]
+    fn deferred_work_is_reported_separately_from_idle() {
+        let base = Instant::now();
+        let pass = reconcile_pass();
+
+        assert_eq!(pass.report(base).state, "idle");
+        assert_eq!(pass.report(base).deferred_seconds, None);
+
+        pass.set_deferred(true, base);
+        let report = pass.report(at(base, 4_021));
+        assert_eq!(report.state, "waiting_deferred");
+        assert_eq!(report.deferred_seconds, Some(4_021));
+        assert_eq!(
+            report.working_seconds, None,
+            "a waiting pass holds no working stretch"
+        );
+    }
+
+    /// Draining the queue returns the pass to true idle, so the state cannot
+    /// latch on and report a livelock that has since resolved.
+    #[test]
+    fn a_drained_queue_returns_the_pass_to_idle() {
+        let base = Instant::now();
+        let pass = reconcile_pass();
+        pass.set_deferred(true, base);
+        pass.set_deferred(false, at(base, 10));
+
+        let report = pass.report(at(base, 20));
+        assert_eq!(report.state, "idle");
+        assert_eq!(report.deferred_seconds, None);
+    }
+
+    /// The clock latches on the first tick that owes work and is not restarted
+    /// by later ticks that still owe it. Without this a loop polling every few
+    /// hundred milliseconds would report an age of roughly one tick forever.
+    #[test]
+    fn the_deferred_clock_is_not_restarted_by_repeat_reports() {
+        let base = Instant::now();
+        let pass = reconcile_pass();
+        pass.set_deferred(true, base);
+        pass.set_deferred(true, at(base, 10));
+        pass.set_deferred(true, at(base, 20));
+
+        assert_eq!(pass.report(at(base, 30)).deferred_seconds, Some(30));
+    }
+
+    /// The blast-radius guard. Deferred work must never make the watchdog stop
+    /// the loop: holding a working stretch open across ladder waits would let
+    /// any flapping file halt reconciliation, which is worse than the blind spot
+    /// this change closes.
+    #[test]
+    fn deferred_work_alone_never_stalls_a_pass() {
+        let base = Instant::now();
+        let supervisor = BackgroundWorkSupervisor::new(Duration::from_secs(60));
+        let pass = supervisor.pass(PASS_RECONCILE);
+        pass.set_deferred(true, base);
+
+        assert!(supervisor.sweep(at(base, 86_400)).is_empty());
+        assert!(!pass.halted());
+        assert_eq!(pass.report(at(base, 86_400)).state, "waiting_deferred");
+    }
+
+    /// A pass that is actually burning CPU is described by that, not by the
+    /// queue it also owes.
+    #[test]
+    fn working_outranks_waiting_deferred() {
+        let base = Instant::now();
+        let pass = reconcile_pass();
+        pass.set_deferred(true, base);
+        pass.working(at(base, 5));
+
+        let report = pass.report(at(base, 30));
+        assert_eq!(report.state, "working");
+        assert_eq!(
+            report.deferred_seconds,
+            Some(30),
+            "the deferred clock keeps aging underneath the working stretch"
+        );
+    }
+
+    /// The two clocks are independent, which is the reason this is a second
+    /// reading rather than a reuse of the working stretch. A loop alternating
+    /// between working and having nothing admittable resets `working_seconds`
+    /// every cycle while the deferred age keeps climbing.
+    #[test]
+    fn the_deferred_clock_survives_an_idle_working_cycle() {
+        let base = Instant::now();
+        let pass = reconcile_pass();
+        pass.set_deferred(true, base);
+
+        for tick in 1..=5 {
+            pass.working(at(base, tick * 10));
+            pass.idle();
+        }
+
+        let report = pass.report(at(base, 100));
+        assert_eq!(report.state, "waiting_deferred");
+        assert_eq!(report.deferred_seconds, Some(100));
+        assert_eq!(report.working_seconds, None);
     }
 
     #[test]
