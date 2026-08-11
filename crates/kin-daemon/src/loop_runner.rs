@@ -1317,6 +1317,8 @@ pub async fn run_loop(
                 .reconciliation_status
                 .store(RECON_IDLE, Ordering::Relaxed);
             pass.idle();
+            // A loop that is gone owes nothing, whatever its ladder still held.
+            pass.set_deferred(false, Instant::now());
             info!("reconciliation loop shutting down");
             break;
         }
@@ -1437,17 +1439,32 @@ pub async fn run_loop(
         });
         enqueue_file_events(&mut pending_events, incoming_events);
 
+        // Report the retry queue's own state every tick, including the ticks
+        // that find nothing to do. This clock ages independently of the working
+        // stretch below, which is what makes a ladder that never converges
+        // visible: the loop keeps deferring the same paths, each individual tick
+        // truthfully has nothing it may admit, and without this the pass reports
+        // idle for the entire livelock.
+        pass.set_deferred(!retry_lane.is_empty(), tick_started);
+
         if pending_events.is_empty() {
-            // Nothing observed, so this loop is genuinely doing nothing and its
-            // working stretch ends. This is the only path that clears it: a tick
-            // that keeps retrying the same unadmittable paths never arrives
-            // here, which is what makes that spin observable.
+            // Nothing to admit this tick, so the working stretch ends.
+            //
+            // This does NOT mean the loop is doing nothing. A tick that keeps
+            // retrying the same unadmittable paths reaches here on every tick of
+            // every ladder wait: the paths waiting out a step are dropped from
+            // the incoming events above, and their retries are not yet due, so
+            // the queue is empty while the work is still owed. That is why the
+            // deferred clock above is a separate reading and why this state is
+            // reported as `waiting_deferred` rather than `idle` whenever the
+            // retry lane still holds something.
             pass.idle();
             // No events — sleep briefly then check again.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = cancel.changed() => {
                     state.reconciliation_status.store(RECON_IDLE, Ordering::Relaxed);
+                    pass.set_deferred(false, Instant::now());
                     info!("reconciliation loop shutting down");
                     break;
                 }
@@ -3284,6 +3301,92 @@ mod tests {
             base * (1 << RETRY_BACKOFF_MAX_SHIFT),
             "an attempt count that cannot overflow the shift must still land on the ceiling"
         );
+    }
+
+    /// The reconcile pass as the disclosure surfaces see it.
+    fn reconcile_report(
+        supervisor: &crate::background_work::BackgroundWorkSupervisor,
+        now: Instant,
+    ) -> kin_cli::commands::resources::BackgroundPassReport {
+        supervisor
+            .reports(now)
+            .into_iter()
+            .find(|report| report.name == crate::background_work::PASS_RECONCILE)
+            .expect("the reconcile pass is registered")
+    }
+
+    /// The tick decision this loop makes about its own state, exercised against
+    /// a real ladder-waiting lane.
+    ///
+    /// The loop reports `set_deferred(!retry_lane.is_empty(), tick_started)` and
+    /// then finds `pending_events` empty, because a path waiting out its step is
+    /// dropped from incoming events and its retry is not yet due. Before
+    /// FIR-2165 that combination reported plain `idle` for the whole wait, so a
+    /// ladder that never converged was indistinguishable from a quiet loop.
+    #[test]
+    fn a_ladder_waiting_tick_reports_waiting_deferred_rather_than_idle() {
+        let base = Duration::from_millis(100);
+        let start = Instant::now();
+        let unstable = PathBuf::from("/repo/Cargo.lock");
+        let mut lane = RetryLane::default();
+        let supervisor = crate::background_work::BackgroundWorkSupervisor::default();
+        let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
+
+        // A quiet loop with an empty lane is genuinely idle.
+        pass.set_deferred(!lane.is_empty(), start);
+        pass.idle();
+        assert_eq!(reconcile_report(&supervisor, start).state, "idle");
+
+        // Defer the path, then advance to the middle of its ladder step. This is
+        // the state the livelock sits in.
+        lane.defer(&unstable, start, base);
+        let mid_wait = start + base / 2;
+        assert!(
+            lane.waiting(&unstable, mid_wait),
+            "the path must still be waiting out its step for this to be the case under test"
+        );
+        assert!(
+            lane.take_due(mid_wait).is_empty(),
+            "no retry is due yet, so the tick observes an empty event queue"
+        );
+
+        // The tick the loop actually runs: report the lane, then find nothing to
+        // admit and end the working stretch.
+        pass.set_deferred(!lane.is_empty(), mid_wait);
+        pass.idle();
+
+        let report = reconcile_report(&supervisor, mid_wait + Duration::from_secs(4_021));
+        assert_eq!(
+            report.state, "waiting_deferred",
+            "work is owed, so this tick is not idle"
+        );
+        assert_eq!(report.deferred_seconds, Some(4_021));
+        assert_eq!(report.working_seconds, None);
+    }
+
+    /// The other direction. Once the path settles and the lane drains, the same
+    /// decision reports true idle, so the state cannot be a constant.
+    #[test]
+    fn a_settled_path_returns_the_tick_to_idle() {
+        let base = Duration::from_millis(100);
+        let start = Instant::now();
+        let unstable = PathBuf::from("/repo/Cargo.lock");
+        let mut lane = RetryLane::default();
+        let supervisor = crate::background_work::BackgroundWorkSupervisor::default();
+        let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
+
+        lane.defer(&unstable, start, base);
+        pass.set_deferred(!lane.is_empty(), start);
+        pass.idle();
+        assert_eq!(
+            reconcile_report(&supervisor, start).state,
+            "waiting_deferred"
+        );
+
+        lane.forget(&unstable);
+        pass.set_deferred(!lane.is_empty(), start + base);
+        pass.idle();
+        assert_eq!(reconcile_report(&supervisor, start + base).state, "idle");
     }
 
     #[test]

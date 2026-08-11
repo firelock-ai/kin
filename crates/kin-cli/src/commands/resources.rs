@@ -139,7 +139,12 @@ fn non_empty_env(key: &str) -> Option<String> {
 pub struct BackgroundPassReport {
     /// Stable pass name, e.g. `embed` or `reconcile`.
     pub name: String,
-    /// `idle`, `working`, or `stopped`.
+    /// `idle`, `working`, `waiting_deferred`, or `stopped`.
+    ///
+    /// `waiting_deferred` is not idleness. It means the pass has nothing it may
+    /// admit this instant because deferred work is waiting out a retry ladder,
+    /// and it is reported separately because a ladder that never converges
+    /// otherwise reads exactly like a pass with nothing to do.
     pub state: String,
     /// Units of work this pass has durably recorded since the daemon started.
     /// Monotonic, so a delta across two reads is meaningful.
@@ -153,6 +158,15 @@ pub struct BackgroundPassReport {
     /// absent while idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_seconds: Option<u64>,
+    /// Seconds the pass has had deferred work owed to it without that queue
+    /// draining; absent when nothing is deferred.
+    ///
+    /// Ages independently of `working_seconds`, which is the point: a retry
+    /// ladder that keeps widening leaves the pass alternating between working
+    /// and having nothing admittable, so neither of the other two clocks ever
+    /// shows the livelock this one measures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_seconds: Option<u64>,
     /// Why this pass was stopped, once it has been. A value drives
     /// `status: "attention"` on `/health`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
