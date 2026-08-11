@@ -315,17 +315,61 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
 /// device, precision, or split); `Operational` marks a perf/cache/lifecycle lever
 /// that leaves numerical output identical.
 ///
-/// The kin-db rows are **machine-checked** against the pinned crate by
-/// `every_kin_db_env_read_is_registered`, which enumerates the vendored source of the
-/// exact version in `Cargo.lock`. The other rows are still hand-maintained: those
-/// crates resolve through the private cargo registry the same way, but their levers
-/// need the per-variable reachability judgement the kin-db sweep already has, so
-/// adding, renaming, or removing one there means updating this table by hand.
+/// The kin-db, kin-infer, kin-search, and kin-vector rows are **machine-checked**
+/// against the pinned crates by `every_pinned_dependency_env_read_is_registered`,
+/// which enumerates the vendored source of the exact versions in `Cargo.lock`. The
+/// kin-vfs and container-entrypoint rows are still hand-maintained: the shim is
+/// injected around the process rather than linked into it, and the entrypoint reads
+/// its names from shell, so neither has a vendored crate source to scan.
 #[rustfmt::skip]
 pub const DOWNSTREAM: &[EnvVarSpec] = &[
     // ---- kin-infer: compute backend / dispatch --------------------------------
     EnvVarSpec { name: "KIN_INFER_CPU_BACKEND", kind: Kind::OneOf(&["pure-rust", "pure_rust", "accelerate"]), default: "accelerate", sensitivity: Sensitivity::Correctness, summary: "kin-infer CPU matmul backend: 'pure-rust' forces the deterministic pure-Rust GEMM for bit-reproducible runs; 'accelerate' uses Apple Accelerate BLAS (the macOS default). BLAS differs from pure-Rust in the last ULPs" },
     EnvVarSpec { name: "KIN_INFER_OCCUPANCY_DISPATCH", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-infer Metal occupancy-informed pointwise threadgroup sizing; numerically identical to the one-simdgroup baseline (a perf A/B lever), default off" },
+    EnvVarSpec { name: "KIN_INFER_FORCE_CPU", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-infer CPU backend override: any present non-empty value other than '0' forces the CPU path instead of the detected accelerator, and CPU differs from Metal in the last ULPs" },
+    EnvVarSpec { name: "KIN_INFER_MAX_INFLIGHT", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer Metal command-buffer submission depth; an explicit value must be >= 1, and unset takes the depth of the profile KIN_RESOURCE_PROFILE resolves to (proof's depth when unset or unrecognized)" },
+    // ---- kin-infer: Metal GEMM / attention kernel families --------------------
+    EnvVarSpec { name: "KIN_INFER_MMA", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "kin-infer simdgroup_matrix MMA GEMM kernels, on by default; only 0/false/no/off forces the scalar tile, and MMA clears a Metal-vs-CPU cosine and swerank parity gate rather than being bit-identical to it" },
+    EnvVarSpec { name: "KIN_INFER_GEMM_FP16", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-infer fp16-operand MMA GEMM; fp16 operands lose about half the mantissa, so it is a throughput-only path that stays off in every profile including proof" },
+    EnvVarSpec { name: "KIN_INFER_STEEL", kind: Kind::Bool, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer double-buffered K-loop MMA GEMM, numerically identical to the single-buffer path (same fp32 accumulate and per-fragment reduction order, only when the loads are issued differs); unset engages it under the throughput and interactive profiles on Metal, and an explicit 1/0 overrides in either direction" },
+    EnvVarSpec { name: "KIN_INFER_MMA_WIDE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-infer wider 64x64 MMA register tile, numerically identical to the 32x32 MMA by construction; off in every profile because the register pressure cuts embed throughput several-fold, and it stays opt-in so the kernel can be measured in isolation" },
+    EnvVarSpec { name: "KIN_INFER_FLASH_ATTENTION", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-infer fused C7 flash-attention kernel family; off in every profile because the fused online softmax changes the attention reduction order and clears only a 5e-4 tolerance against CPU, so it can perturb embedding values" },
+    EnvVarSpec { name: "KIN_INFER_RESHAPE_GPU", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-infer on-device head-major attention reshape instead of the host scatter; off in every profile including proof, where the host scatter is what reproduces the original layout byte-for-byte" },
+    EnvVarSpec { name: "KIN_INFER_FAST_MATH", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "kin-infer MSL fast-math, on by default because that is the toolchain default the shipped kernels were compiled against; only the literal 0 disables it, removing float reassociation and the assume-finite contract and so changing results" },
+    EnvVarSpec { name: "KIN_INFER_MSL_VERSION", kind: Kind::OneOf(&["30", "31"]), default: "", sensitivity: Sensitivity::Correctness, summary: "kin-infer Metal shading language version for the runtime shader compile: '30' and '31' select MSL 3.0/3.1 as a driver-miscompile probe with different codegen, and anything else including unset compiles at the byte-identical MSL 2.4 default" },
+    // ---- kin-infer: pooled-output readback path -------------------------------
+    EnvVarSpec { name: "KIN_INFER_POOLED_OUTPUT", kind: Kind::Bool, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer pooled-embedding readback from the accelerator instead of the full hidden matrix; the device pooling kernel accumulates real tokens in row order exactly as the host mean-pool does, so values are preserved. Unset engages it under the throughput and interactive profiles on Metal, and an explicit 1/0 overrides in either direction" },
+    EnvVarSpec { name: "KIN_INFER_POOLED_MAX_BATCH_SIZE", kind: Kind::Usize, default: "256", sensitivity: Sensitivity::Operational, summary: "kin-infer batch-size ceiling above which the pooled-output readback declines and the full-hidden path runs instead; must be > 0, and an unparseable or zero value falls back to 256" },
+    EnvVarSpec { name: "KIN_INFER_POOLED_MAX_SEQ", kind: Kind::Usize, default: "512", sensitivity: Sensitivity::Operational, summary: "kin-infer sequence-length ceiling for the unsegmented pooled-output readback; must be > 0, and an unparseable or zero value falls back to 512" },
+    EnvVarSpec { name: "KIN_INFER_POOLED_SEGMENTED_MAX_SEQ", kind: Kind::Usize, default: "2048", sensitivity: Sensitivity::Operational, summary: "kin-infer sequence-length ceiling for the segmented pooled-output readback, above which pooling declines entirely; must be > 0, and an unparseable or zero value falls back to 2048" },
+    EnvVarSpec { name: "KIN_INFER_POOLED_SEGMENT_LAYERS", kind: Kind::Usize, default: "2", sensitivity: Sensitivity::Operational, summary: "kin-infer transformer layers per command buffer when the pooled-output path segments a long sequence; clamped to 1..=8, and an unparseable or zero value falls back to 2" },
+    // ---- kin-infer: GPU-resident whole-stack pass ------------------------------
+    EnvVarSpec { name: "KIN_INFER_NO_RESIDENT_STACK", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-infer escape hatch forcing the per-layer accelerator path instead of the whole-stack GPU-resident pass; any present value including '0' forces it, it is read fresh on every call rather than sampled once, and the two paths are what a bit-for-bit A/B compares" },
+    EnvVarSpec { name: "KIN_INFER_RESIDENT_MAX_BATCH_SIZE", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer batch-size ceiling for the GPU-resident whole-stack pass; must be > 0, and unset inherits the pooled-output batch cap (256 by default)" },
+    EnvVarSpec { name: "KIN_INFER_RESIDENT_MAX_SEQ", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer unsegmented sequence-length ceiling for the GPU-resident whole-stack pass; must be > 0, and unset inherits the pooled-output sequence cap (512 by default)" },
+    EnvVarSpec { name: "KIN_INFER_RESIDENT_SEGMENTED_MAX_SEQ", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer segmented sequence-length ceiling for the GPU-resident whole-stack pass; must be > 0, and unset inherits the pooled-output segmented cap (2048 by default)" },
+    EnvVarSpec { name: "KIN_INFER_RESIDENT_SEGMENT_LAYERS", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer transformer layers per command buffer when the GPU-resident pass segments a long sequence; clamped to 1..=8, and unset inherits the pooled-output segment layers (2 by default)" },
+    // ---- kin-infer: batched forward routing -----------------------------------
+    EnvVarSpec { name: "KIN_INFER_BUCKET", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-infer length-bucketed batched forward, on by default; only 0/false/no/off opts out, and the bucketed path is bit-identical per entity so the opt-out is a safe fallback rather than a different answer" },
+    EnvVarSpec { name: "KIN_INFER_NO_FOLD", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "kin-infer routes the attention-output and FFN blocks through the unfused per-op linear+add+norm path instead of the fused residency folds; only 1/true/yes/on enable it, and the result is numerically the unfused computation rather than the folded one" },
+    EnvVarSpec { name: "KIN_INFER_METAL_RESIDENT_BUDGET_BYTES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "kin-infer byte budget admitting concurrent GPU-resident stack reservations; must be > 0, and unset derives from the Metal device's recommended working-set size and system memory" },
+    EnvVarSpec { name: "KIN_INFER_METAL_POOL_CAP_BYTES", kind: Kind::Usize, default: "3221225472", sensitivity: Sensitivity::Operational, summary: "kin-infer Metal buffer-pool total-bytes cap; must be > 0, and an unparseable or zero value falls back to 3 GiB" },
+    EnvVarSpec { name: "KIN_ROPE_PERELEM", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-infer forces the per-input RoPE path (one submission per input) instead of the single whole-batch dispatch; any present value including '0' forces it, and the two strategies are held to a cosine and max-absolute-error parity bar rather than being bit-identical" },
+    // ---- kin-infer: diagnostics and fault probes -------------------------------
+    EnvVarSpec { name: "KIN_INFER_STAGE_TIMINGS", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer splits batched-forward wall time into the device encode/readback stage and the host pooling tail; any present value including '0' enables it, and it is zero-cost while unset" },
+    EnvVarSpec { name: "KIN_INFER_POOLED_OUTPUT_LOG", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer logs each pooled-output readback decision and decline reason to stderr; any present value including '0' enables it" },
+    EnvVarSpec { name: "KIN_INFER_RESIDENT_STACK_LOG", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer logs each GPU-resident stack decision and decline reason to stderr; any present value including '0' enables it" },
+    EnvVarSpec { name: "KIN_INFER_DUMP_LAYER", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer prints a per-layer hidden-state fingerprint on both the single and batched paths so the two trajectories can be diffed to localize a divergent op; any present value including '0' enables it" },
+    EnvVarSpec { name: "KIN_INFER_DUMP_ENTITY", kind: Kind::Usize, default: "0", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer index of the entity traced by KIN_INFER_DUMP_LAYER; an unparseable value falls back to 0" },
+    EnvVarSpec { name: "KIN_INFER_NO_POOL_REUSE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer stops the Metal buffer pool recycling so every acquire allocates fresh, probing whether a buffer-reuse timing race is the corruption source; any present value including '0' enables it" },
+    EnvVarSpec { name: "KIN_INFER_ZERO_ALL", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer zeroes every acquired Metal buffer and its size-class tail so no read can observe stale recycled bytes; only 1/true/yes/on enable it, and the default path is byte-identical" },
+    EnvVarSpec { name: "KIN_INFER_METAL_PHASE_COUNTERS", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer per-phase GPU timestamp counter sampling, consulted only while KIN_INFER_METAL_PROFILE is set; only the literal 0 opts out, which keeps the profiling cadence fix and drops just the counter sampling" },
+    EnvVarSpec { name: "KIN_INFER_METAL_NAN_CHECK", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-infer scans Metal op outputs for non-finite values and prints the first offending index; any present value including '0' enables it" },
+    // ---- kin-search: lexical index persistence --------------------------------
+    EnvVarSpec { name: "KIN_SEARCH_INCREMENTAL_PERSIST", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-search segmented/incremental persistence, on by default; only 0/false/no/off keep the monolithic full-rewrite path, and because load auto-detects the on-disk format the flag governs write strategy and dirty-tracking only, so toggling it is safe in both directions" },
+    EnvVarSpec { name: "KIN_SEARCH_SEGMENT_COUNT", kind: Kind::Usize, default: "64", sensitivity: Sensitivity::Operational, summary: "kin-search segment count for a newly established segmented index only; must be >= 1, an unparseable value falls back to 64, and an existing index keeps whatever count it was built with" },
+    // ---- kin-vector: distance kernel ------------------------------------------
+    EnvVarSpec { name: "KIN_VECTOR_SIMD", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "kin-vector NEON SIMD cosine-distance kernel on aarch64, on by default; only 0/false/no/off select the scalar reduction, and the two reduction orders differ in the last ULPs so distances and therefore ranking order can shift" },
     // ---- kin-db: embedding compute path (shifts embedding vectors) ------------
     EnvVarSpec { name: "KIN_EMBED_BACKEND", kind: Kind::OneOf(&["auto", "cpu", "metal", "gpu"]), default: "auto", sensitivity: Sensitivity::Correctness, summary: "kin-db embedding compute backend: auto (default) uses batched Metal, 'cpu' forces the SIMD/pure path, 'metal'/'gpu' forces Metal; cpu vs metal shifts embeddings in the last ULPs" },
     EnvVarSpec { name: "KIN_EMBED_HYBRID", kind: Kind::Str, default: "off", sensitivity: Sensitivity::Correctness, summary: "kin-db hybrid CPU/GPU embedding split: off (default), 'seq'/'floor' for the sequence-length floor, or any other truthy value for the balanced split; engaging the CPU twin computes some vectors off the Metal device" },
@@ -1413,63 +1457,315 @@ mod tests {
         );
     }
 
+    /// Every kin-infer, kin-search, and kin-vector name those crates read, with a
+    /// value a real operator could set. Kept as pairs so strict mode is exercised
+    /// against values, not just names: a registered variable whose documented kind
+    /// contradicts its read site would validate here and fail.
+    const DEPENDENCY_INFERENCE_CONFIGURATION: &[(&str, &str)] = &[
+        ("KIN_INFER_CPU_BACKEND", "pure-rust"),
+        ("KIN_INFER_FORCE_CPU", "1"),
+        ("KIN_INFER_MAX_INFLIGHT", "4"),
+        ("KIN_INFER_OCCUPANCY_DISPATCH", "1"),
+        ("KIN_INFER_MMA", "0"),
+        ("KIN_INFER_MMA_WIDE", "1"),
+        ("KIN_INFER_GEMM_FP16", "1"),
+        ("KIN_INFER_STEEL", "1"),
+        ("KIN_INFER_FLASH_ATTENTION", "1"),
+        ("KIN_INFER_RESHAPE_GPU", "1"),
+        ("KIN_INFER_FAST_MATH", "0"),
+        ("KIN_INFER_MSL_VERSION", "31"),
+        ("KIN_INFER_POOLED_OUTPUT", "1"),
+        ("KIN_INFER_POOLED_MAX_BATCH_SIZE", "128"),
+        ("KIN_INFER_POOLED_MAX_SEQ", "384"),
+        ("KIN_INFER_POOLED_SEGMENTED_MAX_SEQ", "1024"),
+        ("KIN_INFER_POOLED_SEGMENT_LAYERS", "4"),
+        ("KIN_INFER_NO_RESIDENT_STACK", "1"),
+        ("KIN_INFER_RESIDENT_MAX_BATCH_SIZE", "96"),
+        ("KIN_INFER_RESIDENT_MAX_SEQ", "256"),
+        ("KIN_INFER_RESIDENT_SEGMENTED_MAX_SEQ", "1536"),
+        ("KIN_INFER_RESIDENT_SEGMENT_LAYERS", "3"),
+        ("KIN_INFER_BUCKET", "0"),
+        ("KIN_INFER_NO_FOLD", "1"),
+        ("KIN_INFER_METAL_RESIDENT_BUDGET_BYTES", "8589934592"),
+        ("KIN_INFER_METAL_POOL_CAP_BYTES", "3221225472"),
+        ("KIN_ROPE_PERELEM", "1"),
+        ("KIN_INFER_METAL_PROFILE", "1"),
+        ("KIN_INFER_METAL_PHASE_COUNTERS", "0"),
+        ("KIN_INFER_METAL_NAN_CHECK", "1"),
+        ("KIN_INFER_STAGE_TIMINGS", "1"),
+        ("KIN_INFER_POOLED_OUTPUT_LOG", "1"),
+        ("KIN_INFER_RESIDENT_STACK_LOG", "1"),
+        ("KIN_INFER_DUMP_LAYER", "1"),
+        ("KIN_INFER_DUMP_ENTITY", "3"),
+        ("KIN_INFER_NO_POOL_REUSE", "1"),
+        ("KIN_INFER_ZERO_ALL", "1"),
+        ("KIN_RESOURCE_PROFILE", "throughput"),
+        ("KIN_SEARCH_INCREMENTAL_PERSIST", "0"),
+        ("KIN_SEARCH_SEGMENT_COUNT", "128"),
+        ("KIN_VECTOR_SIMD", "0"),
+    ];
+
+    #[test]
+    fn strict_mode_accepts_a_full_non_default_inference_configuration() {
+        // The bug this closes: 43 live kin-infer/kin-search/kin-vector knobs were
+        // unregistered, so `enforce_startup_env` called each one a probable typo on
+        // every kin invocation while it was changing real behavior, and
+        // KIN_ENV_VALIDATION=strict aborted startup outright.
+        let env: Vec<(String, String)> = DEPENDENCY_INFERENCE_CONFIGURATION
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        let report = audit_env(env, true);
+        assert!(
+            report.unknown.is_empty(),
+            "a working inference configuration must not be called a typo: {:?}",
+            report.unknown
+        );
+        assert!(
+            report.invalid.is_empty(),
+            "a working inference configuration must validate under strict mode: {:?}",
+            report.invalid
+        );
+        assert!(
+            !report.has_hard_errors(),
+            "strict mode must not abort startup on a working inference configuration"
+        );
+    }
+
+    #[test]
+    fn the_inference_configuration_covers_every_reachable_dependency_read() {
+        // Control for the test above: a configuration that quietly shrank would keep
+        // passing while covering less, so it is pinned to the scan table. Every name
+        // the pinned kin-infer / kin-search / kin-vector read, minus the allowlisted
+        // unreachable and test-only ones, must appear here exactly once.
+        let allow = load_dependency_env_allowlist(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        let reachable: std::collections::BTreeSet<String> = PINNED_DEPENDENCY_ENV_READS
+            .iter()
+            .filter(|(crate_name, _)| *crate_name != "kin-db")
+            .flat_map(|(_, reads)| reads.iter())
+            .filter(|n| !allow.contains(**n))
+            .map(|n| n.to_string())
+            .collect();
+        let configured: std::collections::BTreeSet<String> = DEPENDENCY_INFERENCE_CONFIGURATION
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert_eq!(
+            configured.len(),
+            DEPENDENCY_INFERENCE_CONFIGURATION.len(),
+            "the inference configuration lists a variable twice"
+        );
+        assert_eq!(
+            configured, reachable,
+            "the strict-mode inference configuration has drifted from the pinned read set"
+        );
+    }
+
+    #[test]
+    fn a_genuine_inference_typo_is_still_caught() {
+        // The other side of the same guard: widening the registry by 37 names must not
+        // make it blind next to them.
+        let typo = "KIN_INFER_FLASH_ATTENTIN";
+        assert!(spec(typo).is_none(), "{typo} must not be registered");
+
+        let env: Vec<(String, String)> = vec![
+            ("KIN_INFER_FLASH_ATTENTION".to_string(), "1".to_string()),
+            (typo.to_string(), "1".to_string()),
+            ("KIN_VECTOR_SMID".to_string(), "0".to_string()),
+        ];
+
+        let warn = audit_env(env.clone(), false);
+        assert_eq!(
+            warn.unknown,
+            vec![typo.to_string(), "KIN_VECTOR_SMID".to_string()],
+            "an unknown name beside a registered one must still be reported"
+        );
+        // A non-empty `unknown` is the exact condition `enforce_startup_env` turns
+        // into a strict-mode refusal, so this is what "strict still aborts" means at
+        // this level. `has_hard_errors` covers invalid values only and would pass here
+        // whether or not the typo was seen.
+        assert_eq!(
+            audit_env(env, true).unknown.len(),
+            2,
+            "strict mode must still see the typos and refuse startup on them"
+        );
+    }
+
+    #[test]
+    fn the_unreachable_watchdog_knobs_stay_out_of_the_registry() {
+        // kin-infer's EmbedConfig::from_env reads these six, but neither kin nor the
+        // pinned kin-db constructs EmbedConfig or EmbedWatchdog, so nothing in a kin
+        // process reads them. Registering them would document a surface an operator
+        // cannot reach. They are allowlisted instead, and this asserts the two
+        // decisions stay consistent: allowlisted AND unregistered, never one or the
+        // other. If the watchdog is ever wired up, this test is the reminder to move
+        // all six into DOWNSTREAM.
+        let allow = load_dependency_env_allowlist(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        for name in [
+            "KIN_EMBED_WATCHDOG",
+            "KIN_EMBED_ORPHAN_CHECK",
+            "KIN_EMBED_MAX_SECS",
+            "KIN_EMBED_MIN_RATE",
+            "KIN_EMBED_FLOOR_WINDOW_SECS",
+            "KIN_EMBED_FLOOR_GRACE_SECS",
+        ] {
+            assert!(
+                allow.contains(name),
+                "{name} must stay in dependency_env_allowlist.txt with its reachability note"
+            );
+            assert!(
+                spec(name).is_none(),
+                "{name} has no caller in this dependency graph, so registering it would \
+                 document a knob an operator cannot reach; wire the watchdog first"
+            );
+        }
+    }
+
     // ---- pinned-dependency env-read parity --------------------------------
 
-    /// Every `KIN_*` name that appears in the pinned kin-db's own `src/`. The
-    /// enumeration arm below rebuilds this from the vendored crate; this list is what
-    /// keeps the test non-vacuous where that source is not on disk, and it is also the
-    /// control that proves the enumeration found a real tree rather than an empty one.
+    /// Every `KIN_*` name that appears in each pinned first-party dependency's own
+    /// `src/`, keyed by crate name. The enumeration arm below rebuilds each list from
+    /// the vendored crate; these lists are what keep the test non-vacuous where that
+    /// source is not on disk, and they are also the control that proves the
+    /// enumeration found a real tree rather than an empty one.
     ///
-    /// Regenerate with the pinned version from `Cargo.lock`:
+    /// Every crate whose reads land in kin's process environment belongs here, not
+    /// just kin-db. kin-infer, kin-search, and kin-vector were added after the kin-db
+    /// sweep left 43 of their live knobs unregistered, each one reported at startup as
+    /// "unrecognized … probably a typo" while it was changing real behavior.
+    ///
+    /// Regenerate a list with the pinned version from `Cargo.lock`:
     ///
     /// ```text
     /// grep -rhoE '"KIN_[A-Z0-9_]+"' \
-    ///   "$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/kin-db-<version>)/src" \
+    ///   "$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/<crate>-<version>)/src" \
     ///   | tr -d '"' | sort -u
     /// ```
-    const KIN_DB_ENV_READS: &[&str] = &[
-        "KIN_EMBED_BACKEND",
-        "KIN_EMBED_BASE_URL",
-        "KIN_EMBED_BATCH_SIZE",
-        "KIN_EMBED_BATCH_TRACE",
-        "KIN_EMBED_CACHE",
-        "KIN_EMBED_CACHE_BUDGET_GB",
-        "KIN_EMBED_CACHE_DIR",
-        "KIN_EMBED_HYBRID",
-        "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN",
-        "KIN_EMBED_HYBRID_GPU_TPUT_RATIO",
-        "KIN_EMBED_MAX_ATTENTION_AREA",
-        "KIN_EMBED_MAX_BATCH_TOKENS",
-        "KIN_EMBED_MODEL_ID",
-        "KIN_EMBED_MODEL_REVISION",
-        "KIN_EMBED_OPENAI_API_KEY",
-        "KIN_EMBED_OPENAI_BASE_URL",
-        "KIN_EMBED_OPENAI_DIMENSIONS",
-        "KIN_EMBED_OPENAI_DOCUMENT_PREFIX",
-        "KIN_EMBED_OPENAI_MODEL",
-        "KIN_EMBED_OPENAI_QUERY_PREFIX",
-        "KIN_EMBED_OPENAI_REQUEST_JSON",
-        "KIN_EMBED_OPENAI_SEND_DIMENSIONS",
-        "KIN_EMBED_OPENAI_TIMEOUT_SECS",
-        "KIN_EMBED_PIPELINED",
-        "KIN_EMBED_PROVIDER",
-        "KIN_EMBED_TEST_FORCE_METAL_OOM",
-        "KIN_LOCATE_WEIGHT_FILE_PATH",
-        "KIN_RESOURCE_PROFILE",
+    const PINNED_DEPENDENCY_ENV_READS: &[(&str, &[&str])] = &[
+        (
+            "kin-db",
+            &[
+                "KIN_EMBED_BACKEND",
+                "KIN_EMBED_BASE_URL",
+                "KIN_EMBED_BATCH_SIZE",
+                "KIN_EMBED_BATCH_TRACE",
+                "KIN_EMBED_CACHE",
+                "KIN_EMBED_CACHE_BUDGET_GB",
+                "KIN_EMBED_CACHE_DIR",
+                "KIN_EMBED_HYBRID",
+                "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN",
+                "KIN_EMBED_HYBRID_GPU_TPUT_RATIO",
+                "KIN_EMBED_MAX_ATTENTION_AREA",
+                "KIN_EMBED_MAX_BATCH_TOKENS",
+                "KIN_EMBED_MODEL_ID",
+                "KIN_EMBED_MODEL_REVISION",
+                "KIN_EMBED_OPENAI_API_KEY",
+                "KIN_EMBED_OPENAI_BASE_URL",
+                "KIN_EMBED_OPENAI_DIMENSIONS",
+                "KIN_EMBED_OPENAI_DOCUMENT_PREFIX",
+                "KIN_EMBED_OPENAI_MODEL",
+                "KIN_EMBED_OPENAI_QUERY_PREFIX",
+                "KIN_EMBED_OPENAI_REQUEST_JSON",
+                "KIN_EMBED_OPENAI_SEND_DIMENSIONS",
+                "KIN_EMBED_OPENAI_TIMEOUT_SECS",
+                "KIN_EMBED_PIPELINED",
+                "KIN_EMBED_PROVIDER",
+                "KIN_EMBED_TEST_FORCE_METAL_OOM",
+                "KIN_LOCATE_WEIGHT_FILE_PATH",
+                "KIN_RESOURCE_PROFILE",
+            ],
+        ),
+        (
+            "kin-infer",
+            &[
+                "KIN_EMBED_FLOOR_GRACE_SECS",
+                "KIN_EMBED_FLOOR_WINDOW_SECS",
+                "KIN_EMBED_MAX_SECS",
+                "KIN_EMBED_MIN_RATE",
+                "KIN_EMBED_ORPHAN_CHECK",
+                "KIN_EMBED_WATCHDOG",
+                "KIN_INFER_BUCKET",
+                "KIN_INFER_CPU_BACKEND",
+                "KIN_INFER_DUMP_ENTITY",
+                "KIN_INFER_DUMP_LAYER",
+                "KIN_INFER_FAST_MATH",
+                "KIN_INFER_FLASH_ATTENTION",
+                "KIN_INFER_FORCE_CPU",
+                "KIN_INFER_GEMM_FP16",
+                "KIN_INFER_MAX_INFLIGHT",
+                "KIN_INFER_METAL_NAN_CHECK",
+                "KIN_INFER_METAL_PHASE_COUNTERS",
+                "KIN_INFER_METAL_POOL_CAP_BYTES",
+                "KIN_INFER_METAL_PROFILE",
+                "KIN_INFER_METAL_RESIDENT_BUDGET_BYTES",
+                "KIN_INFER_MMA",
+                "KIN_INFER_MMA_WIDE",
+                "KIN_INFER_MSL_VERSION",
+                "KIN_INFER_NO_FOLD",
+                "KIN_INFER_NO_POOL_REUSE",
+                "KIN_INFER_NO_RESIDENT_STACK",
+                "KIN_INFER_NONEXISTENT_FLAG_XYZ",
+                "KIN_INFER_OCCUPANCY_DISPATCH",
+                "KIN_INFER_POOLED_MAX_BATCH_SIZE",
+                "KIN_INFER_POOLED_MAX_SEQ",
+                "KIN_INFER_POOLED_OUTPUT",
+                "KIN_INFER_POOLED_OUTPUT_LOG",
+                "KIN_INFER_POOLED_SEGMENT_LAYERS",
+                "KIN_INFER_POOLED_SEGMENTED_MAX_SEQ",
+                "KIN_INFER_RESHAPE_GPU",
+                "KIN_INFER_RESIDENT_MAX_BATCH_SIZE",
+                "KIN_INFER_RESIDENT_MAX_SEQ",
+                "KIN_INFER_RESIDENT_SEGMENT_LAYERS",
+                "KIN_INFER_RESIDENT_SEGMENTED_MAX_SEQ",
+                "KIN_INFER_RESIDENT_STACK_LOG",
+                "KIN_INFER_STAGE_TIMINGS",
+                "KIN_INFER_STEEL",
+                "KIN_INFER_TEST_SEGMENT_LAYERS_DEFAULT_ZERO",
+                "KIN_INFER_TEST_SEGMENT_LAYERS_MAX",
+                "KIN_INFER_TEST_SEGMENT_LAYERS_OVERSIZED",
+                "KIN_INFER_TEST_SEGMENT_LAYERS_VALID",
+                "KIN_INFER_TEST_SEGMENT_LAYERS_ZERO",
+                "KIN_INFER_ZERO_ALL",
+                "KIN_RESOURCE_PROFILE",
+                "KIN_ROPE_PERELEM",
+            ],
+        ),
+        (
+            "kin-search",
+            &[
+                "KIN_SEARCH_INCREMENTAL_PERSIST",
+                "KIN_SEARCH_SEGMENT_COUNT",
+                "KIN_SEARCH_SOAK_CHECK_EVERY",
+                "KIN_SEARCH_SOAK_MAX_LIVE",
+                "KIN_SEARCH_SOAK_ROUNDS",
+                "KIN_SEARCH_SOAK_SECS",
+                "KIN_SEARCH_SOAK_SEED",
+            ],
+        ),
+        (
+            "kin-vector",
+            &[
+                "KIN_VECTOR_BENCH_DIM",
+                "KIN_VECTOR_BENCH_ITERS",
+                "KIN_VECTOR_BENCH_VECTORS",
+                "KIN_VECTOR_SIMD",
+            ],
+        ),
     ];
 
-    /// The kin-db version this workspace pins, read from `Cargo.lock` so the scan can
-    /// never drift onto a different vendored copy than the one that gets linked.
-    fn pinned_kin_db_version(root: &std::path::Path) -> Option<String> {
+    /// The version of `crate_name` this workspace pins, read from `Cargo.lock` so a
+    /// scan can never drift onto a different vendored copy than the one that gets
+    /// linked.
+    fn pinned_version(root: &std::path::Path, crate_name: &str) -> Option<String> {
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).ok()?;
-        let mut in_kin_db = false;
+        let mut in_crate = false;
         for line in lock.lines() {
             let line = line.trim();
             if line == "[[package]]" {
-                in_kin_db = false;
-            } else if line == "name = \"kin-db\"" {
-                in_kin_db = true;
-            } else if in_kin_db {
+                in_crate = false;
+            } else if line == format!("name = \"{crate_name}\"") {
+                in_crate = true;
+            } else if in_crate {
                 if let Some(rest) = line.strip_prefix("version = \"") {
                     return rest.strip_suffix('"').map(str::to_string);
                 }
@@ -1544,12 +1840,13 @@ mod tests {
     }
 
     #[test]
-    fn every_kin_db_env_read_is_registered() {
-        // The gap this closes: kin-db reads its embedding surface from the process
-        // environment, but the registry only knew a handful of those names, so the
-        // startup audit called a working OpenAI-compatible setup "unrecognized … no
-        // effect" and strict mode refused to start. A whole-repo grep in kin cannot
-        // see any of it, because the reads live in a pinned registry dependency.
+    fn every_pinned_dependency_env_read_is_registered() {
+        // The gap this closes: kin-db, kin-infer, kin-search, and kin-vector read
+        // their levers from the process environment, but the registry knew only a
+        // handful of those names, so the startup audit called live knobs
+        // "unrecognized … no effect" and strict mode refused to start. A whole-repo
+        // grep in kin cannot see any of it, because the reads live in pinned registry
+        // dependencies.
         let allow = load_dependency_env_allowlist(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
         let unregistered = |names: &std::collections::BTreeSet<String>| {
             names
@@ -1558,47 +1855,53 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-
-        // Baseline arm: always runs, so the test can still fail where the vendored
-        // source is absent (a packaged or offline build layout).
-        let baseline: std::collections::BTreeSet<String> =
-            KIN_DB_ENV_READS.iter().map(|s| s.to_string()).collect();
-        assert!(
-            unregistered(&baseline).is_empty(),
-            "these KIN_* vars are read by the pinned kin-db but registered nowhere: {:?}",
-            unregistered(&baseline)
-        );
-
-        // Enumeration arm: rebuild the read set from the vendored crate so a kin-db
-        // that adds a variable, or a pin bump that brings one in, fails here instead
-        // of silently drifting.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let Some(version) = pinned_kin_db_version(&root) else {
-            eprintln!("Cargo.lock not readable; kin-db enumeration arm did not run");
-            return;
-        };
-        let Some(src) = vendored_crate_src(&format!("kin-db-{version}")) else {
-            eprintln!("vendored kin-db-{version} source not on disk; enumeration arm did not run");
-            return;
-        };
-        let scanned = scan_kin_literals(&src);
-        // Control: an enumeration that found nothing, or lost names the pinned list
-        // already proves are there, means the scan pointed somewhere wrong. Without
-        // this, an empty result would read as a clean parity pass.
-        let lost: Vec<&String> = baseline.difference(&scanned).collect();
-        assert!(
-            lost.is_empty(),
-            "the kin-db source scan at {src:?} lost known-present names {lost:?}; \
-             the scan is not looking at the pinned crate"
-        );
-        assert!(
-            unregistered(&scanned).is_empty(),
-            "these KIN_* vars appear in kin-db-{version} source but are registered \
-             nowhere (register them in DOWNSTREAM in env_registry.rs, or, for a name \
-             that is genuinely not an operator-facing variable, add it to \
-             crates/kin-core/dependency_env_allowlist.txt): {:?}",
-            unregistered(&scanned)
-        );
+
+        for (crate_name, reads) in PINNED_DEPENDENCY_ENV_READS {
+            // Baseline arm: always runs, so the test can still fail where the vendored
+            // source is absent (a packaged or offline build layout).
+            let baseline: std::collections::BTreeSet<String> =
+                reads.iter().map(|s| s.to_string()).collect();
+            assert!(
+                unregistered(&baseline).is_empty(),
+                "these KIN_* vars are read by the pinned {crate_name} but registered \
+                 nowhere: {:?}",
+                unregistered(&baseline)
+            );
+
+            // Enumeration arm: rebuild the read set from the vendored crate so a
+            // dependency that adds a variable, or a pin bump that brings one in, fails
+            // here instead of silently drifting.
+            let Some(version) = pinned_version(&root, crate_name) else {
+                eprintln!("{crate_name} not found in Cargo.lock; enumeration arm did not run");
+                continue;
+            };
+            let Some(src) = vendored_crate_src(&format!("{crate_name}-{version}")) else {
+                eprintln!(
+                    "vendored {crate_name}-{version} source not on disk; enumeration arm \
+                     did not run"
+                );
+                continue;
+            };
+            let scanned = scan_kin_literals(&src);
+            // Control: an enumeration that found nothing, or lost names the pinned list
+            // already proves are there, means the scan pointed somewhere wrong. Without
+            // this, an empty result would read as a clean parity pass.
+            let lost: Vec<&String> = baseline.difference(&scanned).collect();
+            assert!(
+                lost.is_empty(),
+                "the {crate_name} source scan at {src:?} lost known-present names \
+                 {lost:?}; the scan is not looking at the pinned crate"
+            );
+            assert!(
+                unregistered(&scanned).is_empty(),
+                "these KIN_* vars appear in {crate_name}-{version} source but are \
+                 registered nowhere (register them in DOWNSTREAM in env_registry.rs, \
+                 or, for a name that is genuinely not an operator-facing variable, add \
+                 it to crates/kin-core/dependency_env_allowlist.txt): {:?}",
+                unregistered(&scanned)
+            );
+        }
     }
 
     // ---- workspace env-read completeness ----------------------------------
