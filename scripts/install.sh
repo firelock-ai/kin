@@ -68,6 +68,16 @@ OS="$(detect_os)"
 ARCH="$(detect_arch)"
 TARGET="${OS}-${ARCH}"
 
+# Windows release archives carry `.exe`-suffixed binaries; every other platform
+# ships bare names. Derive the suffix once from the detected OS and apply it
+# everywhere a binary is named after extraction. Naming a bare `kin-daemon`
+# under a Windows archive aborted the install after the download had already
+# been fetched and verified, which is a worse failure than the 404 it replaced.
+case "$OS" in
+    windows) BIN_EXT=".exe" ;;
+    *)       BIN_EXT="" ;;
+esac
+
 printf '\n'
 printf '  \033[1;36mKin Installer\033[0m\n'
 printf '  Semantic development environment\n'
@@ -90,8 +100,8 @@ fi
 # ── Detect an existing install (reinstall / upgrade) ──────────────────
 
 PREVIOUS_VERSION=""
-if [ -x "$KIN_BIN/kin" ]; then
-    PREVIOUS_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $2}')
+if [ -x "$KIN_BIN/kin$BIN_EXT" ]; then
+    PREVIOUS_VERSION=$("$KIN_BIN/kin$BIN_EXT" --version 2>/dev/null | awk '{print $2}')
     if [ -n "$PREVIOUS_VERSION" ]; then
         info "Existing install found: kin $PREVIOUS_VERSION (will be replaced)"
     else
@@ -234,8 +244,8 @@ fi
 # require it. Assert it is present in the extracted archive BEFORE moving
 # anything, so a daemon-less archive (e.g. a stale build) aborts cleanly instead
 # of leaving a half-installed, daemon-less environment.
-if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
-    err "kin-daemon missing from the downloaded archive."
+if [ ! -f "$EXTRACT_DIR/kin-daemon$BIN_EXT" ]; then
+    err "kin-daemon$BIN_EXT missing from the downloaded archive."
     err "kin status/search and the MCP server require it. Refusing a daemon-less install. Aborting."
     exit 1
 fi
@@ -283,13 +293,13 @@ fi
 # `kin doctor` and `kin update`. Run its content-free check before replacing
 # any installed binary. Unsafe existing state is never silently chmodded or
 # overwritten; the operator must explicitly repair it and rerun the installer.
-chmod +x "$EXTRACT_DIR/kin"
+chmod +x "$EXTRACT_DIR/kin$BIN_EXT"
 if is_truthy "${KIN_REGISTRY_REPAIR:-}"; then
     REGISTRY_AUTHORITY_STATUS=0
-    "$EXTRACT_DIR/kin" registry authority --fix --initialize || REGISTRY_AUTHORITY_STATUS=$?
+    "$EXTRACT_DIR/kin$BIN_EXT" registry authority --fix --initialize || REGISTRY_AUTHORITY_STATUS=$?
 else
     REGISTRY_AUTHORITY_STATUS=0
-    "$EXTRACT_DIR/kin" registry authority --initialize || REGISTRY_AUTHORITY_STATUS=$?
+    "$EXTRACT_DIR/kin$BIN_EXT" registry authority --initialize || REGISTRY_AUTHORITY_STATUS=$?
 fi
 if [ "$REGISTRY_AUTHORITY_STATUS" -ne 0 ]; then
     err "Unsafe local registry authority blocks installation."
@@ -302,9 +312,9 @@ fi
 # optional filesystem-projection client.
 HAVE_VFS=0
 for bin in kin kin-daemon kin-vfs; do
-    if [ -f "$EXTRACT_DIR/$bin" ]; then
-        mv "$EXTRACT_DIR/$bin" "$KIN_BIN/$bin"
-        chmod +x "$KIN_BIN/$bin"
+    if [ -f "$EXTRACT_DIR/$bin$BIN_EXT" ]; then
+        mv "$EXTRACT_DIR/$bin$BIN_EXT" "$KIN_BIN/$bin$BIN_EXT"
+        chmod +x "$KIN_BIN/$bin$BIN_EXT"
         [ "$bin" = "kin-vfs" ] && HAVE_VFS=1
     fi
 done
@@ -312,7 +322,7 @@ done
 # Move the projection shim library if the archive bundled it (Linux .so /
 # macOS .dylib). It is consumed by the shell hooks via $KIN_DIR/lib.
 HAVE_SHIM=0
-for lib in libkin_vfs_shim.so libkin_vfs_shim.dylib; do
+for lib in libkin_vfs_shim.so libkin_vfs_shim.dylib kin_vfs_shim.dll; do
     if [ -f "$EXTRACT_DIR/$lib" ]; then
         mv "$EXTRACT_DIR/$lib" "$KIN_LIB/$lib"
         HAVE_SHIM=1
@@ -355,12 +365,13 @@ if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
     # while today's kin-vfs and shim are glibc-linked. Test the installed CLI
     # before claiming the optional projection is usable, and do not leave a
     # command behind that the host loader cannot execute.
-    if "$KIN_BIN/kin-vfs" --help >/dev/null 2>&1; then
+    if "$KIN_BIN/kin-vfs$BIN_EXT" --help >/dev/null 2>&1; then
         ok "Filesystem projection installed (kin-vfs + shim)"
     else
-        rm -f "$KIN_BIN/kin-vfs" \
+        rm -f "$KIN_BIN/kin-vfs$BIN_EXT" \
             "$KIN_LIB/libkin_vfs_shim.so" \
-            "$KIN_LIB/libkin_vfs_shim.dylib"
+            "$KIN_LIB/libkin_vfs_shim.dylib" \
+            "$KIN_LIB/kin_vfs_shim.dll"
         info "Filesystem projection is unavailable on this platform; core CLI and daemon are fully functional without it."
     fi
 else
@@ -390,7 +401,12 @@ case "$OS" in
             add_to_path "$HOME/.bashrc"
         fi
         ;;
-    linux)
+    linux|windows)
+        # The windows arm is reached from the MSYS, MINGW, and Cygwin shells,
+        # whose startup files are the same ones Linux uses. It could not run at
+        # all until the post-extract path above stopped aborting on those hosts,
+        # so a Windows install that got this far previously left the CLI off
+        # PATH with nothing said about it.
         if [ -f "$HOME/.bashrc" ]; then
             add_to_path "$HOME/.bashrc"
         fi
@@ -404,8 +420,8 @@ esac
 
 export PATH="$KIN_BIN:$PATH"
 
-if has_cmd "$KIN_BIN/kin"; then
-    INSTALLED_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $2}')
+if has_cmd "$KIN_BIN/kin$BIN_EXT"; then
+    INSTALLED_VERSION=$("$KIN_BIN/kin$BIN_EXT" --version 2>/dev/null | awk '{print $2}')
     if [ -n "$PREVIOUS_VERSION" ] && [ -n "$INSTALLED_VERSION" ] && [ "$PREVIOUS_VERSION" != "$INSTALLED_VERSION" ]; then
         ok "kin upgraded: $PREVIOUS_VERSION → $INSTALLED_VERSION"
     else
@@ -432,7 +448,7 @@ else
     # Reopen /dev/tty so the interactive wizard can read keyboard input.
     if [ -t 0 ]; then
         # Already in a TTY — run directly
-        "$KIN_BIN/kin" setup
+        "$KIN_BIN/kin$BIN_EXT" setup
     elif [ -e /dev/tty ] && ( : < /dev/tty ) 2>/dev/null; then
         # Piped but a usable controlling TTY is available — read keyboard input
         # from it. The `( : < /dev/tty )` probe confirms the device can actually
@@ -442,11 +458,11 @@ else
         # a redirection failure on the `:` special built-in exits its shell, so
         # in a bare brace group it would terminate the whole non-interactive
         # installer (POSIX dash) before the fallback below can run.
-        "$KIN_BIN/kin" setup < /dev/tty
+        "$KIN_BIN/kin$BIN_EXT" setup < /dev/tty
     else
         # No usable TTY (CI, Docker, piped without a controlling terminal) —
         # run non-interactive so the install never exits non-zero here.
-        "$KIN_BIN/kin" setup --no-interactive
+        "$KIN_BIN/kin$BIN_EXT" setup --no-interactive
     fi
     set -e
 fi
