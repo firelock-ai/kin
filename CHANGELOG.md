@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.18] - 2026-08-11
+
+### Changed
+
+- Admit observed new files into the workspace as they are written (#739)
+- Publish a Windows tarball and guard installer asset names (#738)
+
+
 ## [0.5.17] - 2026-08-10
 
 ### Changed
