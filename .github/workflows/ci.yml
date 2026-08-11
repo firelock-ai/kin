@@ -93,6 +93,13 @@ jobs:
           # is not evidence that it can.
           python3 ./scripts/verify-installer-release-assets.py
           python3 ./scripts/falsify-installer-release-assets.py
+          # Resolving the archive name is only half an install. Once it lands,
+          # the installer names the binaries inside it, and those names carry a
+          # platform suffix the installer did not account for, so a complete
+          # Windows archive aborted the install after the download had already
+          # been fetched and verified.
+          python3 ./scripts/verify-installer-archive-binaries.py
+          python3 ./scripts/falsify-installer-archive-binaries.py
           python3 ./scripts/test-npm-automatic-release.py
           python3 ./scripts/test-verify-npm-release.py
           node --test \
