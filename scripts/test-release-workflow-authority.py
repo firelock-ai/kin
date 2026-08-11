@@ -63,6 +63,10 @@ INSTALLER_ASSET_GUARD = ROOT / "scripts" / "verify-installer-release-assets.py"
 INSTALLER_ASSET_GUARD_POLICY = "scripts/verify-installer-release-assets.py"
 INSTALLER_ASSET_FALSIFIER = ROOT / "scripts" / "falsify-installer-release-assets.py"
 INSTALLER_ASSET_FALSIFIER_POLICY = "scripts/falsify-installer-release-assets.py"
+INSTALLER_BINARY_GUARD = ROOT / "scripts" / "verify-installer-archive-binaries.py"
+INSTALLER_BINARY_GUARD_POLICY = "scripts/verify-installer-archive-binaries.py"
+INSTALLER_BINARY_FALSIFIER = ROOT / "scripts" / "falsify-installer-archive-binaries.py"
+INSTALLER_BINARY_FALSIFIER_POLICY = "scripts/falsify-installer-archive-binaries.py"
 TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
 TAG_LISTING_FORMAT = (
     "--format='%(refname:strip=2) "
@@ -461,6 +465,8 @@ CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
     "npm-launchers": "npm launcher tests",
     "windows-authority-tests": "Windows authority tests",
+    "windows-authority-cli-tests": "Windows authority CLI tests",
+    "windows-authority-runtime-tests": "Windows authority runtime tests",
     "windows-installer": "Windows installer + vector release build",
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
@@ -2802,7 +2808,7 @@ WINDOWS_DAEMON_SIBLING_BUILD = (
     "- name: Build the sibling Windows daemon the authority tests drive"
 )
 WINDOWS_DAEMON_COMPILE_STEP = (
-    "- name: Compile and run native Windows authority tests"
+    "- name: Compile and run native Windows runtime authority tests"
 )
 WINDOWS_DAEMON_LIFECYCLE_TEST = '"daemon_status_and_stop_lifecycle"'
 
@@ -2854,6 +2860,109 @@ def assert_windows_daemon_sibling_build(ci_job: str) -> None:
         WINDOWS_DAEMON_LIFECYCLE_TEST,
         "native Windows daemon lifecycle prerequisite",
     )
+
+
+WINDOWS_AUTHORITY_JOBS = (
+    "windows-authority-tests",
+    "windows-authority-cli-tests",
+    "windows-authority-runtime-tests",
+)
+WINDOWS_AUTHORITY_LEG_HELPERS = "source ./scripts/windows-authority-legs.sh"
+# Every native Windows leg, wherever it runs. The set is what the three jobs
+# owe between them, so splitting or rebalancing them stays a free choice while
+# dropping one does not: a leg that leaves this file has to leave it visibly.
+WINDOWS_AUTHORITY_LEGS = (
+    "kin-registry library",
+    "kin-core registry authority",
+    "kin-core capability-owned config replacement",
+    "retained config capability exclusion",
+    "kin-git library",
+    "MCP Windows sibling daemon discovery",
+    "kin-core repository initialization",
+    "managed-install spawn fence",
+    "daemon shutdown identity",
+    "kin-cli Windows modules",
+    "full managed uninstall safety",
+    "native full managed uninstall lifecycle",
+    "native managed-daemon ownership scan",
+    "native install authority contention and crash recovery",
+    "native managed-daemon spawn admission",
+    "bounded CLI test subprocesses",
+    "bounded daemon probe subprocesses",
+    "daemon status and stop lifecycle",
+    "spawned-child Windows authority ordering",
+    "isolated runtime process-tree containment",
+    "direct daemon-child containment",
+    "late daemon-descendant containment",
+    "daemon isolation support",
+    "durable merge resolution containment compile",
+)
+
+
+def assert_windows_authority_split(ci_jobs: dict[str, str]) -> None:
+    """Hold the three native Windows jobs to what one job used to owe.
+
+    The legs were split across three jobs because one job could not finish
+    inside any cap worth setting: across 119 sampled runs, 32 of the 106 allowed
+    to finish were destroyed by the 60-minute limit, and the 70 survivors
+    averaged 52.6 minutes against it. Three things have to stay true for the
+    split to be an improvement rather than a way to lose coverage quietly.
+
+    Every leg still runs exactly once. A split is the cheapest possible place to
+    drop a test, because the leg simply is not in the job you are reading and
+    the other job looks complete on its own.
+
+    No job takes a job-level `if:`. These jobs are the merge group's only proof
+    of the native Windows admission contract, and that reasoning did not change
+    when one job became three.
+
+    The step budgets sum to less than the job cap. GitHub CANCELS a job that
+    hits its own timeout, and a cancelled job is silent on a check no ruleset
+    requires and skips its cache save, so the next run starts colder than the
+    one that timed out. A step that overruns its own budget FAILS instead, which
+    is loud and still runs the save. Keeping the sum under the cap is what makes
+    the loud failure arrive first, whichever step is the slow one.
+    """
+
+    combined = "\n".join(
+        "\n".join(active_lines(ci_jobs[job])) for job in WINDOWS_AUTHORITY_JOBS
+    )
+    for leg in WINDOWS_AUTHORITY_LEGS:
+        occurrences = combined.count(f'"{leg}"')
+        if occurrences != 1:
+            raise AssertionError(
+                "the native Windows authority jobs must run every reviewed leg "
+                f"exactly once; '{leg}' appears {occurrences} times across "
+                + ", ".join(WINDOWS_AUTHORITY_JOBS)
+            )
+
+    for job_id in WINDOWS_AUTHORITY_JOBS:
+        block = ci_jobs[job_id]
+        if re.search(r"(?m)^    if:", block) is not None:
+            raise AssertionError(
+                "the Windows authority jobs must stay on every event, so "
+                "admission behavior is asserted before a release commit can "
+                f"carry it: {job_id}"
+            )
+        require(block, WINDOWS_AUTHORITY_LEG_HELPERS, f"shared leg helpers in {job_id}")
+        job_cap = re.search(r"(?m)^    timeout-minutes: (?P<cap>\d+)$", block)
+        if job_cap is None:
+            raise AssertionError(f"{job_id} must declare one job timeout")
+        step_budgets = [
+            int(budget)
+            for budget in re.findall(r"(?m)^        timeout-minutes: (\d+)$", block)
+        ]
+        if not step_budgets:
+            raise AssertionError(
+                f"{job_id} must budget its long steps, or a slow step can only "
+                "be reported by cancelling the job"
+            )
+        if sum(step_budgets) >= int(job_cap.group("cap")):
+            raise AssertionError(
+                f"{job_id} step budgets sum to {sum(step_budgets)} against a job "
+                f"cap of {job_cap.group('cap')}: an overrun there is cancelled "
+                "silently instead of failing loudly"
+            )
 
 
 def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
@@ -3255,6 +3364,50 @@ def assert_installer_asset_guard_wired(ci: str, release: str) -> None:
             f"release.yml must run {INSTALLER_ASSET_GUARD_POLICY} against the "
             "staged assets; the workflow's intent is not the same evidence as "
             "the bytes about to be uploaded"
+        )
+
+
+def assert_installer_archive_binary_guard_wired(ci: str) -> None:
+    """Keep the check that the installer names binaries the archive carries.
+
+    Resolving the right archive name is only half an install. Once the download
+    lands, the installer names the binaries inside it, and a Windows archive
+    carries `.exe`-suffixed names. The installer named the bare form on every
+    platform, so its mandatory-daemon assertion failed against an archive that
+    was present, complete, and checksum-verified, aborting after the user had
+    already waited for the download.
+
+    This guard reads source rather than staged bytes, so it belongs on pull
+    requests alone. The falsifier runs beside it because a guard nobody has
+    watched fail is not evidence that it can.
+    """
+
+    for path, policy in (
+        (INSTALLER_BINARY_GUARD, INSTALLER_BINARY_GUARD_POLICY),
+        (INSTALLER_BINARY_FALSIFIER, INSTALLER_BINARY_FALSIFIER_POLICY),
+    ):
+        if not path.is_file():
+            raise AssertionError(
+                f"{policy} is missing; the installer could name a binary the "
+                "release archive does not carry and nothing would notice"
+            )
+
+    # Match whole invocations rather than searching for the path, which a
+    # commented-out line would still satisfy.
+    ci_lines = {line.strip() for line in ci.splitlines()}
+    missing = sorted(
+        command
+        for command in (
+            f"python3 ./{INSTALLER_BINARY_GUARD_POLICY}",
+            f"python3 ./{INSTALLER_BINARY_FALSIFIER_POLICY}",
+        )
+        if command not in ci_lines
+    )
+    if missing:
+        raise AssertionError(
+            "ci.yml must run " + " and ".join(missing) + "; without both, the "
+            "installer can abort on a complete archive and no pull request "
+            "would go red"
         )
 
 
@@ -6639,7 +6792,7 @@ def main() -> None:
 
     require(
         install_sh,
-        '"$EXTRACT_DIR/kin" registry authority --initialize',
+        '"$EXTRACT_DIR/kin$BIN_EXT" registry authority --initialize',
         "content-free Unix installer registry-authority initialization",
     )
     require(
@@ -8126,11 +8279,11 @@ def main() -> None:
     assert_windows_npm_first_run_proof(
         ci_jobs["windows-authority-tests"], windows_npm_proof
     )
-    assert_windows_daemon_sibling_build(ci_jobs["windows-authority-tests"])
-    windows_job = ci_jobs["windows-authority-tests"]
+    assert_windows_daemon_sibling_build(ci_jobs["windows-authority-runtime-tests"])
+    windows_job = ci_jobs["windows-authority-runtime-tests"]
     sibling_build_start = windows_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
     sibling_build_end = windows_job.index(
-        "      - name: Compile and run native Windows authority tests"
+        "      - name: Compile and run native Windows runtime authority tests"
     )
     sibling_build_block = windows_job[sibling_build_start:sibling_build_end]
     for label, mutated_job, expected in (
@@ -8370,10 +8523,67 @@ def main() -> None:
         "target/x86_64-pc-windows-msvc/release/kin.exe",
         "landing-push Windows admission proof",
     )
-    if re.search(r"(?m)^    if:", ci_jobs["windows-authority-tests"]) is not None:
-        raise AssertionError(
-            "the Windows authority job must stay on every event, so admission "
-            "behavior is asserted before a release commit can carry it"
+    assert_windows_authority_split(ci_jobs)
+    for label, job_id, mutated_block, expected in (
+        (
+            "a native Windows leg is dropped in the split",
+            "windows-authority-cli-tests",
+            ci_jobs["windows-authority-cli-tests"].replace(
+                '"native managed-daemon ownership scan"', '"renamed leg"', 1
+            ),
+            "exactly once",
+        ),
+        (
+            "two Windows jobs both claim the same leg",
+            "windows-authority-runtime-tests",
+            ci_jobs["windows-authority-runtime-tests"].replace(
+                '"daemon isolation support"', '"kin-git library"', 1
+            ),
+            "exactly once",
+        ),
+        (
+            "a Windows authority job takes a job-level condition",
+            "windows-authority-runtime-tests",
+            ci_jobs["windows-authority-runtime-tests"].replace(
+                "    runs-on: windows-latest",
+                "    if: github.event_name != 'merge_group'\n    runs-on: windows-latest",
+                1,
+            ),
+            "must stay on every event",
+        ),
+        (
+            "a Windows authority job stops sourcing the shared leg helpers",
+            "windows-authority-cli-tests",
+            ci_jobs["windows-authority-cli-tests"].replace(
+                f"          {WINDOWS_AUTHORITY_LEG_HELPERS}\n", "", 1
+            ),
+            "shared leg helpers",
+        ),
+        (
+            "the step budgets grow past the job cap they must fire before",
+            "windows-authority-cli-tests",
+            ci_jobs["windows-authority-cli-tests"].replace(
+                "    timeout-minutes: 45", "    timeout-minutes: 30", 1
+            ),
+            "failing loudly",
+        ),
+        (
+            "a Windows authority job budgets no step at all",
+            "windows-authority-cli-tests",
+            re.sub(
+                r"(?m)^        timeout-minutes: \d+\n",
+                "",
+                ci_jobs["windows-authority-cli-tests"],
+            ),
+            "must budget its long steps",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda job_id=job_id, mutated_block=mutated_block: (
+                assert_windows_authority_split({**ci_jobs, job_id: mutated_block})
+            ),
         )
 
     # The Linux release artifacts are the only musl compilation Kin performs,
@@ -9200,6 +9410,21 @@ def main() -> None:
         lambda: assert_installer_asset_guard_wired(
             ci_workflow,
             release.replace(f"./{INSTALLER_ASSET_GUARD_POLICY} --assets-dir .", "true"),
+        ),
+    )
+    assert_installer_archive_binary_guard_wired(ci_workflow)
+    expect_assertion(
+        "ci.yml drops the guard that installer binary names match the archive",
+        "ci.yml must run",
+        lambda: assert_installer_archive_binary_guard_wired(
+            ci_workflow.replace(INSTALLER_BINARY_GUARD_POLICY, "scripts/absent.py")
+        ),
+    )
+    expect_assertion(
+        "ci.yml keeps the binary-name guard but drops its falsification",
+        "ci.yml must run",
+        lambda: assert_installer_archive_binary_guard_wired(
+            ci_workflow.replace(INSTALLER_BINARY_FALSIFIER_POLICY, "scripts/absent.py")
         ),
     )
     expect_assertion(

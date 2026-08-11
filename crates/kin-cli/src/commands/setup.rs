@@ -3256,6 +3256,27 @@ fn json_mcp_repo_from_entry_bytes(content: &[u8], client: &str) -> Result<Option
     Ok(canonical_initialized_repo(&candidate))
 }
 
+/// The repository a written kin MCP entry is bound to, read out of the entry.
+///
+/// Only the clients whose contract carries `--repo` have one. For the rest the
+/// answer is None, which is the honest reading: their binding names no
+/// repository, so there is nothing about it that depends on where setup ran.
+pub(crate) fn mcp_entry_repo_argument(entry: &serde_json::Value) -> Option<PathBuf> {
+    let args = entry.get("args")?.as_array()?;
+    let flag = args
+        .iter()
+        .position(|argument| argument.as_str() == Some("--repo"))?;
+    let repo = PathBuf::from(args.get(flag + 1)?.as_str()?);
+    repo.is_absolute().then_some(repo)
+}
+
+/// The repository the kin MCP entry in this config file is bound to.
+pub(crate) fn bound_repo_for_mcp_config(path: &Path) -> Option<PathBuf> {
+    let bytes = fs::read(path).ok()?;
+    let entry = read_kin_mcp_entry_from_bytes(path, &bytes)?;
+    mcp_entry_repo_argument(&entry)
+}
+
 /// Capture only MCP configs Kin already owns, plus exact workspace targets
 /// persisted in the setup ledger. Update never creates a new client config.
 pub(crate) fn current_mcp_repair_targets() -> Result<Vec<McpRepairTarget>> {
@@ -11880,6 +11901,15 @@ async fn apply_plan(
                         a.name,
                         path.display()
                     );
+                    // Which repository a client ends up bound to is decided by
+                    // the directory this ran in, and nothing said so. A later
+                    // run from a different directory rebound the client
+                    // silently, and the only visible consequence was a health
+                    // report calling a fresh, successful setup drifted. Name
+                    // the repository where the choice is actually made.
+                    if let Some(repo) = bound_repo_for_mcp_config(&path) {
+                        println!("      bound to repository {}", repo.display());
+                    }
                     registered_clients.push(*idx);
                     configured_assistants.push((a.name.to_string(), Some(path)));
                 }
@@ -11944,7 +11974,10 @@ async fn apply_plan(
 /// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
 /// Codex's `config.toml` (`mcp_servers.kin`), normalizing the entry to JSON
 /// for the install ledger.
-fn read_kin_mcp_entry_from_bytes(path: &Path, content: &[u8]) -> Option<serde_json::Value> {
+pub(crate) fn read_kin_mcp_entry_from_bytes(
+    path: &Path,
+    content: &[u8],
+) -> Option<serde_json::Value> {
     if path.extension().and_then(|e| e.to_str()) == Some("toml") {
         let root: toml::Value = toml::from_str(std::str::from_utf8(content).ok()?).ok()?;
         let entry = root.get("mcp_servers")?.get("kin")?;
@@ -19162,6 +19195,127 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert!(repaired.contains(&ConfigLock::normalized_path(&workspace).unwrap()));
         assert!(mcp_repair_targets_ledger_verified(&targets).unwrap());
         assert!(!kin_home.join("update-restart-ack-required.json").exists());
+    }
+
+    /// `kin setup` resolved `--repo` from the directory it ran in and the health
+    /// checker resolved its own expectation from the directory IT ran in, so the
+    /// two disagreed about a binding neither of them had touched and a fresh,
+    /// successful setup read as config drift on the next check. The binding
+    /// setup recorded is the one fact; this test walks a real write through a
+    /// check from somewhere else, and then proves the check can still fail.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_binding_setup_wrote_reads_exact_from_another_repository() {
+        use crate::commands::health::{evaluate_antigravity_binding, HealthStatus};
+
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        let bound = dir.path().join("bound-repo");
+        let moved = dir.path().join("bound-repo-moved");
+        let elsewhere = dir.path().join("another-repo");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        fs::create_dir_all(bound.join(".kin")).unwrap();
+        fs::create_dir_all(elsewhere.join(".kin")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::copy(env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
+        // The workspace binding refuses a repository without trusted Git
+        // authority, so the fixture is a real one.
+        for repo in [&bound, &elsewhere] {
+            let git = crate::commands::test_subprocess::fixture_git(repo)
+                .args(["init", "-q"])
+                .output()
+                .unwrap();
+            assert!(git.status.success());
+        }
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        let previous = env::current_dir().unwrap();
+        let _cwd = CurrentDirGuard(previous);
+        let scan_root = crate::commands::managed_config_scope::SCAN_ROOT_ENV;
+
+        let global = {
+            let _scan_root = EnvVarGuard::set(scan_root, &bound);
+            env::set_current_dir(&bound).unwrap();
+            configure_antigravity().unwrap()
+        };
+        let canonical_bound = bound.canonicalize().unwrap();
+        assert_eq!(
+            bound_repo_for_mcp_config(&global),
+            Some(canonical_bound.clone()),
+            "setup binds the repository it resolved from its own directory"
+        );
+
+        {
+            let _scan_root = EnvVarGuard::set(scan_root, &bound);
+            assert!(
+                evaluate_antigravity_binding(&global, false).is_none(),
+                "the binding is exact in the repository it was written from"
+            );
+        }
+
+        let _scan_root = EnvVarGuard::set(scan_root, &elsewhere);
+        env::set_current_dir(&elsewhere).unwrap();
+        assert!(
+            evaluate_antigravity_binding(&global, false).is_none(),
+            "a binding kin setup wrote must not read as drift because the checker stood elsewhere"
+        );
+
+        // A binding whose repository has gone away is a real fault, not a
+        // disagreement about directories, so the recorded fingerprint does not
+        // excuse it.
+        fs::rename(&bound, &moved).unwrap();
+        assert!(
+            matches!(
+                evaluate_antigravity_binding(&global, false),
+                Some((HealthStatus::Misconfigured, _))
+            ),
+            "a binding pointing at a repository that no longer exists must be caught"
+        );
+        fs::rename(&moved, &bound).unwrap();
+        assert!(
+            evaluate_antigravity_binding(&global, false).is_none(),
+            "the untouched binding reads exact again once its repository is back"
+        );
+
+        // The control. A verifier that cannot fail is not a verifier: an entry
+        // edited after setup wrote it no longer matches what the ledger
+        // recorded, so the strict comparison applies and the edit is caught
+        // from either directory.
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&fs::read(&global).unwrap()).unwrap();
+        root["mcpServers"]["kin"]["args"] = serde_json::json!([
+            "mcp",
+            "start",
+            "--repo",
+            dir.path().join("never-a-repository").to_string_lossy()
+        ]);
+        fs::write(&global, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        assert!(
+            matches!(
+                evaluate_antigravity_binding(&global, false),
+                Some((HealthStatus::Misconfigured, _))
+            ),
+            "an entry edited after setup wrote it must still be caught"
+        );
+        env::set_current_dir(&bound).unwrap();
+        let _scan_root_bound = EnvVarGuard::set(scan_root, &bound);
+        assert!(
+            matches!(
+                evaluate_antigravity_binding(&global, false),
+                Some((HealthStatus::Misconfigured, _))
+            ),
+            "the edited entry is caught from the repository it was bound to as well"
+        );
     }
 
     /// A repository enclosing the fixture is not the repository under test.
