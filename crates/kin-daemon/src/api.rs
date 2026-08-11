@@ -3275,6 +3275,7 @@ async fn command_resources(
         metal_profile: metal_profile_runtime(),
         vector_index_discarded: state.vector_index_discarded().map(str::to_string),
         embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
+        embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
     };
 
     let actual = kin_cli::commands::resources::ActualResources::capture();
@@ -5976,6 +5977,22 @@ async fn embed(
             .map_err(|error| format!("embed build failed: {error:#}"))?;
             if !bounded_request || !result.result.time_limited {
                 state_for_embed.resume_background_embed();
+            }
+            // This pass is where coverage became whole, so this is where the
+            // has-ever-completed marker is published. The background worker
+            // publishes at its own drain point, but it stands down for the
+            // duration of an explicit pass and breaks out before reaching it,
+            // so without this a store filled by `kin embed` never records that
+            // its fill finished. `embedded_*` are store-wide indexed counts
+            // rather than this pass's delta, so together with no pending work
+            // and no time limit they say the same thing the counter re-read
+            // would have said, from evidence that cannot go stale underneath.
+            if !result.result.time_limited
+                && result.result.pending_entities == 0
+                && result.result.pending_artifacts == 0
+                && (result.result.embedded_entities > 0 || result.result.embedded_artifacts > 0)
+            {
+                state_for_embed.record_embedding_pass_drained();
             }
             if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
                 state_for_embed.bump_version();
