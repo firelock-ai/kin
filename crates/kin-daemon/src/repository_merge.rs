@@ -17,7 +17,7 @@ use axum::http::StatusCode;
 use kin_cli::commands::merge::{
     MergeOutcome, MergeReport, MergeRequest, MergeResponse, MERGE_REPORT_SCHEMA,
 };
-use kin_db::LocalRepositoryAuthorityFreeze;
+use kin_db::{LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager};
 use kin_model::{
     compute_resolved_tree_hash, compute_semantic_change_id, ChangeOrigin, ChangeStore,
     EffectiveAdmissionPolicyStamp, EntityStore, Hash256, MergeConflictEntry, MergeConflictSubject,
@@ -34,6 +34,7 @@ use kin_model::{
 use crate::local_repository_authority::{
     require_fresh_daemon_workspace, ActiveLocalRepositoryAuthority, RepositoryAuthorityBindRefusal,
 };
+use crate::source_cas::read_publishable_source;
 use crate::state::{DaemonEvent, DaemonState};
 
 const MERGE_REASON: &str = "publish exact repository-v6 semantic merge";
@@ -571,8 +572,12 @@ fn three_way(
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
         .context("compose exact merged repository tree")?;
-    let (shared_policy, admission_policy_delta) =
-        derive_policy(state, &plan.ours_policy, &desired_tree)?;
+    let (shared_policy, admission_policy_delta) = derive_policy(
+        &state.blobs,
+        &authority.manager,
+        &plan.ours_policy,
+        &desired_tree,
+    )?;
     if admission_policy_delta.is_some() || shared_policy != plan.ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
@@ -922,8 +927,12 @@ pub(crate) fn publish_resolved_merge(
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
         .context("compose exact resolved repository tree")?;
-    let (shared_policy, admission_policy_delta) =
-        derive_policy(state, &ours_policy, &desired_tree)?;
+    let (shared_policy, admission_policy_delta) = derive_policy(
+        &state.blobs,
+        &authority.manager,
+        &ours_policy,
+        &desired_tree,
+    )?;
     if admission_policy_delta.is_some() || shared_policy != ours_policy {
         return Err(merge_conflict(format!(
             "merging {} into {} changes the shared admission policy; a merge that transitions \
@@ -1468,8 +1477,16 @@ fn artifacts_by_id(
         .collect()
 }
 
+/// Measure the merged tree's rule sources to derive its admission policy.
+///
+/// Takes the two stores rather than the daemon state because a merge composes
+/// published trees: every rule file it measures was published by an earlier
+/// change and is therefore durable in repository CAS, whether or not its staged
+/// copy survived. Naming both stores here is what keeps a merge from depending
+/// on ingestion staging that nothing promises to retain.
 fn derive_policy(
-    state: &DaemonState,
+    blobs: &kin_blobs::BlobStore,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
     parent: &SharedAdmissionPolicy,
     tree: &ResolvedTree,
 ) -> Result<(
@@ -1481,15 +1498,12 @@ fn derive_policy(
         if let Some(length) = lengths.get(&hash) {
             return Ok(*length);
         }
-        let body = state
-            .blobs
-            .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
-            .map_err(|error| {
-                ModelError::InvalidOperation(format!(
-                    "read graph-owned admission source {hash}: {error}"
-                ))
-            })?;
-        let length = u64::try_from(body.len()).map_err(|_| {
+        let source = read_publishable_source(blobs, authority, hash).map_err(|error| {
+            ModelError::InvalidOperation(format!(
+                "{error}, while deriving the merged tree's admission policy"
+            ))
+        })?;
+        let length = u64::try_from(source.body().len()).map_err(|_| {
             ModelError::InvalidOperation(format!("graph-owned admission source {hash} exceeds u64"))
         })?;
         lengths.insert(hash, length);
@@ -2274,5 +2288,89 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged_relations.get(&relation.id), Some(&relation));
+    }
+
+    fn rule_source_fixture() -> (
+        tempfile::TempDir,
+        kin_core::InitResult,
+        Hash256,
+        ResolvedTree,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let hash = Hash256::from_bytes(blobs.write(b"target/\n").unwrap().0);
+        let tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(".gitignore").unwrap(),
+            TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
+        (root, init, hash, tree)
+    }
+
+    fn empty_policy() -> SharedAdmissionPolicy {
+        SharedAdmissionPolicy::derive_from_tree(None, &ResolvedTree::default(), |_| Ok(0))
+            .unwrap()
+            .0
+    }
+
+    fn authority(init: &kin_core::InitResult) -> RepositoryAuthorityManager<LocalFileBackend> {
+        RepositoryAuthorityManager::open(
+            init.repository_id.clone(),
+            std::sync::Arc::new(LocalFileBackend::new(init.layout.kindb_dir())),
+        )
+        .unwrap()
+    }
+
+    /// A merge measures every rule file in the merged tree, and by construction
+    /// every one of them was published by an earlier change rather than
+    /// observed by this one. Reading only ingestion staging made a merge depend
+    /// on a store that promises no retention, for bodies the repository already
+    /// owns and for a policy the merge then refuses to let change.
+    #[test]
+    fn a_merge_derives_its_policy_after_ingestion_staging_is_lost() {
+        let (_root, init, hash, tree) = rule_source_fixture();
+        let authority = authority(&init);
+        authority.save_source_blob(hash, b"target/\n").unwrap();
+
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        assert!(
+            blobs
+                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                .is_err(),
+            "the fixture only proves anything while the staged rule body is genuinely gone"
+        );
+
+        let (policy, _) = derive_policy(&blobs, &authority, &empty_policy(), &tree)
+            .expect("a merged tree whose rule bodies authority owns still derives its policy");
+        assert_eq!(
+            policy
+                .sources
+                .iter()
+                .map(|source| source.body_len)
+                .collect::<Vec<_>>(),
+            vec![8],
+            "the measured length is the published body's, not a guess"
+        );
+    }
+
+    /// The control. A rule body no store holds still fails the merge, so the
+    /// fallback cannot be mistaken for one that invents a length.
+    #[test]
+    fn a_merge_still_refuses_a_rule_body_neither_store_holds() {
+        let (_root, init, _hash, tree) = rule_source_fixture();
+        let authority = authority(&init);
+
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+
+        let error = derive_policy(&blobs, &authority, &empty_policy(), &tree)
+            .expect_err("a rule body neither store holds cannot be measured");
+        assert!(
+            format!("{error:#}").contains("absent from both ingestion staging and repository CAS"),
+            "the refusal names both stores it consulted: {error:#}"
+        );
     }
 }

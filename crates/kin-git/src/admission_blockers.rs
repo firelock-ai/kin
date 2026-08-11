@@ -18,6 +18,12 @@
 //! A worktree that has been worked in is not among them. Uncommitted state is
 //! not repository authority and never enters it, so the proof observes the
 //! delta and reports it rather than refusing; see [`crate::preflight`].
+//!
+//! Nor is a sibling worktree, by itself. What the capture needs from one is
+//! that it anchors no commit the shared reference store leaves unnamed, and
+//! that nothing is running against the object database. Both are decided per
+//! worktree by [`crate::preflight::classify_other_worktrees`], and the ones
+//! that pass are disclosed as a note rather than refused.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,8 +33,8 @@ use crate::error::{
 };
 use crate::lossless::open_repo;
 use crate::preflight::{
-    checkout_filter_facts, exact_directory_names, hook_executability, hook_kind,
-    open_repo_with_user_ignore_config, other_registered_worktrees, preflight_error,
+    checkout_filter_facts, classify_other_worktrees, exact_directory_names, hook_executability,
+    hook_kind, open_repo_with_user_ignore_config, other_registered_worktrees, preflight_error,
     reject_in_progress_operations, scan_remote_mapping, stable_path,
 };
 
@@ -92,17 +98,34 @@ pub fn collect_git_admission_blockers(repo_path: &Path) -> Result<GitAdmissionRe
         Err(error) => return Err(error),
     }
 
-    for worktree in other_registered_worktrees(&repo, &source)? {
-        let kind = match worktree.kind {
+    let (tolerated, untolerable) =
+        classify_other_worktrees(&repo, other_registered_worktrees(&repo, &source)?)?;
+    for entry in untolerable {
+        let kind = match entry.worktree.kind {
             RegisteredGitWorktreeKind::Main => "main",
             RegisteredGitWorktreeKind::Linked => "linked",
         };
         report.blockers.push(GitAdmissionBlocker::new(
             format!(
-                "another {kind} Git worktree {} shares this object database",
-                worktree.path.display()
+                "another {kind} Git worktree {} {}",
+                entry.worktree.path.display(),
+                entry.reason
             ),
-            "remove it with 'git worktree remove', or run kin init from the workspace that keeps it",
+            entry.remedy,
+        ));
+    }
+    if !tolerated.is_empty() {
+        report.notes.push(format!(
+            "{} other registered Git worktree(s) share this object database and are not admitted \
+             as Kin workspaces: {}. Each is idle on a branch this capture carries, so their \
+             commits are admitted; any uncommitted work in them is neither admitted nor reported.",
+            tolerated.len(),
+            render_paths(
+                tolerated
+                    .iter()
+                    .map(|worktree| worktree.path.display().to_string())
+                    .collect()
+            )
         ));
     }
 
@@ -578,14 +601,14 @@ mod tests {
         git(&fixture.repo, &["config", "remote.origin.tagOpt", "--tags"]);
         git(
             &fixture.repo,
-            &["config", "branch.main.vscode-merge-base", "origin/main"],
+            &["config", "branch.main.pushRemoteRef", "refs/heads/main"],
         );
         git(&fixture.repo, &["config", "core.askPass", "/bin/true"]);
 
         let refusal = fixture.refusal();
         for expected in [
             "remote.origin.tagOpt",
-            "branch.main.vscode-merge-base",
+            "branch.main.pushRemoteRef",
             "core.askPass",
         ] {
             assert!(
@@ -593,6 +616,171 @@ mod tests {
                 "expected {expected:?} in refusal:\n{refusal}"
             );
         }
+    }
+
+    /// The configuration an ordinary editor-configured checkout carries admits.
+    ///
+    /// Each of these was refused before it was classified, and every developer
+    /// using VS Code or `git config push.autoSetupRemote true` had at least one
+    /// of them. None can change which refs move or what bytes they carry.
+    #[test]
+    fn classified_admissible_developer_configuration_clears() {
+        let fixture = Fixture::clean();
+        git(
+            &fixture.repo,
+            &["config", "branch.main.vscode-merge-base", "origin/main"],
+        );
+        git(&fixture.repo, &["config", "branch.main.rebase", "true"]);
+        git(
+            &fixture.repo,
+            &["config", "branch.main.description", "the trunk"],
+        );
+        git(&fixture.repo, &["config", "push.autoSetupRemote", "true"]);
+        git(
+            &fixture.repo,
+            &["config", "lfs.repositoryFormatVersion", "0"],
+        );
+        git(
+            &fixture.repo,
+            &[
+                "config",
+                "lfs.https://example.invalid/r.git/info/lfs.access",
+                "basic",
+            ],
+        );
+
+        let report = fixture.report();
+        assert!(
+            report.is_clear(),
+            "classified-admissible configuration must not block: {report:?}"
+        );
+    }
+
+    /// A branch section carrying an admissible key still yields its facts.
+    ///
+    /// A refusal anywhere in a section makes the scan discard that section, so
+    /// classifying the editor key is also what lets the branch's real tracking
+    /// configuration be read at all.
+    #[test]
+    fn a_branch_section_with_an_editor_key_still_maps_its_tracking() {
+        let fixture = Fixture::clean();
+        git(
+            &fixture.repo,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/r.git",
+            ],
+        );
+        git(&fixture.repo, &["config", "branch.main.remote", "origin"]);
+        git(
+            &fixture.repo,
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        git(
+            &fixture.repo,
+            &["config", "branch.main.vscode-merge-base", "origin/main"],
+        );
+
+        let source = fs::canonicalize(&fixture.repo).expect("canonical source");
+        let repo = open_repo(&source).expect("open repository");
+        let scan = scan_remote_mapping(&repo).expect("scan transport configuration");
+        assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
+        assert_eq!(scan.facts.branch_tracking.len(), 1);
+        assert_eq!(
+            scan.facts.branch_tracking[0].remote.as_deref(),
+            Some(&b"origin"[..])
+        );
+        assert_eq!(
+            scan.facts.branch_tracking[0].merge_refs,
+            vec![b"refs/heads/main".to_vec()]
+        );
+    }
+
+    /// `push.autoSetupRemote` is modelled, not merely tolerated.
+    #[test]
+    fn push_auto_setup_remote_is_admitted_as_a_fact() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "push.autoSetupRemote", "true"]);
+
+        let source = fs::canonicalize(&fixture.repo).expect("canonical source");
+        let repo = open_repo(&source).expect("open repository");
+        let scan = scan_remote_mapping(&repo).expect("scan transport configuration");
+        assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
+        assert_eq!(
+            scan.facts.push_auto_setup_remote.as_deref(),
+            Some(&b"true"[..])
+        );
+    }
+
+    /// The `[lfs]` narrowing does not admit a repository LFS actually rewrites.
+    ///
+    /// The filter is the surface that changes bytes, and it keeps refusing at
+    /// any configuration scope, which is what makes admitting the section safe.
+    #[test]
+    fn an_lfs_repository_still_blocks_on_its_filter() {
+        let fixture = Fixture::clean();
+        git(
+            &fixture.repo,
+            &["config", "lfs.repositoryFormatVersion", "0"],
+        );
+        git(
+            &fixture.repo,
+            &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"],
+        );
+
+        let report = fixture.report();
+        assert_eq!(
+            report.blockers.len(),
+            1,
+            "the filter is the only refusal an LFS repository earns: {report:?}"
+        );
+        assert!(
+            report.blockers[0].subject.contains("filter \"lfs\""),
+            "{report:?}"
+        );
+    }
+
+    /// An `[lfs]` key naming an endpoint Kin cannot restore keeps refusing.
+    #[test]
+    fn an_lfs_endpoint_key_still_refuses() {
+        let fixture = Fixture::clean();
+        git(
+            &fixture.repo,
+            &[
+                "config",
+                "lfs.url",
+                "https://example.invalid/r.git/info/lfs",
+            ],
+        );
+
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("lfs.url"), "{refusal}");
+    }
+
+    /// An unclassified key under an `[lfs "<endpoint>"]` subsection refuses,
+    /// and the refusal does not print the endpoint.
+    ///
+    /// An LFS subsection name is a URL, which is the same shape that can carry
+    /// `user:password@`, so naming the key is the whole disclosure.
+    #[test]
+    fn an_unclassified_lfs_subsection_key_refuses_without_printing_the_endpoint() {
+        let fixture = Fixture::clean();
+        git(
+            &fixture.repo,
+            &[
+                "config",
+                "lfs.https://token:secret@example.invalid/r.git/info/lfs.locksverify",
+                "true",
+            ],
+        );
+
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("lfs.locksverify"), "{refusal}");
+        assert!(
+            !refusal.contains("secret") && !refusal.contains("example.invalid"),
+            "an endpoint subsection must never reach a refusal:\n{refusal}"
+        );
     }
 
     /// Two offending keys inside one section are both named.
@@ -821,8 +1009,13 @@ mod tests {
         );
     }
 
+    /// An idle sibling on a shared branch admits, and says it is there.
+    ///
+    /// This is what `git worktree add -b` leaves behind, which is the shape
+    /// every worktree user has and the one this fleet's own lane checkouts
+    /// create. Refusing it made kin init unavailable to all of them.
     #[test]
-    fn a_second_registered_worktree_is_reported_with_its_path() {
+    fn an_idle_linked_worktree_is_admitted_and_disclosed() {
         let fixture = Fixture::clean();
         let other = fixture.temp.path().join("other-worktree");
         git(
@@ -836,9 +1029,93 @@ mod tests {
             ],
         );
 
+        let report = fixture.report();
+        assert!(
+            report.is_clear(),
+            "an idle sibling worktree is admissible: {report:?}"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("other-worktree") && note.contains("not admitted")),
+            "the sibling is disclosed rather than hidden: {report:?}"
+        );
+    }
+
+    /// A sibling at a detached HEAD is reported with its path and the reason.
+    #[test]
+    fn a_detached_linked_worktree_is_reported_with_its_path() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("detached-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+
         let refusal = fixture.refusal();
-        assert!(refusal.contains("other-worktree"), "{refusal}");
+        assert!(refusal.contains("detached-worktree"), "{refusal}");
+        assert!(refusal.contains("detached HEAD"), "{refusal}");
         assert!(refusal.contains("git worktree remove"), "{refusal}");
+    }
+
+    /// A sibling mid-rebase is reported, and nothing else can see it.
+    ///
+    /// Its `rebase-merge` directory is under `.git/worktrees/<id>`, which the
+    /// source's own in-progress scan never reaches, so narrowing the worktree
+    /// rule without this check would have admitted a repository being rewritten
+    /// underneath the proof.
+    #[test]
+    fn a_linked_worktree_mid_operation_is_reported() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("busy-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "busy",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        let admin = fixture.repo.join(".git/worktrees/busy-worktree");
+        fs::create_dir(admin.join("rebase-merge")).expect("in-progress rebase state");
+
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("busy-worktree"), "{refusal}");
+        assert!(refusal.contains("rebase-merge"), "{refusal}");
+    }
+
+    /// A sibling holding its own refs is reported, naming the ref.
+    #[test]
+    fn a_linked_worktree_holding_private_refs_is_reported() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("bisect-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bisecting",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        let private = fixture
+            .repo
+            .join(".git/worktrees/bisect-worktree/refs/bisect");
+        fs::create_dir_all(&private).expect("private ref directory");
+        fs::write(private.join("bad"), b"0\n").expect("private ref");
+
+        let refusal = fixture.refusal();
+        assert!(refusal.contains("bisect-worktree"), "{refusal}");
+        assert!(refusal.contains("bad"), "{refusal}");
     }
 
     #[test]

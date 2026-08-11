@@ -628,12 +628,37 @@ fn map_git_coexistence_config(
             })
         })
         .transpose()?;
+    let push_auto_setup_remote = facts
+        .push_auto_setup_remote
+        .as_deref()
+        .map(|value| {
+            git_boolean(value).ok_or_else(|| {
+                KinError::Other(
+                    "Git push.autoSetupRemote escaped preflight without a boolean value"
+                        .to_string(),
+                )
+            })
+        })
+        .transpose()?;
     Ok(GitCoexistenceConfig {
         remotes,
         branches,
         remote_push_default,
         push_default,
+        push_auto_setup_remote,
     })
+}
+
+/// Read one Git boolean exactly as Git reads it.
+///
+/// An empty value is Git's shorthand for true, which is why this cannot be a
+/// plain string comparison against `true`.
+fn git_boolean(value: &[u8]) -> Option<bool> {
+    match value.to_ascii_lowercase().as_slice() {
+        b"" | b"true" | b"yes" | b"on" | b"1" => Some(true),
+        b"false" | b"no" | b"off" | b"0" => Some(false),
+        _ => None,
+    }
 }
 
 fn exact_utf8(value: &[u8], label: &str) -> Result<String> {
@@ -1047,14 +1072,21 @@ mod tests {
         git(&source, ["add", "--all"]);
         git(&source, ["commit", "-m", "initial"]);
         git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
-        git(&source, ["config", "branch.main.vscode-merge-base", "main"]);
+        git(&source, ["config", "branch.main.pushRemoteRef", "main"]);
         git(&source, ["config", "filter.demo.clean", "external-clean"]);
+        // Admissible beside the three blockers, so this also proves a
+        // classified key does not add a fourth line to the refusal.
+        git(&source, ["config", "branch.main.vscode-merge-base", "main"]);
 
         let error = init_from_git(&source).unwrap_err().to_string();
 
         assert!(error.contains("remote.origin.tagOpt"), "{error}");
-        assert!(error.contains("branch.main.vscode-merge-base"), "{error}");
+        assert!(error.contains("branch.main.pushRemoteRef"), "{error}");
         assert!(error.contains("filter \"demo\""), "{error}");
+        assert!(
+            !error.contains("vscode-merge-base"),
+            "a classified key must not reach the refusal: {error}"
+        );
         assert!(!source.join(".kin").exists());
         assert_no_staging_directories(root.path());
     }
