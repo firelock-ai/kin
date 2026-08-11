@@ -202,8 +202,7 @@ pub fn handle_provenance_query<G: GraphStore>(
         let approvals = store
             .get_approvals_for_change(&latest.id)
             .map_err(McpError::graph)?;
-        approvals_json =
-            serde_json::Value::Array(approvals.iter().map(approval_json).collect());
+        approvals_json = serde_json::Value::Array(approvals.iter().map(approval_json).collect());
     }
 
     let changes = ordered
@@ -552,7 +551,10 @@ mod tests {
             );
         }
         let events = response["recent_audit_events"].as_array().unwrap();
-        assert!(!events.is_empty(), "the fixture recorded events: {response}");
+        assert!(
+            !events.is_empty(),
+            "the fixture recorded events: {response}"
+        );
         for event in events {
             assert!(
                 is_hex_hash(&event["event_id"]) && is_hex_hash(&event["actor_id"]),
@@ -571,7 +573,11 @@ mod tests {
         );
 
         let approvals = response["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), 1, "the seeded approval must appear: {response}");
+        assert_eq!(
+            approvals.len(),
+            1,
+            "the seeded approval must appear: {response}"
+        );
         let approval = &approvals[0];
         assert!(
             is_hex_hash(&approval["approval_id"])
