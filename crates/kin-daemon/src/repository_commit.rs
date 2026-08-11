@@ -24,6 +24,7 @@ use kin_model::{
 use crate::commit_deltas::compute_deltas_vs_repository_authority;
 use crate::error::{DaemonError, Result};
 use crate::local_repository_authority::LocalRepositoryAuthorityContext;
+use crate::source_cas::read_publishable_source;
 
 type ProjectionEntry = (kin_model::RepoPath, kin_model::TreeEntry, Arc<[u8]>);
 
@@ -223,25 +224,12 @@ pub(crate) fn plan_session_workspace_admission(
             if let Some(length) = source_lengths.get(&hash) {
                 return Ok(*length);
             }
-            let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
-            let body = match blobs.read(&blob_hash) {
-                Ok(body) => body,
-                Err(ingestion_error) => authority
-                    .load_source_blob(hash)
-                    .map_err(|error| {
-                        ModelError::InvalidOperation(format!(
-                            "read repository source {hash} while deriving exact session policy: \
-                             {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        ModelError::InvalidOperation(format!(
-                            "exact session admission-policy source {hash} is absent from both \
-                             ingestion and repository CAS ({ingestion_error})"
-                        ))
-                    })?,
-            };
-            let length = u64::try_from(body.len()).map_err(|_| {
+            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
+                ModelError::InvalidOperation(format!(
+                    "{error}, while deriving the exact session admission policy"
+                ))
+            })?;
+            let length = u64::try_from(source.body().len()).map_err(|_| {
                 ModelError::InvalidOperation(format!(
                     "exact session admission-policy source {hash} exceeds u64"
                 ))
@@ -378,17 +366,8 @@ pub(crate) fn commit_session_workspace_admission(
     }
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     for hash in &plan.source_hashes {
-        let blob_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
-        match blobs.read(&blob_hash) {
-            Ok(body) => authority.save_source_blob(*hash, &body)?,
-            Err(ingestion_error) => {
-                if authority.load_source_blob(*hash)?.is_none() {
-                    return Err(invalid(format!(
-                        "exact session source {hash} is absent from both ingestion and repository \
-                         CAS ({ingestion_error})"
-                    )));
-                }
-            }
+        if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish() {
+            authority.save_source_blob(*hash, body)?;
         }
     }
 
@@ -508,30 +487,14 @@ pub(crate) fn publish_workspace_tree(
                 return Ok(*length);
             }
             // Every rule file in the desired tree is measured here, changed or
-            // not, because the policy is derived from the whole tree. Ingestion
-            // staging is not authority and carries no retention promise, while
-            // a source the repository already published is durable in its own
-            // CAS. Reading staging first and authority second is what keeps an
-            // untouched `.gitignore` from making publication depend on a
-            // staging directory that any restore or cleanup may have dropped.
-            let body = match blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes())) {
-                Ok(body) => body,
-                Err(ingestion_error) => authority
-                    .load_source_blob(hash)
-                    .map_err(|error| {
-                        ModelError::InvalidOperation(format!(
-                            "read repository source {hash} while deriving the admitted workspace \
-                             policy: {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        ModelError::InvalidOperation(format!(
-                            "admitted workspace policy source {hash} is absent from both \
-                             ingestion and repository CAS ({ingestion_error})"
-                        ))
-                    })?,
-            };
-            let length = u64::try_from(body.len()).map_err(|_| {
+            // not, because the policy is derived from the whole tree rather
+            // than from what moved.
+            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
+                ModelError::InvalidOperation(format!(
+                    "{error}, while deriving the admitted workspace policy"
+                ))
+            })?;
+            let length = u64::try_from(source.body().len()).map_err(|_| {
                 ModelError::InvalidOperation(format!(
                     "admitted workspace policy source {hash} exceeds u64"
                 ))
@@ -603,19 +566,12 @@ pub(crate) fn publish_workspace_tree(
     source_hashes.extend(shared_policy.sources.iter().map(|source| source.body_hash));
     drop(lease);
 
+    // Copying a staged body into repository CAS is how a newly referenced
+    // source becomes durable. An unchanged rule source is already there and
+    // needs no copy.
     for hash in source_hashes {
-        // Copying a staged body into repository CAS is how a newly referenced
-        // source becomes durable. An unchanged rule source is already there and
-        // needs no copy, so staging having dropped it is not a failure. A body
-        // neither store holds still fails the publication, as the typed blob
-        // absence a caller can match on.
-        match blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes())) {
-            Ok(body) => authority.save_source_blob(hash, &body)?,
-            Err(ingestion_error) => {
-                if authority.load_source_blob(hash)?.is_none() {
-                    return Err(DaemonError::from(ingestion_error));
-                }
-            }
+        if let Some(body) = read_publishable_source(blobs, &authority, hash)?.body_to_publish() {
+            authority.save_source_blob(hash, body)?;
         }
     }
     let receipt = authority.commit_repository_transaction(transaction)?;
@@ -833,14 +789,12 @@ fn plan_native_commit_inner(
             if let Some(length) = source_lengths.get(&hash) {
                 return Ok(*length);
             }
-            let body = blobs
-                .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
-                .map_err(|error| {
-                    ModelError::InvalidOperation(format!(
-                        "read graph-owned admission source {hash}: {error}"
-                    ))
-                })?;
-            let length = u64::try_from(body.len()).map_err(|_| {
+            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
+                ModelError::InvalidOperation(format!(
+                    "{error}, while deriving the graph-owned admission policy"
+                ))
+            })?;
+            let length = u64::try_from(source.body().len()).map_err(|_| {
                 ModelError::InvalidOperation(format!(
                     "graph-owned admission source {hash} exceeds u64"
                 ))
@@ -1111,8 +1065,9 @@ pub(crate) fn commit_native_plan(
     }
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     for hash in &plan.source_hashes {
-        let body = blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))?;
-        authority.save_source_blob(*hash, &body)?;
+        if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish() {
+            authority.save_source_blob(*hash, body)?;
+        }
     }
     let receipt = authority.commit_repository_transaction(plan.transaction)?;
     receipt.validate()?;
@@ -1149,8 +1104,9 @@ pub(crate) fn commit_native_plan_with_projection(
     }
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     for hash in &plan.source_hashes {
-        let body = blobs.read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))?;
-        authority.save_source_blob(*hash, &body)?;
+        if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish() {
+            authority.save_source_blob(*hash, body)?;
+        }
     }
 
     let mut body_cache = BTreeMap::new();
@@ -1735,6 +1691,143 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![rules.path.clone()],
             "the derived policy still names the rule file whose body only authority holds"
+        );
+    }
+
+    /// The same loss on the native commit path, which reads unchanged bodies
+    /// twice: once to measure every rule file while deriving the policy, and
+    /// once to copy every source the change references into repository CAS.
+    /// Neither read is bounded to what moved, so an untouched `.gitignore` is
+    /// consulted by every commit forever, and before this both reads went to
+    /// ingestion staging alone.
+    #[test]
+    fn a_native_commit_publishes_after_ingestion_staging_is_lost() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        let rules = add_artifact(&graph, &blobs, b".gitignore", b"target/\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        add_artifact(
+            &graph,
+            &blobs,
+            b"first.rs",
+            b"pub fn first() {}\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("fir2171"),
+            "publish the rule file and one source".to_string(),
+        )
+        .unwrap();
+        commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+
+        // Lose the staging directory the way a restore that carries the
+        // authority database but not a directory named like a cache does.
+        let rules_hash = rules.entry.blob_identity().unwrap();
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        assert!(
+            blobs
+                .read(&kin_blobs::Hash256::from_bytes(*rules_hash.as_bytes()))
+                .is_err(),
+            "the fixture only proves anything while the staged rule body is genuinely gone"
+        );
+
+        // The new file's body is staged, the rule file's is not. One commit has
+        // to read both stores to publish.
+        add_artifact(
+            &graph,
+            &blobs,
+            b"second.rs",
+            b"pub fn second() {}\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("fir2171"),
+            "publish a change that leaves the rule file untouched".to_string(),
+        )
+        .unwrap();
+        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        assert_eq!(result.receipt.generation, 3);
+        assert_eq!(
+            std::fs::read(root.path().join("second.rs")).unwrap(),
+            b"pub fn second() {}\n"
+        );
+
+        let authority = reopen(&init);
+        assert_eq!(
+            authority.load_source_blob(rules_hash).unwrap().as_deref(),
+            Some(b"target/\n".as_slice()),
+            "the rule body the commit measured is the one authority already held"
+        );
+    }
+
+    /// The control that keeps the fallback from swallowing a real loss. A body
+    /// no store holds is not an unchanged body that authority already owns, and
+    /// a publication that cannot find one must still refuse, as the typed blob
+    /// absence rather than as a sentence.
+    #[test]
+    fn a_native_commit_still_refuses_a_body_neither_store_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+
+        add_artifact(&graph, &blobs, b".gitignore", b"target/\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("fir2171"),
+            "publish the rule file".to_string(),
+        )
+        .unwrap();
+        commit_native_plan(&init.layout, &blobs, plan).unwrap();
+
+        // Staged and never published, then lost: the one body that is genuinely
+        // gone rather than merely unstaged.
+        add_artifact(
+            &graph,
+            &blobs,
+            b"orphan.rs",
+            b"pub fn orphan() {}\n",
+            |hash| TreeEntry::blob(hash, false),
+        );
+        std::fs::remove_dir_all(init.layout.ingest_cas_dir()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("fir2171"),
+            "publish a body no store holds".to_string(),
+        )
+        .expect("the rule file authority still owns lets planning get as far as publication");
+        let error = commit_native_plan(&init.layout, &blobs, plan)
+            .expect_err("a body neither store holds cannot be published");
+        assert!(
+            matches!(error, DaemonError::Blob(_)),
+            "absence stays the typed blob failure a caller can match on: {error}"
         );
     }
 
