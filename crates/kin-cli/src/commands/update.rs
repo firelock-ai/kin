@@ -12049,8 +12049,7 @@ mod tests {
     /// an install.
     #[test]
     fn chain_outcome_reports_the_transition_when_an_install_happened() {
-        let body =
-            compose_chain_outcome_body(Some(("9.9.9", "abcdef1234567890deadbeef")));
+        let body = compose_chain_outcome_body(Some(("9.9.9", "abcdef1234567890deadbeef")));
         assert!(
             body.contains(&format!("Updated v{CURRENT_VERSION} to v9.9.9")),
             "the transition names old and new: {body}"
