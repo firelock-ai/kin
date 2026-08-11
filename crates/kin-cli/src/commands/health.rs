@@ -1283,11 +1283,53 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf, client_id: &str) -> (HealthSta
     evaluate_mcp_client_against(path, client_id, &expected_command)
 }
 
-fn evaluate_antigravity_binding(path: &Path, workspace: bool) -> Option<(HealthStatus, String)> {
+/// The repository binding `kin setup` recorded for this client config, when the
+/// entry on disk is still exactly the one setup wrote.
+///
+/// `kin setup` binds `--repo` to the repository it resolved from the directory
+/// it ran in, and this checker resolves its own from the directory it runs in.
+/// Those are two independent derivations of one fact, so a setup run from one
+/// directory and a check run from another disagreed about a binding neither had
+/// touched, and a fresh successful setup read as drift on the next check. The
+/// ledger already holds the fact itself, as a fingerprint of the exact entry
+/// setup wrote. When the entry still matches that fingerprint, the repository it
+/// names IS the repository setup bound, and re-deriving an expectation from the
+/// checker's own directory can only invent a disagreement.
+///
+/// An edited entry gets none of this. Its fingerprint no longer matches, so the
+/// caller falls back to comparing against the discovered repository and a
+/// hand-edited binding is still caught. Neither does a binding whose repository
+/// has since gone away: that is a real fault, not a disagreement about where
+/// anyone stood.
+fn setup_recorded_binding_repo(path: &Path) -> Option<PathBuf> {
+    use crate::commands::setup_ledger::{
+        fingerprint_mcp_entry, ledger_path, ArtifactKind, SetupLedger,
+    };
+
+    let ledger = SetupLedger::load(&ledger_path().ok()?).ok()?;
+    let recorded = ledger
+        .entries
+        .iter()
+        .find(|entry| entry.kind == ArtifactKind::McpConfig && same_path(&entry.path, path))?;
+    let bytes = std::fs::read(path).ok()?;
+    let entry = super::setup::read_kin_mcp_entry_from_bytes(path, &bytes)?;
+    if fingerprint_mcp_entry(&entry) != recorded.fingerprint {
+        return None;
+    }
+    let repo = super::setup::mcp_entry_repo_argument(&entry)?;
+    repo.is_dir().then_some(repo)
+}
+
+pub(crate) fn evaluate_antigravity_binding(
+    path: &Path,
+    workspace: bool,
+) -> Option<(HealthStatus, String)> {
+    // A workspace binding lives inside the repository it names, so it derives
+    // its own expectation and never depended on the checker's directory.
     let repo_root = if workspace {
         path.parent()?.parent()?.canonicalize().ok()?
     } else {
-        current_health_repo()?
+        setup_recorded_binding_repo(path).or_else(current_health_repo)?
     };
     evaluate_antigravity_binding_for(path, workspace, &repo_root)
 }
@@ -1360,7 +1402,7 @@ fn evaluate_codex_binding_for(path: &Path, expected_repo: &Path) -> Option<(Heal
 }
 
 fn evaluate_codex_binding(path: &Path) -> Option<(HealthStatus, String)> {
-    let expected_repo = current_health_repo()?;
+    let expected_repo = setup_recorded_binding_repo(path).or_else(current_health_repo)?;
     evaluate_codex_binding_for(path, &expected_repo)
 }
 
