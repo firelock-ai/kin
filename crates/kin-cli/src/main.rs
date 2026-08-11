@@ -1180,6 +1180,19 @@ enum BranchAction {
         ref_hex: Option<String>,
     },
     /// Switch workspace authority and projection atomically
+    ///
+    /// Uncommitted work comes with you, the way it does across a Git checkout.
+    /// Pending work at a path the destination branch does not track moves
+    /// across and is still uncommitted when you arrive. Pending work at a path
+    /// the destination already tracks with identical content becomes an
+    /// ordinary member of that branch. A pending edit to a member both branches
+    /// hold identically moves across too.
+    ///
+    /// The switch refuses only where replaying the work would lose something:
+    /// a new file whose path the destination tracks with different content, or
+    /// an edit to a member the destination holds differently or does not hold
+    /// at all. It names every blocked path, and commit or `kin stash push`
+    /// clears the way.
     Switch {
         /// UTF-8 short branch name or fully-qualified refs/heads/... name
         #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
