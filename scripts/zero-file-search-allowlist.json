@@ -8,7 +8,7 @@
     },
     {
       "file": "crates/kin-mcp/src/daemon_delegate.rs",
-      "reason": "Daemon-reachability boundary: this module forwards MCP tool calls to the daemon, which is the graph authority. Every filesystem touch here is about reaching that authority, never about answering in its place \u2014 no tool result derives from any of them. Three classes, each pinned to its whole expression: (1) the loopback bearer token at <kin_dir>/daemon.token, read so the forwarded request can authenticate; (2) repo binding, walking up from the working directory for the .kin layout marker to locate that token, which precedes any graph consult because it decides which daemon to talk to; (3) revival, resolving and spawning the known kin-daemon executable via KIN_DAEMON_BIN, the current exe's directory, the cargo target dir, and PATH, a `which` equivalent open-coded to avoid the dependency. The head-generation marker is the daemon's own published counter and only keys a within-session memo; a missing marker reads as generation 0, which costs cross-generation invalidation and never substitutes for a graph answer. Pinned rather than whole-file so any newly added filesystem primitive or subprocess in this module fails the guard",
+      "reason": "Daemon-reachability boundary: this module forwards MCP tool calls to the daemon, which is the graph authority. Every filesystem touch here is about reaching that authority, never about answering in its place — no tool result derives from any of them. Three classes, each pinned to its whole expression: (1) the loopback bearer token at <kin_dir>/daemon.token, read so the forwarded request can authenticate; (2) repo binding, walking up from the working directory for the .kin layout marker to locate that token, which precedes any graph consult because it decides which daemon to talk to; (3) revival, resolving and spawning the known kin-daemon executable via KIN_DAEMON_BIN, the current exe's directory, the cargo target dir, and PATH, a `which` equivalent open-coded to avoid the dependency. The head-generation marker is the daemon's own published counter and only keys a within-session memo; a missing marker reads as generation 0, which costs cross-generation invalidation and never substitutes for a graph answer. Pinned rather than whole-file so any newly added filesystem primitive or subprocess in this module fails the guard",
       "owner": "kin-mcp",
       "expiration": "2026-12-31",
       "allow_match": [
@@ -121,13 +121,16 @@
     },
     {
       "file": "crates/kin-notifier-macos/src/macos.rs",
-      "reason": "False positive: no filesystem access; std::process:: matches are an ExitCode import, a PID used for notification request uniqueness, and process exit",
+      "reason": "Notification identity boundary; answers no semantic query and never reads repository content. The std::process:: matches outside run_action are an ExitCode import, a PID used for notification request uniqueness, and process exit. run_action is function-pinned because it is the notification action boundary: a button press runs the managed kin with a fixed argument vector chosen inside this file and never supplied by the caller, after confirming that managed binary exists. It derives nothing from what it runs and cannot serve locate, search, context, trace, review, xref, or rename.",
       "owner": "kin-notify",
       "expiration": "2026-12-31",
       "allow_match": [
-        "use std::process::ExitCode;",
+        "use std::process::{Command, ExitCode};",
         "std::process::id()",
         "std::process::exit(0);"
+      ],
+      "allow_fn": [
+        "run_action"
       ]
     },
     {

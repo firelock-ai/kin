@@ -1022,6 +1022,36 @@ enum Command {
             value_name = "KIND=PID"
         )]
         runtime_sessions: Vec<String>,
+        /// Set how an available update should reach this machine and exit.
+        /// `prompt` (the default) notifies with the remedy attached and waits
+        /// to be told. `auto` and `manual` are recorded preferences whose
+        /// enforcement has not shipped: today every mode behaves as `prompt`,
+        /// and the recorded choice takes effect when the notifier honors it.
+        #[arg(
+            long,
+            value_enum,
+            value_name = "POLICY",
+            conflicts_with_all = [
+                "skip_verify",
+                "channel",
+                "expect_version",
+                "expect_sha",
+                "expect_archive_sha256",
+                "check_only",
+                "json",
+                "ack_restart",
+                "apply"
+            ]
+        )]
+        set_policy: Option<commands::update::UpdatePolicy>,
+        /// Bring this machine current in one gesture: install the release,
+        /// acknowledge the restart fence, and repair agent configs, in that
+        /// order. This is what the update notification's button runs.
+        #[arg(long, conflicts_with_all = ["check_only", "json", "ack_restart"])]
+        apply: bool,
+        /// With --apply: print the ordered steps and change nothing.
+        #[arg(long, requires = "apply")]
+        dry_run: bool,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -3223,6 +3253,9 @@ fn main() -> Result<()> {
                     json,
                     ack_restart,
                     runtime_sessions,
+                    set_policy,
+                    apply,
+                    dry_run,
                 } => {
                     commands::update::run(
                         skip_verify,
@@ -3234,6 +3267,9 @@ fn main() -> Result<()> {
                         json,
                         ack_restart,
                         runtime_sessions,
+                        set_policy,
+                        apply,
+                        dry_run,
                     )
                     .await
                 }

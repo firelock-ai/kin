@@ -28,22 +28,26 @@
 //! burn the bundle identity with nobody present to answer. Prompting is
 //! confined to `--request-authorization`, which waits indefinitely by default.
 
-use std::process::ExitCode;
+use std::path::PathBuf;
+use std::process::{Command, ExitCode};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use block2::RcBlock;
-use objc2::runtime::Bool;
-use objc2::MainThreadMarker;
+use block2::{DynBlock, RcBlock};
+use objc2::rc::Retained;
+use objc2::runtime::{Bool, ProtocolObject};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRunLoop};
-use objc2_foundation::{NSBundle, NSError, NSString};
+use objc2_foundation::{NSArray, NSBundle, NSError, NSObject, NSObjectProtocol, NSSet, NSString};
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent,
-    UNNotificationInterruptionLevel, UNNotificationRequest, UNNotificationSettings,
-    UNNotificationSound, UNUserNotificationCenter,
+    UNNotificationAction, UNNotificationActionOptions, UNNotificationCategory,
+    UNNotificationCategoryOptions, UNNotificationInterruptionLevel, UNNotificationRequest,
+    UNNotificationResponse, UNNotificationSettings, UNNotificationSound, UNUserNotificationCenter,
+    UNUserNotificationCenterDelegate,
 };
 
 const EXIT_USAGE: u8 = 2;
@@ -55,6 +59,171 @@ const EXIT_NOT_REQUESTED: u8 = 7;
 /// How long a post waits for its delivery callback. Bounded, because an
 /// unattended caller must not hang.
 const POST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a relaunch waits for the response that caused it. macOS launches
+/// this bundle to deliver a button press, so an ordinary run and a
+/// launched-to-handle-a-response run arrive with identical arguments, which is
+/// to say none. The wait is what tells them apart, and it is short because a
+/// person who ran the executable by hand is owed usage text rather than a hang.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The category a notification carrying the update button belongs to, and the
+/// button's own identifier. Both are stable strings: macOS matches a delivered
+/// response against the category registered at post time, so renaming either
+/// silently drops the button.
+const UPDATE_CATEGORY_ID: &str = "ai.kinlab.kin.update";
+const UPDATE_ACTION_ID: &str = "ai.kinlab.kin.update.apply";
+
+/// An action a notification can carry.
+///
+/// The mapping from an action to the command it runs lives here and nowhere
+/// else. A notification that could carry a caller-supplied command would let
+/// anything able to post one get that command executed by a button press, so
+/// callers choose among these names and never supply a command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// Bring this machine current: install, acknowledge the restart fence,
+    /// repair agent configs.
+    Update,
+}
+
+impl Action {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "update" => Some(Self::Update),
+            _ => None,
+        }
+    }
+
+    fn identifier(self) -> &'static str {
+        match self {
+            Self::Update => UPDATE_ACTION_ID,
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::Update => UPDATE_CATEGORY_ID,
+        }
+    }
+
+    /// The button's visible label.
+    fn title(self) -> &'static str {
+        match self {
+            Self::Update => "Update",
+        }
+    }
+
+    /// The fixed argument vector this action runs against the installed `kin`.
+    fn command(self) -> &'static [&'static str] {
+        match self {
+            Self::Update => &["update", "--apply"],
+        }
+    }
+
+    fn from_identifier(identifier: &str) -> Option<Self> {
+        (identifier == UPDATE_ACTION_ID).then_some(Self::Update)
+    }
+}
+
+/// The install root this bundle belongs to.
+///
+/// Derived from the executable's own path rather than from `$HOME`, because a
+/// relaunch by the notification system inherits almost no environment, and
+/// because a side-by-side or relocated install has to drive its own `kin`
+/// rather than whichever one a home directory happens to hold. The bundle
+/// installs at `$KIN_HOME/lib/KinNotifier.app/Contents/MacOS/KinNotifier`, so
+/// the root is five levels up.
+fn kin_home() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("KIN_HOME") {
+        return Some(PathBuf::from(explicit));
+    }
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().nth(5).map(|root| root.to_path_buf())
+}
+
+/// Run an action's fixed command against the installed `kin`.
+///
+/// The child is spawned rather than waited on. A button press must not keep an
+/// accessory app alive for the length of an update, and the chain reports its
+/// own outcome by notification when it finishes, so nothing is lost by exiting
+/// here.
+fn run_action(action: Action) -> Result<PathBuf, String> {
+    let home = kin_home().ok_or_else(|| "could not resolve the Kin install root".to_string())?;
+    let binary = home.join("bin").join("kin");
+    if !binary.is_file() {
+        return Err(format!("no installed kin at {}", binary.display()));
+    }
+    Command::new(&binary)
+        .args(action.command())
+        .spawn()
+        .map_err(|error| format!("could not run {}: {error}", binary.display()))?;
+    Ok(binary)
+}
+
+/// Register the category that carries an action's button.
+///
+/// This runs on both sides. At post time it is what makes the button appear; on
+/// a relaunch it is what lets the delivered response resolve to a category this
+/// process knows.
+fn register_action_category(center: &UNUserNotificationCenter, action: Action) {
+    let button = UNNotificationAction::actionWithIdentifier_title_options(
+        &NSString::from_str(action.identifier()),
+        &NSString::from_str(action.title()),
+        UNNotificationActionOptions::Foreground,
+    );
+    let actions = NSArray::from_slice(&[&*button]);
+    let intents: Retained<NSArray<NSString>> = NSArray::new();
+    let category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+        &NSString::from_str(action.category()),
+        &actions,
+        &intents,
+        UNNotificationCategoryOptions::empty(),
+    );
+    center.setNotificationCategories(&NSSet::from_slice(&[&*category]));
+}
+
+/// State the delegate hands back to the waiting run loop.
+struct ResponseState {
+    identifier: Arc<Mutex<Option<String>>>,
+    done: Arc<AtomicBool>,
+}
+
+define_class!(
+    // SAFETY: NSObject imposes no subclassing requirements, and this class
+    // implements no Drop.
+    #[unsafe(super(NSObject))]
+    #[name = "KinNotifierResponseDelegate"]
+    #[ivars = ResponseState]
+    struct ResponseDelegate;
+
+    unsafe impl NSObjectProtocol for ResponseDelegate {}
+
+    unsafe impl UNUserNotificationCenterDelegate for ResponseDelegate {
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        fn did_receive_response(
+            &self,
+            _center: &UNUserNotificationCenter,
+            response: &UNNotificationResponse,
+            completion: &DynBlock<dyn Fn()>,
+        ) {
+            if let Ok(mut slot) = self.ivars().identifier.lock() {
+                *slot = Some(response.actionIdentifier().to_string());
+            }
+            self.ivars().done.store(true, Ordering::SeqCst);
+            // The system holds the response open until this is called, so it is
+            // called before any work is dispatched rather than after.
+            completion.call(());
+        }
+    }
+);
+
+impl ResponseDelegate {
+    fn new(identifier: Arc<Mutex<Option<String>>>, done: Arc<AtomicBool>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(ResponseState { identifier, done });
+        unsafe { msg_send![super(this), init] }
+    }
+}
 
 const USAGE: &str = "\
 KinNotifier - Kin's macOS notification identity
@@ -71,6 +240,9 @@ OPTIONS:
                           urgent adds sound and a time-sensitive interruption
     --key <KEY>           Dedupe identity. Reposting the same key replaces the
                           existing notification rather than stacking a new one.
+    --action <NAME>       Attach an action button. Only `update` is defined; it
+                          runs `kin update --apply`. The command is fixed here,
+                          never supplied by the caller.
     --timeout <SECONDS>   Override the wait. Posting defaults to 10 seconds;
                           --request-authorization waits indefinitely, because a
                           prompt abandoned by a dying process is recorded as a
@@ -254,11 +426,19 @@ fn post(
     level: Level,
     key: Option<&str>,
     timeout: Option<Duration>,
+    action: Option<Action>,
 ) -> Result<(), String> {
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(title));
     content.setBody(&NSString::from_str(body));
     content.setInterruptionLevel(level.interruption());
+    if let Some(action) = action {
+        // The category has to be registered before the request is added, or the
+        // delivered notification resolves to a category the system does not
+        // know and arrives with no button at all.
+        register_action_category(center, action);
+        content.setCategoryIdentifier(&NSString::from_str(action.category()));
+    }
     if level.makes_sound() {
         content.setSound(Some(&UNNotificationSound::defaultSound()));
     }
@@ -326,6 +506,7 @@ struct Args {
     timeout: Option<Duration>,
     request_authorization: bool,
     status: bool,
+    action: Option<Action>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -337,6 +518,7 @@ fn parse_args() -> Result<Args, String> {
         timeout: None,
         request_authorization: false,
         status: false,
+        action: None,
     };
 
     let mut raw = std::env::args().skip(1);
@@ -365,6 +547,11 @@ fn parse_args() -> Result<Args, String> {
                 }
                 parsed.timeout = Some(Duration::from_secs_f64(seconds));
             }
+            "--action" => {
+                let value = raw.next().ok_or("--action needs a value")?;
+                parsed.action =
+                    Some(Action::parse(&value).ok_or(format!("unknown action: {value}"))?);
+            }
             "--request-authorization" => parsed.request_authorization = true,
             "--status" => parsed.status = true,
             "--help" | "-h" => {
@@ -375,6 +562,55 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     Ok(parsed)
+}
+
+/// Wait for the button press that caused this launch, and run it.
+///
+/// Exits usage when nothing arrives, because then this was not a relaunch at
+/// all: it was a person running the executable with no arguments, and the
+/// answer they are owed is the usage text. That makes the bounded wait the only
+/// thing separating the two cases, which is why it is short.
+fn handle_response(
+    identifier: &Arc<Mutex<Option<String>>>,
+    done: &Arc<AtomicBool>,
+    timeout: Option<Duration>,
+) -> ExitCode {
+    if !pump_until(done, Some(timeout.unwrap_or(RESPONSE_TIMEOUT))) {
+        eprintln!("KinNotifier: --title and --body are both required\n");
+        eprint!("{USAGE}");
+        return ExitCode::from(EXIT_USAGE);
+    }
+
+    let received = match identifier.lock() {
+        Ok(slot) => slot.clone(),
+        Err(_) => None,
+    };
+    let Some(received) = received else {
+        eprintln!("KinNotifier: a notification response arrived carrying no action");
+        return ExitCode::from(EXIT_UNDELIVERED);
+    };
+
+    // Tapping the notification body rather than the button delivers the default
+    // action. That is a request to look at Kin, not a request to change this
+    // machine, so it runs nothing.
+    let Some(action) = Action::from_identifier(&received) else {
+        return ExitCode::SUCCESS;
+    };
+
+    match run_action(action) {
+        Ok(binary) => {
+            println!(
+                "KinNotifier: running {} {}",
+                binary.display(),
+                action.command().join(" ")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("KinNotifier: could not run the update action: {message}");
+            ExitCode::from(EXIT_UNDELIVERED)
+        }
+    }
 }
 
 pub fn run() -> ExitCode {
@@ -398,12 +634,35 @@ pub fn run() -> ExitCode {
         return ExitCode::from(EXIT_NO_BUNDLE);
     };
 
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+
+    // A relaunch to deliver a button press arrives with no arguments, which is
+    // also what a person typing the executable's name by hand supplies. The
+    // delegate is installed before the launch sequence completes because that
+    // is the only window in which the system will hand over a pending
+    // response; deciding later would mean deciding after the response was
+    // already dropped.
+    let handling_response =
+        args.title.is_none() && args.body.is_none() && !args.status && !args.request_authorization;
+    let response_identifier = Arc::new(Mutex::new(None));
+    let response_done = Arc::new(AtomicBool::new(false));
+    let delegate = handling_response.then(|| {
+        let delegate =
+            ResponseDelegate::new(Arc::clone(&response_identifier), Arc::clone(&response_done));
+        center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        register_action_category(&center, Action::Update);
+        delegate
+    });
+
     if establish_app_context().is_none() {
         eprintln!("KinNotifier: could not establish an application context");
         return ExitCode::from(EXIT_NO_BUNDLE);
     }
 
-    let center = UNUserNotificationCenter::currentNotificationCenter();
+    if handling_response {
+        let _delegate = delegate;
+        return handle_response(&response_identifier, &response_done, args.timeout);
+    }
 
     if args.status {
         let status = authorization_status(&center, Some(args.timeout.unwrap_or(POST_TIMEOUT)))
@@ -459,6 +718,7 @@ pub fn run() -> ExitCode {
         args.level,
         args.key.as_deref(),
         args.timeout,
+        args.action,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {

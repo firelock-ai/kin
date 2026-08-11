@@ -250,11 +250,195 @@ fn channel_name(channel: Channel) -> &'static str {
     }
 }
 
+/// How an available update is allowed to reach this machine.
+///
+/// Updating is not a background detail here. Kin's binaries sit under live
+/// agent sessions, daemons part-way through embedding, MCP servers bound into
+/// running CLIs, and VFS shims mapped into other processes. Swapping bytes out
+/// from under all of that without being asked is the mechanism that produces
+/// the stale-runtime drift the watchdog then reports, so the default is to ask.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdatePolicy {
+    /// Install unattended, but only when the machine is provably idle. The
+    /// default is not this: a silent swap under live sessions is exactly the
+    /// failure this policy exists to bound.
+    Auto,
+    /// Notify with the remedy attached and install when the person says so.
+    #[default]
+    Prompt,
+    /// Never notify about an available update. Checks still run.
+    Manual,
+}
+
+fn policy_name(policy: UpdatePolicy) -> &'static str {
+    match policy {
+        UpdatePolicy::Auto => "auto",
+        UpdatePolicy::Prompt => "prompt",
+        UpdatePolicy::Manual => "manual",
+    }
+}
+
+/// What the machine is doing, as far as the updater could actually tell.
+///
+/// `readable` is the field that matters. Every other flag is only meaningful
+/// once the probe that produced it is known to have run, and a probe that could
+/// not answer is not evidence of an idle machine. Collapsing an unreadable
+/// signal into `false` is how an unattended install lands mid-session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MachineActivity {
+    /// A managed daemon, MCP server, or VFS process is alive.
+    pub managed_runtimes_active: bool,
+    /// An agent or user session is open against the daemon.
+    pub external_sessions: bool,
+    /// A store holds work part-way done, such as pending embeddings.
+    pub work_in_flight: bool,
+    /// Whether the probes above actually answered.
+    pub readable: bool,
+}
+
+/// What an unattended check decided to do about an available update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutoDecision {
+    /// Install now, unattended.
+    Proceed,
+    /// Do not install unattended; notify and let the person choose.
+    Prompt(&'static str),
+    /// Say nothing. The person asked not to be told.
+    Silent(&'static str),
+}
+
+impl AutoDecision {
+    /// The reason a machine was not updated unattended, for the log and the
+    /// notification body. `Proceed` has no reason to give.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Proceed => None,
+            Self::Prompt(reason) | Self::Silent(reason) => Some(reason),
+        }
+    }
+}
+
+/// Decide how an available update reaches the machine. Pure, so the rule can be
+/// tested without a daemon, a network, or an install root.
+///
+/// Auto never proceeds on a machine it could not read. That asymmetry is the
+/// whole point: refusing to install when the answer is unknown costs a person
+/// one button press, and installing on an unknown answer costs whatever the
+/// running session was doing.
+pub fn decide_auto_update(policy: UpdatePolicy, activity: MachineActivity) -> AutoDecision {
+    match policy {
+        UpdatePolicy::Manual => AutoDecision::Silent("update policy is manual"),
+        UpdatePolicy::Prompt => AutoDecision::Prompt("update policy is prompt"),
+        UpdatePolicy::Auto => {
+            if !activity.readable {
+                AutoDecision::Prompt("could not read whether this machine was busy")
+            } else if activity.external_sessions {
+                AutoDecision::Prompt("an agent or user session is open")
+            } else if activity.managed_runtimes_active {
+                AutoDecision::Prompt("a managed Kin process is still running")
+            } else if activity.work_in_flight {
+                AutoDecision::Prompt("a store is part-way through indexing")
+            } else {
+                AutoDecision::Proceed
+            }
+        }
+    }
+}
+
+/// One step of the chain that brings a drifted machine current.
+///
+/// The chain exists because the drift a person is shown is not the work. Seven
+/// reported rows routinely reduce to these steps, and asking someone to run
+/// three commands in the right order, from the right binary, is how a machine
+/// stays half-updated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainStep {
+    /// Download, verify, and install the release.
+    Install,
+    /// Acknowledge the restart fence. This one cannot run in the process that
+    /// started the chain: the fence validates the acknowledging binary's own
+    /// version and build sha against the marker, so the old binary can never
+    /// satisfy it. The chain re-invokes the freshly installed `kin` for it.
+    AcknowledgeRestart,
+    /// Repair agent MCP configs and the rest of `kin setup doctor --fix`.
+    RepairConfigs,
+}
+
+impl ChainStep {
+    /// The full chain, in the only order that works.
+    pub const ORDER: [Self; 3] = [Self::Install, Self::AcknowledgeRestart, Self::RepairConfigs];
+
+    /// What this step will do, for `--dry-run` and for the report afterwards.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Install => "install the release",
+            Self::AcknowledgeRestart => "acknowledge the restart fence",
+            Self::RepairConfigs => "repair agent configs",
+        }
+    }
+
+    /// The command a person would otherwise have typed. Printed by `--dry-run`
+    /// so the gesture is never a black box, and so the chain stays auditable
+    /// against what it claims to be a shortcut for.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Install => "kin update",
+            Self::AcknowledgeRestart => "kin update --ack-restart",
+            Self::RepairConfigs => "kin setup doctor --fix",
+        }
+    }
+
+    /// Whether the step must run from the newly installed binary rather than
+    /// from the process that began the chain.
+    pub fn needs_installed_binary(self) -> bool {
+        matches!(self, Self::AcknowledgeRestart | Self::RepairConfigs)
+    }
+}
+
+/// The chain a machine actually needs, given what the check found.
+///
+/// A machine with no available update and no pending fence still has a chain
+/// when its configs drifted, and running the install step there would download
+/// a release it already has. Selecting the steps from the observed state is
+/// what keeps one gesture honest across all of those cases.
+pub fn chain_plan(
+    update_available: bool,
+    restart_ack_required: bool,
+    configs_drifted: bool,
+) -> Vec<ChainStep> {
+    let mut plan = Vec::new();
+    if update_available {
+        plan.push(ChainStep::Install);
+    }
+    // An install writes the fence, so the acknowledgement belongs to the plan
+    // whenever the install is in it, not only when a fence is already pending.
+    if update_available || restart_ack_required {
+        plan.push(ChainStep::AcknowledgeRestart);
+    }
+    if update_available || configs_drifted {
+        plan.push(ChainStep::RepairConfigs);
+    }
+    plan
+}
+
 /// Persisted update preferences, stored at `~/.kin/update.toml`.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct UpdateConfig {
     #[serde(default)]
     channel: Channel,
+    #[serde(default)]
+    policy: UpdatePolicy,
 }
 
 impl UpdateConfig {
@@ -312,11 +496,21 @@ fn resolve_channel_locked(
     persist: bool,
     lock: Option<&InstallRootLock>,
 ) -> Channel {
-    let stored = UpdateConfig::load_from(kin_home).channel;
+    let config = UpdateConfig::load_from(kin_home);
+    let stored = config.channel;
     if let Some(requested) = flag {
         if persist && requested != stored {
+            // The whole file is rewritten, so every field it already carried is
+            // read back and passed through. Constructing a fresh config here
+            // would silently reset the update policy every time a channel
+            // changed, which is the one preference that must never move on its
+            // own.
+            let updated = UpdateConfig {
+                channel: requested,
+                policy: config.policy,
+            };
             // Persisting is best-effort: a write failure must not block the update.
-            match (UpdateConfig { channel: requested }).save_to(kin_home, lock) {
+            match updated.save_to(kin_home, lock) {
                 Ok(()) if !quiet => {
                     println!("Saved default update channel: {}", channel_name(requested))
                 }
@@ -334,6 +528,62 @@ fn resolve_channel_locked(
 /// Pure channel-precedence rule (flag over stored default), split out for tests.
 fn effective_channel(flag: Option<Channel>, stored: Channel) -> Channel {
     flag.unwrap_or(stored)
+}
+
+/// Persist how updates are allowed to reach this machine.
+///
+/// This is the one preference that decides whether bytes move without being
+/// asked, so it is only ever set by an explicit request. Nothing else in the
+/// updater writes it, and the channel path reads it back and passes it through
+/// rather than reconstructing the file.
+fn set_update_policy(policy: UpdatePolicy) -> Result<()> {
+    let requested_home = crate::commands::setup::kin_dir()?;
+    let lock = InstallRootLock::acquire_existing(&requested_home)?;
+    let stored = UpdateConfig::load_from(lock.root());
+    if stored.policy == policy {
+        println!("Update policy is already {}.", policy_name(policy));
+        return Ok(());
+    }
+    UpdateConfig {
+        channel: stored.channel,
+        policy,
+    }
+    .save_to(lock.root(), Some(&lock))
+    .context("failed to persist the update policy")?;
+    println!(
+        "Update policy: {} (was {}).",
+        policy_name(policy),
+        policy_name(stored.policy)
+    );
+    if policy != UpdatePolicy::Prompt {
+        println!(
+            "Recorded, not yet enforced: every mode behaves as prompt today. The recorded \
+             choice takes effect when the notifier honors it; unattended installs will run \
+             only when no agent session, managed Kin process, or part-way indexing job is \
+             detected, and Kin asks instead when that cannot be determined."
+        );
+    }
+    Ok(())
+}
+
+/// Print the ordered chain without running any of it.
+///
+/// The gesture a person triggers from a notification has to be inspectable
+/// before they trigger it, and afterwards has to be checkable against what it
+/// claimed it would do.
+fn print_chain_plan(plan: &[ChainStep]) {
+    if plan.is_empty() {
+        println!("Nothing to apply: this machine is already current.");
+        return;
+    }
+    println!("kin update --apply would run {} step(s):", plan.len());
+    for (index, step) in plan.iter().enumerate() {
+        println!("  {}. {} ({})", index + 1, step.describe(), step.command());
+    }
+    println!(
+        "Steps after the install run from the newly installed binary, because the restart fence \
+         validates the acknowledging binary's own identity."
+    );
 }
 
 fn ensure_pinned_channel_unchanged(preflight: Channel, locked: Channel) -> Result<()> {
@@ -514,6 +764,10 @@ struct UpdateCheck<'a> {
     release_tag: &'a str,
     release_commit_sha: &'a str,
     channel: &'a str,
+    /// How an available update is allowed to reach this machine. The watchdog
+    /// reads it here rather than parsing `update.toml`, so the policy has one
+    /// definition and one reader instead of two encodings that drift.
+    update_policy: &'a str,
     update_available: bool,
     platform_asset: &'a str,
     platform_archive_sha256: &'a str,
@@ -521,6 +775,16 @@ struct UpdateCheck<'a> {
     mcp_repair_pending: bool,
 }
 
+/// `kin update`, plus the two gestures built on top of it: setting the policy,
+/// and applying the whole remedy chain at once.
+///
+/// The chain's later steps deliberately run as fresh processes rather than as
+/// more code in this one. The restart fence validates the acknowledging
+/// binary's own version and build sha against the marker the install wrote, so
+/// the process that performed the install can never satisfy it. Re-invoking the
+/// installed binary is not a convenience here, it is the only ordering the
+/// fence accepts.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     skip_verify: bool,
     channel_flag: Option<Channel>,
@@ -531,7 +795,61 @@ pub async fn run(
     json: bool,
     ack_restart: bool,
     runtime_sessions: Vec<String>,
+    set_policy: Option<UpdatePolicy>,
+    apply: bool,
+    dry_run: bool,
 ) -> Result<()> {
+    // Setting the policy is a preference write and nothing else. It runs before
+    // any expectation parsing, network client, or install-root inspection so
+    // that changing how updates arrive never depends on one being available.
+    if let Some(policy) = set_policy {
+        return set_update_policy(policy);
+    }
+    if dry_run && !apply {
+        anyhow::bail!("--dry-run describes what --apply would do; pass both or neither");
+    }
+
+    run_update_flow(
+        skip_verify,
+        channel_flag,
+        expect_version,
+        expect_sha,
+        expect_archive_sha256,
+        check_only,
+        json,
+        ack_restart,
+        runtime_sessions,
+        apply,
+        dry_run,
+    )
+    .await?;
+
+    if apply && !dry_run {
+        return run_chain_tail();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_update_flow(
+    skip_verify: bool,
+    channel_flag: Option<Channel>,
+    expect_version: Option<Version>,
+    expect_sha: Option<String>,
+    expect_archive_sha256: Option<String>,
+    check_only: bool,
+    json: bool,
+    ack_restart: bool,
+    runtime_sessions: Vec<String>,
+    apply: bool,
+    dry_run: bool,
+) -> Result<()> {
+    // A dry run of the chain is a read. Forcing the check-only path is what
+    // makes that a property of the code rather than a promise in the help text:
+    // every mutation below is already gated on `!check_only`.
+    let plan_only = apply && dry_run;
+    let check_only = check_only || plan_only;
+
     let expectation =
         ReleaseExpectation::from_options(expect_version, expect_sha, expect_archive_sha256)?;
     if ack_restart && expectation.is_some() {
@@ -662,17 +980,12 @@ pub async fn run(
         let restart_ack_required = restart_pending_path(&kin_home).exists();
         if !update_available {
             println!("Already up to date (v{CURRENT_VERSION}).");
-            if restart_ack_required {
-                println!(
-                    "Runtime restart acknowledgement remains required: {}",
-                    restart_pending_path(&kin_home).display()
-                );
-            }
-            if mcp_repair_pending_path(&kin_home).exists() {
-                println!(
-                    "MCP launcher repair remains pending: {}",
-                    mcp_repair_pending_path(&kin_home).display()
-                );
+            // Current bytes with open markers is the exact state the update
+            // notification names bare `kin update` for, so bare `kin update`
+            // finishes the chain here instead of printing marker paths and
+            // leaving the named remedy a no-op.
+            if restart_ack_required || mcp_repair_pending_path(&kin_home).exists() {
+                return run_chain_tail();
             }
             return Ok(());
         }
@@ -747,6 +1060,15 @@ pub async fn run(
     let restart_ack_required = restart_pending_path(&kin_home).exists();
     let mcp_repair_pending = mcp_repair_pending_path(&kin_home).exists();
 
+    if plan_only {
+        print_chain_plan(&chain_plan(
+            update_available,
+            restart_ack_required,
+            mcp_repair_pending,
+        ));
+        return Ok(());
+    }
+
     if check_only {
         let check = UpdateCheck {
             schema: UPDATE_CHECK_SCHEMA,
@@ -755,6 +1077,7 @@ pub async fn run(
             release_tag: &release.tag_name,
             release_commit_sha: &release_commit_sha,
             channel: channel_name(channel),
+            update_policy: policy_name(UpdateConfig::load_from(&kin_home).policy),
             update_available,
             platform_asset: &asset.name,
             platform_archive_sha256: check_archive_sha256
@@ -787,17 +1110,12 @@ pub async fn run(
 
     if !update_available {
         println!("Already up to date (v{CURRENT_VERSION}).");
-        if restart_ack_required {
-            println!(
-                "Runtime restart acknowledgement remains required: {}",
-                restart_pending_path(&kin_home).display()
-            );
-        }
-        if mcp_repair_pending_path(&kin_home).exists() {
-            println!(
-                "MCP launcher repair remains pending: {}",
-                mcp_repair_pending_path(&kin_home).display()
-            );
+        // Same contract as the pinned arm: open markers mean the one-gesture
+        // promise is still unfinished, and bare `kin update` is the command
+        // the notification teaches, so it finishes the chain rather than
+        // naming paths.
+        if restart_ack_required || mcp_repair_pending_path(&kin_home).exists() {
+            return run_chain_tail();
         }
         return Ok(());
     }
@@ -875,6 +1193,128 @@ pub async fn run(
         &pending_record,
     )?;
     report_successful_install(lock, &kin_home, &latest, outcome)
+}
+
+/// The managed `kin` the chain re-invokes. Deliberately the installed path
+/// rather than `current_exe`: after an install those are different bytes, and
+/// the whole reason the tail exists is to run as the new ones.
+fn installed_kin_binary(kin_home: &Path) -> PathBuf {
+    let name = if cfg!(windows) { "kin.exe" } else { "kin" };
+    kin_home.join("bin").join(name)
+}
+
+fn run_chain_step(binary: &Path, step: ChainStep, args: &[&str]) -> Result<()> {
+    println!("Applying: {} ({}).", step.describe(), step.command());
+    let status = std::process::Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run `{}`", step.command()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "`{}` exited with {}. The chain stopped here, and the steps after it did not run",
+            step.command(),
+            status
+        );
+    }
+    Ok(())
+}
+
+/// Finish the chain after the install, as the newly installed binary.
+///
+/// Only the acknowledgement is conditional, because the fence refuses outright
+/// when no marker is pending, and that refusal would otherwise read as a failed
+/// chain rather than as a step with nothing to do. The config repair is
+/// idempotent and always runs, so `--apply` converges a machine whose bytes
+/// were already current but whose agent configs had drifted.
+fn run_chain_tail() -> Result<()> {
+    let kin_home = crate::commands::setup::kin_dir()?;
+    let binary = installed_kin_binary(&kin_home);
+    if !binary.is_file() {
+        anyhow::bail!(
+            "the update chain cannot continue: no installed kin at {}",
+            binary.display()
+        );
+    }
+
+    // Read the fence record before the acknowledgement consumes it: this
+    // process is still the pre-install binary, so the record is the only
+    // truthful source for what the chain installed.
+    let installed = pending_install_identity(&kin_home);
+    if restart_pending_path(&kin_home).exists() {
+        run_chain_step(
+            &binary,
+            ChainStep::AcknowledgeRestart,
+            &["update", "--ack-restart"],
+        )?;
+    } else {
+        println!("No restart fence is pending, so there is nothing to acknowledge.");
+    }
+
+    run_chain_step(
+        &binary,
+        ChainStep::RepairConfigs,
+        &["setup", "doctor", "--fix"],
+    )?;
+    report_chain_outcome(&kin_home, installed);
+    Ok(())
+}
+
+/// What the pending fence says was installed, if a fence is pending.
+///
+/// Absence and unreadability both read as None: the outcome message then
+/// falls back to the running binary's own identity, which is exactly right
+/// when nothing was installed, and merely less specific when the marker
+/// could not be read.
+fn pending_install_identity(kin_home: &Path) -> Option<(String, String)> {
+    let bytes = std::fs::read(restart_pending_path(kin_home)).ok()?;
+    let record: RestartPending = serde_json::from_slice(&bytes).ok()?;
+    Some((record.installed_version, record.kin_commit))
+}
+
+/// The outcome sentence, split from delivery so its truth is testable.
+///
+/// A chain that installed something reports the transition it made, from the
+/// version this process was compiled as to the version the fence recorded.
+/// A chain that only converged markers reports the one version the machine
+/// runs, which the running binary's constants state correctly in that case.
+fn compose_chain_outcome_body(installed: Option<(&str, &str)>) -> String {
+    match installed {
+        Some((version, commit)) => format!(
+            "Updated v{} to v{} ({}); the restart fence is acknowledged and agent configs are repaired.",
+            CURRENT_VERSION,
+            version,
+            &commit[..commit.len().min(12)]
+        ),
+        None => {
+            let build = kin_buildinfo::get();
+            format!(
+                "This machine is current at v{} ({}).",
+                CURRENT_VERSION,
+                &build.sha[..build.sha.len().min(12)]
+            )
+        }
+    }
+}
+
+/// Say what the chain landed on, after it has landed.
+///
+/// The notification this replaces announced a task list before any work
+/// happened. This one reports the version and build the machine is actually
+/// running, which is the only form of the message a reader can check. Delivery
+/// is best-effort on purpose: the chain already succeeded by the time this
+/// runs, and a notification that could not be posted must not turn a finished
+/// update into a failed command.
+fn report_chain_outcome(kin_home: &Path, installed: Option<(String, String)>) {
+    let body = compose_chain_outcome_body(
+        installed
+            .as_ref()
+            .map(|(version, commit)| (version.as_str(), commit.as_str())),
+    );
+    println!("{body}");
+    let notification = kin_notify::Notification::new("Kin update", body, kin_notify::Level::Info)
+        .with_key("install-drift");
+    let _ = kin_notify::Notifier::with_home(kin_home.to_path_buf())
+        .send(&notification, kin_notify::Suppression::None);
 }
 
 fn registry_authority_preflight() -> Result<()> {
@@ -11603,6 +12043,39 @@ mod tests {
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
 
+    /// A chain that installed something must report the transition, not the
+    /// pre-install binary's own constants: the tail runs in the old process,
+    /// so its compile-time version is exactly the wrong single answer after
+    /// an install.
+    #[test]
+    fn chain_outcome_reports_the_transition_when_an_install_happened() {
+        let body = compose_chain_outcome_body(Some(("9.9.9", "abcdef1234567890deadbeef")));
+        assert!(
+            body.contains(&format!("Updated v{CURRENT_VERSION} to v9.9.9")),
+            "the transition names old and new: {body}"
+        );
+        assert!(
+            body.contains("(abcdef123456)"),
+            "the sha is the fence record's, truncated to twelve: {body}"
+        );
+        assert!(
+            !body.contains("current at"),
+            "an install outcome must not claim a single current version: {body}"
+        );
+    }
+
+    /// A markers-only chain installed nothing, so the running binary's own
+    /// identity is the truthful report.
+    #[test]
+    fn chain_outcome_reports_the_running_identity_when_nothing_installed() {
+        let body = compose_chain_outcome_body(None);
+        assert!(
+            body.contains(&format!("current at v{CURRENT_VERSION}")),
+            "the no-install outcome names the running version: {body}"
+        );
+        assert!(!body.contains("Updated"), "nothing was installed: {body}");
+    }
+
     #[cfg(windows)]
     const WINDOWS_INSTALL_AUTHORITY_CHILD_MODE: &str =
         "KIN_INTERNAL_TEST_INSTALL_AUTHORITY_CHILD_MODE";
@@ -15359,9 +15832,22 @@ cwd = {:?}
         let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
         let _registry = EnvVarGuard::set("KIN_REGISTRY_PATH", &registry);
 
-        let error = run(false, None, None, None, None, true, true, false, Vec::new())
-            .await
-            .expect_err("check-only must report, not recover, a stale transaction");
+        let error = run(
+            false,
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+            false,
+            Vec::new(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("check-only must report, not recover, a stale transaction");
         assert!(format!("{error:#}").contains("did not modify any file"));
         assert_eq!(
             fs::read(&sentinel).unwrap(),
@@ -16825,6 +17311,7 @@ cwd = {:?}
             release_tag: "v0.2.22",
             release_commit_sha: "0123456789abcdef0123456789abcdef01234567",
             channel: "stable",
+            update_policy: "prompt",
             update_available: true,
             platform_asset: "kin-macos-aarch64.tar.gz",
             platform_archive_sha256:
@@ -16851,7 +17338,14 @@ cwd = {:?}
         );
         assert_eq!(value["restart_ack_required"], false);
         assert_eq!(value["mcp_repair_pending"], false);
-        assert_eq!(value.as_object().unwrap().len(), 11);
+        // The watchdog reads the policy here rather than parsing update.toml,
+        // so it is part of the contract and not an incidental field.
+        assert_eq!(value["update_policy"], "prompt");
+        // The schema stays v1 because this addition is purely additive: no
+        // field was removed and none changed meaning, so every existing reader
+        // keeps working. The count is what makes that claim checkable, and it
+        // is why adding a field has to be a deliberate edit here.
+        assert_eq!(value.as_object().unwrap().len(), 12);
     }
 
     #[test]
@@ -18029,13 +18523,176 @@ cwd = {:?}
         assert!(message.contains("stable -> alpha"));
     }
 
+    /// A machine with nothing running and every probe answering.
+    fn idle_machine() -> MachineActivity {
+        MachineActivity {
+            managed_runtimes_active: false,
+            external_sessions: false,
+            work_in_flight: false,
+            readable: true,
+        }
+    }
+
+    #[test]
+    fn the_default_policy_asks_before_swapping_bytes() {
+        // The default decides what happens on every install that never sets a
+        // policy, which is all of them. Kin's binaries sit under live agent
+        // sessions and mapped VFS shims, so the default has to be the one that
+        // does not move them without being asked.
+        assert_eq!(UpdatePolicy::default(), UpdatePolicy::Prompt);
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::default(), idle_machine()),
+            AutoDecision::Prompt("update policy is prompt"),
+            "an idle machine on the default policy must still ask"
+        );
+    }
+
+    #[test]
+    fn auto_installs_only_on_a_provably_idle_machine() {
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::Auto, idle_machine()),
+            AutoDecision::Proceed
+        );
+
+        for (activity, expected) in [
+            (
+                MachineActivity {
+                    external_sessions: true,
+                    ..idle_machine()
+                },
+                "an agent or user session is open",
+            ),
+            (
+                MachineActivity {
+                    managed_runtimes_active: true,
+                    ..idle_machine()
+                },
+                "a managed Kin process is still running",
+            ),
+            (
+                MachineActivity {
+                    work_in_flight: true,
+                    ..idle_machine()
+                },
+                "a store is part-way through indexing",
+            ),
+        ] {
+            assert_eq!(
+                decide_auto_update(UpdatePolicy::Auto, activity),
+                AutoDecision::Prompt(expected),
+                "a busy machine must fall back to asking"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_machine_is_never_treated_as_an_idle_one() {
+        // The failure this exists to prevent: a probe that could not answer
+        // being folded into "nothing is running" and an install landing
+        // mid-session. Unknown and idle are different answers, and only one of
+        // them may proceed.
+        let unknown = MachineActivity {
+            readable: false,
+            ..idle_machine()
+        };
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::Auto, unknown),
+            AutoDecision::Prompt("could not read whether this machine was busy")
+        );
+        // The control: the same struct with the probe answering does proceed,
+        // so this test can distinguish the two rather than passing either way.
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::Auto, idle_machine()),
+            AutoDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn manual_stays_quiet_and_prompt_speaks_up() {
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::Manual, idle_machine()),
+            AutoDecision::Silent("update policy is manual")
+        );
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::Prompt, idle_machine()),
+            AutoDecision::Prompt("update policy is prompt")
+        );
+        // Every non-proceeding decision carries a reason a notification or log
+        // can print. A refusal nobody can attribute is the unreadable alarm
+        // this whole surface was built to stop shipping.
+        assert!(AutoDecision::Proceed.reason().is_none());
+        for policy in [UpdatePolicy::Manual, UpdatePolicy::Prompt] {
+            assert!(
+                decide_auto_update(policy, idle_machine())
+                    .reason()
+                    .is_some(),
+                "{policy:?} must say why it did not install"
+            );
+        }
+        assert!(decide_auto_update(
+            UpdatePolicy::Auto,
+            MachineActivity {
+                readable: false,
+                ..idle_machine()
+            }
+        )
+        .reason()
+        .is_some());
+    }
+
+    #[test]
+    fn the_chain_runs_the_install_before_anything_that_depends_on_it() {
+        assert_eq!(
+            chain_plan(true, false, false),
+            vec![
+                ChainStep::Install,
+                ChainStep::AcknowledgeRestart,
+                ChainStep::RepairConfigs
+            ],
+            "an install writes the fence, so its acknowledgement belongs to the same plan"
+        );
+        assert_eq!(
+            chain_plan(false, true, false),
+            vec![ChainStep::AcknowledgeRestart],
+            "a pending fence is its own chain; nothing needs downloading"
+        );
+        assert_eq!(
+            chain_plan(false, false, true),
+            vec![ChainStep::RepairConfigs],
+            "drifted configs on a current machine must not trigger a download"
+        );
+        assert!(
+            chain_plan(false, false, false).is_empty(),
+            "a current machine has no chain to run"
+        );
+        assert_eq!(ChainStep::ORDER.len(), 3);
+    }
+
+    #[test]
+    fn the_steps_after_the_install_run_as_the_installed_binary() {
+        // The restart fence validates the acknowledging binary's own version
+        // and build sha against the marker the install wrote, so the process
+        // that performed the install can never satisfy it. This is an ordering
+        // constraint, not a preference.
+        assert!(!ChainStep::Install.needs_installed_binary());
+        assert!(ChainStep::AcknowledgeRestart.needs_installed_binary());
+        assert!(ChainStep::RepairConfigs.needs_installed_binary());
+        assert_eq!(
+            ChainStep::AcknowledgeRestart.command(),
+            "kin update --ack-restart"
+        );
+        assert_eq!(ChainStep::RepairConfigs.command(), "kin setup doctor --fix");
+    }
+
     #[test]
     fn update_config_toml_roundtrip() {
         let text = toml::to_string_pretty(&UpdateConfig {
             channel: Channel::Alpha,
+            policy: UpdatePolicy::Auto,
         })
         .unwrap();
         assert!(text.contains("channel = \"alpha\""));
+        assert!(text.contains("policy = \"auto\""));
 
         let parsed: UpdateConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.channel, Channel::Alpha);
@@ -18043,6 +18700,10 @@ cwd = {:?}
         // A missing/empty config deserializes to the stable default.
         let empty: UpdateConfig = toml::from_str("").unwrap();
         assert_eq!(empty.channel, Channel::Stable);
+        // Every install that predates the policy has a config carrying only a
+        // channel, and each one must read as prompt rather than as auto.
+        let channel_only: UpdateConfig = toml::from_str("channel = \"alpha\"").unwrap();
+        assert_eq!(channel_only.policy, UpdatePolicy::Prompt);
     }
 
     #[test]
