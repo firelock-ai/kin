@@ -2647,14 +2647,14 @@ mod tests {
     /// perfectly good install.
     #[test]
     fn a_never_configured_shell_leaves_the_summary_without_failures() {
-        let report = HealthReport {
-            platform: "test".to_string(),
-            checks: vec![
+        let report = assemble_health_report(
+            "test".to_string(),
+            vec![
                 check_with("kin_binary", HealthStatus::Healthy),
                 check_with("kin_daemon_binary", HealthStatus::Healthy),
                 shell_path_check_from(shell_state(false, false)),
             ],
-        };
+        );
         let summary = report.summary();
         assert_eq!(
             summary.attention, 0,
@@ -2662,7 +2662,23 @@ mod tests {
         );
         assert_eq!(summary.passed, 2);
         assert_eq!(summary.skipped, 1);
-        assert!(!report.checks.iter().any(|check| is_failing(&check.status)));
+        assert!(
+            report.healthy,
+            "the footer must close green on an install whose only unconfigured surface is one setup was told not to touch"
+        );
+
+        // Falsification: the same machine with a hook setup recorded and now
+        // gone must still close red.
+        let regressed = assemble_health_report(
+            "test".to_string(),
+            vec![
+                check_with("kin_binary", HealthStatus::Healthy),
+                check_with("kin_daemon_binary", HealthStatus::Healthy),
+                shell_path_check_from(shell_state(false, true)),
+            ],
+        );
+        assert_eq!(regressed.summary().attention, 1);
+        assert!(!regressed.healthy);
     }
 
     #[cfg(feature = "vector")]
