@@ -1950,6 +1950,23 @@ fn semantic_query_health_from_runtime(
         );
     }
 
+    // A backlog is only work in progress if something is going to consume it.
+    // On a store whose graph authority is a remote storage backend there is no
+    // durable local vector-sidecar contract, the embedding worker never starts
+    // and `/embed` refuses, so this coverage is not filling and never will be.
+    // Reporting that as pending promises an outcome the host cannot deliver.
+    if runtime.embed_persistence_unavailable {
+        return HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Unsupported,
+            format!(
+                "{detail}; this store's graph authority is a remote storage backend, which \
+                 carries no durable local vector-sidecar contract, so nothing will embed here"
+            ),
+        );
+    }
+
     // Incomplete coverage reads identically whether this is a first run or a
     // repository whose finished index was thrown away at open. Only one of them
     // means work already paid for is being paid for again, so when the daemon
@@ -1959,10 +1976,22 @@ fn semantic_query_health_from_runtime(
         // store has ever finished a fill. Before it has, partial coverage is a
         // correct fresh install doing exactly what it should in its first
         // minutes, and gating readiness on it fails every new user for
-        // succeeding. After it has, the same counters mean a surface that was
-        // ready is not ready now, which is what the gate exists for.
+        // succeeding.
+        //
+        // After it has, this is a top-up rather than lost ground. A working
+        // copy admits new files as they are written and an edit invalidates
+        // the embeddings it touched, so on any repository somebody is actually
+        // working in, coverage goes partial again constantly and comes back on
+        // its own. The surface is serving off a fill that completed, so it is
+        // ready; the backlog is named here rather than held against it. The
+        // states that do mean lost ground keep their own arms above, keyed on
+        // the cause: a discarded index is Stale and a failed worker is Missing,
+        // and neither is inferred from counters that grew.
         let (status, detail) = if runtime.embedding_coverage_ever_complete {
-            (HealthStatus::Stale, detail)
+            (
+                HealthStatus::Healthy,
+                format!("{detail}; coverage completed earlier and this backlog is filling"),
+            )
         } else {
             (
                 HealthStatus::Pending,
@@ -3126,30 +3155,148 @@ mod tests {
     #[cfg(feature = "vector")]
     #[test]
     fn semantic_query_readiness_reports_daemon_graph_backlog_and_failure() {
-        // A store that has finished a fill before: this backlog is coverage it
-        // already held and no longer has, so it keeps the authority gate. The
-        // same counters on a store still working through its first pass are
-        // covered by `a_first_fill_in_progress_does_not_block_readiness`.
-        let pending = crate::commands::resources::EmbedRuntimeState {
+        // A store that has finished a fill before, now carrying a backlog. On
+        // a working copy that is being written to this is the ordinary state,
+        // not lost ground: files are admitted as they are written and an edit
+        // invalidates the embeddings it touched. The surface is serving off a
+        // fill that completed, so it is ready and the backlog is named rather
+        // than held against it. Lost ground keeps its own arms below, keyed on
+        // the cause instead of on counters that grew.
+        let topping_up = crate::commands::resources::EmbedRuntimeState {
             embeddings_indexed: 40,
             embeddings_total: 41,
             embeddings_pending: 1,
             embedding_coverage_ever_complete: true,
             ..Default::default()
         };
-        let stale = semantic_query_health_from_runtime("http://daemon", &pending);
+        let filling = semantic_query_health_from_runtime("http://daemon", &topping_up);
+        assert!(
+            matches!(filling.status, HealthStatus::Healthy),
+            "a top-up on a store whose fill completed is not lost ground: {:?}",
+            filling.status
+        );
+        assert!(filling
+            .detail
+            .contains("40/41 embeddings indexed, 1 pending"));
+        assert!(
+            filling.detail.contains("coverage completed earlier"),
+            "the backlog must still be named, not hidden by the healthy verdict: {}",
+            filling.detail
+        );
+
+        // Falsification. The identical counters must go straight back to
+        // blocking the moment the runtime names a cause that means ground was
+        // actually lost, or the healthy verdict above is not a judgement.
+        let discarded = crate::commands::resources::EmbedRuntimeState {
+            vector_index_discarded: Some("the persisted vector index was not loaded".to_string()),
+            ..topping_up.clone()
+        };
+        let stale = semantic_query_health_from_runtime("http://daemon", &discarded);
         assert!(matches!(stale.status, HealthStatus::Stale));
-        assert!(stale.detail.contains("40/41 embeddings indexed, 1 pending"));
         assert!(stale.manual_fix.is_some());
+        assert!(
+            !assemble_health_report("test".to_string(), vec![stale]).healthy,
+            "a discarded index still has to fail the aggregate"
+        );
 
         let failed = crate::commands::resources::EmbedRuntimeState {
             embed_worker_failed: true,
-            ..pending
+            ..topping_up
         };
         let missing = semantic_query_health_from_runtime("http://daemon", &failed);
         assert!(matches!(missing.status, HealthStatus::Missing));
         assert!(missing.detail.contains("embedding worker failed"));
         assert!(missing.manual_fix.is_some());
+    }
+
+    /// The v0.5.18 release gate, held still. Its Public Install Proof ran
+    /// `kin embed` to completion, read complete observed coverage out of
+    /// `kin status`, and then had readiness call the same store `pending`
+    /// because three files the proof itself had just written were admitted in
+    /// between. Two defects compounded there, and this covers the classifier
+    /// half: a store whose fill completed reports ready even while a backlog
+    /// that arrived afterwards is filling.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn work_arriving_after_a_completed_fill_does_not_un_ready_the_surface() {
+        let after_the_proof_wrote_its_own_output = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 14,
+            embeddings_total: 17,
+            embeddings_pending: 3,
+            embedding_coverage_ever_complete: true,
+            ..Default::default()
+        };
+
+        let semantic = semantic_query_health_from_runtime(
+            "http://daemon",
+            &after_the_proof_wrote_its_own_output,
+        );
+        assert!(
+            matches!(semantic.status, HealthStatus::Healthy),
+            "the install proof asserts readiness is healthy after a completed embed: {:?}",
+            semantic.status
+        );
+
+        let report = assemble_health_report("test".to_string(), vec![semantic]);
+        assert!(
+            report.healthy,
+            "a corpus that grew after its fill completed must not report the install unhealthy"
+        );
+
+        // Falsification. The same counters on a store that has never finished a
+        // fill are a genuine first pass and must still say so, or this check
+        // has stopped distinguishing anything.
+        let first_fill = crate::commands::resources::EmbedRuntimeState {
+            embedding_coverage_ever_complete: false,
+            ..after_the_proof_wrote_its_own_output
+        };
+        assert!(matches!(
+            semantic_query_health_from_runtime("http://daemon", &first_fill).status,
+            HealthStatus::Pending
+        ));
+    }
+
+    /// Pending promises that coverage is on its way. On a store whose graph
+    /// authority is a remote storage backend there is no durable local
+    /// vector-sidecar contract, the worker never starts and `/embed` refuses,
+    /// so the queue is not draining and no amount of waiting changes that.
+    /// Naming the host's limit is honest; reporting progress is not.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_backlog_nothing_will_drain_is_reported_unsupported_rather_than_pending() {
+        let no_local_sidecar = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 0,
+            embeddings_total: 41,
+            embeddings_pending: 41,
+            embed_persistence_unavailable: true,
+            ..Default::default()
+        };
+
+        let semantic = semantic_query_health_from_runtime("http://daemon", &no_local_sidecar);
+        assert!(
+            matches!(semantic.status, HealthStatus::Unsupported),
+            "a queue nothing will consume is not work in progress: {:?}",
+            semantic.status
+        );
+        assert!(
+            semantic.detail.contains("remote storage backend")
+                && semantic.detail.contains("nothing will embed here"),
+            "the cause has to be named where the check is read: {}",
+            semantic.detail
+        );
+
+        // Unsupported is a statement about the host, not a way to stay quiet:
+        // it must not block the aggregate, and the same store must report
+        // pending again the moment local persistence is available.
+        assert!(assemble_health_report("test".to_string(), vec![semantic]).healthy);
+        let local = crate::commands::resources::EmbedRuntimeState {
+            embed_persistence_unavailable: false,
+            ..no_local_sidecar
+        };
+        assert!(matches!(
+            semantic_query_health_from_runtime("http://daemon", &local).status,
+            HealthStatus::Pending
+        ));
     }
 
     /// A repository whose finished index was thrown away at open looks exactly
@@ -3266,19 +3413,25 @@ mod tests {
             "a rebuild after a discard must still block readiness"
         );
 
-        // The other blocking direction: coverage this store already held once
-        // and no longer has, with nothing discarded at open.
-        let regressed = crate::commands::resources::EmbedRuntimeState {
+        // The same counters on a store that has finished a fill are the other
+        // side of what this check separates, and they are not a blocking state.
+        // Nothing was discarded and no worker failed, so this is a corpus that
+        // grew or an edit that invalidated what it touched, which is what every
+        // repository somebody is working in does all day. The blocking states
+        // above keep their own arms, keyed on the cause rather than inferred
+        // from counters, and `work_arriving_after_a_completed_fill_does_not_
+        // un_ready_the_surface` holds the release-gate case this came from.
+        let topping_up = crate::commands::resources::EmbedRuntimeState {
             embedding_coverage_ever_complete: true,
             ..mid_first_fill.clone()
         };
-        let after_regression = semantic_query_health_from_runtime("http://daemon", &regressed);
+        let after_top_up = semantic_query_health_from_runtime("http://daemon", &topping_up);
         assert!(
-            matches!(after_regression.status, HealthStatus::Stale),
-            "a store that was complete and is not now has lost ground: {:?}",
-            after_regression.status
+            matches!(after_top_up.status, HealthStatus::Healthy),
+            "a backlog on a store whose fill completed is not lost ground: {:?}",
+            after_top_up.status
         );
-        assert!(!assemble_health_report("test".to_string(), vec![after_regression]).healthy);
+        assert!(assemble_health_report("test".to_string(), vec![after_top_up]).healthy);
 
         // A wedged worker fails outright whether or not the fill ever finished.
         let wedged = crate::commands::resources::EmbedRuntimeState {

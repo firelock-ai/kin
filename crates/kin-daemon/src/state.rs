@@ -1667,6 +1667,31 @@ impl DaemonState {
         }
     }
 
+    /// Publish the has-ever-completed marker for an explicit pass that drained
+    /// its queue.
+    ///
+    /// The re-read in `record_embedding_coverage_complete` is a snapshot taken
+    /// after the fact, and on a working copy that is still being written to,
+    /// new files can be admitted between a pass draining and the marker being
+    /// written. The snapshot then reads partial, no marker is published, and a
+    /// store whose fill demonstrably finished goes on reporting a first fill
+    /// forever. The pass's own report is the durable evidence, so a caller that
+    /// holds it records the completion directly rather than asking the counters
+    /// again and losing the race.
+    pub fn record_embedding_pass_drained(&self) {
+        let marker = self.layout.kindb_embedding_coverage_marker_path();
+        if marker.exists() {
+            return;
+        }
+        if let Err(error) = Self::write_embedding_coverage_marker(&marker) {
+            debug!(
+                path = %marker.display(),
+                %error,
+                "could not publish the embedding-coverage marker; readiness will keep reporting a first fill"
+            );
+        }
+    }
+
     /// Whether a coverage snapshot describes a fill that actually finished.
     ///
     /// An empty store is excluded deliberately: it has not finished a fill, it
@@ -8154,6 +8179,47 @@ mod tests {
                 .kindb_embedding_coverage_marker_path()
                 .exists(),
             "the claim must live in the store, not in the process that made it"
+        );
+    }
+
+    /// The race the counter re-read loses. A pass drains its queue, and before
+    /// the counters can be read back a working copy admits another file, so the
+    /// re-read reports partial coverage and publishes nothing. The store then
+    /// reports a first fill forever despite having finished one, which is what
+    /// left the v0.5.18 install proof reading `pending` on a store whose embed
+    /// had just reported no pending work at all.
+    #[test]
+    fn a_drained_pass_records_completion_even_when_new_work_already_arrived() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        state
+            .graph
+            .upsert_entity(&test_entity("arrived_after_the_pass", "src/late.rs"))
+            .unwrap();
+        let status = state.graph.embedding_status();
+        assert!(
+            !DaemonState::coverage_is_whole(status.indexed, status.pending, status.total),
+            "fixture precondition: work arriving after the pass must already have made the \
+             counters partial, got {}/{} indexed, {} pending",
+            status.indexed,
+            status.total,
+            status.pending
+        );
+
+        state.record_embedding_coverage_complete();
+        assert!(
+            !state.embedding_coverage_ever_complete(),
+            "fixture precondition: recording from a re-read of these counters publishes nothing, \
+             which is the bug this fixture exists to hold still"
+        );
+
+        state.record_embedding_pass_drained();
+        assert!(
+            state.embedding_coverage_ever_complete(),
+            "a pass that drained its own queue is the evidence a fill finished, and it cannot be \
+             invalidated by a later write growing the corpus"
         );
     }
 

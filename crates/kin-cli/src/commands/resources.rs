@@ -40,6 +40,13 @@ pub struct EmbedRuntimeState {
     /// something different before this has ever been true than after it.
     #[serde(default)]
     pub embedding_coverage_ever_complete: bool,
+    /// Set when this store's graph authority is a remote storage backend, which
+    /// carries no durable local vector-sidecar contract. The embedding worker
+    /// never starts on such a store and `/embed` refuses, so a queued backlog
+    /// there is not work in progress and will never become coverage. Defaults
+    /// to false so an ordinary local store is unaffected.
+    #[serde(default)]
+    pub embed_persistence_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
