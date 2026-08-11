@@ -1005,12 +1005,19 @@ struct ShellIntegrationState<'a> {
 
 /// Build the shell integration check from probed state.
 ///
-/// `recorded_by_setup` decides the severity of an absent hook, and only that.
+/// `recorded_by_setup` decides the severity of an ABSENT hook, and only that.
 /// The installer publishes `KIN_NO_SETUP=1` on its own install page and then
 /// says to run `kin setup` when ready, so a machine that took that path has no
 /// hook by instruction. Scoring it a failure told every such user their healthy
 /// install was broken. A hook setup did write and that is now gone stays a
 /// failure, because that is Kin's own artifact missing.
+///
+/// A hook file that is present but unsourced is never reclassified, whatever the
+/// ledger says. Kin's artifact is on disk, so "setup has not installed a shell
+/// hook yet" would be a false statement about a state the user can see, and a
+/// diagnostic that lies in the reassuring direction is worse than the noisy
+/// report this replaces. That case reaches the failing arm through
+/// `!hook_installed` below, which is why the reclassification tests both.
 fn shell_path_check_from(state: ShellIntegrationState<'_>) -> HealthCheck {
     let ShellIntegrationState {
         shell,
@@ -1047,7 +1054,7 @@ fn shell_path_check_from(state: ShellIntegrationState<'_>) -> HealthCheck {
             detail,
         )
         .fixable()
-    } else if !recorded_by_setup {
+    } else if !recorded_by_setup && !hook_installed {
         HealthCheck::new(
             "shell_path",
             "Shell integration",
@@ -2640,6 +2647,26 @@ mod tests {
                 healthy.status
             );
         }
+
+        // A hook on disk that nothing sources is a real misconfiguration even
+        // with no ledger behind it. Kin's artifact is right there, so the
+        // not-configured-yet wording would be a false statement about a state
+        // the user can see, and reclassifying it would be the half-corrected
+        // surface this class of fix is supposed to avoid.
+        let mut present_but_unsourced = shell_state(false, false);
+        present_but_unsourced.hook_installed = true;
+        let stranded = shell_path_check_from(present_but_unsourced);
+        assert!(
+            matches!(stranded.status, HealthStatus::Misconfigured),
+            "an installed but unsourced hook must stay a failure, got {:?}",
+            stranded.status
+        );
+        assert!(is_failing(&stranded.status));
+        assert!(
+            !stranded.detail.contains("has not installed"),
+            "the detail must not claim no hook exists when one does: {}",
+            stranded.detail
+        );
     }
 
     /// The sixth check of this class. A machine healthy except for never having
