@@ -9,7 +9,25 @@ pub struct RegisteredGitWorktreeFact {
     pub kind: RegisteredGitWorktreeKind,
     pub id: Option<Vec<u8>>,
     pub path: std::path::PathBuf,
+    /// Where that worktree keeps its own HEAD, index, and administrative
+    /// state. Everything private to a worktree lives here rather than in the
+    /// shared object database, which is the whole reason a sibling has to be
+    /// classified separately from the source.
+    pub git_dir: std::path::PathBuf,
     pub locked: bool,
+}
+
+/// One other registered worktree this migration cannot tolerate, and why.
+///
+/// A sibling worktree is ordinary. What makes one untolerable is state the
+/// capture cannot see: refs the shared store does not publish, or an operation
+/// still running against the object database. `reason` names that state and
+/// `remedy` is the one action that clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntolerableGitWorktree {
+    pub worktree: RegisteredGitWorktreeFact,
+    pub reason: String,
+    pub remedy: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +161,26 @@ fn describe_unsealed_gaps(total_gaps: usize, reported: &[UnsealedContentGap]) ->
     described
 }
 
+/// Render every untolerable sibling worktree with its path, reason, and remedy.
+fn describe_untolerable_worktrees(worktrees: &[UntolerableGitWorktree]) -> String {
+    worktrees
+        .iter()
+        .map(|entry| {
+            format!(
+                "the {} worktree {} {} ({})",
+                match entry.worktree.kind {
+                    RegisteredGitWorktreeKind::Main => "main",
+                    RegisteredGitWorktreeKind::Linked => "linked",
+                },
+                entry.worktree.path.display(),
+                entry.reason,
+                entry.remedy
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Errors from the kin-git adapter.
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -199,11 +237,12 @@ pub enum GitError {
     },
 
     #[error(
-        "Git migration source has {count} other registered worktree(s); single-workspace import must account for each workspace"
+        "Git migration source shares its object database with {count} worktree(s) holding state this capture cannot prove: {}",
+        describe_untolerable_worktrees(worktrees)
     )]
     AdditionalWorktrees {
         count: usize,
-        worktrees: Vec<RegisteredGitWorktreeFact>,
+        worktrees: Vec<UntolerableGitWorktree>,
     },
 
     #[error(

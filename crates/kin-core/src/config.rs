@@ -399,6 +399,9 @@ pub struct GitCoexistenceConfig {
     pub remote_push_default: Option<String>,
     #[serde(default)]
     pub push_default: Option<GitPushDefault>,
+    /// Sealed repository-local `push.autoSetupRemote`, if the source set it.
+    #[serde(default)]
+    pub push_auto_setup_remote: Option<bool>,
 }
 
 impl fmt::Debug for GitCoexistenceConfig {
@@ -412,6 +415,7 @@ impl fmt::Debug for GitCoexistenceConfig {
                 &self.remote_push_default.is_some(),
             )
             .field("push_default", &self.push_default)
+            .field("push_auto_setup_remote", &self.push_auto_setup_remote)
             .field("transport_values", &"<redacted>")
             .finish()
     }
@@ -1663,6 +1667,7 @@ mod tests {
             }],
             remote_push_default: None,
             push_default: None,
+            push_auto_setup_remote: None,
         };
         git.validate().unwrap();
 
@@ -1701,6 +1706,7 @@ mod tests {
             branches: Vec::new(),
             remote_push_default: Some(".".into()),
             push_default: None,
+            push_auto_setup_remote: None,
         };
         git.validate().unwrap();
 
@@ -2021,6 +2027,7 @@ transport = "native-kin"
                 }],
                 remote_push_default: Some("origin".to_string()),
                 push_default: Some(GitPushDefault::Simple),
+                push_auto_setup_remote: None,
             },
             ..KinConfig::default()
         };

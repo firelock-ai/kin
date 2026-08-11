@@ -44,7 +44,7 @@ pub use authority::build_git_external_authority;
 pub use error::{
     GitAdmissionBlocker, GitCheckoutFilterFact, GitError, LocalGitHookExecutability,
     LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact, RegisteredGitWorktreeKind,
-    Result, UnsealedContentGap,
+    Result, UnsealedContentGap, UntolerableGitWorktree,
 };
 pub use global_config::empty_global_git_config;
 pub use lossless::{

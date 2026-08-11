@@ -37,7 +37,7 @@ use kin_model::{
 use crate::admission_blockers::effective_hook_surface;
 use crate::error::{
     GitCheckoutFilterFact, GitError, LocalGitHookExecutability, LocalGitHookFact, LocalGitHookKind,
-    RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result,
+    RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result, UntolerableGitWorktree,
 };
 use crate::lossless::{
     capture_lossless_git_repository, open_repo, reject_shallow_repository, GitObjectFormat,
@@ -263,6 +263,12 @@ pub struct GitRemoteMappingFacts {
     pub remote_push_default: Option<Vec<u8>>,
     /// Effective repository-local `push.default`, if explicitly set.
     pub push_default: Option<Vec<u8>>,
+    /// Effective repository-local `push.autoSetupRemote`, if explicitly set.
+    ///
+    /// Modelled rather than admitted silently. It decides whether a push of a
+    /// branch with no upstream publishes and records one instead of refusing,
+    /// which is transport behaviour Kin has to be able to restore on eject.
+    pub push_auto_setup_remote: Option<Vec<u8>>,
 }
 
 impl GitRemoteMappingFacts {
@@ -271,6 +277,7 @@ impl GitRemoteMappingFacts {
             && self.branch_tracking.is_empty()
             && self.remote_push_default.is_none()
             && self.push_default.is_none()
+            && self.push_auto_setup_remote.is_none()
     }
 }
 
@@ -285,6 +292,10 @@ impl fmt::Debug for GitRemoteMappingFacts {
                 &self.remote_push_default.is_some(),
             )
             .field("push_default_present", &self.push_default.is_some())
+            .field(
+                "push_auto_setup_remote_present",
+                &self.push_auto_setup_remote.is_some(),
+            )
             .field("values", &"<redacted>")
             .finish()
     }
@@ -580,11 +591,12 @@ fn observe(
         )));
     }
 
-    let other_worktrees = other_registered_worktrees(&repo, &source_worktree)?;
-    if !other_worktrees.is_empty() {
+    let (tolerated_worktrees, untolerable_worktrees) =
+        classify_other_worktrees(&repo, other_registered_worktrees(&repo, &source_worktree)?)?;
+    if !untolerable_worktrees.is_empty() {
         return Err(GitError::AdditionalWorktrees {
-            count: other_worktrees.len(),
-            worktrees: other_worktrees,
+            count: untolerable_worktrees.len(),
+            worktrees: untolerable_worktrees,
         });
     }
 
@@ -646,7 +658,10 @@ fn observe(
     let snapshot_fingerprint = fingerprint_snapshot(&snapshot);
     let semantic_plan_fingerprint = fingerprint_plan(plan)?;
     let compatibility = GitMigrationCompatibilityFacts {
-        other_registered_worktrees: Vec::new(),
+        // Tolerated siblings are recorded rather than dropped. Both
+        // observations carry them, so one appearing or vanishing mid-proof
+        // fails the comparison instead of passing unnoticed.
+        other_registered_worktrees: tolerated_worktrees,
         local_hooks: Vec::new(),
         configured_custom_hooks_path: false,
         checkout_filters: Vec::new(),
@@ -1586,7 +1601,22 @@ pub(crate) fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()
     if stable_path(repo.common_dir()) != stable_path(repo.git_dir()) {
         roots.push(repo.common_dir().to_path_buf());
     }
-    let markers = [
+    for root in &roots {
+        if let Some(reason) = in_progress_operation_state(root)? {
+            return Err(preflight_error(reason));
+        }
+    }
+    Ok(())
+}
+
+/// Administrative state under one Git directory that says work is unfinished.
+///
+/// Split out of [`reject_in_progress_operations`] because a sibling worktree
+/// keeps its own copy of every one of these under `.git/worktrees/<id>`, which
+/// neither the source's Git directory nor the common directory contains. Asking
+/// this of the source alone leaves a sibling mid-rebase invisible.
+fn in_progress_operation_state(root: &Path) -> Result<Option<String>> {
+    const MARKERS: &[&str] = &[
         "rebase-apply",
         "rebase-merge",
         "sequencer",
@@ -1603,26 +1633,24 @@ pub(crate) fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()
         "config.lock",
         "gc.pid",
     ];
-    for root in &roots {
-        for marker in markers {
-            let path = root.join(marker);
-            if fs::symlink_metadata(&path).is_ok() {
-                return Err(preflight_error(format!(
-                    "Git administrative state {} indicates an in-progress or incomplete operation",
-                    path.display()
-                )));
-            }
-        }
-        for relative in ["refs", "logs", "reftable", "objects/pack", "objects/info"] {
-            if let Some(lock) = find_lock_file(&root.join(relative))? {
-                return Err(preflight_error(format!(
-                    "Git lock {} indicates concurrent repository mutation",
-                    lock.display()
-                )));
-            }
+    for marker in MARKERS {
+        let path = root.join(marker);
+        if fs::symlink_metadata(&path).is_ok() {
+            return Ok(Some(format!(
+                "Git administrative state {} indicates an in-progress or incomplete operation",
+                path.display()
+            )));
         }
     }
-    Ok(())
+    for relative in ["refs", "logs", "reftable", "objects/pack", "objects/info"] {
+        if let Some(lock) = find_lock_file(&root.join(relative))? {
+            return Ok(Some(format!(
+                "Git lock {} indicates concurrent repository mutation",
+                lock.display()
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn find_lock_file(root: &Path) -> Result<Option<PathBuf>> {
@@ -1671,6 +1699,7 @@ pub(crate) fn other_registered_worktrees(
                     kind: RegisteredGitWorktreeKind::Main,
                     id: None,
                     path: workdir.to_path_buf(),
+                    git_dir: main.git_dir().to_path_buf(),
                     locked: false,
                 });
             }
@@ -1693,6 +1722,7 @@ pub(crate) fn other_registered_worktrees(
             kind: RegisteredGitWorktreeKind::Linked,
             id: Some(proxy.id().to_vec()),
             path,
+            git_dir: proxy.git_dir().to_path_buf(),
             locked: proxy.is_locked(),
         });
     }
@@ -1702,6 +1732,204 @@ pub(crate) fn other_registered_worktrees(
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(facts)
+}
+
+/// Split the other registered worktrees into the ones this migration can
+/// tolerate and the ones it cannot, with a reason for each refusal.
+///
+/// A worktree sharing the object database is not itself a problem. What the
+/// capture needs is that every object the migration must carry is reachable
+/// from a ref the capture reads, and that nothing is mutating the database
+/// while it reads. Both are decidable from the sibling's own Git directory.
+///
+/// The capture walks [`crate::lossless::capture_lossless_git_repository`],
+/// which iterates the source worktree's reference store and its own HEAD.
+/// That store publishes the shared refs plus the source's private ones. A
+/// sibling's HEAD lives in `.git/worktrees/<id>/HEAD` and its per-worktree refs
+/// in `.git/worktrees/<id>/refs`, and neither is published there. So a sibling
+/// checked out on an ordinary shared branch names nothing the capture misses:
+/// its commits arrive through `refs/heads/<branch>` like any other. A sibling
+/// at a detached HEAD, or holding its own refs, can anchor commits no shared
+/// ref reaches, and migrating away from that object database would drop them.
+///
+/// Concurrency needs no rule here. The capture re-reads refs and HEAD after
+/// walking the object closure, and [`preflight_git_migration`] observes the
+/// source twice and compares, so a commit made in any worktree during the proof
+/// is caught as source drift whichever worktree made it.
+///
+/// What a tolerated sibling still costs is disclosed rather than refused: its
+/// commits are admitted, its uncommitted work is not, and Kin creates no
+/// workspace for it.
+pub(crate) fn classify_other_worktrees(
+    repo: &gix::Repository,
+    worktrees: Vec<RegisteredGitWorktreeFact>,
+) -> Result<(Vec<RegisteredGitWorktreeFact>, Vec<UntolerableGitWorktree>)> {
+    let mut tolerated = Vec::new();
+    let mut untolerable = Vec::new();
+    for worktree in worktrees {
+        match untolerable_worktree_state(repo, &worktree)? {
+            Some((reason, remedy)) => untolerable.push(UntolerableGitWorktree {
+                worktree,
+                reason,
+                remedy,
+            }),
+            None => tolerated.push(worktree),
+        }
+    }
+    Ok((tolerated, untolerable))
+}
+
+/// Why one sibling worktree cannot be tolerated, if it cannot.
+fn untolerable_worktree_state(
+    repo: &gix::Repository,
+    worktree: &RegisteredGitWorktreeFact,
+) -> Result<Option<(String, String)>> {
+    let git_dir = &worktree.git_dir;
+    // A reftable worktree keeps its refs in a format this boundary does not
+    // read, so nothing below can tell a private ref from an empty store.
+    if fs::symlink_metadata(git_dir.join("reftable")).is_ok() {
+        return Ok(Some((
+            "keeps its refs in a reftable this boundary cannot read, so whether it anchors \
+             commits no shared ref names is undecidable"
+                .to_string(),
+            "remove it with 'git worktree remove', then run kin init again".to_string(),
+        )));
+    }
+    if let Some(reason) = in_progress_operation_state(git_dir)? {
+        return Ok(Some((
+            format!("has an operation still running against this object database: {reason}"),
+            "finish or abort that worktree's Git operation, then run kin init again".to_string(),
+        )));
+    }
+    if let Some(private) = first_private_worktree_ref(git_dir)? {
+        return Ok(Some((
+            format!(
+                "carries its own ref {}, which this repository's shared reference store does not \
+                 publish, so the capture cannot see what it anchors",
+                private.display()
+            ),
+            "clear that worktree's per-worktree refs, for example with 'git bisect reset'"
+                .to_string(),
+        )));
+    }
+    match read_worktree_head(git_dir)? {
+        WorktreeHead::Detached => Ok(Some((
+            "is checked out at a detached HEAD, which no shared ref names, so the capture cannot \
+             prove it carries that worktree's commits"
+                .to_string(),
+            "check that worktree out on a branch, or remove it with 'git worktree remove'"
+                .to_string(),
+        ))),
+        WorktreeHead::Branch(name) => {
+            if shared_branch_exists(repo, &name) {
+                Ok(None)
+            } else {
+                Ok(Some((
+                    format!(
+                        "is on branch {}, which this repository's shared reference store does not \
+                         carry, so the capture cannot reach what it points at",
+                        String::from_utf8_lossy(&name)
+                    ),
+                    "commit that branch, or remove the worktree with 'git worktree remove'"
+                        .to_string(),
+                )))
+            }
+        }
+        WorktreeHead::Unreadable(detail) => Ok(Some((
+            format!("has a HEAD this boundary cannot read: {detail}"),
+            "remove it with 'git worktree remove', then run kin init again".to_string(),
+        ))),
+    }
+}
+
+/// What one worktree's own `HEAD` file says it is checked out at.
+enum WorktreeHead {
+    /// Symbolic at a full ref name.
+    Branch(Vec<u8>),
+    /// Directly at an object.
+    Detached,
+    Unreadable(String),
+}
+
+fn read_worktree_head(git_dir: &Path) -> Result<WorktreeHead> {
+    let path = git_dir.join("HEAD");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorktreeHead::Unreadable(format!(
+                "{} is absent",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(GitError::io(&path, error)),
+    };
+    let trimmed = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
+        .map_or(&bytes[..0], |last| &bytes[..=last]);
+    let Some(target) = trimmed.strip_prefix(b"ref: ") else {
+        return Ok(WorktreeHead::Detached);
+    };
+    let target = target.strip_prefix(b" ").unwrap_or(target);
+    if !target.starts_with(b"refs/") {
+        return Ok(WorktreeHead::Unreadable(format!(
+            "symbolic target {} is not a full ref name",
+            String::from_utf8_lossy(target)
+        )));
+    }
+    Ok(WorktreeHead::Branch(target.to_vec()))
+}
+
+/// Whether a branch the sibling names is one the capture's reference store
+/// publishes.
+///
+/// Only `refs/heads/` counts. Every other namespace a symbolic HEAD could name
+/// is either per-worktree, and therefore already refused above, or not a place
+/// `git worktree add` puts a checkout.
+fn shared_branch_exists(repo: &gix::Repository, name: &[u8]) -> bool {
+    if !name.starts_with(b"refs/heads/") {
+        return false;
+    }
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    repo.find_reference(name).is_ok()
+}
+
+/// The first ref one worktree keeps privately, if it keeps any.
+///
+/// `.git/worktrees/<id>/refs` is where Git puts `refs/bisect/*` and
+/// `refs/worktree/*`, which belong to that worktree alone. Packed refs are
+/// always shared, so a loose walk here is the complete private set.
+fn first_private_worktree_ref(git_dir: &Path) -> Result<Option<PathBuf>> {
+    fn walk(root: &Path) -> Result<Option<PathBuf>> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(GitError::io(root, error)),
+        };
+        let entries = entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|error| GitError::io(root, error))?;
+        let mut paths = entries
+            .into_iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| GitError::io(&path, error))?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                if let Some(found) = walk(&path)? {
+                    return Ok(Some(found));
+                }
+            } else {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+    walk(&git_dir.join("refs"))
 }
 
 pub(crate) fn checkout_filter_facts(repo: &gix::Repository) -> Vec<GitCheckoutFilterFact> {
@@ -1767,6 +1995,7 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
     let mut branch_tracking = Vec::<GitBranchTrackingFact>::new();
     let mut remote_push_default = None;
     let mut push_default = None;
+    let mut push_auto_setup_remote = None;
     let mut refusals = Vec::<String>::new();
 
     for section in config.plumbing().sections().filter(|section| {
@@ -1794,6 +2023,7 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
                         section,
                         &format!("remote.{}", String::from_utf8_lossy(name)),
                         &["url", "pushurl", "fetch", "push"],
+                        &[],
                         &mut refusals,
                     ) {
                         continue;
@@ -1822,6 +2052,7 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
                         section,
                         "remote",
                         &["pushdefault"],
+                        &[],
                         &mut refusals,
                     ) {
                         continue;
@@ -1844,6 +2075,7 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
                     section,
                     &format!("branch.{}", String::from_utf8_lossy(name)),
                     &["remote", "merge", "pushremote"],
+                    ADMISSIBLE_BRANCH_KEYS,
                     &mut refusals,
                 ) {
                     continue;
@@ -1863,12 +2095,24 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
                 if section.header().subsection_name().is_some() {
                     return Err(unsafe_git_config("named push section"));
                 }
-                if collect_unknown_config_keys(section, "push", &["default"], &mut refusals) {
+                if collect_unknown_config_keys(
+                    section,
+                    "push",
+                    &["default", "autosetupremote"],
+                    &[],
+                    &mut refusals,
+                ) {
                     continue;
                 }
                 set_unique_explicit_value(section, "default", &mut push_default, |value| {
                     validate_push_default(value)
                 })?;
+                set_unique_explicit_value(
+                    section,
+                    "autosetupremote",
+                    &mut push_auto_setup_remote,
+                    validate_git_boolean,
+                )?;
             }
             "core" => collect_transfer_core_keys(section, &mut refusals),
             // Split out of the arm below because it is the one section here a
@@ -1880,9 +2124,10 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
                     .subsection_name()
                     .and_then(|name| name.to_str().ok()),
             )),
+            "lfs" => collect_lfs_keys(section, &mut refusals),
             "credential" | "http" | "https" | "url" | "protocol" | "transport" | "transfer"
-            | "fetch" | "receive" | "uploadpack" | "ssh" | "lfs" => {
-                // Twelve sections share this refusal, so naming the one that
+            | "fetch" | "receive" | "uploadpack" | "ssh" => {
+                // Eleven sections share this refusal, so naming the one that
                 // matched is the difference between a reader knowing what to
                 // look for and reading a category. The section name is one of
                 // these literals and is always safe to print; the subsection
@@ -1905,6 +2150,7 @@ pub(crate) fn scan_remote_mapping(repo: &gix::Repository) -> Result<RemoteMappin
             branch_tracking,
             remote_push_default,
             push_default,
+            push_auto_setup_remote,
         },
         refusals,
     })
@@ -1943,7 +2189,30 @@ fn branch_fact_mut<'a>(
     branches.last_mut().expect("branch was just inserted")
 }
 
+/// Keys inside `[branch "<name>"]` that Kin admits without modelling them.
+///
+/// This is not the allowlist inverted. A key in neither list still refuses, so
+/// an unrecognised one fails closed exactly as before. These four are here
+/// because they are what an ordinary editor-configured checkout carries, and
+/// none of them changes which refs a fetch or push moves, what bytes those refs
+/// carry, or which remote any branch maps to.
+///
+/// `rebase`, `description`, and `mergeoptions` shape a later local integration,
+/// which is the same thing `[pull]` and `[merge]` do, and this scan already
+/// admits both of those sections whole; refusing the per-branch spelling while
+/// admitting the repository-wide one was an inconsistency rather than a
+/// boundary. `vscode-merge-base` is an editor annotation Git itself never
+/// reads: VS Code writes one per branch and recomputes it on demand, so an
+/// eject that does not restore it loses nothing Git would have acted on.
+const ADMISSIBLE_BRANCH_KEYS: &[&str] =
+    &["rebase", "description", "mergeoptions", "vscode-merge-base"];
+
 /// Collect every key outside the exact allowlist, naming each one.
+///
+/// `allowed` keys contribute facts Kin models and restores on eject.
+/// `admissible` keys are ones this boundary has classified as unable to affect
+/// transport, so they are dropped without a refusal and without a fact. A key
+/// in neither list refuses, which is what keeps the subset fail-closed.
 ///
 /// `scope` is the section spelling, which the caller builds from a subsection
 /// name that has only been checked for control characters. That is not enough
@@ -1959,22 +2228,54 @@ fn collect_unknown_config_keys(
     section: &gix::config::file::Section<'_>,
     scope: &str,
     allowed: &[&str],
+    admissible: &[&str],
     refusals: &mut Vec<String>,
 ) -> bool {
     let scope = printable_config_scope(scope);
     let before = refusals.len();
     for name in section.value_names() {
         let name = name.to_string();
-        if !allowed
+        let recognized = allowed
             .iter()
-            .any(|allowed| name.eq_ignore_ascii_case(allowed))
-        {
+            .chain(admissible.iter())
+            .any(|known| name.eq_ignore_ascii_case(known));
+        if !recognized {
             refusals.push(format!(
                 "unsupported transfer-affecting repository-local key {scope}.{name}"
             ));
         }
     }
     refusals.len() != before
+}
+
+/// Classify one `[lfs]` section key by key rather than refusing it wholesale.
+///
+/// Git LFS moves bytes only through its `filter.lfs` clean and smudge commands,
+/// and [`checkout_filter_facts`] refuses a configured `filter` at any scope, so
+/// a repository actually using LFS is still refused there. An `[lfs]` section
+/// is not that surface; it is client configuration, and two of its keys are
+/// state git-lfs mints for itself. `lfs.repositoryformatversion` is the marker
+/// `git lfs install --local` writes, and `[lfs "<endpoint>"] access` caches an
+/// authentication mode git-lfs re-negotiates whenever it is absent. Dropping
+/// either on eject changes nothing a user would find missing.
+///
+/// Everything else in the section still refuses, `lfs.url` most of all: it
+/// names an endpoint Kin would have to restore and cannot.
+fn collect_lfs_keys(section: &gix::config::file::Section<'_>, refusals: &mut Vec<String>) {
+    let subsectioned = section.header().subsection_name().is_some();
+    for name in section.value_names() {
+        let name = name.to_string();
+        let admissible = if subsectioned {
+            name.eq_ignore_ascii_case("access")
+        } else {
+            name.eq_ignore_ascii_case("repositoryformatversion")
+        };
+        if !admissible {
+            refusals.push(format!(
+                "unsupported transfer-affecting repository-local key lfs.{name}"
+            ));
+        }
+    }
 }
 
 /// Keep a section spelling printable, dropping a subsection that is not a plain
@@ -2146,6 +2447,21 @@ fn validate_safe_merge_ref(value: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Accept exactly the spellings Git reads as a boolean.
+///
+/// An empty value is Git's own shorthand for true, so it is accepted with the
+/// rest rather than treated as a missing value.
+fn validate_git_boolean(value: &[u8]) -> Result<()> {
+    let lowered = value.to_ascii_lowercase();
+    if !matches!(
+        lowered.as_slice(),
+        b"" | b"true" | b"false" | b"yes" | b"no" | b"on" | b"off" | b"1" | b"0"
+    ) {
+        return Err(unsafe_git_config("non-boolean push.autoSetupRemote"));
+    }
+    Ok(())
+}
+
 fn validate_push_default(value: &[u8]) -> Result<()> {
     std::str::from_utf8(value).map_err(|_| unsafe_git_config("non-UTF-8 push.default"))?;
     if !matches!(
@@ -2280,7 +2596,7 @@ fn fingerprint_plan(plan: &SemanticGitImportPlan) -> Result<Hash256> {
 }
 
 fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
-    let mut hash = FramedHash::new(b"kin.git.migration-preflight-proof.v2");
+    let mut hash = FramedHash::new(b"kin.git.migration-preflight-proof.v3");
     hash.bytes(proof.repository_id.as_str().as_bytes());
     hash.bytes(proof.snapshot_fingerprint.as_bytes());
     hash.bytes(proof.semantic_plan_fingerprint.as_bytes());
@@ -2313,6 +2629,10 @@ fn fingerprint_proof(proof: &GitMigrationPreflightProof) -> Hash256 {
         proof.remote_mapping.remote_push_default.as_deref(),
     );
     encode_optional_bytes(&mut hash, proof.remote_mapping.push_default.as_deref());
+    encode_optional_bytes(
+        &mut hash,
+        proof.remote_mapping.push_auto_setup_remote.as_deref(),
+    );
     hash.finish()
 }
 
@@ -4279,22 +4599,130 @@ mod tests {
             &[
                 "worktree",
                 "add",
-                "-b",
-                "other",
+                "--detach",
                 other.to_str().expect("utf8 test path"),
             ],
         );
         let (snapshot, plan) = snapshot_plan(&worktrees.repo, &worktrees.store);
-        match preflight_git_migration(&worktrees.repo, &snapshot, &plan, &worktrees.store)
-            .expect_err("additional worktree blocker")
-        {
+        let error = preflight_git_migration(&worktrees.repo, &snapshot, &plan, &worktrees.store)
+            .expect_err("additional worktree blocker");
+        let rendered = error.to_string();
+        match error {
             GitError::AdditionalWorktrees { count, worktrees } => {
                 assert_eq!(count, 1);
                 assert_eq!(worktrees.len(), 1);
-                assert_eq!(stable_path(&worktrees[0].path), stable_path(&other));
+                assert_eq!(
+                    stable_path(&worktrees[0].worktree.path),
+                    stable_path(&other)
+                );
+                assert!(worktrees[0].reason.contains("detached HEAD"), "{rendered}");
+                assert!(!worktrees[0].remedy.is_empty(), "{rendered}");
             }
             error => panic!("unexpected error: {error:?}"),
         }
+        assert!(
+            rendered.contains("other-worktree") && rendered.contains("detached HEAD"),
+            "the refusal names the worktree and why: {rendered}"
+        );
+    }
+
+    /// An idle sibling on a shared branch is proved, not refused.
+    ///
+    /// This is the shape every `git worktree` user has, and the one the fleet's
+    /// own lane checkouts create. Its commits arrive through `refs/heads/*`
+    /// like any other, so the capture misses nothing by admitting the source
+    /// beside it.
+    #[test]
+    fn an_idle_linked_worktree_on_a_shared_branch_is_proved_and_recorded() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("idle-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+
+        let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
+        let proof = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
+            .expect("an idle sibling worktree is tolerated");
+        assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
+        assert_eq!(
+            stable_path(&proof.compatibility.other_registered_worktrees[0].path),
+            stable_path(&other)
+        );
+    }
+
+    /// A sibling mid-rebase is refused, and only this check can see it.
+    ///
+    /// Its `rebase-merge` directory lives under `.git/worktrees/<id>`, which is
+    /// neither the source's Git directory nor the common directory, so the
+    /// source's own in-progress scan cannot reach it.
+    #[test]
+    fn a_linked_worktree_with_an_in_progress_operation_is_refused() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("rebasing-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        let admin = fixture.repo.join(".git/worktrees/rebasing-worktree");
+        assert!(admin.is_dir(), "fixture must own the worktree admin dir");
+        fs::create_dir(admin.join("rebase-merge")).expect("in-progress rebase state");
+
+        let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
+        let rendered = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
+            .expect_err("a sibling mid-rebase is refused")
+            .to_string();
+        assert!(
+            rendered.contains("rebasing-worktree") && rendered.contains("rebase-merge"),
+            "the refusal names the worktree and its state: {rendered}"
+        );
+    }
+
+    /// A sibling holding its own refs is refused, naming the ref.
+    #[test]
+    fn a_linked_worktree_holding_a_private_ref_is_refused() {
+        let fixture = Fixture::clean();
+        let other = fixture.temp.path().join("bisecting-worktree");
+        git(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane",
+                other.to_str().expect("utf8 test path"),
+            ],
+        );
+        let private = fixture
+            .repo
+            .join(".git/worktrees/bisecting-worktree/refs/bisect");
+        fs::create_dir_all(&private).expect("private ref directory");
+        fs::write(
+            private.join("bad"),
+            b"0000000000000000000000000000000000000000\n",
+        )
+        .expect("private ref");
+
+        let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
+        let rendered = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
+            .expect_err("a sibling holding private refs is refused")
+            .to_string();
+        assert!(
+            rendered.contains("bisecting-worktree") && rendered.contains("bisect"),
+            "the refusal names the worktree and the ref: {rendered}"
+        );
     }
 
     #[test]
