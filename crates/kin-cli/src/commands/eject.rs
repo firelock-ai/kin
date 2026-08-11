@@ -416,6 +416,14 @@ fn install_git_coexistence_config(
     if let Some(push_default) = config.push_default {
         add_local_git_config(worktree, git_dir, "push.default", push_default.as_str())?;
     }
+    if let Some(auto_setup_remote) = config.push_auto_setup_remote {
+        add_local_git_config(
+            worktree,
+            git_dir,
+            "push.autoSetupRemote",
+            if auto_setup_remote { "true" } else { "false" },
+        )?;
+    }
     Ok(())
 }
 
