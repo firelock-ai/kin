@@ -291,6 +291,13 @@ BOUNDARY_DIRS = [
     "crates/kin-core/src/federation.rs",
     "crates/kin-core/src/git_init.rs",
     "crates/kin-core/src/init.rs",
+    # Init's own staging directories, and nothing else. It runs before any
+    # graph exists, on paths init itself minted, and its whole output is
+    # whether a directory this process created still needs removing. It
+    # answers no locate/search/context/trace/review/xref query, and the
+    # directory it enumerates is the repository's parent, never repository
+    # content.
+    "crates/kin-core/src/init_staging.rs",
     "crates/kin-core/src/layout.rs",
     "crates/kin-core/src/lib.rs",
     "crates/kin-core/src/manifest.rs",
