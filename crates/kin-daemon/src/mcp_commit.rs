@@ -163,6 +163,30 @@ fn declare_carried_split(
     result["carried_pending_files"] = serde_json::json!(carried);
 }
 
+/// Whether the receipt a commit reply describes was published by this call or
+/// by an earlier one under the same caller-stable transaction id.
+///
+/// A caller that retried needs exactly this bit to know whether its re-send
+/// double-applied, and no other field in the reply carries it: a replay
+/// restates the original change id, repository generation, and root hash
+/// exactly, which is what makes the idempotency correct and also what makes it
+/// invisible. So the bit is threaded from the path that knows rather than
+/// inferred at the reply.
+#[derive(Clone, Copy)]
+enum CommitApplication {
+    /// This call moved repository authority.
+    Applied,
+    /// Authority had already moved under this transaction id before this call
+    /// ran, so the reply restates a landing this call did not make.
+    AlreadyApplied,
+}
+
+impl CommitApplication {
+    fn already_applied(self) -> bool {
+        matches!(self, Self::AlreadyApplied)
+    }
+}
+
 /// Commit one daemon-owned MCP transaction through exact repository authority.
 ///
 /// The caller holds `DaemonState::coordination_gate` and the graph-authority
@@ -295,6 +319,8 @@ fn commit_exact_transaction_inner(
         if let Some(recovered) = recover_native_commit(&authority_context, operation_id)
             .map_err(|error| format!("recover exact MCP repository receipt: {error}"))?
         {
+            // The fence this recovered against was set by an earlier attempt,
+            // so authority moved before this call ran.
             return finalize_committed_transaction(
                 state,
                 sessions,
@@ -303,6 +329,7 @@ fn commit_exact_transaction_inner(
                 recovered,
                 None,
                 coordination,
+                CommitApplication::AlreadyApplied,
             );
         }
         if transaction.state == "committed" {
@@ -400,6 +427,9 @@ fn commit_exact_transaction_inner(
         ));
     }
 
+    // This call planned and published under its own fence, including the branch
+    // where the mutation reported an error and the receipt recovery below it
+    // found the receipt that same attempt had already written.
     finalize_committed_transaction(
         state,
         sessions,
@@ -411,6 +441,7 @@ fn commit_exact_transaction_inner(
             carried_pending_files: plan.carried_pending_files,
         }),
         coordination,
+        CommitApplication::Applied,
     )
 }
 
@@ -1468,6 +1499,7 @@ fn finalize_committed_transaction(
     committed: NativeCommitResult,
     planned: Option<PlannedCommitFacts>,
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
+    application: CommitApplication,
 ) -> Result<kin_mcp::ToolCallResult, String> {
     let (planned_layouts, planned_carry) = match planned {
         Some(planned) => (planned.layouts, Some(planned.carried_pending_files)),
@@ -1545,6 +1577,7 @@ fn finalize_committed_transaction(
         "transaction_id": terminal.transaction_id,
         "state": "committed",
         "status": "committed",
+        "already_applied": application.already_applied(),
         "ops_applied": terminal.staged_operations.len(),
         "entity_deltas": committed.entity_count,
         "relation_deltas": committed.relation_count,
@@ -4960,6 +4993,104 @@ mod tests {
                 .generation,
             generation_after_first,
             "answering the retry must not publish a second repository generation"
+        );
+    }
+
+    /// `already_applied` must separate a first application from a replay, and
+    /// it is the only field that can.
+    ///
+    /// A replay restates the original change id, repository generation, and
+    /// root hash exactly, which is what makes the idempotency correct and also
+    /// what makes it invisible. The field was emitted only on the replay path,
+    /// where it is hardcoded true, and was absent from the reply a fresh commit
+    /// returns, so no code path could ever answer false and a caller deciding
+    /// whether its retry double-applied had nothing to read.
+    #[test]
+    fn already_applied_separates_a_first_application_from_a_replay() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+
+        let first = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(first.is_error, Some(true), "{}", result_text(&first));
+        let first_body: serde_json::Value = serde_json::from_str(result_text(&first)).unwrap();
+        assert_eq!(
+            first_body["already_applied"],
+            serde_json::json!(false),
+            "a first-ever application must report that it moved authority: {}",
+            result_text(&first)
+        );
+
+        // Exactly what a successful commit leaves behind for the next attempt.
+        state
+            .mcp_transactions
+            .lock()
+            .unwrap()
+            .remove(&transaction_id);
+        let retry_sessions = test_sessions();
+        let retry = commit_exact_transaction(&state, &retry_sessions, &arguments, None);
+        assert_ne!(retry.is_error, Some(true), "{}", result_text(&retry));
+        let retry_body: serde_json::Value = serde_json::from_str(result_text(&retry)).unwrap();
+        assert_eq!(
+            retry_body["already_applied"],
+            serde_json::json!(true),
+            "an exact replay must report that it published nothing further: {}",
+            result_text(&retry)
+        );
+
+        assert_eq!(retry_body["change_id"], first_body["change_id"]);
+        assert_eq!(retry_body["new_root_hash"], first_body["new_root_hash"]);
+        assert_eq!(
+            retry_body["repository_generation"], first_body["repository_generation"],
+            "the two replies agree on every fact about the change, which is why \
+             already_applied is the only bit that can carry the distinction"
+        );
+    }
+
+    /// Resuming a fenced commit is a replay too, and must say so.
+    ///
+    /// The publication crashed after the repository receipt existed, so
+    /// authority moved under the earlier attempt. The resume recovers that
+    /// receipt and publishes nothing, which is the same fact the evicted-record
+    /// retry reports and reaches the caller through a different path.
+    #[test]
+    fn a_resumed_fenced_commit_reports_that_authority_had_already_moved() {
+        let (_dir, state) = test_state();
+        let (entity, _) = install_exact_source(
+            &state,
+            "src/lib.rs",
+            b"pub fn value() -> u8 { 1 }\n",
+            "value",
+        );
+        let sessions = test_sessions();
+        let (transaction_id, arguments) =
+            stage_entity_edit(&sessions, &entity, "pub fn value() -> u8 { 2 }");
+
+        state
+            .mcp_fail_after_authority_once
+            .store(true, Ordering::SeqCst);
+        let crashed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_eq!(crashed.is_error, Some(true), "{}", result_text(&crashed));
+        assert_eq!(
+            sessions.get_transaction(&transaction_id).unwrap().state,
+            "committing"
+        );
+
+        let resumed = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(resumed.is_error, Some(true), "{}", result_text(&resumed));
+        let resumed_body: serde_json::Value = serde_json::from_str(result_text(&resumed)).unwrap();
+        assert_eq!(
+            resumed_body["already_applied"],
+            serde_json::json!(true),
+            "a resume recovers a receipt an earlier attempt published: {}",
+            result_text(&resumed)
         );
     }
 
