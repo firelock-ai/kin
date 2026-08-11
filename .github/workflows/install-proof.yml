@@ -737,24 +737,29 @@ jobs:
           git add -A && git commit -qm "probe"
           # kin init admits this worktree exactly and repeats that proof across
           # publication, so a report file must neither exist in it nor grow
-          # while init runs. Capture outside the admitted tree and copy the log
-          # back afterwards, on success and on failure alike, so a refusal still
-          # reaches the uploaded proof reports.
-          init_log="$RUNNER_TEMP/kin-init.txt"
+          # while init runs. Every later capture is under the same constraint
+          # for the same reason: the daemon admits observed new files as they
+          # are written, so a report written into this tree becomes semantic
+          # corpus and the store the proof measures keeps growing while it is
+          # being measured. Capture outside the admitted tree throughout, and
+          # copy the whole set back after the last assertion that reads the
+          # store, on success and on failure alike, so a refusal still reaches
+          # the uploaded proof reports.
+          captures="$RUNNER_TEMP/kin-proof-captures"
+          mkdir -p "$captures"
           init_status=0
-          kin init > "$init_log" 2>&1 || init_status=$?
-          cat "$init_log"
-          cp "$init_log" kin-init.txt
+          kin init > "$captures/kin-init.txt" 2>&1 || init_status=$?
+          cat "$captures/kin-init.txt"
           if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi
           # Do not pipe this command through tee. On Windows, the daemon child
           # inherits the pipe and keeps it open until idle shutdown, which makes
           # the shell wait for the daemon and then tests a process that just exited.
-          kin status > kin-status.txt 2>&1
-          cat kin-status.txt
-          kin status --json > kin-status.json 2>&1
-          cat kin-status.json
-          kin bench-meta --json > kin-build-meta.json
-          cat kin-build-meta.json
+          kin status > "$captures/kin-status.txt" 2>&1
+          cat "$captures/kin-status.txt"
+          kin status --json > "$captures/kin-status.json" 2>&1
+          cat "$captures/kin-status.json"
+          kin bench-meta --json > "$captures/kin-build-meta.json"
+          cat "$captures/kin-build-meta.json"
           # Prove every supported agent-client config writer without requiring
           # the proprietary clients on a public runner. Detection is PATH-based;
           # these inert shims make setup exercise the real merge paths while the
@@ -802,12 +807,12 @@ jobs:
           NODE
 
           kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
-            2>&1 | tee kin-setup.txt
+            2>&1 | tee "$captures/kin-setup.txt"
 
           # Normalize the real TOML Codex entry with Python's standard parser
           # so the later cross-platform Node validator can apply the same exact
           # command/args/profile checks it applies to JSON clients.
-          CODEX_CONFIG="$HOME/.codex/config.toml" python3 - <<'PY'
+          CODEX_CONFIG="$HOME/.codex/config.toml" PROOF_CAPTURES="$captures" python3 - <<'PY'
           import json
           import os
           import pathlib
@@ -816,7 +821,7 @@ jobs:
           config = pathlib.Path(os.environ["CODEX_CONFIG"])
           with config.open("rb") as handle:
               entry = tomllib.load(handle)["mcp_servers"]["kin"]
-          pathlib.Path("kin-codex-config.json").write_text(
+          pathlib.Path(os.environ["PROOF_CAPTURES"], "kin-codex-config.json").write_text(
               json.dumps({"mcpServers": {"kin": entry}}, indent=2) + "\n",
               encoding="utf-8",
           )
@@ -846,26 +851,31 @@ jobs:
           HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
           KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
             kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
-            2>&1 | tee kin-claude-fallback-setup.txt
+            2>&1 | tee "$captures/kin-claude-fallback-setup.txt"
           if [ -e "$claude_fallback_home/.claude.json" ]; then
             echo "Claude fallback proof unexpectedly wrote the primary ~/.claude.json path" >&2
             exit 1
           fi
-          cp "$claude_fallback_home/.claude/config.json" kin-claude-fallback-config.json
+          cp "$claude_fallback_home/.claude/config.json" "$captures/kin-claude-fallback-config.json"
           HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
           KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
-            kin setup status --json > kin-claude-fallback-health.json
+            kin setup status --json > "$captures/kin-claude-fallback-health.json"
           HOME="$claude_fallback_home" USERPROFILE="$claude_fallback_home" \
           KIN_HOME="$primary_home/.kin" PATH="$claude_fallback_path" \
-            kin doctor --json > kin-claude-fallback-doctor.json
+            kin doctor --json > "$captures/kin-claude-fallback-doctor.json"
 
       - name: Graph query and MCP tool-call proof
         shell: bash
         working-directory: kin-install-proof
         run: |
           set -euo pipefail
-          kin search hello --json | tee kin-search.json
-          kin locate hello --json --explain --max-files 5 | tee kin-locate.json
+          # Same capture directory the first-run step opened, for the same
+          # reason: nothing this proof writes may land in the tree the daemon
+          # is watching until every assertion that reads the store has run.
+          captures="$RUNNER_TEMP/kin-proof-captures"
+          mkdir -p "$captures"
+          kin search hello --json | tee "$captures/kin-search.json"
+          kin locate hello --json --explain --max-files 5 | tee "$captures/kin-locate.json"
 
           # `kin status` deliberately does not auto-start the daemon. The graph
           # query above does, so capture daemon provenance only after that
@@ -877,7 +887,7 @@ jobs:
               exit 1
               ;;
           esac
-          DAEMON_PORT="$daemon_port" node <<'NODE' > kin-daemon-health.json
+          DAEMON_PORT="$daemon_port" node <<'NODE' > "$captures/kin-daemon-health.json"
           const http = require("http");
           const request = http.get(
             `http://127.0.0.1:${process.env.DAEMON_PORT}/health`,
@@ -903,9 +913,9 @@ jobs:
             process.exitCode = 1;
           });
           NODE
-          cat kin-daemon-health.json
-          kin setup status --json | tee kin-health.json
-          kin doctor --json | tee kin-doctor.json
+          cat "$captures/kin-daemon-health.json"
+          kin setup status --json | tee "$captures/kin-health.json"
+          kin doctor --json | tee "$captures/kin-doctor.json"
 
           # Drive the absolute installed MCP stdio server through initialize,
           # tools/list, a real graph-backed semantic_search call, daemon loss,
@@ -913,10 +923,12 @@ jobs:
           # directory from the child's PATH and clear KIN_DAEMON_BIN: sibling
           # discovery must work on its own, including kin-daemon.exe on Windows.
           # Node owns the timeout so this behaves the same on every runner.
-          node <<'NODE'
+          PROOF_CAPTURES="$captures" node <<'NODE'
           const fs = require("fs");
           const path = require("path");
           const { execFileSync, spawn, spawnSync } = require("child_process");
+
+          const captures = process.env.PROOF_CAPTURES;
 
           const resolver = process.platform === "win32"
             ? ["where.exe", ["kin"]]
@@ -962,7 +974,7 @@ jobs:
               },
             );
             fs.appendFileSync(
-              "kin-mcp-daemon-stop.txt",
+              path.join(captures, "kin-mcp-daemon-stop.txt"),
               `${phase}: status=${stopped.status}\n${stopped.stdout ?? ""}${stopped.stderr ?? ""}\n`,
             );
             if (stopped.error || stopped.status !== 0) {
@@ -1018,8 +1030,8 @@ jobs:
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            fs.writeFileSync("kin-mcp-out.jsonl", stdout);
-            fs.writeFileSync("kin-mcp-err.txt", stderr);
+            fs.writeFileSync(path.join(captures, "kin-mcp-out.jsonl"), stdout);
+            fs.writeFileSync(path.join(captures, "kin-mcp-err.txt"), stderr);
             if (error) {
               if (!child.killed) child.kill("SIGKILL");
               console.error(error);
@@ -1106,6 +1118,11 @@ jobs:
         working-directory: kin-install-proof
         run: |
           set -euo pipefail
+          # Same capture directory the first-run step opened. The VFS logs and
+          # the probe's own output are reports about the tree, so they stay out
+          # of it while the daemon is watching.
+          captures="$RUNNER_TEMP/kin-proof-captures"
+          mkdir -p "$captures"
           # The shipped shim deliberately bypasses Kin-family control-plane
           # processes (basenames beginning with `kin-`). Keep this external
           # probe outside that namespace so the proof exercises interposition.
@@ -1176,7 +1193,7 @@ jobs:
             cleanup_status=0
             chmod u+rw probe.py || cleanup_status=1
             if [ -n "$vfs_pid" ]; then
-              kin-vfs stop --workspace . >> kin-vfs-daemon.log 2>&1 || cleanup_status=1
+              kin-vfs stop --workspace . >> "$captures/kin-vfs-daemon.log" 2>&1 || cleanup_status=1
               stopped=false
               for _ in $(seq 1 150); do
                 # A missing PID is the expected successful-stop state. Keep
@@ -1190,7 +1207,7 @@ jobs:
                 sleep 0.1
               done
               if [ "$stopped" != true ]; then
-                cat kin-vfs-daemon.log >&2
+                cat "$captures/kin-vfs-daemon.log" >&2
                 echo "installed kin-vfs daemon did not stop cleanly" >&2
                 kill "$vfs_pid" 2>/dev/null || true
                 sleep 1
@@ -1227,7 +1244,7 @@ jobs:
           trap 'on_vfs_signal 130' INT
           trap 'on_vfs_signal 143' TERM
 
-          kin-vfs start --workspace . > kin-vfs-daemon.log 2>&1 &
+          kin-vfs start --workspace . > "$captures/kin-vfs-daemon.log" 2>&1 &
           vfs_pid=$!
           socket_ready=false
           for _ in $(seq 1 150); do
@@ -1241,7 +1258,7 @@ jobs:
             sleep 0.1
           done
           if [ "$socket_ready" != true ]; then
-            cat kin-vfs-daemon.log >&2
+            cat "$captures/kin-vfs-daemon.log" >&2
             echo "installed kin-vfs daemon did not bind its socket" >&2
             exit 1
           fi
@@ -1250,26 +1267,26 @@ jobs:
           # only the installed shim and real Kin daemon can return probe.py.
           chmod 000 probe.py
           set +e
-          "$probe_bin" "$PWD/probe.py" > vfs-negative.txt 2>&1
+          "$probe_bin" "$PWD/probe.py" > "$captures/vfs-negative.txt" 2>&1
           negative_status=$?
           set -e
           if [ "$negative_status" -ne 4 ]; then
-            cat vfs-negative.txt >&2
+            cat "$captures/vfs-negative.txt" >&2
             echo "negative control failed before the expected raw-disk open denial (status $negative_status)" >&2
             exit 1
           fi
-          if ! grep -Eq '^open: (Permission denied|Operation not permitted)$' vfs-negative.txt; then
-            cat vfs-negative.txt >&2
+          if ! grep -Eq '^open: (Permission denied|Operation not permitted)$' "$captures/vfs-negative.txt"; then
+            cat "$captures/vfs-negative.txt" >&2
             echo "negative control did not fail with the expected raw-disk permission error" >&2
             exit 1
           fi
 
           KIN_VFS_STRICT=1 kin-vfs exec --workspace . -- \
             "$probe_bin" "$PWD/probe.py" \
-            > vfs-graph-read.txt 2> vfs-graph-read.stderr.txt
-          printf 'def hello():\n    return 42\n' > vfs-expected.txt
-          if ! cmp -s vfs-expected.txt vfs-graph-read.txt; then
-            cmp -l vfs-expected.txt vfs-graph-read.txt >&2 || true
+            > "$captures/vfs-graph-read.txt" 2> "$captures/vfs-graph-read.stderr.txt"
+          printf 'def hello():\n    return 42\n' > "$captures/vfs-expected.txt"
+          if ! cmp -s "$captures/vfs-expected.txt" "$captures/vfs-graph-read.txt"; then
+            cmp -l "$captures/vfs-expected.txt" "$captures/vfs-graph-read.txt" >&2 || true
             echo "installed VFS did not return the exact graph-owned probe.py bytes" >&2
             exit 1
           fi
@@ -1302,7 +1319,119 @@ jobs:
               ;;
             *) echo "unsupported Unix install-proof shell: $PROOF_SHELL" >&2; exit 1 ;;
           esac
-          kin embed --max-seconds 300 --json | tee kin-embed.json
+          # Same capture directory the first-run step opened, for the same
+          # reason. This step is where it matters most: everything below reads
+          # the store and asserts on what it read.
+          captures="$RUNNER_TEMP/kin-proof-captures"
+          mkdir -p "$captures"
+          kin embed --max-seconds 300 --json | tee "$captures/kin-embed.json"
+
+          # A pass reports on the work it took, and the store can still be
+          # taking on content the pass never saw: kin init admits the worktree,
+          # setup writes the agent config into it, and the watcher admits new
+          # non-ignored files as they arrive. Coverage is an instantaneous
+          # whole-store read, so a capture taken while any of that is still
+          # landing measures a corpus that grows underneath it, which is what
+          # left one leg reading complete coverage in health and 13 of 18 in
+          # locate a second later. Settle the store before measuring it: poll
+          # the counters until an embedding pass has nothing left pending and
+          # two consecutive reads agree that nothing new was admitted between
+          # them. A sleep would be a guess about how long that takes; this is
+          # the measurement itself, bounded, and loud about the exact counter
+          # that never settled when the budget runs out.
+          PROOF_CAPTURES="$captures" node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const { execFileSync } = require("child_process");
+
+          const captures = process.env.PROOF_CAPTURES;
+          const budgetMs = 180_000;
+          const pollSeconds = 1;
+          const log = [];
+          const record = (line) => {
+            log.push(line);
+            console.log(line);
+          };
+          const flush = () => {
+            fs.writeFileSync(
+              path.join(captures, "kin-embedding-settle.txt"),
+              `${log.join("\n")}\n`,
+            );
+          };
+
+          // Everything a later read could see change: the counters an embedding
+          // pass drains, and the generations and counts admission moves. Equal
+          // fingerprints across two consecutive reads is what "nothing arrived
+          // between them" means here.
+          const fingerprint = (status) => {
+            const enrichment = status.semantic_enrichment ?? {};
+            const coverage = status.embedding_coverage ?? {};
+            return JSON.stringify({
+              repository_generation: status.repository?.generation,
+              workspace_generation: status.workspace?.generation,
+              authority_generation: enrichment.authority_generation,
+              enrichment_workspace_generation: enrichment.workspace_generation,
+              entity_count: enrichment.entity_count,
+              relation_count: enrichment.relation_count,
+              semantic_change_count: enrichment.semantic_change_count,
+              coverage_state: coverage.state,
+              coverage_reason: coverage.reason,
+              indexed: coverage.indexed,
+              pending: coverage.pending,
+              total: coverage.total,
+            });
+          };
+
+          const deadline = Date.now() + budgetMs;
+          let previous = null;
+          let last = "no status read completed";
+          let reads = 0;
+          let settled = false;
+          while (Date.now() < deadline) {
+            reads += 1;
+            let status;
+            try {
+              status = JSON.parse(
+                execFileSync("kin", ["status", "--json"], { encoding: "utf8", timeout: 120_000 }),
+              );
+            } catch (error) {
+              // A read that fails is not a settled store. Keep polling and let
+              // the expiry below report the last failure rather than treating
+              // an unreadable store as a quiet one.
+              last = `kin status --json failed: ${error.message}`;
+              previous = null;
+              execFileSync("sleep", [String(pollSeconds)]);
+              continue;
+            }
+            const current = fingerprint(status);
+            last = current;
+            const coverage = status.embedding_coverage ?? {};
+            const drained =
+              coverage.state === "observed" &&
+              coverage.total > 0 &&
+              coverage.pending === 0 &&
+              coverage.indexed === coverage.total;
+            if (drained && current === previous) {
+              record(`settled after ${reads} reads: ${current}`);
+              settled = true;
+              break;
+            }
+            previous = current;
+            execFileSync("sleep", [String(pollSeconds)]);
+          }
+          if (!settled) {
+            record(`did not settle within ${budgetMs / 1000}s over ${reads} reads: ${last}`);
+            flush();
+            console.log(
+              `::error::the store never settled: ${last}. ` +
+              "Embedding coverage must reach observed with pending 0 and indexed equal to total, " +
+              "and two consecutive reads must agree that nothing new was admitted between them.",
+            );
+            process.exit(1);
+          }
+          flush();
+          NODE
+
           # Coverage can be momentarily unobservable rather than incomplete: a
           # graph mutation batch spanning the sample leaves the daemon unable to
           # pair counters with a stable authority epoch, and status then reports
@@ -1321,19 +1450,52 @@ jobs:
           case "$settle_probe" in
             *--wait-quiesce*)
               printf 'bounded settle (kin status --wait-quiesce 60)\n' \
-                | tee kin-status-settle-mode.txt
-              kin status --json --wait-quiesce 60 | tee kin-embedded-status.json
+                | tee "$captures/kin-status-settle-mode.txt"
+              kin status --json --wait-quiesce 60 | tee "$captures/kin-embedded-status.json"
               ;;
             *)
               printf 'single sample (installed kin has no --wait-quiesce)\n' \
-                | tee kin-status-settle-mode.txt >&2
-              kin status --json | tee kin-embedded-status.json
+                | tee "$captures/kin-status-settle-mode.txt" >&2
+              kin status --json | tee "$captures/kin-embedded-status.json"
               ;;
           esac
-          kin setup status --json | tee kin-embedded-health.json
-          kin doctor --json | tee kin-embedded-doctor.json
-          kin search hello --semantic --json | tee kin-semantic-search.json
-          kin locate hello --json --explain --max-files 5 | tee kin-semantic-locate.json
+          kin setup status --json | tee "$captures/kin-embedded-health.json"
+          kin doctor --json | tee "$captures/kin-embedded-doctor.json"
+          kin search hello --semantic --json | tee "$captures/kin-semantic-search.json"
+          kin locate hello --json --explain --max-files 5 | tee "$captures/kin-semantic-locate.json"
+
+      - name: Restore captured proof reports into the proof repository
+        # Every assertion that reads the store has run by now, so the captures
+        # can take their place in the tree and the uploaded artifact keeps the
+        # layout it has always had. This runs on failure too: a leg that died
+        # early still has to hand over what it captured before it died, which
+        # is the whole reason the init log was already copied back on both
+        # paths before any of the rest moved out here.
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          captures="$RUNNER_TEMP/kin-proof-captures"
+          destination="$PWD/kin-install-proof"
+          if [ ! -d "$captures" ]; then
+            echo "no proof captures were taken"
+            exit 0
+          fi
+          if [ ! -d "$destination" ]; then
+            echo "no proof repository exists to restore captures into"
+            exit 0
+          fi
+          # List the directory rather than globbing it. RUNNER_TEMP is a
+          # backslash path on Windows, which reaches a syscall intact but does
+          # not survive pathname expansion, so a `"$captures"/*` pattern would
+          # match nothing there and restore nothing while exiting clean.
+          restored=0
+          while IFS= read -r capture; do
+            [ -n "$capture" ] || continue
+            cp "$captures/$capture" "$destination/$capture"
+            restored=$((restored + 1))
+          done < <(ls -1 "$captures")
+          echo "restored $restored proof capture(s) into the proof repository"
 
       - name: Validate installed capability proof
         shell: bash
