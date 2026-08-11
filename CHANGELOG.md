@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split the Windows authority job and budget its steps (#743)
 - Account for Windows binary suffixes in the installer post-extract path (#744)
 - Verify MCP bindings against what setup recorded and name the repository setup binds (#745)
+- Scope daemon stop and the daemon census by KIN_HOME, with the supervisor machine-wide by contract (#746)
 
 
 ## [0.5.17] - 2026-08-10
