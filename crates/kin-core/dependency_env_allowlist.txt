@@ -1,12 +1,12 @@
-# Intentional exceptions for the `every_kin_db_env_read_is_registered` test in
-# src/env_registry.rs.
+# Intentional exceptions for the `every_pinned_dependency_env_read_is_registered`
+# test in src/env_registry.rs.
 #
-# That test enumerates every `KIN_*` name appearing in the pinned kin-db's own
-# `src/` and requires each one to be registered, because kin-db reads its
-# embedding surface out of the same process environment kin validates at startup.
-# An unregistered name there makes the startup audit call a live knob
-# "unrecognized ... no effect", and makes KIN_ENV_VALIDATION=strict refuse to
-# start.
+# That test enumerates every `KIN_*` name appearing in the pinned kin-db,
+# kin-infer, kin-search, and kin-vector `src/` trees and requires each one to be
+# registered, because those crates read their levers out of the same process
+# environment kin validates at startup. An unregistered name there makes the
+# startup audit call a live knob "unrecognized ... no effect", and makes
+# KIN_ENV_VALIDATION=strict refuse to start.
 #
 # List one `KIN_*` name per line to exempt a name the scan finds but that is
 # genuinely not an operator-facing variable, such as a name assembled only for a
@@ -15,7 +15,55 @@
 #
 # The default and correct action is to register the variable in the DOWNSTREAM
 # table in env_registry.rs, with the kind, default, and sensitivity read off the
-# actual kin-db read site. An entry here is a conscious decision to keep a name
-# out of the registry, not a place to silence a real gap.
+# actual read site. An entry here is a conscious decision to keep a name out of
+# the registry, not a place to silence a real gap.
+
+# ---- kin-infer embed watchdog: no caller in this dependency graph ----------
+# `EmbedConfig::from_env` in kin-infer's watchdog.rs reads these six. Neither
+# kin nor the pinned kin-db constructs `EmbedConfig` or `EmbedWatchdog`
+# anywhere, so nothing in a kin process ever reads them and registering them
+# would document a surface an operator cannot reach: setting KIN_EMBED_MAX_SECS
+# against today's binaries caps nothing. They stay out of the registry until a
+# caller exists (FIR-2163).
 #
-# (No exceptions are needed at the currently pinned kin-db.)
+# Wiring the watchdog is the real open question rather than a registration one.
+# Umbrella doctrine wants embed drivers to carry a parent-death watchdog and a
+# hard wall-clock cap that releases the GPU, and kin-infer already implements
+# both behind this config with nothing calling it. If that wiring lands, delete
+# this block and register all six.
+KIN_EMBED_WATCHDOG
+KIN_EMBED_ORPHAN_CHECK
+KIN_EMBED_MAX_SECS
+KIN_EMBED_MIN_RATE
+KIN_EMBED_FLOOR_WINDOW_SECS
+KIN_EMBED_FLOOR_GRACE_SECS
+
+# ---- test-only fixture names in the pinned dependencies -------------------
+# The scan is deliberately over-inclusive: it matches the `KIN_*` literal rather
+# than a read shape, so it also sees names that exist only inside a dependency's
+# own `#[cfg(test)]` module. These never reach a kin process.
+
+# kin-infer resource.rs: the deliberately-absent name its env_flag_override test
+# asserts parses to None.
+KIN_INFER_NONEXISTENT_FLAG_XYZ
+
+# kin-infer lib.rs: per-case fixture names for the segment-layer clamp tests, one
+# variable per case so the cases do not contend on a shared name.
+KIN_INFER_TEST_SEGMENT_LAYERS_ZERO
+KIN_INFER_TEST_SEGMENT_LAYERS_VALID
+KIN_INFER_TEST_SEGMENT_LAYERS_DEFAULT_ZERO
+KIN_INFER_TEST_SEGMENT_LAYERS_MAX
+KIN_INFER_TEST_SEGMENT_LAYERS_OVERSIZED
+
+# kin-search lib.rs: knobs for its own segmented-persistence soak test, read only
+# from inside that test.
+KIN_SEARCH_SOAK_ROUNDS
+KIN_SEARCH_SOAK_CHECK_EVERY
+KIN_SEARCH_SOAK_MAX_LIVE
+KIN_SEARCH_SOAK_SEED
+KIN_SEARCH_SOAK_SECS
+
+# kin-vector lib.rs: shape knobs for its own in-crate distance benchmark.
+KIN_VECTOR_BENCH_DIM
+KIN_VECTOR_BENCH_VECTORS
+KIN_VECTOR_BENCH_ITERS

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (442 total, 321 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (479 total, 332 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -74,11 +74,15 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
 | `KIN_REQUIRE_COMPLETE_EMBEDDINGS` | bool | false | correctness | require full embedding coverage before answering locate/search |
 | `KIN_RESOURCE_PROFILE` | enum | interactive | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset, the kin binaries select interactive at startup (value-preserving Metal kernels, proof's embedding budgets), while a library caller that never selects still resolves to proof; throughput additionally scales the batch budgets, may engage CPU/GPU hybrid embedding and overlaps persist with compute, and is non-citable |
+| `KIN_ROPE_PERELEM` | string | *(unset)* | correctness | kin-infer forces the per-input RoPE path (one submission per input) instead of the single whole-batch dispatch; any present value including '0' forces it, and the two strategies are held to a cosine and max-absolute-error parity bar rather than being bit-identical |
 | `KIN_SCOPE_TIMING` | bool | false | diagnostic | print scope graph build timing to stderr |
+| `KIN_SEARCH_INCREMENTAL_PERSIST` | bool | true | operational | kin-search segmented/incremental persistence, on by default; only 0/false/no/off keep the monolithic full-rewrite path, and because load auto-detects the on-disk format the flag governs write strategy and dirty-tracking only, so toggling it is safe in both directions |
 | `KIN_SEARCH_MODE` | enum | *(unset)* | correctness | search strictness; 'precise' rejects broad show-body searches |
+| `KIN_SEARCH_SEGMENT_COUNT` | usize | 64 | operational | kin-search segment count for a newly established segmented index only; must be >= 1, an unparseable value falls back to 64, and an existing index keeps whatever count it was built with |
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
+| `KIN_VECTOR_SIMD` | bool | true | correctness | kin-vector NEON SIMD cosine-distance kernel on aarch64, on by default; only 0/false/no/off select the scalar reduction, and the two reduction orders differ in the last ULPs so distances and therefore ranking order can shift |
 | `KIN_VFS_DISABLE` | bool | false | correctness | kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off |
 | `KIN_VFS_STRICT` | bool | false | correctness | require graph-authoritative projection misses to fail loud when the daemon is unreachable instead of passing through to raw files |
 | `KIN_WORKSPACE_DIR` | path | *(unset)* | operational | docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume |
@@ -185,9 +189,42 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_INFER_BUCKET` | bool | true | operational | kin-infer length-bucketed batched forward, on by default; only 0/false/no/off opts out, and the bucketed path is bit-identical per entity so the opt-out is a safe fallback rather than a different answer |
 | `KIN_INFER_CPU_BACKEND` | enum | accelerate | correctness | kin-infer CPU matmul backend: 'pure-rust' forces the deterministic pure-Rust GEMM for bit-reproducible runs; 'accelerate' uses Apple Accelerate BLAS (the macOS default). BLAS differs from pure-Rust in the last ULPs |
+| `KIN_INFER_DUMP_ENTITY` | usize | 0 | diagnostic | kin-infer index of the entity traced by KIN_INFER_DUMP_LAYER; an unparseable value falls back to 0 |
+| `KIN_INFER_DUMP_LAYER` | string | *(unset)* | diagnostic | kin-infer prints a per-layer hidden-state fingerprint on both the single and batched paths so the two trajectories can be diffed to localize a divergent op; any present value including '0' enables it |
+| `KIN_INFER_FAST_MATH` | bool | true | correctness | kin-infer MSL fast-math, on by default because that is the toolchain default the shipped kernels were compiled against; only the literal 0 disables it, removing float reassociation and the assume-finite contract and so changing results |
+| `KIN_INFER_FLASH_ATTENTION` | bool | false | correctness | kin-infer fused C7 flash-attention kernel family; off in every profile because the fused online softmax changes the attention reduction order and clears only a 5e-4 tolerance against CPU, so it can perturb embedding values |
+| `KIN_INFER_FORCE_CPU` | string | *(unset)* | correctness | kin-infer CPU backend override: any present non-empty value other than '0' forces the CPU path instead of the detected accelerator, and CPU differs from Metal in the last ULPs |
+| `KIN_INFER_GEMM_FP16` | bool | false | correctness | kin-infer fp16-operand MMA GEMM; fp16 operands lose about half the mantissa, so it is a throughput-only path that stays off in every profile including proof |
+| `KIN_INFER_MAX_INFLIGHT` | usize | *(unset)* | operational | kin-infer Metal command-buffer submission depth; an explicit value must be >= 1, and unset takes the depth of the profile KIN_RESOURCE_PROFILE resolves to (proof's depth when unset or unrecognized) |
+| `KIN_INFER_METAL_NAN_CHECK` | string | *(unset)* | diagnostic | kin-infer scans Metal op outputs for non-finite values and prints the first offending index; any present value including '0' enables it |
+| `KIN_INFER_METAL_PHASE_COUNTERS` | bool | true | diagnostic | kin-infer per-phase GPU timestamp counter sampling, consulted only while KIN_INFER_METAL_PROFILE is set; only the literal 0 opts out, which keeps the profiling cadence fix and drops just the counter sampling |
+| `KIN_INFER_METAL_POOL_CAP_BYTES` | usize | 3221225472 | operational | kin-infer Metal buffer-pool total-bytes cap; must be > 0, and an unparseable or zero value falls back to 3 GiB |
 | `KIN_INFER_METAL_PROFILE` | string | *(unset)* | operational | Metal inference profile selection |
+| `KIN_INFER_METAL_RESIDENT_BUDGET_BYTES` | usize | *(unset)* | operational | kin-infer byte budget admitting concurrent GPU-resident stack reservations; must be > 0, and unset derives from the Metal device's recommended working-set size and system memory |
+| `KIN_INFER_MMA` | bool | true | correctness | kin-infer simdgroup_matrix MMA GEMM kernels, on by default; only 0/false/no/off forces the scalar tile, and MMA clears a Metal-vs-CPU cosine and swerank parity gate rather than being bit-identical to it |
+| `KIN_INFER_MMA_WIDE` | bool | false | operational | kin-infer wider 64x64 MMA register tile, numerically identical to the 32x32 MMA by construction; off in every profile because the register pressure cuts embed throughput several-fold, and it stays opt-in so the kernel can be measured in isolation |
+| `KIN_INFER_MSL_VERSION` | enum | *(unset)* | correctness | kin-infer Metal shading language version for the runtime shader compile: '30' and '31' select MSL 3.0/3.1 as a driver-miscompile probe with different codegen, and anything else including unset compiles at the byte-identical MSL 2.4 default |
+| `KIN_INFER_NO_FOLD` | bool | false | correctness | kin-infer routes the attention-output and FFN blocks through the unfused per-op linear+add+norm path instead of the fused residency folds; only 1/true/yes/on enable it, and the result is numerically the unfused computation rather than the folded one |
+| `KIN_INFER_NO_POOL_REUSE` | string | *(unset)* | diagnostic | kin-infer stops the Metal buffer pool recycling so every acquire allocates fresh, probing whether a buffer-reuse timing race is the corruption source; any present value including '0' enables it |
+| `KIN_INFER_NO_RESIDENT_STACK` | string | *(unset)* | correctness | kin-infer escape hatch forcing the per-layer accelerator path instead of the whole-stack GPU-resident pass; any present value including '0' forces it, it is read fresh on every call rather than sampled once, and the two paths are what a bit-for-bit A/B compares |
 | `KIN_INFER_OCCUPANCY_DISPATCH` | bool | false | operational | kin-infer Metal occupancy-informed pointwise threadgroup sizing; numerically identical to the one-simdgroup baseline (a perf A/B lever), default off |
+| `KIN_INFER_POOLED_MAX_BATCH_SIZE` | usize | 256 | operational | kin-infer batch-size ceiling above which the pooled-output readback declines and the full-hidden path runs instead; must be > 0, and an unparseable or zero value falls back to 256 |
+| `KIN_INFER_POOLED_MAX_SEQ` | usize | 512 | operational | kin-infer sequence-length ceiling for the unsegmented pooled-output readback; must be > 0, and an unparseable or zero value falls back to 512 |
+| `KIN_INFER_POOLED_OUTPUT` | bool | *(unset)* | operational | kin-infer pooled-embedding readback from the accelerator instead of the full hidden matrix; the device pooling kernel accumulates real tokens in row order exactly as the host mean-pool does, so values are preserved. Unset engages it under the throughput and interactive profiles on Metal, and an explicit 1/0 overrides in either direction |
+| `KIN_INFER_POOLED_OUTPUT_LOG` | string | *(unset)* | diagnostic | kin-infer logs each pooled-output readback decision and decline reason to stderr; any present value including '0' enables it |
+| `KIN_INFER_POOLED_SEGMENTED_MAX_SEQ` | usize | 2048 | operational | kin-infer sequence-length ceiling for the segmented pooled-output readback, above which pooling declines entirely; must be > 0, and an unparseable or zero value falls back to 2048 |
+| `KIN_INFER_POOLED_SEGMENT_LAYERS` | usize | 2 | operational | kin-infer transformer layers per command buffer when the pooled-output path segments a long sequence; clamped to 1..=8, and an unparseable or zero value falls back to 2 |
+| `KIN_INFER_RESHAPE_GPU` | bool | false | correctness | kin-infer on-device head-major attention reshape instead of the host scatter; off in every profile including proof, where the host scatter is what reproduces the original layout byte-for-byte |
+| `KIN_INFER_RESIDENT_MAX_BATCH_SIZE` | usize | *(unset)* | operational | kin-infer batch-size ceiling for the GPU-resident whole-stack pass; must be > 0, and unset inherits the pooled-output batch cap (256 by default) |
+| `KIN_INFER_RESIDENT_MAX_SEQ` | usize | *(unset)* | operational | kin-infer unsegmented sequence-length ceiling for the GPU-resident whole-stack pass; must be > 0, and unset inherits the pooled-output sequence cap (512 by default) |
+| `KIN_INFER_RESIDENT_SEGMENTED_MAX_SEQ` | usize | *(unset)* | operational | kin-infer segmented sequence-length ceiling for the GPU-resident whole-stack pass; must be > 0, and unset inherits the pooled-output segmented cap (2048 by default) |
+| `KIN_INFER_RESIDENT_SEGMENT_LAYERS` | usize | *(unset)* | operational | kin-infer transformer layers per command buffer when the GPU-resident pass segments a long sequence; clamped to 1..=8, and unset inherits the pooled-output segment layers (2 by default) |
+| `KIN_INFER_RESIDENT_STACK_LOG` | string | *(unset)* | diagnostic | kin-infer logs each GPU-resident stack decision and decline reason to stderr; any present value including '0' enables it |
+| `KIN_INFER_STAGE_TIMINGS` | string | *(unset)* | diagnostic | kin-infer splits batched-forward wall time into the device encode/readback stage and the host pooling tail; any present value including '0' enables it, and it is zero-cost while unset |
+| `KIN_INFER_STEEL` | bool | *(unset)* | operational | kin-infer double-buffered K-loop MMA GEMM, numerically identical to the single-buffer path (same fp32 accumulate and per-fragment reduction order, only when the loads are issued differs); unset engages it under the throughput and interactive profiles on Metal, and an explicit 1/0 overrides in either direction |
+| `KIN_INFER_ZERO_ALL` | bool | false | diagnostic | kin-infer zeroes every acquired Metal buffer and its size-class tail so no read can observe stale recycled bytes; only 1/true/yes/on enable it, and the default path is byte-identical |
 
 ## Storage
 
