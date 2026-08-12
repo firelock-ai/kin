@@ -97,7 +97,7 @@ Public Git history is part of the product, so keep it clean and reviewable:
 
 - **Keep branch names topical, not tracker-coded.** Prefer short, descriptive
   names like `fix/write-durability` or `feat/streaming-list`. Avoid embedding
-  internal issue or tracker IDs in a branch name — a squash merge copies the
+  internal issue or tracker IDs in a branch name. A squash merge copies the
   branch name into the public commit subject, so anything in the branch name
   lands in history verbatim.
 - **Write durable subjects and bodies.** Commit messages should describe the

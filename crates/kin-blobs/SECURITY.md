@@ -36,7 +36,8 @@ support window.
 ## Scope
 
 This policy covers the `kin-blobs` repository: the content-addressable blob
-storage substrate — immutable content keyed by its SHA-256 digest, with atomic,
-Git-style sharded writes. Other Kin ecosystem repositories (for example `kin`,
-`kin-db`, `kin-vfs`, `kinlab`) carry their own security policies; report issues
-against the repository where the affected code lives.
+storage substrate, which keys immutable content by its SHA-256 digest and
+writes it atomically into a Git-style sharded layout. Other Kin ecosystem
+repositories (for example `kin`, `kin-db`, `kin-vfs`, `kinlab`) carry their own
+security policies; report issues against the repository where the affected code
+lives.
