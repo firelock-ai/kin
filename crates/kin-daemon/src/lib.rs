@@ -119,6 +119,7 @@ pub mod background_work;
 pub mod commit_deltas;
 pub mod daemon;
 pub mod error;
+pub mod graph_only_members;
 pub mod lifecycle;
 mod local_repository_authority;
 pub mod loop_runner;
