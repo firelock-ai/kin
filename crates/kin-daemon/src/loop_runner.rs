@@ -1557,6 +1557,10 @@ pub async fn run_loop(
                     .background_work
                     .reconcile()
                     .record_admission_success(Instant::now());
+                crate::background_work::record_durable_admission(
+                    &state.layout,
+                    state.graph.resolved_tree().len() as u64,
+                );
                 admission
             }
             Err(error) => {
