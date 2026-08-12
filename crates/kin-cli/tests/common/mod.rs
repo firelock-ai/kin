@@ -1366,12 +1366,81 @@ pub struct Command<'runtime> {
 
 impl Command<'static> {
     pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
+        let program = program.as_ref();
+        let mut inner = std::process::Command::new(program);
+        if is_git_program(program) {
+            inner.args(FIXTURE_GIT_MAINTENANCE_SUPPRESSION);
+        }
         Self {
-            inner: Some(std::process::Command::new(program)),
+            inner: Some(inner),
             runtime: None,
             intentional_env: Vec::new(),
         }
     }
+}
+
+/// Command-scope configuration prepended to every fixture Git launch.
+///
+/// Integration fixtures commit a repository and then admit it. Git otherwise
+/// ends a commit by spawning `git maintenance run --auto --quiet --detach`,
+/// which outlives the commit, and whose incremental-repack task runs
+/// `git multi-pack-index write` and holds
+/// `objects/pack/multi-pack-index.lock` for the width of that write. Kin's
+/// admission preflight reads any lock under `objects/pack` as concurrent
+/// repository mutation and refuses, so the fixture was racing a background
+/// process it never asked for.
+///
+/// This rides on the argument list rather than in the environment on purpose.
+/// The environment of a fixture command is inherited by the `kin` binary under
+/// test and by every Git process it spawns, and the fixture boundary keeps that
+/// environment free of Git configuration scope so the product is exercised with
+/// the Git behavior a user would get.
+const FIXTURE_GIT_MAINTENANCE_SUPPRESSION: [&str; 4] =
+    ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
+/// Whether a program name launches Git, so the suppression above reaches every
+/// fixture Git command without each call site having to remember it.
+///
+/// Matched on the file stem so an absolute path and a `.exe` suffix both
+/// resolve, and case-insensitively because Windows paths do.
+fn is_git_program(program: &OsStr) -> bool {
+    std::path::Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("git"))
+}
+
+#[test]
+fn fixture_git_commands_prepend_maintenance_suppression() {
+    for program in ["git", "/usr/bin/git", "git.exe", "GIT"] {
+        assert!(
+            is_git_program(OsStr::new(program)),
+            "{program} was not recognized as Git, so its commits would detach maintenance"
+        );
+    }
+    for program in ["sh", "kin", "gitk", "git-upload-pack", "/usr/bin/legit"] {
+        assert!(
+            !is_git_program(OsStr::new(program)),
+            "{program} was misread as Git"
+        );
+    }
+
+    let git = Command::new("git");
+    let arguments = git
+        .inner_ref()
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        arguments.iter().map(String::as_str).collect::<Vec<_>>(),
+        FIXTURE_GIT_MAINTENANCE_SUPPRESSION.to_vec(),
+        "a fixture Git command did not lead with the maintenance suppression"
+    );
+
+    // The suppression is Git configuration, so it must not reach anything else.
+    assert!(
+        Command::new("sh").inner_ref().get_args().next().is_none(),
+        "a non-Git fixture command was given Git configuration arguments"
+    );
 }
 
 impl<'runtime> Command<'runtime> {
