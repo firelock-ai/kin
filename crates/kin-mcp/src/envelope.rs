@@ -185,15 +185,16 @@ impl GraphState {
 /// two different answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegativeClass {
-    /// Embedding-backed retrieval (`semantic_locate`, `semantic_search`). An
-    /// empty result is only authoritative when *embedding* coverage is complete —
-    /// a half-embedded graph can hide a match that exists.
+    /// Embedding-backed retrieval (`semantic_locate`). An empty result is only
+    /// authoritative when *embedding* coverage is complete — a half-embedded
+    /// graph can hide a match that exists.
     Semantic,
-    /// Graph-structure-backed retrieval (`find_references`, `graph_neighborhood`,
-    /// `trace_data_flow`, `dead_code`, `find_dead_code_seeded`, `entity_history`,
-    /// `bulk_check_references`). These read typed graph relations, not embeddings,
-    /// so their absence-trust depends on the *graph* being initialized and loaded,
-    /// not on embedding coverage.
+    /// Graph-structure-backed retrieval (`semantic_search`, `find_references`,
+    /// `graph_neighborhood`, `trace_data_flow`, `dead_code`,
+    /// `find_dead_code_seeded`, `entity_history`, `bulk_check_references`). These
+    /// read typed graph relations or the entity index, not embeddings, so their
+    /// absence-trust depends on the *graph* being initialized and loaded, not on
+    /// embedding coverage.
     Structural,
 }
 
@@ -343,11 +344,21 @@ impl Envelope {
     /// Lift `semantic_coverage` and `graph_as_of` out of a tool payload when the
     /// daemon already computed them, so they live in one predictable place on the
     /// envelope. Absent fields stay unknown.
+    ///
+    /// Two keys are read for coverage because two arms of `semantic_locate`
+    /// publish it differently: the fused arm's `semantic_coverage` is the full
+    /// counter object, while the cosine arm's is a bare `indexed / total` float
+    /// that no envelope field can be built from. That float is not an object, so
+    /// the lift used to skip it and the negative beside it reported coverage
+    /// unknown next to a coverage figure the same response had just printed.
+    /// `semantic_coverage_detail` carries the counters on both arms and is read
+    /// as the fallback.
     pub fn with_payload_metadata(mut self, payload: &Value) -> Self {
         if self.semantic_coverage.is_none() {
-            if let Some(coverage) = payload
-                .get("semantic_coverage")
-                .and_then(SemanticCoverage::from_payload_field)
+            if let Some(coverage) = ["semantic_coverage", "semantic_coverage_detail"]
+                .into_iter()
+                .filter_map(|key| payload.get(key))
+                .find_map(SemanticCoverage::from_payload_field)
             {
                 self.semantic_coverage = Some(coverage);
             }
@@ -670,6 +681,46 @@ mod tests {
         assert!(!coverage.complete);
         assert_eq!(coverage.note.as_deref(), Some("partial"));
         assert_eq!(env.graph_as_of, Some(serde_json::json!("change:abcdef")));
+    }
+
+    #[test]
+    fn with_payload_metadata_lifts_counters_beside_a_bare_coverage_float() {
+        // FIR-2216. The cosine `semantic_locate` arm publishes coverage as a
+        // bare `indexed / total` float, which carries no counts to build an
+        // envelope field from, so the lift skipped it and the negative reported
+        // coverage unknown next to a coverage figure the same payload printed.
+        // The counters ride alongside under the key the fused arm already uses.
+        let payload = serde_json::json!({
+            "results": [],
+            "semantic_coverage": 1.0,
+            "semantic_coverage_detail": {
+                "indexed": 49, "total": 49, "pending": 0, "complete": true,
+            },
+        });
+        let env = Envelope::daemon().with_payload_metadata(&payload);
+        let coverage = env.semantic_coverage.expect("counters lifted");
+        assert_eq!(coverage.indexed, 49);
+        assert_eq!(coverage.total, 49);
+        assert!(coverage.complete);
+    }
+
+    #[test]
+    fn with_payload_metadata_prefers_the_coverage_object_over_the_detail_key() {
+        // The fused arm publishes the counters under `semantic_coverage`
+        // itself. That is the tool's own field and stays authoritative; the
+        // detail key is only consulted when it is not an object.
+        let payload = serde_json::json!({
+            "semantic_coverage": {
+                "indexed": 10, "total": 20, "pending": 10, "complete": false,
+            },
+            "semantic_coverage_detail": {
+                "indexed": 99, "total": 99, "pending": 0, "complete": true,
+            },
+        });
+        let env = Envelope::daemon().with_payload_metadata(&payload);
+        let coverage = env.semantic_coverage.expect("coverage lifted");
+        assert_eq!(coverage.indexed, 10);
+        assert!(!coverage.complete);
     }
 
     #[test]

@@ -6746,6 +6746,7 @@ fn semantic_locate_payload(
     query: &str,
     file_granularity: bool,
     semantic_coverage: f32,
+    coverage_detail: &kin_cli::commands::locate::SemanticCoverage,
     key: &str,
     page: usize,
     page_size: usize,
@@ -6765,6 +6766,7 @@ fn semantic_locate_payload(
         "granularity": if file_granularity { "file" } else { "entity" },
         "routing": "cosine-v0",
         "semantic_coverage": semantic_coverage,
+        "semantic_coverage_detail": coverage_detail,
         "page": page,
         "total_ranked": total,
         "next_cursor": next_cursor,
@@ -6986,11 +6988,19 @@ fn build_semantic_locate_result(
 
     // Coverage is reported, never gated: a partially-embedded graph still
     // returns whatever the index can answer (graceful degradation per R5).
-    let status = graph.embedding_status();
-    let semantic_coverage = if status.total == 0 {
+    //
+    // Both shapes come from ONE observation. The legacy `indexed / total` float
+    // is what this arm has always published, and it is the only shape here that
+    // no response envelope can be built from: a bare number carries no counts,
+    // so the negative beside it reported coverage unknown next to a coverage
+    // figure this same payload had just printed. The counters ride alongside
+    // under the key the fused arm already uses, and taking both from one
+    // measurement is what keeps them from disagreeing.
+    let coverage_detail = kin_cli::commands::locate::local_semantic_coverage(graph, None);
+    let semantic_coverage = if coverage_detail.total == 0 {
         0.0_f32
     } else {
-        status.indexed as f32 / status.total as f32
+        coverage_detail.indexed as f32 / coverage_detail.total as f32
     };
 
     // Paging fast path: a valid cursor whose ranking is still cached at the
@@ -7016,6 +7026,7 @@ fn build_semantic_locate_result(
                     &query,
                     file_granularity,
                     semantic_coverage,
+                    &coverage_detail,
                     &parsed.key,
                     parsed.page,
                     page_size,
@@ -7290,6 +7301,7 @@ fn build_semantic_locate_result(
         &query,
         file_granularity,
         semantic_coverage,
+        &coverage_detail,
         &key,
         0,
         page_size,
@@ -27395,6 +27407,35 @@ mod tests {
         assert!(
             parsed.get("semantic_coverage").is_some(),
             "response must carry semantic_coverage"
+        );
+        // FIR-2216: the legacy field is a bare ratio, which no response
+        // envelope can be built from, so the negative beside it reported
+        // coverage unknown next to this very number. The counters ride along
+        // under the key the fused arm already uses, and the envelope lift reads
+        // them, so the two coverage fields in one reply agree.
+        let detail = parsed
+            .get("semantic_coverage_detail")
+            .expect("cosine payload carries the structured coverage counters");
+        for counter in ["indexed", "total", "pending"] {
+            assert!(
+                detail
+                    .get(counter)
+                    .and_then(|value| value.as_u64())
+                    .is_some(),
+                "semantic_coverage_detail must carry {counter}: {detail}"
+            );
+        }
+        assert!(
+            detail
+                .get("complete")
+                .and_then(|value| value.as_bool())
+                .is_some(),
+            "semantic_coverage_detail must state completeness: {detail}"
+        );
+        let lifted = kin_mcp::Envelope::daemon().with_payload_metadata(&parsed);
+        assert!(
+            lifted.semantic_coverage.is_some(),
+            "the response envelope must be able to read this payload's coverage"
         );
         assert!(
             parsed.get("results").and_then(|v| v.as_array()).is_some(),
