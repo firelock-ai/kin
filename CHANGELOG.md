@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.21] - 2026-08-12
+
+### Changed
+
+- Treat an in-flight call as session activity so the sweeper cannot reap mid-write (#776)
+- Let the interrupted init choose its own kill point (#785)
+- Stop Git auto-maintenance from racing test fixture repositories (#772)
+- Report a files-mode resolution miss from impact_analysis (#782)
+- Make the retrieval negative consume the signals printed beside it (#777)
+- Render artifact hashes and change ids as hex so they round-trip (#787)
+- Record graph-truth freshness durably and state it on kin graph status (#781)
+- Clear RUSTSEC-2026-0253 and make the advisory gate able to fail (#788)
+- Stop an unnamed ranking from certifying that the symbol is absent (#791)
+- Emit match_kind and all_fallback from the compat-v0 locate arm (#786)
+- Stop reading an empty embed queue as finished coverage, and time the commit finalize (#790)
+- Check Kin/kin-vfs compatibility on pull requests, not only at release (#789)
+- Remove the demo assets that show a retired command and private source (#793)
+
+
 ## [0.5.20] - 2026-08-12
 
 ### Changed
