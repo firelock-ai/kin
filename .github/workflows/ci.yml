@@ -917,6 +917,7 @@ jobs:
         run: |
           python3 scripts/test-release-workflow-authority.py
           node --test \
+            scripts/check-kin-vfs-compat.test.mjs \
             scripts/check-release-version.test.mjs \
             scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \
@@ -924,6 +925,19 @@ jobs:
           node --check scripts/check-release-version.mjs
           node --check scripts/prepare-release.mjs
           node --check scripts/release-intent.mjs
+
+      # release.yml refuses a release whose Kin lock resolves a different
+      # kin-vfs-core than the pinned kin-vfs checkout builds, and that
+      # comparison ran nowhere else: a pull request moving the Kin lock passed
+      # every required context and failed only after the tag existed, where the
+      # tag has already resolved its own workflows. Run the same comparison
+      # here, against the pin read out of release.yml, so the answer arrives
+      # while a commit can still change it.
+      - name: Verify Kin/kin-vfs compatibility at the pinned release input
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/check-kin-vfs-compat.mjs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16

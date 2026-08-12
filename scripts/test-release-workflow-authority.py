@@ -59,6 +59,10 @@ ABANDONED_TAGS_POLICY = "scripts/abandoned-release-tags.json"
 TAG_SELECTOR_POLICY = "scripts/select-admissible-release-tag.py"
 ASSERTION_REACHABILITY = ROOT / "scripts" / "test-assertion-reachability.py"
 ASSERTION_REACHABILITY_POLICY = "scripts/test-assertion-reachability.py"
+KIN_VFS_COMPAT_GUARD = ROOT / "scripts" / "check-kin-vfs-compat.mjs"
+KIN_VFS_COMPAT_GUARD_POLICY = "scripts/check-kin-vfs-compat.mjs"
+KIN_VFS_COMPAT_TEST = ROOT / "scripts" / "check-kin-vfs-compat.test.mjs"
+KIN_VFS_COMPAT_TEST_POLICY = "scripts/check-kin-vfs-compat.test.mjs"
 INSTALLER_ASSET_GUARD = ROOT / "scripts" / "verify-installer-release-assets.py"
 INSTALLER_ASSET_GUARD_POLICY = "scripts/verify-installer-release-assets.py"
 INSTALLER_ASSET_FALSIFIER = ROOT / "scripts" / "falsify-installer-release-assets.py"
@@ -3449,6 +3453,53 @@ def assert_assertion_reachability_gate_wired(workflow: str) -> None:
             f"{ASSERTION_REACHABILITY_POLICY} is missing; the release gates "
             "would no longer prove their own checks run"
         )
+
+
+def assert_kin_vfs_compat_gate_wired(ci: str) -> None:
+    """Keep the pull-request half of the Kin/kin-vfs compatibility check.
+
+    release.yml refuses a release whose Kin lock resolves a different
+    kin-vfs-core than the pinned kin-vfs checkout builds. That comparison used
+    to run only at release time, so a pull request moving the Kin lock passed
+    every required context and went red after the tag existed, where the tag
+    has already resolved its own workflows and no fix lands without cutting
+    another tag. kin#788 was exactly that shape: its first commit moved the
+    lock to 0.4.2 while the pin still built 0.3.0.
+
+    The gate reads the pin out of release.yml instead of recording it a sixth
+    time, so its unit tests are load-bearing rather than decorative: an
+    extraction that silently found nothing would be a gate that cannot fail.
+    Both halves are required here for that reason.
+    """
+
+    # Match whole invocations rather than searching for the path, which a
+    # commented-out line would still satisfy.
+    lines = {line.strip() for line in ci.splitlines()}
+    command = f"node {KIN_VFS_COMPAT_GUARD_POLICY}"
+    if not lines & {command, f"run: {command}"}:
+        raise AssertionError(
+            "ci.yml must run "
+            f"{KIN_VFS_COMPAT_GUARD_POLICY}; without it a Kin lock change that "
+            "outruns the immutable kin-vfs pin stays green until it reds a tag"
+        )
+    # The test list is a line-continuation block, so the invocation carries a
+    # trailing backslash on every entry but the last.
+    if not lines & {KIN_VFS_COMPAT_TEST_POLICY, f"{KIN_VFS_COMPAT_TEST_POLICY} \\"}:
+        raise AssertionError(
+            "ci.yml must run "
+            f"{KIN_VFS_COMPAT_TEST_POLICY}; the gate reads the pin out of "
+            "release.yml, and an unproven extraction is a gate that cannot fail"
+        )
+    for path, policy in (
+        (KIN_VFS_COMPAT_GUARD, KIN_VFS_COMPAT_GUARD_POLICY),
+        (KIN_VFS_COMPAT_TEST, KIN_VFS_COMPAT_TEST_POLICY),
+    ):
+        if not path.is_file():
+            raise AssertionError(
+                f"{policy} is missing; Kin could resolve a kin-vfs-core that "
+                "the pinned release input does not build and no pull request "
+                "would go red"
+            )
 
 
 def assert_installer_asset_guard_wired(ci: str, release: str) -> None:
@@ -9664,6 +9715,31 @@ def main() -> None:
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
+    assert_kin_vfs_compat_gate_wired(ci_workflow)
+    expect_assertion(
+        "ci.yml drops the pull-request Kin/kin-vfs compatibility gate",
+        "ci.yml must run",
+        lambda: assert_kin_vfs_compat_gate_wired(
+            ci_workflow.replace(f"run: node {KIN_VFS_COMPAT_GUARD_POLICY}", "run: true")
+        ),
+    )
+    expect_assertion(
+        "the Kin/kin-vfs gate survives only as a commented-out ci.yml step",
+        "ci.yml must run",
+        lambda: assert_kin_vfs_compat_gate_wired(
+            ci_workflow.replace(
+                f"run: node {KIN_VFS_COMPAT_GUARD_POLICY}",
+                f"run: # node {KIN_VFS_COMPAT_GUARD_POLICY}",
+            )
+        ),
+    )
+    expect_assertion(
+        "ci.yml keeps the Kin/kin-vfs gate but drops the tests proving its parse",
+        "ci.yml must run",
+        lambda: assert_kin_vfs_compat_gate_wired(
+            ci_workflow.replace(KIN_VFS_COMPAT_TEST_POLICY, "scripts/absent.test.mjs")
+        ),
+    )
     assert_installer_asset_guard_wired(ci_workflow, release)
     expect_assertion(
         "ci.yml drops the guard that installer asset names are published",
