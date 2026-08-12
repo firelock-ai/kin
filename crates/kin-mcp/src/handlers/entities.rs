@@ -2789,6 +2789,20 @@ pub struct GraphStatusReport {
     pub embeddings_indexed: usize,
     pub embeddings_pending: usize,
     pub embeddings_total: usize,
+    /// Vectors resident in the selected graph's index, INCLUDING any the graph
+    /// no longer admits. `embeddings_total` is the size of the retrieval
+    /// universe graph truth admits right now, so the two differ exactly by the
+    /// index's accumulated staleness. Absent when this build or this graph has
+    /// no vector index to measure, which is not the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_index_keys: Option<usize>,
+    /// Indexed vectors graph truth does not admit: superseded entity revisions
+    /// and retired entities whose vectors the sidecar carried forward. This is
+    /// the counter that makes staleness legible beside a complete coverage
+    /// figure. Retrieval ranks these keys and then drops them, which is what
+    /// semantic_locate reports as its `vector_sidecar` degradation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_keys_not_in_graph: Option<usize>,
     /// Observed counts do not attest that every eligible source was enriched.
     pub completion_attested: bool,
     /// The stdio server's standard response envelope. Direct daemon calls omit
@@ -2815,6 +2829,10 @@ struct GraphStatusReportWire {
     embeddings_indexed: usize,
     embeddings_pending: usize,
     embeddings_total: usize,
+    #[serde(default)]
+    embedding_index_keys: Option<usize>,
+    #[serde(default)]
+    embedding_keys_not_in_graph: Option<usize>,
     #[serde(deserialize_with = "deserialize_graph_status_unattested")]
     completion_attested: bool,
     #[serde(default, rename = "_kin")]
@@ -2840,6 +2858,8 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             embeddings_indexed: wire.embeddings_indexed,
             embeddings_pending: wire.embeddings_pending,
             embeddings_total: wire.embeddings_total,
+            embedding_index_keys: wire.embedding_index_keys,
+            embedding_keys_not_in_graph: wire.embedding_keys_not_in_graph,
             completion_attested: wire.completion_attested,
             response_envelope: wire.response_envelope,
         };
@@ -2864,6 +2884,33 @@ impl GraphStatusReport {
                 "embeddings_pending ({}) is below the uncovered embedding count ({uncovered})",
                 self.embeddings_pending
             ));
+        }
+        // The index cannot hold fewer vectors than the graph-admitted keys found
+        // in it, and the staleness counter is a derivation of the two rather
+        // than a third independent claim. Validating it here is what stops the
+        // report from carrying a staleness figure that disagrees with its own
+        // coverage.
+        if let Some(index_keys) = self.embedding_index_keys {
+            if index_keys < self.embeddings_indexed {
+                return Err(format!(
+                    "embedding_index_keys ({index_keys}) is below embeddings_indexed ({})",
+                    self.embeddings_indexed
+                ));
+            }
+            let expected = index_keys - self.embeddings_indexed;
+            if self.embedding_keys_not_in_graph != Some(expected) {
+                return Err(format!(
+                    "embedding_keys_not_in_graph ({:?}) is not embedding_index_keys minus \
+                     embeddings_indexed ({expected})",
+                    self.embedding_keys_not_in_graph
+                ));
+            }
+        } else if self.embedding_keys_not_in_graph.is_some() {
+            return Err(
+                "embedding_keys_not_in_graph was reported without the index population it is \
+                 derived from"
+                    .to_string(),
+            );
         }
         if let Some(envelope) = &self.response_envelope {
             self.validate_response_envelope(envelope)?;
@@ -2944,7 +2991,17 @@ mode one repo-daemon response owns every field, including for an X-Kin-Session t
 scope, so durable repository counts cannot be mixed with a different live/session graph. \
 Reach for it as a quick health/readiness check: confirm the selected graph is populated, \
 check how much of its own retrieval universe has embeddings indexed, and verify the scope \
-before relying on other tools. embedding_source is selected_graph; any pipeline-specific \
+before relying on other tools. That universe is what graph truth admits right now — the \
+graph's entities, their head revisions, and its artifacts — so a graph holding no entities \
+can still report complete coverage over its artifacts alone: read entity_count beside the \
+coverage, never instead of it. Coverage completeness is also not index freshness. \
+embedding_index_keys reports how many vectors the index actually holds and \
+embedding_keys_not_in_graph how many of those graph truth no longer admits (superseded \
+revisions, retired entities), so a fully stale index cannot read as a clean one behind \
+pending=0. Retrieval ranks those keys and drops them, which is the same fact \
+semantic_locate reports as its vector_sidecar degradation. Both counters are absent, not \
+zero, when there is no index to measure. embedding_source is selected_graph; any \
+pipeline-specific \
 fallback coverage is reported by semantic_locate itself. sampling=point_in_time_selected_graph \
 means the daemon held its normal embedding-work fence while reading internally synchronized \
 coverage counters, then revalidated authority_epoch after capturing every counter; \
@@ -2961,6 +3018,9 @@ pub struct GraphStatusObservation {
     pub embeddings_indexed: usize,
     pub embeddings_pending: usize,
     pub embeddings_total: usize,
+    /// Vectors resident in the selected graph's index, sampled under the same
+    /// fence as the counters above. `None` when there is no index to measure.
+    pub embedding_index_keys: Option<usize>,
 }
 
 pub fn handle_daemon_graph_status_observation(
@@ -2980,6 +3040,10 @@ pub fn handle_daemon_graph_status_observation(
         embeddings_indexed: observation.embeddings_indexed,
         embeddings_pending: observation.embeddings_pending,
         embeddings_total: observation.embeddings_total,
+        embedding_index_keys: observation.embedding_index_keys,
+        embedding_keys_not_in_graph: observation
+            .embedding_index_keys
+            .map(|keys| keys.saturating_sub(observation.embeddings_indexed)),
         completion_attested: false,
         response_envelope: None,
     };
@@ -4587,6 +4651,7 @@ mod tests {
             embeddings_indexed: embeddings.indexed,
             embeddings_pending: embeddings.pending,
             embeddings_total: embeddings.total,
+            embedding_index_keys: None,
         };
         let result =
             handle_daemon_graph_status_observation(GraphStatusScope::TemporalSession, observation)
@@ -4626,6 +4691,7 @@ mod tests {
                 embeddings_indexed: 3,
                 embeddings_pending: 0,
                 embeddings_total: 2,
+                embedding_index_keys: None,
             },
         )
         .expect_err("the direct daemon boundary must reject impossible coverage");
@@ -4633,6 +4699,160 @@ mod tests {
             error
                 .to_string()
                 .contains("embeddings_indexed (3) exceeds embeddings_total (2)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_status_names_index_staleness_beside_complete_coverage() {
+        // FIR-2215. The umbrella store reported coverage {complete: true,
+        // indexed: 49, pending: 0, total: 49} beside entity_count 0, while
+        // semantic_locate reported 40 of those ranked vector keys resolving to
+        // entities the graph no longer holds. Coverage is measured against what
+        // graph truth admits, so a fully stale index satisfied it perfectly and
+        // staleness hid behind pending=0. The index population is now reported
+        // beside the coverage and the difference is named.
+        let result = handle_daemon_graph_status_observation(
+            GraphStatusScope::Head,
+            GraphStatusObservation {
+                authority_epoch: 7,
+                entity_count: 0,
+                relation_count: 0,
+                embeddings_indexed: 49,
+                embeddings_pending: 0,
+                embeddings_total: 49,
+                embedding_index_keys: Some(89),
+            },
+        )
+        .expect("a stale-but-covered graph is a reportable observation");
+        let report: GraphStatusReport = serde_json::from_value(parsed_response(&result)).unwrap();
+        assert_eq!(report.embedding_index_keys, Some(89));
+        assert_eq!(report.embedding_keys_not_in_graph, Some(40));
+
+        // Positive control: a graph whose index holds exactly what truth admits
+        // reports zero stale keys, so the counter distinguishes the two states
+        // rather than always firing.
+        let result = handle_daemon_graph_status_observation(
+            GraphStatusScope::Head,
+            GraphStatusObservation {
+                authority_epoch: 7,
+                entity_count: 12,
+                relation_count: 3,
+                embeddings_indexed: 49,
+                embeddings_pending: 0,
+                embeddings_total: 49,
+                embedding_index_keys: Some(49),
+            },
+        )
+        .unwrap();
+        let report: GraphStatusReport = serde_json::from_value(parsed_response(&result)).unwrap();
+        assert_eq!(report.embedding_keys_not_in_graph, Some(0));
+
+        // Negative control: no index to measure is absent, never a measured
+        // zero, and the derived counter goes with it.
+        let result = handle_daemon_graph_status_observation(
+            GraphStatusScope::Head,
+            GraphStatusObservation {
+                authority_epoch: 7,
+                entity_count: 12,
+                relation_count: 3,
+                embeddings_indexed: 0,
+                embeddings_pending: 12,
+                embeddings_total: 12,
+                embedding_index_keys: None,
+            },
+        )
+        .unwrap();
+        let payload = parsed_response(&result);
+        assert!(payload.get("embedding_index_keys").is_none(), "{payload}");
+        assert!(
+            payload.get("embedding_keys_not_in_graph").is_none(),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn graph_status_rejects_an_index_smaller_than_its_own_covered_keys() {
+        // The staleness counter is a derivation of two sampled numbers, so a
+        // report whose index holds fewer vectors than the coverage found in it
+        // is incoherent and must not serialize.
+        let error = handle_daemon_graph_status_observation(
+            GraphStatusScope::Head,
+            GraphStatusObservation {
+                authority_epoch: 7,
+                entity_count: 4,
+                relation_count: 0,
+                embeddings_indexed: 10,
+                embeddings_pending: 0,
+                embeddings_total: 10,
+                embedding_index_keys: Some(9),
+            },
+        )
+        .expect_err("an index below its own covered keys is not a reportable observation");
+        assert!(
+            error
+                .to_string()
+                .contains("embedding_index_keys (9) is below embeddings_indexed (10)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_status_rejects_a_staleness_figure_that_disagrees_with_its_coverage() {
+        // A hand-built or drifted daemon payload cannot smuggle in a staleness
+        // number that is not the difference between the two counters it claims
+        // to derive from.
+        let wire = serde_json::json!({
+            "schema": GRAPH_STATUS_SCHEMA,
+            "view": "daemon_selected_graph",
+            "scope": "head",
+            "authority": "repo-daemon",
+            "sampling": "point_in_time_selected_graph",
+            "authority_epoch": 7,
+            "entity_count": 4,
+            "relation_count": 0,
+            "embedding_source": "selected_graph",
+            "embeddings_indexed": 10,
+            "embeddings_pending": 0,
+            "embeddings_total": 10,
+            "embedding_index_keys": 50,
+            "embedding_keys_not_in_graph": 0,
+            "completion_attested": false,
+        });
+        let error = serde_json::from_value::<GraphStatusReport>(wire)
+            .expect_err("a staleness figure must agree with the counters it derives from");
+        assert!(
+            error
+                .to_string()
+                .contains("is not embedding_index_keys minus embeddings_indexed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_status_rejects_staleness_reported_without_an_index_population() {
+        let wire = serde_json::json!({
+            "schema": GRAPH_STATUS_SCHEMA,
+            "view": "daemon_selected_graph",
+            "scope": "head",
+            "authority": "repo-daemon",
+            "sampling": "point_in_time_selected_graph",
+            "authority_epoch": 7,
+            "entity_count": 4,
+            "relation_count": 0,
+            "embedding_source": "selected_graph",
+            "embeddings_indexed": 10,
+            "embeddings_pending": 0,
+            "embeddings_total": 10,
+            "embedding_keys_not_in_graph": 3,
+            "completion_attested": false,
+        });
+        let error = serde_json::from_value::<GraphStatusReport>(wire)
+            .expect_err("a derived counter cannot arrive without what it derives from");
+        assert!(
+            error
+                .to_string()
+                .contains("without the index population it is derived from"),
             "{error}"
         );
     }
