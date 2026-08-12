@@ -27368,12 +27368,18 @@ mod tests {
             .expect("cosine payload carries the structured coverage counters");
         for counter in ["indexed", "total", "pending"] {
             assert!(
-                detail.get(counter).and_then(|value| value.as_u64()).is_some(),
+                detail
+                    .get(counter)
+                    .and_then(|value| value.as_u64())
+                    .is_some(),
                 "semantic_coverage_detail must carry {counter}: {detail}"
             );
         }
         assert!(
-            detail.get("complete").and_then(|value| value.as_bool()).is_some(),
+            detail
+                .get("complete")
+                .and_then(|value| value.as_bool())
+                .is_some(),
             "semantic_coverage_detail must state completeness: {detail}"
         );
         let lifted = kin_mcp::Envelope::daemon().with_payload_metadata(&parsed);
