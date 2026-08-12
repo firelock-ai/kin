@@ -4,9 +4,9 @@
 
 LSP client for graph enrichment. Spawns and drives language servers (clangd,
 rust-analyzer, typescript-language-server, etc.) to resolve type-level
-relations that the Kin parser cannot derive from AST analysis alone — call
-targets across dynamic dispatch, trait implementations, cross-file type
-aliases.
+relations that the Kin parser cannot derive from AST analysis alone, such as
+call targets across dynamic dispatch, trait implementations, and cross-file
+type aliases.
 
 ## Build
 
@@ -17,7 +17,7 @@ cargo test
 
 ## Architecture
 
-- `src/lib.rs` — `LspClient` struct; spawn, initialize, request, shutdown
+- `src/lib.rs`: `LspClient` struct; spawn, initialize, request, shutdown
 - Async (tokio): child-process stdin/stdout I/O over the LSP JSON-RPC protocol
 - Stateless beyond the per-session LSP handshake
 

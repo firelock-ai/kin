@@ -36,8 +36,8 @@ support window.
 ## Scope
 
 This policy covers the `kin-lsp` repository: the language-server enrichment
-boundary, which adds type-resolved graph relations — call hierarchy, type
-hierarchy, and type-definition links — from standard language servers. Other Kin
+boundary, which adds type-resolved graph relations (call hierarchy, type
+hierarchy, and type-definition links) from standard language servers. Other Kin
 ecosystem repositories (for example `kin`, `kin-db`, `kin-vfs`, `kinlab`) carry
 their own security policies; report issues against the repository where the
 affected code lives.
