@@ -2512,7 +2512,6 @@ mod tests {
 
         let panicking = {
             let coord = Arc::clone(&coord);
-            let sid = sid;
             std::thread::spawn(move || {
                 let _in_flight = coord.begin_call(&sid);
                 panic!("call failed mid-flight");
