@@ -1678,9 +1678,9 @@ mod tests {
         (report, reads.get(), tokio::time::Instant::now() - started)
     }
 
-    /// The FIR-1877 race itself: the daemon could not pair a stable authority
-    /// epoch with a sample, and the coverage it was hiding is observable a
-    /// moment later. A single-sample caller failed here.
+    /// The race itself: the daemon could not pair a stable authority epoch with
+    /// a sample, and the coverage it was hiding is observable a moment later. A
+    /// single-sample caller failed here.
     #[tokio::test]
     async fn a_mutation_in_flight_settles_into_the_observation_it_was_hiding() {
         let base = settle_base_report();

@@ -24,7 +24,7 @@
 # anywhere, so nothing in a kin process ever reads them and registering them
 # would document a surface an operator cannot reach: setting KIN_EMBED_MAX_SECS
 # against today's binaries caps nothing. They stay out of the registry until a
-# caller exists (FIR-2163).
+# caller exists.
 #
 # Wiring the watchdog is the real open question rather than a registration one.
 # Umbrella doctrine wants embed drivers to carry a parent-death watchdog and a

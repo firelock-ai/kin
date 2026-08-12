@@ -16553,10 +16553,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         (dir, home)
     }
 
-    /// FIR-1878: the Kin-first directive is a standing instruction to prefer
-    /// Kin's MCP tools over grep and raw file reads, in every repository, for
-    /// every session. Writing it for a client whose MCP server setup never
-    /// registered points that agent at tools which are not wired.
+    /// The Kin-first directive is a standing instruction to prefer Kin's MCP
+    /// tools over grep and raw file reads, in every repository, for every
+    /// session. Writing it for a client whose MCP server setup never registered
+    /// points that agent at tools which are not wired.
     ///
     /// Models the reported first-install shape: Cursor registers, Claude Code
     /// does not, and the run still reaches the reminder step. Against the

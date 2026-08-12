@@ -540,7 +540,7 @@ fn install_full_vector_index(graph: &kin_db::InMemoryGraph, sidecar: &Path) -> u
     keys.len()
 }
 
-/// FIR-1785: coverage must come from a graph that actually holds an index.
+/// Coverage must come from a graph that actually holds an index.
 ///
 /// The regression this pins is not a wrong number, it is a well-formed one.
 /// `embedding_status` answers `indexed = 0` for every retrievable object when

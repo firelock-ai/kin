@@ -3244,9 +3244,9 @@ mod tests {
         );
     }
 
-    /// FIR-1886 at the daemon: an attached client whose session outlasts the
-    /// window this daemon was spawned with grows it, and the grown window is
-    /// what the shutdown decision then reads.
+    /// The idle-window contract at the daemon: an attached client whose session
+    /// outlasts the window this daemon was spawned with grows it, and the grown
+    /// window is what the shutdown decision then reads.
     ///
     /// The two-sided part is the second half. Growing the window must not stop
     /// the daemon idling out; it must only move when.
@@ -3290,10 +3290,10 @@ mod tests {
 
     /// The monitor reads the live window, not the one it was handed at start.
     ///
-    /// This is the half of FIR-1886 that the state round-trip above cannot
-    /// reach: a monitor that closed over its startup value would keep counting
-    /// against 60 seconds however loudly an attached session said 1800, and the
-    /// state accessor would look perfectly correct while the daemon still died.
+    /// This is the half the state round-trip above cannot reach: a monitor that
+    /// closed over its startup value would keep counting against 60 seconds
+    /// however loudly an attached session said 1800, and the state accessor
+    /// would look perfectly correct while the daemon still died.
     #[tokio::test]
     async fn the_idle_monitor_counts_against_the_live_window_not_its_startup_one() {
         async fn open_idle_state() -> (tempfile::TempDir, Arc<DaemonState>) {

@@ -635,8 +635,8 @@ mod tests {
         assert!(message.contains("disabled"));
     }
 
-    /// FIR-2025(a), both sides. An unconfigured server serves the curated belt
-    /// and the whole surface is reachable only by asking for it.
+    /// Both sides. An unconfigured server serves the curated belt, and the
+    /// whole surface is reachable only by asking for it.
     ///
     /// The counts are asserted against the profile lists themselves rather than
     /// against literals, so this stays true as tools are added; what it pins is
@@ -667,9 +667,9 @@ mod tests {
         );
     }
 
-    /// FIR-2025(b). "What breaks if I change this" is the product's flagship
-    /// question, and the tool whose name says exactly that must be in the
-    /// profile every agent receives.
+    /// "What breaks if I change this" is the product's flagship question, and
+    /// the tool whose name says exactly that must be in the profile every agent
+    /// receives.
     #[test]
     fn the_default_profile_carries_impact_analysis() {
         let served = resolve_tool_profile(None, None)

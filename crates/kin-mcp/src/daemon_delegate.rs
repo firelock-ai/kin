@@ -1849,8 +1849,8 @@ mod tests {
 
     // ── Session-path revival over real sockets ─────────────────────────────
     //
-    // The regression FIR-1575 reports: only `/mcp/tools/call` had a revival
-    // path, so a repo daemon that idled out between two tool calls left every
+    // The regression: only `/mcp/tools/call` had a revival path, so a repo
+    // daemon that idled out between two tool calls left every
     // session/intent/traffic/status forward failing forever. These drive the
     // shared state machine those forwards now use, against real loopback
     // sockets, so reqwest's own error classification is exercised rather than

@@ -5411,7 +5411,7 @@ mod tests {
     /// A page of retrieval hits derives repository authority ONCE, not once per
     /// hit.
     ///
-    /// This is the bound FIR-1897 was filed on. `semantic_locate` fans a client
+    /// This is the bound that matters. `semantic_locate` fans a client
     /// `limit: 5` out to 40 daemon candidates, and the body projection re-opened
     /// the persisted authority and replayed the whole committed history for each
     /// one, so on a 23,683-blob store a single query ran past 44 minutes with no
@@ -5526,9 +5526,9 @@ mod tests {
 
     /// An entity the current workspace does not contain is history, not a gap.
     ///
-    /// FIR-1935. The graph ingests whole reachable history, so it carries
-    /// entities for files a repository deleted or renamed -- on the first
-    /// repository this was tried against, `httpx/models.py`, deleted in 2020.
+    /// The graph ingests whole reachable history, so it carries entities for
+    /// files a repository deleted or renamed -- on the first repository this
+    /// was tried against, `httpx/models.py`, deleted in 2020.
     /// The body projection reported that absence as an authority gap, and every
     /// surface projecting many entities turned one such candidate into a failed
     /// request.
@@ -5639,11 +5639,11 @@ mod tests {
 
     /// One caller deleted by history does not cost the whole reference set.
     ///
-    /// The page-level half of FIR-1935, on the multi-entity surface this crate
-    /// owns: `find_references` projects a body per referencing entity, so before
-    /// the fix a single historical caller propagated its error out of the loop
-    /// and the call returned nothing at all. The daemon's `semantic_locate` had
-    /// the identical shape and is what the ticket was filed on.
+    /// The page-level half, on the multi-entity surface this crate owns:
+    /// `find_references` projects a body per referencing entity, so before the
+    /// fix a single historical caller propagated its error out of the loop and
+    /// the call returned nothing at all. The daemon's `semantic_locate` had
+    /// the identical shape and is where it was first found.
     ///
     /// The assertion that matters is that the LIVE callers come back. A test
     /// that only asserted the call no longer errors would also pass if the fix
@@ -5733,9 +5733,9 @@ mod tests {
     /// `collect_graph_reference_rows` projects a bounded body per REFERENCING
     /// entity, so it has the same multi-entity shape as a retrieval page and had
     /// the same defect: a full authority recovery and a whole-history replay per
-    /// caller found. It was missed when FIR-1897 was first scoped because the
-    /// surface reads relations rather than running retrieval, and the ticket was
-    /// written about `semantic_locate`.
+    /// caller found. It was missed when the defect was first scoped because the
+    /// surface reads relations rather than running retrieval, and the scoping
+    /// was written about `semantic_locate`.
     ///
     /// Same counting discipline as the page test above, and the same second arm
     /// so a cheap fixture cannot be mistaken for a fixed one.

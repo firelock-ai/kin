@@ -3578,7 +3578,7 @@ async fn command_trace_data_flow(
 /// server-side work is not cancelled, then revives and loses the race for a repo
 /// lock the live daemon still holds. What actually made the call slow enough to
 /// trip that ladder was one repository-authority open per step, fixed alongside
-/// this (FIR-1937).
+/// this.
 ///
 /// So this is defence in depth for the concurrent case rather than the fix, and
 /// it is what makes cancellation reachable at all: a walk inline in the handler
@@ -3616,7 +3616,7 @@ async fn run_trace_data_flow_off_runtime(
 /// disconnect, a timeout, a cancelled task — stops the server-side work rather
 /// than merely stopping anyone from reading its result. Without this, a query
 /// whose caller had gone kept burning CPU to completion, and a repository could
-/// be held out of service by work nobody was waiting for (FIR-1898).
+/// be held out of service by work nobody was waiting for.
 struct CancelOnDrop(kin_cli::commands::trace_data_flow::TraceCancel);
 
 impl Drop for CancelOnDrop {
@@ -11709,8 +11709,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
 
-    /// The HTTP contract an attached client uses to state its idle need
-    /// (FIR-1886), driven through the real router.
+    /// The HTTP contract an attached client uses to state its idle need, driven
+    /// through the real router.
     ///
     /// Both sides: a client whose session outlasts the daemon's window grows
     /// it, and a request that is not a floor is refused rather than silently
@@ -12578,9 +12578,9 @@ mod tests {
         }
     }
 
-    /// FIR-2183: an artifact hit reads the same whichever arm answered. The
-    /// fused arm used to write a constant `id_space: "entity"`, which was true
-    /// for exactly as long as the projection could only emit graph entities;
+    /// An artifact hit reads the same whichever arm answered. The fused arm
+    /// used to write a constant `id_space: "entity"`, which was true for
+    /// exactly as long as the projection could only emit graph entities;
     /// once a ranked artifact reaches this surface the constant relabels it as a
     /// resolvable id that every id-consuming tool refuses. Asserted on the
     /// serialized body, because the identity is written into the JSON after the
@@ -12618,9 +12618,9 @@ mod tests {
         assert!(rows[1].get("artifact_path").is_none());
     }
 
-    /// FIR-2170, asserted against the serializer rather than a hand-written
-    /// payload. `LocateResult` skips `entities` when the vector is empty, so an
-    /// empty fused page reaches the negative machinery carrying `files` and no
+    /// Asserted against the serializer rather than a hand-written payload.
+    /// `LocateResult` skips `entities` when the vector is empty, so an empty
+    /// fused page reaches the negative machinery carrying `files` and no
     /// `entities` key at all — the shape that has to be recognized, and the one
     /// a fixture written from the struct definition would miss.
     #[test]
@@ -12641,9 +12641,9 @@ mod tests {
         assert_eq!(negative["result_count"], json!(0));
     }
 
-    /// FIR-2178 on the same serialized shape: a full page for a symbol the
-    /// ranking never names is qualified, and every row it served is still
-    /// counted, because the contract reports and never filters.
+    /// The same serialized shape again: a full page for a symbol the ranking
+    /// never names is qualified, and every row it served is still counted,
+    /// because the contract reports and never filters.
     #[test]
     fn unnamed_fused_locate_body_is_qualified_without_dropping_rows() {
         let result = kin_cli::commands::locate::LocateResult {
@@ -14991,8 +14991,8 @@ mod tests {
 
     /// A daemon that has bound but not yet opened state ANSWERS.
     ///
-    /// FIR-2081. Opening state re-verifies the whole durable publication, so the
-    /// window is proportional to repository size. Two failure modes bracket it:
+    /// Opening state re-verifies the whole durable publication, so the window
+    /// is proportional to repository size. Two failure modes bracket it:
     /// binding after the open makes every arrival a connection refusal, and
     /// binding without answering leaves probes in the accept backlog until a
     /// readiness timeout kills a daemon that is working correctly.
@@ -20810,8 +20810,8 @@ mod tests {
         assert!(mcp_status.response_envelope.is_none());
     }
 
-    /// FIR-1785: the endpoint must publish the coverage of the index this
-    /// daemon is actually holding.
+    /// The endpoint must publish the coverage of the index this daemon is
+    /// actually holding.
     ///
     /// The sibling case above proves an unindexed graph is reported as an
     /// absence, which a handler that always answered "unobserved" would also
@@ -22627,8 +22627,8 @@ mod tests {
         assert_eq!(body["focal_entity"]["name"], json!("resolvable_target"));
     }
 
-    /// The cfg-twin shape from FIR-2146: one name, two entities, one of them the
-    /// ranked winner. The short-circuit decides only whether the index can place
+    /// The cfg-twin shape: one name, two entities, one of them the ranked
+    /// winner. The short-circuit decides only whether the index can place
     /// a name at all, so an ambiguous name has to reach the ranker and come back
     /// with the same choice it made before.
     #[tokio::test]
@@ -23589,7 +23589,7 @@ mod tests {
     // Health and readiness
     // -----------------------------------------------------------------------
 
-    /// The FIR-2147 shape end to end on `/health`.
+    /// The failing-admission shape end to end on `/health`.
     ///
     /// Nothing here is stopped and nothing is wedged. The reconcile loop wakes,
     /// fails its whole-tree admission, defers the paths, and sleeps, on
@@ -23663,9 +23663,9 @@ mod tests {
         assert!(!json.reconcile.degraded());
     }
 
-    /// The FIR-2145 shape: events errored and were dropped while every surface
-    /// read clean. Each dropped event leaves one path's enrichment stale, so the
-    /// count and the daemon's own error both have to reach `/health`.
+    /// Events errored and were dropped while every surface read clean. Each
+    /// dropped event leaves one path's enrichment stale, so the count and the
+    /// daemon's own error both have to reach `/health`.
     #[tokio::test]
     async fn health_degrades_and_names_the_error_when_reconcile_events_are_dropped() {
         let state = test_state();
@@ -27892,9 +27892,9 @@ mod tests {
     /// has, and it is the one where a per-result authority open multiplies.
     /// Distinct query tools at ONE publication share ONE authority load.
     ///
-    /// FIR-2079. Every MCP query request used to open repository authority for
-    /// itself, and an open decodes the whole persisted snapshot and re-verifies
-    /// every persisted body against its content address, so the query floor was
+    /// Every MCP query request used to open repository authority for itself,
+    /// and an open decodes the whole persisted snapshot and re-verifies every
+    /// persisted body against its content address, so the query floor was
     /// whole-repository work per REQUEST rather than per publication.
     ///
     /// The bound is a COUNT, never elapsed time. What an open costs is a
@@ -27910,9 +27910,9 @@ mod tests {
     #[tokio::test]
     async fn distinct_query_tools_share_one_authority_load_per_publication() {
         const PAGE: usize = 3;
-        // Same reason as the FIR-1897 test above: a phase budget exhausted by a
-        // stalled host makes locate return early with nothing projected, which
-        // reads at these assertions exactly like the regression they catch.
+        // Budgets disabled: a phase budget exhausted by a stalled host makes
+        // locate return early with nothing projected, which reads at these
+        // assertions exactly like the regression they catch.
         let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
             .with("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", "0")
             .with("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", "0")
@@ -28049,11 +28049,11 @@ mod tests {
     /// The three tools that resolve source through kin-cli command helpers share
     /// ONE authority load at one publication.
     ///
-    /// The other wrapper, and the gap FIR-2079 left open. `get_entity_source`,
-    /// `get_entity_sources`, and `trace_data_flow` do not read through kin-mcp's
-    /// authority; they route into kin-cli's, which opened per call. The batched
-    /// one was worse than per-request: it resolves source per entity, so N
-    /// entities cost N whole-store verifications.
+    /// The other wrapper, and the gap the per-request fix left open.
+    /// `get_entity_source`, `get_entity_sources`, and `trace_data_flow` do not
+    /// read through kin-mcp's authority; they route into kin-cli's, which
+    /// opened per call. The batched one was worse than per-request: it resolves
+    /// source per entity, so N entities cost N whole-store verifications.
     ///
     /// A count, not elapsed time, for the same reason as the query-tool bound
     /// above: what an open costs is a property of the store, so a timing
@@ -28252,15 +28252,16 @@ mod tests {
 
     /// The FUSED `semantic_locate` page opens repository authority ONCE.
     ///
-    /// This is the call-site regression test for FIR-1897 on the arm `POST
-    /// /locate` always uses, that `pipeline: "fused"` selects, that multi-query
-    /// forces, and that `KIN_PROFILE=accuracy-v1` selects. It runs the real MCP
-    /// dispatch route, so what it bounds is the shipped path rather than a
-    /// primitive: fused locate funnels into `run_with_graph_capture_budgeted`,
-    /// which projects bodies TWICE over the same symbol set -- once in
-    /// `attach_snippets` and again in `build_entity_view`. Holding one session
-    /// across both is the whole fix; reverting either to the one-shot entry point
-    /// compiles, changes no output, and must fail HERE.
+    /// This is the call-site regression test for the per-body authority open,
+    /// on the arm `POST /locate` always uses, that `pipeline: "fused"` selects,
+    /// that multi-query forces, and that `KIN_PROFILE=accuracy-v1` selects. It
+    /// runs the real MCP dispatch route, so what it bounds is the shipped path
+    /// rather than a primitive: fused locate funnels into
+    /// `run_with_graph_capture_budgeted`, which projects bodies TWICE over the
+    /// same symbol set -- once in `attach_snippets` and again in
+    /// `build_entity_view`. Holding one session across both is the whole fix;
+    /// reverting either to the one-shot entry point compiles, changes no
+    /// output, and must fail HERE.
     ///
     /// The assertion is on COUNTS, never on elapsed time. An authority open is a
     /// full recovery that re-verifies every persisted body against its content

@@ -849,9 +849,8 @@ mod tests {
         BackgroundWorkSupervisor::default().pass(PASS_RECONCILE)
     }
 
-    /// The FIR-2165 correction. A pass with deferred work owed reports a state
-    /// of its own, so a retry ladder that never converges stops reading as a
-    /// pass with nothing to do.
+    /// A pass with deferred work owed reports a state of its own, so a retry
+    /// ladder that never converges stops reading as a pass with nothing to do.
     #[test]
     fn deferred_work_is_reported_separately_from_idle() {
         let base = Instant::now();
@@ -1269,8 +1268,8 @@ mod tests {
         assert_eq!(supervisor.reports(Instant::now()).len(), 1);
     }
 
-    /// The FIR-2147 shape: every complete admission failing, for long enough
-    /// that the last success is hours old. The streak is what names it.
+    /// Every complete admission failing, for long enough that the last success
+    /// is hours old. The streak is what names it.
     #[test]
     fn consecutive_admission_failures_accumulate_into_a_streak() {
         let probes = ReconcileProbes::default();

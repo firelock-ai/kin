@@ -786,8 +786,8 @@ mod tests {
 
     #[test]
     fn an_unresolvable_id_is_a_reported_miss_rather_than_an_empty_record() {
-        // FIR-2218. An id resolving to no entity with nothing recorded against
-        // it returned a clean success, so a resolution failure and "no
+        // An id resolving to no entity with nothing recorded against it
+        // returned a clean success, so a resolution failure and "no
         // provenance recorded" were the same answer on this surface while
         // get_entity_source failed loudly on the same id.
         let store = kin_db::InMemoryGraph::new();

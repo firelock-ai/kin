@@ -367,7 +367,7 @@ async fn impact_on_a_genuinely_isolated_entity_still_reports_plain_empty() {
     );
 }
 
-/// FIR-2032. `--file` narrows the candidates the ordinary lookup already found.
+/// `--file` narrows the candidates the ordinary lookup already found.
 /// When it narrows them to none, the answer must say the filter matched nothing
 /// and name what the name itself resolves to. Claiming the entity is absent from
 /// the graph is false: the unfiltered lookup just found it.

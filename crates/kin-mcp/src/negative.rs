@@ -2101,8 +2101,8 @@ mod tests {
 
     #[test]
     fn empty_fused_locate_page_carries_the_negative() {
-        // FIR-2170: the fused arm is the default for code-bearing stores, and
-        // its empty page used to reach an agent as a bare `files: []` with no
+        // The fused arm is the default for code-bearing stores, and its empty
+        // page used to reach an agent as a bare `files: []` with no
         // qualification at all — an honest-looking negative that had qualified
         // nothing.
         let payload = empty_fused_locate_page("where does the daemon start");
@@ -2181,8 +2181,8 @@ mod tests {
 
     #[test]
     fn fabricated_symbol_gets_a_full_fused_page_qualified_as_unnamed() {
-        // FIR-2178: five confidently-scored hits for a symbol that exists
-        // nowhere. The page is real and stays whole; what it is NOT is the
+        // Five confidently-scored hits for a symbol that exists nowhere. The
+        // page is real and stays whole; what it is NOT is the
         // symbol that was asked for, and that is now stated.
         let mut payload = empty_fused_locate_page("zzqqxx_nonexistent_symbol_9f3a");
         payload["entities"] = json!((0..5)

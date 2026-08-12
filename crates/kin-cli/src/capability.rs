@@ -616,9 +616,10 @@ mod tests {
         assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
     }
 
-    /// The FIR-2023 shape, both ways round. An 18-core host whose memory probe
-    /// fails must not be scored `Minimal` and reported as though 4 GB had been
-    /// measured; the same host with a reading must score `Performance`.
+    /// A failed memory probe and a real one, both ways round. An 18-core host
+    /// whose memory probe fails must not be scored `Minimal` and reported as
+    /// though 4 GB had been measured; the same host with a reading must score
+    /// `Performance`.
     #[test]
     fn a_failed_memory_probe_is_reported_rather_than_scored_as_four_gigabytes() {
         let misread = CapabilityDetection::resolve(
