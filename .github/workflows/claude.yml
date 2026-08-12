@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Claude
+
+# Answers @claude on issues and pull requests, so a captain can hand off a
+# bounded piece of unblock work from the thread it came up in instead of
+# switching to a terminal and rebuilding the context by hand.
+#
+# ACTIVATION IS ONE FOUNDER STEP, shared with the release sentinel. This
+# workflow reads `secrets.CLAUDE_CODE_OAUTH_TOKEN`, which only the founder can
+# mint because `claude setup-token` is interactive:
+#
+#   claude setup-token
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private
+#
+# Until that secret exists the preflight job reports it and the responder is
+# skipped, so an @claude mention on an unwired repository is quietly ignored
+# rather than failing the thread.
+#
+# Who can invoke it. The action checks repository access for issue, pull
+# request, comment, and review events and refuses an actor without write
+# permission, so this is org-members-only by default and no input here relaxes
+# it. `allowed_non_write_users` is deliberately absent, and `allowed_bots`
+# keeps its empty default so no App can invoke this with a prompt it controls.
+# Comment text is still untrusted input: it is never interpolated into a `run:`
+# block or a `ref:` here, and the action strips hidden markdown before Claude
+# reads it, which reduces prompt-injection exposure without eliminating it.
+# That is why the permissions below stay narrow.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+# Keyed per thread so two mentions in one issue queue behind each other while
+# mentions in different threads still run in parallel. Never cancelled: a
+# half-finished answer is worse than a slow one.
+concurrency:
+  group: kin-claude-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  # Secrets cannot be read in a job-level `if`, so the credential check is its
+  # own job. This keeps an unwired repository green.
+  preflight:
+    name: Resolve responder credential
+    if: >-
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.credential.outputs.enabled }}
+    steps:
+      - name: Report whether the responder credential is wired
+        id: credential
+        env:
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Only ever tests for emptiness. The value is never printed.
+          if [ -n "${OAUTH_TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "CLAUDE_CODE_OAUTH_TOKEN is present; the responder will run."
+            exit 0
+          fi
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set, so this @claude mention is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private' to activate the responder."
+
+  respond:
+    name: Respond to the mention
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Respond
+        uses: anthropics/claude-code-action@9c41ed18ca8b2b2a17eaef4723d5092ccdebc814 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The job-scoped token, which expires with the job and carries exactly
+          # the permissions declared above. Never a personal access token.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Repository conventions the answer has to satisfy. The action reads
+          # the mention and the thread from the event context itself, so no
+          # untrusted comment text is interpolated into this file.
+          prompt: |
+            You are answering an @claude mention in ${{ github.repository }}, the
+            semantic system of record for Kin. Read AGENTS.md or CLAUDE.md at the
+            repository root before you change anything; it is the authority for
+            boundaries and conventions here, and the repository-local docs are the
+            authority for the component you touch.
+
+            PROVENANCE, binding on every commit message, pull request body, issue
+            body, and comment you write.
+
+            No assistant-authorship traces anywhere, ever. No session trailers, no
+            session ids, no session URLs, no co-author lines naming an assistant, and
+            no generated-with notices. This repository lands work through a merge
+            queue that mints the squash commit message verbatim from the pull request
+            title and body, so a trace placed in a body is authored straight into
+            public history where no local hook can catch it. A check on the pull
+            request refuses those bytes, and it is the last line of defence rather
+            than the first.
+
+            Ticket references are the exception and are expected: a pull request body
+            names the tickets its merge resolves, one `Closes FIR-XXXX` per line.
+            Never put a ticket id in a code comment or a branch name, where it
+            becomes a stale pointer rather than a record of the change.
+
+            Code comments describe durable technical behavior only. Rationale,
+            status, and working notes belong in the pull request body or the ticket.
+
+            Write in the founder register: lead with the outcome, flowing prose over
+            bullet spam, short sentences and contractions welcome, claims exactly as
+            strong as the evidence allows. No em dashes anywhere. Restructure the
+            sentence instead of swapping the dash for a comma or a colon, because a
+            clause held together by the wrong punctuation reads more machine-authored
+            than the dash did, not less.
+
+            VERIFICATION. Do not answer questions about how this code behaves from
+            documentation, comments, or adjacent files. Read the source and say what
+            it actually does. If a check you ran could not have failed, it is not
+            evidence: confirm it would visibly break if your claim were false before
+            you report it. Say "I could not verify this" rather than filling the gap,
+            because flat prose is recoverable and a plausible fabrication is not.
+
+            SCOPE. Stay inside what the mention asked for. Do not merge anything, do
+            not mark a draft ready, do not force-push, do not rewrite history, do not
+            touch a release tag, and do not edit files under `.github/workflows`.
+            Open a pull request for review rather than pushing to main, which is
+            protected and will refuse you anyway. If the work turns out larger than
+            the thread implies, say what you found and what you would do next instead
+            of doing it.
+          claude_args: |
+            --max-turns 40
