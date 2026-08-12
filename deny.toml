@@ -14,6 +14,16 @@ feature-depth = 1
 
 # --- Advisory database (replaces standalone cargo-audit) ---
 [advisories]
+# cargo-deny defaults `unsound` to "workspace", which surfaces unsound advisories
+# only for crates the workspace declares directly. Every third-party crate kin
+# ships is transitive, so the default left this required context structurally
+# unable to fail on an unsound advisory. Two sat in the shipped graph while the
+# check reported success: RUSTSEC-2026-0253, a use-after-free in lru 0.16.4
+# reached through kin-vfs-core, and RUSTSEC-2026-0186, an unchecked pointer
+# offset in memmap2 0.9.10 reached through gix. Both are fixed in the lock beside
+# this line. "all" is what lets the check fail; do not weaken it back without
+# replacing the coverage.
+unsound = "all"
 # Ignore specific advisories that cannot be resolved yet.
 # Each entry must have a reason explaining why it is safe to ignore.
 ignore = [
