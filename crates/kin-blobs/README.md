@@ -7,9 +7,10 @@ content keyed by its SHA-256 digest. Writes are atomic and content is sharded
 Git-style (`{root}/{hash[0..2]}/{hash[2..]}`), so identical content is stored
 once and always addressed by its hash.
 
-It is a foundational primitive in the open Kin local substrate: higher layers
-such as `kin-model` and `kin-db` build the canonical types and the semantic
-graph on top of content-addressable storage.
+It is the storage primitive in the open Kin local substrate. `kin-model` takes
+its canonical content hash from this crate and `kin` keeps published source
+bodies in a store built by it; Kin's graph, ranking, and provenance policy lives
+above this crate, not inside it.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
@@ -29,6 +30,13 @@ Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.
 cargo build
 cargo test
 ```
+
+A blob's bytes are durable when `write` returns. The barrier that makes the
+blob's *name* durable is deferred and amortized across a shard directory, and
+`sync`, the `Drop` drain, or `write` itself issues it once enough renames
+accumulate. A store built with `BlobStore::new_ephemeral` issues no device
+barrier at all and makes none of those guarantees across a crash. Layout,
+content addressing, dedup, and read-side verification are identical either way.
 
 ## Usage
 
@@ -54,8 +62,12 @@ println!("{h}");
 ## Key types
 
 - `BlobStore`: filesystem-backed store with `write`, `read`, `exists`, `delete`,
-  `list_hashes`, and garbage collection (`gc`) against a live set.
+  `list_hashes`, `sync`, `quarantine`, and garbage collection (`gc`) against a
+  live set. Build it with `new` for a durable store or `new_ephemeral` for one
+  that issues no device barriers.
 - `Hash256`: 256-bit content hash (SHA-256), with hex parsing and formatting.
+- `GcReport`: what one `gc` pass scanned, retained, reclaimed, and freed in
+  bytes.
 - `digest()` / `digest_bytes()`: content-hash computation helpers.
 
 ## License
