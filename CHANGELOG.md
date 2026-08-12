@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.21] - 2026-08-12
+
+### Changed
+
+- Treat an in-flight call as session activity so the sweeper cannot reap mid-write (#776)
+- Let the interrupted init choose its own kill point (#785)
+- Stop Git auto-maintenance from racing test fixture repositories (#772)
+- Report a files-mode resolution miss from impact_analysis (#782)
+- Make the retrieval negative consume the signals printed beside it (#777)
+
+
 ## [0.5.20] - 2026-08-12
 
 ### Changed
