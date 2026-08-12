@@ -499,14 +499,7 @@ fn exact_tree_admission(
         .artifacts_by_path()
         .map(|artifact| artifact.path.clone())
         .collect::<Vec<_>>();
-    let mut graph_only_paths = Vec::new();
-    for artifact in previous.artifacts_by_path() {
-        if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
-            != kin_core::SourceProjectionDisposition::Materialized
-        {
-            graph_only_paths.push(artifact.path.clone());
-        }
-    }
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
     let ignore =
         kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
     // A rule that begins matching an already-admitted path retracts it. Ignoring
@@ -572,20 +565,35 @@ fn exact_tree_admission(
         // explicit pass will. The scan behind this is complete, so each pass
         // replaces the previous answer instead of adding to it, and the explicit
         // seam below replaces it again the moment one takes what was left.
+        //
+        // A retired graph-only member takes its host subtree out of the bound
+        // for the same reason, and it is the half that cannot be decided from
+        // this tree alone. Content beneath a Gitlink was written while the
+        // Gitlink still stood, so the events naming it were never observations
+        // of this repository's projection. They keep arriving after a transition
+        // removes the member, and this tree no longer remembers that it was
+        // there, so without the retirement they read as ordinary new files and
+        // one branch switch leaves the workspace ahead of the base it was just
+        // made level with. The paths stay in the untracked report either way, so
+        // an explicit seam still sweeps them and says what it took.
+        //
+        // The retired set is read once for the whole pass rather than per path.
+        // It is small and usually empty, but `observed` is the working copy.
+        let retired = state.retired_graph_only_members.snapshot();
+        let admissible = |path: &RepoPath| {
+            observation_covers_path(observation, path)
+                && !crate::graph_only_members::covered_by(&retired, path)
+        };
         state
             .background_work
             .reconcile()
             .record_untracked_observation(
                 observed.entries().keys().filter(|path| {
-                    previous.artifact_id_at_path(path).is_none()
-                        && !observation_covers_path(observation, path)
+                    previous.artifact_id_at_path(path).is_none() && !admissible(path)
                 }),
                 excluded_host_content(&scan),
             );
-        observed.retain(|path, _| {
-            previous.artifact_id_at_path(path).is_some()
-                || observation_covers_path(observation, path)
-        });
+        observed.retain(|path, _| previous.artifact_id_at_path(path).is_some() || admissible(path));
     }
     // A bounded tick re-inserts every tracked path its observation did not
     // cover, which would restore the paths the rules just retracted. Editing
@@ -687,6 +695,11 @@ fn exact_tree_admission(
                 std::iter::empty::<&RepoPath>(),
                 excluded_host_content(&scan),
             );
+        // The same pass took whatever the retirements were holding back, so they
+        // have served their purpose. A caller who explicitly admits the subtree
+        // under a removed Gitlink has said outright that the content is theirs,
+        // and ambient observation resumes over it from here.
+        state.retired_graph_only_members.clear();
     }
 
     Ok(ExactTreeAdmission {
@@ -2832,6 +2845,140 @@ mod tests {
         ));
         assert_eq!(tree_entry(&state, "submodule"), Some(gitlink));
         assert!(tree_entry(&state, "submodule/src/lib.rs").is_none());
+    }
+
+    /// Stage the shape of the branch-switch race without racing anything.
+    ///
+    /// A Gitlink stands, host content is written beneath it, the member is
+    /// removed, and only then does the watcher event for that content reach
+    /// admission. That is exactly what a switch produces when its watcher
+    /// backlog outlives the transition, and the ordering here is fixed rather
+    /// than raced, so the assertion does not depend on any timing.
+    fn state_whose_gitlink_was_removed_under_a_pending_event(
+        repo: &tempfile::TempDir,
+    ) -> (Arc<DaemonState>, std::path::PathBuf) {
+        let state = open_test_state(repo);
+        let gitlink = TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x5a; 20]));
+        let artifact_id = kin_model::ArtifactId::new();
+        let member = test_repo_path("submodule");
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: kin_model::LocatedEntry::new(member.clone(), gitlink),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        std::fs::create_dir_all(repo.path().join("submodule/src")).unwrap();
+        let nested = repo.path().join("submodule/src/lib.rs");
+        std::fs::write(&nested, b"independent checkout content").unwrap();
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Removed {
+                    artifact_id,
+                    old: kin_model::LocatedEntry::new(member, gitlink),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        (state, nested)
+    }
+
+    /// The fix. The transition retired the member, so the host content beneath
+    /// it stays out of the workspace however late its event arrives.
+    #[test]
+    fn a_retired_gitlink_keeps_its_host_subtree_out_of_ambient_admission() {
+        let repo = tempfile::tempdir().unwrap();
+        let (state, nested) = state_whose_gitlink_was_removed_under_a_pending_event(&repo);
+        state
+            .retired_graph_only_members
+            .retire([&test_repo_path("submodule")]);
+
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(nested)).unwrap();
+        assert!(
+            matches!(admitted, AdmittedFileEvent::Untracked { .. }),
+            "content beneath a retired member is untracked, not admitted: {admitted:?}"
+        );
+        assert!(
+            tree_entry(&state, "submodule/src/lib.rs").is_none(),
+            "a removed Gitlink must not hand its host subtree to the workspace"
+        );
+        let report = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert_eq!(
+            report.untracked_paths_sample,
+            vec!["submodule/src/lib.rs"],
+            "the content is reported rather than hidden, so an explicit seam can take it"
+        );
+    }
+
+    /// The control that proves the assertion above can fail. Without the
+    /// retirement, the identical sequence admits the nested content, which is
+    /// the defect: the workspace goes ahead of the base a switch just made it
+    /// level with, and the next switch refuses.
+    #[test]
+    fn without_the_retirement_a_removed_gitlink_leaks_its_host_subtree() {
+        let repo = tempfile::tempdir().unwrap();
+        let (state, nested) = state_whose_gitlink_was_removed_under_a_pending_event(&repo);
+
+        admit_file_event_ambient(&state, &FileEvent::Changed(nested)).unwrap();
+        assert!(
+            tree_entry(&state, "submodule/src/lib.rs").is_some(),
+            "this control exists to fail the day the leak stops reproducing without a retirement"
+        );
+    }
+
+    /// An explicit admission seam takes what the retirement was holding back,
+    /// and ambient observation resumes over the subtree afterwards.
+    #[test]
+    fn an_explicit_seam_sweeps_a_retired_subtree_and_ends_the_retirement() {
+        let repo = tempfile::tempdir().unwrap();
+        let (state, nested) = state_whose_gitlink_was_removed_under_a_pending_event(&repo);
+        state
+            .retired_graph_only_members
+            .retire([&test_repo_path("submodule")]);
+
+        admit_file_event(&state, &FileEvent::Changed(nested.clone())).unwrap();
+        assert!(
+            tree_entry(&state, "submodule/src/lib.rs").is_some(),
+            "an explicit seam admits every host path the complete walk met"
+        );
+        assert!(
+            state.retired_graph_only_members.snapshot().is_empty(),
+            "the sweep is the caller saying the subtree is theirs"
+        );
+
+        std::fs::write(&nested, b"edited after the explicit sweep").unwrap();
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(nested)).unwrap();
+        let AdmittedFileEvent::Regular { tree_changed, .. } = admitted else {
+            panic!("an edit under a swept subtree is ordinary content now: {admitted:?}");
+        };
+        assert!(tree_changed);
+    }
+
+    /// A retirement is scoped to its own subtree. Nothing else in the working
+    /// copy stops being ambiently admissible because one Gitlink went away.
+    #[test]
+    fn a_retirement_leaves_the_rest_of_the_working_copy_admissible() {
+        let repo = tempfile::tempdir().unwrap();
+        let (state, _) = state_whose_gitlink_was_removed_under_a_pending_event(&repo);
+        state
+            .retired_graph_only_members
+            .retire([&test_repo_path("submodule")]);
+
+        let sibling = repo.path().join("sibling.rs");
+        std::fs::write(&sibling, b"pub fn sibling() -> u32 { 1 }\n").unwrap();
+        let admitted = admit_file_event_ambient(&state, &FileEvent::Changed(sibling)).unwrap();
+        assert!(
+            !matches!(admitted, AdmittedFileEvent::Untracked { .. }),
+            "an unrelated new file is still admitted from the act of writing it: {admitted:?}"
+        );
+        assert!(tree_entry(&state, "sibling.rs").is_some());
     }
 
     #[tokio::test]

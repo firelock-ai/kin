@@ -1268,6 +1268,11 @@ pub struct DaemonState {
     /// daemon-health signal; cleared on the next tick whose deletions are within
     /// the anti-wipe threshold.
     pub mass_deletion_blocked: AtomicBool,
+    /// Repository paths that were graph-only members until a transition dropped
+    /// them. Host content beneath one was on disk while the member still stood,
+    /// so it is pre-existing content rather than something ambient observation
+    /// saw arrive, however late the watcher event naming it drains.
+    pub retired_graph_only_members: crate::graph_only_members::RetiredGraphOnlyMembers,
     /// True when the background embedding worker has permanently stopped (it
     /// exhausted its consecutive-panic budget). The graph/locate/reconcile
     /// surfaces keep serving — embeddings are a DERIVED index — but the vector
@@ -2280,6 +2285,7 @@ impl DaemonState {
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
+            retired_graph_only_members: Default::default(),
             embed_worker_failed: AtomicBool::new(false),
             derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
@@ -2498,6 +2504,7 @@ impl DaemonState {
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
+            retired_graph_only_members: Default::default(),
             embed_worker_failed: AtomicBool::new(false),
             derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
@@ -4194,6 +4201,29 @@ impl DaemonState {
             )));
         }
 
+        // Record what this transition does to graph-only membership before the
+        // query tree moves. Every repository transition seam finalizes here, so
+        // this is the one place that sees both sides of one, and taking the
+        // verdict from the transition rather than from the tree afterwards is
+        // what makes it independent of when a watcher event drains: until the
+        // apply below, a member is live and ambient observation drops events
+        // beneath it; from here on it is retired and the host content under it
+        // is reported untracked instead of admitted as something newly written.
+        let previous_members = crate::graph_only_members::members_of(expected_previous_tree)
+            .map_err(|error| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "cannot read graph-only members of the repository transition base: {error}"
+                )))
+            })?;
+        let desired_members =
+            crate::graph_only_members::members_of(desired_tree).map_err(|error| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                    "cannot read graph-only members of the repository transition result: {error}"
+                )))
+            })?;
+        self.retired_graph_only_members
+            .retire(previous_members.difference(&desired_members));
+
         let authority_snapshot = authority_graph.to_snapshot();
         let live_snapshot = self.graph.to_snapshot();
         let semantics = kin_core::diff_workspace_semantics(
@@ -4242,6 +4272,12 @@ impl DaemonState {
                     .to_string(),
             )));
         }
+        // A path this transition restored as a graph-only member is covered by
+        // the live rule again from here on, so its retirement has nothing left
+        // to do. Dropped after the apply rather than before it, so the two rules
+        // never hand off through a gap.
+        self.retired_graph_only_members
+            .forget_live_members(&desired_members);
 
         let generation_advanced = live_generation == receipt.roots_before.generation;
         if generation_advanced {
