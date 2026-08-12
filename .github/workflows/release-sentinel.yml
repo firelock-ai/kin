@@ -11,11 +11,11 @@ name: Release Sentinel
 # noticing that nothing happened, which is the slowest detector available.
 #
 # ACTIVATION IS ONE FOUNDER STEP. This workflow reads
-# `secrets.CLAUDE_CODE_OAUTH_TOKEN`, which only the founder can mint because
+# `secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI`, which only the founder can mint because
 # `claude setup-token` is interactive:
 #
 #   claude setup-token
-#   gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all
 #
 # Until that secret exists the preflight job below reports it and the patrol is
 # skipped, so this file is inert rather than red. Nothing else about the rail
@@ -63,18 +63,18 @@ jobs:
       - name: Report whether the sentinel credential is wired
         id: credential
         env:
-          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI }}
         run: |
           set -euo pipefail
           # Only ever tests for emptiness. The value is never printed, never
           # written to an output, and never passed to another step.
           if [ -n "${OAUTH_TOKEN:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "CLAUDE_CODE_OAUTH_TOKEN is present; the patrol will run."
+            echo "CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI is present; the patrol will run."
             exit 0
           fi
           echo "enabled=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set, so the release sentinel is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private' to activate the patrol. This run is a success on purpose: an unwired sentinel must not read as a broken rail."
+          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI is not set, so the release sentinel is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all' to activate the patrol. This run is a success on purpose: an unwired sentinel must not read as a broken rail."
 
   patrol:
     name: Patrol the release rail
@@ -108,7 +108,7 @@ jobs:
       - name: Patrol
         uses: anthropics/claude-code-action@9c41ed18ca8b2b2a17eaef4723d5092ccdebc814 # v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI }}
           # The job-scoped token, which expires with the job and carries exactly
           # the permissions declared above. Never a personal access token: a
           # static credential does not rotate between runs.

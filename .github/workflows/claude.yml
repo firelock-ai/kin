@@ -8,11 +8,11 @@ name: Claude
 # switching to a terminal and rebuilding the context by hand.
 #
 # ACTIVATION IS ONE FOUNDER STEP, shared with the release sentinel. This
-# workflow reads `secrets.CLAUDE_CODE_OAUTH_TOKEN`, which only the founder can
+# workflow reads `secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI`, which only the founder can
 # mint because `claude setup-token` is interactive:
 #
 #   claude setup-token
-#   gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all
 #
 # Until that secret exists the preflight job reports it and the responder is
 # skipped, so an @claude mention on an unwired repository is quietly ignored
@@ -67,17 +67,17 @@ jobs:
       - name: Report whether the responder credential is wired
         id: credential
         env:
-          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI }}
         run: |
           set -euo pipefail
           # Only ever tests for emptiness. The value is never printed.
           if [ -n "${OAUTH_TOKEN:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "CLAUDE_CODE_OAUTH_TOKEN is present; the responder will run."
+            echo "CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI is present; the responder will run."
             exit 0
           fi
           echo "enabled=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set, so this @claude mention is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private' to activate the responder."
+          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI is not set, so this @claude mention is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI --org firelock-ai --visibility all' to activate the responder."
 
   respond:
     name: Respond to the mention
@@ -102,7 +102,7 @@ jobs:
       - name: Respond
         uses: anthropics/claude-code-action@9c41ed18ca8b2b2a17eaef4723d5092ccdebc814 # v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI }}
           # The job-scoped token, which expires with the job and carries exactly
           # the permissions declared above. Never a personal access token.
           github_token: ${{ secrets.GITHUB_TOKEN }}
