@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.19] - 2026-08-12
+
+### Changed
+
+- Report a reconcile pass waiting on a retry ladder as waiting_deferred (#753)
+- Check a structured facet against the normalization that wrote it (#756)
+- Carry a pending workspace across kin branch switch (#748)
+- Report the newest change and bound the payload in kin_provenance_query (#751)
+- Admit text-matched artifacts into locate candidacy so a docs store can answer for its own content (#760)
+- Report a shell hook setup never installed as unconfigured, not failed (#757)
+- Make update arrival a policy and carry its remedy as one gesture (#755)
+- Give Windows its zip suffix in the manual install instructions (#763)
+- Drop the dead triage-doc pointer from the CI clippy comment (#764)
+- Report a completed fill as ready when new work arrives after it (#761)
+- Fail CI when the README language count and the adapter registry disagree (#688)
+- Capture the install proof's own reports outside the tree it measures (#762)
+- Spread graph-status resample attempts across real time (#629)
+- Abandon the v0.5.18 release tag (#765)
+
+
 ## [0.5.18] - 2026-08-11
 
 ### Changed
