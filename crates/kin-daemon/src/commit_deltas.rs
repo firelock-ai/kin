@@ -1442,8 +1442,8 @@ mod tests {
         );
     }
 
-    /// FIR-2147: the walk declines to observe a tracked path its rules cover,
-    /// so the observation carries that path's existing truth forward unchanged.
+    /// The walk declines to observe a tracked path its rules cover, so the
+    /// observation carries that path's existing truth forward unchanged.
     /// Reading "unobserved" as "absent" would delete graph-owned identity by
     /// inference, and it would do it on the exact pass that stopped reading the
     /// path. Retiring an ignored member stays an announced retraction.
@@ -1559,7 +1559,7 @@ mod tests {
     /// blob for those exact bytes, so nothing is left to read and this succeeds;
     /// the earlier code read every leaf a second time and fails here.
     ///
-    /// This is the whole-store phase FIR-2152 found inside the per-event path.
+    /// This is the whole-store phase that used to sit inside the per-event path.
     /// The reconcile loop runs this on every tick, so a working copy of twenty
     /// thousand files paid two complete reads of itself to observe that one file
     /// had moved. What it costs now is proportional to what moved.

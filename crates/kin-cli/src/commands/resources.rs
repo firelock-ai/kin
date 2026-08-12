@@ -770,8 +770,8 @@ mod tests {
     /// Untracked host content is announced and is not a fault.
     ///
     /// Both halves matter. Without the notice, a file a reader can see on disk
-    /// has no entities and no surface says why, which is the question FIR-2152
-    /// arrived as. Without the second assertion, every working copy mid-edit
+    /// has no entities and no surface says why, which is the question a reader
+    /// arrives with. Without the second assertion, every working copy mid-edit
     /// would report `attention`, and a health signal that is always on is one
     /// nobody reads.
     #[test]

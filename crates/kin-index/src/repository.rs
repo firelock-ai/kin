@@ -1481,10 +1481,10 @@ mod tests {
         assert!(prefixed.matches(&path("target/other.o")));
     }
 
-    /// The trap behind FIR-1854: a default exclude alone retires nothing. The
-    /// walk stops observing the path, and stopping short of observing it is
-    /// exactly why it cannot report the path gone. Retirement stays an
-    /// announced retraction the caller performs against graph truth.
+    /// The trap: a default exclude alone retires nothing. The walk stops
+    /// observing the path, and stopping short of observing it is exactly why it
+    /// cannot report the path gone. Retirement stays an announced retraction
+    /// the caller performs against graph truth.
     #[test]
     fn default_excludes_never_retire_an_already_tracked_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -1715,9 +1715,9 @@ mod tests {
         );
     }
 
-    /// FIR-2147: an ignore rule is a statement about IO, not only about
-    /// membership. A tracked path the rules exclude is observed as unverified
-    /// and never opened, so no byte of an ignored subtree reaches the hasher.
+    /// An ignore rule is a statement about IO, not only about membership. A
+    /// tracked path the rules exclude is observed as unverified and never
+    /// opened, so no byte of an ignored subtree reaches the hasher.
     #[test]
     fn an_ignored_subtree_costs_no_content_reads_even_when_tracked() {
         let temp = tempfile::tempdir().unwrap();
@@ -1769,10 +1769,10 @@ mod tests {
         );
     }
 
-    /// The live shape behind FIR-2147: a 120GB VM image inside an ignored
-    /// subtree rewrote itself while the walk hashed it, and the churn failed
-    /// every whole-tree admission for two days. Nothing in an ignored subtree
-    /// is read now, so its churn cannot reach the rest of the tree.
+    /// The live shape: a 120GB VM image inside an ignored subtree rewrote
+    /// itself while the walk hashed it, and the churn failed every whole-tree
+    /// admission for two days. Nothing in an ignored subtree is read now, so
+    /// its churn cannot reach the rest of the tree.
     #[test]
     fn churn_beneath_an_ignored_subtree_admits_the_rest_of_the_tree() {
         use std::sync::atomic::{AtomicBool, Ordering};

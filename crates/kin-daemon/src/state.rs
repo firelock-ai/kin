@@ -1011,10 +1011,10 @@ impl IdleTimeoutRaise {
 /// returning the new window when one is warranted and `None` when the current
 /// window already covers the request.
 ///
-/// This is the whole decision behind FIR-1886. The idle window is fixed by
-/// whichever process spawns the daemon, and on a developer machine that is
-/// almost always an ordinary CLI command taking the short CLI default. A
-/// later client with a much longer session — an MCP agent loop that goes quiet
+/// This is the whole decision the idle floor exists to make. The idle window is
+/// fixed by whichever process spawns the daemon, and on a developer machine
+/// that is almost always an ordinary CLI command taking the short CLI default.
+/// A later client with a much longer session — an MCP agent loop that goes quiet
 /// between tool calls — used to inherit that short window silently and have the
 /// daemon expire underneath it mid-session.
 ///
@@ -5219,9 +5219,9 @@ mod tests {
             .expect("directory metadata sync must not reject a valid host directory");
     }
 
-    /// FIR-1886, both sides at the resolution layer. A client whose session
-    /// outlasts the window this daemon was spawned with grows it; a client that
-    /// already fits inside it changes nothing.
+    /// Both sides at the resolution layer. A client whose session outlasts the
+    /// window this daemon was spawned with grows it; a client that already fits
+    /// inside it changes nothing.
     #[test]
     fn an_idle_floor_grows_a_short_window_and_leaves_a_long_one_alone() {
         let secs = Duration::from_secs;

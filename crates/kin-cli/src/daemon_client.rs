@@ -4171,8 +4171,8 @@ fn resolve_idle_timeout_env(
 /// back a process whose window was fixed by whoever started it, which on a
 /// developer machine is almost always an ordinary CLI command taking the short
 /// CLI default. An MCP session that attached there inherited 60 seconds and had
-/// the daemon expire underneath it between tool calls (FIR-1886). A caller with
-/// a stated need has to say so to the daemon it actually got.
+/// the daemon expire underneath it between tool calls. A caller with a stated
+/// need has to say so to the daemon it actually got.
 ///
 /// `None` means the caller stated no need of its own and is content with
 /// whatever the daemon is running, which is the pre-existing behavior for every
@@ -10866,10 +10866,10 @@ mod tests {
 
     // ── idle-timeout carried to a daemon this process did not start ────────
 
-    /// FIR-1886, both sides. Injecting at spawn only helps the caller that
-    /// spawns, and an MCP session usually attaches to a daemon an ordinary CLI
-    /// command already started at the 60-second default. A caller with a stated
-    /// need must carry it; a caller with none must leave the daemon alone.
+    /// Both sides. Injecting at spawn only helps the caller that spawns, and an
+    /// MCP session usually attaches to a daemon an ordinary CLI command already
+    /// started at the 60-second default. A caller with a stated need must carry
+    /// it; a caller with none must leave the daemon alone.
     #[test]
     fn an_mcp_session_carries_its_window_to_a_daemon_it_did_not_start() {
         assert_eq!(

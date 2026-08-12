@@ -1242,12 +1242,12 @@ mod tests {
     /// The command names host content the loop declined to track, and does not
     /// call it a fault.
     ///
-    /// This is the FIR-2152 shape from the reader's side. A file was written, no
-    /// entity for it ever appeared, and the only surface that could have
-    /// explained why said nothing about it at all. Naming it as a warning would
-    /// be the opposite error: a working copy mid-edit holds untracked files
-    /// constantly, and a status command that cries fault over every one of them
-    /// is one nobody reads.
+    /// This is the untracked-content shape from the reader's side. A file was
+    /// written, no entity for it ever appeared, and the only surface that could
+    /// have explained why said nothing about it at all. Naming it as a warning
+    /// would be the opposite error: a working copy mid-edit holds untracked
+    /// files constantly, and a status command that cries fault over every one
+    /// of them is one nobody reads.
     #[test]
     fn graph_status_names_untracked_paths_without_calling_them_a_fault() {
         let (_temp, binding, graph) = graph_validation_fixture();
@@ -1286,9 +1286,8 @@ mod tests {
         );
     }
 
-    /// A dropped reconcile event reaches the same verdict. This is the FIR-2145
-    /// shape, where events errored and were skipped while every surface read
-    /// clean.
+    /// A dropped reconcile event reaches the same verdict: events errored and
+    /// were skipped while every surface read clean.
     #[test]
     fn graph_status_names_dropped_reconcile_events() {
         let (_temp, binding, graph) = graph_validation_fixture();

@@ -32,10 +32,10 @@
 //! projection additionally carries a random operation id and the wall-clock
 //! commit time. Two admissions agree on those roots only by adopting one
 //! repository identity, which is what `KinManifest::adopting` is for and which
-//! two independent `kin init` runs deliberately do not do. Closing them is
-//! FIR-2068's follow-up and needs a repository-identity decision plus a root
-//! schema version, because every existing store validates that its recorded
-//! root bundle recomputes from its persisted envelope.
+//! two independent `kin init` runs deliberately do not do. Closing them needs a
+//! repository-identity decision plus a root schema version, because every
+//! existing store validates that its recorded root bundle recomputes from its
+//! persisted envelope.
 
 use serde_json::Value;
 use std::fs;

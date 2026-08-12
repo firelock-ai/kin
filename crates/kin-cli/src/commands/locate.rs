@@ -1446,8 +1446,8 @@ fn record_vector_index_degradation(
 ///
 /// A tier chosen after a failed host probe is reported as its own thing. The
 /// ordinary entry's remediation tells the reader to run on a bigger host, which
-/// is wrong advice when the host was never read: the machine that produced
-/// FIR-2023 had eight times the RAM the entry implied it lacked.
+/// is wrong advice when the host was never read: the machine that produced this
+/// misreport had eight times the RAM the entry implied it lacked.
 fn record_capability_tier_degradation(
     detection: &CapabilityDetection,
     sink: &mut Vec<RetrievalDegradation>,
@@ -3757,9 +3757,9 @@ fn run_with_graph_capture_budgeted(
         }
     }
 
-    // FIR-2183. Runs on every profile and outside the floor's lever, because the
-    // floor is a re-ranking choice for code files while this is the only door a
-    // tracked artifact has at all. It runs after the floor so that when both can
+    // Runs on every profile and outside the floor's lever, because the floor is
+    // a re-ranking choice for code files while this is the only door a tracked
+    // artifact has at all. It runs after the floor so that when both can
     // admit the same path the floor's placement wins and nothing is admitted
     // twice.
     admit_text_matched_artifacts(&mut fused, &artifact_candidates, &mut degradations);
@@ -4056,8 +4056,8 @@ fn run_with_graph_capture_budgeted(
     // authority open is a full recovery and the committed state a body's
     // artifact-identity binding needs is a whole-history replay, so a session
     // per function pays both twice for one answer, and a session per read pays
-    // them once per definition symbol. That per-symbol shape is the FIR-1897
-    // defect itself, and holding it here is what keeps it off this path.
+    // them once per definition symbol. That per-symbol shape is the defect
+    // itself, and holding it here is what keeps it off this path.
     //
     // Constructing the session performs no IO, so hoisting it above the
     // `opts.enabled` guards inside both callees costs a disabled request
@@ -16040,7 +16040,7 @@ fn match_symbol_entity<'a>(
 ///
 /// Reads through the request's held authority. The one-shot entry point builds a
 /// fresh session per call, which is correct for a single-entity surface and is
-/// the FIR-1897 defect here: this runs once per definition symbol on a page.
+/// the defect here: this runs once per definition symbol on a page.
 fn bounded_entity_body_with_note(
     held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
     entity: &kin_model::Entity,
@@ -16115,8 +16115,9 @@ fn bounded_entity_body_with_note(
 /// Takes the SAME held authority [`attach_snippets`] just used. Both walk the
 /// same symbol set in the same request, so a body here resolves against
 /// authority and committed state already derived; deriving them again per
-/// definition symbol is the FIR-1897 shape, and it reaches every locate entry
-/// point because they all funnel through [`run_with_graph_capture_budgeted`].
+/// definition symbol is the defect this removes, and it reaches every locate
+/// entry point because they all funnel through
+/// [`run_with_graph_capture_budgeted`].
 /// Project one ranked artifact file into a [`LocateEntity`] row.
 ///
 /// The row deliberately carries no `entity_id`: there is no entity behind it,
@@ -16810,10 +16811,10 @@ mod tests {
             .expect("a sub-Performance tier must record a capability_tier degradation")
     }
 
-    /// FIR-2023 in the surface a caller actually reads. A tier the host chose
-    /// and a tier a failed probe chose must not produce the same entry: the
-    /// first's remediation is sound advice, the second's told an operator with
-    /// 128 GB to obtain more RAM.
+    /// The misread host in the surface a caller actually reads. A tier the host
+    /// chose and a tier a failed probe chose must not produce the same entry:
+    /// the first's remediation is sound advice, the second's told an operator
+    /// with 128 GB to obtain more RAM.
     #[test]
     fn a_misread_host_is_a_distinct_capability_entry_from_a_small_one() {
         let mut misread = Vec::new();
@@ -17118,11 +17119,10 @@ mod tests {
             .find(|event| event.component == "artifact_candidates" && event.reason == reason)
     }
 
-    /// FIR-2183, the ticket's own battery: a store whose answer lives in an
-    /// artifact must be able to say so on the surface an agent reads. This is the
-    /// dogfood session's exact failure, where a store proven by
-    /// `kin_artifact_read` to hold a phrase answered queries for that phrase with
-    /// Python function names.
+    /// A store whose answer lives in an artifact must be able to say so on the
+    /// surface an agent reads. This is the dogfood session's exact failure,
+    /// where a store proven by `kin_artifact_read` to hold a phrase answered
+    /// queries for that phrase with Python function names.
     #[test]
     #[serial_test::serial]
     fn a_ranked_artifact_reaches_the_graph_native_entity_surface() {
@@ -18372,9 +18372,9 @@ mod tests {
         );
     }
 
-    /// FIR-2179. Nothing on the ingest path writes an opaque artifact for a
-    /// source file, so on a real store the body lookup misses for every
-    /// candidate and the reranker used to score a batch of empty documents.
+    /// Nothing on the ingest path writes an opaque artifact for a source file,
+    /// so on a real store the body lookup misses for every candidate and the
+    /// reranker used to score a batch of empty documents.
     /// The entities the graph does hold for the path carry the same text the
     /// embedder reads, so they stand in.
     #[cfg(feature = "embeddings")]

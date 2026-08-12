@@ -446,9 +446,9 @@ pub fn build_trace_data_flow_response_within(
     // Opening authority verifies every stored body, linear in store size. The
     // per-step body projection used to open its own, so a chain of N steps paid
     // N+1 full-store verifications and a structurally tiny trace ran for
-    // minutes on a large store (FIR-1937, FIR-1909). Holding one open also
-    // makes the chain coherent: every step is now read from the same
-    // generation, where per-step opens could straddle a publication.
+    // minutes on a large store. Holding one open also makes the chain coherent:
+    // every step is now read from the same generation, where per-step opens
+    // could straddle a publication.
     //
     // A store with no readable authority still gets its chain. Bodies were
     // always optional per step, and hoisting the open must not turn a payload
@@ -1162,8 +1162,8 @@ mod tests {
         );
     }
 
-    /// The property FIR-1898 is actually about: the WORK stops, not just the
-    /// response. A cancelled walk must leave traversal undone that the same
+    /// The property cancellation is actually about: the WORK stops, not just
+    /// the response. A cancelled walk must leave traversal undone that the same
     /// walk uncancelled completes, measured against that walk rather than a
     /// constant.
     ///

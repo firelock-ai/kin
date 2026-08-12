@@ -2231,8 +2231,9 @@ mod tests {
         ]
     }
 
-    /// The FIR-2167 refusal: a pinned session sweeping `--all` reaches only its
-    /// own daemons, and the neighbour's survives.
+    /// The refusal that keeps a sweep inside one home: a pinned session
+    /// sweeping `--all` reaches only its own daemons, and the neighbour's
+    /// survives.
     #[test]
     fn a_home_scoped_sweep_stops_only_its_own_daemons() {
         let (targets, foreign) = partition_by_home(two_homes(), "/homes/a/.kin", StopScope::Home);
@@ -2312,7 +2313,7 @@ mod tests {
     }
 
     /// The census must be able to say which daemons are the caller's, which is
-    /// the FIR-2180 visibility half of the contract.
+    /// the visibility half of the home-scoping contract the sweep enforces.
     #[test]
     fn the_census_labels_every_home() {
         let labels: Vec<_> = two_homes()

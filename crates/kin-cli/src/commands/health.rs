@@ -2265,10 +2265,10 @@ mod tests {
         );
     }
 
-    /// The FIR-2147 shape at the `kin health` surface. No pass is stopped —
-    /// the reconcile loop is waking, failing, and sleeping on schedule, which
-    /// is exactly why the supervisor never stopped it — and the check still
-    /// must not answer healthy.
+    /// The failing-admission shape at the `kin health` surface. No pass is
+    /// stopped — the reconcile loop is waking, failing, and sleeping on
+    /// schedule, which is exactly why the supervisor never stopped it — and the
+    /// check still must not answer healthy.
     #[test]
     fn background_work_degrades_when_reconcile_admits_nothing_though_no_pass_is_stopped() {
         let check =
@@ -3953,7 +3953,7 @@ mod tests {
         assert_eq!(canonical_health_repo(vanished.clone()), vanished);
     }
 
-    /// Regression, FIR-1911: on Windows the first `kin setup` wrote the global
+    /// Regression: on Windows the first `kin setup` wrote the global
     /// Antigravity binding with the canonicalized (`\\?\` verbatim) repository
     /// root, then `kin setup status --json` reported it misconfigured, because
     /// the global arm compared it against a non-canonicalized root by exact

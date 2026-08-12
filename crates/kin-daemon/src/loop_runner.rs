@@ -2480,10 +2480,10 @@ mod tests {
     /// A watcher event for host content the repository has never tracked is
     /// declined outright, and the decline is published.
     ///
-    /// This is FIR-2152. The path could not be admitted, because ambient
-    /// observation may revise graph-owned history but never enlarge it, and it
-    /// could not be enriched either, because the revalidation compares host
-    /// bytes against a tree entry authority does not hold. The loop deferred it
+    /// The path could not be admitted, because ambient observation may revise
+    /// graph-owned history but never enlarge it, and it could not be enriched
+    /// either, because the revalidation compares host bytes against a tree
+    /// entry authority does not hold. The loop deferred it
     /// instead, and every retry bought another complete exact-tree admission
     /// over the whole working copy that arrived at the identical refusal: the
     /// backlog never emptied, the status never returned to idle, the reported
@@ -2740,7 +2740,7 @@ mod tests {
     /// explicit seam and produces no watcher event of its own, so on a working
     /// copy nobody is editing there is no next ambient tick to replace the
     /// record. The surface would keep naming a path whose entities resolve,
-    /// which is the same misdirection FIR-2152 set out to remove.
+    /// which is the same misdirection the disclosure exists to remove.
     #[test]
     fn admitting_a_declined_path_clears_its_disclosure_without_another_host_event() {
         let repo = tempfile::tempdir().unwrap();
@@ -3481,9 +3481,9 @@ mod tests {
     ///
     /// The loop reports `set_deferred(retry_lane.deferred_owed(), tick_started)` and
     /// then finds `pending_events` empty, because a path waiting out its step is
-    /// dropped from incoming events and its retry is not yet due. Before
-    /// FIR-2165 that combination reported plain `idle` for the whole wait, so a
-    /// ladder that never converged was indistinguishable from a quiet loop.
+    /// dropped from incoming events and its retry is not yet due. That
+    /// combination used to report plain `idle` for the whole wait, so a ladder
+    /// that never converged was indistinguishable from a quiet loop.
     #[test]
     fn a_ladder_waiting_tick_reports_waiting_deferred_rather_than_idle() {
         let base = Duration::from_millis(100);

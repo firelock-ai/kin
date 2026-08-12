@@ -4023,12 +4023,12 @@ mod tests {
         parsed_response(&handle_graph_neighborhood(&args, store).unwrap())
     }
 
-    /// The FIR-1595 regression. The tool has always described itself as
-    /// returning "both what it depends on and what depends on it", but traversed
-    /// the outgoing index alone, so `caller` — the only entity whose behavior a
-    /// change to `focal` can break — was never in the answer. An agent asking
-    /// this tool for blast radius got the focal's dependencies instead, with
-    /// nothing in the output to reveal the substitution.
+    /// The tool has always described itself as returning "both what it depends
+    /// on and what depends on it", but traversed the outgoing index alone, so
+    /// `caller` — the only entity whose behavior a change to `focal` can
+    /// break — was never in the answer. An agent asking this tool for blast
+    /// radius got the focal's dependencies instead, with nothing in the output
+    /// to reveal the substitution.
     #[test]
     fn graph_neighborhood_returns_dependents_not_only_dependencies() {
         let (store, _, focal_id, _) = neighborhood_fixture();
@@ -4705,7 +4705,7 @@ mod tests {
 
     #[test]
     fn graph_status_names_index_staleness_beside_complete_coverage() {
-        // FIR-2215. The umbrella store reported coverage {complete: true,
+        // The umbrella store reported coverage {complete: true,
         // indexed: 49, pending: 0, total: 49} beside entity_count 0, while
         // semantic_locate reported 40 of those ranked vector keys resolving to
         // entities the graph no longer holds. Coverage is measured against what

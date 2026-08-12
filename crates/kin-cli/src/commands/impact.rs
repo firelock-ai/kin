@@ -1093,8 +1093,8 @@ mod tests {
         );
     }
 
-    /// FIR-2032, at the unit boundary: the qualifier miss is reported as a miss,
-    /// the machine surface carries the identities the name does resolve to, and
+    /// The qualifier miss at the unit boundary. It is reported as a miss, the
+    /// machine surface carries the identities the name does resolve to, and
     /// the count of matches after qualification stays zero.
     #[tokio::test]
     async fn qualifier_miss_names_the_unfiltered_candidates_on_both_surfaces() {
