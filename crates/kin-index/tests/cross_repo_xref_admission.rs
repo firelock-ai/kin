@@ -304,6 +304,12 @@ where
     S: AsRef<OsStr>,
 {
     Command::new("git")
+        // This fixture commits a repository and then admits it in the same
+        // test. Git otherwise ends a commit by detaching
+        // `git maintenance run --auto`, which outlives the commit and can hold
+        // `objects/pack/multi-pack-index.lock` while the admission preflight
+        // reads the object store and refuses on any lock it finds there.
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(repo)
         .env("GIT_CONFIG_NOSYSTEM", "1")
