@@ -1,0 +1,14 @@
+# Canonical author identities.
+#
+# One human wrote this repository under several Git identities: a GitHub
+# noreply address, a second work address, and one address Git synthesized from
+# a hostname when a checkout had no user.email set. This file maps them onto a
+# single name and address for git log, git shortlog, git blame, and GitHub's
+# contributor view. No commit is rewritten and no SHA changes.
+#
+# Bot identities are deliberately left alone, so automated commits stay
+# visibly automated.
+
+Troy Fortin <troy@firelock.ai> <63249686+troyjr4103@users.noreply.github.com>
+Troy Fortin <troy@firelock.ai> <troy.fortin@firelock.ai>
+Troy Fortin <troy@firelock.ai> <troyfortinjr@MacBook-Pro-2.local>

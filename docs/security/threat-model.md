@@ -160,13 +160,18 @@ addresses are re-verified.
 
 ## Residual Risks and Hardening
 
-- **Shared and multi-tenant hosts.** The default same-user trust boundary means
-  any process running as your user can reach the loopback daemon. On hosts where
-  that is not an acceptable assumption, enable `KIN_DAEMON_REQUIRE_TOKEN` (or set
-  an explicit `KIN_DAEMON_AUTH_TOKEN`).
-- **Provisioned-but-unenforced token.** Because the per-install token is
-  provisioned but not enforced by default, do not assume bearer authentication is
-  active unless one of the enforcement variables above is set.
+- **Shared and multi-tenant hosts.** Bearer authentication is enforced by
+  default, but the token file is readable by its owner, so any process running as
+  your user can read it and reach the loopback daemon. That is the default
+  same-user trust boundary, and a token does not raise it. On hosts where the
+  assumption does not hold, set an explicit `KIN_DAEMON_AUTH_TOKEN` that lives
+  outside the repository, and never set `KIN_DAEMON_REQUIRE_TOKEN` to a falsy
+  value.
+- **The escape hatch is real.** A falsy `KIN_DAEMON_REQUIRE_TOKEN` turns bearer
+  authentication off for a daemon that then relies on the loopback bind and the
+  Host/Origin guard alone. Check the variable before assuming an audited host is
+  enforcing the token, since the opt-out survives in whatever shell profile or
+  service unit set it.
 - **Off-host exposure.** Binding the daemon to a non-loopback address requires a
   token, but exposing it to a network still widens the attack surface
   considerably; treat it as a deliberate, audited deployment choice.

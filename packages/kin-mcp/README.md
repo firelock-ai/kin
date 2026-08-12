@@ -45,14 +45,18 @@ Use it directly from an MCP client with `npx`:
 }
 ```
 
-For a pinned version:
+To pin a version, add it to the package spec. Take the number from the
+[published version list](https://www.npmjs.com/package/@kinlab/kin-mcp?activeTab=versions)
+rather than from this page, because a version written into a README is stale by
+the next release and pins whoever copies it to whatever shipped when the line
+was typed:
 
 ```json
 {
   "mcpServers": {
     "kin": {
       "command": "npx",
-      "args": ["-y", "@kinlab/kin-mcp@0.5.14"]
+      "args": ["-y", "@kinlab/kin-mcp@<version>"]
     }
   }
 }
