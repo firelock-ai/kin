@@ -2735,8 +2735,27 @@ pub fn resolve_diff<G: GraphStore>(
     // Mode 2: file paths
     if let Some(files) = get_optional_string_array(args, "files") {
         if !files.is_empty() {
-            return kin_review::diff_from_files(store, &files)
-                .map_err(|e| McpError::Review(e.to_string()));
+            return kin_review::diff_from_files(store, &files).map_err(|error| match error {
+                // Files mode resolves each path to the entities the graph holds
+                // for it and diffs those. When none resolve there is nothing to
+                // diff, and the shared review error for that is worded for the
+                // base/head mode: "no changes between base and head". A caller
+                // who passed neither a base nor a head reads a complaint about
+                // a comparison that never happened and looks for a diff
+                // problem, when the fact is that the paths named no entities.
+                // Tracked paths with no parser-emitted entities are the common
+                // case here: a workflow file is a real artifact and resolves to
+                // nothing.
+                kin_review::ReviewError::NoChanges => McpError::Review(format!(
+                    "no entity resolved from the given files, so nothing was diffed: [{}]. \
+                     These paths named no entities in this graph, which is what a tracked file \
+                     the parsers emit no entities for looks like; no base or head was \
+                     compared. Confirm the paths with kin_artifact_list, or pass entity_ids \
+                     for the declarations you mean.",
+                    files.join(", ")
+                )),
+                other => McpError::Review(other.to_string()),
+            });
         }
     }
 
