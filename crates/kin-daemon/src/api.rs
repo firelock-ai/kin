@@ -6775,10 +6775,55 @@ fn semantic_locate_payload(
     if !degradations.is_empty() {
         payload["degradations"] = json!(degradations);
     }
+    // The page-level half of the disclosure: not one ranked entity carries a
+    // name the query asked for.
+    //
+    // Read from `rows`, the whole retained ranking, never from `window`. A
+    // per-page verdict would call a query successful because page 1 happened to
+    // hold the one name hit and a fallback because page 2 did not, which is the
+    // reasoning the fused arm already refuses. Emitted only when true, and only
+    // for entity granularity, so both arms of this tool carry the field on the
+    // same terms.
+    if !file_granularity && locate_rows_are_all_fallback(rows) {
+        payload["all_fallback"] = json!(true);
+    }
     match serde_json::to_string_pretty(&payload) {
         Ok(text) => kin_mcp::ToolCallResult::text(text),
         Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
     }
+}
+
+/// Classify one cosine-arm hit for the caller's `match_kind` disclosure.
+///
+/// Only two values are reachable, and that is the honest set for this arm: it
+/// ranks from the vector index alone, so a hit the query did not name arrived by
+/// embedding similarity. `TextFallback` would claim a lexical pool that never
+/// ran on this profile.
+///
+/// The name test is [`semloc_query_has_exact_token`], which is the same rule
+/// `match_evidence.name_match` reports and the same one kin-cli applies for the
+/// fused arm's `match_kind`, so this field cannot disagree with the evidence
+/// object beside it or with the other arm.
+fn cosine_match_kind(query: &str, name: &str) -> kin_cli::commands::locate::LocateMatchKind {
+    if semloc_query_has_exact_token(query, name) {
+        kin_cli::commands::locate::LocateMatchKind::Name
+    } else {
+        kin_cli::commands::locate::LocateMatchKind::Semantic
+    }
+}
+
+/// True when a ranking returned rows and none of them is a name the query asked
+/// for.
+///
+/// An empty ranking is NOT all-fallback: nothing was returned, so there is
+/// nothing to warn about mistaking for an answer, and the confidence-qualified
+/// negative is what speaks to an empty page. This mirrors the fused arm's own
+/// rule rather than restating it differently.
+fn locate_rows_are_all_fallback(rows: &[serde_json::Value]) -> bool {
+    !rows.is_empty()
+        && !rows.iter().any(|row| {
+            row.get("match_kind") == Some(&json!(kin_cli::commands::locate::LocateMatchKind::Name))
+        })
 }
 
 /// The identity half of one `semantic_locate` row: which id space the hit
@@ -7219,6 +7264,26 @@ fn build_semantic_locate_result(
             "provenance": { "file": file },
             "match_evidence": match_evidence,
         });
+        // The disclosure field the tool description promises on every hit.
+        //
+        // Retrieval always returns its best candidates, so a query for a symbol
+        // that exists nowhere comes back as a full page of confidently-scored
+        // rows that is indistinguishable, field for field, from a page that
+        // found it. `match_kind` is the caller's defence against that, and this
+        // arm serves every stock daemon while emitting it on no row at all.
+        //
+        // Only two values are reachable here, and that is the honest set: this
+        // arm ranks from the vector index alone, so a hit the query did not name
+        // came from embedding similarity rather than a lexical pool.
+        // `TextFallback` would claim a pool that never ran.
+        //
+        // Derived from the same predicate `match_evidence.name_match` reports,
+        // which is the one rule `kin-cli` uses for the fused arm's own
+        // `match_kind`, so the field cannot disagree with the evidence object
+        // printed beside it or with the other arm.
+        if !file_granularity {
+            hit["match_kind"] = json!(cosine_match_kind(&query, &name));
+        }
         write_locate_hit_identity(&mut hit, &identity);
         if let Some(span) = span {
             let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
@@ -12107,6 +12172,101 @@ mod tests {
                 "partial"
             );
         }
+    }
+
+    /// FIR-2199. The compat-v0 default arm emitted neither disclosure field.
+    ///
+    /// Measured on the shipped default profile, `match_kind` was absent from all
+    /// 188 result rows across 40 queries and `all_fallback` never appeared once,
+    /// while accuracy-v1 emitted both on the same battery. Those are the two
+    /// signals `semantic_locate`'s own description names as the caller's defence
+    /// against a full, confident-looking page for a symbol that does not exist,
+    /// so every stock daemon was serving pages with the defence missing.
+    #[test]
+    fn the_cosine_arm_classifies_every_hit_and_agrees_with_its_own_evidence() {
+        use kin_cli::commands::locate::LocateMatchKind;
+
+        // A query token that IS the name: the query asked for this symbol.
+        assert_eq!(
+            cosine_match_kind("find Detector please", "Detector"),
+            LocateMatchKind::Name
+        );
+        // A qualified name matches on its last dotted segment, the same way the
+        // evidence object resolves it.
+        assert_eq!(
+            cosine_match_kind("constant Raspbian", "constant.Raspbian"),
+            LocateMatchKind::Name
+        );
+        // Prose that never names the symbol: embedding similarity surfaced it.
+        // `Semantic`, never `TextFallback` — this arm has no lexical pool to
+        // attribute a hit to, and claiming one would be a fabricated provenance.
+        assert_eq!(
+            cosine_match_kind("where do we handle retries", "Detector"),
+            LocateMatchKind::Semantic
+        );
+        // A partial token overlap is not a name hit. This is the case that makes
+        // the field worth reading: the page looks responsive and is not.
+        assert_eq!(
+            cosine_match_kind("parse the request body", "parse_request"),
+            LocateMatchKind::Semantic
+        );
+
+        // The anti-drift property: for one hit, `match_kind == Name` exactly when
+        // the `match_evidence.name_match` printed beside it says `exact`. Two
+        // fields on one row disagreeing is the defect class this lane exists to
+        // remove.
+        for (query, name) in [
+            ("find Detector please", "Detector"),
+            ("constant Raspbian", "constant.Raspbian"),
+            ("where do we handle retries", "Detector"),
+            ("parse the request body", "parse_request"),
+            ("", "Detector"),
+            ("Detector", ""),
+        ] {
+            let names_it = cosine_match_kind(query, name) == LocateMatchKind::Name;
+            let evidence_says_exact =
+                cosine_match_evidence(query, name, None, false, false)["name_match"] == "exact";
+            assert_eq!(
+                names_it, evidence_says_exact,
+                "match_kind and match_evidence must agree for ({query:?}, {name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn all_fallback_is_a_verdict_on_the_whole_ranking_and_can_be_absent() {
+        use kin_cli::commands::locate::LocateMatchKind;
+        let named = json!({ "match_kind": LocateMatchKind::Name });
+        let similar = json!({ "match_kind": LocateMatchKind::Semantic });
+
+        // Every row surfaced by similarity and none named: the page is a set of
+        // neighbors, not the answer it looks like.
+        assert!(locate_rows_are_all_fallback(&[
+            similar.clone(),
+            similar.clone()
+        ]));
+
+        // Positive control: ONE name hit anywhere in the retained ranking clears
+        // the flag, so it distinguishes the two cases rather than always firing.
+        assert!(!locate_rows_are_all_fallback(&[
+            similar.clone(),
+            named.clone()
+        ]));
+        // Including when the name hit is deep enough to sit on a later page. A
+        // per-page verdict would call this a fallback while paging.
+        let mut deep = vec![similar.clone(); 40];
+        deep.push(named);
+        assert!(!locate_rows_are_all_fallback(&deep));
+
+        // An empty ranking is not all-fallback: nothing came back, so there is
+        // nothing to mistake for an answer, and the negative envelope is what
+        // speaks to an empty page.
+        assert!(!locate_rows_are_all_fallback(&[]));
+
+        // A row with no classification at all cannot clear the flag by accident,
+        // and cannot set it either: it is not a name hit, so a ranking of such
+        // rows reads as fallback, which is the weaker claim.
+        assert!(locate_rows_are_all_fallback(&[json!({ "name": "x" })]));
     }
 
     #[test]
