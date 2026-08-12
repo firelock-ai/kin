@@ -6,8 +6,8 @@
 Bounded `cargo-fuzz` (libFuzzer) coverage for kin-db's binary ingestion and
 semantic-entity-graph build paths.
 
-kin-db has no source-language parser of its own — tree-sitter parsing lives in
-`kin`. kin-db's "parser/ingestion entry points that build the semantic entity
+kin-db has no source-language parser of its own. Tree-sitter parsing lives
+in `kin`. kin-db's "parser/ingestion entry points that build the semantic entity
 graph" are therefore the **binary snapshot/delta decoders**, the
 **graph + index builder**, and the **entity-extraction read surfaces** that
 walk the adjacency built during ingestion. These targets fuzz exactly those.
@@ -54,16 +54,17 @@ corpus is intentionally **not** committed; only the hand-authored seeds are.
 `.github/workflows/fuzz.yml`:
 
 - **On PRs** (touching the parser/ingestion/storage surface): deterministic
-  regression — replays the committed seed corpus only (`-runs=0`, no mutation),
-  so a PR is gated on known-bad inputs (e.g. `seed_body_len_overflow`) without
-  mutation-based flakiness blocking unrelated changes.
+  regression run that replays the committed seed corpus only (`-runs=0`, no
+  mutation), so a PR is gated on known-bad inputs (e.g.
+  `seed_body_len_overflow`) without mutation-based flakiness blocking unrelated
+  changes.
 - **Weekly schedule + manual dispatch**: bounded mutation fuzzing
   (`-max_total_time=600`) for discovery.
 
 A crash fails the job and uploads the reproducing artifact.
 
-> Found by this harness: `seed_body_len_overflow` — a header `body_len` near
-> `usize::MAX` wrapped `16 + body_len` and panicked on the body slice in both
+> Found by this harness: `seed_body_len_overflow`, where a header `body_len`
+> near `usize::MAX` wrapped `16 + body_len` and panicked on the body slice in both
 > the snapshot and delta decoders. Fixed with checked arithmetic;
 > the seed is committed as a permanent regression guard.
 
