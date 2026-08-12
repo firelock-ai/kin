@@ -213,6 +213,15 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     // on exactly the path where an operator most needs to know it did.
     // `summary_lines` derives its wording from the two sides instead.
     let after = census(state);
+
+    // The durable freshness marker is stamped from the after side, and only for
+    // a pass that succeeded. Stamping a failed pass would record that the store
+    // is current at the exact moment it was refused, which is the false
+    // freshness this marker exists to prevent, reached by the other door.
+    if failure.is_none() {
+        crate::background_work::record_durable_admission(&state.layout, after.tracked as u64);
+    }
+
     let embeddings = state.graph.embedding_status();
     let report = AdmitReport {
         schema: ADMIT_SCHEMA.to_string(),

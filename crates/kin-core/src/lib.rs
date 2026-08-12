@@ -25,6 +25,7 @@ pub mod hooks;
 pub mod init;
 mod init_progress;
 mod init_staging;
+pub mod last_admission;
 pub mod layout;
 pub mod manifest;
 pub mod ranking;

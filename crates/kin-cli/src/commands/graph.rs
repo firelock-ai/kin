@@ -82,7 +82,35 @@ pub enum EntitySourceOutcome {
 /// `kin graph status` — quick health check of the semantic graph.
 pub async fn status() -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Status).await?)
+    let mut response = run_daemon_graph(&layout, &GraphCommandRequest::Status).await?;
+    append_freshness_line(
+        &mut response.lines,
+        &kin_core::last_admission::read(&layout),
+        chrono::Utc::now(),
+    );
+    print_graph_response(response)
+}
+
+/// State how fresh the graph truth being reported actually is.
+///
+/// Read here rather than asked of the daemon, the same way the MCP path reads
+/// the durable authority-head marker straight off disk. The daemon's own report
+/// is scoped to the graph it holds in memory, and freshness is a property of the
+/// store on disk, which the CLI is standing in.
+///
+/// Appended unconditionally. Every other line in this report can be absent when
+/// there is nothing to say, but "how old is this" has no such state: a report
+/// that stays silent about freshness is exactly what let a months-behind store
+/// answer with a clean bill of health. When the record is missing or unreadable
+/// the line says the freshness is unknown, which is a different and more useful
+/// answer than nothing.
+fn append_freshness_line(
+    lines: &mut Vec<String>,
+    freshness: &kin_core::last_admission::LastAdmissionRead,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    lines.push(String::new());
+    lines.push(format!("ℹ graph truth: {}", freshness.describe(now)));
 }
 
 /// `kin graph validate` — structural integrity checks.
@@ -1058,6 +1086,65 @@ mod tests {
         SemanticFingerprint, SourceSpan, TreeEntry, Visibility,
     };
     use std::fs;
+
+    mod freshness {
+        use super::super::append_freshness_line;
+        use chrono::TimeZone;
+        use kin_core::last_admission::{LastAdmission, LastAdmissionRead};
+
+        fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc.timestamp_opt(secs, 0).unwrap()
+        }
+
+        fn rendered(read: &LastAdmissionRead, now: i64) -> String {
+            let mut lines = Vec::new();
+            append_freshness_line(&mut lines, read, at(now));
+            lines.join("\n")
+        }
+
+        /// The Aug-11 store, stated as a test: months behind, and the report has
+        /// to say so with an order of magnitude and a coverage count.
+        #[test]
+        fn a_store_months_behind_reports_its_age_and_coverage() {
+            let read = LastAdmissionRead::Recorded(LastAdmission::new(at(0), 31));
+            let out = rendered(&read, 86_400 * 70);
+            assert!(out.contains("70d"), "expected a day-scale age: {out}");
+            assert!(
+                out.contains("31 tracked artifact"),
+                "expected the coverage count: {out}"
+            );
+        }
+
+        /// The property that kills the false all-clear: a healthy, current store
+        /// still emits the freshness line. If freshness were only reported when
+        /// something looked wrong, a reader could never tell silence from health.
+        #[test]
+        fn a_current_store_still_states_its_freshness() {
+            let read = LastAdmissionRead::Recorded(LastAdmission::new(at(1_000), 125));
+            let out = rendered(&read, 1_030);
+            assert!(
+                out.contains("graph truth:"),
+                "a current store must still state freshness: {out}"
+            );
+            assert!(out.contains("30s"), "expected a fresh age: {out}");
+        }
+
+        /// Absent and unreadable both have to reach the reader as unknown, never
+        /// as silence and never as current.
+        #[test]
+        fn unknown_freshness_is_stated_rather_than_omitted() {
+            for read in [
+                LastAdmissionRead::Absent,
+                LastAdmissionRead::Unreadable("truncated".to_string()),
+            ] {
+                let out = rendered(&read, 500);
+                assert!(
+                    out.contains("unknown"),
+                    "unknown freshness must be stated: {out}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
