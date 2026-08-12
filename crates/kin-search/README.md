@@ -1,6 +1,6 @@
 # kin-search
 
-> Low-level lexical search primitives and staged retrieval.
+> Lexical search substrate for semantic retrieval.
 
 `kin-search` is a small, in-memory BM25 text index with code-aware
 tokenization and no external search-engine dependency. It splits identifiers
