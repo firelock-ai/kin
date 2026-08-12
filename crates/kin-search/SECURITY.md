@@ -35,8 +35,8 @@ support window.
 
 ## Scope
 
-This policy covers the `kin-search` repository: the lexical search primitives —
-a lightweight, in-memory, code-aware BM25 text index. Other Kin ecosystem
+This policy covers the `kin-search` repository: the lexical search primitives
+(a lightweight, in-memory, code-aware BM25 text index). Other Kin ecosystem
 repositories (for example `kin`, `kin-db`, `kin-vfs`, `kinlab`) carry their own
 security policies; report issues against the repository where the affected code
 lives.

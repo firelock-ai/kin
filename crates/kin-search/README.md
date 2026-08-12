@@ -8,7 +8,7 @@ tokenization and no external search-engine dependency. It splits identifiers
 write them.
 
 It is a low-level retrieval primitive in the open Kin local substrate. Higher
-layers, notably `kin-db`, compose it with vector retrieval and graph
+layers, including `kin-db`, compose it with vector retrieval and graph
 structure; Kin's ranking and proof-weighting policy lives above this crate, not
 inside it.
 
