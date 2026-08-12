@@ -3758,9 +3758,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vfs-core"
-version = "0.3.0"
+version = "0.4.2"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "12ff474623a86dced7abba355db891e534a15b2ca31be382fc14ab6c73790385"
+checksum = "5032cf253334f030b958f36417f84978eafcdbf12708e777cf4e1f395ba49cd5"
 dependencies = [
  "lru",
  "parking_lot",
@@ -3864,11 +3864,11 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
