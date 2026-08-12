@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emit match_kind and all_fallback from the compat-v0 locate arm (#786)
 - Stop reading an empty embed queue as finished coverage, and time the commit finalize (#790)
 - Check Kin/kin-vfs compatibility on pull requests, not only at release (#789)
+- Remove the demo assets that show a retired command and private source (#793)
 
 
 ## [0.5.20] - 2026-08-12
