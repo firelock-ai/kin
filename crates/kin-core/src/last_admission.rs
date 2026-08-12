@@ -196,6 +196,28 @@ pub fn write(layout: &KinLayout, recorded: &LastAdmission) -> std::io::Result<()
         let _ = std::fs::remove_file(&staged);
         return Err(error);
     }
+    sync_directory_metadata(parent)?;
+    Ok(())
+}
+
+/// Sync the containing directory so the rename that published the marker is
+/// itself durable.
+///
+/// A rename is only as durable as the directory entry recording it. Syncing the
+/// staged file alone leaves a window where a crash loses the publication even
+/// though the bytes reached the platter, which is exactly the restart this
+/// record exists to survive. This is the step that makes the atomic publish
+/// above mirror the authority head marker beside it rather than merely resemble
+/// it.
+#[cfg(unix)]
+fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path).and_then(|directory| directory.sync_all())
+}
+
+/// Non-unix platforms expose no portable directory handle to sync, so the
+/// rename's own ordering guarantees are all there is.
+#[cfg(not(unix))]
+fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
