@@ -96,7 +96,7 @@ Before creating any tag, the single job refuses unless **all** hold:
    history. Break glass uses only the typed `repository_dispatch` action
    `release_tag`. GitHub assigns that event the last commit and ref of the
    default branch and runs it only when the workflow exists on that branch.
-   The job additionally requires `github.actor` in the allowlist
+   The job also requires `github.actor` in the allowlist
    (`troyjr4103`, `kin-release-bot[bot]`), `main` as the reported default
    branch, and `refs/heads/main` as the event ref.
 2. **Well-formed inputs.** `tag` must match `^v[0-9]+\.[0-9]+\.[0-9]+$`; `sha`
@@ -256,7 +256,7 @@ workflow, tag, commit, GitHub-hosted runner, and transparency timestamp.
 The marker also carries the stable numeric Release run ID as an attested audit
 identifier, so downstream provenance can keep its existing linkage without
 requiring GitHub to retain the mutable Actions record forever.
-The one explicit pre-marker migration release, v0.3.6, additionally has to
+The one explicit pre-marker migration release, v0.3.6, also has to
 prove exact npm latest versions, matching GHCR latest/version/tag digests, and
 the exact source-bound GHCR attestation, plus aggregate release provenance.
 Markerless fallback is retired for v0.4.0 and later. Missing logs therefore
@@ -331,7 +331,7 @@ decision), so the App itself can reach every repository in the org. The workflow
 does not depend on a repo-scoped install: the "Mint kin-release-bot installation
 token" step passes `owner: firelock-ai` + `repositories: kin` to
 `actions/create-github-app-token`, which narrows every minted installation token
-to the `kin` repository alone. The raw private key is more powerful than one
+to the `kin` repository alone. The raw private key carries more authority than one
 narrowed token, so it must exist only as a secret in the main-only
 `release-tag` Environment and only default-branch-pinned trigger paths may
 consume it.

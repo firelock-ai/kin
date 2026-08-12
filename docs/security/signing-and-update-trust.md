@@ -54,7 +54,7 @@ tag/commit/lock provenance. The four Unix legs exercise a fresh repository,
 graph search/locate, MCP initialize/list/call, and supported agent configuration
 writers. The Windows leg instead requires both `kin init` boundaries to refuse
 without publishing a repository, then proves the remaining repository-free CLI
-diagnostics and setup writers. The four Unix legs additionally make the source
+diagnostics and setup writers. The four Unix legs also make the source
 file unreadable on raw disk, then require
 the installed VFS shim and real Kin daemon to return the exact graph-owned bytes.
 That probe also calls `fstat` on stdout before opening the workspace path, which

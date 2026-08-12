@@ -31,7 +31,7 @@ store.
 The store is not a copy of the packfile, so it is not bounded by one, and the
 gap is much larger than the semantic layer alone accounts for.
 
-Two things inside `.kin/` account for essentially all of it. Broken down on
+Two things inside `.kin/` account for all of it, to within rounding. Broken down on
 ripgrep at 2,261 commits, whose 6.1 MiB object store became a 405.4 MiB store:
 
 | Part of `.kin/` | Size | Share |
