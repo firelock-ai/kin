@@ -39,7 +39,7 @@ jobs:
           esac
 
           # Count commits whose message does not contain a Signed-off-by trailer.
-          # jq does the pattern match entirely inside the API response — commit
+          # jq does the pattern match entirely inside the API response, so commit
           # messages are never interpolated into the shell command, avoiding
           # injection from untrusted PR content.
           UNSIGNED=$(gh api \
