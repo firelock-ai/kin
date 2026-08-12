@@ -502,6 +502,12 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/link-check.yml": {
         "link-check": "Check public documentation links",
     },
+    # Reports an ejection on the pull request the merge queue dropped. It runs
+    # on workflow_run after the fact, produces no check on a pull request, and
+    # so is never a required-context producer.
+    ".github/workflows/merge-queue-ejection-notice.yml": {
+        "notice": None,
+    },
     ".github/workflows/notify-approver.yml": {
         "notify": None,
     },
