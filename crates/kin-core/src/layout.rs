@@ -124,6 +124,25 @@ impl KinLayout {
         self.kindb_dir().join("head-generation")
     }
 
+    /// `.kin/kindb/last-admission` — when a complete exact-tree admission last
+    /// succeeded.
+    ///
+    /// Durable rather than in-process on purpose. The reconcile probes already
+    /// record this, but they record it in daemon memory, so a restart erases it
+    /// and every freshness surface reports that no admission has ever succeeded.
+    /// A store that has not been admitted since March then reads the same as one
+    /// admitted a second ago, which is the whole defect: nothing a reader can
+    /// consult says how far graph truth has fallen behind the repository.
+    ///
+    /// Deliberately not written by the generation-publish path. That path also
+    /// runs on daemon startup, so stamping it there would refresh the timestamp
+    /// on every restart and manufacture exactly the false freshness this marker
+    /// exists to prevent. It is written only where an admission actually
+    /// succeeded.
+    pub fn kindb_last_admission_path(&self) -> PathBuf {
+        self.kindb_dir().join("last-admission")
+    }
+
     /// `.kin/kindb/graph.kvec` — persisted vector index aligned with the snapshot.
     pub fn kindb_vector_index_path(&self) -> PathBuf {
         self.kindb_snapshot_path().with_extension("kvec")

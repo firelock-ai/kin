@@ -603,6 +603,32 @@ impl RecordedFault {
     }
 }
 
+/// Persist the durable last-admission marker after a complete pass succeeded.
+///
+/// Called beside [`ReconcileProbes::record_admission_success`] rather than from
+/// inside it, for two reasons. The probes hold a mutex while they record, and
+/// doing file I/O under it would put a disk write on a lock every admission
+/// waits behind. And the probes deliberately know nothing about the store's
+/// layout, which keeps them a pure in-memory disclosure.
+///
+/// A write failure is logged and swallowed. An admission that succeeded did
+/// succeed, and turning a marker-write failure into an admission failure would
+/// report an admitted tree as unadmitted, which is a worse lie than the one this
+/// marker fixes. The failure direction is also the safe one: an unwritten marker
+/// leaves the previous, older timestamp in place, so the store reads as staler
+/// than it is and never as fresher.
+pub fn record_durable_admission(layout: &kin_core::KinLayout, tracked_artifacts: u64) {
+    let recorded =
+        kin_core::last_admission::LastAdmission::new(chrono::Utc::now(), tracked_artifacts);
+    if let Err(error) = kin_core::last_admission::write(layout, &recorded) {
+        tracing::warn!(
+            error = %error,
+            "could not persist the last-admission marker; freshness surfaces will report the \
+             previous admission until the next pass rewrites it"
+        );
+    }
+}
+
 /// What the filesystem reconciliation loop has actually managed to admit.
 ///
 /// The loop already knew every fact here. It logged an admission failure at
