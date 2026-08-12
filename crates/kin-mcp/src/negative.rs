@@ -1160,6 +1160,64 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_vector_index_does_not_certify_a_ranked_absence() {
+        // The counters lift made the cosine arm's coverage readable, and read
+        // `complete` alone it also made an EMPTY index authoritative: an index
+        // holding no vectors reports `total == 0`, which
+        // `embedding_status_complete` calls complete because nothing is missing
+        // when nothing is eligible. A ranked search over it examined nothing.
+        //
+        // This is the exact payload the cosine arm publishes on such a graph, and
+        // the contradiction it used to carry: the float says 0.0 while the lifted
+        // counters said 100% and certified the absence.
+        let payload = json!({
+            "query": "auth",
+            "routing": "cosine-v0",
+            "results": [],
+            "total_ranked": 0,
+            "semantic_coverage": 0.0,
+            "semantic_coverage_detail": {
+                "indexed": 0, "total": 0, "pending": 0, "complete": true,
+            },
+        });
+        let envelope = Envelope::daemon().with_payload_metadata(&payload);
+        let negative =
+            negative_for("semantic_locate", &payload, &envelope).expect("empty page is qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("coverage_empty"),
+            "an empty index must name itself: {}",
+            negative["trust_reason"]
+        );
+
+        // Positive control: the same shape over a POPULATED complete index stays
+        // authoritative, so the gate reads the count rather than always firing.
+        let populated = json!({
+            "query": "auth",
+            "routing": "cosine-v0",
+            "results": [],
+            "total_ranked": 0,
+            "semantic_coverage": 1.0,
+            "semantic_coverage_detail": {
+                "indexed": 49, "total": 49, "pending": 0, "complete": true,
+            },
+        });
+        let envelope = Envelope::daemon()
+            .with_payload_metadata(&populated)
+            .with_health(&json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "graph_entity_count": 49,
+            }));
+        let negative = negative_for("semantic_locate", &populated, &envelope).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+    }
+
+    #[test]
     fn semantic_search_absence_is_gated_on_the_graph_not_on_embeddings() {
         // FIR-2216. semantic_search filters the entity index by name/kind/
         // language and never reads a vector, so gating it on embedding coverage

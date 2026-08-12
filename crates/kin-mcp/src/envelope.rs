@@ -387,7 +387,9 @@ impl Envelope {
     /// gates are shared; the completeness gate is class-specific:
     ///
     /// - [`NegativeClass::Semantic`] tools read embeddings, so absence is
-    ///   authoritative only with **complete embedding coverage**.
+    ///   authoritative only with **complete embedding coverage over a non-empty
+    ///   index**. Completeness alone is not enough: an index with nothing in it
+    ///   reports complete coverage and searched nothing.
     /// - [`NegativeClass::Structural`] tools read typed graph relations, so absence
     ///   is authoritative when the daemon **graph is initialized and loaded** —
     ///   embedding coverage is irrelevant to them.
@@ -412,6 +414,19 @@ impl Envelope {
                 None => (
                     false,
                     "coverage_unknown: embedding coverage was not reported, so an empty result may mean 'not indexed' rather than 'not present'",
+                ),
+                // `total == 0` is reported as COMPLETE coverage, and for a
+                // coverage question that is right: nothing is eligible, so
+                // nothing is missing. For an absence question it is the opposite
+                // of authority. A ranked search over an index holding no vectors
+                // examined nothing, so its empty page is a fact about the index.
+                // Reading the `complete` flag alone is how a graph with zero
+                // retrievable keys came to certify absence at "100% coverage",
+                // one field away from the `indexed / total` float the same
+                // payload printed as 0.0.
+                Some(coverage) if coverage.total == 0 => (
+                    false,
+                    "coverage_empty: the semantic index holds no vectors at all, so a ranked search examined nothing and an empty result says nothing about whether the target exists",
                 ),
                 Some(coverage) if !coverage.complete => (
                     false,
