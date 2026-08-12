@@ -1,8 +1,8 @@
 # kin-model
 
-> Canonical types and domain models for Kin's semantic VCS.
+> Canonical types and domain models shared across the Kin stack.
 
-`kin-model` contains the canonical shared types for Kin's semantic repository
+`kin-model` holds the canonical shared types for Kin's semantic repository
 substrate.
 
 It defines the graph objects that the public Kin stack uses across the local
@@ -15,8 +15,10 @@ engine, CLI, daemon, MCP server, projection layer, and supporting crates:
 - projection, reconciliation, preset, and policy types
 
 This crate is intentionally small and dependency-light. It is the schema and
-domain boundary for the open local substrate, not the hosted KinLab control
-plane.
+domain boundary for the open Kin local substrate, not the hosted KinLab control
+plane. It sits on `kin-blobs` for content-addressable identity and `kin-vector`
+for embedding vectors, and the layers above it, `kin-db` and `kin` included,
+take their types from here instead of redefining them.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
@@ -29,6 +31,34 @@ navigate it semantically, with provenance, review, and governance built in. It c
 with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
 
 Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+
+## Build
+
+```bash
+cargo build
+cargo test
+```
+
+The toolchain is pinned in `rust-toolchain.toml` so a local build matches CI.
+
+## Changing a persisted type
+
+Types reachable from a snapshot, delta, or operation record are persisted by
+`kin-db` as compact MessagePack, and that encoding writes a struct as an array,
+so a field is identified by its position and never by its name. Two rules
+follow. A new field goes last, because appending is additive and an older
+record simply runs out of array elements. And `skip_serializing_if` belongs
+only on trailing fields, paired with `#[serde(default)]`, because a skipped
+field shortens the array. Break either rule and every following value shifts
+into the wrong slot, which decodes as the wrong type or, worse, as a plausible
+wrong value.
+
+Both rules are enforced rather than trusted. `tests/persisted_schema.rs` denies
+a non-trailing `skip_serializing_if` by source scan and round-trips the
+skipping values themselves, and `.github/workflows/kin-db-compat.yml` runs the
+downstream `kin-db` suite against the change, because this repository's own
+tests cannot observe an existing store decoding wrongly. The full rule lives in
+the crate docs at the top of `src/lib.rs`.
 
 ## Versioning & release policy
 
