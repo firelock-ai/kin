@@ -2011,6 +2011,24 @@ const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// selected HEAD/session graph, prevents an embedding transition or graph
 /// mutation from spanning the published observation without asking kin-mcp to
 /// reread a mutable graph.
+/// How many vectors the selected graph's index actually holds, or `None` when
+/// there is no index to measure.
+///
+/// `None` and `Some(0)` are different answers and must stay that way: a build
+/// without vector retrieval, or a graph that never attached an index, has
+/// nothing to report, while an attached and empty index is a measured zero.
+/// Reading index metadata needs no embedder and takes no additional lock beyond
+/// the index's own.
+#[cfg(feature = "vector")]
+fn selected_graph_index_population(graph: &kin_db::InMemoryGraph) -> Option<usize> {
+    graph.vector_index_stats().map(|(_, population)| population)
+}
+
+#[cfg(not(feature = "vector"))]
+fn selected_graph_index_population(_graph: &kin_db::InMemoryGraph) -> Option<usize> {
+    None
+}
+
 async fn mcp_graph_status_with_stable_authority(
     state: &DaemonState,
     session_id: Option<&SessionId>,
@@ -2034,6 +2052,14 @@ async fn mcp_graph_status_with_stable_authority(
                     embeddings_indexed: embeddings.indexed,
                     embeddings_pending: embeddings.pending,
                     embeddings_total: embeddings.total,
+                    // Sampled under the same fence as the counters above, so the
+                    // index population and the graph-admitted coverage describe
+                    // one instant. `embeddings_total` is what graph truth admits
+                    // now and this is what the index actually holds, so the
+                    // difference is the index's accumulated staleness: without it
+                    // a store whose every vector points at a retired entity reads
+                    // as fully embedded with nothing pending.
+                    embedding_index_keys: selected_graph_index_population(selected_graph),
                 }
             }
             Err(std::sync::TryLockError::WouldBlock) => {
