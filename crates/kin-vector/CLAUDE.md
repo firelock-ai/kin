@@ -13,6 +13,6 @@ Single-file engine (src/lib.rs). Generic over Id type via VectorId trait.
 HNSW parameters: M=16, M_MAX_0=32, EF_CONSTRUCTION=200, EF_SEARCH=50.
 
 ## Key types
-- VectorIndex<Id> — the main index, generic over key type
-- VectorId trait — bound for index keys (Copy + Eq + Hash + Serialize)
-- DefaultId — UUID-based default key type
+- VectorIndex<Id>: the main index, generic over key type
+- VectorId trait: bound for index keys (Copy + Eq + Hash + Serialize)
+- DefaultId: UUID-based default key type

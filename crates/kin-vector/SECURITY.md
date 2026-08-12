@@ -36,7 +36,7 @@ support window.
 ## Scope
 
 This policy covers the `kin-vector` repository: the vector and
-approximate-nearest-neighbor substrate — a pure-Rust HNSW index. Other Kin
+approximate-nearest-neighbor substrate (a pure-Rust HNSW index). Other Kin
 ecosystem repositories (for example `kin`, `kin-db`, `kin-vfs`, `kinlab`) carry
 their own security policies; report issues against the repository where the
 affected code lives.
