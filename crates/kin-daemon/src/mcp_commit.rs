@@ -881,6 +881,20 @@ fn require_bound_authority_revision(
     })
 }
 
+/// Whether the derived graph and repository authority agree on the workspace.
+///
+/// This snapshots both sides to compare three fields of the result, and a
+/// snapshot deep-clones every sub-store, including the entity revision history
+/// and the audit log, both of which grow with every commit a repository has
+/// ever taken. So a comparison of three maps costs two whole-graph clones, the
+/// reply path runs it twice, and both runs sit after the change is already
+/// durable. That is most of what a caller waits through on a large store, and
+/// `timed_finalize_step` is what makes the cost visible instead of silent.
+///
+/// kin-db 0.7.21 answers the same question under its own read lock with no
+/// clone at all (`InMemoryGraph::semantic_workspace_matches`). This call site
+/// moves to it once that version is published and `kin` re-locks against it;
+/// the comparison is identical, so the swap is a cost change only.
 fn semantic_workspace_matches(left: &kin_db::InMemoryGraph, right: &kin_db::InMemoryGraph) -> bool {
     let left = left.to_snapshot();
     let right = right.to_snapshot();
@@ -1491,6 +1505,31 @@ fn replay_applied_commit(
     Ok(kin_mcp::ToolCallResult::text(json))
 }
 
+/// A finalize step slower than this names itself at `info`, the level an
+/// operator actually sees.
+const SLOW_FINALIZE_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Run one step of the post-durability finalize and record what it cost.
+///
+/// The change is already durable when this stretch begins, and on a large store
+/// the caller waited minutes in it with not one line in the log. That silence
+/// is why the block was attributed to re-embedding across two releases, until a
+/// reconstruction against `kin log` timestamps showed the re-embedding was
+/// under a second of it. Every step reports its own duration now, so the next
+/// slow commit says which part was slow instead of leaving it to be guessed.
+fn timed_finalize_step<T>(step: &'static str, work: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let outcome = work();
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed >= SLOW_FINALIZE_STEP {
+        tracing::info!(step, elapsed_ms, "slow commit finalize step");
+    } else {
+        tracing::debug!(step, elapsed_ms, "commit finalize step");
+    }
+    outcome
+}
+
 fn finalize_committed_transaction(
     state: &Arc<DaemonState>,
     sessions: &kin_mcp::SessionRegistry,
@@ -1506,8 +1545,10 @@ fn finalize_committed_transaction(
         None => (Vec::new(), None),
     };
     let authority_context = authority_context(state)?;
-    let authority = load_native_commit_base(&authority_context)
-        .map_err(|error| format!("reload committed MCP repository authority: {error}"))?;
+    let authority = timed_finalize_step("reload_repository_authority", || {
+        load_native_commit_base(&authority_context)
+    })
+    .map_err(|error| format!("reload committed MCP repository authority: {error}"))?;
     // A resume has no plan and still owes the same answer, so it recovers the
     // split from the staged operations the interruption left behind.
     let carried_pending_files = planned_carry.unwrap_or_else(|| {
@@ -1527,30 +1568,41 @@ fn finalize_committed_transaction(
         ));
     }
 
-    install_authority_graph(state.graph.as_ref(), &authority.graph, &committed)?;
-    let layouts = if planned_layouts.is_empty() && committed.file_count > 0 {
-        rebuild_changed_layouts(state, &authority, &committed.change)?
-    } else {
-        planned_layouts
-    };
-    for layout in layouts {
-        state.graph.upsert_file_layout(&layout).map_err(|error| {
-            format!("install committed exact layout {}: {error}", layout.file_id)
-        })?;
-    }
-    if !semantic_workspace_matches(state.graph.as_ref(), &authority.graph) {
+    timed_finalize_step("install_authority_graph", || {
+        install_authority_graph(state.graph.as_ref(), &authority.graph, &committed)
+    })?;
+    let layouts = timed_finalize_step("rebuild_changed_layouts", || {
+        if planned_layouts.is_empty() && committed.file_count > 0 {
+            rebuild_changed_layouts(state, &authority, &committed.change)
+        } else {
+            Ok(planned_layouts)
+        }
+    })?;
+    timed_finalize_step("install_layouts", || {
+        for layout in layouts {
+            state.graph.upsert_file_layout(&layout).map_err(|error| {
+                format!("install committed exact layout {}: {error}", layout.file_id)
+            })?;
+        }
+        Ok::<(), String>(())
+    })?;
+    if !timed_finalize_step("verify_workspace_matches_authority", || {
+        semantic_workspace_matches(state.graph.as_ref(), &authority.graph)
+    }) {
         return Err(format!(
             "derived daemon graph does not match repository authority after transaction {}",
             transaction.transaction_id
         ));
     }
-    record_commit_provenance(
-        state.graph.as_ref(),
-        actor,
-        &transaction,
-        &committed,
-        &carried_pending_files,
-    )?;
+    timed_finalize_step("record_commit_provenance", || {
+        record_commit_provenance(
+            state.graph.as_ref(),
+            actor,
+            &transaction,
+            &committed,
+            &carried_pending_files,
+        )
+    })?;
 
     let observed_generation = state.snapshot_generation.load(Ordering::SeqCst);
     if observed_generation < committed.receipt.generation {
@@ -1572,7 +1624,9 @@ fn finalize_committed_transaction(
             .map_err(|error| format!("terminalize exact MCP transaction: {error}"))?
     };
     let modified_files = changed_file_ids(&committed.change)?;
-    let root_hash = hex::encode(state.graph.compute_root_hash());
+    let root_hash = timed_finalize_step("compute_root_hash", || {
+        hex::encode(state.graph.compute_root_hash())
+    });
     let mut result = serde_json::json!({
         "transaction_id": terminal.transaction_id,
         "state": "committed",

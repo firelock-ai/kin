@@ -584,6 +584,36 @@ fn embed_work_outstanding(embed_pass_active: bool, queued: bool, worker_can_drai
     embed_pass_active || (queued && worker_can_drain)
 }
 
+/// What the background embed worker should do when its queue drains.
+///
+/// The queue is the worker's whole notion of work, so a retrieval key with no
+/// vector and no queue entry is work nothing will ever do, announced as
+/// `remaining=0`. Coverage is the authority for whether work exists; the queue
+/// is only how it gets done, and `kin embed` has always known the difference.
+/// Re-queueing the gap is therefore the right answer, and bounding it is what
+/// keeps a key that can never be embedded from spinning the worker every
+/// interval: the same gap twice running means the previous re-queue changed
+/// nothing, so the worker reports it once and stops asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverageDrainVerdict {
+    /// Coverage is whole. The drain really is finished.
+    Complete,
+    /// Coverage is short and no re-queue has been tried at this gap yet.
+    Backfill { missing: usize },
+    /// Coverage is short and the last re-queue at this gap produced nothing.
+    Stalled { missing: usize },
+}
+
+fn coverage_drain_verdict(missing: usize, backfilled_gap: Option<usize>) -> CoverageDrainVerdict {
+    if missing == 0 {
+        CoverageDrainVerdict::Complete
+    } else if backfilled_gap == Some(missing) {
+        CoverageDrainVerdict::Stalled { missing }
+    } else {
+        CoverageDrainVerdict::Backfill { missing }
+    }
+}
+
 fn embed_work_in_flight(state: &DaemonState) -> bool {
     embed_work_outstanding(
         state.embed_pass_active(),
@@ -1713,6 +1743,11 @@ pub async fn run_with_authority_on(
         let mut index_reset_triggered = false;
         let mut error_backoff: Option<Duration> = None;
         const EMBED_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(60);
+        // The coverage gap this worker last re-queued, so a gap it cannot close
+        // is reported once instead of re-queued every interval. Cleared by any
+        // batch that embeds something, since progress makes the next gap a new
+        // question.
+        let mut backfilled_gap: Option<usize> = None;
         'wake: loop {
             // Between wakes this worker is genuinely doing nothing, so the
             // working stretch ends here. A wedged drain never reaches this
@@ -1780,12 +1815,54 @@ pub async fn run_with_authority_on(
                 let pending = embed_state.graph.pending_embeddings();
                 let pending_artifacts = embed_state.graph.pending_artifact_embeddings();
                 if pending == 0 && pending_artifacts == 0 {
-                    // The queue is drained: this is where coverage becomes
-                    // whole, so it is where the has-ever-completed marker is
-                    // published. Recording it here rather than from a reader
-                    // keeps the claim on the side that actually did the work.
-                    embed_state.record_embedding_coverage_complete();
-                    break;
+                    // An empty queue is not the same fact as whole coverage,
+                    // and the difference is what let every commit cost a store
+                    // part of its memory in silence. A change mints a HEAD
+                    // revision key per touched entity, and anything that puts a
+                    // retrievable key into truth without queueing it leaves the
+                    // worker nothing to do and no reason to say so. Ask coverage
+                    // before believing the drain.
+                    let status = embed_state.graph.embedding_status();
+                    let missing = status.total.saturating_sub(status.indexed);
+                    match coverage_drain_verdict(missing, backfilled_gap) {
+                        CoverageDrainVerdict::Backfill { missing } => {
+                            warn!(
+                                missing,
+                                indexed = status.indexed,
+                                total = status.total,
+                                "embedding queue drained while coverage is short; re-queueing the missing keys"
+                            );
+                            backfilled_gap = Some(missing);
+                            #[cfg(feature = "embeddings")]
+                            embed_state.graph.queue_missing_for_embedding();
+                            embed_state.graph.queue_missing_artifacts_for_embedding();
+                            if embed_state.graph.pending_embeddings() > 0
+                                || embed_state.graph.pending_artifact_embeddings() > 0
+                            {
+                                continue;
+                            }
+                            warn!(
+                                missing,
+                                "no retrievable key could be queued for the missing coverage"
+                            );
+                            break;
+                        }
+                        CoverageDrainVerdict::Stalled { missing } => {
+                            debug!(
+                                missing,
+                                "embedding coverage is short and re-queueing it changed nothing"
+                            );
+                            break;
+                        }
+                        CoverageDrainVerdict::Complete => {
+                            // Coverage is whole here, so this is where the
+                            // has-ever-completed marker is published. Recording
+                            // it on the side that did the work keeps the claim
+                            // off a reader that only saw a quiet queue.
+                            embed_state.record_embedding_coverage_complete();
+                            break;
+                        }
+                    }
                 }
                 // From here to the next `idle` this worker is spending the
                 // machine. Latched, so a drain that never finishes keeps one
@@ -1828,6 +1905,9 @@ pub async fn run_with_authority_on(
                         // embedder — clear any error backoff / reset latch.
                         index_reset_triggered = false;
                         error_backoff = None;
+                        // Progress makes the next coverage gap a new question,
+                        // so a gap that once looked unclosable gets asked again.
+                        backfilled_gap = None;
                         embed_pass.reset_retries();
                         info!(count, remaining = remaining.saturating_sub(count), label);
                         // Serialize successive flushes: the previous batch's
@@ -2877,10 +2957,10 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        drain_pending_flush, embed_work_outstanding, format_singleton_contention,
-        next_embed_error_backoff, parse_duration_secs, parse_owner_watch_pid,
-        should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
-        watched_process_is_alive, ControlPlane, DaemonConfig, DaemonState,
+        coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
+        format_singleton_contention, next_embed_error_backoff, parse_duration_secs,
+        parse_owner_watch_pid, should_enable_lsp_enrichment, should_flush_now, shutdown_signalled,
+        watched_process_is_alive, ControlPlane, CoverageDrainVerdict, DaemonConfig, DaemonState,
         DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE, RECON_IDLE,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2890,6 +2970,45 @@ mod tests {
     #[test]
     fn default_embed_batch_is_backlog_friendly() {
         assert_eq!(DaemonConfig::default().embed_batch_size, 512);
+    }
+
+    /// FIR-2254's accounting half. A drained queue over a store that is short
+    /// on coverage is the exact state the daemon used to log as `remaining=0`
+    /// while `kin graph status` reported hundreds pending, because the worker
+    /// asked the queue and the status asked coverage. An empty queue alone must
+    /// never be read as finished.
+    #[test]
+    fn a_drained_queue_over_short_coverage_is_not_finished() {
+        assert_eq!(
+            coverage_drain_verdict(641, None),
+            CoverageDrainVerdict::Backfill { missing: 641 }
+        );
+        assert_eq!(
+            coverage_drain_verdict(0, None),
+            CoverageDrainVerdict::Complete
+        );
+    }
+
+    /// Re-queueing is bounded by what it achieves. The same gap twice running
+    /// means the previous re-queue placed nothing the worker could embed, so
+    /// the worker reports it and stands down instead of rebuilding the same
+    /// queue every interval forever.
+    #[test]
+    fn a_gap_that_requeueing_cannot_close_is_reported_not_retried() {
+        assert_eq!(
+            coverage_drain_verdict(641, Some(641)),
+            CoverageDrainVerdict::Stalled { missing: 641 }
+        );
+        // A different gap is a different question, and gets its own attempt.
+        assert_eq!(
+            coverage_drain_verdict(210, Some(641)),
+            CoverageDrainVerdict::Backfill { missing: 210 }
+        );
+        // Coverage closing outranks the latch entirely.
+        assert_eq!(
+            coverage_drain_verdict(0, Some(641)),
+            CoverageDrainVerdict::Complete
+        );
     }
 
     #[test]
