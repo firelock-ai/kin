@@ -5,6 +5,7 @@ pub mod backend;
 pub mod capability;
 pub mod commands;
 pub mod daemon_client;
+pub mod model_residency;
 pub mod output_style;
 pub mod profile;
 pub mod progress;

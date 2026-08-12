@@ -3528,11 +3528,14 @@ fn run_with_graph_capture_budgeted(
                     let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
                         .unwrap_or_else(|_| "main".to_string());
 
-                    // 1.7 latency gate: time model load + rerank so an over-budget
-                    // rerank can fall back to the pre-rerank order (see
+                    // 1.7 latency gate: time model acquisition + rerank so an
+                    // over-budget rerank can fall back to the pre-rerank order (see
                     // rerank_within_budget). Budget unset (0) == prior behavior.
+                    // Only the first query in a serving process pays a model build
+                    // here; after that the model is resident (see model_residency)
+                    // and this window is the rerank itself.
                     let rerank_started = std::time::Instant::now();
-                    match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
+                    match crate::model_residency::cross_encoder(&model_id, &revision) {
                         Ok(encoder) => {
                             let mut docs = Vec::new();
                             let mut candidates = Vec::new();
