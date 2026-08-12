@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -106,6 +108,45 @@ pub fn configured_session_idle_ttl() -> Duration {
         .map_or(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs)
 }
 
+/// Calls the daemon is currently executing, per session, each under an id
+/// unique for the life of its coordinator.
+///
+/// Per call rather than a count, because the age of a session's oldest RUNNING
+/// call is what the sweeper reasons about. A count plus one start time reports
+/// the start of the busy period instead, which for an agent issuing overlapping
+/// calls never resets and grows without bound. Ids are handed out in order, so
+/// the lowest id still present is the oldest live call.
+type ActiveCalls = Arc<Mutex<HashMap<SessionId, BTreeMap<u64, Instant>>>>;
+
+/// A call this daemon is executing on a session's behalf.
+///
+/// Holding one marks the session as busy for as long as the call runs, and
+/// dropping it releases the mark. The release is a `Drop`, not a call the
+/// handler has to remember, so an early return or a panic mid-call cannot leave
+/// a session marked busy forever and thereby unreapable.
+#[must_use = "the session is marked busy only while this guard is held; dropping it \
+              immediately, as `let _ = ...` does, silently disables the protection"]
+pub struct ActiveCall {
+    calls: ActiveCalls,
+    session_id: SessionId,
+    call_id: u64,
+}
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session_calls) = calls.get_mut(&self.session_id) {
+            session_calls.remove(&self.call_id);
+            if session_calls.is_empty() {
+                calls.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 pub struct SessionCoordinator {
     graph: Arc<kin_db::InMemoryGraph>,
     /// Linearization point for session/intent lifecycle mutations. `kin-db`'s
@@ -116,6 +157,10 @@ pub struct SessionCoordinator {
     arbitration: Mutex<()>,
     /// How long a heartbeat stays valid before a PID-less session is stale.
     session_idle_ttl: Duration,
+    /// Sessions with a call running inside this daemon right now.
+    active_calls: ActiveCalls,
+    /// Source of the ids under which running calls are recorded.
+    next_call_id: AtomicU64,
 }
 
 impl SessionCoordinator {
@@ -138,12 +183,76 @@ impl SessionCoordinator {
             graph,
             arbitration: Mutex::new(()),
             session_idle_ttl: ttl,
+            active_calls: Arc::new(Mutex::new(HashMap::new())),
+            next_call_id: AtomicU64::new(0),
         }
     }
 
     /// The idle TTL this coordinator reaps PID-less sessions against.
     pub fn session_idle_ttl(&self) -> Duration {
         self.session_idle_ttl
+    }
+
+    /// Mark `session_id` as having a call running inside this daemon until the
+    /// returned guard is dropped.
+    ///
+    /// A session blocked in a synchronous call it issued is the opposite of an
+    /// idle one, so the sweeper must not judge it while the call runs. The
+    /// evidence is a commit reaped 5 seconds before it returned: the session
+    /// was destroyed by the daemon that was at that moment executing its write.
+    ///
+    /// The mark is taken under `arbitration`, the same lock the sweep holds
+    /// across its whole pass, because a mark the sweep cannot be ordered against
+    /// does not prevent the reap. Without it a call could set its mark in the
+    /// window between the sweep testing that session and deleting it, and be
+    /// reaped anyway. This is therefore a blocking call while a sweep is in
+    /// progress, and it must not be made while holding `arbitration`.
+    #[must_use = "the session is marked busy only while the returned guard is held"]
+    pub fn begin_call(&self, session_id: &SessionId) -> ActiveCall {
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut calls = self
+                .active_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            calls
+                .entry(*session_id)
+                .or_default()
+                .insert(call_id, Instant::now());
+        }
+        ActiveCall {
+            calls: Arc::clone(&self.active_calls),
+            session_id: *session_id,
+            call_id,
+        }
+    }
+
+    /// [`SessionCoordinator::begin_call`] for a request that may carry no
+    /// session. A call with no session has no lease to protect.
+    #[must_use = "the session is marked busy only while the returned guard is held"]
+    pub fn begin_call_for(&self, session_id: Option<&SessionId>) -> Option<ActiveCall> {
+        session_id.map(|session_id| self.begin_call(session_id))
+    }
+
+    /// How long this session's oldest RUNNING call has been in flight, or
+    /// `None` when the daemon is running nothing for it.
+    ///
+    /// Call ids are issued in order, so the lowest one still recorded is the
+    /// oldest call that has not yet returned. A call that has returned stops
+    /// counting even when later calls on the same session are still running.
+    pub fn active_call_age(&self, session_id: &SessionId) -> Option<Duration> {
+        let calls = self
+            .active_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        calls
+            .get(session_id)
+            .and_then(|session_calls| session_calls.values().next())
+            .map(|started| started.elapsed())
     }
 
     // -----------------------------------------------------------------------
@@ -953,6 +1062,38 @@ impl SessionCoordinator {
         let mut reaped = Vec::new();
 
         for session in &sessions {
+            // A call this daemon is still executing is activity, and it
+            // outranks both staleness signals. The heartbeat cannot refresh
+            // during a synchronous call, and the PID a session registered can
+            // be gone while the caller blocked on that call is not, so judging
+            // either one here reaps a session in the middle of its own write.
+            if let Some(in_flight) = self.active_call_age(&session.session_id) {
+                if in_flight <= stale_threshold {
+                    debug!(
+                        session_id = %session.session_id,
+                        vendor = %session.vendor,
+                        in_flight_secs = in_flight.as_secs(),
+                        "session has a call in flight; not idle"
+                    );
+                    continue;
+                }
+                // A call buys the same window a heartbeat buys, and no more.
+                // Without a ceiling a handler that never returns holds its
+                // session's hard-lock scopes against every other session for
+                // the life of the daemon, and the sweeper is the only collector
+                // for those scopes. Say so at WARN: a call outrunning the idle
+                // window is a stuck daemon call, which is worth an operator's
+                // attention whichever way the sweep then decides.
+                warn!(
+                    session_id = %session.session_id,
+                    vendor = %session.vendor,
+                    in_flight_secs = in_flight.as_secs(),
+                    idle_window_secs = stale_threshold.as_secs(),
+                    "session call has been in flight past the idle window; \
+                     judging the session on its own signals"
+                );
+            }
+
             let mut is_stale = false;
             let pid_alive = session.pid.map(|pid| (pid, is_process_alive(pid)));
 
@@ -2232,6 +2373,243 @@ mod tests {
         assert_eq!(reaped[0].1.len(), 1);
         assert!(coord.get_session(&sid).unwrap().is_none());
         assert!(coord.list_intents(&sid).unwrap().is_empty());
+    }
+
+    /// The F17 shape: a session is reaped while the daemon is still executing
+    /// that session's own commit. The signal that fired was the registered PID,
+    /// which was gone while the caller blocked inside the call was not.
+    #[test]
+    fn a_session_with_a_call_in_flight_survives_a_sweep_that_would_reap_it() {
+        let coord = SessionCoordinator::new(Arc::new(kin_db::InMemoryGraph::new()));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "committing-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+        let intent = coord
+            .register_intent(
+                &sid,
+                vec![IntentScope::Entity(EntityId::new())],
+                LockType::Hard,
+                "write in flight",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            intent,
+            IntentRegistrationResult::Registered { .. }
+        ));
+
+        let in_flight = coord.begin_call(&sid);
+
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            0,
+            "a session must not be reaped while its own call is running"
+        );
+        assert!(coord.get_session(&sid).unwrap().is_some());
+        assert_eq!(
+            coord.list_intents(&sid).unwrap().len(),
+            1,
+            "the in-flight call's intent must survive with its session"
+        );
+
+        drop(in_flight);
+
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            1,
+            "once the call returns the session is judged on its own merits again"
+        );
+        assert!(coord.get_session(&sid).unwrap().is_none());
+    }
+
+    /// An agent issuing overlapping calls stays protected until the last of
+    /// them returns, not until the first does.
+    #[test]
+    fn overlapping_calls_protect_the_session_until_the_last_one_ends() {
+        let coord = SessionCoordinator::new(Arc::new(kin_db::InMemoryGraph::new()));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "busy-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        let first = coord.begin_call(&sid);
+        let second = coord.begin_call(&sid);
+
+        drop(first);
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            0,
+            "one of two calls returning does not make the session idle"
+        );
+
+        drop(second);
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 1);
+    }
+
+    /// Busy is per session. One agent's long call must not shelter another
+    /// agent's dead session from the sweeper.
+    #[test]
+    fn a_call_on_one_session_does_not_protect_another() {
+        let coord = SessionCoordinator::new(Arc::new(kin_db::InMemoryGraph::new()));
+        let busy = coord
+            .register_session(
+                "claude-code",
+                "busy-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+        let idle = coord
+            .register_session(
+                "claude-code",
+                "dead-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        let _in_flight = coord.begin_call(&busy);
+
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 1);
+        assert!(coord.get_session(&busy).unwrap().is_some());
+        assert!(coord.get_session(&idle).unwrap().is_none());
+    }
+
+    /// The busy mark is released by `Drop`, so a call that unwinds cannot
+    /// strand a session as permanently unreapable.
+    #[test]
+    fn a_call_that_panics_still_releases_its_session() {
+        let coord = Arc::new(SessionCoordinator::new(Arc::new(
+            kin_db::InMemoryGraph::new(),
+        )));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "panicking-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        let panicking = {
+            let coord = Arc::clone(&coord);
+            let sid = sid;
+            std::thread::spawn(move || {
+                let _in_flight = coord.begin_call(&sid);
+                panic!("call failed mid-flight");
+            })
+        };
+        assert!(panicking.join().is_err());
+
+        assert!(
+            coord.active_call_age(&sid).is_none(),
+            "an unwound call must not leave its session marked busy"
+        );
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 1);
+    }
+
+    /// A call buys the same window a heartbeat buys, and no more.
+    ///
+    /// Without a ceiling, a handler that never returns holds its session's
+    /// hard-lock scopes against every other session for the life of the daemon,
+    /// because the sweeper is the only collector for those scopes. That trades
+    /// a mid-write reap for a permanent leak, which is the worse of the two.
+    #[test]
+    fn a_call_in_flight_past_the_idle_window_stops_protecting_its_session() {
+        let coord = SessionCoordinator::with_session_idle_ttl(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_millis(5),
+        );
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "stuck-agent",
+                SessionTransport::Mcp,
+                Some(999_999_999),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        let _stuck = coord.begin_call(&sid);
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            0,
+            "a call inside the window still protects its session"
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            coord.sweep_stale_sessions().unwrap(),
+            1,
+            "a call outrunning the idle window must not defer the sweep forever"
+        );
+        assert!(coord.get_session(&sid).unwrap().is_none());
+    }
+
+    /// The reported age is the oldest call STILL RUNNING, not the start of the
+    /// busy period.
+    ///
+    /// An agent issuing continuously overlapping calls never lets the count
+    /// reach zero. Measuring from the start of the busy period would make that
+    /// agent's reported age grow without bound, so the busiest and healthiest
+    /// session would be the first one the ceiling above reaps.
+    #[test]
+    fn the_reported_call_age_tracks_the_oldest_call_still_running() {
+        let coord = SessionCoordinator::new(Arc::new(kin_db::InMemoryGraph::new()));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "continuously-busy-agent",
+                SessionTransport::Mcp,
+                Some(std::process::id()),
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+
+        let first = coord.begin_call(&sid);
+        std::thread::sleep(Duration::from_millis(20));
+        let second = coord.begin_call(&sid);
+
+        let with_both = coord.active_call_age(&sid).expect("a call is running");
+        drop(first);
+        let with_second_only = coord
+            .active_call_age(&sid)
+            .expect("a call is still running");
+
+        assert!(
+            with_second_only < with_both,
+            "the first call returning must stop counting toward the age: \
+             oldest-live {with_second_only:?} should be younger than {with_both:?}"
+        );
+        assert!(
+            with_second_only < Duration::from_millis(20),
+            "the age must be measured from the second call's start, not the first's"
+        );
+
+        drop(second);
+        assert!(coord.active_call_age(&sid).is_none());
     }
 
     #[test]

@@ -7671,6 +7671,18 @@ async fn mcp_tools_call(
     // refreshes the lease. Without this the idle TTL behaves as a lifetime cap:
     // an agent working continuously through tools that do not heartbeat gets
     // reaped mid-task, and its in-flight transaction dies with it.
+    // Mark the session busy BEFORE anything else touches the coordinator. This
+    // call may run for minutes, and a heartbeat is only a point in time, so the
+    // sweeper must not judge the session idle from a heartbeat that cannot be
+    // refreshed while the call runs, nor from a PID, while the caller is
+    // blocked inside this very call. Dropped at the end of the call on every
+    // path, including a panic.
+    //
+    // Order matters and is the whole fix: `touch_session_liveness` blocks on
+    // the same lock the sweep holds across its entire pass, so taking the mark
+    // after it means a sweep that starts first reaps this session while this
+    // call waits, which is the exact window the reap came through.
+    let _active_call = state.coordinator.begin_call_for(session_id.as_ref());
     touch_session_liveness(&state, session_id.as_ref());
     let mutates = mcp_tool_mutates_graph(&request.name);
     let (graph, graph_authority) = if mutates {
@@ -8003,6 +8015,18 @@ async fn mcp_tools_call(
         } else {
             (None, None, Vec::new(), Vec::new())
         };
+    // The session this call destroys if it is reaped is the transaction's
+    // owner, which is resolved from the transaction record and need not be the
+    // caller named by `X-Kin-Session`: the commit tool's schema makes
+    // `session_id` optional, and nothing enforces the match today. Mark the
+    // owner busy too, or a commit issued with only the arguments its schema
+    // requires protects nothing.
+    let _owner_call = transaction_session_id
+        .as_deref()
+        .and_then(|owner| Uuid::parse_str(owner).ok())
+        .map(SessionId)
+        .filter(|owner| Some(*owner) != session_id)
+        .map(|owner| state.coordinator.begin_call(&owner));
     let mut transaction_preflight = transaction_session_id.as_deref().map(|session_id| {
         sessions.evaluate_transaction_write(session_id, transaction_scopes.clone())
     });
