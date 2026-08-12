@@ -63,12 +63,21 @@ struct RetrievalSpec {
 /// and tools whose payload is always populated), so no negative is synthesized.
 fn spec_for(tool: &str) -> Option<RetrievalSpec> {
     let spec = match tool {
+        // Structural rather than semantic on purpose. This tool filters
+        // declarations by name pattern, kind, language, and role; it never
+        // consults the vector index, which is why the daemon deliberately does
+        // not attach embedding coverage to its payload. Gating its absence on
+        // embedding coverage made every empty search report
+        // `coverage_unknown` and advise "re-check after embedding is complete"
+        // — on a store whose embeddings were complete, about a lookup that
+        // never read one. The substrate it actually reads is the graph, so the
+        // graph gate is the one that can answer for it.
         "semantic_search" => RetrievalSpec {
             field: "results",
             kind: "no_entity_match",
             subject: "no entity declaration matched the search",
             always: false,
-            class: NegativeClass::Semantic,
+            class: NegativeClass::Structural,
         },
         // Daemon-only: offline returns an error (no payload), so this fires only
         // on the daemon path. `field` is the cosine arm's collection; the fused
@@ -399,13 +408,68 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     gaps
 }
 
+/// The degradations a retrieval payload reported about its OWN run, as stable
+/// `component:reason` labels.
+///
+/// The envelope's [`Degraded`] flags describe the daemon; this array describes
+/// the query that just ran, and the two are not the same fact. A locate page
+/// that dropped forty ranked keys because the graph no longer holds the
+/// entities behind them has degraded in a way no daemon flag reports, and
+/// reading only the daemon flags is how a negative came to print "no degraded
+/// signals" one field away from a populated `degradations[]` in the same
+/// response.
+///
+/// An entry missing either half of its identity is skipped rather than
+/// half-named: a label is a claim about what degraded, and `unknown:partial`
+/// is not one.
+///
+/// [`Degraded`]: crate::envelope::Degraded
+fn payload_degradation_labels(payload: &Value) -> Vec<String> {
+    let Some(entries) = payload.get("degradations").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let component = entry.get("component").and_then(Value::as_str)?;
+            let reason = entry.get("reason").and_then(Value::as_str)?;
+            Some(format!("{component}:{reason}"))
+        })
+        .collect()
+}
+
+/// Every degraded signal that bears on this answer: the daemon's own flags
+/// first, then the ones the payload reported about this query, deduplicated and
+/// in a stable order.
+fn degraded_signals(payload: &Value, envelope: &Envelope) -> Vec<String> {
+    let mut labels: Vec<String> = envelope
+        .degraded
+        .active_labels()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for label in payload_degradation_labels(payload) {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
 /// A human sentence spelling out "absent as-of X, coverage Y%, degraded Z" and
 /// the actionable consequence, so the negative is legible without cross-reading
 /// the envelope. `subject` and `consequence` are passed rather than read off a
 /// spec because a tool may narrow its own framing before the advice is built,
 /// and because a name that never resolved carries a different consequence than
-/// a lookup that ran and found nothing.
-fn build_advice(subject: &str, consequence: &str, envelope: &Envelope) -> String {
+/// a lookup that ran and found nothing. `degraded` is passed for the same
+/// reason: the payload's own degradations belong in the sentence, and only the
+/// caller has the payload.
+fn build_advice(
+    subject: &str,
+    consequence: &str,
+    envelope: &Envelope,
+    degraded: &[String],
+) -> String {
     let as_of = match &envelope.graph_as_of {
         Some(value) => format!("graph as-of {value}"),
         None => "an unversioned graph snapshot".to_string(),
@@ -418,7 +482,6 @@ fn build_advice(subject: &str, consequence: &str, envelope: &Envelope) -> String
         Some(_) => "semantic coverage complete".to_string(),
         None => "semantic coverage unknown".to_string(),
     };
-    let degraded = envelope.degraded.active_labels();
     let degraded = if degraded.is_empty() {
         "no degraded signals".to_string()
     } else {
@@ -749,6 +812,43 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         }
     }
 
+    // The payload's own `degradations[]` is a report about THIS query, and the
+    // verdict has to consume it or contradict it. A page that names an active
+    // degradation beside a negative claiming none is the shape this whole
+    // module exists to prevent. `trace_data_flow` is skipped because it states
+    // the same fact above in walk vocabulary, and saying it twice in one reason
+    // is not saying it better.
+    let degradations = payload_degradation_labels(payload);
+    if !degradations.is_empty() && tool != "trace_data_flow" {
+        let gap = format!(
+            "retrieval_degraded: this query reported degradations [{}], so it did not run at \
+             full capability",
+            degradations.join(", ")
+        );
+        trust_reason = if trustworthy {
+            gap
+        } else {
+            format!("{trust_reason}; {gap}")
+        };
+        trustworthy = false;
+    }
+
+    // A graph holding no entities answers every query identically, so an empty
+    // result there describes the graph and not the code. This is the same gate
+    // [`resolution_miss_for`] applies to a name that never resolved: the two
+    // ways of reporting "nothing" have to agree about an empty graph, or an
+    // agent learns which phrasing to trust rather than which answer.
+    if envelope.graph_state.entity_count == Some(0) {
+        let gap = "graph_empty: the graph holds no entities at all, so an empty result says \
+                   nothing about whether the target exists";
+        trust_reason = if trustworthy {
+            gap.to_string()
+        } else {
+            format!("{trust_reason}; {gap}")
+        };
+        trustworthy = false;
+    }
+
     let interpretation = if ranking_names_nothing {
         "unnamed_ranking"
     } else if spec.always {
@@ -761,6 +861,8 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     } else {
         absence_consequence(spec.always, trustworthy)
     };
+
+    let degraded_signals = degraded_signals(payload, envelope);
 
     let mut negative = Map::new();
     negative.insert("kind".to_string(), json!(kind));
@@ -783,13 +885,15 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
     );
     negative.insert("semantic_coverage".to_string(), coverage_value(envelope));
     negative.insert(
-        "degraded_signals".to_string(),
-        json!(envelope.degraded.active_labels()),
-    );
-    negative.insert(
         "advice".to_string(),
-        json!(build_advice(subject, consequence, envelope)),
+        json!(build_advice(
+            subject,
+            consequence,
+            envelope,
+            &degraded_signals
+        )),
     );
+    negative.insert("degraded_signals".to_string(), json!(degraded_signals));
     Some(Value::Object(negative))
 }
 
@@ -866,6 +970,15 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         "Absence is NOT authoritative: the name may simply not be indexed yet, so do not conclude the symbol does not exist. Re-check once the graph is complete and the daemon is healthy."
     };
 
+    // A miss carries no payload, so the daemon's own flags are the whole
+    // degraded picture here.
+    let degraded_signals: Vec<String> = envelope
+        .degraded
+        .active_labels()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
     let mut negative = Map::new();
     negative.insert("kind".to_string(), json!(kind));
     negative.insert("subject".to_string(), json!(subject));
@@ -887,13 +1000,15 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
     );
     negative.insert("semantic_coverage".to_string(), coverage_value(envelope));
     negative.insert(
-        "degraded_signals".to_string(),
-        json!(envelope.degraded.active_labels()),
-    );
-    negative.insert(
         "advice".to_string(),
-        json!(build_advice(subject, consequence, envelope)),
+        json!(build_advice(
+            subject,
+            consequence,
+            envelope,
+            &degraded_signals
+        )),
     );
+    negative.insert("degraded_signals".to_string(), json!(degraded_signals));
     Some(Value::Object(negative))
 }
 
@@ -992,10 +1107,10 @@ mod tests {
     // ---- semantic class: absence gated on EMBEDDING coverage ----
 
     #[test]
-    fn semantic_search_complete_coverage_is_authoritative() {
-        let payload = json!({ "results": [] });
+    fn semantic_locate_complete_coverage_is_authoritative() {
+        let payload = json!({ "query": "auth", "results": [], "total_ranked": 0 });
         let negative = negative_for(
-            "semantic_search",
+            "semantic_locate",
             &payload,
             &semantic_authoritative_envelope(),
         )
@@ -1010,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_partial_coverage_is_inconclusive() {
+    fn semantic_locate_partial_coverage_is_inconclusive() {
         let mut env = Envelope::daemon();
         env.semantic_coverage = Some(SemanticCoverage {
             indexed: 40,
@@ -1019,8 +1134,8 @@ mod tests {
             complete: false,
             note: Some("indexing".to_string()),
         });
-        let payload = json!({ "results": [] });
-        let negative = negative_for("semantic_search", &payload, &env).unwrap();
+        let payload = json!({ "query": "auth", "results": [], "total_ranked": 0 });
+        let negative = negative_for("semantic_locate", &payload, &env).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
         assert!(negative["trust_reason"]
             .as_str()
@@ -1030,18 +1145,150 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_coverage_unknown_even_on_ready_graph_is_inconclusive() {
+    fn semantic_locate_coverage_unknown_even_on_ready_graph_is_inconclusive() {
         // The class boundary: a fully initialized + loaded graph does NOT make a
-        // semantic absence authoritative — embeddings can still be incomplete, so
-        // an empty semantic result may mean "not indexed".
-        let payload = json!({ "results": [] });
+        // ranked-retrieval absence authoritative — embeddings can still be
+        // incomplete, so an empty locate page may mean "not indexed".
+        let payload = json!({ "query": "auth", "results": [], "total_ranked": 0 });
         let negative =
-            negative_for("semantic_search", &payload, &structural_ready_envelope()).unwrap();
+            negative_for("semantic_locate", &payload, &structural_ready_envelope()).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
         assert!(negative["trust_reason"]
             .as_str()
             .unwrap()
             .contains("coverage_unknown"));
+    }
+
+    #[test]
+    fn semantic_search_absence_is_gated_on_the_graph_not_on_embeddings() {
+        // FIR-2216. semantic_search filters the entity index by name/kind/
+        // language and never reads a vector, so gating it on embedding coverage
+        // made every empty search report `coverage_unknown` and advise
+        // "re-check after embedding is complete" — including on a store whose
+        // embeddings were complete. It answers to the graph gate instead, which
+        // is the substrate it actually reads.
+        let payload = json!({ "results": [] });
+        let negative = negative_for("semantic_search", &payload, &structural_ready_envelope())
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("structural_authoritative"));
+        // Negative control on the same tool: an unloaded graph must still be
+        // inconclusive, so the gate is one that can fail.
+        let unloaded = Envelope::daemon().with_health(&json!({ "graph_loaded": false }));
+        let negative = negative_for("semantic_search", &payload, &unloaded).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+    }
+
+    #[test]
+    fn payload_degradations_are_named_beside_the_verdict() {
+        // FIR-2216. A locate page that reported an active degradation carried a
+        // negative saying `degraded_signals: []` and advice reading "no degraded
+        // signals", one field away from the degradation itself. The envelope's
+        // flags describe the daemon; this array describes the query, and the
+        // verdict has to consume both.
+        let degraded = json!({
+            "query": "auth",
+            "results": [],
+            "total_ranked": 0,
+            "degradations": [{
+                "component": "vector_sidecar",
+                "reason": "retired_entity_keys",
+                "detail": "40 ranked vector key(s) resolved to entities the graph no longer holds",
+                "remediation": "run 'kin embed'",
+            }],
+        });
+        let negative = negative_for(
+            "semantic_locate",
+            &degraded,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(
+            negative["degraded_signals"],
+            json!(["vector_sidecar:retired_entity_keys"])
+        );
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("retrieval_degraded"));
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(advice.contains("vector_sidecar:retired_entity_keys"));
+        assert!(!advice.contains("no degraded signals"));
+
+        // Positive control: the same page with nothing degraded stays
+        // authoritative and still says so, so the signal is one that can be
+        // absent.
+        let clean = json!({ "query": "auth", "results": [], "total_ranked": 0 });
+        let negative = negative_for(
+            "semantic_locate",
+            &clean,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
+        assert_eq!(negative["degraded_signals"], json!([]));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("no degraded signals"));
+    }
+
+    #[test]
+    fn a_degradation_missing_half_its_identity_is_not_half_named() {
+        // Honesty: a label is a claim about what degraded. An entry with no
+        // reason is dropped rather than published as `vector_sidecar:unknown`.
+        let payload = json!({
+            "query": "auth",
+            "results": [],
+            "total_ranked": 0,
+            "degradations": [{ "component": "vector_sidecar" }],
+        });
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
+        assert_eq!(negative["degraded_signals"], json!([]));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+    }
+
+    #[test]
+    fn an_empty_graph_downgrades_an_empty_result() {
+        // FIR-2216. A graph holding no entities answers every query with
+        // nothing, so an empty result there is a fact about the graph. The
+        // resolution-miss path already refused to certify absence on an empty
+        // graph; the resolved-but-empty path has to agree, or an agent learns
+        // which phrasing to trust rather than which answer.
+        let empty_graph = Envelope::daemon().with_health(&json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_entity_count": 0,
+        }));
+        let payload = json!({ "results": [] });
+        let negative = negative_for("semantic_search", &payload, &empty_graph)
+            .expect("empty results yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("graph_empty"));
+
+        // Positive control: the same loaded graph holding entities certifies the
+        // absence, so the gate reads the count rather than always firing.
+        let populated = Envelope::daemon().with_health(&json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_entity_count": 5,
+        }));
+        let negative = negative_for("semantic_search", &payload, &populated).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
     }
 
     // ---- structural class: absence gated on GRAPH initialized + loaded ----

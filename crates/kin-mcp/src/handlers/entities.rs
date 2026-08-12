@@ -32,8 +32,10 @@ truncated. Prefer it over text search when you care about declarations and want 
 precise, navigable anchors rather than a pile of line hits. \
 On an empty result the response carries an additive `negative` object: its \
 `safe_to_conclude_absent` flag says whether the absence is authoritative \
-(daemon-owned graph, complete embedding coverage, no degraded signals) or merely \
-\"not indexed yet\" — check it before treating \"none found\" as ground truth.";
+(daemon-owned graph, initialized and loaded, holding entities, no degraded signals) \
+or merely \"not indexed yet\" — check it before treating \"none found\" as ground \
+truth. This filter reads the entity index rather than the vector index, so its \
+absence is gated on the graph being complete, not on embedding coverage.";
 
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
