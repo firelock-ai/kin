@@ -5247,6 +5247,88 @@ mod tests {
         assert_eq!(rows[0]["span"]["start_line"], 41);
     }
 
+    /// FIR-2217. Files mode reported a diff-mode complaint on a resolution
+    /// failure.
+    ///
+    /// `impact_analysis {files: [...]}` on paths that resolve to no entities came
+    /// back as "review error: no changes between base and head" when no base and
+    /// no head had been passed. An agent reads that as a diff problem and starts
+    /// looking for one, which is the wrong-cause error class this workspace
+    /// polices. Tracked paths with no parser-emitted entities are the ordinary
+    /// way to hit it: a workflow file is a real artifact and resolves to nothing.
+    #[tokio::test]
+    async fn impact_analysis_files_mode_names_a_resolution_miss_not_a_diff_complaint() {
+        let store = InMemoryGraph::new();
+        let present = impact_probe_entity("resolvable_probe_2217", Some(3));
+        let present_path = present
+            .file_origin
+            .as_ref()
+            .expect("the probe carries a file origin")
+            .to_string();
+        kin_model::graph::EntityStore::upsert_entity(&store, &present).unwrap();
+        let sessions = SessionRegistry::new();
+
+        let absent_args = HashMap::from([
+            (
+                "files".to_string(),
+                serde_json::json!(["crates/kin-index/src/classifier.rs", ".github/workflows/release.yml"]),
+            ),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let error = review::handle_impact_analysis(&absent_args, &store, &sessions)
+            .await
+            .expect_err("files resolving to no entities is an error, not an empty report")
+            .to_string();
+
+        assert!(
+            error.contains("no entity resolved from the given files"),
+            "the error must name the resolution miss: {error}"
+        );
+        assert!(
+            !error.contains("no changes between base and head"),
+            "a files-mode miss must not report a diff-mode complaint: {error}"
+        );
+        assert!(
+            error.contains(".github/workflows/release.yml"),
+            "the error must name the paths that resolved to nothing: {error}"
+        );
+
+        // The wording has to be one the envelope recognizes, or the tool fails
+        // loudly and still carries no negative object beside it.
+        let negative = crate::negative::resolution_miss_for(
+            "impact_analysis",
+            &error,
+            &crate::Envelope::daemon(),
+        )
+        .expect("a files-mode miss must carry the standard negative object");
+        assert_eq!(negative["kind"], serde_json::json!("scope_not_resolved"));
+
+        // Positive control: a path that DOES resolve still produces a report, so
+        // the new arm reads the resolution rather than rejecting files mode.
+        let present_args = HashMap::from([
+            ("files".to_string(), serde_json::json!([present_path])),
+            ("include_traffic".to_string(), serde_json::json!(false)),
+        ]);
+        let value = tool_result_json(
+            review::handle_impact_analysis(&present_args, &store, &sessions)
+                .await
+                .expect("a resolvable file must still yield an impact report"),
+        );
+        assert!(
+            value.get("affected_callers").is_some() || value.get("changed_entities").is_some(),
+            "the control must return a real report: {value}"
+        );
+
+        // Negative control on the envelope side: an unrelated failure from the
+        // same tool must NOT be dressed up as a resolution miss.
+        assert!(crate::negative::resolution_miss_for(
+            "impact_analysis",
+            "review error: graph store error: disk went away",
+            &crate::Envelope::daemon(),
+        )
+        .is_none());
+    }
+
     /// The artifact-identity binding is SKIPPED for an entity committed history
     /// has no revision for, and that skip is the fresh-clone case this read exists
     /// to serve.

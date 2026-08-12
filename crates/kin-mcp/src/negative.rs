@@ -800,6 +800,16 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
 /// it, which is the one shape an agent cannot calibrate.
 fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
     match tool {
+        // The review family's files mode resolves each named path to the
+        // entities the graph holds for it. When none resolve, nothing was
+        // compared, and that is a fact about the paths rather than about a diff.
+        // All three tools share one `resolve_diff`, so all three report the same
+        // miss; a spec for only the tool it was found on would leave its
+        // siblings failing loudly with no negative beside them.
+        "impact_analysis" | "semantic_diff" | "semantic_review" => Some((
+            "scope_not_resolved",
+            "the files that were named resolved to no entities, so nothing was diffed or analyzed",
+        )),
         "find_references" => Some((
             "focal_not_resolved",
             "the entity that was asked about could not be resolved, so no references were looked up",
