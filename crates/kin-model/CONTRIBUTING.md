@@ -31,8 +31,8 @@ locally avoids surprises.
 ## Versioning Policy
 
 kin-model is the **release/version source of truth** for canonical Kin types.
-Every source change intended for publication must bump the crate version — the
-registry is immutable and you cannot overwrite a published `(name, version)`.
+Every source change intended for publication must bump the crate version. The
+registry is immutable, so you cannot overwrite a published `(name, version)`.
 
 See [`downstream-pins.json`](downstream-pins.json) and the scripts in
 `scripts/` for the downstream compatibility gate. A breaking (MINOR) bump must

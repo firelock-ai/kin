@@ -16,7 +16,7 @@ cargo test
 
 Single-workspace crate (`src/lib.rs` and submodules). Depends on `kin-blobs`
 (for content-addressable identity) and `kin-vector` (for embedding vectors).
-Zero Kin runtime dependencies — types only.
+Both are type-level dependencies, so there are zero Kin runtime dependencies.
 
 ## Boundary rule
 
