@@ -205,18 +205,23 @@ _kin_vfs_chpwd() {
 
 # Kin-family control-plane binaries must not be injected with the shim.
 # External tools (editors, builds) keep the shim via the global env var.
+#
+# Every wrapper clears the preload variables inline and depends on no other
+# function. A consumer that replays these definitions into another shell
+# carries the whole exclusion with them, so the wrapper cannot resolve to a
+# missing helper.
 _kin_vfs_exec_without_preload() {
     DYLD_INSERT_LIBRARIES= LD_PRELOAD= command "$@"
 }
 
-kin() { _kin_vfs_exec_without_preload kin "$@"; }
-kin-real() { _kin_vfs_exec_without_preload kin-real "$@"; }
-kin-daemon() { _kin_vfs_exec_without_preload kin-daemon "$@"; }
-kin-mcp() { _kin_vfs_exec_without_preload kin-mcp "$@"; }
-kin-vfs() { _kin_vfs_exec_without_preload kin-vfs "$@"; }
-kin-bench-prep() { _kin_vfs_exec_without_preload kin-bench-prep "$@"; }
-kin-bench-eval() { _kin_vfs_exec_without_preload kin-bench-eval "$@"; }
-kin-bench-target() { _kin_vfs_exec_without_preload kin-bench-target "$@"; }
+kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }
+kin-real() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-real "$@"; }
+kin-daemon() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-daemon "$@"; }
+kin-mcp() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-mcp "$@"; }
+kin-vfs() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-vfs "$@"; }
+kin-bench-prep() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-bench-prep "$@"; }
+kin-bench-eval() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-bench-eval "$@"; }
+kin-bench-target() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-bench-target "$@"; }
 
 autoload -Uz add-zsh-hook
 add-zsh-hook chpwd _kin_vfs_chpwd
@@ -421,18 +426,23 @@ _kin_vfs_prompt_command() {
 
 # Kin-family control-plane binaries must not be injected with the shim.
 # External tools (editors, builds) keep the shim via the global env var.
+#
+# Every wrapper clears the preload variables inline and depends on no other
+# function. A consumer that replays these definitions into another shell
+# carries the whole exclusion with them, so the wrapper cannot resolve to a
+# missing helper.
 _kin_vfs_exec_without_preload() {
     DYLD_INSERT_LIBRARIES= LD_PRELOAD= command "$@"
 }
 
-kin() { _kin_vfs_exec_without_preload kin "$@"; }
-kin-real() { _kin_vfs_exec_without_preload kin-real "$@"; }
-kin-daemon() { _kin_vfs_exec_without_preload kin-daemon "$@"; }
-kin-mcp() { _kin_vfs_exec_without_preload kin-mcp "$@"; }
-kin-vfs() { _kin_vfs_exec_without_preload kin-vfs "$@"; }
-kin-bench-prep() { _kin_vfs_exec_without_preload kin-bench-prep "$@"; }
-kin-bench-eval() { _kin_vfs_exec_without_preload kin-bench-eval "$@"; }
-kin-bench-target() { _kin_vfs_exec_without_preload kin-bench-target "$@"; }
+kin() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin "$@"; }
+kin-real() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-real "$@"; }
+kin-daemon() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-daemon "$@"; }
+kin-mcp() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-mcp "$@"; }
+kin-vfs() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-vfs "$@"; }
+kin-bench-prep() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-bench-prep "$@"; }
+kin-bench-eval() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-bench-eval "$@"; }
+kin-bench-target() { DYLD_INSERT_LIBRARIES= LD_PRELOAD= command kin-bench-target "$@"; }
 
 if [ -z "$PROMPT_COMMAND" ]; then
     PROMPT_COMMAND="_kin_vfs_prompt_command"
@@ -872,11 +882,55 @@ function _kin_vfs_deactivate
     set -g _KIN_VFS_WORKSPACE ""
 end
 
-# kin is a graph tool — never inject VFS shim into its process.
+# Kin-family control-plane binaries must not be injected with the shim.
+# External tools (editors, builds) keep the shim via the global env var.
+# The set covers the same binaries the zsh and bash hooks wrap.
 function kin --wraps=kin --description 'Run kin without VFS shim'
     set -lx DYLD_INSERT_LIBRARIES
     set -lx LD_PRELOAD
     command kin $argv
+end
+
+function kin-real --wraps=kin-real --description 'Run kin-real without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-real $argv
+end
+
+function kin-daemon --wraps=kin-daemon --description 'Run kin-daemon without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-daemon $argv
+end
+
+function kin-mcp --wraps=kin-mcp --description 'Run kin-mcp without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-mcp $argv
+end
+
+function kin-vfs --wraps=kin-vfs --description 'Run kin-vfs without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-vfs $argv
+end
+
+function kin-bench-prep --wraps=kin-bench-prep --description 'Run kin-bench-prep without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-bench-prep $argv
+end
+
+function kin-bench-eval --wraps=kin-bench-eval --description 'Run kin-bench-eval without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-bench-eval $argv
+end
+
+function kin-bench-target --wraps=kin-bench-target --description 'Run kin-bench-target without VFS shim'
+    set -lx DYLD_INSERT_LIBRARIES
+    set -lx LD_PRELOAD
+    command kin-bench-target $argv
 end
 
 function _kin_vfs_chpwd --on-variable PWD
@@ -14689,6 +14743,165 @@ expect_workspace "$TEST_ALIASED_SESSION_START" "$TEST_ALIASED_SESSION_PHYSICAL" 
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+
+    /// The Kin-family binaries every shell hook must exclude from the shim.
+    const SHIM_EXCLUDED_BINARIES: [&str; 8] = [
+        "kin",
+        "kin-real",
+        "kin-daemon",
+        "kin-mcp",
+        "kin-vfs",
+        "kin-bench-prep",
+        "kin-bench-eval",
+        "kin-bench-target",
+    ];
+
+    #[test]
+    fn posix_shim_exclusion_wrappers_depend_on_no_other_function() {
+        for (shell, source) in [("zsh", ZSH_HOOK), ("bash", BASH_HOOK)] {
+            for binary in SHIM_EXCLUDED_BINARIES {
+                let wrapper = format!(
+                    "{binary}() {{ DYLD_INSERT_LIBRARIES= LD_PRELOAD= command {binary} \"$@\"; }}"
+                );
+                assert!(
+                    source.contains(&wrapper),
+                    "{shell} hook does not define a self-sufficient wrapper for {binary}; \
+                     a wrapper that delegates to a helper breaks whenever a consumer \
+                     replays only public functions"
+                );
+            }
+
+            for binary in SHIM_EXCLUDED_BINARIES {
+                let delegating = format!("{binary}() {{ _kin_vfs_exec_without_preload ");
+                assert!(
+                    !source.contains(&delegating),
+                    "{shell} hook wrapper for {binary} still delegates to a private helper"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fish_hook_excludes_the_same_binaries_as_the_posix_hooks() {
+        for binary in SHIM_EXCLUDED_BINARIES {
+            let definition = format!("function {binary} --wraps={binary} ");
+            assert!(
+                FISH_HOOK.contains(&definition),
+                "fish hook leaves {binary} running with the VFS shim injected, \
+                 contradicting the exclusion the zsh and bash hooks enforce"
+            );
+            let body = format!("command {binary} $argv");
+            assert!(
+                FISH_HOOK.contains(&body),
+                "fish hook wrapper for {binary} does not exec the real binary"
+            );
+        }
+    }
+
+    /// Replays only the public wrappers into a fresh shell, the way a consumer
+    /// that snapshots exported functions and drops underscore-prefixed private
+    /// ones does, then runs each wrapper against a stub binary.
+    ///
+    /// Before the wrappers inlined the exclusion this exited 127 with
+    /// `command not found: _kin_vfs_exec_without_preload`, leaving `kin`
+    /// unrunnable in any such shell.
+    #[test]
+    fn wrappers_survive_a_consumer_that_replays_only_public_functions() {
+        let fixture = tempfile::tempdir().unwrap();
+        let bin = fixture.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        for binary in SHIM_EXCLUDED_BINARIES {
+            let stub = bin.join(binary);
+            // An unset variable and an empty one both mean "no shim injected",
+            // and macOS strips DYLD_* when exec'ing a protected system binary,
+            // so collapse the two into one observable value.
+            fs::write(
+                &stub,
+                "#!/bin/sh\n\
+                 echo \"ran $(basename \"$0\") dyld=[${DYLD_INSERT_LIBRARIES-}] \
+                 ld=[${LD_PRELOAD-}]\"\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        for (shell, hook_name, hook, flags) in [
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                BASH_HOOK,
+                &["--noprofile", "--norc"][..],
+            ),
+            ("/bin/zsh", "kin-vfs.zsh", ZSH_HOOK, &["-f"][..]),
+        ] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+
+            let hook_path = fixture.path().join(hook_name);
+            fs::write(&hook_path, hook).unwrap();
+
+            // Keep only the public wrapper definitions, exactly the subset a
+            // function-replaying consumer carries forward.
+            let mut replay = String::new();
+            for line in hook.lines() {
+                for binary in SHIM_EXCLUDED_BINARIES {
+                    if line.starts_with(&format!("{binary}() {{")) {
+                        replay.push_str(line);
+                        replay.push('\n');
+                    }
+                }
+            }
+            assert!(
+                !replay.is_empty(),
+                "{shell}: no public wrapper definitions were captured for replay"
+            );
+
+            let mut script = String::from("set -u\n");
+            script.push_str(&format!("PATH={}:$PATH\n", bin.display()));
+            script.push_str("export DYLD_INSERT_LIBRARIES=/stale/preload.dylib\n");
+            script.push_str("export LD_PRELOAD=/stale/preload.so\n");
+            script.push_str(&replay);
+            for binary in SHIM_EXCLUDED_BINARIES {
+                script.push_str(&format!("{binary} --version || exit 127\n"));
+            }
+
+            let script_path = fixture.path().join(format!("{hook_name}.replay"));
+            fs::write(&script_path, &script).unwrap();
+
+            let output = Command::new(shell)
+                .args(flags)
+                .arg(&script_path)
+                .output()
+                .unwrap_or_else(|e| panic!("{shell}: failed to run replay script: {e}"));
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert!(
+                output.status.success(),
+                "{shell}: replayed wrappers failed (status {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+            assert!(
+                !stderr.contains("_kin_vfs_exec_without_preload"),
+                "{shell}: replayed wrapper resolved to a missing private helper\nstderr:\n{stderr}"
+            );
+
+            for binary in SHIM_EXCLUDED_BINARIES {
+                assert!(
+                    stdout.contains(&format!("ran {binary} dyld=[] ld=[]")),
+                    "{shell}: wrapper for {binary} did not run with both preload \
+                     variables cleared\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+            }
         }
     }
 
