@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.20] - 2026-08-12
+
+### Changed
+
+- Regenerate the fuzz lock for the kin-model 0.7.8 and kin-vector 0.1.11 pins (#768)
+- Consume the shared merge-queue ejection notice (#770)
+- Drop the em dash and the retired category line from NOTICE (#773)
+- Hold the cross-encoder resident across queries instead of rebuilding per call (#775)
+- Name the vector index's staleness beside its coverage in graph status (#778)
+- Decide nested-checkout membership at the transition, not at drain (#779)
+- True up the public docs against the shipped CLI (#774)
+- Report a resolution miss from kin_provenance_query (#780)
+
+
 ## [0.5.19] - 2026-08-12
 
 ### Changed
