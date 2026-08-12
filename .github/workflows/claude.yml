@@ -35,11 +35,10 @@ on:
   pull_request_review:
     types: [submitted]
 
+# Read-only by default, so a job that says nothing can do nothing. The
+# responder escalates on its own job below and the credential check never does.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  actions: read
+  contents: read
 
 # Keyed per thread so two mentions in one issue queue behind each other while
 # mentions in different threads still run in parallel. Never cancelled: a
@@ -57,6 +56,9 @@ jobs:
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
+    # Reads a secret's presence and nothing else. No write anywhere.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -81,6 +83,14 @@ jobs:
     name: Respond to the mention
     needs: preflight
     if: needs.preflight.outputs.enabled == 'true'
+    # The ceiling for the responder, and the only escalation in this file. It
+    # does not carry workflow-write, so a push touching `.github/workflows` is
+    # refused by the server, and main is protected against direct pushes.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

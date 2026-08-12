@@ -37,14 +37,10 @@ on:
     - cron: "11,41 * * * *"
   workflow_dispatch:
 
-# The ceiling for everything below. `contents: write` is what enabling
-# auto-merge and pushing an abandonment branch both require; it does not carry
-# workflow-write, and main is protected against direct pushes.
+# Read-only by default, so a job that says nothing can do nothing. The patrol
+# escalates on its own job below and the credential check never does.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  actions: read
+  contents: read
 
 concurrency:
   group: kin-release-sentinel
@@ -56,6 +52,9 @@ jobs:
   # repository green instead of failing every half hour on a missing secret.
   preflight:
     name: Resolve sentinel credential
+    # Reads a secret's presence and nothing else. No write anywhere.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -81,6 +80,16 @@ jobs:
     name: Patrol the release rail
     needs: preflight
     if: needs.preflight.outputs.enabled == 'true'
+    # The ceiling for the patrol, and the only escalation in this file.
+    # `contents: write` is what enabling auto-merge and pushing an abandonment
+    # branch both require. It does not carry workflow-write, so a push touching
+    # `.github/workflows` is refused by the server, and main is protected
+    # against direct pushes regardless.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

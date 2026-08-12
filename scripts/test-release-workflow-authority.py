@@ -481,6 +481,10 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "verify-pins": "Verify base image pins",
     },
     ".github/workflows/ci.yml": CI_JOB_DISPLAY_NAMES,
+    ".github/workflows/claude.yml": {
+        "preflight": "Resolve responder credential",
+        "respond": "Respond to the mention",
+    },
     ".github/workflows/daemon-smoke.yml": {
         "daemon-smoke": "Linux Daemon Smoke + MCP Headless",
     },
@@ -516,6 +520,10 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/release-recovery.yml": {
         "reconcile": "Reconcile failed release",
+    },
+    ".github/workflows/release-sentinel.yml": {
+        "preflight": "Resolve sentinel credential",
+        "patrol": "Patrol the release rail",
     },
     ".github/workflows/release-tag.yml": {
         "mint-release-tag": "Mint release tag",
