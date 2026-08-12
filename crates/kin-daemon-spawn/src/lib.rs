@@ -1752,7 +1752,7 @@ fn log_reaper_group_finalization(
     sentinel_status: std::process::ExitStatus,
     process_group: libc::pid_t,
 ) {
-    let sentinel_was_killed = sentinel_exit_was_sigkill(sentinel_status);
+    let sentinel_was_killed = sentinel_exit_was_signalled(sentinel_status);
     // The sentinel handle was just reaped and consumed. This is the one final
     // group probe; no reaper path may signal the numeric PGID after this call.
     // It asks the same containment question the launcher path asks, because an
@@ -2015,7 +2015,7 @@ fn finalize_owned_process_group(
             "process-group sentinel did not exit before finalization deadline",
         )
     })?;
-    let sentinel_was_killed = sentinel_exit_was_sigkill(status);
+    let sentinel_was_killed = sentinel_exit_was_signalled(status);
     // Taking the already-reaped handle releases the PID pin. From this point
     // onward no code may send STOP/KILL to the numeric process group.
     sentinel.take();
@@ -2024,7 +2024,8 @@ fn finalize_owned_process_group(
     let containment = process_group_containment(process_group);
     if !sentinel_was_killed {
         return Err(std::io::Error::other(format!(
-            "process-group sentinel exited unexpectedly: {status}"
+            "process-group sentinel exited unexpectedly: {status}; group containment: \
+             {containment:?}"
         )));
     }
     match containment {
@@ -2591,11 +2592,36 @@ fn signal_process_group_after_delivered_kill(
     }
 }
 
+/// Whether the sentinel died because something signalled it rather than
+/// because it decided to leave.
+///
+/// The distinction this draws is between a sentinel the barrier killed and a
+/// sentinel that returned on its own, because only the second one releases the
+/// PID pin early and leaves a numeric PGID free to be recycled under a caller
+/// still signalling it. A sentinel that leaves on its own always does so
+/// through [`libc::_exit`], so every self-exit carries a code and no signal;
+/// rejecting those is what gives this check its teeth, and both `_exit(0)` and
+/// `_exit(70)` stay rejected here.
+///
+/// SIGKILL is the barrier's own signal. SIGHUP is the kernel's, and it arrives
+/// as a direct consequence of the barrier: `quiesce_pinned_process_group`
+/// opens by stopping the whole group, and POSIX requires that when a process
+/// group becomes orphaned while any member is stopped, every member is sent
+/// SIGHUP followed by SIGCONT. The window between that STOP and the KILL that
+/// follows it is small but real, so a group orphaned inside it loses its
+/// sentinel to SIGHUP before the barrier's own KILL can land. Reading that as
+/// an unexpected exit failed runs whose containment had actually succeeded.
+///
+/// Accepting SIGHUP costs nothing that was being checked here. This crate
+/// never sends SIGHUP and the sentinel installs no handler for it, so a SIGHUP
+/// death cannot be self-inflicted. Containment itself is proven separately by
+/// [`process_group_containment`], which enumerates the group and classifies
+/// every member, and which keeps deciding both callers.
 #[cfg(unix)]
-fn sentinel_exit_was_sigkill(status: std::process::ExitStatus) -> bool {
+fn sentinel_exit_was_signalled(status: std::process::ExitStatus) -> bool {
     use std::os::unix::process::ExitStatusExt as _;
 
-    status.signal() == Some(libc::SIGKILL)
+    matches!(status.signal(), Some(libc::SIGKILL) | Some(libc::SIGHUP))
 }
 
 #[cfg(unix)]
@@ -5115,6 +5141,72 @@ mod tests {
             !port_record_is_orphaned(dir.path()),
             "a port beside a live PID record may belong to a daemon mid-publication"
         );
+    }
+
+    /// Run a child to completion under `sh`, returning how it ended.
+    ///
+    /// The child is signalled or exits on its own depending on `end`, which is
+    /// the only difference the classifier is being asked to read.
+    #[cfg(unix)]
+    fn reaped_child_status(end: ChildEnding) -> std::process::ExitStatus {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(match end {
+                ChildEnding::Signalled(_) => "while :; do sleep 1; done".to_string(),
+                ChildEnding::SelfExit(code) => format!("exit {code}"),
+            })
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child whose ending the classifier will read");
+        if let ChildEnding::Signalled(signal) = end {
+            let pid = libc::pid_t::try_from(child.id()).expect("child pid fits a pid_t");
+            assert_eq!(
+                unsafe { libc::kill(pid, signal) },
+                0,
+                "deliver the ending signal"
+            );
+        }
+        child.wait().expect("reap the child")
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum ChildEnding {
+        Signalled(libc::c_int),
+        SelfExit(i32),
+    }
+
+    /// A sentinel the barrier stopped may be killed by the kernel instead.
+    ///
+    /// `quiesce_pinned_process_group` stops the group before it kills it, and
+    /// POSIX sends SIGHUP to every member of a process group that becomes
+    /// orphaned while a member is stopped. A sentinel lost that way was read as
+    /// an unexpected exit, which failed runs whose containment had succeeded.
+    /// The self-exit codes stay rejected in the same assertion, because those
+    /// are the endings that really do release the PID pin early.
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_sentinel_is_not_an_unexpected_exit_but_a_self_exit_still_is() {
+        assert!(
+            sentinel_exit_was_signalled(reaped_child_status(ChildEnding::Signalled(libc::SIGKILL))),
+            "SIGKILL is the barrier's own signal"
+        );
+        assert!(
+            sentinel_exit_was_signalled(reaped_child_status(ChildEnding::Signalled(libc::SIGHUP))),
+            "SIGHUP reaches a stopped sentinel whose group is orphaned before the barrier's kill \
+             lands, and this crate never sends it, so it cannot be self-inflicted"
+        );
+
+        for code in [0, 70] {
+            let status = reaped_child_status(ChildEnding::SelfExit(code));
+            assert!(
+                !sentinel_exit_was_signalled(status),
+                "a sentinel that leaves through _exit({code}) releases the PID pin early and must \
+                 still be reported"
+            );
+        }
     }
 
     #[test]
