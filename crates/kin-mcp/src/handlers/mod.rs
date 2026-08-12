@@ -5271,7 +5271,10 @@ mod tests {
         let absent_args = HashMap::from([
             (
                 "files".to_string(),
-                serde_json::json!(["crates/kin-index/src/classifier.rs", ".github/workflows/release.yml"]),
+                serde_json::json!([
+                    "crates/kin-index/src/classifier.rs",
+                    ".github/workflows/release.yml"
+                ]),
             ),
             ("include_traffic".to_string(), serde_json::json!(false)),
         ]);
