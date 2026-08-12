@@ -1998,6 +1998,7 @@ async fn resolve_session_source_scope(
 
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
+const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 
 /// Capture one point-in-time status observation of the graph selected for this
 /// request.
@@ -3116,9 +3117,9 @@ async fn live_embedding_coverage(
 ) -> kin_cli::commands::status::EmbeddingCoverage {
     use kin_cli::commands::status::{EmbeddingCoverage, EmbeddingCoverageUnobserved};
 
-    for _ in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+    for attempt in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
         let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
-            tokio::task::yield_now().await;
+            settle_graph_authority_writer(attempt).await;
             continue;
         };
         let coverage = match sample_embedding_coverage(Arc::clone(state)).await {
@@ -3126,13 +3127,36 @@ async fn live_embedding_coverage(
             Err(reason) => return EmbeddingCoverage::unobserved(reason),
         };
         if !state.graph_authority_epoch_is_current(authority_epoch) {
-            tokio::task::yield_now().await;
+            settle_graph_authority_writer(attempt).await;
             continue;
         }
         return coverage;
     }
 
     EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::GraphMutationInFlight)
+}
+
+/// Give a graph-authority writer time to drain before the next resample.
+///
+/// `yield_now` is the wrong instrument for this wait. It reorders ready tasks
+/// on this runtime and returns without the clock advancing, so every attempt
+/// observes what is effectively the same instant and a writer merely passing
+/// through spends the entire attempt budget. Writers holding this guard do
+/// filesystem and content-address work on blocking threads, which yielding an
+/// async worker cannot wait for at all. Sleeping a short doubling interval
+/// spreads the attempts across real time instead, so a brief writer is
+/// outlasted rather than reported.
+///
+/// This widens the observation window; it does not soften the verdict. A writer
+/// that never drains still exhausts every attempt and is still published as a
+/// mutation in flight.
+async fn settle_graph_authority_writer(attempt: usize) {
+    // The last attempt has no resample left to protect, so it does not pay for
+    // a nap whose result nobody reads.
+    if attempt + 1 >= GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+        return;
+    }
+    tokio::time::sleep(GRAPH_STATUS_WRITER_SETTLE_FLOOR.saturating_mul(1 << attempt)).await;
 }
 
 /// Take one coverage reading on a blocking thread.
@@ -20870,6 +20894,33 @@ mod tests {
                 unattached_vector_coverage_reason()
             ),
             "with no mutation in flight the sampler must report the build's graph state"
+        );
+    }
+
+    /// A writer merely passing through must be outlasted rather than published.
+    ///
+    /// This is the case the attempt budget exists to cover, and it only holds if
+    /// the attempts span real time. Separated by `yield_now` they all landed in
+    /// the same instant, so any writer alive when the call began — however
+    /// briefly — consumed every attempt and was reported as a mutation in
+    /// flight. This test fails against that spelling and passes once the
+    /// attempts are spread by an actual wait.
+    #[tokio::test]
+    async fn live_coverage_outlasts_a_writer_that_drains_mid_sample() {
+        let state = test_state();
+        let mutation_guard = state.begin_graph_authority_mutation();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(mutation_guard);
+        });
+
+        let coverage = live_embedding_coverage(&state).await;
+        assert_ne!(
+            coverage,
+            kin_cli::commands::status::EmbeddingCoverage::unobserved(
+                kin_cli::commands::status::EmbeddingCoverageUnobserved::GraphMutationInFlight
+            ),
+            "a writer that drains mid-sample must be waited out, not published as in flight"
         );
     }
 
