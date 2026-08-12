@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop Git auto-maintenance from racing test fixture repositories (#772)
 - Report a files-mode resolution miss from impact_analysis (#782)
 - Make the retrieval negative consume the signals printed beside it (#777)
+- Render artifact hashes and change ids as hex so they round-trip (#787)
+- Record graph-truth freshness durably and state it on kin graph status (#781)
+- Clear RUSTSEC-2026-0253 and make the advisory gate able to fail (#788)
+- Stop an unnamed ranking from certifying that the symbol is absent (#791)
 
 
 ## [0.5.20] - 2026-08-12
