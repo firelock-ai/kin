@@ -1,0 +1,284 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Release Sentinel
+
+# Patrols the three release-rail failures that are silent by construction: a
+# green pull request whose auto-merge was disarmed and which therefore simply
+# never lands, a train that holds while main keeps accumulating releasable
+# drift, and a release whose own tag carries the defect that blocks it. None of
+# the three reports itself. Each one has previously been found by a human
+# noticing that nothing happened, which is the slowest detector available.
+#
+# ACTIVATION IS ONE FOUNDER STEP. This workflow reads
+# `secrets.CLAUDE_CODE_OAUTH_TOKEN`, which only the founder can mint because
+# `claude setup-token` is interactive:
+#
+#   claude setup-token
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private
+#
+# Until that secret exists the preflight job below reports it and the patrol is
+# skipped, so this file is inert rather than red. Nothing else about the rail
+# changes while it is unwired.
+#
+# The guardrails that matter are structural, not promises made in the prompt.
+# The allowlist can express `gh pr create --draft` and `gh pr merge --auto
+# --squash` as whole command prefixes, so this run has no way to spell an
+# immediate merge or a ready-for-review pull request at all. Draft pull requests
+# cannot be merged or auto-merged by GitHub, main carries a `merge_queue` rule
+# that refuses a direct merge regardless, and GITHUB_TOKEN is issued without
+# `workflows: write`, so a push touching `.github/workflows` is refused by the
+# server. The prompt restates these rules because a model reading its own limits
+# behaves better, but it is not what enforces them.
+on:
+  schedule:
+    # Offset from the train (7,22,37,52) and recovery (3,18,33,48) so the
+    # sentinel reads a settled rail rather than one mid-reconcile.
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+
+# Read-only by default, so a job that says nothing can do nothing. The patrol
+# escalates on its own job below and the credential check never does.
+permissions:
+  contents: read
+
+concurrency:
+  group: kin-release-sentinel
+  cancel-in-progress: false
+
+jobs:
+  # Secrets cannot be read in a job-level `if`, so the credential check is its
+  # own job and the patrol gates on its output. This is what keeps an unwired
+  # repository green instead of failing every half hour on a missing secret.
+  preflight:
+    name: Resolve sentinel credential
+    # Reads a secret's presence and nothing else. No write anywhere.
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.credential.outputs.enabled }}
+    steps:
+      - name: Report whether the sentinel credential is wired
+        id: credential
+        env:
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Only ever tests for emptiness. The value is never printed, never
+          # written to an output, and never passed to another step.
+          if [ -n "${OAUTH_TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "CLAUDE_CODE_OAUTH_TOKEN is present; the patrol will run."
+            exit 0
+          fi
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set, so the release sentinel is skipped. Mint it with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN --org firelock-ai --visibility private' to activate the patrol. This run is a success on purpose: an unwired sentinel must not read as a broken rail."
+
+  patrol:
+    name: Patrol the release rail
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    # The ceiling for the patrol, and the only escalation in this file.
+    # `contents: write` is what enabling auto-merge and pushing an abandonment
+    # branch both require. It does not carry workflow-write, so a push touching
+    # `.github/workflows` is refused by the server, and main is protected
+    # against direct pushes regardless.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # No `ref:` input on purpose. Both triggers resolve GITHUB_SHA to a commit
+      # on the default branch, so this fetches one immutable snapshot rather
+      # than whatever main becomes while the patrol runs. The checkout is sparse
+      # because the only tracked files the patrol reads or edits are the
+      # abandonment record and the selector that validates it, and a workspace
+      # holding nothing else is a workspace an injected instruction cannot
+      # rummage through.
+      - name: Checkout the release policy from the default-branch commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts
+
+      - name: Patrol
+        uses: anthropics/claude-code-action@9c41ed18ca8b2b2a17eaef4723d5092ccdebc814 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The job-scoped token, which expires with the job and carries exactly
+          # the permissions declared above. Never a personal access token: a
+          # static credential does not rotate between runs.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            You are the release sentinel for ${{ github.repository }}. You run on a
+            schedule against a settled rail. Work through the three duties below in
+            order, then stop and summarise what you found and what you changed.
+
+            Every duty must be idempotent. You run every thirty minutes, so any
+            action you take must be safe to reach again on the next run and the
+            hundred after it. Before you create anything, look for the thing you
+            would be creating and update it instead. Never open a second copy of
+            something you already opened.
+
+            DUTY ONE. Re-arm green pull requests whose auto-merge was disarmed.
+
+            List the open pull requests targeting main with
+            `gh pr list --repo ${{ github.repository }} --state open --base main
+            --json number,title,isDraft,mergeable,autoMergeRequest,headRefName`.
+            Ignore every draft. For each remaining pull request whose
+            `autoMergeRequest` is null, read its checks with
+            `gh pr checks <number> --repo ${{ github.repository }} --json
+            name,state,bucket`. Judge on the `state` field, whose values are
+            upper-case, and treat the pull request as fully green only when it has at
+            least one check and every check's `state` is SUCCESS, SKIPPED, or
+            NEUTRAL. A single PENDING, QUEUED, FAILURE, CANCELLED, or ERROR state
+            means you leave it alone: this duty re-arms work the rail already judged
+            good, and it never overrules a judgement in progress. Do not mix `state`
+            up with `bucket`, whose values are lower-case, and do not infer greenness
+            from the `mergeable` field, which answers a different question. A pull
+            request with zero checks is never green: an empty check list and a
+            passing one are different findings.
+
+            For each fully green pull request with auto-merge disarmed, re-arm it
+            with exactly this command shape, because the allowlist admits no other:
+
+              gh pr merge --auto --squash <number> --repo ${{ github.repository }}
+
+            That hands the pull request to the merge queue, which owns rebasing,
+            running merge_group CI, and landing it in order. You are arming a queue
+            entry, not merging. If the command fails, report the error it printed
+            and move on to the next pull request rather than trying another spelling.
+
+            DUTY TWO. Surface a train that is holding while main keeps drifting.
+
+            Read the newest Release Train run with
+            `gh run list --repo ${{ github.repository }} --workflow release-train.yml
+            --limit 1 --json databaseId,conclusion,createdAt,url` and then read its
+            log with `gh run view <id> --repo ${{ github.repository }} --log`.
+
+            The train prints its decision. A line reading `release drift: N
+            first-parent range commit(s), base=<tag>, bump=<bump>` means it resolved
+            releasable drift and proceeded, which is healthy. A notice saying the
+            highest tag is not finalized GitHub Latest, or that a tag is already
+            staged on main, means the rail is HELD: the train has stood down and is
+            waiting for something else to move. A hold is only worth alarming about
+            when main has releasable drift behind it, because a held rail with
+            nothing to release is simply idle.
+
+            When the rail is held with drift, open or update ONE alarm issue. Its
+            title is exactly, with no tag or count appended:
+
+              Release rail is held with releasable drift
+
+            Find it first with `gh issue list --repo ${{ github.repository }} --state
+            open --search "\"Release rail is held with releasable drift\" in:title"
+            --json number,title --jq '.[] | select(.title == "Release rail is held
+            with releasable drift") | .number'`. GitHub title search is fuzzy, so
+            the exact-title filter is what makes this idempotent. If a number comes
+            back, update that issue's body with `gh issue edit <number> --repo
+            ${{ github.repository }} --body-file <file>`. Only when nothing comes
+            back do you `gh issue create`. Never open a second one, and never key
+            the title to a tag, because the tag changes while the condition does not.
+
+            The body names the blocking tag, the failed release run id and its URL,
+            the drift count, and the two ways out: land the fix that unblocks the
+            tag, or record the tag as abandoned so the rail can step past it. Write
+            it as prose a captain can act on without opening the run.
+
+            If the rail is healthy and that issue is open, say so in a comment and
+            close it. A stale alarm is worse than no alarm, because the next reader
+            learns to ignore it.
+
+            DUTY THREE. Draft an abandonment when the blocking release is
+            structurally dead. You DRAFT it. You never merge it.
+
+            A release is structurally dead when the defect that blocks it is frozen
+            into the tag itself, so no later change to main can reach it. Read
+            `scripts/abandoned-release-tags.json` for the shape of that judgement:
+            every reason already recorded there names a defect in the tagged tree or
+            in a workflow that resolves from the tag, and says why main cannot repair
+            it. A transient runner failure, a flaky leg, or anything automatic
+            recovery could still fix on a retry is NOT structurally dead, and drafting
+            an abandonment for one would retire a release that was going to land.
+
+            When the blocking release is structurally dead, add one entry to the
+            `abandoned` array in `scripts/abandoned-release-tags.json` carrying all
+            five required fields, none empty and none guessed:
+
+              tag                     the blocking release tag, as vX.Y.Z
+              sha                     the full forty-character commit the tag peels
+                                      to, read with `git ls-remote origin
+                                      "refs/tags/<tag>^{}"` so an annotated tag is
+                                      peeled to its commit rather than recorded as
+                                      its own object
+              reason                  prose naming the exact failing step, why the tag
+                                      cannot receive the fix, and what the release
+                                      object and published channels currently show
+              superseded_by           the release tag that carries the fix, as vX.Y.Z
+              failed_release_run_id   the numeric id of the failed Release run
+
+            Validate your edit before you open anything, by running
+            `python3 scripts/select-admissible-release-tag.py` the way the rail runs
+            it. If validation fails, fix the entry. If you cannot make it pass, open
+            nothing and report why: a malformed record waives nothing and would
+            quiet the alarm without moving the rail.
+
+            Then commit it on a branch named `automation/abandon-<tag>` and push with
+            exactly this command shape, because the allowlist admits no other:
+
+              git push --set-upstream origin automation/abandon-<tag>
+
+            Then open a DRAFT pull request, again in exactly this shape:
+
+              gh pr create --draft --repo ${{ github.repository }} --base main
+                --head automation/abandon-<tag> --title "..." --body-file <file>
+
+            The record is a reviewed surface, so a human or a captain session
+            approves it. Your job ends at the draft. Do not mark it ready, do not
+            request review, and do not arm auto-merge on it. Duty one skips drafts
+            for exactly this reason, so your own next run will not re-arm it.
+
+            If a branch or a draft pull request for that tag already exists, update
+            it rather than opening a second one.
+
+            HARD RULES, in force for all three duties.
+
+            Never merge anything. Duty one arms the queue and stops. Nothing you do
+            merges a pull request, and nothing you do marks a draft ready.
+
+            Never force-push, never rewrite history, never touch a tag, and never
+            edit anything under `.github/workflows`. Never rewrite or delete an
+            existing entry in the abandonment record; you may only append.
+
+            Never invent a fact. Every number, tag, sha, and run id you write must
+            come from a command you actually ran in this session. If you could not
+            read something, say it was unreadable rather than defaulting it to zero,
+            because an unreadable value and a real zero are different findings and
+            only one of them is safe to act on.
+
+            PROVENANCE, binding on every issue body, pull request body, commit
+            message, and comment you write.
+
+            No assistant-authorship traces anywhere, ever. No session trailers, no
+            session ids, no session URLs, no co-author lines naming an assistant, and
+            no generated-with notices. A merge queue mints the squash commit message
+            verbatim from a pull request title and body, so a trace in a body is
+            authored straight into public history where no local hook can catch it.
+
+            Ticket references belong in pull request bodies, where they are useful
+            provenance. Never put a ticket id in a code comment or a branch name.
+
+            Write in the founder register: lead with the outcome, flowing prose over
+            bullet spam, short sentences and contractions welcome, claims exactly as
+            strong as the evidence allows. No em dashes anywhere. Restructure the
+            sentence instead of swapping the dash for a comma or a colon, because a
+            clause held together by the wrong punctuation reads more machine-authored
+            than the dash did, not less.
+          claude_args: |
+            --max-turns 60
+            --allowedTools "Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr merge --auto --squash:*),Bash(gh pr create --draft:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue close:*),Bash(git ls-remote:*),Bash(git checkout:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(git push --set-upstream origin automation/abandon-:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(python3 scripts/select-admissible-release-tag.py:*),Bash(jq:*),Read,Edit,Write"
+            --disallowedTools "WebFetch,WebSearch"
