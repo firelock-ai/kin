@@ -512,12 +512,12 @@ fn absence_consequence(always: bool, trustworthy: bool) -> &'static str {
 /// empty result: here the rows are real and stay ranked, and what is absent is
 /// the NAME, so the advice has to separate "these are neighbors" from "the
 /// symbol does not exist" instead of collapsing them into one verdict.
-fn unnamed_ranking_consequence(trustworthy: bool) -> &'static str {
-    if trustworthy {
-        "These hits are neighbors, not the symbol: no ranked entity carries the name the query asked for, and on a complete graph that means no entity carries it at all. Do not treat the top hit as the requested symbol."
-    } else {
-        "These hits are neighbors, not the symbol: no ranked entity carries the name the query asked for. The name's absence is NOT authoritative — it may simply not be indexed yet — so do not conclude the symbol does not exist. Re-check after embedding is complete and the daemon is healthy."
-    }
+fn unnamed_ranking_consequence() -> &'static str {
+    "These hits are neighbors, not the symbol: no ranked entity carries the name the query \
+     asked for. That is a fact about this ranking, not about the graph, because a ranking is \
+     a bounded candidate set and the name may belong to an entity it never considered. Do not \
+     treat the top hit as the requested symbol, and do not conclude the symbol does not exist: \
+     settle that with find_references or semantic_search, which resolve a name directly."
 }
 
 /// The kind the payload reports for its focal entity, whichever shape carries
@@ -739,6 +739,35 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         kind = "no_named_match";
         subject = "the query named a symbol and no ranked entity carries that name; \
                    every hit was surfaced by content or embedding similarity";
+        // A ranking is a bounded candidate set, so this verdict can never be
+        // authoritative no matter how complete the index is.
+        //
+        // Certifying it was a false statement about the graph, not a strict
+        // reading of a true one. A dogfood on the shipped artifact asked for
+        // `prune_orphaned_vectors` on a fully covered store and got ten wrong
+        // rows carrying `safe_to_conclude_absent: true`, `trust: authoritative`,
+        // and advice reading "on a complete graph that means no entity carries
+        // it at all". `find_references` resolved that exact name to a real
+        // method 1.9 seconds later in the same run. The fabricated control
+        // returned the IDENTICAL envelope, so the verdict could not separate a
+        // symbol retrieval missed from one that does not exist, and stamped both
+        // authoritative.
+        //
+        // Coverage completeness licenses nothing here. It says every entity has
+        // an embedding, not that the ranker considered every entity, and the
+        // name absent from a window says nothing about the rows outside it. The
+        // surfaces that CAN answer existence resolve a name directly, so the
+        // advice sends the caller to those instead.
+        trustworthy = false;
+        // The substrate reason is kept after the gap rather than replaced. It is
+        // still true and still useful, and on a complete index it reads
+        // "the substrate is fine, the ranking is the limit", which is exactly
+        // the distinction that was being collapsed.
+        trust_reason = format!(
+            "ranking_is_bounded: no ranked entity carries the name, and a ranking is a bounded \
+             candidate set rather than an enumeration of the graph, so the name may belong to an \
+             entity this query never ranked; observed substrate state: {trust_reason}"
+        );
     }
     if tool == "graph_neighborhood" {
         // The emitted edge array is capped by the caller's `limit`, and a
@@ -857,7 +886,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         "absent_as_indexed"
     };
     let consequence = if ranking_names_nothing {
-        unnamed_ranking_consequence(trustworthy)
+        unnamed_ranking_consequence()
     } else {
         absence_consequence(spec.always, trustworthy)
     };
@@ -2175,6 +2204,93 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("neighbors, not the symbol"));
+    }
+
+    #[test]
+    fn an_unnamed_ranking_never_certifies_that_the_symbol_is_absent() {
+        // A dogfood on the shipped artifact asked a fully covered store for
+        // `prune_orphaned_vectors`, got ten wrong rows, and the envelope stamped
+        // them `safe_to_conclude_absent: true`, `trust: authoritative`, advising
+        // that "on a complete graph that means no entity carries it at all".
+        // `find_references` resolved that exact name to a real method 1.9
+        // seconds later in the same run.
+        //
+        // A ranking is a bounded candidate set. Complete coverage says every
+        // entity has an embedding, not that the ranker considered every entity,
+        // so absence from a ranking can never license absence from the graph.
+        // Certifying it turned a silent miss into a confident false statement.
+        let mut existing = empty_fused_locate_page("prune_orphaned_vectors");
+        existing["entities"] = json!((0..10)
+            .map(|index| fused_locate_hit(&format!("neighbor_{index}")))
+            .collect::<Vec<_>>());
+        existing["total_ranked"] = json!(10);
+        existing["all_fallback"] = json!(true);
+        let negative = negative_for(
+            "semantic_locate",
+            &existing,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("an unnamed ranking is qualified");
+
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("ranking_is_bounded"),
+            "the reason must name the bound: {}",
+            negative["trust_reason"]
+        );
+        // The substrate observation is kept rather than replaced: on a complete
+        // index the honest reading is "the substrate is fine, the ranking is the
+        // limit", which is the distinction that was being collapsed.
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("semantic_authoritative"));
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("no entity carries it at all"),
+            "the advice must not assert graph-wide absence: {advice}"
+        );
+        assert!(
+            advice.contains("find_references") || advice.contains("semantic_search"),
+            "the advice must send the caller to a surface that resolves a name: {advice}"
+        );
+
+        // The control from the dogfood that makes this matter: a FABRICATED
+        // symbol produced the identical envelope, so the verdict could not
+        // separate a symbol retrieval missed from one that does not exist. Both
+        // are still inconclusive here, which is the honest answer for both,
+        // because this surface cannot tell them apart and must not pretend to.
+        let mut fabricated = empty_fused_locate_page("zzqqxx_nonexistent_symbol_9f3a");
+        fabricated["entities"] = json!((0..10)
+            .map(|index| fused_locate_hit(&format!("neighbor_{index}")))
+            .collect::<Vec<_>>());
+        fabricated["total_ranked"] = json!(10);
+        fabricated["all_fallback"] = json!(true);
+        let fabricated = negative_for(
+            "semantic_locate",
+            &fabricated,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
+        assert_eq!(fabricated["safe_to_conclude_absent"], json!(false));
+
+        // And the gate that still works: an EMPTY page on the same envelope is a
+        // real absence and stays authoritative. The bound applies to a populated
+        // ranking that missed a name, not to a query that ranked nothing, so
+        // this fix removes no verdict it was entitled to make.
+        let empty = json!({ "query": "auth", "results": [], "total_ranked": 0 });
+        let empty = negative_for(
+            "semantic_locate",
+            &empty,
+            &semantic_authoritative_envelope(),
+        )
+        .unwrap();
+        assert_eq!(empty["safe_to_conclude_absent"], json!(true));
+        assert_eq!(empty["kind"], json!("no_ranked_match"));
     }
 
     #[test]
