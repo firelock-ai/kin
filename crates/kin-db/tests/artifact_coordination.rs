@@ -30,9 +30,9 @@
 //!
 //! | Artifact | Path | Purpose |
 //! |----------|------|---------|
-//! | HNSW index | `*.usearch` | usearch HNSW graph for semantic similarity |
-//! | Key map sidecar | `*.keys.bin` | EntityId <-> u64 key mapping for usearch |
-//! | Recovery marker | `*.usearch.tmp.meta` | SHA-256 for crash recovery of vector index |
+//! | HNSW index | `*.kvec` | `kin-vector` HNSW graph for semantic similarity |
+//! | Metadata sidecar | `*.kvec.meta.json` | Embedder identity, dimensions, count, and graph root that gate the index as retrieval authority |
+//! | Recovery marker | `*.kvec.tmp.meta` | SHA-256 for crash recovery of vector index |
 
 use kin_db::*;
 use std::path::{Path, PathBuf};
