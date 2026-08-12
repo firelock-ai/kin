@@ -2328,6 +2328,10 @@ def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> No
         require(active, policy, "reachable Windows stage-leak check")
 
 
+PROOF_CAPTURE_DIRECTORY = 'captures="$RUNNER_TEMP/kin-proof-captures"'
+PROOF_CAPTURE_DIRECTORY_CREATE = 'mkdir -p "$captures"'
+
+
 def assert_install_proof_init_log_authority(first_run: str) -> None:
     """Keep the install proof's own report files out of the worktree kin init admits.
 
@@ -2335,24 +2339,25 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
     before publication, and repeats it again afterwards, refusing when the two
     differ. A report file written into that worktree therefore breaks admission
     twice over: it is an untracked non-ignored path, and an ignored one would
-    still change size between the repeats.
+    still change size between the repeats. The same worktree stays under a
+    watcher that admits new non-ignored files for the rest of the job, so the
+    constraint outlives init and every later capture is held to it by
+    `assert_install_proof_captures_stay_out_of_the_admitted_tree`.
 
     Pinning the capture lines is not enough on its own, because the property is
-    about the whole span between entering that worktree and admitting it. Three
-    mutations leave every pinned line in place and still break admission or the
-    evidence it produces: an unrelated write into the worktree before init, a
-    copy-back reordered above init, and a second init that an exact-prefix count
-    cannot see. So the span is closed-form, the capture order is asserted, and
-    an `init` this function does not recognize is refused by name.
+    about the whole span between entering that worktree and admitting it. Two
+    mutations leave every pinned line in place and still break admission: an
+    unrelated write into the worktree before init, and a second init that an
+    exact-prefix count cannot see. So the span is closed-form and an `init` this
+    function does not recognize is refused by name.
     """
 
     active = active_lines(first_run)
-    admission = 'kin init > "$init_log" 2>&1 || init_status=$?'
+    admission = 'kin init > "$captures/kin-init.txt" 2>&1 || init_status=$?'
     bootstrap = (
         "git init -q && git config user.email ci@firelock.ai && git config user.name ci"
     )
     entry = "mkdir -p kin-install-proof && cd kin-install-proof"
-    copy_back = 'cp "$init_log" kin-init.txt'
     propagate = 'if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi'
     # An `init` token anywhere in an active line, not a prefix of one:
     # `(cd sub && kin init)`, `eval kin init`, and `"$KIN" init` all admit a
@@ -2373,22 +2378,22 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
         )
     for policy in (
         entry,
-        'init_log="$RUNNER_TEMP/kin-init.txt"',
-        copy_back,
+        PROOF_CAPTURE_DIRECTORY,
+        PROOF_CAPTURE_DIRECTORY_CREATE,
         propagate,
     ):
         if policy not in active:
             raise AssertionError(
                 f"install-proof init log capture lost an active line: {policy}"
             )
-    # The log is copied back after admission and kin's own exit status is
-    # propagated after that. Reordering the copy above init leaves every pinned
-    # line present, and only `set -e` on a not-yet-created file catches it.
-    order = [active.index(step) for step in (admission, copy_back, propagate)]
+    # kin's own exit status is propagated after admission. Reordering the
+    # propagation above init leaves every pinned line present and reports the
+    # status of whatever ran before it instead.
+    order = [active.index(step) for step in (admission, propagate)]
     if order != sorted(order):
         raise AssertionError(
-            "install-proof init log capture must admit, then copy the log back, "
-            f"then propagate kin's own exit status; found line order {order}"
+            "install-proof init log capture must admit, then propagate kin's "
+            f"own exit status; found line order {order}"
         )
     # Nothing may write into the worktree between entering it and admitting it.
     # A line-presence check cannot see an inserted write, and an inserted write
@@ -2398,7 +2403,8 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
         bootstrap,
         "printf 'def hello():\\n    return 42\\n' > probe.py",
         'git add -A && git commit -qm "probe"',
-        'init_log="$RUNNER_TEMP/kin-init.txt"',
+        PROOF_CAPTURE_DIRECTORY,
+        PROOF_CAPTURE_DIRECTORY_CREATE,
         "init_status=0",
     ]
     if prelude != committed_prelude:
@@ -2406,6 +2412,123 @@ def assert_install_proof_init_log_authority(first_run: str) -> None:
             "only the committed Git bootstrap may run between entering the "
             f"worktree kin init admits and admitting it; found {prelude}"
         )
+
+
+def assert_install_proof_captures_stay_out_of_the_admitted_tree(
+    proof_steps: dict[str, str], restore: str, restore_position: tuple[int, int, int]
+) -> None:
+    """Keep every proof report out of the admitted tree until nothing measures it.
+
+    The worktree the proof admits stays under a watcher for the rest of the job,
+    so a report written into it becomes semantic corpus and the store the
+    assertions read grows while they read it. That is not a hypothesis: a leg
+    read complete coverage in health and 13 of 18 in locate one second later,
+    and it fenced a release.
+
+    A report is therefore captured under RUNNER_TEMP and restored afterwards. A
+    presence check on the restore step cannot see the mutation that matters,
+    which is one capture reverting to a relative path, so every report-shaped
+    redirect, tee, and Node write in these steps is examined instead and a
+    relative target is refused by name. The restore itself has to run after the
+    last step that reads the store, before the validator that reads the files,
+    and on failure as well, or a leg that dies early hands over no evidence at
+    all.
+    """
+
+    # A bare filename with a report extension and no directory part: exactly
+    # the shape a write into the admitted tree takes, and one no capture under
+    # `"$captures/..."` can wear, so a match is the defect rather than a
+    # candidate for it.
+    in_tree_report = re.compile(r"[\w.\-]+\.(?:json|jsonl|txt|log)")
+    writes = (
+        re.compile(r"(?:^|\s)\d?>>?\s*(\S+)"),
+        re.compile(r"\|\s*tee\s+(\S+)"),
+        re.compile(r"(?:write|append)FileSync\(\s*\"([^\"]+)\""),
+    )
+    for step_name, step_source in proof_steps.items():
+        for line in active_lines(step_source):
+            for pattern in writes:
+                for raw in pattern.findall(line):
+                    if in_tree_report.fullmatch(raw.strip('"')):
+                        raise AssertionError(
+                            f"{step_name} writes a proof report into the "
+                            f"admitted tree rather than the capture "
+                            f"directory: {line}"
+                        )
+
+    restore_active = active_lines(restore)
+    for policy in (
+        PROOF_CAPTURE_DIRECTORY,
+        'destination="$PWD/kin-install-proof"',
+        'cp "$captures/$capture" "$destination/$capture"',
+        'done < <(ls -1 "$captures")',
+    ):
+        if policy not in restore_active:
+            raise AssertionError(
+                f"install-proof capture restore lost an active line: {policy}"
+            )
+    if "if: always()" not in restore_active:
+        raise AssertionError(
+            "install-proof capture restore must run on failure too, or a leg "
+            "that dies early uploads no captured evidence"
+        )
+    last_store_read, restore_start, validation_start = restore_position
+    if not last_store_read < restore_start < validation_start:
+        raise AssertionError(
+            "install-proof captures must be restored after the last step that "
+            "reads the store and before the step that reads the files; found "
+            f"positions {restore_position}"
+        )
+
+
+def assert_install_proof_embedding_settles_before_measurement(embedding: str) -> None:
+    """Require a bounded, counter-driven settle between the embed and its captures.
+
+    An embedding pass reports on the work it took, and content that belongs in
+    the corpus is admitted asynchronously around it, so coverage read straight
+    afterwards can be a sample of a store still taking work on. Waiting is
+    therefore mandatory, but only in the form that can fail: a sleep asserts a
+    duration nobody measured, while a poll asserts the counters themselves and
+    says which one never settled when its budget runs out.
+    """
+
+    active = active_lines(embedding)
+    embed = 'kin embed --max-seconds 300 --json | tee "$captures/kin-embed.json"'
+    settle = 'PROOF_CAPTURES="$captures" node <<\'NODE\''
+    capture = (
+        'kin status --json --wait-quiesce 60 | tee "$captures/kin-embedded-status.json"'
+    )
+    for policy in (embed, settle, capture):
+        if policy not in active:
+            raise AssertionError(
+                f"install-proof embedding settle lost an active line: {policy}"
+            )
+    settle_body = "\n".join(active)
+    for policy in (
+        'coverage.state === "observed" &&',
+        "coverage.total > 0 &&",
+        "coverage.pending === 0 &&",
+        "coverage.indexed === coverage.total",
+        "drained && current === previous",
+        "process.exit(1);",
+    ):
+        if policy not in settle_body:
+            raise AssertionError(
+                "install-proof embedding settle must poll the counters to "
+                f"quiescence and fail on expiry: {policy}"
+            )
+    order = [active.index(step) for step in (embed, settle, capture)]
+    if order != sorted(order):
+        raise AssertionError(
+            "install-proof must embed, then settle, then capture the status it "
+            f"asserts on; found line order {order}"
+        )
+    for line in active:
+        if re.fullmatch(r"sleep [\d.]+", line):
+            raise AssertionError(
+                "install-proof must settle on the counters rather than on a "
+                f"duration nobody measured: {line}"
+            )
 
 
 def assert_install_proof_windows_experimental_posture(install_proof: str) -> None:
@@ -2639,7 +2762,7 @@ def assert_install_proof_status_contract(
 
     require(
         first_run_active,
-        "kin bench-meta --json > kin-build-meta.json",
+        'kin bench-meta --json > "$captures/kin-build-meta.json"',
         "installed CLI provenance capture",
     )
     require(
@@ -2651,7 +2774,7 @@ def assert_install_proof_status_contract(
         "for agent in claude cursor codex gemini windsurf agy; do",
         'antigravity_legacy="$HOME/.gemini/antigravity-ide/mcp_config.json"',
         'command: "/stale/kin"',
-        'CODEX_CONFIG="$HOME/.codex/config.toml" python3',
+        'CODEX_CONFIG="$HOME/.codex/config.toml" PROOF_CAPTURES="$captures" python3',
         'tomllib.load(handle)["mcp_servers"]["kin"]',
         'claude_fallback_home="$RUNNER_TEMP/kin-proof-claude-fallback-home"',
         'printf \'{}\\n\' > "$claude_fallback_home/.claude/config.json"',
@@ -2664,13 +2787,13 @@ def assert_install_proof_status_contract(
     graph_active_lines = active_lines(graph_query)
     graph_active = "\n".join(graph_active_lines)
     for policy in (
-        "kin search hello --json | tee kin-search.json",
+        'kin search hello --json | tee "$captures/kin-search.json"',
         "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\"",
         'DAEMON_PORT="$daemon_port" node',
         "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
         "kin-daemon-health.json",
-        "kin setup status --json | tee kin-health.json",
-        "kin doctor --json | tee kin-doctor.json",
+        'kin setup status --json | tee "$captures/kin-health.json"',
+        'kin doctor --json | tee "$captures/kin-doctor.json"',
         'path.join(process.cwd(), ".agents", "mcp_config.json")',
         "spawn(entry.command, entry.args",
         'const stripVerbatim = (p) => (typeof p === "string" && p.startsWith("\\\\\\\\?\\\\") ? p.slice(4) : p);',
@@ -2679,10 +2802,10 @@ def assert_install_proof_status_contract(
     ):
         require(graph_active, policy, "installed daemon startup and health capture")
 
-    daemon_start = "kin search hello --json | tee kin-search.json"
+    daemon_start = 'kin search hello --json | tee "$captures/kin-search.json"'
     endpoint_capture = "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
-    setup_health = "kin setup status --json | tee kin-health.json"
-    doctor_health = "kin doctor --json | tee kin-doctor.json"
+    setup_health = 'kin setup status --json | tee "$captures/kin-health.json"'
+    doctor_health = 'kin doctor --json | tee "$captures/kin-doctor.json"'
     daemon_start_index = graph_active_lines.index(daemon_start)
     if any(
         daemon_start_index >= graph_active_lines.index(capture)
@@ -2742,7 +2865,7 @@ def assert_install_proof_status_contract(
 
     require(
         embedding_active,
-        "kin status --json | tee kin-embedded-status.json",
+        'kin status --json | tee "$captures/kin-embedded-status.json"',
         "post-embedding repository status capture",
     )
 
@@ -7238,9 +7361,13 @@ def main() -> None:
         "      - name: Unix embedding and semantic retrieval proof",
         graph_query_start,
     )
+    restore_start = install_proof.index(
+        "      - name: Restore captured proof reports into the proof repository",
+        embedding_start,
+    )
     validation_start = install_proof.index(
         "      - name: Validate installed capability proof",
-        embedding_start,
+        restore_start,
     )
     preserve_start = install_proof.index(
         "      - name: Preserve proof reports",
@@ -7248,7 +7375,8 @@ def main() -> None:
     )
     first_run = install_proof[first_run_start:graph_query_start]
     graph_query = install_proof[graph_query_start:embedding_start]
-    embedding = install_proof[embedding_start:validation_start]
+    embedding = install_proof[embedding_start:restore_start]
+    restore = install_proof[restore_start:validation_start]
     validation = install_proof[validation_start:preserve_start]
     for policy in (
         'case "$PROOF_SHELL" in',
@@ -7263,7 +7391,7 @@ def main() -> None:
         "outside the worktree it admits",
         lambda: assert_install_proof_init_log_authority(
             first_run.replace(
-                'kin init > "$init_log" 2>&1 || init_status=$?',
+                'kin init > "$captures/kin-init.txt" 2>&1 || init_status=$?',
                 "kin init 2>&1 | tee kin-init.txt",
                 1,
             )
@@ -7278,8 +7406,8 @@ def main() -> None:
     )
     for label, active_line in (
         (
-            "the captured init log never reaches the proof reports",
-            'cp "$init_log" kin-init.txt',
+            "the capture directory stops being rooted outside the worktree",
+            'captures="$RUNNER_TEMP/kin-proof-captures"',
         ),
         (
             "a refused init stops failing the install proof",
@@ -7310,24 +7438,159 @@ def main() -> None:
         "only the committed Git bootstrap may run",
         lambda: assert_install_proof_init_log_authority(
             first_run.replace(
-                '          init_log="$RUNNER_TEMP/kin-init.txt"\n',
+                '          captures="$RUNNER_TEMP/kin-proof-captures"\n',
                 "          echo scratch > proof-note.txt\n"
-                '          init_log="$RUNNER_TEMP/kin-init.txt"\n',
+                '          captures="$RUNNER_TEMP/kin-proof-captures"\n',
                 1,
             )
         ),
     )
     expect_assertion(
-        "the init log is copied back before the worktree is admitted",
-        "must admit, then copy the log back",
+        "kin's own init status is propagated before init has run",
+        "must admit, then propagate",
         lambda: assert_install_proof_init_log_authority(
             first_run.replace(
-                '          kin init > "$init_log" 2>&1 || init_status=$?\n'
-                '          cat "$init_log"\n'
-                '          cp "$init_log" kin-init.txt\n',
-                '          cp "$init_log" kin-init.txt\n'
-                '          kin init > "$init_log" 2>&1 || init_status=$?\n'
-                '          cat "$init_log"\n',
+                '          kin init > "$captures/kin-init.txt" 2>&1 || init_status=$?\n'
+                '          cat "$captures/kin-init.txt"\n'
+                '          if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi\n',
+                '          if [ "$init_status" -ne 0 ]; then exit "$init_status"; fi\n'
+                '          kin init > "$captures/kin-init.txt" 2>&1 || init_status=$?\n'
+                '          cat "$captures/kin-init.txt"\n',
+                1,
+            )
+        ),
+    )
+
+    # The capture contract the init log was the first case of, now covering
+    # every report the proof writes while the watcher is admitting.
+    proof_steps = {
+        "the first-run proof": first_run,
+        "the graph query, MCP, and VFS proof": graph_query,
+        "the embedding proof": embedding,
+    }
+    restore_position = (embedding_start, restore_start, validation_start)
+    assert_install_proof_captures_stay_out_of_the_admitted_tree(
+        proof_steps, restore, restore_position
+    )
+    for label, step_name, original, mutation in (
+        (
+            "a first-run capture reverts to a relative redirect",
+            "the first-run proof",
+            'kin status --json > "$captures/kin-status.json" 2>&1',
+            "kin status --json > kin-status.json 2>&1",
+        ),
+        (
+            "a graph-query capture reverts to a relative tee",
+            "the graph query, MCP, and VFS proof",
+            'kin doctor --json | tee "$captures/kin-doctor.json"',
+            "kin doctor --json | tee kin-doctor.json",
+        ),
+        (
+            "a VFS capture reverts to a relative stderr redirect",
+            "the graph query, MCP, and VFS proof",
+            '2> "$captures/vfs-graph-read.stderr.txt"',
+            "2> vfs-graph-read.stderr.txt",
+        ),
+        (
+            "an embedding capture reverts to a relative tee",
+            "the embedding proof",
+            'kin locate hello --json --explain --max-files 5 | tee "$captures/kin-semantic-locate.json"',
+            "kin locate hello --json --explain --max-files 5 | tee kin-semantic-locate.json",
+        ),
+        (
+            "an MCP Node capture reverts to a relative write",
+            "the graph query, MCP, and VFS proof",
+            'fs.writeFileSync(path.join(captures, "kin-mcp-out.jsonl"), stdout);',
+            'fs.writeFileSync("kin-mcp-out.jsonl", stdout);',
+        ),
+    ):
+        expect_assertion(
+            label,
+            "writes a proof report into the admitted tree",
+            lambda mutated_steps={
+                **proof_steps,
+                step_name: proof_steps[step_name].replace(original, mutation, 1),
+            }: assert_install_proof_captures_stay_out_of_the_admitted_tree(
+                mutated_steps, restore, restore_position
+            ),
+        )
+    for label, active_line in (
+        (
+            "the captures never reach the proof reports",
+            'cp "$captures/$capture" "$destination/$capture"',
+        ),
+        (
+            "the restore stops listing the capture directory",
+            'done < <(ls -1 "$captures")',
+        ),
+    ):
+        expect_assertion(
+            label,
+            "install-proof capture restore",
+            lambda mutated=restore.replace(
+                active_line, f"# {active_line}", 1
+            ): assert_install_proof_captures_stay_out_of_the_admitted_tree(
+                proof_steps, mutated, restore_position
+            ),
+        )
+    expect_assertion(
+        "a failed leg stops handing over what it captured",
+        "must run on failure too",
+        lambda: assert_install_proof_captures_stay_out_of_the_admitted_tree(
+            proof_steps, restore.replace("if: always()", "if: success()", 1), restore_position
+        ),
+    )
+    expect_assertion(
+        "the captures are restored before the assertions that read the store",
+        "after the last step that reads the store",
+        lambda: assert_install_proof_captures_stay_out_of_the_admitted_tree(
+            proof_steps, restore, (embedding_start, embedding_start - 1, validation_start)
+        ),
+    )
+
+    assert_install_proof_embedding_settles_before_measurement(embedding)
+    for label, expected, original, mutation in (
+        (
+            "the settle stops requiring a drained embedding pass",
+            "poll the counters to quiescence",
+            "coverage.pending === 0 &&",
+            "coverage.pending >= 0 &&",
+        ),
+        (
+            "the settle stops requiring two agreeing reads",
+            "poll the counters to quiescence",
+            "drained && current === previous",
+            "drained",
+        ),
+        (
+            "an expired settle stops failing the leg",
+            "poll the counters to quiescence",
+            "process.exit(1);",
+            "process.exitCode = 0;",
+        ),
+        (
+            "the store is measured before it has settled",
+            "embed, then settle, then capture",
+            'PROOF_CAPTURES="$captures" node <<\'NODE\'',
+            "kin status --json --wait-quiesce 60 | tee \"$captures/kin-embedded-status.json\"\n"
+            "          PROOF_CAPTURES=\"$captures\" node <<'NODE'",
+        ),
+    ):
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=embedding.replace(
+                original, mutation, 1
+            ): assert_install_proof_embedding_settles_before_measurement(mutated),
+        )
+    expect_assertion(
+        "the settle becomes a duration nobody measured",
+        "rather than on a duration nobody measured",
+        lambda: assert_install_proof_embedding_settles_before_measurement(
+            embedding.replace(
+                '          PROOF_CAPTURES="$captures" node',
+                "          sleep 30\n"
+                '          PROOF_CAPTURES="$captures" node',
                 1,
             )
         ),
@@ -7924,8 +8187,8 @@ def main() -> None:
         "installed CLI provenance capture",
         lambda: assert_install_proof_status_contract(
             first_run.replace(
-                "kin bench-meta --json > kin-build-meta.json",
-                "kin --version > kin-build-meta.json",
+                'kin bench-meta --json > "$captures/kin-build-meta.json"',
+                'kin --version > "$captures/kin-build-meta.json"',
                 1,
             ),
             graph_query,
@@ -7939,12 +8202,12 @@ def main() -> None:
         lambda: assert_install_proof_status_contract(
             first_run,
             graph_query.replace(
-                "kin search hello --json | tee kin-search.json",
+                'kin search hello --json | tee "$captures/kin-search.json"',
                 "# graph query moved below daemon provenance capture",
                 1,
             ).replace(
-                "cat kin-daemon-health.json",
-                "cat kin-daemon-health.json\n          kin search hello --json | tee kin-search.json",
+                'cat "$captures/kin-daemon-health.json"',
+                'cat "$captures/kin-daemon-health.json"\n          kin search hello --json | tee "$captures/kin-search.json"',
                 1,
             ),
             embedding,
@@ -7957,8 +8220,8 @@ def main() -> None:
         lambda: assert_install_proof_status_contract(
             first_run,
             graph_query.replace(
-                "kin search hello --json | tee kin-search.json",
-                "# kin search hello --json | tee kin-search.json",
+                'kin search hello --json | tee "$captures/kin-search.json"',
+                '# kin search hello --json | tee "$captures/kin-search.json"',
                 1,
             ),
             embedding,
@@ -7971,20 +8234,20 @@ def main() -> None:
         lambda: assert_install_proof_status_contract(
             first_run,
             graph_query.replace(
-                "kin setup status --json | tee kin-health.json",
+                'kin setup status --json | tee "$captures/kin-health.json"',
                 "# setup health moved above daemon startup",
                 1,
             )
             .replace(
-                "kin doctor --json | tee kin-doctor.json",
+                'kin doctor --json | tee "$captures/kin-doctor.json"',
                 "# doctor health moved above daemon startup",
                 1,
             )
             .replace(
-                "kin search hello --json | tee kin-search.json",
-                "kin setup status --json | tee kin-health.json\n"
-                "          kin doctor --json | tee kin-doctor.json\n"
-                "          kin search hello --json | tee kin-search.json",
+                'kin search hello --json | tee "$captures/kin-search.json"',
+                'kin setup status --json | tee "$captures/kin-health.json"\n'
+                '          kin doctor --json | tee "$captures/kin-doctor.json"\n'
+                '          kin search hello --json | tee "$captures/kin-search.json"',
                 1,
             ),
             embedding,
@@ -8148,7 +8411,7 @@ def main() -> None:
         "fstat(STDOUT_FILENO, &stdout_stat)",
         "chmod 000 probe.py",
         "KIN_VFS_STRICT=1 kin-vfs exec --workspace .",
-        "cmp -s vfs-expected.txt vfs-graph-read.txt",
+        'cmp -s "$captures/vfs-expected.txt" "$captures/vfs-graph-read.txt"',
         "installed VFS did not return the exact graph-owned probe.py bytes",
         "release-provenance-attestation.json",
         "installed-vfs-provenance.json",
