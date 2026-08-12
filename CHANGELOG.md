@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clear RUSTSEC-2026-0253 and make the advisory gate able to fail (#788)
 - Stop an unnamed ranking from certifying that the symbol is absent (#791)
 - Emit match_kind and all_fallback from the compat-v0 locate arm (#786)
+- Stop reading an empty embed queue as finished coverage, and time the commit finalize (#790)
 
 
 ## [0.5.20] - 2026-08-12
