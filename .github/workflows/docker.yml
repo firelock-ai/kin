@@ -50,7 +50,7 @@ jobs:
               mirrors = ["mirror.gcr.io"]
 
       # Build-only gate: this job NEVER pushes an image. It proves the
-      # multi-stage Dockerfile still builds end to end — kin-* dependencies
+      # multi-stage Dockerfile still builds end to end, with kin-* dependencies
       # resolved from the Kin sparse registry, then a release build of the
       # `kin` and `kin-daemon` binaries into a slim runtime image. Layer cache
       # is persisted across runs via the GitHub Actions cache backend so the
@@ -84,10 +84,11 @@ jobs:
         run: bash scripts/verify-container-build-info.sh kin:ci "$EXPECTED_SHA"
 
       # Container-level smoke on the freshly built image. Proves the entrypoint
-      # boots the daemon in local mode with NO /workspace volume — the case that
-      # previously crash-looped on a bare `mkdir /workspace` — that GCS mode
-      # prepares the same workspace path, and that an unwritable workspace fails
-      # loudly instead of dying on mkdir. Creds-free and bounded well under 2 min.
+      # boots the daemon in local mode with NO /workspace volume, the case that
+      # previously crash-looped on a bare `mkdir /workspace`. It also proves that
+      # GCS mode prepares the same workspace path, and that an unwritable
+      # workspace fails loudly instead of dying on mkdir. Creds-free and bounded
+      # well under 2 min.
       - name: Entrypoint smoke (local boot + SIGTERM, gcs prep, unwritable fail)
         run: |
           set -uo pipefail
@@ -105,12 +106,12 @@ jobs:
             test "$(stat -c %u "$HOME")" = "$(id -u)"
           '
 
-          echo "::group::Local mode — no /workspace mount, default workspace"
+          echo "::group::Local mode (no /workspace mount, default workspace)"
           docker rm -f kin-local >/dev/null 2>&1 || true
           docker run -d --name kin-local "$IMAGE" >/dev/null
           # The daemon binds and logs "daemon API server listening" before the
           # slower graph/model startup, so it is the deterministic offline signal
-          # that it reached serving state — independent of reconcile/embed timing.
+          # that it reached serving state, independent of reconcile/embed timing.
           listening=0
           for _ in $(seq 1 40); do
             if docker logs kin-local 2>&1 | grep -q "daemon API server listening"; then listening=1; break; fi
@@ -119,7 +120,7 @@ jobs:
           done
           if [ "$listening" -ne 1 ]; then echo "::error::kin-daemon never reached its listening line in local mode"; dump kin-local; exit 1; fi
           # The entrypoint's prep line rides a different stream buffer than the
-          # daemon's tracing, so it can flush after the listening line — poll it
+          # daemon's tracing, so it can flush after the listening line. Poll it
           # with the same deadline instead of asserting on a single read.
           prep=0
           for _ in $(seq 1 15); do
@@ -128,7 +129,7 @@ jobs:
           done
           if [ "$prep" -ne 1 ]; then echo "::error::entrypoint did not report local storage prep"; dump kin-local; exit 1; fi
           # Best-effort readiness probe (an empty repo may still be initializing);
-          # logged for signal only — the listening line is the hard gate.
+          # logged for signal only. The listening line is the hard gate.
           if docker exec kin-local sh -c 'curl -fsS http://127.0.0.1:4219/readiness' >/dev/null 2>&1; then
             echo "readiness: 200 (ready)"
           else
@@ -142,10 +143,11 @@ jobs:
           docker rm -f kin-local >/dev/null 2>&1 || true
           echo "::endgroup::"
 
-          echo "::group::GCS mode — same workspace prep path (creds-free)"
+          echo "::group::GCS mode (same workspace prep path, creds-free)"
           # No bucket/creds in CI, so the daemon exits right after workspace prep;
           # assert the unified prep ran on the same /tmp/kin-workspace and reached
-          # daemon exec without the unwritable fatal — i.e. prep is mode-agnostic.
+          # daemon exec without the unwritable fatal, which is to say that prep
+          # is mode-agnostic.
           docker rm -f kin-gcs >/dev/null 2>&1 || true
           docker run -d --name kin-gcs -e KIN_STORAGE=gcs "$IMAGE" >/dev/null
           gcs_prep=0
@@ -162,7 +164,7 @@ jobs:
           echo "gcs mode: workspace prepared and reached daemon exec"
           echo "::endgroup::"
 
-          echo "::group::Unwritable workspace — loud fatal, no bare mkdir death"
+          echo "::group::Unwritable workspace (loud fatal, no bare mkdir death)"
           # KIN_WORKSPACE_DIR=/workspace is an unwritable image-root path with no
           # mount: the entrypoint must print an actionable fatal and exit 1.
           # Expected-failure capture: suspend errexit so the nonzero exit lands

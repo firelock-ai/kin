@@ -8,8 +8,8 @@ name: Release Tag (bot-mediated)
 # the release captain holding the founder credential that the ruleset admits,
 # this workflow mints a short-lived installation token for the "kin-release-bot"
 # GitHub App (allowlisted in that ruleset) and creates the tag ref only after a
-# strict, fail-closed set of checks pass. Creating the ref with an App token —
-# never the default GITHUB_TOKEN — is what lets the existing tag-triggered
+# strict, fail-closed set of checks pass. Creating the ref with an App token,
+# never the default GITHUB_TOKEN, is what lets the existing tag-triggered
 # `release.yml` DAG fire.
 #
 # Automatic reconciliation uses only trusted default-branch workflow code. It
@@ -51,7 +51,7 @@ jobs:
     # whatever that run concluded in aggregate. The aggregate conclusion is not
     # a release verdict and is deliberately not consulted here: a ci.yml run
     # carries jobs beyond the release-critical ones, so a single non-required
-    # red — an advisory Windows or coverage leg — turns the whole run red and
+    # red (an advisory Windows or coverage leg) turns the whole run red and
     # would silence this trigger on most main pushes, leaving the schedule as
     # the only automatic path. "Verify required checks are green" below is the
     # authority. It binds each reviewed required context to its exact workflow
@@ -754,7 +754,7 @@ jobs:
           steps.resolve.outputs.needed == 'true' &&
           steps.prior.outputs.ready == 'true'
         # Fail closed on the commit's check-runs. REQUIRED_CHECKS is the
-        # presence-required release-critical set — a sha missing any of these is
+        # presence-required release-critical set, so a sha missing any of these is
         # refused even if nothing failed. Every required check must conclude
         # success except DCO, which is allowed to report skipped because that
         # pull-request-only job is inapplicable on a merged main HEAD. This
@@ -1214,7 +1214,7 @@ jobs:
                   )
 
           if errors:
-              print("::error::refusing — check verification failed:")
+              print("::error::refusing because check verification failed:")
               for error in errors:
                   print(f"  - {error}")
               sys.exit(1)
@@ -1309,7 +1309,7 @@ jobs:
         run: |
           set -euo pipefail
           if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
-            echo "::error::tag $TAG already exists — refusing"
+            echo "::error::tag $TAG already exists, refusing to overwrite it"
             exit 1
           fi
           echo "tag $TAG does not exist yet"

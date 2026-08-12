@@ -937,7 +937,7 @@ jobs:
         run: |
           test -f .cargo/config.toml
           grep -q '^\[registries\.kin\]' .cargo/config.toml
-          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
       # Same trusted-ref scoping as the Windows authority job: restore always,
       # save only from main. This is the pull-request critical path, so a warm
@@ -953,8 +953,8 @@ jobs:
       # Two guards, two jobs. The Python checker walks every crate and carries
       # the owned, dated, existence-validated allowlist. The shell guard is a
       # dependency-free check on the ten core answer modules and is the one the
-      # kin-cli unit test drives. Both run, and the third step falsifies them —
-      # a guard that has never been shown to fail proves nothing.
+      # kin-cli unit test drives. Both run, and the third step falsifies them,
+      # because a guard that has never been shown to fail proves nothing.
       - name: Check Zero File-Search Invariant
         run: python3 scripts/verify-zero-file-search.py
 
@@ -983,10 +983,10 @@ jobs:
             local out rc=0
             out="$("$@" 2>&1)" || rc=$?
             if [[ $rc -eq 0 ]]; then
-              echo "::error::falsification failed — $label did not fail"; echo "$out"; exit 1
+              echo "::error::falsification failed. $label passed when it should have failed"; echo "$out"; exit 1
             fi
             if ! grep -qF "$want" <<<"$out"; then
-              echo "::error::falsification failed — $label failed but never named '$want'"
+              echo "::error::falsification failed. $label failed but never named '$want'"
               echo "$out"; exit 1
             fi
             echo "  ok: $label"
@@ -1070,7 +1070,7 @@ jobs:
       # a merge change's entity/relation deltas are discarded and recomputed by
       # the replay algorithm. Editing that algorithm changes what Kin reports
       # about the past, and HYDRATION_SEMANTICS_VERSION is the declared dial for
-      # it — but nothing coupled the two, so the dial sat unchanged across the
+      # it. Nothing coupled the two, so the dial sat unchanged across the
       # releases that rewrote replay. This pins the replay surface by digest, so
       # an edit cannot ship without an explicit, reviewed manifest update.
       - name: Check Hydration Replay Semantics
@@ -1094,7 +1094,7 @@ jobs:
       # 45 distinct clippy lints (the 1.96 bump from 1.94 added collapsible_match,
       # manual_checked_ops, useless_conversion). The `--` keeps these allows AFTER the
       # RUSTFLAGS=-Dwarnings group so each specific lint overrides it. (The ArtifactId
-      # deprecation is now enforced — its `-A deprecated` rustc allow was removed once the
+      # deprecation is now enforced. Its `-A deprecated` rustc allow was removed once the
       # graph-assigned ArtifactId migration landed.)
       - name: Clippy
         run: >
@@ -1304,13 +1304,13 @@ jobs:
         run: |
           test -f .cargo/config.toml
           grep -q '^\[registries\.kin\]' .cargo/config.toml
-          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
       - name: Cache cargo registry
         # Registry only, deliberately: tarpaulin's instrumented builds use their
         # own flags, so a cached target never fingerprint-matches. Measured on
         # main: a 4.62 GB target cache HIT left coverage at 24.2 min vs 23.5
-        # cold — zero benefit, while its size (47% of the repo's 10 GB budget)
+        # cold. That is zero benefit, and its size (47% of the repo's 10 GB budget)
         # evicted the Windows release-build cache that does pay for itself.
         uses: actions/cache@v6
         with:
