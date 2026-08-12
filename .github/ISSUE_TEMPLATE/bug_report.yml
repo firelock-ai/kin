@@ -14,8 +14,8 @@ body:
     id: version
     attributes:
       label: Kin Version
-      description: Output of `kin --version`
-      placeholder: "kin 0.1.0"
+      description: The whole first line of `kin --version`, build identity included
+      placeholder: "kin 0.5.20 (<sha> <ref> <timestamp>)"
     validations:
       required: true
 
@@ -59,23 +59,26 @@ body:
     attributes:
       label: Affected Crate (if known)
       options:
+        - kin-buildinfo
         - kin-cli
-        - kin-daemon
-        - kin-core
-        - kin-blobs
-        - kin-index
-        - kin-parser
-        - kin-semantic-contracts
-        - kin-projection
-        - kin-reconcile
-        - kin-git
         - kin-context
-        - kin-review
-        - kin-bench
-        - kin-migrate
+        - kin-core
+        - kin-daemon
+        - kin-daemon-spawn
+        - kin-git
+        - kin-index
         - kin-mcp
-        - kin-runtime
-        - kin-search
+        - kin-migrate
+        - kin-notifier-macos
+        - kin-notify
+        - kin-parser
+        - kin-projection
+        - kin-ranking
+        - kin-reconcile
+        - kin-registry
         - kin-remote
-        - kin-integration-tests
+        - kin-review
+        - kin-runtime
+        - kin-semantic-contracts
+        - kin-spine
         - Unknown

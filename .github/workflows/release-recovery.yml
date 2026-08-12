@@ -265,8 +265,8 @@ jobs:
       # deterministic failure and never prevent one.
       #
       # This step never fails the job. An unreadable attempt must leave the
-      # controller exactly as it was — retrying, because a transient API error
-      # is not evidence that the release failure is deterministic — so every
+      # controller exactly as it was, still retrying, because a transient API
+      # error is not evidence that the release failure is deterministic. So every
       # read is guarded and every unhappy path degrades to "unrecorded", which
       # the repeat test refuses to count.
       - name: Classify the failure signature across attempts

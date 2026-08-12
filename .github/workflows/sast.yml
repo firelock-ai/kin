@@ -82,7 +82,7 @@ jobs:
         run: |
           test -f .cargo/config.toml
           grep -q '^\[registries\.kin\]' .cargo/config.toml
-          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
       # Install the release binary directly instead of running
       # EmbarkStudios/cargo-deny-action, which is a Docker action whose image is

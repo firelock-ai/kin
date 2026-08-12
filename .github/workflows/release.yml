@@ -386,7 +386,7 @@ jobs:
       # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
       # zip, and the separate notarize_linux job submits it to Apple Notary via
       # rcodesign. When false (default), the macOS leg notarizes inline with
-      # xcrun notarytool — the proven fallback path.
+      # xcrun notarytool, the proven fallback path.
       NOTARIZE_ON_LINUX: ${{ needs.config.outputs.notarize_on_linux }}
     strategy:
       fail-fast: false
@@ -931,7 +931,7 @@ jobs:
           # Assert the produced zip actually contains kin-daemon.exe.
           $entries = [System.IO.Compression.ZipFile]::OpenRead("$PWD/$env:ARTIFACT.zip").Entries.Name
           if ($entries -notcontains "kin-daemon.exe") {
-            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip — refusing to publish a daemon-less archive"
+            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip, refusing to publish a daemon-less archive"
             exit 1
           }
           # The POSIX installer builds one archive name for every platform it
@@ -1159,7 +1159,7 @@ jobs:
   # zips. rcodesign calls the same Apple Notary API as notarytool and accepts the
   # same zip of standalone Mach-O binaries, so the resulting ticket (server-side,
   # keyed by code-signature hash) covers the identical binaries already packaged
-  # into the published .tar.gz — the published artifacts are unchanged. This job
+  # into the published .tar.gz, so the published artifacts are unchanged. This job
   # is a gate: if notarization fails, the release fails.
   notarize_linux:
     name: Notarize macOS binaries (Linux / rcodesign)
@@ -1230,7 +1230,7 @@ jobs:
           shopt -s nullglob
           zips=(*-notarize.zip)
           if [ ${#zips[@]} -eq 0 ]; then
-            echo "::error::no signed notarization zips were downloaded — nothing to notarize"
+            echo "::error::no signed notarization zips were downloaded, so there is nothing to notarize"
             exit 1
           fi
           for zip in "${zips[@]}"; do
@@ -2514,7 +2514,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     # Least privilege: read the repo (to peel the tag to its commit) and push
-    # tags to ghcr — not the workflow-level `contents: write`.
+    # tags to ghcr, not the workflow-level `contents: write`.
     permissions:
       contents: read
       packages: write

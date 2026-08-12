@@ -3,8 +3,8 @@
 #
 # Public install proof: verifies the complete repository workflow on Unix and
 # the explicit repository-free refusal contract on native Windows. Anonymous
-# only — no checkout, no secrets, no registry auth — exactly what a first-time
-# user downloads. Exercises the real `get.kinlab.dev` installer and public
+# only, with no checkout, no secrets, and no registry auth, exactly what a
+# first-time user downloads. Exercises the real `get.kinlab.dev` installer and public
 # GitHub-release artifacts with checksum and provenance verification.
 name: Install Proof
 
@@ -28,7 +28,7 @@ on:
   release:
     types: [published]
   schedule:
-    # Weekly — catch a broken release / installer / endpoint before users do.
+    # Weekly, to catch a broken release / installer / endpoint before users do.
     - cron: "0 12 * * 1"
 
 permissions:
@@ -74,7 +74,7 @@ jobs:
             export KIN_VERSION="${RELEASE_EVENT_TAG#v}"
           fi
           # CI/non-interactive install. NOTE the env var binds to `sh`, not
-          # `curl` — `KIN_NO_SETUP=1 curl … | sh` would set it only for curl and
+          # `curl`. `KIN_NO_SETUP=1 curl … | sh` would set it only for curl and
           # the piped script would never see it (it would then try the
           # interactive setup against a non-controlling /dev/tty).
           curl -fsSL https://get.kinlab.dev/install | KIN_NO_SETUP=1 sh
@@ -729,7 +729,7 @@ jobs:
             *) echo "unsupported install-proof setup shell: $PROOF_SHELL" >&2; exit 1 ;;
           esac
 
-          # A fresh repo so the daemon has something to initialize against —
+          # A fresh repo so the daemon has something to initialize against. This
           # proves the installed daemon actually starts and serves on this OS.
           mkdir -p kin-install-proof && cd kin-install-proof
           git init -q && git config user.email ci@firelock.ai && git config user.name ci
