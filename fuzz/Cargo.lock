@@ -645,9 +645,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.7"
+version = "0.7.8"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "9e39741a0edad255687301dc087a915f787a31c0a9eee028150081c884e940ea"
+checksum = "75c237b19289638e728e70048011c5d5731d9ef45878f078e7663f2b0e9475e1"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -702,12 +702,13 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.9"
+version = "0.1.11"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "fd4c2a7ebb07f6ca4ae49fe57eaafa91adbca5e38e76d133b25008c87679f7e8"
+checksum = "c1904ba13d244810b195168b04ada8884094f8d5374c54f36e9b9375ac6e625a"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
+ "memmap2",
  "parking_lot",
  "rayon",
  "rmp-serde",
@@ -756,6 +757,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "num-traits"
