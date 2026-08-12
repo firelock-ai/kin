@@ -808,6 +808,15 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
             "focal_not_resolved",
             "the focal that was asked about could not be resolved, so no data-flow chain was walked",
         )),
+        // An unknown id and an entity with no recorded history are the same
+        // shape on this tool's success path — change_count 0, latest_change
+        // null, empty approvals and events — so the miss has to be reported as a
+        // miss or an agent reads a resolution failure as "no provenance
+        // recorded" and treats unaccountable code as accounted for.
+        "kin_provenance_query" => Some((
+            "entity_not_resolved",
+            "the entity that was asked about could not be resolved, so no provenance was looked up",
+        )),
         _ => None,
     }
 }

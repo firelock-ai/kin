@@ -64,7 +64,9 @@ recent writes rather than its complete write history, and an entity whose last w
 older than the scan window comes back with an empty list. Treat a populated list as \
 authoritative about who wrote this entity, and an empty one as no recent record rather \
 than as proof nothing ever wrote it; change_count and latest_change are the \
-complete-history fields.";
+complete-history fields. An entity_id that names no entity fails loudly and carries the \
+standard negative object rather than returning an empty history, so \"nothing is recorded \
+about this code\" and \"that id resolves to nothing\" are never the same answer.";
 
 /// The change origin, with the Git object id rendered the way Git prints it.
 ///
@@ -180,6 +182,35 @@ pub fn handle_provenance_query<G: GraphStore>(
         .get_entity_history(&entity_id)
         .map_err(McpError::graph)?;
 
+    // An id that resolves to nothing and has nothing recorded against it is a
+    // resolution miss, not an empty provenance record.
+    //
+    // Both cases used to answer identically — change_count 0, latest_change
+    // null, empty approvals and audit events, no error — so an agent that
+    // fat-fingered an id, or passed an artifact_id, read "nothing is recorded
+    // about this code" and moved on. `get_entity_source` fails loudly on the
+    // same id; this tool succeeded.
+    //
+    // Both halves of the condition are load-bearing. A retired entity is absent
+    // from the graph while its history survives, and its provenance is exactly
+    // what a caller is entitled to ask for, so a live-entity check alone would
+    // refuse the question this tool exists to answer. An entity that resolves
+    // with no changes yet recorded is a real, reportable emptiness. Only the
+    // conjunction means nothing was looked up.
+    if history.is_empty()
+        && store
+            .get_entity(&entity_id)
+            .map_err(McpError::graph)?
+            .is_none()
+    {
+        return Ok(ToolCallResult::error(format!(
+            "no entity exists with ID '{id_str}' and no change history is recorded against it, \
+             so no provenance was looked up. This entity ID is invalid or stale; retrying the \
+             same ID will not succeed. Resolve the symbol first with semantic_search or \
+             find_references and query provenance for the id it returns."
+        )));
+    }
+
     // Newest first, decided here rather than taken from the store.
     //
     // `get_entity_history` returns the entity's changes oldest first, so reading
@@ -275,7 +306,7 @@ mod tests {
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         Visibility,
     };
-    use kin_model::graph::{ChangeStore, ProvenanceStore};
+    use kin_model::graph::{ChangeStore, EntityStore as _, ProvenanceStore};
     use kin_model::ids::{AuthorId, EntityId, GitObjectId, Hash256, LanguageId, SemanticChangeId};
     use kin_model::provenance::{
         ActorId, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
@@ -736,15 +767,76 @@ mod tests {
 
     #[test]
     fn an_entity_with_no_history_reports_nothing_rather_than_failing() {
+        // The entity has to actually be in the graph for this to be the case it
+        // names. It previously used a bare id against an empty store, which is
+        // the resolution miss below rather than an emptiness, and asserting
+        // success on it is what locked the two cases together.
         let store = kin_db::InMemoryGraph::new();
-        let entity = EntityId::new();
+        let entity = entity_named("freshly_admitted", "fn freshly_admitted()");
+        store.upsert_entity(&entity).unwrap();
 
-        let response = query(&store, &entity, &[]);
+        let response = query(&store, &entity.id, &[]);
 
         assert_eq!(response["change_count"], 0);
         assert!(response["latest_change"].is_null());
         assert_eq!(response["changes"].as_array().unwrap().len(), 0);
         assert_eq!(response["truncated"], false);
         assert_eq!(response["next_offset"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn an_unresolvable_id_is_a_reported_miss_rather_than_an_empty_record() {
+        // FIR-2218. An id resolving to no entity with nothing recorded against
+        // it returned a clean success, so a resolution failure and "no
+        // provenance recorded" were the same answer on this surface while
+        // get_entity_source failed loudly on the same id.
+        let store = kin_db::InMemoryGraph::new();
+        let fabricated = EntityId::new();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(fabricated.to_string()),
+        )]);
+        let result = handle_provenance_query(&args, &store).unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let message = rendered(&result);
+        assert!(message.contains("no entity exists with ID"), "{message}");
+        assert!(
+            message.contains("no provenance was looked up"),
+            "the miss must say the lookup never ran: {message}"
+        );
+
+        // The message has to be one the envelope recognizes as a resolution
+        // miss, or the tool fails loudly and still carries no negative object.
+        let negative = crate::negative::resolution_miss_for(
+            "kin_provenance_query",
+            message,
+            &crate::Envelope::daemon(),
+        )
+        .expect("the miss must carry the standard negative object");
+        assert_eq!(negative["kind"], serde_json::json!("entity_not_resolved"));
+        assert_eq!(negative["result_count"], serde_json::json!(0));
+
+        // Positive control: a real entity in the same store still answers, so
+        // the guard reads the id rather than refusing every call.
+        let live = entity_named("still_here", "fn still_here()");
+        store.upsert_entity(&live).unwrap();
+        let response = query(&store, &live.id, &[]);
+        assert_eq!(response["change_count"], 0);
+
+        // Second control, and the reason the guard is a conjunction: a retired
+        // entity is gone from the graph while its history survives, and its
+        // provenance is exactly what a caller is entitled to ask for.
+        let (history_only, retired, newest) = git_then_agent_store();
+        assert!(
+            history_only.get_entity(&retired).unwrap().is_none(),
+            "the fixture's entity is history-only, which is what makes it the control"
+        );
+        let response = query(&history_only, &retired, &[]);
+        assert_eq!(response["change_count"], 2);
+        assert_eq!(
+            response["latest_change"]["id"].as_str().unwrap(),
+            newest.to_string()
+        );
     }
 }
