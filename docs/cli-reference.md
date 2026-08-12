@@ -562,7 +562,7 @@ kin resolve [options]
 | `--keep-path <path=artifact>` |  | Settle a contested path by naming the artifact that keeps it. Repeatable. |
 | `--all-ours` |  | Resolve all remaining conflicts keeping your version |
 | `--all-theirs` |  | Resolve all remaining conflicts keeping the incoming version |
-| `--do-continue` |  | Complete the merge after all conflicts are resolved |
+| `--do-continue`, `--continue` |  | Complete the merge after all conflicts are resolved. `--continue` is an accepted alias that the CLI parses but does not list in `--help`, so a reader coming from Git will find it works. |
 | `--abort` |  | Abort the merge and discard conflict state |
 | `--expect <hash>` |  | Require the merge transaction to still be the one this identity names |
 | `--json` |  | Emit the machine-readable merge transaction record |
@@ -2152,7 +2152,7 @@ kin embed [options]
 | --- | --- | --- |
 | `--batch-size <batch-size>` |  | Embedding batch size (entities per inference pass). Defaults to 64, or the throughput resource plan's per-chunk budget when KIN_RESOURCE_PROFILE=throughput is set. |
 | `--max-seconds <seconds>` |  | Stop after this many seconds, persist completed vectors, and leave the rest pending. |
-| `--rebuild` |  | Drop the existing vector index and re-embed every entity at the current model's dimension. Use this to migrate a repo indexed with an older model (e.g. a 384-dim index that fails against the 768-dim default). |
+| `--rebuild`, `--force` |  | Drop the existing vector index and re-embed every entity at the current model's dimension. Use this to migrate a repo indexed with an older model (e.g. a 384-dim index that fails against the 768-dim default). `--force` is a visible alias and appears in `kin embed --help`. |
 | `--json` |  | Output JSON status instead of progress text. |
 
 ### `kin cache`
