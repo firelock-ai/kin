@@ -235,6 +235,7 @@ fn init_from_git_with_hooks(
         capture_lossless_git_repository(&source, repository_id, &capture_store)
             .map_err(|error| git_boundary_error("capture exact Git repository", error))?
     };
+    park_at_capture_barrier(capture_dir.path());
 
     progress.begin("build Git authority");
     let git_authority = {
@@ -940,6 +941,42 @@ fn bind_historical_semantics(
         .map_err(|error| git_boundary_error("bind historical semantics", error))
 }
 
+/// Park a captured init where a test can kill it on a settled capture tree.
+///
+/// The kill point belongs to the child, not to a parent guessing at it from
+/// outside. A parent that polls the capture directory and signals once it looks
+/// full enough is signalling a live writer, and removing a tree a writer is
+/// still extending is allowed to fail: `remove_staging_tree` retries a bounded
+/// number of times and then leaves the directory carrying its lease for the
+/// next init to reap. The interrupted-init test asserts the directory is gone,
+/// which is the stronger of the two outcomes, so guessing the moment made the
+/// assertion a coin flip and ejected merge-queue batches that had touched no
+/// Rust at all.
+///
+/// Parking here settles it. The capture holds the entire object closure by this
+/// point and nothing writes into it again, so the signal path's removal is the
+/// only thing left to decide the result. The path is published by rename, so a
+/// parent never reads a half-written name, and the thread then blocks: only the
+/// signal ends this process.
+#[cfg(all(test, unix))]
+fn park_at_capture_barrier(capture: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Some(barrier) = std::env::var_os("KIN_INIT_INTERRUPTED_TEST_BARRIER") else {
+        return;
+    };
+    let barrier = std::path::PathBuf::from(barrier);
+    let staging = barrier.with_extension("publishing");
+    std::fs::write(&staging, capture.as_os_str().as_bytes()).expect("stage the capture barrier");
+    std::fs::rename(&staging, &barrier).expect("publish the capture barrier");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(not(all(test, unix)))]
+fn park_at_capture_barrier(_capture: &Path) {}
+
 #[cfg(test)]
 mod tests {
 
@@ -1167,10 +1204,15 @@ mod tests {
     ///
     /// The reported failure was exactly this: a `SIGTERM` left no `.kin`, so
     /// the store stayed atomic, and stranded the whole captured object closure
-    /// beside the repository where nothing named it for a day. The parent waits
-    /// until it can see the capture directory before signalling, so a child
-    /// that died before staging anything fails this test rather than passing
-    /// it.
+    /// beside the repository where nothing named it for a day.
+    ///
+    /// The child picks the moment. It captures the whole source, publishes the
+    /// directory it staged, and blocks there, so the signal always lands on a
+    /// capture tree that is complete and settled. Guessing that moment from
+    /// outside was the flake: a parent polling for "enough files" signalled a
+    /// live writer, and removal against a live writer may give up and leave the
+    /// directory leased for the next init's reap, which is weaker than what
+    /// this test asserts.
     #[cfg(unix)]
     #[test]
     fn an_init_killed_mid_capture_leaves_no_kin_and_no_capture_directory() {
@@ -1178,8 +1220,9 @@ mod tests {
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
-        // Enough distinct bodies that capture is still running when the parent
-        // notices the directory and signals.
+        // A closure worth stranding. The reported incident left 837 MiB of
+        // loose objects behind, and removing an all-but-empty directory would
+        // prove nothing about removing a real one.
         for index in 0..400 {
             std::fs::write(
                 source.join(format!("body-{index:04}.txt")),
@@ -1190,27 +1233,32 @@ mod tests {
         git(&source, ["add", "--all"]);
         git(&source, ["commit", "-m", "initial"]);
 
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("git_init::tests::interrupted_init_subprocess")
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let barrier = root.path().join("capture-barrier");
+        let mut child = ParkedChild::spawn(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("git_init::tests::interrupted_init_subprocess")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
+                .env("KIN_INIT_INTERRUPTED_TEST_BARRIER", &barrier),
+        );
 
-        // Wait until the capture is actually filling the directory, not merely
-        // until it exists. Removing a tree a live writer is still extending is
-        // the case the signal path has to survive, and killing the child the
-        // instant the directory appears would never reach it.
-        let staged = wait_for_filling_capture(root.path(), 20, &mut child);
+        let staged = wait_for_capture_barrier(&barrier, &mut child);
+        // What the removal has to clear is a real closure, so say how real. A
+        // barrier that ever moved ahead of the capture would otherwise leave
+        // this test removing an empty directory and still passing.
+        let captured = count_files(&staged);
+        assert!(
+            captured > 400,
+            "{} holds {captured} files, too few to be the captured closure",
+            staged.display()
+        );
         assert_eq!(
             unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
             0,
             "deliver SIGTERM to the interrupted init"
         );
-        let status = child.wait().unwrap();
+        let status = child.wait();
 
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
@@ -1230,56 +1278,112 @@ mod tests {
         assert_no_staging_directories(root.path());
     }
 
-    /// Poll until the child's capture directory holds at least `wanted` files,
-    /// failing loudly if the child finishes or stalls before it gets there.
+    /// An init subprocess killed when it goes out of scope.
+    ///
+    /// The interrupted init blocks at its barrier until something signals it,
+    /// so a parent that fails an assertion on the way there would otherwise
+    /// leave a process parked for the rest of the run. Waiting takes the child
+    /// out, so a reaped process is never signalled again under a pid something
+    /// else has since been given.
     #[cfg(unix)]
-    fn wait_for_filling_capture(
-        parent: &Path,
-        wanted: usize,
-        child: &mut std::process::Child,
-    ) -> std::path::PathBuf {
-        fn count_files(root: &Path) -> usize {
-            let Ok(entries) = std::fs::read_dir(root) else {
-                return 0;
-            };
-            entries
-                .flatten()
-                .map(|entry| match entry.path() {
-                    path if path.is_dir() => count_files(&path),
-                    _ => 1,
-                })
-                .sum()
+    struct ParkedChild(Option<std::process::Child>);
+
+    #[cfg(unix)]
+    impl ParkedChild {
+        fn spawn(command: &mut std::process::Command) -> Self {
+            let child = command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the interrupted init");
+            Self(Some(child))
         }
+
+        fn live(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().expect("the interrupted init is still live")
+        }
+
+        fn id(&mut self) -> u32 {
+            self.live().id()
+        }
+
+        fn wait(&mut self) -> std::process::ExitStatus {
+            self.0
+                .take()
+                .expect("the interrupted init is still live")
+                .wait()
+                .expect("await the interrupted init")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ParkedChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Count every file under one tree, so a claim about what a capture holds
+    /// can be wrong out loud.
+    #[cfg(unix)]
+    fn count_files(root: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| match entry.path() {
+                path if path.is_dir() => count_files(&path),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    /// Wait for the child to publish the capture directory it staged.
+    ///
+    /// The barrier appears only once a whole object closure is on disk, so a
+    /// child that died before capturing anything fails this test rather than
+    /// passing it.
+    #[cfg(unix)]
+    fn wait_for_capture_barrier(barrier: &Path, child: &mut ParkedChild) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt as _;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with(".kin-git-capture-"))
-                        && path.is_dir()
-                        && count_files(&path) >= wanted
-                    {
-                        return path;
-                    }
+            match std::fs::read(barrier) {
+                Ok(published) => {
+                    let staged = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&published));
+                    assert!(
+                        staged.is_dir(),
+                        "the init subprocess published {}, which is no capture directory",
+                        staged.display()
+                    );
+                    return staged;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    panic!("read the capture barrier {}: {error}", barrier.display())
                 }
             }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("the init subprocess exited before it filled a capture: {status:?}");
+            if let Some(status) = child.live().try_wait().unwrap() {
+                panic!("the init subprocess exited before it captured anything: {status:?}");
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                panic!("the init subprocess never filled a capture directory");
+                panic!("the init subprocess never reached its capture barrier");
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
     /// Child half of
     /// [`an_init_killed_mid_capture_leaves_no_kin_and_no_capture_directory`].
+    ///
+    /// Parks at the end of the capture phase through
+    /// [`park_at_capture_barrier`], so the parent signals a settled tree rather
+    /// than racing one still being written.
     #[cfg(unix)]
     #[test]
     fn interrupted_init_subprocess() {
