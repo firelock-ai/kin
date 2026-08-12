@@ -15,6 +15,9 @@ Manual / per-tool configuration is available in the
 [Advanced configuration](#9-advanced-configuration) section, but you do not need it for a
 normal first run.
 
+Every command below, and every command this guide does not reach, is documented
+in the [CLI reference](cli-reference.md).
+
 ---
 
 ## 1. Install
@@ -326,8 +329,8 @@ kin with claude -- "fix the failing test"             # agent inside a session
 
 On success the session reconciles back into the graph (generated dirs like
 `node_modules/` are skipped by policy); on failure the workspace is preserved
-with recovery commands. See [Session Runtime](session-runtime.md) for the full
-contract, closeout flags, and Docker/Compose caveats.
+with recovery commands. See [Session runtime](session-runtime.md) for closeout
+flags, Docker and Compose caveats, and what is not claimed yet.
 
 ---
 
