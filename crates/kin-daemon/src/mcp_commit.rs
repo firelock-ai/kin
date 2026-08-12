@@ -892,15 +892,11 @@ fn require_bound_authority_revision(
 /// `timed_finalize_step` is what makes the cost visible instead of silent.
 ///
 /// kin-db 0.7.21 answers the same question under its own read lock with no
-/// clone at all (`InMemoryGraph::semantic_workspace_matches`). This call site
-/// moves to it once that version is published and `kin` re-locks against it;
-/// the comparison is identical, so the swap is a cost change only.
+/// clone at all, and the comparison is identical, so this wrapper is a cost
+/// change only: three-map equality without deep-cloning revision history and
+/// the audit log on both sides, twice per reply.
 fn semantic_workspace_matches(left: &kin_db::InMemoryGraph, right: &kin_db::InMemoryGraph) -> bool {
-    let left = left.to_snapshot();
-    let right = right.to_snapshot();
-    left.entities == right.entities
-        && left.relations == right.relations
-        && left.resolved_tree == right.resolved_tree
+    left.semantic_workspace_matches(right)
 }
 
 fn plan_exact_transaction(
