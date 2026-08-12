@@ -2,9 +2,16 @@
   <img src="docs/assets/kin-banner-2026.png" alt="Kin, the semantic system of record for AI-written software" width="100%" />
 </p>
 
-<!-- Demo GIF slot: embed the launch demo GIF here, directly under the banner,
-     once the final asset lands in docs/assets/. Do not link an asset that is
-     not in the tree. -->
+<p align="center">
+  <img src=".github/demos/git-interop.gif" alt="Terminal recording: kin init, kin git import, kin commit, kin status, and kin trace run against an existing Git repository" width="100%" />
+</p>
+
+<p align="center">
+  <sub>Adopting Kin on a repository that already has Git history: <code>kin init</code>,
+  <code>kin git import</code>, one semantic commit, then a trace. Recorded by
+  <a href="scripts/record-demos.sh"><code>scripts/record-demos.sh</code></a> on a
+  small sample project, so the counts are the sample's, not a benchmark.</sub>
+</p>
 
 <div align="center">
 
