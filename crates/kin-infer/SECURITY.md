@@ -36,7 +36,7 @@ support window.
 ## Scope
 
 This policy covers the `kin-infer` repository: the inference and embedding
-substrate — a pure-Rust, GPU-accelerated transformer inference engine. Other Kin
+substrate, a pure-Rust, GPU-accelerated transformer inference engine. Other Kin
 ecosystem repositories (for example `kin`, `kin-db`, `kin-vfs`, `kinlab`) carry
 their own security policies; report issues against the repository where the
 affected code lives.
