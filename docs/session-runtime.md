@@ -1,25 +1,4 @@
-# Session Runtime Acceptance Contract
-
-> **Current development status:** repository-v6 exact session materialization is
-> implemented at the daemon boundary, including non-code/binary artifacts,
-> executable bits, symlinks, exact source-CAS reads, scoped artifact selection,
-> and a durable three-way-reconcile base record. `kin exec`, `kin shell`,
-> `kin open`, `kin with`, and `kin reconcile` are exposed: the daemon
-> materializes the projection, the process runs inside it, and a clean exit
-> admits the observed delta through the reconcile boundary. Docker and Compose
-> are represented and materializable, but are **not yet claimed as end-to-end
-> dogfood-ready through these launchers**. Check `kin capabilities --json` for
-> live availability.
->
-> Parts of the remainder of this document are still the contract these commands
-> must satisfy rather than a description of shipped behavior. Where the two
-> disagree, `kin capabilities --json` and the code are authoritative.
-
-Two exact-tree cases still fail closed at the physical session boundary:
-byte-exact non-UTF-8 repository paths (retained in repository authority and Git
-export, but not yet projected by the UTF-8 workspace boundary) and gitlinks
-(retained exactly as imported targets, but awaiting the graph-native
-cross-repository model and recursive materialization).
+# Session runtime
 
 Kin's session runtime is the venv-like execution contract for a Kin repository.
 You, or an agent, run normal project commands such as `npm test`, `make`,
@@ -29,7 +8,7 @@ into a **session workspace**, the tool runs there like in any ordinary checkout,
 and Kin reconciles the results back into the semantic graph when the session
 ends.
 
-Three surfaces share this contract:
+Four surfaces share this contract:
 
 | Surface | What it is | When to use it |
 | --- | --- | --- |
@@ -46,6 +25,32 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
 - **`kin exec` / `kin shell`**: run ordinary commands through a session workspace.
 - **`kin with`**: launch an assistant inside a
   session workspace with session-coherent MCP.
+
+## What ships, and what does not
+
+Exact session materialization is implemented at the daemon boundary, including
+non-code and binary artifacts, executable bits, symlinks, exact source-CAS
+reads, scoped artifact selection, and a durable three-way-reconcile base
+record. `kin exec`, `kin shell`, `kin open`, `kin with`, and `kin reconcile`
+are exposed: the daemon materializes the projection, the process runs inside
+it, and a clean exit admits the observed delta through the reconcile boundary.
+
+Four things are deliberately not claimed yet.
+
+- **Docker and Compose** are represented and materializable, but are not
+  claimed end to end through these launchers. The
+  [caveats below](#docker-and-compose-caveats) describe what does work today.
+- **Byte-exact non-UTF-8 repository paths** fail closed at the physical session
+  boundary. They are retained in repository authority and in Git export, but the
+  UTF-8 workspace boundary does not project them.
+- **Gitlinks** also fail closed there. They are retained exactly as imported
+  targets, and they await the graph-native cross-repository model and recursive
+  materialization.
+- **Parts of the detail below** state the contract these commands satisfy rather
+  than a walkthrough of one observed run.
+
+`kin capabilities --json` reports live per-command availability, and it is the
+authority when it and this page disagree. So is the code.
 
 ## The execution contract
 
@@ -283,12 +288,10 @@ belongs to another session is neither.
 
 Supervisor-level behavior still sees every registered daemon regardless of home:
 the rogue-daemon reaper, idle accounting, and the stop-before-update preflight
-census all operate on the machine-wide registry. That is correct for the
-machine-level jobs among them (an install-wide update must account for every
-process running the binaries it replaces) and worth revisiting for the ones that
-act on an individual daemon's behalf. The recorded home is now available to
-those paths; using it is deliberately left to follow-up work rather than folded
-into the scoping change.
+census all operate on the machine-wide registry. That is what an install-wide
+update requires, since it must account for every process running the binaries it
+replaces. Expect those paths to act on daemons from other managed homes, and use
+the scoped `kin daemon stop --all` when you mean only your own.
 
 ## Recovery reference
 
