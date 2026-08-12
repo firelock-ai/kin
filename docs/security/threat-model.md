@@ -4,8 +4,8 @@ This document describes the security model of the parts of Kin that run as
 long-lived local processes or interpose on the operating system: the **Kin
 daemon** (its graph and coordination control API) and the **filesystem
 projection** that serves graph-backed content to ordinary tools. It
-describes behavior as it exists today, including the cases where a protection is
-provisioned but not enforced by default. Where a boundary is owned by another
+describes behavior as it exists today, including the residual risks a shipped
+protection does not cover. Where a boundary is owned by another
 repository in the ecosystem, that is called out so the authority for the
 implementation is unambiguous.
 
