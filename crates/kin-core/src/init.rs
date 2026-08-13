@@ -3247,7 +3247,9 @@ mod tests {
             None,
         )
         .unwrap();
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
 
         let published = publish_repository_layout(prepared).unwrap();
 
@@ -3357,7 +3359,9 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "metadata-drift");
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
         std::fs::write(
             prepared.layout.config_path(),
@@ -3378,7 +3382,9 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "uncertain");
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error = publish_repository_layout_linearized(prepared, |publication| {
@@ -3402,7 +3408,9 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "collision");
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         std::fs::create_dir(&final_kin).unwrap();
@@ -3421,7 +3429,9 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "final-check");
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error = publish_repository_layout_linearized(prepared, |_publication| {
@@ -3444,7 +3454,9 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "unused-capability");
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error =
@@ -3463,7 +3475,9 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "post-publish-check");
-        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
+        prepared
+            .commit_repository_bootstrap(transaction.clone())
+            .unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error = publish_repository_layout_linearized(prepared, |publication| {
