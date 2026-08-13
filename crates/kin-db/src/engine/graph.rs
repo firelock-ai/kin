@@ -4969,10 +4969,13 @@ impl InMemoryGraph {
         queue.pop_frontier_batch(batch_size)
     }
 
-    /// Drain the current pending embedding queue in batches.
+    /// Drain the current pending embedding work in batches, covering both the
+    /// entity queue and the artifact queue.
     ///
     /// This is the graph-first incremental path: graph mutations enqueue
-    /// changed entities, and callers process only that pending work.
+    /// changed entities and artifacts, and callers process only that pending
+    /// work. Entity batches drain first; artifact batches follow through the
+    /// same staged pipeline.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_all_pending_embeddings(&self, batch_size: usize) -> Result<usize, KinDbError> {
         let _span = tracing::info_span!(
@@ -4985,10 +4988,10 @@ impl InMemoryGraph {
         }
         let timing_base = self.embed_stage_timings.snapshot();
         let mut total = 0usize;
-        let initial_pending = self.pending_embeddings();
+        let initial_pending = self.pending_embeddings() + self.pending_artifact_embeddings();
         let start_time = std::time::Instant::now();
         loop {
-            let pending = self.pending_embeddings();
+            let pending = self.pending_embeddings() + self.pending_artifact_embeddings();
             if pending == 0 {
                 break;
             }
@@ -5000,7 +5003,7 @@ impl InMemoryGraph {
             if initial_pending > 0 {
                 let percent = (total * 100) / initial_pending;
                 eprint!(
-                    "\r  Embedding Entities: [{}/{}] {}% | {:.1}s",
+                    "\r  Embedding Graph Truth: [{}/{}] {}% | {:.1}s",
                     total,
                     initial_pending,
                     percent,
@@ -5039,7 +5042,7 @@ impl InMemoryGraph {
         .entered();
 
         let batch_size = batch_size.max(1);
-        let initial_pending = self.pending_embeddings();
+        let initial_pending = self.pending_embeddings() + self.pending_artifact_embeddings();
         let start_time = std::time::Instant::now();
         let mut running_total = 0usize;
         let timing_base = self.embed_stage_timings.snapshot();
@@ -5075,7 +5078,7 @@ impl InMemoryGraph {
                 if initial_pending > 0 {
                     let percent = (running_total * 100) / initial_pending;
                     eprint!(
-                        "\r  Embedding Entities: [{}/{}] {}% | {:.1}s",
+                        "\r  Embedding Graph Truth: [{}/{}] {}% | {:.1}s",
                         running_total,
                         initial_pending,
                         percent,
@@ -5094,9 +5097,12 @@ impl InMemoryGraph {
         }
 
         // Single end-of-drain reconcile, mirroring the serial path's one prune when
-        // the queue empties. Gated on the queue being empty so an error-requeued
+        // the queue empties. Gated on both queues being empty so an error-requeued
         // remainder is never pruned against a partially embedded index.
-        if total > 0 && self.embedding_queue.lock().is_empty() {
+        if total > 0
+            && self.embedding_queue.lock().is_empty()
+            && self.artifact_embedding_queue.lock().is_empty()
+        {
             self.prune_orphaned_vectors();
         }
 
@@ -5170,10 +5176,11 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    /// Process up to `batch_size` items from the embedding queue.
+    /// Process up to `batch_size` items from the embedding queues.
     ///
-    /// Drains keys from the queue, generates embeddings via the
-    /// CodeEmbedder, and inserts them into the HNSW VectorIndex.
+    /// Drains keys from the entity queue (topping up remaining capacity from
+    /// the artifact queue), generates embeddings via the CodeEmbedder, and
+    /// inserts them into the HNSW VectorIndex.
     /// Returns the number of items successfully embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
@@ -5192,7 +5199,7 @@ impl InMemoryGraph {
     }
 
     /// Stage 1 of the embed pipeline: drain a deterministic, priority-ordered
-    /// batch and format each entity's text. This is the ONLY stage that touches
+    /// batch and format each item's text. This is the ONLY stage that touches
     /// the entity graph — it acquires the `entities` read lock, formats every
     /// item, and releases it before returning — so a caller can run it for the
     /// next batch while the current batch is on the GPU.
@@ -5200,13 +5207,26 @@ impl InMemoryGraph {
     /// `drain_embedding_batch` is the single ordering authority: batch
     /// composition depends only on queue contents and graph state, never on map
     /// iteration order, so it is identical across processes.
+    ///
+    /// Once the entity queue runs dry, remaining batch capacity is topped up
+    /// from the artifact embedding queue, so every consumer of the staged
+    /// pipeline finishes a run with artifact vectors present instead of leaving
+    /// that sub-space to a second hand-rolled drain loop. Entity work always
+    /// drains first; artifacts never displace it within a batch.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn prepare_pending_embedding_batch(&self, batch_size: usize) -> PreparedEmbedBatch {
         use crate::embed::format_graph_entity_text;
         use crate::embed::format_graph_entity_text_with_context;
 
         let batch_size = batch_size.max(1);
-        let batch = self.drain_embedding_batch(batch_size);
+        let mut batch = self.drain_embedding_batch(batch_size);
+        if batch.len() < batch_size {
+            batch.extend(
+                self.drain_artifact_embedding_batch(batch_size - batch.len())
+                    .into_iter()
+                    .map(|(artifact_id, recency)| (RetrievalKey::Artifact(artifact_id), recency)),
+            );
+        }
         // Time only the text-format work; the drain above is timed inside
         // `drain_embedding_batch`, so the two stages never double-count.
         let _prep_timer = self
@@ -5256,7 +5276,30 @@ impl InMemoryGraph {
                             texts.push(format_graph_entity_text(&rev.entity));
                         }
                     }
-                    _ => {}
+                    RetrievalKey::Artifact(artifact_id) => {
+                        if let Some((artifact_key, text)) =
+                            artifact_embedding_doc(&ent, artifact_id)
+                        {
+                            keys.push(artifact_key);
+                            texts.push(text);
+                        } else {
+                            // A queued artifact without a shallow/structured/opaque
+                            // enrichment record has no embeddable document. Dropping
+                            // it here mirrors `process_artifact_embedding_queue`,
+                            // but say so instead of vanishing the key.
+                            tracing::debug!(
+                                artifact_id = %artifact_id.0,
+                                "skipping queued artifact with no embedding doc source"
+                            );
+                        }
+                    }
+                    RetrievalKey::ArtifactRevision(_) => {
+                        // No doc builder exists for historical artifact revisions;
+                        // only the head artifact key is retrieval truth.
+                        tracing::debug!(
+                            "skipping artifact revision key with no embedding doc source"
+                        );
+                    }
                 }
             }
         }
@@ -5367,13 +5410,17 @@ impl InMemoryGraph {
             return Err(err);
         }
 
-        // Live retire: when this batch drains the entity queue, a re-embed that
+        // Live retire: when this batch drains the embed queues, a re-embed that
         // appended a new revision (and embedded its key) has left the entity's
         // prior revision vector behind. Reconcile the index to graph truth so the
         // superseded generation is retired now, instead of accumulating until the
-        // next daemon boot's load-time reclaim. Gated on the queue being empty so
-        // a multi-batch backfill prunes once at the end rather than per batch.
-        if prune_on_empty && count > 0 && self.embedding_queue.lock().is_empty() {
+        // next daemon boot's load-time reclaim. Gated on both queues being empty
+        // so a multi-batch backfill prunes once at the end rather than per batch.
+        if prune_on_empty
+            && count > 0
+            && self.embedding_queue.lock().is_empty()
+            && self.artifact_embedding_queue.lock().is_empty()
+        {
             self.prune_orphaned_vectors();
         }
 
@@ -17694,6 +17741,148 @@ mod tests {
         assert_eq!(
             prepared.recency.get(&RetrievalKey::EntityRevision(rev_new)),
             Some(&EmbedRecency::Backfill)
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_tops_up_with_queued_artifacts() {
+        let g = InMemoryGraph::new();
+        let structured = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([0x31; 32]),
+            text_preview: Some("build the workspace".into()),
+        };
+        let artifact_id = admit_enrichment(&g, &structured.file_id, structured.content_hash);
+        g.upsert_structured_artifact(&structured).unwrap();
+        assert_eq!(g.pending_artifact_embeddings(), 1);
+
+        let prepared = g.prepare_pending_embedding_batch(10);
+        assert_eq!(
+            prepared.keys,
+            vec![RetrievalKey::Artifact(artifact_id)],
+            "an empty entity queue must top the batch up from the artifact queue"
+        );
+        assert_eq!(
+            prepared.texts,
+            vec![crate::embed::format_artifact_text(&structured)],
+            "artifact text must come from the artifact embedding doc builder"
+        );
+        assert_eq!(
+            prepared.recency.get(&RetrievalKey::Artifact(artifact_id)),
+            Some(&EmbedRecency::ChangedThisSync),
+            "the live-mutation recency tier must survive the top-up"
+        );
+        assert_eq!(
+            g.pending_artifact_embeddings(),
+            0,
+            "prepare drains the artifact queue"
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_formats_artifact_keys_from_the_entity_queue() {
+        let g = InMemoryGraph::new();
+        let shallow = ShallowTrackedFile {
+            file_id: FilePathId::new("docs/AGENTS.md"),
+            language_hint: "markdown".into(),
+            declaration_count: 0,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([0x32; 32]),
+            signature_hash: None,
+            declaration_names: vec!["Checks That Cannot Fail".into()],
+            import_paths: vec![],
+        };
+        let artifact_id = admit_enrichment(&g, &shallow.file_id, shallow.syntax_hash);
+        g.upsert_shallow_file(&shallow).unwrap();
+        g.artifact_embedding_queue.lock().clear();
+
+        g.queue_keys_for_embedding(&[RetrievalKey::Artifact(artifact_id)]);
+        assert_eq!(g.pending_embeddings(), 1);
+
+        let prepared = g.prepare_pending_embedding_batch(10);
+        assert_eq!(
+            prepared.keys,
+            vec![RetrievalKey::Artifact(artifact_id)],
+            "an artifact key in the unified queue must be prepared, not destroyed"
+        );
+        assert_eq!(
+            prepared.texts,
+            vec![crate::embed::format_shallow_text(&shallow)],
+            "the shallow doc builder must format the artifact's text"
+        );
+        assert_eq!(g.pending_embeddings(), 0);
+        assert_eq!(g.pending_artifact_embeddings(), 0);
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_drains_entities_before_artifact_topup() {
+        let g = InMemoryGraph::new();
+        let mut api = test_entity_with_id(0x93, "api");
+        api.kind = EntityKind::Interface;
+        let pubfn = test_entity_with_id(0x94, "pubfn");
+        g.upsert_entity(&api).unwrap();
+        g.upsert_entity(&pubfn).unwrap();
+        let structured = StructuredArtifact {
+            file_id: FilePathId::new("compose.yaml"),
+            kind: ArtifactKind::ComposeFile,
+            content_hash: Hash256::from_bytes([0x33; 32]),
+            text_preview: Some("services".into()),
+        };
+        let artifact_id = admit_enrichment(&g, &structured.file_id, structured.content_hash);
+        g.upsert_structured_artifact(&structured).unwrap();
+
+        let first = g.prepare_pending_embedding_batch(2);
+        assert_eq!(
+            first.keys,
+            vec![RetrievalKey::Entity(api.id), RetrievalKey::Entity(pubfn.id)],
+            "a full entity batch must leave no capacity for artifact top-up"
+        );
+        assert_eq!(
+            g.pending_artifact_embeddings(),
+            1,
+            "the artifact must wait for entity work to drain"
+        );
+
+        let second = g.prepare_pending_embedding_batch(2);
+        assert_eq!(
+            second.keys,
+            vec![RetrievalKey::Artifact(artifact_id)],
+            "the next batch must drain the queued artifact"
+        );
+        assert_eq!(g.pending_artifact_embeddings(), 0);
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_drains_doc_less_artifacts_without_stranding() {
+        let g = InMemoryGraph::new();
+        // A source-only artifact identity has no shallow/structured/opaque
+        // enrichment record, so no embeddable document exists for it.
+        let artifact_id = g.admit_artifact_for_test(
+            "src/lib.rs",
+            TreeEntry::blob(Hash256::from_bytes([0x34; 32]), false),
+        );
+        g.queue_artifacts_for_embedding(&[artifact_id]);
+        assert_eq!(g.pending_artifact_embeddings(), 1);
+
+        let prepared = g.prepare_pending_embedding_batch(10);
+        assert!(
+            prepared.is_empty(),
+            "a doc-less artifact prepares no embeddable work"
+        );
+        assert_eq!(
+            g.pending_artifact_embeddings(),
+            0,
+            "a doc-less artifact must drain rather than strand the queue"
+        );
+        assert_eq!(
+            prepared.recency.get(&RetrievalKey::Artifact(artifact_id)),
+            Some(&EmbedRecency::Backfill),
+            "recency metadata is retained for skipped keys so error requeue can preserve priority"
         );
     }
 
