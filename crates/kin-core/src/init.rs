@@ -304,12 +304,13 @@ impl PreparedRepositoryInit {
     /// different transaction is rejected once bootstrap authority exists.
     pub fn commit_repository_bootstrap(
         &mut self,
-        transaction: &RepositoryTransaction,
+        transaction: RepositoryTransaction,
     ) -> Result<&RepositoryBootstrap> {
         verify_metadata_seal(&self.layout, &self.metadata_seal)?;
         let transaction_hash = transaction
             .transaction_hash()
             .map_err(|error| KinError::Other(error.to_string()))?;
+        let operation_id = transaction.operation_id;
         let repository_id = &self.repository_id;
         let workspace_id = self.workspace_id;
         let default_ref = &self.default_ref;
@@ -320,7 +321,7 @@ impl PreparedRepositoryInit {
         match &mut self.bootstrap {
             Some(bootstrap) => {
                 if bootstrap.receipt.transaction_hash != transaction_hash
-                    || bootstrap.receipt.operation_id != transaction.operation_id
+                    || bootstrap.receipt.operation_id != operation_id
                 {
                     return Err(KinError::Other(
                         "staged repository already has a different bootstrap transaction"
@@ -333,7 +334,7 @@ impl PreparedRepositoryInit {
                 {
                     let _span = info_span!("kin.init.commit.validate_bootstrap").entered();
                     validate_bootstrap_transaction(
-                        transaction,
+                        &transaction,
                         repository_id,
                         workspace_id,
                         default_ref,
@@ -580,7 +581,7 @@ fn init_with_config(
         SharedAdmissionPolicy::empty(0),
         None,
     )?;
-    prepared.commit_repository_bootstrap(&transaction)?;
+    prepared.commit_repository_bootstrap(transaction)?;
     let result = publish_repository_layout(prepared)?;
 
     info!(
@@ -1299,7 +1300,7 @@ where
         &prepared_default_ref,
         &initial_roots,
     )?;
-    commit_bootstrap_transaction(authority, &transaction, &repository_id, workspace_id)
+    commit_bootstrap_transaction(authority, transaction, &repository_id, workspace_id)
 }
 
 fn build_repository_bootstrap_transaction(
@@ -1417,32 +1418,35 @@ fn build_repository_bootstrap_transaction(
 
 fn commit_bootstrap_transaction<B>(
     authority: &RepositoryAuthorityManager<B>,
-    transaction: &RepositoryTransaction,
+    transaction: RepositoryTransaction,
     repository_id: &RepositoryId,
     workspace_id: WorkspaceId,
 ) -> Result<RepositoryBootstrap>
 where
     B: StorageBackend + 'static,
 {
-    // The clone is measured separately from the commit it feeds. A bootstrap
-    // transaction carries every reachable external object and every change in
-    // history, so on a real repository this copies tens of thousands of records
-    // to satisfy an owned-parameter API, and the caller drops the original
-    // immediately afterwards. Whether that is worth removing is a measurement,
-    // not a guess, so it gets its own span rather than hiding inside the commit.
-    let owned_transaction = {
+    // A bootstrap transaction carries every reachable external object and every
+    // change in history, so on a repository with real history a copy taken to
+    // satisfy the owned-parameter commit is a second whole-history allocation,
+    // charged at the point init already holds its largest working set. The
+    // transaction is therefore moved into the commit rather than cloned, and
+    // every field the receipt is checked against is read before the move.
+    let initial_change_id = transaction
+        .workspace_mutation
+        .as_ref()
+        .and_then(|mutation| match mutation.new_base_target {
+            Some(RefTarget::Change { change_id }) => Some(change_id),
+            _ => None,
+        });
+    let receipt = {
         let _span = info_span!(
-            "kin.init.commit.clone_transaction",
+            "kin.init.commit.authority_commit",
             external_objects = transaction.external_objects.len(),
             changes = transaction.changes.len()
         )
         .entered();
-        transaction.clone()
-    };
-    let receipt = {
-        let _span = info_span!("kin.init.commit.authority_commit").entered();
         authority
-            .commit_repository_transaction(owned_transaction)
+            .commit_repository_transaction(transaction)
             .map_err(graph_error)?
     };
     let workspace = {
@@ -1475,13 +1479,6 @@ where
         }
         crate::durable_semantic_enrichment_summary(&lease, &workspace_id)?
     };
-    let initial_change_id = transaction
-        .workspace_mutation
-        .as_ref()
-        .and_then(|mutation| match mutation.new_base_target {
-            Some(RefTarget::Change { change_id }) => Some(change_id),
-            _ => None,
-        });
     Ok(RepositoryBootstrap {
         receipt,
         workspace,
@@ -3203,7 +3200,7 @@ mod tests {
         let expected_repository = prepared.repository_id().clone();
 
         let bootstrap = prepared
-            .commit_repository_bootstrap(&transaction)
+            .commit_repository_bootstrap(transaction.clone())
             .unwrap()
             .clone();
         let published = publish_repository_layout(prepared).unwrap();
@@ -3250,7 +3247,7 @@ mod tests {
             None,
         )
         .unwrap();
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
 
         let published = publish_repository_layout(prepared).unwrap();
 
@@ -3264,11 +3261,11 @@ mod tests {
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "retry");
 
         let first = prepared
-            .commit_repository_bootstrap(&transaction)
+            .commit_repository_bootstrap(transaction.clone())
             .unwrap()
             .clone();
         let replay = prepared
-            .commit_repository_bootstrap(&transaction)
+            .commit_repository_bootstrap(transaction.clone())
             .unwrap()
             .clone();
         assert_eq!(first, replay);
@@ -3276,7 +3273,7 @@ mod tests {
         let mut different = transaction;
         different.operation_id = OperationId::new();
         let error = prepared
-            .commit_repository_bootstrap(&different)
+            .commit_repository_bootstrap(different.clone())
             .unwrap_err();
         assert!(error
             .to_string()
@@ -3291,7 +3288,7 @@ mod tests {
         transaction.default_ref_mutation = None;
 
         let error = prepared
-            .commit_repository_bootstrap(&transaction)
+            .commit_repository_bootstrap(transaction.clone())
             .unwrap_err();
 
         assert!(error.to_string().contains("default ref must exactly match"));
@@ -3360,7 +3357,7 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "metadata-drift");
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
         std::fs::write(
             prepared.layout.config_path(),
@@ -3381,7 +3378,7 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "uncertain");
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error = publish_repository_layout_linearized(prepared, |publication| {
@@ -3405,7 +3402,7 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "collision");
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         std::fs::create_dir(&final_kin).unwrap();
@@ -3424,7 +3421,7 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "final-check");
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error = publish_repository_layout_linearized(prepared, |_publication| {
@@ -3447,7 +3444,7 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "unused-capability");
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error =
@@ -3466,7 +3463,7 @@ mod tests {
         let working_dir = directory.path().canonicalize().unwrap();
         let final_kin = working_dir.join(".kin");
         let (mut prepared, transaction) = prepare_unborn(directory.path(), "post-publish-check");
-        prepared.commit_repository_bootstrap(&transaction).unwrap();
+        prepared.commit_repository_bootstrap(transaction.clone()).unwrap();
         let staging_root = prepared.layout.root().to_path_buf();
 
         let error = publish_repository_layout_linearized(prepared, |publication| {
