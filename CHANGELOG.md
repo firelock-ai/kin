@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.25] - 2026-08-13
+
+### Changed
+
+- Time every phase of an MCP commit, including the authority publication boundary (#807)
+- Retain tracked artifact text at ingest so retrieval has something to index (#802)
+
+
 ## [0.5.24] - 2026-08-13
 
 ### Changed
