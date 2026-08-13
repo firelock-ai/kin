@@ -12,6 +12,36 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 
 ---
 
+## Every Answer Names Its Authority: the `_kin` Envelope
+
+Every tool response carries a `_kin` envelope (version 1) that names what produced the
+answer and how far to trust it. The contract behind it is simple: there is no
+configuration under which the server backfills a semantic answer from raw file search
+behind a successful response. An answer is graph-backed and names the graph state that
+produced it, or the gap is reported as a gap.
+
+The envelope's fields:
+
+- `runtime`: `repo-daemon` (live, graph-owned truth) or `offline-in-process` (an
+  in-process store, explicitly a fallback surface and labeled as one).
+- `graph_as_of` and `graph_state`: the snapshot generation that answered, plus
+  reconciliation status, entity count, and loaded/initialized flags when known.
+- `semantic_coverage`: `indexed`, `total`, `pending`, and `complete` for the embedding
+  signal, carried only when the daemon computed it and never fabricated here.
+- `degraded`: honest flags (`daemon_unreachable`, `embed_worker_failed`,
+  `mass_deletion_blocked`, `offline_fallback`), each present only when observed.
+
+Empty results carry a named trust verdict, so an agent can tell "not present" apart from
+"not indexed yet". Semantic tools (`semantic_locate`, `semantic_search`) report
+`semantic_authoritative` only under complete embedding coverage with no degraded
+signals, and `coverage_partial` or `coverage_unknown` otherwise. Structural tools
+(`find_references`, `graph_neighborhood`, `trace_data_flow`, and the other
+graph-relation readers) report `structural_authoritative` only with the graph
+initialized and loaded. Treat every other verdict as "ask again when the graph is
+ready" rather than as evidence of absence.
+
+---
+
 ## Configuring the server
 
 The recommended way to expose these tools is the guided wizard: run `kin setup` and choose
