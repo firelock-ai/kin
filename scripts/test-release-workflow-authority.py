@@ -7018,7 +7018,7 @@ def main() -> None:
         "release_workflow_run_id",
         "completed_capstones",
         "Attest terminal completion marker",
-        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+        "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
         "Refuse mismatched existing completion assets",
         "Verify public terminal completion proof",
     ):
@@ -9251,7 +9251,7 @@ def main() -> None:
         'if [ "$digest" != "$EXPECTED_DIGEST" ]',
         '"${IMAGE}@${digest}" "$COMMIT"',
         "Attest immutable daemon image",
-        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+        "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
         "subject-name: ghcr.io/firelock-ai/kin",
         "subject-digest: ${{ steps.subject.outputs.digest }}",
         "push-to-registry: true",
@@ -9602,7 +9602,7 @@ def main() -> None:
         archive_attestation_start:release_creation_start
     ]
     for policy in (
-        "actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6",
+        "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
         "subject-path: |",
         "kin-linux-x86_64.tar.gz",
         "kin-linux-aarch64.tar.gz",

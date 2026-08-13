@@ -334,7 +334,7 @@ jobs:
       - name: Attest immutable daemon image
         # With no predicate inputs actions/attest emits SLSA provenance. Store
         # the bundle next to the exact digest in GHCR for downstream admission.
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/firelock-ai/kin
           subject-digest: ${{ steps.subject.outputs.digest }}
@@ -1653,7 +1653,7 @@ jobs:
         if: ${{ steps.release_state.outputs.existing_final != 'true' }}
         # Fail closed: without a repository attestation, no public prerelease is
         # created and no npm package can be published from these archives.
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             kin-linux-x86_64.tar.gz
@@ -2742,7 +2742,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Attest terminal completion marker
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: release-promotion.json
 
