@@ -422,10 +422,17 @@ fn build_graph_status_response(
     lines.push(format!("Kinds: {}", kind_parts.join(", ")));
 
     lines.push(String::new());
-    if let Some(reason) = &embedding_runtime.vector_index_discarded {
+    if let Some(reason) = embedding_runtime
+        .vector_index_discarded
+        .as_ref()
+        .filter(|_| embed_status.pending > 0)
+    {
         // A real gap, reported with its cause. The bare counters here read as
         // discovered loss; naming the open-time discard and the automatic
-        // recovery is what tells the operator no manual GPU pass is owed.
+        // recovery is what tells the operator no manual GPU pass is owed. The
+        // discard reason is recorded once at open and never cleared, so it is
+        // named only while the gap it explains is still open; a recovered
+        // store goes back to the plain measured line.
         lines.push(format!(
             "Embeddings: {}/{} indexed ({} pending); the persisted vector index was not loaded \
              when this daemon opened ({reason}); the daemon restores coverage in the background",
@@ -1715,6 +1722,39 @@ mod tests {
                 .any(|line| line.contains("embeddings are still pending")),
             "a real gap keeps its warning: {:?}",
             discarded.lines
+        );
+
+        // The reason is recorded once at open and never cleared, so once the
+        // gap it explains is closed the line must not keep naming it. A graph
+        // with nothing pending renders the plain measured line.
+        let (_temp2, binding2, empty_graph) = graph_validation_fixture();
+        let recovered = build_graph_status_response(
+            &binding2,
+            &empty_graph,
+            &Default::default(),
+            &GraphStatusEmbeddingRuntime {
+                vector_index_discarded: Some(
+                    "fixture: metadata no longer matches graph truth".to_string(),
+                ),
+                coverage_ever_complete: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !recovered
+                .lines
+                .iter()
+                .any(|line| line.contains("was not loaded")),
+            "a closed gap must not keep naming its discard: {:?}",
+            recovered.lines
+        );
+        assert!(
+            recovered
+                .lines
+                .iter()
+                .any(|line| line == "Embeddings: 0/0 indexed (0 pending)"),
+            "a store with nothing pending renders the plain measured line: {:?}",
+            recovered.lines
         );
     }
 
