@@ -64,6 +64,11 @@ command line (the flag wins):
 A value that is not one of these is not silently treated as "serve everything": the server
 falls back to `agent-default` and says on stderr what it was asked for and what it served.
 
+A profile shapes the tool surface `kin mcp start` offers. It is not a permission system, and
+it does not constrain a local process that already holds your repo daemon's credentials.
+Reach for it to keep an agent's belt focused and its context small, not as a capability
+boundary you can rely on.
+
 ---
 
 ## 1. Retrieval & Codebase Exploration
