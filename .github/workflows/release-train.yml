@@ -694,10 +694,23 @@ jobs:
   hold-alarm:
     name: Report a held rail
     needs: reconcile
-    # Runs even when the reconcile job failed or was skipped. A failed train run
+    # Runs when the reconcile job ran, whatever it concluded. A failed train run
     # is already loud, and its absent marker reads as unreadable here, which
     # neither opens an alarm nor closes one.
-    if: always()
+    #
+    # It deliberately stands down when reconcile was SKIPPED, and that condition
+    # is load-bearing rather than tidiness. The workflow_run trigger fires on
+    # every CI completion and the reconcile job's own `if` filters almost all of
+    # them out: seventeen of the last twenty runs concluded skipped, against two
+    # that reconciled. A bare `always()` would run this job on all of them, which
+    # breaks the alarm twice over. Each skipped run would contribute a cycle with
+    # no marker, and an unreadable cycle breaks the streak, so the count could
+    # never reach four. Worse, a run whose only job was skipped concludes
+    # skipped, which is exactly how the gather step below tells a non-cycle from
+    # a cycle; adding a job that always runs would conclude those runs success
+    # and hide the distinction. The alarm would have read as working and been
+    # structurally unable to fire.
+    if: always() && needs.reconcile.result != 'skipped'
     permissions:
       # Reading prior cycles' markers, and nothing else, needs actions:read.
       # Nothing in this job writes to a branch, a tag, or a pull request.

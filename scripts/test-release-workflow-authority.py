@@ -6455,6 +6455,26 @@ def assert_release_hold_marker_contract(
                 "is merely idle would then cry wolf every cycle"
             )
 
+    # The alarm must stand down when the reconcile job was skipped, and this is
+    # load-bearing rather than tidiness. Almost every train run is a skipped
+    # workflow_run tick. A job that ran on those would contribute a cycle with no
+    # marker, and an unreadable cycle breaks the streak, so the count could never
+    # reach the threshold. It would also conclude those runs success rather than
+    # skipped, which is exactly how the gather step tells a non-cycle from a
+    # cycle. The alarm would read as working and be unable to fire.
+    alarm_job = workflow_job_blocks(release_train).get("hold-alarm")
+    if alarm_job is None:
+        raise AssertionError("the release train must declare its hold-alarm job")
+    alarm_condition = "\n".join(
+        line for line in alarm_job.splitlines() if not line.lstrip().startswith("#")
+    )
+    if "needs.reconcile.result != 'skipped'" not in alarm_condition:
+        raise AssertionError(
+            "the hold alarm must stand down on a skipped reconcile; counting "
+            "skipped ticks as cycles breaks the streak it needs to reach and "
+            "erases the skipped conclusion the gather step reads"
+        )
+
     threshold = re.search(r"DEFAULT_THRESHOLD = (\d+)", hold_alarm)
     if threshold is None:
         raise AssertionError("the hold-alarm reader must declare its threshold")
@@ -7599,6 +7619,19 @@ def main() -> None:
                 "DEFAULT_THRESHOLD = 4",
                 "DEFAULT_THRESHOLD = 6",
             ),
+        ),
+    )
+    expect_assertion(
+        "the alarm counts every skipped workflow_run tick as a cycle",
+        "must stand down on a skipped reconcile",
+        lambda: assert_release_hold_marker_contract(
+            release_train.replace(
+                "    if: always() && needs.reconcile.result != 'skipped'",
+                "    if: always()",
+                1,
+            ),
+            release_sentinel,
+            hold_alarm,
         ),
     )
     expect_assertion(
