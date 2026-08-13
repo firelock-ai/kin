@@ -1067,7 +1067,10 @@ mod tests {
             "https://github.invalid/acme/app.git",
         )];
 
-        let sealed = super::collect_sealed_git_remotes(&config);
+        // Read the payload the command prints, not the collector beneath it.
+        // Suppression would live in the payload builder, so a test that called
+        // the collector directly could not see it happen.
+        let sealed = super::remote_list_payload(&config).sealed_git_remotes;
         assert_eq!(sealed.len(), 1);
         assert_eq!(sealed[0].name, "upstream");
         assert_eq!(
@@ -1083,7 +1086,9 @@ mod tests {
         // The control: with no sealed remotes the list is empty, so the
         // assertions above distinguish presence from a list that is always full.
         config.git.remotes.clear();
-        assert!(super::collect_sealed_git_remotes(&config).is_empty());
+        assert!(super::remote_list_payload(&config)
+            .sealed_git_remotes
+            .is_empty());
     }
 
     /// The default flag marks exactly the configured default, and nothing else.
