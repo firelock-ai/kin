@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.25] - 2026-08-13
+
+### Changed
+
+- Time every phase of an MCP commit, including the authority publication boundary (#807)
+- Retain tracked artifact text at ingest so retrieval has something to index (#802)
+- Get the Windows install proof past daemon endpoint provenance (#811)
+- Make a held release train say so instead of concluding green (#810)
+- Settle dying group members and reserve the tests' closed ports (#803)
+- Compare the MCP tool reference to the registry as sets (#815)
+- Recognize a bare symbol name against the qualified entity that declares it (#813)
+- Read the locate honesty verdict from the answer rather than the page size (#814)
+
+
 ## [0.5.24] - 2026-08-13
 
 ### Changed
