@@ -26,6 +26,9 @@ RELEASE = WORKFLOWS / "release.yml"
 RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
+RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
+HOLD_ALARM = ROOT / "scripts" / "release-hold-alarm.mjs"
+HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
@@ -540,6 +543,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/release-train.yml": {
         "reconcile": "Reconcile release PR",
+        "hold-alarm": "Report a held rail",
     },
     ".github/workflows/release.yml": {
         "config": "Resolve release config",
@@ -6322,6 +6326,145 @@ def assert_recovery_abandonment_stand_down(release_recovery: str) -> None:
             )
 
 
+def assert_release_hold_marker_contract(
+    release_train: str,
+    release_sentinel: str,
+    hold_alarm: str,
+) -> None:
+    """Pin the hold marker to a producer, a consumer, and one alarm title.
+
+    A marker nobody reads and an alarm keyed to a title that moves are the two
+    ways this reporting path fails back into silence, and both of them look
+    exactly like a working rail from the run history. The producer, the
+    deterministic consumer, and the sentinel prompt each spell the same title
+    and the same schema, so this is what stops the three drifting apart.
+    """
+
+    plan = "\n".join(
+        job_step_active_lines(
+            release_train, "reconcile", "name: Resolve releasable drift"
+        )
+    )
+    stand_downs = plan.count('echo "needed=false"')
+    holds = plan.count("write_marker held ")
+    if stand_downs == 0:
+        raise AssertionError(
+            "the release train must still have a stand-down path to report"
+        )
+    if holds != stand_downs:
+        raise AssertionError(
+            "every release-train stand-down must publish a hold marker; "
+            f"{stand_downs} stand-down(s) publish {holds} marker(s)"
+        )
+    if "write_marker clear " not in plan:
+        raise AssertionError(
+            "the release train must publish an all-clear marker when it "
+            "proceeds, because only an all-clear can close the alarm"
+        )
+
+    schema = '"kin.release-hold.v1"'
+    if schema not in plan:
+        raise AssertionError(
+            "the release train must stamp the reviewed hold-marker schema"
+        )
+    if f"MARKER_SCHEMA = {schema}" not in hold_alarm:
+        raise AssertionError(
+            "the hold-alarm reader must accept exactly the schema the release "
+            "train stamps, or every marker reads as unreadable"
+        )
+
+    artifact = "name: release-hold-marker"
+    upload = "\n".join(
+        job_step_active_lines(
+            release_train, "reconcile", "name: Publish this cycle's hold marker"
+        )
+    )
+    if artifact not in upload:
+        raise AssertionError(
+            "the release train must upload the hold marker under the reviewed "
+            "artifact name"
+        )
+    if "if: always()" not in upload:
+        raise AssertionError(
+            "the hold marker must be uploaded on every path, including the "
+            "stand-downs that are the whole reason it exists"
+        )
+    gather = "\n".join(
+        job_step_active_lines(
+            release_train, "hold-alarm", "name: Gather this cycle"
+        )
+    )
+    # Compared as a whole token, not as a substring. `release-hold-marker-v2`
+    # contains `release-hold-marker`, so a prefix test would pass a rename that
+    # points the reader at an artifact the train never uploads, and the alarm
+    # would go quiet exactly the way it did before any of this existed.
+    downloaded = re.findall(r"--name (\S+)", gather)
+    if downloaded != ["release-hold-marker"]:
+        raise AssertionError(
+            "the alarm must download exactly the artifact the train uploads, "
+            f"not {downloaded}"
+        )
+
+    title = "Release rail is held with releasable drift"
+    for source, surface in (
+        (hold_alarm, "the hold-alarm reader"),
+        (release_train, "the release train's alarm job"),
+        (release_sentinel, "the release sentinel prompt"),
+    ):
+        if source.count(title) < 1:
+            raise AssertionError(
+                f"{surface} must spell the one reviewed alarm title exactly, "
+                "or a second issue is opened every time the wording drifts"
+            )
+    if re.search(r"v\d+\.\d+\.\d+", title) or any(char.isdigit() for char in title):
+        raise AssertionError(
+            "the alarm title must carry no tag and no count, because a title "
+            "that moves with the rail opens a new issue on every move"
+        )
+
+    decide = "\n".join(
+        job_step_active_lines(
+            release_train, "hold-alarm", "name: Decide whether the rail"
+        )
+    )
+    # An issue on its own leaves the run history reading all-green, and the
+    # all-green run history is the surface that lied. Both loud verdicts have to
+    # end the job nonzero, and neither quiet verdict may.
+    for verdict in ("open)", "update)"):
+        segment = decide.split(verdict, 1)
+        if len(segment) != 2:
+            raise AssertionError(
+                f"the alarm must still handle the {verdict[:-1]} verdict"
+            )
+        tail = segment[1].split(";;", 1)[0]
+        if "exit 1" not in tail:
+            raise AssertionError(
+                f"an alarm that {verdict[:-1]}s an issue must also fail its run; "
+                "a green run beside an open alarm is the silence this replaces"
+            )
+    for verdict in ("quiet)", "close)"):
+        segment = decide.split(verdict, 1)
+        if len(segment) != 2:
+            raise AssertionError(
+                f"the alarm must still handle the {verdict[:-1]} verdict"
+            )
+        tail = segment[1].split(";;", 1)[0]
+        if "exit 1" in tail:
+            raise AssertionError(
+                f"a {verdict[:-1]} verdict must not fail the run; a rail that "
+                "is merely idle would then cry wolf every cycle"
+            )
+
+    threshold = re.search(r"DEFAULT_THRESHOLD = (\d+)", hold_alarm)
+    if threshold is None:
+        raise AssertionError("the hold-alarm reader must declare its threshold")
+    if f'THRESHOLD: "{threshold.group(1)}"' not in release_train:
+        raise AssertionError(
+            "the release train must pass the same consecutive-cycle threshold "
+            "the reader defaults to, so one number describes the alarm"
+        )
+
+
 def assert_abandoned_tag_admission(
     release_tag: str,
     release_train: str,
@@ -6810,6 +6953,8 @@ def main() -> None:
     release_recovery = RELEASE_RECOVERY.read_text(encoding="utf-8")
     release_tag = RELEASE_TAG.read_text(encoding="utf-8")
     release_train = RELEASE_TRAIN.read_text(encoding="utf-8")
+    release_sentinel = RELEASE_SENTINEL.read_text(encoding="utf-8")
+    hold_alarm = HOLD_ALARM.read_text(encoding="utf-8")
     release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
@@ -7380,6 +7525,93 @@ def main() -> None:
                 "          steps.record.outputs.abandoned != 'true'",
                 "          # steps.record.outputs.abandoned != 'true'",
             )
+        ),
+    )
+
+    # A hold is a correct decision that used to reach nobody. The marker is what
+    # makes it readable and the alarm job is what makes it heard, so the pair is
+    # pinned together: a producer with no consumer and a consumer with no
+    # producer both read exactly like a healthy rail.
+    assert_release_hold_marker_contract(release_train, release_sentinel, hold_alarm)
+    expect_assertion(
+        "a release-train stand-down publishes no hold marker",
+        "must publish a hold marker",
+        lambda: assert_release_hold_marker_contract(
+            release_train.replace(
+                '            write_marker held no_drift "main has no commits beyond ${tag}" \\\n'
+                '              "" "$tag" 0\n',
+                "",
+                1,
+            ),
+            release_sentinel,
+            hold_alarm,
+        ),
+    )
+    expect_assertion(
+        "the alarm opens an issue and still concludes the run green",
+        "must also fail its run",
+        lambda: assert_release_hold_marker_contract(
+            release_train.replace(
+                '              echo "::error::The release rail has held with releasable drift '
+                'for $(jq -er .consecutive "$decision") consecutive cycles. Opened the tracking '
+                'issue that names the blocking tag and the two ways out."\n'
+                "              exit 1\n",
+                '              echo "::error::The release rail has held with releasable drift '
+                'for $(jq -er .consecutive "$decision") consecutive cycles. Opened the tracking '
+                'issue that names the blocking tag and the two ways out."\n',
+                1,
+            ),
+            release_sentinel,
+            hold_alarm,
+        ),
+    )
+    expect_assertion(
+        "the sentinel stops naming the one alarm title the reader owns",
+        "must spell the one reviewed alarm title",
+        lambda: assert_release_hold_marker_contract(
+            release_train,
+            release_sentinel.replace(
+                "Release rail is held with releasable drift",
+                "Release rail is stuck",
+            ),
+            hold_alarm,
+        ),
+    )
+    expect_assertion(
+        "the reader accepts a schema the train never stamps",
+        "must accept exactly the schema",
+        lambda: assert_release_hold_marker_contract(
+            release_train,
+            release_sentinel,
+            hold_alarm.replace(
+                'MARKER_SCHEMA = "kin.release-hold.v1"',
+                'MARKER_SCHEMA = "kin.release-hold.v2"',
+            ),
+        ),
+    )
+    expect_assertion(
+        "the train and the reader disagree about how many cycles it takes",
+        "must pass the same consecutive-cycle threshold",
+        lambda: assert_release_hold_marker_contract(
+            release_train,
+            release_sentinel,
+            hold_alarm.replace(
+                "DEFAULT_THRESHOLD = 4",
+                "DEFAULT_THRESHOLD = 6",
+            ),
+        ),
+    )
+    expect_assertion(
+        "the train stops uploading the marker later cycles read",
+        "must download exactly the artifact the train uploads",
+        lambda: assert_release_hold_marker_contract(
+            release_train.replace(
+                "--name release-hold-marker \\",
+                "--name release-hold-marker-v2 \\",
+                1,
+            ),
+            release_sentinel,
+            hold_alarm,
         ),
     )
     for forbidden in (
