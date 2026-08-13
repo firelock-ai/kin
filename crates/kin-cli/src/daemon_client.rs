@@ -10161,9 +10161,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kin");
         std::fs::create_dir_all(&root).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let closed = reserved_closed_loopback_port();
+        let port = closed.port;
         let pid =
             write_attributed_endpoint_files(&root, recycled_identity_for_this_process(), port);
 
@@ -10299,9 +10298,8 @@ mod tests {
     #[test]
     fn live_daemon_endpoint_returns_alive_pid_even_before_port_binds() {
         let dir = tempfile::tempdir().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let closed = reserved_closed_loopback_port();
+        let port = closed.port;
         std::fs::write(
             dir.path().join("daemon.pid"),
             std::process::id().to_string(),
