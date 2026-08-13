@@ -831,6 +831,17 @@ pub async fn process_daemon_message(
 /// The MCP protocol version this server supports.
 const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Usage instructions returned at initialize time so a connecting agent knows
+/// what this server is before its first tool call. Kept factual: what the
+/// tools answer from, when to prefer them over text search, and how to read
+/// the envelope and negative contract on retrieval results.
+const SERVER_INSTRUCTIONS: &str = "Kin answers repository questions from a semantic graph rather than raw file search. \
+Prefer semantic_locate to find symbols and behavior by meaning, get_context_pack for a structured context bundle \
+around an entity or file, and trace_data_flow for cross-file data lineage; reach for grep only when no graph-backed \
+tool answers the question. Every tool response carries a `_kin` envelope reporting graph freshness and coverage. An \
+empty retrieval result also carries a `negative` object whose `safe_to_conclude_absent` field says whether the \
+absence can be trusted; when it is false, treat the answer as unknown rather than absent.";
+
 fn handle_initialize(
     id: Option<serde_json::Value>,
     params: &serde_json::Value,
@@ -855,6 +866,7 @@ fn handle_initialize(
             name: config.server_name.clone(),
             version: config.server_version.clone(),
         },
+        instructions: Some(SERVER_INSTRUCTIONS.into()),
     })
     .unwrap_or_default();
 
@@ -1422,6 +1434,10 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"], "kin-mcp");
         // P2-2.3: kinVersion must be present in serverInfo
         assert!(result["serverInfo"]["kinVersion"].is_string());
+        // The spec's instructions field must reach the wire with usable content.
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("semantic_locate"));
+        assert!(instructions.contains("safe_to_conclude_absent"));
     }
 
     #[tokio::test]

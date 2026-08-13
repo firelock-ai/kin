@@ -88,6 +88,10 @@ pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: ServerInfo,
+    /// Optional usage hint the client may inject into the model's context
+    /// (`instructions` in the MCP 2024-11-05 schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 /// Server info.
@@ -174,6 +178,29 @@ mod tests {
         assert!(json.contains("-32601"));
         assert!(json.contains("Method not found"));
         assert!(!json.contains("\"result\""));
+    }
+
+    #[test]
+    fn initialize_result_serializes_instructions() {
+        let make = |instructions: Option<String>| InitializeResult {
+            protocol_version: "2024-11-05".into(),
+            capabilities: ServerCapabilities {
+                tools: ToolsCapability {
+                    list_changed: false,
+                },
+            },
+            server_info: ServerInfo {
+                name: "kin-mcp".into(),
+                version: "0.0.0".into(),
+            },
+            instructions,
+        };
+
+        let with = serde_json::to_value(make(Some("use the graph".into()))).unwrap();
+        assert_eq!(with["instructions"], "use the graph");
+
+        let without = serde_json::to_value(make(None)).unwrap();
+        assert!(without.get("instructions").is_none());
     }
 
     #[test]
