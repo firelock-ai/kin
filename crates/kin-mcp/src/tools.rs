@@ -1049,6 +1049,68 @@ pub fn tool_definitions() -> ToolsListResult {
                     "additionalProperties": false
                 }),
             },
+            ToolDefinition {
+                name: "youcom_search".into(),
+                description: crate::handlers::youcom::YOUCOM_SEARCH_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The web query to send to You.com"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 10,
+                            "description": "Maximum results per section returned by You.com"
+                        },
+                        "freshness": {
+                            "type": "string",
+                            "description": "Freshness window such as day, week, month, year, or YYYY-MM-DDtoYYYY-MM-DD"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9,
+                            "default": 0,
+                            "description": "Pagination offset"
+                        },
+                        "country": {
+                            "type": "string",
+                            "description": "Country code to focus results"
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "BCP 47 language code"
+                        },
+                        "safesearch": {
+                            "type": "string",
+                            "enum": ["off", "moderate", "strict"],
+                            "default": "moderate",
+                            "description": "Content filtering level"
+                        },
+                        "include_domains": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Strict domain allowlist"
+                        },
+                        "exclude_domains": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Domain blocklist"
+                        },
+                        "boost_domains": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Domains that should get a ranking boost"
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            },
         ],
     }
 }
@@ -1273,8 +1335,8 @@ mod tests {
     fn expected_tool_count() {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
-        // + 1 get_entity_sources + 2 exact artifact tools = 64
-        assert_eq!(list.tools.len(), 64);
+        // + 1 get_entity_sources + 2 exact artifact tools + 1 You.com search = 65
+        assert_eq!(list.tools.len(), 65);
     }
 
     /// The tool reference must name every tool the registry serves, and its

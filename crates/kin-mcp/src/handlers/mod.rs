@@ -3,6 +3,7 @@
 
 pub mod artifacts;
 pub mod common;
+pub mod youcom;
 
 // Handler submodules are public so each tool's rich `*_DESC` description const
 // can live next to the handler that implements it, and be referenced by the
@@ -156,6 +157,8 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_graph_status" => entities::handle_graph_status(arguments, store),
         // Benchmark
         "benchmark" => bench::handle_benchmark(arguments, store),
+        // Optional external web search
+        "youcom_search" => youcom::handle_youcom_search(arguments).await,
         _ => Err(McpError::ToolNotFound(tool_name.to_string())),
     }
 }

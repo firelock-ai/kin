@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 64 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 65 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -63,6 +63,10 @@ command line (the flag wins):
 
 A value that is not one of these is not silently treated as "serve everything": the server
 falls back to `agent-default` and says on stderr what it was asked for and what it served.
+
+The `full` profile also includes optional, externally integrated tools such as
+`youcom_search`. Configure `YDC_API_KEY` and optionally `YOUCOM_BASE_URL`
+before launching `kin mcp start` if you want that surface available.
 
 ---
 
