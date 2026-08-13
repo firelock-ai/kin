@@ -496,7 +496,7 @@ impl IndexPipeline {
                     file_id: file_id.clone(),
                     content_hash: Hash256::from_bytes(blob_hash.0),
                     mime_type: None,
-                    text_preview: None,
+                    text_preview: artifacts::opaque_text_preview(content, None),
                 }))
             }
             FileClassification::OpaqueArtifact { mime_hint } => {
@@ -507,11 +507,12 @@ impl IndexPipeline {
                     "enriched opaque artifact"
                 );
 
+                let text_preview = artifacts::opaque_text_preview(content, mime_hint.as_deref());
                 Ok(IndexedAny::OpaqueArtifact(OpaqueArtifact {
                     file_id: file_id.clone(),
                     content_hash: Hash256::from_bytes(blob_hash.0),
                     mime_type: mime_hint,
-                    text_preview: None,
+                    text_preview,
                 }))
             }
         }
@@ -1409,6 +1410,74 @@ pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
         assert_eq!(
             artifact.mime_type.as_deref(),
             Some("application/octet-stream")
+        );
+        assert!(
+            artifact.text_preview.is_none(),
+            "binary bytes must not enter the text index"
+        );
+    }
+
+    /// The FIR-2183 mechanism: real ingest stored every opaque artifact with no
+    /// text at all, so the text index and the artifact embedding saw only a
+    /// path and a MIME type, and a docs store could not answer for its own
+    /// content. The deep marker sits past any head-sized preview, so this test
+    /// fails against head-only retention too, not just against `None`.
+    #[test]
+    fn admitted_markdown_keeps_deep_text_in_its_retrieval_preview() {
+        let mut body =
+            String::from("# Field Notes\n\nHead marker: zebrafish lantern protocol.\n\n");
+        for index in 0..40 {
+            body.push_str(&format!(
+                "Routine paragraph {index} about ordinary upkeep of the greenhouse ledger and \
+                 irrigation schedule, nothing remarkable here.\n\n"
+            ));
+        }
+        body.push_str(
+            "## Deep Doctrine\n\nThe quokka semaphore doctrine states that a docs store must \
+             answer for its own content.\n",
+        );
+        assert!(
+            body.find("quokka").unwrap() > 2_000,
+            "the deep marker must sit beyond any head-sized preview"
+        );
+
+        let bytes = body.as_bytes();
+        let hash = kin_blobs::digest(bytes);
+        let indexed = IndexPipeline::new()
+            .index_any_content(&FilePathId::new("AGENTS.md"), bytes, hash)
+            .unwrap();
+
+        let IndexedAny::OpaqueArtifact(artifact) = indexed else {
+            panic!("markdown must take the opaque enrichment facet");
+        };
+        let preview = artifact
+            .text_preview
+            .expect("a textual artifact must retain its text for retrieval");
+        assert!(preview.contains("zebrafish lantern protocol"));
+        assert!(preview.contains("quokka semaphore doctrine"));
+    }
+
+    /// The retention bound holds, and an extensionless text file qualifies by
+    /// content rather than by MIME hint.
+    #[test]
+    fn artifact_text_retention_is_bounded_and_content_qualified() {
+        let body = "word ".repeat(60_000);
+        let bytes = body.as_bytes();
+        let hash = kin_blobs::digest(bytes);
+        let indexed = IndexPipeline::new()
+            .index_any_content(&FilePathId::new("NOTICE"), bytes, hash)
+            .unwrap();
+
+        let IndexedAny::OpaqueArtifact(artifact) = indexed else {
+            panic!("extensionless text must take the opaque enrichment facet");
+        };
+        assert_eq!(artifact.mime_type, None);
+        let preview = artifact
+            .text_preview
+            .expect("printable extensionless bytes must qualify as text");
+        assert_eq!(
+            preview.chars().count(),
+            crate::artifacts::ARTIFACT_TEXT_RETENTION_CHARS
         );
     }
 

@@ -17341,6 +17341,59 @@ mod tests {
             .all(|entity| entity.id_space == LocateIdSpace::Artifact));
     }
 
+    /// The same promise through the REAL ingest enrichment instead of a
+    /// hand-rolled preview. Every fixture above hands `put_opaque` its full
+    /// body as `text_preview`, which is a state ingest never produced: the
+    /// enrichment pipeline stored every opaque artifact with no text at all,
+    /// so on a real store the text index held only a path and a MIME type and
+    /// every one of these green tests described a store that could not exist.
+    /// This test routes the bytes through `IndexPipeline::index_any_content`,
+    /// exactly what the daemon runs on admit, and puts the phrase past any
+    /// head-sized preview so head-only retention fails it too.
+    #[test]
+    #[serial_test::serial]
+    fn a_pipeline_enriched_docs_store_answers_for_deep_content() {
+        let mut body = String::from("# Kin Ecosystem AGENTS.md\n\n");
+        for index in 0..40 {
+            body.push_str(&format!(
+                "Ordinary paragraph {index} about workspace upkeep and lane hygiene, nothing \
+                 doctrinal here.\n\n"
+            ));
+        }
+        body.push_str("## Verification Rule\n\nChecks That Cannot Fail is doctrine here.\n");
+        assert!(
+            body.find("Checks That Cannot Fail").unwrap() > 2_000,
+            "the phrase must sit beyond any head-sized preview"
+        );
+
+        let bytes = body.as_bytes();
+        let indexed = kin_index::pipeline::IndexPipeline::new()
+            .index_any_content(
+                &FilePathId::new("AGENTS.md"),
+                bytes,
+                kin_blobs::digest(bytes),
+            )
+            .unwrap();
+        let kin_index::pipeline::IndexedAny::OpaqueArtifact(artifact) = indexed else {
+            panic!("markdown must take the opaque enrichment facet");
+        };
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph.put_opaque(&artifact).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "Checks That Cannot Fail");
+        assert!(
+            artifact_row(&result, "AGENTS.md").is_some(),
+            "a pipeline-enriched docs store must answer for its own deep content; entities: {:?}",
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The bound holds, and a short page says it was short. A page cut to its
     /// limit with nothing said reads as the store having only that much.
     #[test]
