@@ -36,6 +36,13 @@ repository. No data is uploaded to Firelock or any third party in this
 version. A future opt-in upload feature (described in the roadmap) will
 require a separate, explicit consent step.
 
+## What leaves the machine
+
+Telemetry is one slice of the network story. The complete enumeration of every network
+exit in the CLI, the daemon, and the launcher, and of what stays local by construction,
+lives in
+[docs/security/what-leaves-the-machine.md](docs/security/what-leaves-the-machine.md).
+
 ## How to manage your data
 
 ```sh
