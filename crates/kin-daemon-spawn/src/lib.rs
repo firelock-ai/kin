@@ -2000,6 +2000,35 @@ fn quiesce_pinned_process_group(
     Ok(())
 }
 
+/// Wait out the kill-to-exit window of the group's remaining members.
+///
+/// The cleanup barrier delivers SIGKILL to the whole group before finalization
+/// runs, but delivery is not death: the kernel retires a condemned process on
+/// its own schedule, and on a loaded host that lags the barrier by whole
+/// scheduler quanta, longer when the member is mid-fsync in uninterruptible
+/// sleep. The probe after sentinel reap runs exactly once, so any settling has
+/// to happen here, while the unreaped sentinel handle still pins the numeric
+/// group id and every member this reads is provably ours.
+///
+/// This settles and never judges. Whatever state the group is in at the
+/// deadline, the caller's single post-reap probe stays the one authority that
+/// can fail, with its richer diagnosis (sentinel exit reason included) intact.
+#[cfg(unix)]
+fn settle_pinned_group_member_exits(process_group: libc::pid_t, deadline: std::time::Instant) {
+    loop {
+        match process_group_containment(process_group) {
+            ProcessGroupContainment::Empty | ProcessGroupContainment::OnlyExited => return,
+            ProcessGroupContainment::LiveMember { .. }
+            | ProcessGroupContainment::Indeterminate { .. } => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(PROCESS_GROUP_GUARDIAN_POLL_INTERVAL);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn finalize_owned_process_group(
     sentinel: &mut Option<std::process::Child>,
@@ -2009,6 +2038,7 @@ fn finalize_owned_process_group(
     let sentinel_child = sentinel
         .as_mut()
         .ok_or_else(|| std::io::Error::other("process-group sentinel was already finalized"))?;
+    settle_pinned_group_member_exits(process_group, deadline);
     let status = reap_child_until(sentinel_child, deadline)?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -3350,6 +3380,63 @@ mod tests {
             process_group_containment(pgid),
             ProcessGroupContainment::LiveMember { pid: pgid },
             "a running member must be reported, and named"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn finalization_settle_outwaits_a_member_the_kill_has_not_yet_torn_down() {
+        // The merge-queue shape: the barrier's SIGKILL is delivered, the member
+        // has not yet been retired by the kernel, and finalization begins. The
+        // settle must keep reading until the member stops being live instead of
+        // judging the transient.
+        let mut child = spawn_in_own_group("sleep", &["30"]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::LiveMember { pid: pgid },
+            "the member must still be live when the settle begins"
+        );
+
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            unsafe { libc::kill(pgid, libc::SIGKILL) };
+        });
+        settle_pinned_group_member_exits(pgid, std::time::Instant::now() + Duration::from_secs(10));
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::OnlyExited,
+            "the settle returned while its member could still run"
+        );
+
+        killer.join().expect("join the killer thread");
+        child.wait().expect("collect the member");
+    }
+
+    #[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn finalization_settle_stays_bounded_and_leaves_a_live_member_reported() {
+        // The inverse: a member nothing killed must not be settled away. The
+        // wait uses its whole bound, returns, and leaves the live member for
+        // the post-reap probe to report, so failing loud still works.
+        let mut child = spawn_in_own_group("sleep", &["30"]);
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+
+        let bound = Duration::from_millis(200);
+        let began = std::time::Instant::now();
+        settle_pinned_group_member_exits(pgid, began + bound);
+        let waited = began.elapsed();
+        assert!(
+            waited >= bound,
+            "the settle gave up on a live member after {waited:?}, before its {bound:?} bound"
+        );
+        assert_eq!(
+            process_group_containment(pgid),
+            ProcessGroupContainment::LiveMember { pid: pgid },
+            "a member that never exits must stay reported for the probe to judge"
         );
 
         let _ = child.kill();
