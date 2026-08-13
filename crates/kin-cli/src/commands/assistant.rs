@@ -3,9 +3,13 @@
 
 use anyhow::Result;
 use kin_model::{EntityStore, WorkStore};
+use serde::Serialize;
 
 use kin_core::{doctor, install_adapter, list_adapters, AssistantKind};
 use kin_core::{ManagedDocConfig, RepoSummary, SyncMode};
+
+/// Schema token stamped on every `kin assistant list --json` answer.
+pub const ASSISTANT_LIST_SCHEMA: &str = "kin.assistant.list.v1";
 
 /// `kin assistant install <assistant>` — Install an assistant adapter.
 pub async fn install(assistant: String) -> Result<()> {
@@ -112,11 +116,54 @@ pub async fn run_doctor(assistant: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// One installed assistant adapter.
+#[derive(Debug, Serialize)]
+pub struct AssistantAdapterEntry {
+    /// Canonical adapter id, the token `kin assistant install` accepts.
+    pub kind: String,
+    pub display_name: String,
+    pub mcp_capable: bool,
+    pub cooperative: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssistantListJson {
+    pub schema: &'static str,
+    pub count: usize,
+    pub adapters: Vec<AssistantAdapterEntry>,
+}
+
+fn adapter_entries(adapters: &[kin_core::AssistantAdapterConfig]) -> Vec<AssistantAdapterEntry> {
+    adapters
+        .iter()
+        .map(|config| AssistantAdapterEntry {
+            kind: config.kind.as_str().to_string(),
+            display_name: config.display_name.clone(),
+            mcp_capable: config.mcp_capable,
+            cooperative: config.cooperative,
+        })
+        .collect()
+}
+
 /// `kin assistant list` — List installed assistant adapters.
-pub async fn list() -> Result<()> {
+pub async fn list(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
 
     let adapters = list_adapters(&layout)?;
+
+    // The text path spends its empty case teaching the reader how to install an
+    // adapter. That guidance is for a human at a terminal; the machine surface
+    // answers with a zero count and the same stamped envelope.
+    if json {
+        let entries = adapter_entries(&adapters);
+        let payload = AssistantListJson {
+            schema: ASSISTANT_LIST_SCHEMA,
+            count: entries.len(),
+            adapters: entries,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
 
     if adapters.is_empty() {
         println!("No assistant adapters installed.");
@@ -415,4 +462,75 @@ fn build_repo_summary(layout: &kin_core::KinLayout) -> Result<RepoSummary> {
         work_item_count: work_items.len(),
         coverage_ratio: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repository with no adapter installed answers with a stamped zero.
+    ///
+    /// The text path spends its empty case on install guidance, which is the
+    /// right answer for a human and unparseable for anything else.
+    #[test]
+    fn no_installed_adapter_answers_with_a_stamped_zero() {
+        let entries = adapter_entries(&[]);
+        assert!(entries.is_empty());
+
+        let payload = AssistantListJson {
+            schema: ASSISTANT_LIST_SCHEMA,
+            count: entries.len(),
+            adapters: entries,
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["schema"], ASSISTANT_LIST_SCHEMA);
+        assert_eq!(value["count"].as_u64().unwrap(), 0);
+        assert!(
+            value["adapters"].is_array(),
+            "the list must be present and empty, never absent"
+        );
+    }
+
+    /// Every installed adapter reaches the payload with the fields the table
+    /// prints, and `kind` is the canonical token rather than the display name.
+    ///
+    /// The two are different strings on purpose: `kind` is what
+    /// `kin assistant install` accepts back, so a caller round-tripping the
+    /// display name would build a command that fails.
+    #[test]
+    fn the_json_surface_carries_each_adapter_with_its_installable_kind() {
+        let installed = list_adapters_fixture();
+        let entries = adapter_entries(&installed);
+
+        assert_eq!(entries.len(), installed.len());
+        for (entry, config) in entries.iter().zip(installed.iter()) {
+            assert_eq!(entry.kind, config.kind.as_str());
+            assert_eq!(entry.display_name, config.display_name);
+            assert_eq!(entry.mcp_capable, config.mcp_capable);
+            assert_eq!(entry.cooperative, config.cooperative);
+        }
+
+        assert!(
+            AssistantKind::from_str(&entries[0].kind).is_some(),
+            "kind must be the token `kin assistant install` accepts"
+        );
+        assert!(
+            AssistantKind::from_str("kin-not-a-real-assistant").is_none(),
+            "the round-trip probe must be able to answer no, or the assertion \
+             above proves nothing"
+        );
+    }
+
+    fn list_adapters_fixture() -> Vec<kin_core::AssistantAdapterConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        install_adapter(&layout, AssistantKind::ClaudeCode).unwrap();
+        let installed = list_adapters(&layout).unwrap();
+        assert!(
+            !installed.is_empty(),
+            "an empty fixture would make every assertion above vacuous"
+        );
+        installed
+    }
 }

@@ -17,6 +17,9 @@ use url::Url;
 
 use crate::commands::auth;
 
+/// Schema token stamped on every `kin remote list --json` answer.
+pub const REMOTE_LIST_SCHEMA: &str = "kin.remote.list.v1";
+
 #[derive(Debug, Clone)]
 pub(crate) struct PushPlanContext {
     pub(crate) remote: RemoteRefConfig,
@@ -368,9 +371,87 @@ pub(crate) fn ensure_git_remote(working_dir: &Path, name: &str, url: Option<&str
     Ok(())
 }
 
-pub async fn list() -> Result<()> {
+/// One explicitly configured Kin remote.
+#[derive(Debug, Serialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub host: String,
+    pub transport: String,
+    pub default: bool,
+    pub url: Option<String>,
+}
+
+/// One Git coexistence remote sealed from repository-local Git config.
+#[derive(Debug, Serialize)]
+pub struct SealedGitRemoteEntry {
+    pub name: String,
+    pub host: String,
+    pub transport: String,
+    pub url: Option<String>,
+}
+
+/// `count` counts `remotes` alone, never the two lists summed.
+///
+/// The sealed list is a different kind of thing: those remotes were read out of
+/// Git rather than configured in Kin, and a single total would let a caller
+/// report configured remotes that do not exist. Its length is its own count.
+///
+/// Both arrays are always emitted. The text path shows sealed remotes only when
+/// no explicit remote is configured, which is a display choice about what is
+/// worth crowding a terminal with; a machine surface that dropped them would be
+/// hiding state the repository actually holds.
+#[derive(Debug, Serialize)]
+pub struct RemoteListJson {
+    pub schema: &'static str,
+    pub count: usize,
+    pub remotes: Vec<RemoteEntry>,
+    pub sealed_git_remotes: Vec<SealedGitRemoteEntry>,
+}
+
+fn collect_remotes(config: &KinConfig) -> Vec<RemoteEntry> {
+    config
+        .remote
+        .refs
+        .iter()
+        .map(|remote| RemoteEntry {
+            name: remote.name.clone(),
+            host: remote.host.to_string(),
+            transport: remote.transport.to_string(),
+            default: config.remote.default.as_deref() == Some(remote.name.as_str()),
+            url: remote.url.clone(),
+        })
+        .collect()
+}
+
+fn collect_sealed_git_remotes(config: &KinConfig) -> Vec<SealedGitRemoteEntry> {
+    config
+        .git
+        .remotes
+        .iter()
+        .map(|sealed| SealedGitRemoteEntry {
+            name: sealed.name.clone(),
+            host: sealed.host_kind().to_string(),
+            transport: RemoteTransportKind::GitExport.to_string(),
+            url: sealed.publish_url().map(str::to_string),
+        })
+        .collect()
+}
+
+pub async fn list(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
+
+    if json {
+        let remotes = collect_remotes(&config);
+        let payload = RemoteListJson {
+            schema: REMOTE_LIST_SCHEMA,
+            count: remotes.len(),
+            remotes,
+            sealed_git_remotes: collect_sealed_git_remotes(&config),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
 
     if config.remote.refs.is_empty() {
         println!("No explicit Kin remotes configured.");
@@ -931,6 +1012,97 @@ mod tests {
             fetch_refspecs: vec![format!("+refs/heads/*:refs/remotes/{name}/*")],
             push_refspecs: Vec::new(),
         }
+    }
+
+    /// `count` describes `remotes` alone.
+    ///
+    /// Summing the two lists would report configured Kin remotes that were
+    /// never configured, so this asserts the count against a config where the
+    /// two lengths differ. Were `count` the sum, it would read 3 here.
+    #[test]
+    fn the_json_count_describes_the_configured_remotes_alone() {
+        let mut config = KinConfig::default();
+        config.remote.refs = vec![test_remote("origin")];
+        config.remote.default = Some("origin".to_string());
+        config.git.remotes = vec![
+            sealed_remote("upstream", "https://github.invalid/acme/app.git"),
+            sealed_remote("mirror", "https://gitlab.invalid/acme/mirror.git"),
+        ];
+
+        let remotes = super::collect_remotes(&config);
+        let payload = super::RemoteListJson {
+            schema: super::REMOTE_LIST_SCHEMA,
+            count: remotes.len(),
+            remotes,
+            sealed_git_remotes: super::collect_sealed_git_remotes(&config),
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(value["schema"], super::REMOTE_LIST_SCHEMA);
+        assert_eq!(value["count"].as_u64().unwrap(), 1);
+        assert_eq!(value["remotes"].as_array().unwrap().len(), 1);
+        assert_eq!(value["sealed_git_remotes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["count"].as_u64().unwrap() as usize,
+            value["remotes"].as_array().unwrap().len(),
+            "count must track the remotes array, never the two lists summed"
+        );
+    }
+
+    /// Sealed Git remotes are emitted even when an explicit remote exists.
+    ///
+    /// The text path shows them only when no explicit remote is configured.
+    /// That is a choice about crowding a terminal, and a machine surface that
+    /// copied it would drop state the repository actually holds, invisibly.
+    #[test]
+    fn sealed_git_remotes_survive_an_explicit_remote_being_configured() {
+        let mut config = KinConfig::default();
+        config.remote.refs = vec![test_remote("origin")];
+        config.git.remotes = vec![sealed_remote(
+            "upstream",
+            "https://github.invalid/acme/app.git",
+        )];
+
+        let sealed = super::collect_sealed_git_remotes(&config);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].name, "upstream");
+        assert_eq!(
+            sealed[0].url.as_deref(),
+            Some("https://github.invalid/acme/app.git")
+        );
+        assert_eq!(
+            sealed[0].transport,
+            RemoteTransportKind::GitExport.to_string()
+        );
+        assert_eq!(sealed[0].host, RemoteHostKind::GitHub.to_string());
+
+        // The control: with no sealed remotes the list is empty, so the
+        // assertions above distinguish presence from a list that is always full.
+        config.git.remotes.clear();
+        assert!(super::collect_sealed_git_remotes(&config).is_empty());
+    }
+
+    /// The default flag marks exactly the configured default, and nothing else.
+    #[test]
+    fn exactly_the_default_remote_is_flagged_default() {
+        let mut config = KinConfig::default();
+        config.remote.refs = vec![test_remote("origin"), test_remote("backup")];
+        config.remote.default = Some("backup".to_string());
+
+        let remotes = super::collect_remotes(&config);
+        let flagged: Vec<&str> = remotes
+            .iter()
+            .filter(|remote| remote.default)
+            .map(|remote| remote.name.as_str())
+            .collect();
+        assert_eq!(flagged, vec!["backup"]);
+
+        // With no default configured nothing is flagged, so the assertion above
+        // is about the configured value rather than about position in the list.
+        config.remote.default = None;
+        assert!(super::collect_remotes(&config)
+            .iter()
+            .all(|remote| !remote.default));
     }
 
     #[cfg(unix)]
