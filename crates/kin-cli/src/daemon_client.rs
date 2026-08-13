@@ -7908,11 +7908,11 @@ mod tests {
     // later command repeated the same failure until the first daemon exited.
     // A timeout is evidence that a daemon is slow, never that it is dead.
 
-    /// A loopback port that refuses connections for as long as this guard
-    /// lives, so the probe exercises the unreachable-endpoint path without
-    /// waiting on a real timeout.
+    /// A loopback port guaranteed to answer no probe for as long as this
+    /// guard lives, so a test's unreachable endpoint stays unreachable for the
+    /// width of the test.
     ///
-    /// The refusal has to hold for the width of the probe, not just at
+    /// That guarantee has to hold for the width of the probe, not just at
     /// acquisition. This test binary runs hundreds of sibling tests that bind
     /// ephemeral loopback listeners the whole time, so a port that was merely
     /// observed closed and then released can be handed by the kernel to a
@@ -7920,9 +7920,11 @@ mod tests {
     /// answer naming a different repository, which is positive evidence of a
     /// stale record, and the verdict the test meant to be about "nothing
     /// listens here" becomes a retirement. Holding the socket bound but never
-    /// listening keeps both properties at once: without a listen queue every
-    /// connect is refused, and while the reservation is held no other socket
-    /// can bind the port.
+    /// listening keeps the port unanswerable and unbindable at once: no other
+    /// socket can take it, and with no listen queue a connect gets a reset on
+    /// Linux and Windows and an unanswered SYN on macOS. Both read as "no
+    /// usable answer" to every prober here, which judges through its own
+    /// deadline rather than through the shape of the connect failure.
     struct ReservedClosedPort {
         port: u16,
         _reservation: tokio::net::TcpSocket,
@@ -7941,16 +7943,18 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_closed_port_refuses_connections_and_cannot_be_rebound() {
+    fn a_reserved_closed_port_answers_no_connection_and_cannot_be_rebound() {
         let reserved = reserved_closed_loopback_port();
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], reserved.port));
 
-        let error = std::net::TcpStream::connect(address)
-            .expect_err("a reserved closed port must refuse connections while held");
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::ConnectionRefused,
-            "refusal must be immediate, not a timeout: {error}"
+        let error = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))
+            .expect_err("a reserved closed port must never yield a connection while held");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ),
+            "the connect failure must be refusal or silence, not a different failure: {error}"
         );
         assert!(
             std::net::TcpListener::bind(address).is_err(),
