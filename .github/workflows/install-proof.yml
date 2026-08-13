@@ -874,8 +874,21 @@ jobs:
           # is watching until every assertion that reads the store has run.
           captures="$RUNNER_TEMP/kin-proof-captures"
           mkdir -p "$captures"
-          kin search hello --json | tee "$captures/kin-search.json"
-          kin locate hello --json --explain --max-files 5 | tee "$captures/kin-locate.json"
+          # Redirect and print rather than pipe, the same treatment the first-run
+          # step gives `kin status` and for the same reason. A daemon that
+          # inherits the caller's pipe holds it until it idles out, so a piped
+          # query returns its answer and then leaves this shell waiting for the
+          # daemon to die. Every assertion below reads state the daemon owns, so
+          # a step that waits for the daemon before making them measures the
+          # wreckage instead: the endpoint read three lines down is retired
+          # during shutdown, and a missing `.kin/daemon.port` is what this step
+          # then reports. Releasing that handle is the fix, and this is the
+          # shape that stops one released build's regression from being read as
+          # a daemon that never published at all.
+          kin search hello --json > "$captures/kin-search.json"
+          cat "$captures/kin-search.json"
+          kin locate hello --json --explain --max-files 5 > "$captures/kin-locate.json"
+          cat "$captures/kin-locate.json"
 
           # `kin status` deliberately does not auto-start the daemon. The graph
           # query above does, so capture daemon provenance only after that

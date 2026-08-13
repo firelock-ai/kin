@@ -2804,8 +2804,25 @@ def assert_install_proof_status_contract(
 
     graph_active_lines = active_lines(graph_query)
     graph_active = "\n".join(graph_active_lines)
+    # A query that starts the daemon must be redirected, never piped. Windows
+    # hands a spawned daemon every handle its caller was given, so a piped query
+    # leaves the reader on the far side waiting for the daemon rather than for
+    # the CLI. The step then resumes only once the daemon has idled out and
+    # retired the endpoint the next line reads, so it reports a missing
+    # `.kin/daemon.port`. That reads as a daemon which never published one, and
+    # for two releases it was recorded as exactly that.
+    for line in graph_active_lines:
+        if line.startswith(("kin search ", "kin locate ")) and "|" in line:
+            raise AssertionError(
+                "install proof must redirect a daemon-starting query rather than "
+                "pipe it: a daemon that inherits the pipe holds it until idle "
+                "shutdown and retires the endpoint this step reads before the "
+                f"read happens: {line}"
+            )
+
     for policy in (
-        'kin search hello --json | tee "$captures/kin-search.json"',
+        'kin search hello --json > "$captures/kin-search.json"',
+        'kin locate hello --json --explain --max-files 5 > "$captures/kin-locate.json"',
         "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\"",
         'DAEMON_PORT="$daemon_port" node',
         "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
@@ -2820,7 +2837,7 @@ def assert_install_proof_status_contract(
     ):
         require(graph_active, policy, "installed daemon startup and health capture")
 
-    daemon_start = 'kin search hello --json | tee "$captures/kin-search.json"'
+    daemon_start = 'kin search hello --json > "$captures/kin-search.json"'
     endpoint_capture = "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
     setup_health = 'kin setup status --json | tee "$captures/kin-health.json"'
     doctor_health = 'kin doctor --json | tee "$captures/kin-doctor.json"'
@@ -8267,12 +8284,12 @@ def main() -> None:
         lambda: assert_install_proof_status_contract(
             first_run,
             graph_query.replace(
-                'kin search hello --json | tee "$captures/kin-search.json"',
+                'kin search hello --json > "$captures/kin-search.json"',
                 "# graph query moved below daemon provenance capture",
                 1,
             ).replace(
                 'cat "$captures/kin-daemon-health.json"',
-                'cat "$captures/kin-daemon-health.json"\n          kin search hello --json | tee "$captures/kin-search.json"',
+                'cat "$captures/kin-daemon-health.json"\n          kin search hello --json > "$captures/kin-search.json"',
                 1,
             ),
             embedding,
@@ -8285,8 +8302,40 @@ def main() -> None:
         lambda: assert_install_proof_status_contract(
             first_run,
             graph_query.replace(
+                'kin search hello --json > "$captures/kin-search.json"',
+                '# kin search hello --json > "$captures/kin-search.json"',
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "a daemon-starting query is piped again",
+        "must redirect a daemon-starting query rather than pipe it",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                'kin search hello --json > "$captures/kin-search.json"\n'
+                '          cat "$captures/kin-search.json"',
                 'kin search hello --json | tee "$captures/kin-search.json"',
-                '# kin search hello --json | tee "$captures/kin-search.json"',
+                1,
+            ),
+            embedding,
+            validation,
+        ),
+    )
+    expect_assertion(
+        "the second daemon-starting query is piped again",
+        "must redirect a daemon-starting query rather than pipe it",
+        lambda: assert_install_proof_status_contract(
+            first_run,
+            graph_query.replace(
+                "kin locate hello --json --explain --max-files 5 > "
+                '"$captures/kin-locate.json"\n'
+                '          cat "$captures/kin-locate.json"',
+                "kin locate hello --json --explain --max-files 5 | tee "
+                '"$captures/kin-locate.json"',
                 1,
             ),
             embedding,
@@ -8309,10 +8358,10 @@ def main() -> None:
                 1,
             )
             .replace(
-                'kin search hello --json | tee "$captures/kin-search.json"',
+                'kin search hello --json > "$captures/kin-search.json"',
                 'kin setup status --json | tee "$captures/kin-health.json"\n'
                 '          kin doctor --json | tee "$captures/kin-doctor.json"\n'
-                '          kin search hello --json | tee "$captures/kin-search.json"',
+                '          kin search hello --json > "$captures/kin-search.json"',
                 1,
             ),
             embedding,
