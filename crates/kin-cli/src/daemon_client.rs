@@ -7908,14 +7908,54 @@ mod tests {
     // later command repeated the same failure until the first daemon exited.
     // A timeout is evidence that a daemon is slow, never that it is dead.
 
-    /// A loopback port with nothing listening: connections are refused
-    /// immediately, so the probe exercises the unreachable-endpoint path
-    /// without waiting on a real timeout.
-    fn closed_loopback_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
+    /// A loopback port that refuses connections for as long as this guard
+    /// lives, so the probe exercises the unreachable-endpoint path without
+    /// waiting on a real timeout.
+    ///
+    /// The refusal has to hold for the width of the probe, not just at
+    /// acquisition. This test binary runs hundreds of sibling tests that bind
+    /// ephemeral loopback listeners the whole time, so a port that was merely
+    /// observed closed and then released can be handed by the kernel to a
+    /// sibling's mock daemon mid-probe. The probe then receives a real health
+    /// answer naming a different repository, which is positive evidence of a
+    /// stale record, and the verdict the test meant to be about "nothing
+    /// listens here" becomes a retirement. Holding the socket bound but never
+    /// listening keeps both properties at once: without a listen queue every
+    /// connect is refused, and while the reservation is held no other socket
+    /// can bind the port.
+    struct ReservedClosedPort {
+        port: u16,
+        _reservation: tokio::net::TcpSocket,
+    }
+
+    fn reserved_closed_loopback_port() -> ReservedClosedPort {
+        let socket = tokio::net::TcpSocket::new_v4().expect("create the port reservation socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback bind address"))
+            .expect("bind the port reservation");
+        let port = socket.local_addr().expect("read the reserved port").port();
+        ReservedClosedPort {
+            port,
+            _reservation: socket,
+        }
+    }
+
+    #[test]
+    fn a_reserved_closed_port_refuses_connections_and_cannot_be_rebound() {
+        let reserved = reserved_closed_loopback_port();
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], reserved.port));
+
+        let error = std::net::TcpStream::connect(address)
+            .expect_err("a reserved closed port must refuse connections while held");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "refusal must be immediate, not a timeout: {error}"
+        );
+        assert!(
+            std::net::TcpListener::bind(address).is_err(),
+            "no listener may take the port while the reservation is held"
+        );
     }
 
     fn write_endpoint_files(kin_root: &Path, pid: u32, port: u16) {
@@ -7942,7 +7982,8 @@ mod tests {
         let root = dir.path();
         // The recorded owner is this test process, so it is provably alive —
         // exactly the daemon-still-loading shape.
-        write_endpoint_files(root, std::process::id(), closed_loopback_port());
+        let closed = reserved_closed_loopback_port();
+        write_endpoint_files(root, std::process::id(), closed.port);
 
         let verdict = wait_for_existing_daemon_within(
             root,
@@ -7970,7 +8011,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let pid = std::process::id();
-        write_endpoint_files(root, pid, closed_loopback_port());
+        let closed = reserved_closed_loopback_port();
+        write_endpoint_files(root, pid, closed.port);
 
         let ExistingDaemon::LiveNotReady(message) = wait_for_existing_daemon_within(
             root,
@@ -8156,9 +8198,11 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn predecessor process");
-        write_endpoint_files(&root, predecessor.id(), closed_loopback_port());
+        let predecessor_port = reserved_closed_loopback_port();
+        write_endpoint_files(&root, predecessor.id(), predecessor_port.port);
 
-        let successor_port = closed_loopback_port();
+        let successor_reservation = reserved_closed_loopback_port();
+        let successor_port = successor_reservation.port;
         let successor_root = root.clone();
         let handover = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -9114,7 +9158,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let legacy_startup_authority =
             try_acquire_supervisor_startup_lock_in_dir(dir.path()).unwrap();
-        let legacy_port = closed_loopback_port();
+        let legacy_reservation = reserved_closed_loopback_port();
+        let legacy_port = legacy_reservation.port;
 
         let initial = wait_for_existing_supervisor_in_dir_with_hook(dir.path(), None, || {
             // The merge-base supervisor itself writes without either new lock.
@@ -9625,7 +9670,8 @@ mod tests {
     async fn contended_retirement_never_becomes_start_authorization() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write_endpoint_files(root, 999_999_999, closed_loopback_port());
+        let closed = reserved_closed_loopback_port();
+        write_endpoint_files(root, 999_999_999, closed.port);
         let lifecycle = OpenOptions::new()
             .create(true)
             .read(true)
@@ -9759,7 +9805,8 @@ mod tests {
             .open(dir.path().join(SUPERVISOR_SINGLETON_FILE))
             .unwrap();
         singleton.lock_exclusive().unwrap();
-        let port = closed_loopback_port();
+        let reservation = reserved_closed_loopback_port();
+        let port = reservation.port;
         std::fs::write(
             dir.path().join(SUPERVISOR_PID_FILE),
             std::process::id().to_string(),
@@ -9805,7 +9852,8 @@ mod tests {
         // positive evidence, so the record is cleared and a start proceeds.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write_endpoint_files(root, 999_999_999, closed_loopback_port());
+        let closed = reserved_closed_loopback_port();
+        write_endpoint_files(root, 999_999_999, closed.port);
 
         let verdict = wait_for_existing_daemon_within(
             root,
