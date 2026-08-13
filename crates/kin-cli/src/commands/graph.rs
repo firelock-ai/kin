@@ -1574,6 +1574,144 @@ mod tests {
         );
     }
 
+    /// The v0.5.21 battery's restart transient. Right after a daemon restart,
+    /// `kin graph status` announced `Embeddings: 0/10456 indexed (10456
+    /// pending)` with a pending warning on a store whose vectors were intact,
+    /// because `embedding_status` answers zero indexed for every retrievable
+    /// object while no vector index is attached. The state that must never be
+    /// read as loss: nothing was discarded at open and coverage has completed
+    /// on this store before.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_restart_attach_window_is_not_reported_as_lost_coverage() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph.upsert_entity(&test_entity("alpha_transform")).unwrap();
+        let total = graph.embedding_status().total;
+        assert!(total > 0, "the fixture must carry retrievable objects");
+        assert!(
+            graph.vector_index_stats().is_none(),
+            "the fixture graph must carry no attached vector index"
+        );
+
+        // Control: the same graph with no daemon context is a first fill, and
+        // a first fill keeps the measured counters and the pending warning.
+        let first_fill =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
+        let measured = format!("Embeddings: 0/{total} indexed ({total} pending)");
+        assert!(
+            first_fill.lines.iter().any(|line| line == &measured),
+            "a first fill keeps its measured line: {:?}",
+            first_fill.lines
+        );
+        assert!(
+            first_fill
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "a first fill keeps its pending warning: {:?}",
+            first_fill.lines
+        );
+
+        // The restart window itself.
+        let restart = build_graph_status_response(
+            &binding,
+            &graph,
+            &Default::default(),
+            &GraphStatusEmbeddingRuntime {
+                vector_index_discarded: None,
+                coverage_ever_complete: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !restart.lines.iter().any(|line| line.contains("indexed (")),
+            "the structural zero must not be printed as a measured count: {:?}",
+            restart.lines
+        );
+        assert!(
+            !restart
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "the restart window must not warn about lost coverage: {:?}",
+            restart.lines
+        );
+        let embeddings_line = restart
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            embeddings_line.contains("not measured at this instant"),
+            "{embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains(&total.to_string()),
+            "the total stays disclosed: {embeddings_line}"
+        );
+        assert!(
+            restart
+                .lines
+                .iter()
+                .any(|line| line.starts_with('ℹ') && line.contains("startup timing")),
+            "the window is disclosed as a note rather than hidden: {:?}",
+            restart.lines
+        );
+    }
+
+    /// A discard at open is a real gap and keeps its accounting, but it names
+    /// its cause beside the counters. Bare `0/N (N pending)` after a restart is
+    /// what sent operators toward a manual GPU embed pass the daemon's own
+    /// recovery made unnecessary.
+    #[test]
+    fn a_discarded_index_names_its_reason_beside_the_counters() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph.upsert_entity(&test_entity("beta_transform")).unwrap();
+        let status = graph.embedding_status();
+
+        let discarded = build_graph_status_response(
+            &binding,
+            &graph,
+            &Default::default(),
+            &GraphStatusEmbeddingRuntime {
+                vector_index_discarded: Some(
+                    "fixture: metadata no longer matches graph truth".to_string(),
+                ),
+                coverage_ever_complete: true,
+            },
+        )
+        .unwrap();
+        let embeddings_line = discarded
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            embeddings_line.contains(&format!(
+                "{}/{} indexed ({} pending)",
+                status.indexed, status.total, status.pending
+            )),
+            "a real gap keeps its measured counters: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("fixture: metadata no longer matches graph truth"),
+            "the discard reason is named where the counters are read: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("restores coverage in the background"),
+            "the automatic recovery is named so nobody runs a manual pass: {embeddings_line}"
+        );
+        assert!(
+            discarded
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "a real gap keeps its warning: {:?}",
+            discarded.lines
+        );
+    }
+
     #[test]
     fn graph_status_does_not_call_a_mixed_relation_graph_relationless() {
         let (_temp, binding, graph) = graph_validation_fixture();

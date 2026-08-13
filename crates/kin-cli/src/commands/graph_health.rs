@@ -704,6 +704,7 @@ mod tests {
                 path_samples: vec!["out/generated.rs".to_string()],
             },
             complete_coverage(),
+            None,
         )
     }
 
@@ -795,6 +796,7 @@ mod tests {
                 path_samples: Vec::new(),
             },
             coverage,
+            None,
         );
 
         assert!(report.repository_artifact_coverage.complete);
@@ -840,6 +842,7 @@ mod tests {
             &empty_supported_inputs(),
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(!report.repository_artifact_coverage.complete);
@@ -873,6 +876,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(report.critical_issues.is_empty());
@@ -905,6 +909,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(!report.graph_empty_for_supported_inputs);
@@ -931,6 +936,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(report.graph_empty_for_supported_inputs);
