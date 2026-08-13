@@ -1082,9 +1082,15 @@ fn score_name_match(search_term: &str, entity_name: &str) -> f32 {
     // on its signature substring alone, and the parity floor never records an
     // exact hit for it.
     //
-    // Deliberately narrower than making `::` a part separator outright. This
-    // restores the exact-name verdict the qualification hid and changes nothing
-    // about how partial matches against a qualified name are scored.
+    // Deliberately narrower than making `::` a part separator outright, so
+    // part-based partials against a qualified name are unchanged and
+    // `orphaned_vectors` against the method above still scores 3.0. The
+    // single-term contains fallback at the end of this function is NOT
+    // unchanged: a term equal to the tail takes this arm at 5.0 where that
+    // fallback scored it 1.0, which crosses the lexical parity floor's quality
+    // floor and its exact-hit latch and flips the seed loop's BM25F field
+    // weight from body to name. That widening is intended and its size is
+    // unmeasured.
     let tail_parts = split_identifier_parts(qualified_name_tail(entity_name));
     if !tail_parts.is_empty() && search_parts == tail_parts {
         return 5.0;
@@ -18329,10 +18335,10 @@ mod tests {
     /// The defect as the dogfood measured it, in the arithmetic that produced
     /// the number.
     ///
-    /// `InMemoryGraph::prune_orphaned_vectors` scored 52.054 in `files[].symbols`
-    /// on 0.5.17, 0.5.19 and 0.5.21, the same value on three consecutive
-    /// releases. It decomposes exactly: a name score of ZERO, one substring hit
-    /// in the signature (0.5), times the 100 proximity weight, plus 2.0 for the
+    /// `InMemoryGraph::prune_orphaned_vectors` scored 52.05 in `files[].symbols`
+    /// on 0.5.17 and 52.054 on 0.5.21, the same value on two releases. It
+    /// decomposes exactly: a name score of ZERO, one substring hit in the
+    /// signature (0.5), times the 100 proximity weight, plus 2.0 for the
     /// function kind and 0.054 for a 54-line span. The name score being zero is
     /// the whole of it, and 52.054 is what a symbol ranked on its signature text
     /// alone is worth.
@@ -18357,7 +18363,7 @@ mod tests {
         assert!(
             ranked[0].score > scored_on_signature_alone,
             "the exact-name candidate scored {} , which is the signature-text-only \
-             value the dogfood recorded on three releases",
+             value the dogfood recorded on 0.5.17 and 0.5.21",
             ranked[0].score
         );
         assert!(
