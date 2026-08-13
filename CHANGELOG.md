@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.22] - 2026-08-13
+
+### Changed
+
+- Read the sentinel token from its account-suffixed secret name (#796)
+
+
 ## [0.5.21] - 2026-08-12
 
 ### Changed
