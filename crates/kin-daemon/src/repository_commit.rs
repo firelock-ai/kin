@@ -1133,10 +1133,10 @@ pub(crate) fn commit_native_plan_with_projection(
             )
         })?
     } else {
-        let previous_entries = crate::mcp_commit::timed_commit_phase(
-            "load_previous_projection_entries",
-            || load_projection_entries(&authority, &plan.previous_tree, &mut body_cache),
-        )?;
+        let previous_entries =
+            crate::mcp_commit::timed_commit_phase("load_previous_projection_entries", || {
+                load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)
+            })?;
         crate::mcp_commit::timed_commit_phase("reconcile_workspace_and_commit_authority", || {
             kin_core::reconcile_source_tree_and_commit_repository_transaction(
                 layout.working_dir(),
