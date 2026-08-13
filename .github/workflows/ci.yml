@@ -329,6 +329,15 @@ jobs:
             "managed_spawn_fence" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon-spawn --lib
+          # The one clause of the spawn contract only Windows can answer. Unix
+          # gets handle release from CLOEXEC, so this case passes there whether
+          # or not the code that provides it on Windows exists, and a host run
+          # of it is not evidence about Windows. Same compilation unit as the
+          # fence leg above, so it costs a run rather than a build.
+          run_required_exact "detached spawn releases the caller's stdio" \
+            "tests::a_detached_spawn_does_not_hold_the_callers_stdout_open" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon-spawn --lib
           run_required_filter "daemon shutdown identity" "shutdown" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon --no-default-features --lib

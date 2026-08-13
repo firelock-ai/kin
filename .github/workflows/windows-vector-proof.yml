@@ -184,10 +184,17 @@ jobs:
           # state=unobserved reason=no_running_daemon wherever it is placed, and
           # returns that negative in under a second rather than hanging.
           #
+          # The cause is the pipe, not the daemon's own lifetime. A daemon
+          # spawned on Windows used to inherit every handle its caller held, so
+          # the `tee` above could not reach end of file until the daemon idled
+          # out, and the shell reached the next line only once it had. Releasing
+          # the caller's standard handles ends that wait, which may in turn let
+          # this read start observing a live daemon.
+          #
           # Keeping it after the queries costs nothing, so it stays there, but do
-          # not read the placement as buying coverage. Nothing here depends on it:
-          # the read is captured as a diagnostic and every assertion below runs
-          # off `kin embed`'s own report instead.
+          # not read the placement as buying coverage under either answer.
+          # Nothing here depends on it: the read is captured as a diagnostic and
+          # every assertion below runs off `kin embed`'s own report instead.
           kin.exe status --json | tee "$RUNNER_TEMP/kin-status.json"
 
       - name: Assert the runtime proved semantic search
