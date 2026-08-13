@@ -3424,6 +3424,19 @@ async fn command_graph(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    // The runtime facts below describe the HEAD store: why its persisted
+    // vector index was not installed at open, and whether its coverage has
+    // ever been whole. A session temporal scope serves a different graph, so
+    // those facts would mislabel it; a scoped request gets the default, which
+    // renders exactly as before.
+    let embedding_runtime = if std::sync::Arc::ptr_eq(&graph, &state.graph) {
+        kin_cli::commands::graph::GraphStatusEmbeddingRuntime {
+            vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+            coverage_ever_complete: state.embedding_coverage_ever_complete(),
+        }
+    } else {
+        kin_cli::commands::graph::GraphStatusEmbeddingRuntime::default()
+    };
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
         graph.as_ref(),
@@ -3432,6 +3445,7 @@ async fn command_graph(
             .background_work
             .reconcile()
             .report(std::time::Instant::now()),
+        &embedding_runtime,
     )
     .map_err(internal_error)?;
     Ok(Json(response))

@@ -10,7 +10,7 @@ use kin_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::graph_health::inspect_graph;
+use super::graph_health::{inspect_graph, inspect_graph_with_embedding_observation};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -221,9 +221,12 @@ pub fn execute_graph_command(
     graph: &kin_db::InMemoryGraph,
     request: &GraphCommandRequest,
     reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &GraphStatusEmbeddingRuntime,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => build_graph_status_response(binding, graph, reconcile),
+        GraphCommandRequest::Status => {
+            build_graph_status_response(binding, graph, reconcile, embedding_runtime)
+        }
         GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => build_graph_source_response(
@@ -234,12 +237,73 @@ pub fn execute_graph_command(
     }
 }
 
+/// What the daemon knows about this store's embedding runtime that the graph
+/// alone cannot say.
+///
+/// `embedding_status` structurally answers zero indexed for every retrievable
+/// object while no vector index is attached, and a restart serves exactly that
+/// window: the v0.5.21 battery watched `kin graph status` announce
+/// `0/10456 indexed (10456 pending)` on a store whose vectors sat intact on
+/// disk and recovered in seconds with zero embed dispatches. Telling that
+/// window apart from a first fill or a real discard takes two facts only the
+/// daemon holds, so the daemon hands them in the way it already hands
+/// `ReconcileHealth`.
+#[derive(Debug, Clone, Default)]
+pub struct GraphStatusEmbeddingRuntime {
+    /// Why the persisted vector index on disk was not installed when this
+    /// daemon opened, when it was there and was not. Mirrors
+    /// `DaemonState::vector_index_discarded`.
+    pub vector_index_discarded: Option<String>,
+    /// Whether this store's embedding coverage has ever been whole, read from
+    /// the persisted completion marker. A first fill and a restart window show
+    /// identical counters; only this tells them apart.
+    pub coverage_ever_complete: bool,
+}
+
+/// Whether coverage counters describe an attached vector index.
+///
+/// With no index attached, `embedding_status` answers `indexed = 0` for every
+/// retrievable object. That zero is structural; `vector_index_stats()` is the
+/// call that distinguishes an index that is absent from one that is measured.
+#[cfg(feature = "vector")]
+fn embedding_coverage_is_measured(graph: &kin_db::InMemoryGraph) -> bool {
+    graph.vector_index_stats().is_some()
+}
+
+/// Without vector support there is no index to attach and no structural zero
+/// to guard against; the legacy rendering stays.
+#[cfg(not(feature = "vector"))]
+fn embedding_coverage_is_measured(_graph: &kin_db::InMemoryGraph) -> bool {
+    true
+}
+
 fn build_graph_status_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &GraphStatusEmbeddingRuntime,
 ) -> Result<GraphCommandResponse> {
-    let health = inspect_graph(binding, graph)?;
+    // One sample for every embedding line in this response. The counter below
+    // and the health warning used to sample coverage independently, and an
+    // embed batch completing between the two reads made the warning name a
+    // pending count the counter beside it contradicted by exactly one batch
+    // (the v0.5.21 battery caught 1 of 12 paired readings disagreeing by 512).
+    let embed_status = graph.embedding_status();
+    let coverage_is_measured = embedding_coverage_is_measured(graph) || embed_status.total == 0;
+    // The restart window: nothing is attached, nothing was discarded, and this
+    // store has been whole before. Pending work in that state is the reader's
+    // timing, not lost coverage, and must not be warned about as loss.
+    let pending_is_not_loss = !coverage_is_measured
+        && embedding_runtime.vector_index_discarded.is_none()
+        && embedding_runtime.coverage_ever_complete;
+    let health = inspect_graph_with_embedding_observation(
+        binding,
+        graph,
+        Some(&super::graph_health::EmbeddingCoverageObservation {
+            status: embed_status.clone(),
+            pending_is_not_loss,
+        }),
+    )?;
 
     let entities = graph.list_all_entities()?;
 
@@ -293,9 +357,6 @@ fn build_graph_status_response(
         .iter()
         .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
         .collect();
-
-    // Embedding status
-    let embed_status = graph.embedding_status();
 
     // Doc summary coverage
     let with_docs = defined.iter().filter(|e| e.doc_summary.is_some()).count();
@@ -361,10 +422,28 @@ fn build_graph_status_response(
     lines.push(format!("Kinds: {}", kind_parts.join(", ")));
 
     lines.push(String::new());
-    lines.push(format!(
-        "Embeddings: {}/{} indexed ({} pending)",
-        embed_status.indexed, embed_status.total, embed_status.pending
-    ));
+    if let Some(reason) = &embedding_runtime.vector_index_discarded {
+        // A real gap, reported with its cause. The bare counters here read as
+        // discovered loss; naming the open-time discard and the automatic
+        // recovery is what tells the operator no manual GPU pass is owed.
+        lines.push(format!(
+            "Embeddings: {}/{} indexed ({} pending); the persisted vector index was not loaded \
+             when this daemon opened ({reason}); the daemon restores coverage in the background",
+            embed_status.indexed, embed_status.total, embed_status.pending
+        ));
+    } else if pending_is_not_loss {
+        lines.push(format!(
+            "Embeddings: not measured at this instant; no vector index is attached to this graph \
+             yet, coverage completed before on this store, and nothing was discarded at open, so \
+             {} retrievable objects await the index rather than re-embedding",
+            embed_status.total
+        ));
+    } else {
+        lines.push(format!(
+            "Embeddings: {}/{} indexed ({} pending)",
+            embed_status.indexed, embed_status.total, embed_status.pending
+        ));
+    }
     lines.push(format!(
         "Doc summaries: {}/{} ({:.0}%)",
         with_docs,
@@ -1282,7 +1361,7 @@ mod tests {
         // separates the two halves here and asserting on it would pass whatever
         // the reconcile term did. What must differ is the reconcile warning
         // itself: absent on a healthy daemon, present on this one.
-        let healthy = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let healthy = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
         assert!(
             !healthy
                 .lines
@@ -1302,6 +1381,7 @@ mod tests {
                 last_admission_success_age_seconds: Some(172_800),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -1349,6 +1429,7 @@ mod tests {
                 untracked_paths_sample: vec!["fir2152_probe.rs".to_string()],
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -1390,6 +1471,7 @@ mod tests {
                 last_error_age_seconds: Some(90),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         // The reconcile warning is the assertion that carries this test. The
@@ -1462,7 +1544,7 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let response = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
 
         // The entity-rooted total and the whole-table total count different
         // scopes, so neither line may carry a bare "Relations" label.
@@ -1505,7 +1587,7 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let response = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
 
         assert!(response
             .lines
@@ -2435,7 +2517,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let validate = build_graph_validate_response(&binding, &graph).unwrap();
-        let status = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let status = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
 
         let validate_notes = note_lines(&validate);
         assert!(
