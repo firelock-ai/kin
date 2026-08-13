@@ -1138,6 +1138,7 @@ pub fn context_bench_tool_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn all_tools_have_names_and_descriptions() {
@@ -1277,36 +1278,221 @@ mod tests {
         assert_eq!(list.tools.len(), 64);
     }
 
-    /// The tool reference must name every tool the registry serves, and its
-    /// headline count must be that number.
+    /// The reference lists each category's members on a line opening with this
+    /// marker. That roster is the surface a reader scans, so it is what
+    /// membership means here.
+    const DOC_ROSTER_MARKER: &str = "*Tools:*";
+
+    /// The names the reference's category rosters enumerate.
+    ///
+    /// A name that appears only in prose is not a roster entry. Reading the
+    /// whole page as one string erases that difference, which is how a tool
+    /// mentioned once inside another tool's description can satisfy a guard
+    /// while appearing in no category at all.
+    fn doc_roster_names(doc: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for line in doc.lines() {
+            let Some(roster) = line.trim().strip_prefix(DOC_ROSTER_MARKER) else {
+                continue;
+            };
+            // Backticks alternate open/close across the split, so the odd
+            // fragments are the code spans.
+            for span in roster.split('`').skip(1).step_by(2) {
+                let span = span.trim();
+                if !span.is_empty() {
+                    names.insert(span.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// The tool count the reference's headline claims, read as a number rather
+    /// than matched as a string.
+    ///
+    /// Matching a formatted sentence only ever answers "is this exact number
+    /// written somewhere", which a page can satisfy while enumerating a
+    /// different set. Reading the number lets it be compared against both the
+    /// registry and the rosters.
+    fn doc_headline_tool_count(doc: &str) -> Option<usize> {
+        let (_, after) = doc.split_once("exposes ")?;
+        let (count, _) = after.split_once(" semantic tools")?;
+        count.trim().parse().ok()
+    }
+
+    /// Every way `docs/mcp-tools.md` and the registry can disagree, stated
+    /// plainly. An empty result is the only passing answer.
+    fn doc_registry_disagreements(doc: &str, registered: &BTreeSet<String>) -> Vec<String> {
+        let rostered = doc_roster_names(doc);
+        let mut problems = Vec::new();
+
+        for name in registered.difference(&rostered) {
+            problems.push(format!(
+                "{name} is served by the registry but listed in no '{DOC_ROSTER_MARKER}' category \
+                 roster in docs/mcp-tools.md"
+            ));
+        }
+        for name in rostered.difference(registered) {
+            problems.push(format!(
+                "{name} is listed in a docs/mcp-tools.md category roster but the registry serves \
+                 no such tool"
+            ));
+        }
+
+        match doc_headline_tool_count(doc) {
+            Some(headline) => {
+                if headline != registered.len() {
+                    problems.push(format!(
+                        "the headline claims {headline} tools and the registry serves {}",
+                        registered.len()
+                    ));
+                }
+                if headline != rostered.len() {
+                    problems.push(format!(
+                        "the headline claims {headline} tools and the category rosters enumerate \
+                         {}",
+                        rostered.len()
+                    ));
+                }
+            }
+            None => problems.push(
+                "docs/mcp-tools.md states no 'exposes N semantic tools' headline count".to_string(),
+            ),
+        }
+
+        problems
+    }
+
+    /// The tool reference must enumerate every tool the registry serves, name
+    /// nothing it does not, and claim the count it enumerates.
     ///
     /// The reference presents itself as the whole surface, so a tool the
-    /// registry defines but the page never names is invisible to the agents
-    /// the page exists for, and two of the tools this caught ship in
+    /// registry defines but no category lists is invisible to the agents the
+    /// page exists for, and two of the tools this caught ship in
     /// `agent-default`. Nothing tied the page to the registry, which is why it
     /// drifted to claiming 62 while serving 64. `docs/env-vars.md` has exactly
     /// this tie and did not drift.
+    ///
+    /// The first repair of that drift compared substrings, which restored the
+    /// same blind spot in a shape that reported success: any mention anywhere
+    /// counted as coverage, and the headline was matched rather than read. The
+    /// comparison is between sets now, and `doc_registry_disagreements` is
+    /// exercised against synthetic pages below so its ability to fail does not
+    /// rest on a plant somebody removed afterward.
     #[test]
-    fn mcp_doc_names_every_registered_tool() {
+    fn mcp_doc_enumerates_exactly_the_registered_tools() {
         let doc = include_str!("../../../docs/mcp-tools.md");
         let list = tool_definitions();
-        for tool in &list.tools {
-            assert!(
-                doc.contains(tool.name.as_str()),
-                "{} is served by the registry but named nowhere in docs/mcp-tools.md",
-                tool.name
-            );
-        }
-        let headline = format!("exposes {} semantic tools", list.tools.len());
-        assert!(
-            doc.contains(headline.as_str()),
-            "docs/mcp-tools.md must state the served tool count, which is now {}",
-            list.tools.len()
+        let registered: BTreeSet<String> =
+            list.tools.iter().map(|tool| tool.name.clone()).collect();
+        assert_eq!(
+            registered.len(),
+            list.tools.len(),
+            "the registry serves a duplicate tool name, so set comparison would hide one of them"
         );
+
+        let problems = doc_registry_disagreements(doc, &registered);
         assert!(
-            !doc.contains("kin_not_a_real_tool"),
-            "the containment probe must be able to answer no, or the assertions \
-             above prove nothing"
+            problems.is_empty(),
+            "docs/mcp-tools.md disagrees with the registry:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_prose_mention_is_not_roster_membership() {
+        let doc = "\
+# Reference
+
+The Kin MCP server exposes 2 semantic tools to AI assistants.
+
+## 1. Retrieval
+*Tools:* `alpha`, `beta`
+
+- **`alpha`**: the first tool. Pair it with `gamma` when you need a body.
+";
+        // The substring test the old guard performed still passes here, which
+        // is precisely the defect: `gamma` is served by nothing the page lists.
+        assert!(doc.contains("gamma"));
+        assert!(!doc_roster_names(doc).contains("gamma"));
+
+        let registered = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let problems = doc_registry_disagreements(doc, &registered);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("gamma") && problem.contains("listed in no")),
+            "a registered tool mentioned only in prose must be reported: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_roster_name_the_registry_does_not_serve_is_reported() {
+        let doc = "\
+The Kin MCP server exposes 2 semantic tools to AI assistants.
+
+*Tools:* `alpha`, `retired_tool`
+";
+        let registered = ["alpha", "beta"].into_iter().map(String::from).collect();
+        let problems = doc_registry_disagreements(doc, &registered);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("retired_tool") && problem.contains("no such tool")),
+            "a rostered name the registry does not serve must be reported: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_headline_that_disagrees_with_the_rosters_is_reported() {
+        let doc = "\
+The Kin MCP server exposes 9 semantic tools to AI assistants.
+
+*Tools:* `alpha`, `beta`
+";
+        let registered = ["alpha", "beta"].into_iter().map(String::from).collect();
+        let problems = doc_registry_disagreements(doc, &registered);
+        assert!(
+            problems.iter().any(|problem| problem.contains("claims 9")),
+            "a headline disagreeing with what the page enumerates must be reported: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_headline_count_is_reported_rather_than_skipped() {
+        let doc = "*Tools:* `alpha`\n";
+        assert_eq!(doc_headline_tool_count(doc), None);
+        assert_eq!(doc_headline_tool_count("exposes many semantic tools"), None);
+        assert_eq!(
+            doc_headline_tool_count("exposes 64 semantic tools"),
+            Some(64)
+        );
+
+        let registered = ["alpha"].into_iter().map(String::from).collect();
+        let problems = doc_registry_disagreements(doc, &registered);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("states no 'exposes N semantic tools' headline")),
+            "a page with no headline count must be reported: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_agreeing_page_reports_nothing() {
+        let doc = "\
+The Kin MCP server exposes 2 semantic tools to AI assistants.
+
+*Tools:* `alpha`, `beta`
+";
+        let registered = ["alpha", "beta"].into_iter().map(String::from).collect();
+        assert_eq!(
+            doc_registry_disagreements(doc, &registered),
+            Vec::<String>::new(),
+            "the check must be able to pass, or its failures say nothing"
         );
     }
 
