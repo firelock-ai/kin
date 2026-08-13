@@ -1361,7 +1361,9 @@ mod tests {
         // separates the two halves here and asserting on it would pass whatever
         // the reconcile term did. What must differ is the reconcile warning
         // itself: absent on a healthy daemon, present on this one.
-        let healthy = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
+        let healthy =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
         assert!(
             !healthy
                 .lines
@@ -1544,7 +1546,9 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
+        let response =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
 
         // The entity-rooted total and the whole-table total count different
         // scopes, so neither line may carry a bare "Relations" label.
@@ -1585,7 +1589,9 @@ mod tests {
     #[test]
     fn a_restart_attach_window_is_not_reported_as_lost_coverage() {
         let (_temp, binding, graph) = graph_validation_fixture();
-        graph.upsert_entity(&test_entity("alpha_transform")).unwrap();
+        graph
+            .upsert_entity(&test_entity("alpha_transform"))
+            .unwrap();
         let total = graph.embedding_status().total;
         assert!(total > 0, "the fixture must carry retrievable objects");
         assert!(
@@ -1725,7 +1731,9 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
+        let response =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
 
         assert!(response
             .lines
@@ -2655,7 +2663,9 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let validate = build_graph_validate_response(&binding, &graph).unwrap();
-        let status = build_graph_status_response(&binding, &graph, &Default::default(), &Default::default()).unwrap();
+        let status =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
 
         let validate_notes = note_lines(&validate);
         assert!(

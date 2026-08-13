@@ -559,7 +559,10 @@ fn build_graph_health_report(
                 pending_embeddings
             ));
         } else {
-            warnings.push(format!("{} embeddings are still pending", pending_embeddings));
+            warnings.push(format!(
+                "{} embeddings are still pending",
+                pending_embeddings
+            ));
         }
     }
 
@@ -675,7 +678,8 @@ mod tests {
             ..complete_coverage()
         };
 
-        let report = build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None);
+        let report =
+            build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None);
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
