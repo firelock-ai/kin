@@ -230,17 +230,31 @@ fn query_names_a_symbol(query: &str) -> bool {
 /// scores cannot separate them: they are ranks within a result set, not evidence
 /// that anything matched.
 ///
-/// The verdict is read from what each arm already publishes about its FULL
-/// ranking, never from the page alone, because a page is a window: an exact name
-/// match sitting on page two would otherwise be reported as absent from the
-/// whole ranking.
+/// The verdict is read from what the answer publishes about its FULL ranking,
+/// never from the page alone, because a page is a window: an exact name match
+/// sitting on page two would otherwise be reported as absent from the whole
+/// ranking.
 ///
-/// - Fused arm: `all_fallback` is computed over the full ranking before paging
-///   and means precisely this, so it is used verbatim.
-/// - Cosine arm: every row's `match_evidence.name_match` is inspected, and only
-///   when the page holds the entire ranking. A row that reports no
-///   `match_evidence` at all leaves the question unanswered, so nothing is
-///   qualified — the same refusal to guess the rest of the module makes.
+/// `all_fallback` IS that published verdict. Both arms compute it over the whole
+/// retained ranking before the daemon windows a page, with the same rule, and
+/// both omit the field when it is false, so its presence is authoritative and
+/// routing does not enter into it.
+///
+/// A payload carrying no `all_fallback` at all is an older daemon that never
+/// published one, and only there is the fact inferred from the page: every row's
+/// `match_evidence.name_match` is inspected, and only when the page holds the
+/// entire ranking. A row that reports no `match_evidence` leaves the question
+/// unanswered, so nothing is qualified, which is the same refusal to guess the
+/// rest of the module makes.
+///
+/// The inference cannot be the primary reading, because the condition it needs
+/// is one a real store almost never meets. `total_ranked` grows with the
+/// requested limit, so the page covers the ranking only when the ranking
+/// collapses to a degenerate row or two. A fabricated symbol measured at limit 8
+/// ranked 1 and carried the disclosure; the same symbol at limit 50 ranked 56
+/// and carried none. Asking for more results removed the honesty envelope, which
+/// left the guard present in the one case nobody queries and absent in every
+/// case they do.
 fn locate_ranking_names_nothing(payload: &Value) -> bool {
     if !payload
         .get("query")
@@ -249,8 +263,11 @@ fn locate_ranking_names_nothing(payload: &Value) -> bool {
     {
         return false;
     }
+    if let Some(all_fallback) = payload.get("all_fallback").and_then(Value::as_bool) {
+        return all_fallback;
+    }
     if payload.get("routing").and_then(Value::as_str) == Some("fused-v1") {
-        return payload.get("all_fallback").and_then(Value::as_bool) == Some(true);
+        return false;
     }
     let Some(rows) = payload.get("results").and_then(Value::as_array) else {
         return false;
@@ -2401,6 +2418,136 @@ mod tests {
             &semantic_authoritative_envelope()
         )
         .is_none());
+    }
+
+    /// The measured pair, as one query at two limits against one daemon.
+    ///
+    /// `total_ranked` is not a fixed property of a query; it grows with the
+    /// requested limit. On a fresh fully embedded store a fabricated symbol
+    /// ranked 1 at limit 8 and 56 at limit 50, so the page covered the ranking
+    /// in the first case and not the second, and the disclosure that fired on
+    /// the small page vanished on the large one. Asking for more results removed
+    /// the honesty envelope, and the guard survived only because it was always
+    /// tested on a ranking small enough to satisfy it.
+    #[test]
+    fn a_cosine_page_wider_than_its_window_still_carries_the_unnamed_verdict() {
+        let page_of = |served: usize, total: u64| {
+            json!({
+                "query": "qqzz_fabricated_method_7k2b",
+                "granularity": "entity",
+                "routing": "cosine-v0",
+                "page": 0,
+                "total_ranked": total,
+                "all_fallback": true,
+                "results": (0..served)
+                    .map(|index| cosine_locate_hit(&format!("neighbor_{index}"), "none"))
+                    .collect::<Vec<_>>(),
+            })
+        };
+
+        // Limit 8: one ranked row, the page holds the whole ranking. This is the
+        // only shape that ever produced a negative.
+        let small = negative_for(
+            "semantic_locate",
+            &page_of(1, 1),
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a whole-ranking page has always been qualified");
+        assert_eq!(small["kind"], json!("no_named_match"));
+
+        // Limit 50: fifty rows served out of fifty-six ranked. Same daemon, same
+        // query, seconds apart, and this page carried no negative at all.
+        let wide = negative_for(
+            "semantic_locate",
+            &page_of(50, 56),
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a wider page is still a ranking that named nothing");
+        assert_eq!(wide["kind"], json!("no_named_match"));
+        assert_eq!(wide["interpretation"], json!("unnamed_ranking"));
+        // Qualification, never filtering: every row served is still counted.
+        assert_eq!(wide["result_count"], json!(50));
+        // The verdict is widened only in the safe direction. It says the ranking
+        // named nothing, never that the graph holds nothing.
+        assert_eq!(wide["safe_to_conclude_absent"], json!(false));
+        assert_eq!(wide["trust"], json!("inconclusive"));
+    }
+
+    /// The control that keeps the widened verdict honest: a published
+    /// `all_fallback` of false means a name hit is somewhere in the ranking, and
+    /// that is true of a windowed page exactly as it is of a whole one.
+    #[test]
+    fn a_cosine_page_whose_ranking_holds_a_name_hit_is_never_qualified() {
+        for (served, total) in [(50_usize, 56_u64), (2, 2)] {
+            // The daemon omits `all_fallback` when the ranking holds a name hit,
+            // so an ordinary answer carries no such key and one row reports the
+            // exact match.
+            let mut rows: Vec<Value> = (0..served.saturating_sub(1))
+                .map(|index| cosine_locate_hit(&format!("neighbor_{index}"), "none"))
+                .collect();
+            rows.insert(0, cosine_locate_hit("locate_result_count", "exact"));
+            let payload = json!({
+                "query": "locate_result_count",
+                "granularity": "entity",
+                "routing": "cosine-v0",
+                "page": 0,
+                "total_ranked": total,
+                "results": rows,
+            });
+            assert!(
+                negative_for(
+                    "semantic_locate",
+                    &payload,
+                    &semantic_authoritative_envelope()
+                )
+                .is_none(),
+                "a ranking holding the named symbol is not an unnamed ranking \
+                 ({served} of {total})"
+            );
+        }
+    }
+
+    /// An older daemon publishes no `all_fallback`, and its verdict must not
+    /// change. Everything the widened branch adds is read off a field that
+    /// daemon never sends, so the inference is exactly what still answers here.
+    #[test]
+    fn a_payload_without_all_fallback_keeps_the_inferred_verdict() {
+        let whole_ranking = json!({
+            "query": "zzqqxx_nonexistent_symbol_9f3a",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 2,
+            "results": [
+                cosine_locate_hit("neighbor_one", "none"),
+                cosine_locate_hit("neighbor_two", "partial"),
+            ],
+        });
+        assert!(
+            negative_for(
+                "semantic_locate",
+                &whole_ranking,
+                &semantic_authoritative_envelope()
+            )
+            .is_some(),
+            "the inference still qualifies a page that holds its whole ranking"
+        );
+
+        let windowed = json!({
+            "query": "zzqqxx_nonexistent_symbol_9f3a",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 9,
+            "results": [cosine_locate_hit("neighbor_one", "none")],
+        });
+        assert!(
+            negative_for(
+                "semantic_locate",
+                &windowed,
+                &semantic_authoritative_envelope()
+            )
+            .is_none(),
+            "without a published verdict a window is still unguessable"
+        );
     }
 
     #[test]
