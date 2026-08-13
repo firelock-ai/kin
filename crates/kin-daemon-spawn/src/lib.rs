@@ -2678,15 +2678,24 @@ impl DaemonSpawnPlan {
     }
 }
 
-/// Put the daemon in its own session so it outlives the process that started
-/// it and never receives the caller's terminal signals.
+/// Cut the daemon loose from the caller so it outlives the process that started
+/// it and takes none of that process's session with it.
 ///
-/// A test runtime is the one exception. Its guardian puts the invoking process
-/// in a stable process group and passes both an owner capability and the exact
-/// group id. Keeping the daemon in that verified group lets the harness reap
-/// the complete process tree even if graceful product cleanup fails. The owner
-/// marker alone is never sufficient: a missing, malformed, non-positive, or
-/// mismatched group keeps normal production detachment enabled.
+/// Unix reads that as the signal side: `setsid` puts the daemon in its own
+/// session, where the caller's terminal signals cannot reach it, and the file
+/// descriptors it does not need are already gone because Rust opens everything
+/// `CLOEXEC`.
+///
+/// Windows has no `CLOEXEC`, so the same sentence has to be enforced on the
+/// handle side instead; see [`release_caller_standard_handles`].
+///
+/// A test runtime is the one exception on the signal side. Its guardian puts
+/// the invoking process in a stable process group and passes both an owner
+/// capability and the exact group id. Keeping the daemon in that verified group
+/// lets the harness reap the complete process tree even if graceful product
+/// cleanup fails. The owner marker alone is never sufficient: a missing,
+/// malformed, non-positive, or mismatched group keeps normal production
+/// detachment enabled.
 pub fn detach_from_caller(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
@@ -2703,9 +2712,61 @@ pub fn detach_from_caller(cmd: &mut std::process::Command) {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = cmd;
+        release_caller_standard_handles();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Stop a spawned daemon from holding the caller's standard handles open.
+///
+/// `CreateProcess` hands a child every handle currently marked inheritable, not
+/// only the three the parent chose for its stdio. A handle the caller itself
+/// inherited keeps that mark, so a shell pipeline's write end reaches the daemon
+/// even though the daemon's own stdout and stderr were redirected into the
+/// daemon log. Nothing in the daemon knows it holds that handle, so it stays
+/// open for the daemon's whole life and the reader on the far side never sees
+/// end of file: `kin search --json | jq` prints its answer and then hangs until
+/// the daemon idles out, and whatever runs next in that shell observes a daemon
+/// that has just retired its endpoint rather than the live one that served the
+/// query.
+///
+/// Clearing the inherit flag on this process's standard handles is the
+/// equivalent of the `CLOEXEC` Unix gets for free. It does not affect stdio the
+/// caller assigns to a child, because `std::process` duplicates whatever handle
+/// a `Stdio` names into a fresh inheritable one for the child rather than
+/// passing this flag through, and it does not affect this process's own use of
+/// its handles, which is why it is safe to do once and leave done.
+#[cfg(windows)]
+fn release_caller_standard_handles() {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+
+    let standard = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for handle in standard {
+        // A process started without a console reports its standard handles as
+        // null or as the invalid sentinel. Neither names anything a child could
+        // inherit, and asking the kernel about them only produces an error to
+        // discard.
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // Nothing here can be repaired by a caller: the flag is either cleared
+        // or the handle was never inheritable in the first place.
+        unsafe {
+            let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+        }
     }
 }
 
@@ -5292,5 +5353,144 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // ── A detached spawn releases the caller's stdio ─────────────────────
+
+    /// Set on the process standing in for a spawned daemon; its value is the
+    /// path that process publishes to prove it really started.
+    const DETACHED_HOLDER_ENV: &str = "KIN_INTERNAL_TEST_DETACHED_HOLDER";
+
+    /// Set on the process standing in for the CLI that does the spawning; its
+    /// value is the readiness path it passes down.
+    const DETACHED_RELAY_ENV: &str = "KIN_INTERNAL_TEST_DETACHED_RELAY";
+
+    /// Long enough that anything still waiting on this process is waiting for
+    /// it and not for a slow runner, short enough that a failing run leaves
+    /// nothing behind for long.
+    const DETACHED_HOLDER_LIFETIME: Duration = Duration::from_secs(60);
+
+    /// A third of the holder's lifetime, so the pass and the failure are told
+    /// apart by a wide margin rather than by a race.
+    const DETACHED_CLOSE_BUDGET: Duration = Duration::from_secs(20);
+
+    /// Stand-in for the spawned daemon: publish readiness, then outlive the
+    /// process that started it.
+    #[test]
+    fn detached_spawn_holder_worker() {
+        let Some(ready) = std::env::var_os(DETACHED_HOLDER_ENV) else {
+            return;
+        };
+        let ready = PathBuf::from(ready);
+        let staged = ready.with_extension("staging");
+        std::fs::write(&staged, b"holding\n").expect("stage holder readiness");
+        std::fs::rename(&staged, &ready).expect("publish holder readiness");
+        std::thread::sleep(DETACHED_HOLDER_LIFETIME);
+    }
+
+    /// Stand-in for the CLI: spawn a daemon through the shared contract and
+    /// exit immediately, leaving only the question of what the daemon still
+    /// holds.
+    #[test]
+    fn detached_spawn_relay_worker() {
+        use std::process::Stdio;
+
+        let Some(ready) = std::env::var_os(DETACHED_RELAY_ENV) else {
+            return;
+        };
+        let executable = std::env::current_exe().expect("resolve the relay executable");
+        let mut holder = Command::new(executable);
+        holder
+            .args([
+                "--exact",
+                "tests::detached_spawn_holder_worker",
+                "--nocapture",
+            ])
+            .env(DETACHED_HOLDER_ENV, ready)
+            .env_remove(DETACHED_RELAY_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_from_caller(&mut holder);
+        let holder = holder.spawn().expect("spawn the detached holder");
+        // Outliving this process is the point, so the handle is released
+        // deliberately rather than waited on.
+        std::mem::forget(holder);
+    }
+
+    fn detached_probe_started(ready: &Path, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while !ready.is_file() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
+    /// A daemon started through the shared contract must not keep the stdio the
+    /// caller was given.
+    ///
+    /// Unix gets this from `CLOEXEC` and has always had it. Windows hands a
+    /// child every inheritable handle, so before the caller's standard handles
+    /// were released the daemon silently held its spawner's stdout: the reader
+    /// on the far side of `kin search --json | jq` saw no end of file until the
+    /// daemon idled out, and by then the daemon had retired the endpoint the
+    /// next command was about to read.
+    #[test]
+    fn a_detached_spawn_does_not_hold_the_callers_stdout_open() {
+        use std::io::Read as _;
+        use std::process::Stdio;
+
+        let dir = tempfile::tempdir().expect("temporary directory for the detach probe");
+        let ready = dir.path().join("holder.ready");
+        let executable = std::env::current_exe().expect("resolve the probe executable");
+
+        let mut relay = Command::new(executable)
+            .args([
+                "--exact",
+                "tests::detached_spawn_relay_worker",
+                "--nocapture",
+            ])
+            .env(DETACHED_RELAY_ENV, &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the detach relay");
+        let mut relay_stdout = relay.stdout.take().expect("the relay's stdout is a pipe");
+
+        // Read on a thread the test never joins: when the handle did leak, this
+        // read cannot return until the holder's own lifetime ends, and the test
+        // has to be able to report that rather than wait it out.
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut drained = Vec::new();
+            let closed = relay_stdout.read_to_end(&mut drained).is_ok();
+            let _ = closed_tx.send(closed);
+        });
+
+        // Readiness first, and it is not a formality: a relay that never
+        // managed to start a holder closes the pipe on its own, which is the
+        // exact observation this test would otherwise call a pass.
+        let started = detached_probe_started(&ready, DETACHED_CLOSE_BUDGET);
+        let closed = closed_rx.recv_timeout(DETACHED_CLOSE_BUDGET);
+
+        let _ = relay.kill();
+        let _ = relay.wait();
+
+        assert!(
+            started,
+            "the relay never started a detached holder, so this run proves nothing about what a \
+             holder keeps open"
+        );
+        assert_eq!(
+            closed.ok(),
+            Some(true),
+            "the detached holder is still holding its spawner's stdout open {} seconds after the \
+             spawner exited",
+            DETACHED_CLOSE_BUDGET.as_secs()
+        );
     }
 }
