@@ -35,4 +35,4 @@ jobs:
   notice:
     permissions:
       pull-requests: write
-    uses: firelock-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.25
+    uses: firelock-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.29
