@@ -80,6 +80,19 @@ fn collect_specs(specs_dir: &Path) -> Result<Vec<SpecEntry>> {
     Ok(specs)
 }
 
+/// The envelope `--json` prints, built in one place so a test can gate it.
+///
+/// The runtime must not assemble this inline: a test that built its own copy
+/// would keep passing while the printed document drifted, which is the shape of
+/// a check that cannot fail.
+fn spec_list_payload(specs: Vec<SpecEntry>) -> SpecListJson {
+    SpecListJson {
+        schema: SPEC_LIST_SCHEMA,
+        count: specs.len(),
+        specs,
+    }
+}
+
 pub async fn list(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
 
@@ -89,12 +102,10 @@ pub async fn list(json: bool) -> Result<()> {
     // An empty set is an answer, so the stamped envelope goes out with a zero
     // count rather than the prose the text path prints.
     if json {
-        let payload = SpecListJson {
-            schema: SPEC_LIST_SCHEMA,
-            count: specs.len(),
-            specs,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&spec_list_payload(specs))?
+        );
         return Ok(());
     }
 
@@ -187,12 +198,7 @@ mod tests {
         let specs = collect_specs(&dir.path().join("specs")).unwrap();
         assert!(specs.is_empty());
 
-        let payload = SpecListJson {
-            schema: SPEC_LIST_SCHEMA,
-            count: specs.len(),
-            specs,
-        };
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(spec_list_payload(specs)).unwrap();
         assert_eq!(value["schema"], SPEC_LIST_SCHEMA);
         assert_eq!(value["count"].as_u64().unwrap(), 0);
         assert!(
@@ -221,12 +227,7 @@ mod tests {
         assert_eq!(specs[0].intent, "name the embedding gap");
         assert_eq!(specs[1].intent, "tighten the reconcile loop");
 
-        let payload = SpecListJson {
-            schema: SPEC_LIST_SCHEMA,
-            count: specs.len(),
-            specs,
-        };
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(spec_list_payload(specs)).unwrap();
         assert_eq!(
             value["count"].as_u64().unwrap() as usize,
             value["specs"].as_array().unwrap().len()

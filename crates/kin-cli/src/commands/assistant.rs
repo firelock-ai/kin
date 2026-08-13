@@ -145,6 +145,20 @@ fn adapter_entries(adapters: &[kin_core::AssistantAdapterConfig]) -> Vec<Assista
         .collect()
 }
 
+/// The envelope `--json` prints, built in one place so a test can gate it.
+///
+/// The runtime must not assemble this inline: a test that built its own copy
+/// would keep passing while the printed document drifted, which is the shape of
+/// a check that cannot fail.
+fn assistant_list_payload(adapters: &[kin_core::AssistantAdapterConfig]) -> AssistantListJson {
+    let adapters = adapter_entries(adapters);
+    AssistantListJson {
+        schema: ASSISTANT_LIST_SCHEMA,
+        count: adapters.len(),
+        adapters,
+    }
+}
+
 /// `kin assistant list` — List installed assistant adapters.
 pub async fn list(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
@@ -155,13 +169,10 @@ pub async fn list(json: bool) -> Result<()> {
     // adapter. That guidance is for a human at a terminal; the machine surface
     // answers with a zero count and the same stamped envelope.
     if json {
-        let entries = adapter_entries(&adapters);
-        let payload = AssistantListJson {
-            schema: ASSISTANT_LIST_SCHEMA,
-            count: entries.len(),
-            adapters: entries,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&assistant_list_payload(&adapters))?
+        );
         return Ok(());
     }
 
@@ -474,15 +485,9 @@ mod tests {
     /// right answer for a human and unparseable for anything else.
     #[test]
     fn no_installed_adapter_answers_with_a_stamped_zero() {
-        let entries = adapter_entries(&[]);
-        assert!(entries.is_empty());
+        assert!(adapter_entries(&[]).is_empty());
 
-        let payload = AssistantListJson {
-            schema: ASSISTANT_LIST_SCHEMA,
-            count: entries.len(),
-            adapters: entries,
-        };
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(assistant_list_payload(&[])).unwrap();
         assert_eq!(value["schema"], ASSISTANT_LIST_SCHEMA);
         assert_eq!(value["count"].as_u64().unwrap(), 0);
         assert!(

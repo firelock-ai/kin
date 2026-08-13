@@ -437,19 +437,30 @@ fn collect_sealed_git_remotes(config: &KinConfig) -> Vec<SealedGitRemoteEntry> {
         .collect()
 }
 
+/// The envelope `--json` prints, built in one place so a test can gate it.
+///
+/// The runtime must not assemble this inline: a test that built its own copy
+/// would keep passing while the printed document drifted, which is the shape of
+/// a check that cannot fail.
+fn remote_list_payload(config: &KinConfig) -> RemoteListJson {
+    let remotes = collect_remotes(config);
+    RemoteListJson {
+        schema: REMOTE_LIST_SCHEMA,
+        count: remotes.len(),
+        remotes,
+        sealed_git_remotes: collect_sealed_git_remotes(config),
+    }
+}
+
 pub async fn list(json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let config = KinConfig::load_or_default(&layout.config_path())?;
 
     if json {
-        let remotes = collect_remotes(&config);
-        let payload = RemoteListJson {
-            schema: REMOTE_LIST_SCHEMA,
-            count: remotes.len(),
-            remotes,
-            sealed_git_remotes: collect_sealed_git_remotes(&config),
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&remote_list_payload(&config))?
+        );
         return Ok(());
     }
 
@@ -1029,14 +1040,7 @@ mod tests {
             sealed_remote("mirror", "https://gitlab.invalid/acme/mirror.git"),
         ];
 
-        let remotes = super::collect_remotes(&config);
-        let payload = super::RemoteListJson {
-            schema: super::REMOTE_LIST_SCHEMA,
-            count: remotes.len(),
-            remotes,
-            sealed_git_remotes: super::collect_sealed_git_remotes(&config),
-        };
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(super::remote_list_payload(&config)).unwrap();
 
         assert_eq!(value["schema"], super::REMOTE_LIST_SCHEMA);
         assert_eq!(value["count"].as_u64().unwrap(), 1);

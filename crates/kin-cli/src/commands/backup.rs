@@ -90,6 +90,19 @@ fn collect_backups(backups_dir: &PathBuf) -> Result<Vec<BackupEntry>> {
     Ok(backups)
 }
 
+/// The envelope `--json` prints, built in one place so a test can gate it.
+///
+/// The runtime must not assemble this inline: a test that built its own copy
+/// would keep passing while the printed document drifted, which is the shape of
+/// a check that cannot fail.
+fn backup_list_payload(backups: Vec<BackupEntry>) -> BackupListJson {
+    BackupListJson {
+        schema: BACKUP_LIST_SCHEMA,
+        count: backups.len(),
+        backups,
+    }
+}
+
 /// `kin backup list` — List available backups.
 pub async fn list(json: bool) -> Result<()> {
     let layout = discover_layout()?;
@@ -102,12 +115,10 @@ pub async fn list(json: bool) -> Result<()> {
     // A caller parsing this must never have to distinguish "no backups" from
     // "not JSON".
     if json {
-        let payload = BackupListJson {
-            schema: BACKUP_LIST_SCHEMA,
-            count: backups.len(),
-            backups,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&backup_list_payload(backups))?
+        );
         return Ok(());
     }
 
@@ -367,12 +378,7 @@ mod tests {
         let backups = collect_backups(&dir.path().to_path_buf()).unwrap();
         assert!(backups.is_empty());
 
-        let payload = BackupListJson {
-            schema: BACKUP_LIST_SCHEMA,
-            count: backups.len(),
-            backups,
-        };
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(backup_list_payload(backups)).unwrap();
         assert_eq!(value["schema"], BACKUP_LIST_SCHEMA);
         assert_eq!(value["count"].as_u64().unwrap(), 0);
         assert!(
@@ -403,12 +409,7 @@ mod tests {
         assert_eq!(backups[1].size_bytes, 2);
         assert!(backups[0].path.ends_with("graph-20260101-000000.kndb"));
 
-        let payload = BackupListJson {
-            schema: BACKUP_LIST_SCHEMA,
-            count: backups.len(),
-            backups,
-        };
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(backup_list_payload(backups)).unwrap();
         assert_eq!(
             value["count"].as_u64().unwrap() as usize,
             value["backups"].as_array().unwrap().len()
