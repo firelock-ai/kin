@@ -3,12 +3,19 @@
 
 name: Release Sentinel
 
-# Patrols the three release-rail failures that are silent by construction: a
-# green pull request whose auto-merge was disarmed and which therefore simply
-# never lands, a train that holds while main keeps accumulating releasable
-# drift, and a release whose own tag carries the defect that blocks it. None of
-# the three reports itself. Each one has previously been found by a human
-# noticing that nothing happened, which is the slowest detector available.
+# Patrols the release-rail failures that are silent by construction: a green
+# pull request whose auto-merge was disarmed and which therefore simply never
+# lands, and a release whose own tag carries the defect that blocks it. Neither
+# reports itself. Each has previously been found by a human noticing that
+# nothing happened, which is the slowest detector available.
+#
+# The third failure, a train holding while main keeps accumulating releasable
+# drift, is no longer one of them. The train now publishes a structured hold
+# marker on every cycle and a deterministic job in that same workflow opens the
+# alarm and fails its run, with no credential a founder has to mint. This patrol
+# reads the same marker but does not own the alarm, because a reporting path
+# that only works once a human wires a secret is a reporting path that was still
+# silent the day it was needed.
 #
 # ACTIVATION IS ONE FOUNDER STEP. This workflow reads
 # `secrets.CLAUDE_CODE_OAUTH_TOKEN_TROY_FIRELOCK_AI`, which only the founder can mint because
@@ -153,45 +160,45 @@ jobs:
             entry, not merging. If the command fails, report the error it printed
             and move on to the next pull request rather than trying another spelling.
 
-            DUTY TWO. Surface a train that is holding while main keeps drifting.
+            DUTY TWO. Read the rail's own hold marker and judge what it cannot.
 
-            Read the newest Release Train run with
-            `gh run list --repo ${{ github.repository }} --workflow release-train.yml
-            --limit 1 --json databaseId,conclusion,createdAt,url` and then read its
-            log with `gh run view <id> --repo ${{ github.repository }} --log`.
-
-            The train prints its decision. A line reading `release drift: N
-            first-parent range commit(s), base=<tag>, bump=<bump>` means it resolved
-            releasable drift and proceeded, which is healthy. A notice saying the
-            highest tag is not finalized GitHub Latest, or that a tag is already
-            staged on main, means the rail is HELD: the train has stood down and is
-            waiting for something else to move. A hold is only worth alarming about
-            when main has releasable drift behind it, because a held rail with
-            nothing to release is simply idle.
-
-            When the rail is held with drift, open or update ONE alarm issue. Its
-            title is exactly, with no tag or count appended:
+            The train no longer leaves its decision in prose. Every cycle publishes
+            a `release-hold-marker` artifact carrying schema `kin.release-hold.v1`,
+            and a deterministic job in the same workflow already owns the alarm: it
+            opens, updates, and closes ONE issue titled exactly
 
               Release rail is held with releasable drift
 
-            Find it first with `gh issue list --repo ${{ github.repository }} --state
-            open --search "\"Release rail is held with releasable drift\" in:title"
-            --json number,title --jq '.[] | select(.title == "Release rail is held
-            with releasable drift") | .number'`. GitHub title search is fuzzy, so
-            the exact-title filter is what makes this idempotent. If a number comes
-            back, update that issue's body with `gh issue edit <number> --repo
-            ${{ github.repository }} --body-file <file>`. Only when nothing comes
-            back do you `gh issue create`. Never open a second one, and never key
-            the title to a tag, because the tag changes while the condition does not.
+            once the rail has held with drift for four consecutive cycles, and it
+            fails its own run while that alarm stands. That job needs no credential
+            of yours and runs whether or not you are wired, so do NOT open, edit, or
+            close that issue, and never open a second issue about the same hold. It
+            is not yours. Duplicating it is how a rail ends up with two alarms that
+            disagree.
 
-            The body names the blocking tag, the failed release run id and its URL,
-            the drift count, and the two ways out: land the fix that unblocks the
-            tag, or record the tag as abandoned so the rail can step past it. Write
-            it as prose a captain can act on without opening the run.
+            Your duty here is the judgement the deterministic job deliberately does
+            not make. Read the newest cycle with `gh run list --repo
+            ${{ github.repository }} --workflow release-train.yml --limit 1 --json
+            databaseId,conclusion,url`, then read its marker with `gh run download
+            <id> --repo ${{ github.repository }} --name release-hold-marker --dir
+            <dir>`. Parse the JSON. Its `state` is `held` or `clear`, `reason` says
+            which stand-down the train took, `drift` is the count of reviewed commits
+            waiting, `blocking_tag` names the tag in the way, and
+            `failed_release_run_id` names the Release run that failed on it, or null
+            when no such run was found.
 
-            If the rail is healthy and that issue is open, say so in a comment and
-            close it. A stale alarm is worse than no alarm, because the next reader
-            learns to ignore it.
+            A `drift` of null means that cycle could not measure the count. Report it
+            as unmeasured. Never read it as zero: an unreadable count and a real zero
+            are different findings and only one of them means the rail is idle.
+
+            If `state` is `clear`, the rail is healthy and there is nothing to do
+            here. Say so and move on.
+
+            If `state` is `held` with drift above zero, go to duty three and decide
+            whether the blocking tag is structurally dead. That decision is the one
+            thing on this rail no deterministic job can make, and it is why you are
+            here. Comment your reasoning on the existing alarm issue when one is
+            open, so the captain reading it finds your judgement beside the facts.
 
             DUTY THREE. Draft an abandonment when the blocking release is
             structurally dead. You DRAFT it. You never merge it.
@@ -280,5 +287,5 @@ jobs:
             than the dash did, not less.
           claude_args: |
             --max-turns 60
-            --allowedTools "Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr merge --auto --squash:*),Bash(gh pr create --draft:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue close:*),Bash(git ls-remote:*),Bash(git checkout:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(git push --set-upstream origin automation/abandon-:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(python3 scripts/select-admissible-release-tag.py:*),Bash(jq:*),Read,Edit,Write"
+            --allowedTools "Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr merge --auto --squash:*),Bash(gh pr create --draft:*),Bash(gh run list:*),Bash(gh run view:*),Bash(gh run download:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Bash(gh issue close:*),Bash(git ls-remote:*),Bash(git checkout:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(git push --set-upstream origin automation/abandon-:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*),Bash(python3 scripts/select-admissible-release-tag.py:*),Bash(jq:*),Read,Edit,Write"
             --disallowedTools "WebFetch,WebSearch"
