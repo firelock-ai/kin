@@ -772,22 +772,36 @@ fn plan_minted_revision_vectors(
     minted
 }
 
-/// The most recent (HEAD) revision id of every entity's revision chain.
+/// The most recent (HEAD) revision id of every LIVE entity's revision chain.
 ///
 /// `append_entity_revisions` pushes each new generation to the end of the
-/// chain, so `revs.last()` is the live revision. Superseded generations are
-/// intentionally excluded: the vector index tracks at most one revision vector
-/// per live entity. A superseded generation that a live re-embed leaves behind
-/// is an orphan to reclaim — not retrieval truth that semantic search should
-/// return as a second hit for the same entity. This is the single authority for
-/// "which revision keys are current", shared by the prune target and the
-/// embedding-queue backfill so the two never disagree (a disagreement would make
-/// the backfill re-embed a key the prune immediately evicts, churning forever).
+/// chain, so `revs.last()` is the live revision. Two exclusions keep this the
+/// retrieval-truth set rather than the history set:
+///
+/// - Superseded generations. The vector index tracks at most one revision
+///   vector per live entity; a superseded generation that a live re-embed
+///   leaves behind is an orphan to reclaim, not retrieval truth that semantic
+///   search should return as a second hit for the same entity.
+/// - Chains whose owning entity the graph no longer holds. Whole-history
+///   ingest derives a revision chain for every entity that ever existed, and
+///   removing an entity ends its chain without deleting it, so a repository
+///   with real history carries many chains keyed by ids absent from
+///   `ent.entities`. Such a chain's head resolves only to a snapshot of a
+///   dead entity: a vector under its key can never be served, retrieval must
+///   drop it, and every drop is reported as a degradation. Admitting those
+///   heads as truth made a freshly embedded store rank and drop them on every
+///   query while the prune kept their vectors forever.
+///
+/// This is the single authority for "which revision keys are current", shared
+/// by the prune target and the embedding-queue backfill so the two never
+/// disagree (a disagreement would make the backfill re-embed a key the prune
+/// immediately evicts, churning forever).
 #[cfg(feature = "vector")]
 fn latest_revision_ids(ent: &EntityData) -> impl Iterator<Item = EntityRevisionId> + '_ {
     ent.entity_revisions
-        .values()
-        .filter_map(|revs| revs.last().map(|rev| rev.revision_id))
+        .iter()
+        .filter(|(id, _)| ent.entities.contains_key(*id))
+        .filter_map(|(_, revs)| revs.last().map(|rev| rev.revision_id))
 }
 
 fn entity_ids_for_relation(relation: &Relation) -> Vec<EntityId> {
@@ -15964,6 +15978,152 @@ mod tests {
 
         // Idempotent: a clean index prunes nothing.
         assert_eq!(gen2.prune_orphaned_vectors(), 0);
+    }
+
+    /// Index keys that resolve through revision history to an entity the graph
+    /// no longer holds. This mirrors the daemon's retired-key gate: retrieval
+    /// ranks such a key, resolves it to a snapshot of a dead entity, drops it,
+    /// and reports the drop as a `retired_entity_keys` degradation. The count
+    /// here is therefore the number of degradation-producing keys the store
+    /// would hand every query.
+    #[cfg(feature = "vector")]
+    fn count_index_keys_resolving_to_dead_entities(graph: &InMemoryGraph) -> usize {
+        let vi = graph
+            .vector_index
+            .lock()
+            .clone()
+            .expect("vector index installed");
+        vi.retrievable_keys()
+            .into_iter()
+            .filter(|key| match graph.resolve_retrieval_key(key) {
+                Some(ResolvedRetrievalItem::Entity(entity)) => {
+                    graph.get_entity(&entity.id).unwrap().is_none()
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// A store whose history contains a chain for an entity the graph no longer
+    /// holds, embedded fresh to full coverage, must hand retrieval zero keys it
+    /// can only drop. Whole-history ingest derives a revision chain for every
+    /// entity that ever existed and removal ends a chain without deleting it,
+    /// so truth admitting those chain heads made every query rank dead keys,
+    /// drop them, and warn, while the prune kept their vectors and a re-embed
+    /// re-queued them. Assertions are on counts and set membership so this
+    /// fails when dead heads are admitted as truth again.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn fresh_full_coverage_over_dead_chain_history_holds_zero_retired_keys() {
+        let live = test_entity("live_fn", "src/live.rs");
+        let retired = test_entity("retired_fn", "src/retired.rs");
+        let graph = InMemoryGraph::new();
+        apply_init_change(&graph, 0x01, &[live.clone(), retired.clone()]);
+
+        // History ends the retired entity's chain without deleting it.
+        graph.remove_entity(&retired.id).unwrap();
+        let (live_head_key, retired_head_key) = {
+            let ent = graph.entities.read();
+            assert!(
+                ent.entity_revisions.contains_key(&retired.id),
+                "removal must keep the revision chain (history is append-only)"
+            );
+            assert!(!ent.entities.contains_key(&retired.id));
+            (
+                RetrievalKey::EntityRevision(
+                    ent.entity_revisions[&live.id].last().unwrap().revision_id,
+                ),
+                RetrievalKey::EntityRevision(
+                    ent.entity_revisions[&retired.id]
+                        .last()
+                        .unwrap()
+                        .revision_id,
+                ),
+            )
+        };
+
+        // Truth is the live set only: the dead chain's head is out, the live
+        // entity's keys are in (positive controls prove the lookups can hit).
+        let truth = graph.graph_truth_retrievable_keys();
+        assert!(truth.contains(&RetrievalKey::Entity(live.id)));
+        assert!(truth.contains(&live_head_key));
+        assert!(!truth.contains(&retired_head_key));
+        assert_eq!(truth.len(), 2);
+
+        // Init-time invalidation queued work the synthetic embed below never
+        // drains; drop it so `pending` reflects coverage alone.
+        graph.embedding_queue.lock().clear();
+
+        // A fresh full-coverage embed over this history mints no droppable key,
+        // and coverage counts exactly the servable universe.
+        embed_all_retrievable(&graph);
+        let status = graph.embedding_status();
+        assert_eq!((status.indexed, status.pending, status.total), (2, 0, 2));
+        assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 0);
+
+        // A full re-queue admits live keys and never the dead head, so a
+        // re-embed cannot reintroduce what retrieval must drop.
+        graph.queue_all_for_embedding();
+        let queue = graph.embedding_queue.lock();
+        assert!(queue.contains(&RetrievalKey::Entity(live.id)));
+        assert!(queue.contains(&live_head_key));
+        assert!(!queue.contains(&retired_head_key));
+    }
+
+    /// Retiring an entity that already has vectors must stay visible until
+    /// reconciled, then actually reconcile: the surviving head-revision vector
+    /// counts as a droppable key while it lingers, one prune evicts exactly
+    /// that vector, and the missing-coverage backfill does not queue it back.
+    /// This is the discriminating pair to the fresh-store gate above: a real
+    /// retirement still surfaces, and the re-embed remediation genuinely
+    /// resolves it instead of churning forever.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn retiring_an_embedded_entity_is_reclaimed_by_prune_not_requeued() {
+        let live = test_entity("live_fn", "src/live.rs");
+        let retired = test_entity("retired_fn", "src/retired.rs");
+        let graph = InMemoryGraph::new();
+        apply_init_change(&graph, 0x01, &[live.clone(), retired.clone()]);
+        embed_all_retrievable(&graph);
+
+        // Init-time invalidation queued work the synthetic embed above never
+        // drains; drop it so `pending` reflects coverage alone.
+        graph.embedding_queue.lock().clear();
+
+        // Consume the initial full-reconcile flag on a clean store: nothing to
+        // evict, nothing droppable.
+        assert_eq!(graph.prune_orphaned_vectors(), 0);
+        assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 0);
+
+        let retired_head_key = {
+            let ent = graph.entities.read();
+            RetrievalKey::EntityRevision(
+                ent.entity_revisions[&retired.id]
+                    .last()
+                    .unwrap()
+                    .revision_id,
+            )
+        };
+
+        // Removal drops the HEAD-entity vector immediately but the revision
+        // vector survives until reconcile, so retrieval genuinely has one key
+        // it must drop: the degradation channel carries real signal here.
+        graph.remove_entity(&retired.id).unwrap();
+        assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 1);
+
+        // Removal forces a full reconcile; the prune evicts exactly the dead
+        // head and the store returns to a zero-drop steady state.
+        assert_eq!(graph.prune_orphaned_vectors(), 1);
+        assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 0);
+        let status = graph.embedding_status();
+        assert_eq!((status.indexed, status.pending, status.total), (2, 0, 2));
+
+        // The backfill agrees with the prune: nothing is missing, and the dead
+        // head is not re-queued for embedding.
+        graph.queue_missing_for_embedding();
+        let queue = graph.embedding_queue.lock();
+        assert_eq!(queue.len(), 0);
+        assert!(!queue.contains(&retired_head_key));
     }
 
     /// Source-level convergence: re-importing unchanged content must not append a
