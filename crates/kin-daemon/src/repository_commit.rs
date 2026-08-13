@@ -1102,41 +1102,56 @@ pub(crate) fn commit_native_plan_with_projection(
             plan.transaction.repository_id, repository_id
         )));
     }
-    let authority = authority_context.open().map_err(DaemonError::Graph)?;
-    for hash in &plan.source_hashes {
-        if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish() {
-            authority.save_source_blob(*hash, body)?;
+    let authority = crate::mcp_commit::timed_commit_phase("open_repository_authority", || {
+        authority_context.open()
+    })
+    .map_err(DaemonError::Graph)?;
+    crate::mcp_commit::timed_commit_phase("stage_changed_source_blobs", || {
+        for hash in &plan.source_hashes {
+            if let Some(body) = read_publishable_source(blobs, &authority, *hash)?.body_to_publish()
+            {
+                authority.save_source_blob(*hash, body)?;
+            }
         }
-    }
+        Ok::<(), DaemonError>(())
+    })?;
 
     let mut body_cache = BTreeMap::new();
-    let target_entries = load_projection_entries(&authority, &plan.target_tree, &mut body_cache)?;
+    let target_entries = crate::mcp_commit::timed_commit_phase("load_projection_entries", || {
+        load_projection_entries(&authority, &plan.target_tree, &mut body_cache)
+    })?;
     let (projected, receipt) = if plan.previous_tree == plan.target_tree {
-        kin_core::verify_unchanged_source_tree_and_commit_repository_transaction(
-            layout.working_dir(),
-            &plan.target_tree,
-            target_entries
-                .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-            &authority,
-            plan.transaction,
-        )?
+        crate::mcp_commit::timed_commit_phase("reconcile_workspace_and_commit_authority", || {
+            kin_core::verify_unchanged_source_tree_and_commit_repository_transaction(
+                layout.working_dir(),
+                &plan.target_tree,
+                target_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                &authority,
+                plan.transaction,
+            )
+        })?
     } else {
-        let previous_entries =
-            load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)?;
-        kin_core::reconcile_source_tree_and_commit_repository_transaction(
-            layout.working_dir(),
-            &plan.previous_tree,
-            &plan.target_tree,
-            previous_entries
-                .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-            target_entries
-                .iter()
-                .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-            &authority,
-            plan.transaction,
-        )?
+        let previous_entries = crate::mcp_commit::timed_commit_phase(
+            "load_previous_projection_entries",
+            || load_projection_entries(&authority, &plan.previous_tree, &mut body_cache),
+        )?;
+        crate::mcp_commit::timed_commit_phase("reconcile_workspace_and_commit_authority", || {
+            kin_core::reconcile_source_tree_and_commit_repository_transaction(
+                layout.working_dir(),
+                &plan.previous_tree,
+                &plan.target_tree,
+                previous_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                target_entries
+                    .iter()
+                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                &authority,
+                plan.transaction,
+            )
+        })?
     };
     let materializable = materializable_artifact_count(&plan.target_tree)?;
     if projected != materializable {
