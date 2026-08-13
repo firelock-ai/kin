@@ -8671,7 +8671,7 @@ def main() -> None:
         "attestations: read",
         "persist-credentials: false",
         "fetch-depth: 0",
-        "docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0",
+        "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
         "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c",
         "EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}",
         "EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}",
