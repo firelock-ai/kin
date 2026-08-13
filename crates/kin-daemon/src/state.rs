@@ -1614,12 +1614,13 @@ impl DaemonState {
                 vector_path.display()
             ),
         };
-        // Not "embedded again from scratch": the preserved sidecar stays on
-        // disk, and the recovery pass reuses prior vectors where they still
-        // apply. A dirty-restart repro on v0.5.23 watched a discarded index
-        // restore full coverage with zero embed dispatches, so promising a
-        // full GPU rebuild here overstated the cost and sent operators to run
-        // an embed pass nobody needed.
+        // Not "embedded again from scratch": the sidecar is preserved on disk,
+        // and the recovery pass answers unchanged texts from the embedder's
+        // persistent EmbeddingCache, forwarding only misses. A dirty-restart
+        // repro on v0.5.23 watched a discarded index restore full coverage
+        // with zero embed dispatches, so promising a full GPU rebuild here
+        // overstated the cost and sent operators to run an embed pass nobody
+        // needed.
         warn!(
             path = %vector_path.display(),
             "{discarded}; the daemon restores coverage in the background and reuses prior \
