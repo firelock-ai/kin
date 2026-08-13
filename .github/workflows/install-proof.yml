@@ -878,13 +878,13 @@ jobs:
           # step gives `kin status` and for the same reason. A daemon that
           # inherits the caller's pipe holds it until it idles out, so a piped
           # query returns its answer and then leaves this shell waiting for the
-          # daemon to die. Every assertion below reads state the daemon owns, so
-          # a step that waits for the daemon before making them measures the
-          # wreckage instead: the endpoint read three lines down is retired
-          # during shutdown, and a missing `.kin/daemon.port` is what this step
-          # then reports. Releasing that handle is the fix, and this is the
-          # shape that stops one released build's regression from being read as
-          # a daemon that never published at all.
+          # daemon to die. Everything below reads state the daemon owns, so a
+          # step that waits for the daemon before reading measures the wreckage
+          # instead: shutdown retires the endpoint, and the endpoint read just
+          # below then reports a `.kin/daemon.port` that never existed as far as
+          # it can tell. That is what this leg reported for two releases, and it
+          # is why the queries here must not be piped even once the daemon stops
+          # holding handles it was never given.
           kin search hello --json > "$captures/kin-search.json"
           cat "$captures/kin-search.json"
           kin locate hello --json --explain --max-files 5 > "$captures/kin-locate.json"
