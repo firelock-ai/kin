@@ -10,10 +10,10 @@ mounted by `kin-daemon`). **Publishing and other mutations require
 authentication; reads remain open.** Cargo and OCI use separate write
 credentials so one ecosystem's publisher cannot mutate the other.
 
-- Read endpoints — `config.json`, the sparse index, and `dl/{name}/{version}`
-  downloads — never check a token, so `cargo` can fetch dependencies without
+- Read endpoints (`config.json`, the sparse index, and `dl/{name}/{version}`
+  downloads) never check a token, so `cargo` can fetch dependencies without
   credentials.
-- The write endpoint — `POST /registry/cargo/api/v1/crates/publish` — requires a
+- The write endpoint (`POST /registry/cargo/api/v1/crates/publish`) requires a
   bearer token that matches the daemon's configured secret.
 - OCI `POST`, `PUT`, and `DELETE` routes require the OCI bearer token; OCI
   `GET` and `HEAD` routes remain public for pulls and discovery.
@@ -74,13 +74,13 @@ the environment, trying in order:
 2. `KIN_REGISTRY_CARGO_TOKEN`
 
 The first non-empty value is sent as the bearer token. If neither is set, the CLI
-prints a warning to stderr —
+prints a warning to stderr:
 
 ```
 warning: no KINLAB_CARGO_TOKEN set; publish will be rejected by an authenticated registry
 ```
 
-— and posts without the header, which an authenticated registry rejects.
+The CLI then posts without the header, which an authenticated registry rejects.
 
 ### 2. Per-repo `scripts/publish-kinlab-crates.sh`
 
@@ -92,10 +92,10 @@ registry_token="${KINLAB_CARGO_TOKEN:-${KINLAB_TOKEN:-}}"
 ```
 
 and attach `authorization: Bearer ${registry_token}` to the upload. These run in
-CI on `v*.*.*` release tags, wired through:
+CI on `v*.*.*` release tags. In CI:
 
-- `KINLAB_CARGO_TOKEN` — from the `KINLAB_CARGO_TOKEN` CI secret
-- `KINLAB_CARGO_REGISTRY_URL` — from the `KINLAB_CARGO_REGISTRY_URL` CI variable
+- `KINLAB_CARGO_TOKEN` comes from the `KINLAB_CARGO_TOKEN` CI secret
+- `KINLAB_CARGO_REGISTRY_URL` comes from the `KINLAB_CARGO_REGISTRY_URL` CI variable
 
 If the token is empty the scripts omit the header and the publish is rejected by
 the now-fail-closed registry (surfaced as a non-2xx HTTP error).

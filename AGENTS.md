@@ -2,9 +2,9 @@
 
 This repository (`kin`) is part of the Kin ecosystem.
 
-The canonical source of truth for agent and contributor guidance — repo roles,
+The canonical source of truth for agent and contributor guidance (repo roles,
 boundaries, multi-session lane arbitration, commit hygiene, investor-hygiene
-rules, the ordered vision, and the public narrative — lives in the umbrella
+rules, the ordered vision, and the public narrative) lives in the umbrella
 workspace `AGENTS.md`:
 
 **`kin-ecosystem/AGENTS.md`** (also symlinked as `kin-ecosystem/CLAUDE.md`)

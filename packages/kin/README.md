@@ -82,7 +82,7 @@ Any MCP client can also use the included server manually:
 
 `kin setup status` and `kin doctor` recognize this exact canonical wrapper topology instead
 of flagging it for repair. Do not shorten `command` to a bare `kin`: agent clients do not
-reliably inherit your shell `PATH`. Codex and Antigravity bindings additionally require
+reliably inherit your shell `PATH`. Codex and Antigravity bindings also require
 `"--repo", "/absolute/path/to/repository"` at the end of the argument vector; an Antigravity
 workspace entry also uses that path as `cwd`.
 
