@@ -84,7 +84,7 @@ regex = "1"
 tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 rayon = { workspace = true }
-rustc-hash = "1.1"
+rustc-hash = "2.1"
 sysinfo = "0.39"
 toml = { workspace = true }
 toml_edit = "0.25"
