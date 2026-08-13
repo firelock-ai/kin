@@ -847,6 +847,30 @@ where
     Ok(file_ids)
 }
 
+/// Upper bound, in characters, on one supporting-artifact entry in a pack.
+///
+/// A tracked artifact retains its text up to
+/// `kin_index::artifacts::ARTIFACT_TEXT_RETENTION_CHARS` so the text index and
+/// the artifact embedding see the whole document. A pack entry is a different
+/// thing: an excerpt sitting beside the focal entity under a shared token
+/// budget. Unbounded, one ordinary document claims the entire budget, and every
+/// other artifact for every other file loses its seat. The whole text stays
+/// reachable through the artifact read path.
+const ARTIFACT_ENTRY_CONTENT_CHARS: usize = 2_000;
+
+/// Trim an artifact entry to the excerpt a pack can afford to carry.
+fn bounded_artifact_entry_content(content: String) -> String {
+    if content.len() <= ARTIFACT_ENTRY_CONTENT_CHARS {
+        return content;
+    }
+    content.chars().take(ARTIFACT_ENTRY_CONTENT_CHARS).collect()
+}
+
+/// Admit supporting artifacts for the planned files under the pack's budget.
+///
+/// Admission skips an entry that does not fit rather than stopping at it.
+/// Entries sort by file path, so stopping let whichever artifact happened to
+/// sort early decide how many of the others were seen at all.
 fn append_supporting_artifacts<G>(
     graph: &G,
     pack: &mut ContextPack,
@@ -873,7 +897,7 @@ where
                 retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: file.file_id.clone(),
                 kind: ArtifactContextKind::ShallowFile,
-                content: kin_db::embed::format_shallow_text(&file),
+                content: bounded_artifact_entry_content(kin_db::embed::format_shallow_text(&file)),
             });
         }
 
@@ -885,7 +909,9 @@ where
                 retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
-                content: kin_db::embed::format_artifact_text(&artifact),
+                content: bounded_artifact_entry_content(kin_db::embed::format_artifact_text(
+                    &artifact,
+                )),
             });
         }
 
@@ -897,7 +923,9 @@ where
                 retrieval_key: RetrievalKey::Artifact(artifact_id),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::OpaqueArtifact,
-                content: kin_db::embed::format_opaque_text(&artifact),
+                content: bounded_artifact_entry_content(kin_db::embed::format_opaque_text(
+                    &artifact,
+                )),
             });
         }
     }
@@ -912,7 +940,7 @@ where
     for entry in entries {
         let tokens = estimate_tokens(&entry.content);
         if pack.actual_tokens + tokens > budget_max {
-            break;
+            continue;
         }
         pack.actual_tokens += tokens;
         pack.supporting_artifacts.push(entry);
@@ -1839,6 +1867,186 @@ mod tests {
             .annotations
             .iter()
             .all(|entry| !entry.content.contains("Keep this target cached")));
+    }
+
+    /// A docs store is the case FIR-2183 is about, and a real doc is far larger
+    /// than the metadata line artifacts used to carry. The entry must be
+    /// excerpted to a size a pack can afford, and an entry that still does not
+    /// fit must not decide whether the rest of the files are seen at all. The
+    /// sibling Makefile sorts after AGENTS.md, so it is exactly the seat a
+    /// stop-at-first-overflow admission gave away.
+    #[test]
+    fn a_large_docs_artifact_neither_empties_nor_dominates_supporting_artifacts() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let mut docs_body =
+            String::from("# Kin Ecosystem AGENTS.md\n\nThe canonical umbrella doc.\n\n");
+        while docs_body.len() < 53_000 {
+            docs_body.push_str(
+                "Ordinary paragraph about workspace upkeep, lane hygiene, and the ordered \
+                 story this file keeps durable.\n\n",
+            );
+        }
+
+        let agents = FilePathId::new("AGENTS.md");
+        let makefile = FilePathId::new("Makefile");
+        let agents_artifact_id = admit_test_artifact(&store, &agents, Hash256::from_bytes([7; 32]));
+        let makefile_artifact_id =
+            admit_test_artifact(&store, &makefile, Hash256::from_bytes([3; 32]));
+
+        store
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: agents.clone(),
+                content_hash: Hash256::from_bytes([7; 32]),
+                mime_type: Some("text/markdown".to_string()),
+                text_preview: Some(docs_body),
+            })
+            .unwrap();
+        store
+            .upsert_structured_artifact(&StructuredArtifact {
+                file_id: makefile.clone(),
+                kind: ArtifactKind::Makefile,
+                content_hash: Hash256::from_bytes([3; 32]),
+                text_preview: Some("build:\n\tcargo test".to_string()),
+            })
+            .unwrap();
+
+        let plan = ContextPlan {
+            seeds: vec![
+                ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(agents_artifact_id),
+                    file_path: Some(agents.clone()),
+                    score: 3.0,
+                    lexical: true,
+                    semantic: false,
+                },
+                ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(makefile_artifact_id),
+                    file_path: Some(makefile.clone()),
+                    score: 2.0,
+                    lexical: true,
+                    semantic: false,
+                },
+            ],
+        };
+
+        let options = ContextOptions::default();
+        let budget_max = options.budget.max_tokens();
+        let pack = build_context_pack_from_plan(&store, &focal.id, &options, &plan).unwrap();
+
+        let docs_entry = pack
+            .supporting_artifacts
+            .iter()
+            .find(|entry| entry.file_path == agents)
+            .expect("a docs store must carry its own artifact in a default-budget pack");
+        assert!(
+            docs_entry.content.contains("Kin Ecosystem AGENTS.md"),
+            "the admitted entry must carry artifact text, not just its metadata line"
+        );
+        assert!(
+            docs_entry.content.chars().count() <= ARTIFACT_ENTRY_CONTENT_CHARS,
+            "one artifact entry must stay an excerpt"
+        );
+        assert!(
+            estimate_tokens(&docs_entry.content) * 4 < budget_max,
+            "one artifact entry must not claim a quarter of the budget"
+        );
+
+        assert!(
+            pack.supporting_artifacts
+                .iter()
+                .any(|entry| entry.file_path == makefile),
+            "a large artifact must not cost a later file its seat"
+        );
+        assert!(pack.actual_tokens <= budget_max);
+    }
+
+    /// Admission skips what it cannot afford instead of stopping there. The
+    /// budget here fits the Makefile entry and not the AGENTS.md one, and
+    /// AGENTS.md sorts first, so stopping at the first overflow costs the
+    /// Makefile a seat it could have paid for.
+    #[test]
+    fn an_unaffordable_artifact_does_not_cost_the_next_file_its_seat() {
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_file_entity("handler", EntityKind::Function, "src/main.rs");
+        store.upsert_entity(&focal).unwrap();
+
+        let agents = FilePathId::new("AGENTS.md");
+        let makefile = FilePathId::new("Makefile");
+        assert!(agents.0 < makefile.0, "the large entry must sort first");
+
+        let agents_artifact_id = admit_test_artifact(&store, &agents, Hash256::from_bytes([7; 32]));
+        let makefile_artifact_id =
+            admit_test_artifact(&store, &makefile, Hash256::from_bytes([3; 32]));
+
+        let opaque = OpaqueArtifact {
+            file_id: agents.clone(),
+            content_hash: Hash256::from_bytes([7; 32]),
+            mime_type: Some("text/markdown".to_string()),
+            text_preview: Some("Doctrine paragraph about lane hygiene. ".repeat(40)),
+        };
+        let structured = StructuredArtifact {
+            file_id: makefile.clone(),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([3; 32]),
+            text_preview: Some("build:\n\tcargo test".to_string()),
+        };
+        store.upsert_opaque_artifact(&opaque).unwrap();
+        store.upsert_structured_artifact(&structured).unwrap();
+
+        let agents_tokens = estimate_tokens(&bounded_artifact_entry_content(
+            kin_db::embed::format_opaque_text(&opaque),
+        ));
+        let makefile_tokens = estimate_tokens(&bounded_artifact_entry_content(
+            kin_db::embed::format_artifact_text(&structured),
+        ));
+        assert!(
+            makefile_tokens < agents_tokens,
+            "the fixture must make only the later entry affordable"
+        );
+
+        let baseline = build_context_pack(&store, &focal.id, &ContextOptions::default())
+            .unwrap()
+            .actual_tokens;
+        let options = ContextOptions {
+            budget: TokenBudget::Custom(baseline + makefile_tokens),
+            ..ContextOptions::default()
+        };
+
+        let plan = ContextPlan {
+            seeds: vec![
+                ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(agents_artifact_id),
+                    file_path: Some(agents.clone()),
+                    score: 3.0,
+                    lexical: true,
+                    semantic: false,
+                },
+                ContextPlanSeed {
+                    retrieval_key: RetrievalKey::Artifact(makefile_artifact_id),
+                    file_path: Some(makefile.clone()),
+                    score: 2.0,
+                    lexical: true,
+                    semantic: false,
+                },
+            ],
+        };
+
+        let pack = build_context_pack_from_plan(&store, &focal.id, &options, &plan).unwrap();
+
+        let admitted: Vec<&FilePathId> = pack
+            .supporting_artifacts
+            .iter()
+            .map(|entry| &entry.file_path)
+            .collect();
+        assert_eq!(
+            admitted,
+            vec![&makefile],
+            "the affordable later entry must still be admitted"
+        );
+        assert!(pack.actual_tokens <= options.budget.max_tokens());
     }
 
     #[test]

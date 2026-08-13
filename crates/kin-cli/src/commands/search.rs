@@ -915,6 +915,22 @@ fn entity_to_daemon_record(
     }
 }
 
+/// Characters of artifact text a search record renders.
+///
+/// The stored preview is a retrieval retention (up to
+/// `kin_index::artifacts::ARTIFACT_TEXT_RETENTION_CHARS`), not a display
+/// string; a record that carried it whole would put an entire document on the
+/// wire per row.
+const ARTIFACT_PREVIEW_DISPLAY_CHARS: usize = 320;
+
+fn artifact_display_preview(preview: Option<&str>) -> Option<String> {
+    let text = preview?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(ARTIFACT_PREVIEW_DISPLAY_CHARS).collect())
+}
+
 fn resolved_item_to_daemon_record(
     item: &ResolvedRetrievalItem,
     match_kind: SearchMatchKind,
@@ -964,7 +980,7 @@ fn resolved_item_to_daemon_record(
             file,
             artifact_kind: format!("{:?}", artifact.kind),
             line: 1,
-            preview: artifact.text_preview.clone(),
+            preview: artifact_display_preview(artifact.text_preview.as_deref()),
             score,
             match_kind: Some(match_kind),
         },
@@ -980,7 +996,7 @@ fn resolved_item_to_daemon_record(
                 .clone()
                 .unwrap_or_else(|| "opaque".to_string()),
             line: 1,
-            preview: artifact.text_preview.clone(),
+            preview: artifact_display_preview(artifact.text_preview.as_deref()),
             score,
             match_kind: Some(match_kind),
         },
@@ -1102,8 +1118,12 @@ fn record_preview(item: &ResolvedRetrievalItem) -> Option<String> {
                 ))
             }
         }
-        ResolvedRetrievalItem::StructuredArtifact(artifact) => artifact.text_preview.clone(),
-        ResolvedRetrievalItem::OpaqueArtifact(artifact) => artifact.text_preview.clone(),
+        ResolvedRetrievalItem::StructuredArtifact(artifact) => {
+            artifact_display_preview(artifact.text_preview.as_deref())
+        }
+        ResolvedRetrievalItem::OpaqueArtifact(artifact) => {
+            artifact_display_preview(artifact.text_preview.as_deref())
+        }
     }
 }
 
