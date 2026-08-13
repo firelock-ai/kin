@@ -3403,6 +3403,34 @@ fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileR
     None
 }
 
+/// The daemon-owned embedding facts `kin graph status` renders beside its
+/// coverage counters, in the same carrier `/commands/resources` and semantic
+/// query readiness already use.
+///
+/// Only the facts this path renders are populated. The counter fields stay at
+/// their defaults on purpose: the status renderer takes the single
+/// `embedding_status()` sample that governs every embedding line of its
+/// response, so a second sample taken here could only become a number that
+/// disagrees with the line beside it. Nothing here is rendered as a count.
+///
+/// The facts describe the HEAD store. A session temporal scope serves a
+/// different graph, so they would mislabel it; a scoped request gets the
+/// default, which renders exactly as it did before any of them existed.
+fn graph_status_embedding_runtime(
+    state: &DaemonState,
+    graph: &Arc<kin_db::InMemoryGraph>,
+) -> kin_cli::commands::resources::EmbedRuntimeState {
+    if !Arc::ptr_eq(graph, &state.graph) {
+        return kin_cli::commands::resources::EmbedRuntimeState::default();
+    }
+    kin_cli::commands::resources::EmbedRuntimeState {
+        vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
+        embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
+        ..Default::default()
+    }
+}
+
 /// POST /commands/graph — render graph CLI commands from daemon-owned graph state.
 async fn command_graph(
     headers: axum::http::HeaderMap,
@@ -3424,19 +3452,7 @@ async fn command_graph(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    // The runtime facts below describe the HEAD store: why its persisted
-    // vector index was not installed at open, and whether its coverage has
-    // ever been whole. A session temporal scope serves a different graph, so
-    // those facts would mislabel it; a scoped request gets the default, which
-    // renders exactly as before.
-    let embedding_runtime = if std::sync::Arc::ptr_eq(&graph, &state.graph) {
-        kin_cli::commands::graph::GraphStatusEmbeddingRuntime {
-            vector_index_discarded: state.vector_index_discarded().map(str::to_string),
-            coverage_ever_complete: state.embedding_coverage_ever_complete(),
-        }
-    } else {
-        kin_cli::commands::graph::GraphStatusEmbeddingRuntime::default()
-    };
+    let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
         graph.as_ref(),
@@ -12956,6 +12972,92 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let layout = kin_core::init(&dir).unwrap().layout;
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    /// The state a hand-built runtime literal cannot reach: a real store with
+    /// no vector-index sidecar on disk and a coverage-completion marker from an
+    /// earlier life.
+    ///
+    /// `DaemonState::load_validated_vector_index` returns `None` both when the
+    /// index loaded and when there was none to load, and a loaded index stays
+    /// attached, so a store reporting no attached index with no discard reason
+    /// is the second case: the vectors are absent, not waiting. This opens the
+    /// store, reads both facts off it rather than asserting them into a struct,
+    /// and renders through the production builder, so the claim under test is
+    /// the one `kin graph status` actually prints.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_store_with_no_sidecar_is_never_told_its_embeddings_are_intact() {
+        let state = test_state();
+        std::fs::write(state.layout.kindb_embedding_coverage_marker_path(), b"1").unwrap();
+
+        assert!(
+            !state.layout.kindb_vector_index_path().exists(),
+            "the fixture store must carry no persisted vector index"
+        );
+        assert_eq!(
+            state.vector_index_discarded(),
+            None,
+            "a store that never had an index has had nothing discarded"
+        );
+        assert!(
+            state.embedding_coverage_ever_complete(),
+            "the marker must read back as a completed fill"
+        );
+
+        state
+            .graph
+            .upsert_entity(&test_entity("alpha_transform", "src/alpha.py"))
+            .unwrap();
+        let status = state.graph.embedding_status();
+        assert!(
+            status.pending > 0,
+            "the fixture must carry uncovered retrievable objects"
+        );
+        assert!(
+            state.graph.vector_index_stats().is_none(),
+            "no index may be attached in this state"
+        );
+
+        let runtime = graph_status_embedding_runtime(&state, &state.graph);
+        let response = kin_cli::commands::graph::execute_graph_command(
+            &state.local_repository_authority_binding().unwrap(),
+            state.graph.as_ref(),
+            &kin_cli::commands::graph::GraphCommandRequest::Status,
+            &Default::default(),
+            &runtime,
+        )
+        .unwrap();
+
+        for forbidden in [
+            "await the index",
+            "nothing was discarded",
+            "startup timing",
+            "rather than re-embedding",
+        ] {
+            assert!(
+                !response.lines.iter().any(|line| line.contains(forbidden)),
+                "absent vectors must not be reported as intact ({forbidden}): {:?}",
+                response.lines
+            );
+        }
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "the only signal that coverage is absent must survive: {:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Embeddings:")
+                    && line.contains("the live graph carries no vector index")),
+            "the structural zero is named where the counters are read: {:?}",
+            response.lines
+        );
     }
 
     fn unattached_vector_coverage_reason() -> kin_cli::commands::status::EmbeddingCoverageUnobserved

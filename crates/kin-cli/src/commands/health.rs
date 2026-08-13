@@ -2011,11 +2011,18 @@ fn semantic_query_health_from_runtime(
         "semantic_query_readiness",
         "Semantic query readiness",
         HealthStatus::Stale,
-        format!("{detail}; {reason}, so it is being rebuilt from scratch"),
+        // Not "rebuilt from scratch". The daemon's recovery pass answers
+        // unchanged texts from the embedder's persistent cache and forwards
+        // only misses, so promising a full rebuild overstates the cost and
+        // sends operators to run an embed pass nobody needed. The open-time
+        // daemon log makes the same statement in the same words, and two
+        // surfaces disagreeing about one fact invites a reader to trust the
+        // wrong one.
+        format!("{detail}; {reason}, so the daemon is restoring coverage in the background"),
     )
     .with_manual_fix(
-        "allow daemon embedding to finish or run `kin embed`; the rebuild is not lost work \
-         repeating itself once it completes",
+        "allow daemon embedding to finish, or run `kin embed` to force it now; the restore \
+         reuses prior vectors where they still apply",
     )
 }
 
@@ -3321,8 +3328,19 @@ mod tests {
         assert!(matches!(semantic.status, HealthStatus::Stale));
         assert!(
             semantic.detail.contains("graph.kvec")
-                && semantic.detail.contains("rebuilt from scratch"),
+                && semantic
+                    .detail
+                    .contains("restoring coverage in the background"),
             "a discarded index must be named, not left to be inferred from coverage: {}",
+            semantic.detail
+        );
+        // The recovery serves unchanged texts from the embedding cache, so no
+        // surface may promise a full re-embed. The open-time daemon log used to
+        // say this too and no longer does; this check keeps the two from
+        // drifting apart again.
+        assert!(
+            !semantic.detail.contains("from scratch"),
+            "a recovery that reuses prior vectors must not be announced as a full rebuild: {}",
             semantic.detail
         );
         assert!(semantic.manual_fix.is_some());
