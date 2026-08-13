@@ -349,17 +349,21 @@ fn commit_exact_transaction_inner(
             .map_err(|error| format!("persist receipt-less committing reset: {error}"))?;
     }
 
-    let base = load_native_commit_base(&authority_context)
-        .map_err(|error| format!("load exact MCP commit base: {error}"))?;
+    let base = timed_commit_phase("load_commit_base", || {
+        load_native_commit_base(&authority_context)
+    })
+    .map_err(|error| format!("load exact MCP commit base: {error}"))?;
     require_bound_authority_revision(state, &base, &transaction_id)?;
-    let plan = match plan_exact_transaction(
-        state,
-        &authority_context,
-        &transaction,
-        &actor,
-        operation_id,
-        &base,
-    ) {
+    let plan = match timed_commit_phase("plan_transaction", || {
+        plan_exact_transaction(
+            state,
+            &authority_context,
+            &transaction,
+            &actor,
+            operation_id,
+            &base,
+        )
+    }) {
         Ok(plan) => plan,
         Err(error) => {
             return Err(unstage_failed_attempt(
@@ -383,12 +387,14 @@ fn commit_exact_transaction_inner(
         ));
     }
 
-    let committed = match commit_native_plan_with_projection(
-        &state.layout,
-        state.blobs.as_ref(),
-        &authority_context,
-        plan.native,
-    ) {
+    let committed = match timed_commit_phase("publish_authority_and_projection", || {
+        commit_native_plan_with_projection(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan.native,
+        )
+    }) {
         Ok(committed) => committed,
         Err(commit_error) => match recover_native_commit(&authority_context, operation_id) {
             Ok(Some(recovered)) => recovered,
@@ -1522,6 +1528,28 @@ fn timed_finalize_step<T>(step: &'static str, work: impl FnOnce() -> T) -> T {
         tracing::info!(step, elapsed_ms, "slow commit finalize step");
     } else {
         tracing::debug!(step, elapsed_ms, "commit finalize step");
+    }
+    outcome
+}
+
+/// Run one phase of the commit that precedes durable publication and record
+/// what it cost.
+///
+/// The finalize after authority publication already times its own steps, and
+/// the first measurement under that timing showed the multi-minute wait
+/// sitting in front of it instead: building and persisting the authority
+/// successor runs whole-graph work with nothing in the log. Naming these
+/// phases lets the next slow commit attribute the wait to the phase that
+/// spent it instead of leaving the reply gap unexplained.
+pub(crate) fn timed_commit_phase<T>(phase: &'static str, work: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let outcome = work();
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed >= SLOW_FINALIZE_STEP {
+        tracing::info!(phase, elapsed_ms, "slow commit phase");
+    } else {
+        tracing::debug!(phase, elapsed_ms, "commit phase");
     }
     outcome
 }
