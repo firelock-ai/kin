@@ -15,7 +15,7 @@ body:
     attributes:
       label: Kin Version
       description: The whole first line of `kin --version`, build identity included
-      placeholder: "kin 0.5.20 (<sha> <ref> <timestamp>)"
+      placeholder: "kin 0.5.23 (<sha> <ref> <timestamp>)"
     validations:
       required: true
 

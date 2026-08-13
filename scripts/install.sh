@@ -8,7 +8,7 @@
 #   curl -fsSL https://get.kinlab.dev/install | sh
 #
 # Options (via env vars):
-#   KIN_VERSION=0.1.0    Pin a specific version (default: latest)
+#   KIN_VERSION=0.5.23    Pin a specific version (default: latest)
 #   KIN_HOME=~/.kin       Install directory (preferred; default: ~/.kin)
 #   KIN_DIR=~/.kin        Install directory compatibility alias
 #   KIN_NO_SETUP=1        Skip interactive setup after install

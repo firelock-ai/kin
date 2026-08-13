@@ -1848,7 +1848,7 @@ kin release apply <crate-name> <version> [repos] [options]
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<crate-name>` | yes | The registry crate whose pin to bump (e.g. kin-db). |
-| `<version>` | yes | The version to pin (e.g. 0.2.24). |
+| `<version>` | yes | The version to pin (e.g. 0.7.21). |
 | `[repos]` | no | Repos to update (default: every consumer repo). |
 
 | Flag | Default | Description |
