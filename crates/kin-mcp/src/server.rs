@@ -1489,7 +1489,28 @@ mod tests {
 
         let tools = &resp.result.unwrap()["tools"];
         assert!(tools.is_array());
-        assert!(!tools.as_array().unwrap().is_empty());
+        let tools = tools.as_array().unwrap();
+        assert!(!tools.is_empty());
+
+        // The annotations have to survive the serving path, not just the
+        // registry: a client reads them from this response and from nowhere
+        // else.
+        for tool in tools {
+            assert!(
+                tool["annotations"]["title"].is_string(),
+                "{} reached the wire with no title",
+                tool["name"]
+            );
+            assert!(tool["annotations"]["readOnlyHint"].is_boolean());
+        }
+
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "tools/list must serve a stable name order");
     }
 
     #[tokio::test]

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.28] - 2026-08-14
+
+### Changed
+
+- Add MCP tool annotations and deterministic tool ordering (#828)
+- Add MCP Registry publish chain, MCPB packaging, and a stdio Docker stage (#829)
+- Finish the Claude Code plugin and ship cross-agent distribution manifests (#827)
+
+
 ## [0.5.27] - 2026-08-14
 
 ### Changed
