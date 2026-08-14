@@ -12,7 +12,8 @@ is connected" will look broken, because the tools will correctly report an empty
 graph.
 
 So the install is four steps, not one: install the CLI, admit the repository, build the
-vector index, wire the server into the client. Verify at the end with a real query.
+vector index, wire the server into the client. Verify with a real query, and stop the daemon
+if you were only proving the install works.
 
 ## Step 1: install the Kin CLI
 
@@ -60,7 +61,21 @@ If `kin` is not on PATH, start a new login shell, or call the binary at `~/.kin/
 
 ## Step 2: admit the repository
 
-Run this inside the repository the user wants Kin to answer for:
+A shallow clone is refused, so check for one first. If you cloned the repository yourself
+with `--depth 1`, or you are running in CI where `actions/checkout` defaults to a shallow
+fetch, deepen it before going further:
+
+```sh
+git rev-parse --is-shallow-repository   # prints true on a shallow clone
+git fetch --unshallow                   # only needed when that printed true
+```
+
+In CI, set `fetch-depth: 0` on `actions/checkout` instead. Skipping this is not silent:
+`kin init` exits 1 and prints `shallow Git repositories cannot be imported losslessly`,
+naming `git fetch --unshallow` as the fix. Recovering costs a full history fetch you could
+have done up front.
+
+Then run this inside the repository the user wants Kin to answer for:
 
 ```sh
 cd /path/to/repository
@@ -122,6 +137,20 @@ The merge is defensive. It refuses to write to a file that is not valid JSON, on
 the `command`, `args`, and `env` keys under its own entry, and records every write to a
 ledger so `kin setup uninstall` can reverse it.
 
+Cline is supported, and it is one of the clients `kin setup` does not detect, so wire it by
+hand with the entry below. Cline reads the same `mcpServers` shape. The CLI reads
+`~/.cline/mcp.json`. In the VS Code extension, open the MCP Servers panel, then the
+Configure tab, then Configure MCP Servers, which opens the settings JSON the extension
+uses. Anything else that takes an `mcpServers` block works the same way.
+
+Two more warnings for an unattended run. `kin setup --intent agent --no-interactive` writes
+to real files in the user's home directory, so do not run it inside a sandbox that must
+leave the user's configuration alone. And when `kin setup status` reports clients as
+MISCONFIGURED, its printed fix is to run `kin setup` or `kin doctor --fix`, both of which
+rewrite every detected client's config on the machine. That is the right call for a user
+who asked for it and the wrong one for an agent tidying up on its own, so surface it rather
+than run it.
+
 To configure a client by hand, use this entry, substituting the absolute path that
 `which kin` reports:
 
@@ -170,7 +199,18 @@ because it means an agent session can admit a repository without being asked.
 
 ## Step 5: verify
 
-Two checks. First, the configuration:
+Three checks, in order. First the graph, from inside the repository from step 2:
+
+```sh
+kin graph status
+```
+
+It prints an `Embeddings: <indexed>/<total> indexed (<pending> pending)` line. Step 3 is
+finished when pending is 0.
+
+Then the configuration, also from inside that repository, because this command reads the
+working directory. Run it anywhere else and it reports a different repository, or none, and
+a healthy-looking result says nothing about the install you just did:
 
 ```sh
 kin setup status
@@ -178,15 +218,57 @@ kin setup status
 
 Then the real one. From the client, with the repository from step 2 as the working
 directory, make one `semantic_locate` call with a plain-language description of something
-the repository does. A successful install returns ranked entities and a `_kin` envelope
-reporting `semantic_authoritative`. That envelope is the proof, because it names the graph
-generation and the embedding coverage that produced the answer.
+the repository does. A successful install returns ranked results and a `_kin` envelope
+beside them. Read three fields on that envelope, all of which the response actually carries:
 
-If the envelope reports `coverage_partial` or `coverage_unknown`, step 3 has not finished.
-Rerun `kin graph status` and wait for coverage to complete before concluding anything about
-the result.
+- `_kin.semantic_coverage.complete` is `true` and `_kin.semantic_coverage.pending` is 0.
+  That is step 3 finished. When `complete` is `false`, embedding is still running, so rerun
+  `kin embed` or wait, and do not conclude anything from the ranking yet.
+- `_kin.graph_as_of.generation` is a number. That names the graph the answer came from.
+- `_kin.runtime` is `repo-daemon`. That is graph-owned truth. `offline-in-process` means
+  the daemon did not answer and you are reading a fallback surface.
+
+Do not test for the string `semantic_authoritative`. It is a trust verdict Kin attaches
+only to an empty result, in the `negative` object, alongside `coverage_partial` and
+`coverage_unknown`. A successful call has results, so it carries no `negative` object and
+none of those three strings appear. An install checked by matching that token reports
+failure on a working server.
+
+The `negative` object is worth reading when a result comes back empty. Its
+`safe_to_conclude_absent` field says whether the absence can be trusted, and its reason
+names which gate ruled.
+
+### One thing to tell the user before they judge the answers
+
+`kin setup status` prints a `Retrieval quality profile` line naming the profile serving
+queries and which retrieval levers are on. A stock install serves `compat-v0`, which is the
+default on purpose and keeps the historical ranking behavior. `KIN_PROFILE` selects a
+profile, and `accuracy-v1` is the opt-in candidate shape. Two facts matter if you change it.
+The profile is read by the process that serves queries, so it has to be set where the daemon
+starts and not on the MCP client entry, and a daemon already running has to be restarted
+under it. And `accuracy-v1` stays opt-in because it has not graduated on measurement, so
+treat it as a comparison to run rather than a fix to apply.
+
+## Step 6: stop the daemon when you are done
+
+Kin answers from a resident daemon, which keeps running after your commands return. An
+unattended install that is only proving the setup works should clean up after itself.
+
+```sh
+kin daemon status              # what is running, and under which repository
+kin daemon stop                # stop this repository's daemon
+kin daemon stop --all          # then the rest under this KIN_HOME, and the supervisor
+```
+
+The supervisor is machine-wide rather than per `KIN_HOME`, so `--all` skips and names
+daemons belonging to other managed homes rather than stopping them, and leaves the
+supervisor up while any of them remain. Leave a daemon running if the user is about to work
+in the repository. It is the normal serving state, not a leak.
 
 ## When something is wrong
+
+**`kin init` exits 1 saying the repository is shallow.** Run `git fetch --unshallow`, then
+run `kin init .` again. Nothing from the failed attempt needs cleaning up first.
 
 **The tools are not listed at all.** The server did not start. Check Node 20 or newer for
 the npx path, and network access for its first-run download. Otherwise, check that the
