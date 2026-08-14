@@ -10,7 +10,7 @@ use kin_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::graph_health::inspect_graph;
+use super::graph_health::{inspect_graph, inspect_graph_with_pending_embeddings};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -221,9 +221,12 @@ pub fn execute_graph_command(
     graph: &kin_db::InMemoryGraph,
     request: &GraphCommandRequest,
     reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
 ) -> Result<GraphCommandResponse> {
     match request {
-        GraphCommandRequest::Status => build_graph_status_response(binding, graph, reconcile),
+        GraphCommandRequest::Status => {
+            build_graph_status_response(binding, graph, reconcile, embedding_runtime)
+        }
         GraphCommandRequest::Validate => build_graph_validate_response(binding, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
         GraphCommandRequest::Source { entity } => build_graph_source_response(
@@ -234,12 +237,37 @@ pub fn execute_graph_command(
     }
 }
 
+/// Whether coverage counters describe an attached vector index.
+///
+/// With no index attached, `embedding_status` answers `indexed = 0` for every
+/// retrievable object. That zero is structural; `vector_index_stats()` is the
+/// call that distinguishes an index that is absent from one that is measured.
+#[cfg(feature = "vector")]
+fn embedding_coverage_is_measured(graph: &kin_db::InMemoryGraph) -> bool {
+    graph.vector_index_stats().is_some()
+}
+
+/// Without vector support there is no index to attach and no structural zero
+/// to guard against; the legacy rendering stays.
+#[cfg(not(feature = "vector"))]
+fn embedding_coverage_is_measured(_graph: &kin_db::InMemoryGraph) -> bool {
+    true
+}
+
 fn build_graph_status_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
     reconcile: &crate::commands::resources::ReconcileHealth,
+    embedding_runtime: &crate::commands::resources::EmbedRuntimeState,
 ) -> Result<GraphCommandResponse> {
-    let health = inspect_graph(binding, graph)?;
+    // One sample for every embedding line in this response. The counter below
+    // and the health warning used to sample coverage independently, and an
+    // embed batch completing between the two reads made the warning name a
+    // pending count the counter beside it contradicted by exactly one batch
+    // (the v0.5.21 battery caught 1 of 12 paired readings disagreeing by 512).
+    let embed_status = graph.embedding_status();
+    let coverage_is_measured = embedding_coverage_is_measured(graph) || embed_status.total == 0;
+    let health = inspect_graph_with_pending_embeddings(binding, graph, Some(embed_status.pending))?;
 
     let entities = graph.list_all_entities()?;
 
@@ -293,9 +321,6 @@ fn build_graph_status_response(
         .iter()
         .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
         .collect();
-
-    // Embedding status
-    let embed_status = graph.embedding_status();
 
     // Doc summary coverage
     let with_docs = defined.iter().filter(|e| e.doc_summary.is_some()).count();
@@ -361,10 +386,59 @@ fn build_graph_status_response(
     lines.push(format!("Kinds: {}", kind_parts.join(", ")));
 
     lines.push(String::new());
-    lines.push(format!(
+    // The counters are true in every state below: with no vector index
+    // attached, zero retrievable objects really are indexed in this graph.
+    // What the bare counters cannot say is WHY, and a reader who cannot tell a
+    // discarded index from a first fill reads every one of them as loss. So the
+    // counters always render and the cause is appended when the daemon knows
+    // one. Each clause states only a fact the daemon holds; none of them
+    // promises the vectors are intact, because nothing on this path can know
+    // that. `kin status` reports the same absence as "the live graph carries no
+    // vector index" and publishes no coverage at all, which is the wording
+    // followed here.
+    let mut embeddings_line = format!(
         "Embeddings: {}/{} indexed ({} pending)",
         embed_status.indexed, embed_status.total, embed_status.pending
-    ));
+    );
+    if embed_status.pending > 0 {
+        if embedding_runtime.embed_persistence_unavailable {
+            // Outranks every clause below, exactly as it does in
+            // `semantic_query_health_from_runtime`: this store's graph
+            // authority is a remote backend, the embedding worker never starts
+            // and `/embed` refuses, so a backlog here is not filling and no
+            // clause may imply that it is.
+            embeddings_line.push_str(
+                "; this store's graph authority is a remote storage backend, which carries no \
+                 durable local vector-sidecar contract, so nothing will embed here",
+            );
+        } else if let Some(reason) = embedding_runtime.vector_index_discarded.as_ref() {
+            // A real gap, reported with its cause. Naming the open-time discard
+            // and the automatic recovery is what tells the operator no manual
+            // GPU pass is owed. The reason is recorded once at open and never
+            // cleared, so it is named only while the gap it explains is still
+            // open; a recovered store goes back to the plain line.
+            embeddings_line.push_str(&format!(
+                "; the persisted vector index was not loaded when this daemon opened ({reason}); \
+                 the daemon restores coverage in the background"
+            ));
+        } else if !coverage_is_measured {
+            // No index is attached and the daemon recorded no discard at open,
+            // so these zeros are structural rather than a measurement of a
+            // store that lost ground. That is all this path knows. It does NOT
+            // know the vectors are sitting intact somewhere: an index that
+            // loaded at open would still be attached, so this branch is reached
+            // only when there was no sidecar to load, or when a later reset
+            // detached one. Both of those rebuild rather than re-attach, so no
+            // clause here may tell the reader to wait instead of embedding.
+            embeddings_line.push_str(
+                "; the live graph carries no vector index, so nothing in it is indexed yet",
+            );
+            if embedding_runtime.embedding_coverage_ever_complete {
+                embeddings_line.push_str(" and coverage has completed on this store before");
+            }
+        }
+    }
+    lines.push(embeddings_line);
     lines.push(format!(
         "Doc summaries: {}/{} ({:.0}%)",
         with_docs,
@@ -1282,7 +1356,9 @@ mod tests {
         // separates the two halves here and asserting on it would pass whatever
         // the reconcile term did. What must differ is the reconcile warning
         // itself: absent on a healthy daemon, present on this one.
-        let healthy = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let healthy =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
         assert!(
             !healthy
                 .lines
@@ -1302,6 +1378,7 @@ mod tests {
                 last_admission_success_age_seconds: Some(172_800),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -1349,6 +1426,7 @@ mod tests {
                 untracked_paths_sample: vec!["fir2152_probe.rs".to_string()],
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         assert!(
@@ -1390,6 +1468,7 @@ mod tests {
                 last_error_age_seconds: Some(90),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         // The reconcile warning is the assertion that carries this test. The
@@ -1462,7 +1541,9 @@ mod tests {
             .upsert_relation(&test_relation(RelationKind::Calls, caller.id, callee.id))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let response =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
 
         // The entity-rooted total and the whole-table total count different
         // scopes, so neither line may carry a bare "Relations" label.
@@ -1492,6 +1573,248 @@ mod tests {
         );
     }
 
+    /// A graph carrying no attached vector index must never be told its
+    /// embeddings are intact.
+    ///
+    /// `embedding_status` answers zero indexed for every retrievable object
+    /// while no index is attached, so the bare counters read as discovered
+    /// loss on a store that simply has nothing attached yet. Disclosing that
+    /// is the fix. Promising the vectors are sitting somewhere intact is not:
+    /// an index that loaded at open would still be attached, so whenever this
+    /// state is reached there was no sidecar to load or a later reset detached
+    /// one, and both of those rebuild rather than re-attach. The warning is the
+    /// reader's only signal that coverage is not there, so it stays.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_graph_with_no_attached_index_is_not_told_its_embeddings_are_intact() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph
+            .upsert_entity(&test_entity("alpha_transform"))
+            .unwrap();
+        let status = graph.embedding_status();
+        assert!(
+            status.total > 0,
+            "the fixture must carry retrievable objects"
+        );
+        assert!(
+            graph.vector_index_stats().is_none(),
+            "the fixture graph must carry no attached vector index"
+        );
+
+        // The state the daemon can actually produce with no discard recorded:
+        // no sidecar was on disk at open, while the persisted marker says this
+        // store finished a fill once.
+        let no_sidecar = build_graph_status_response(
+            &binding,
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_discarded: None,
+                embedding_coverage_ever_complete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let embeddings_line = no_sidecar
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            embeddings_line.contains(&format!(
+                "{}/{} indexed ({} pending)",
+                status.indexed, status.total, status.pending
+            )),
+            "the counters are true and stay disclosed: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("the live graph carries no vector index"),
+            "the structural zero is named rather than left to read as loss: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("coverage has completed on this store before"),
+            "the marker is disclosed so this is not read as a first fill: {embeddings_line}"
+        );
+        for forbidden in [
+            "await the index",
+            "nothing was discarded",
+            "startup timing",
+            "rather than re-embedding",
+        ] {
+            assert!(
+                !no_sidecar.lines.iter().any(|line| line.contains(forbidden)),
+                "no line may claim the vectors are intact ({forbidden}): {:?}",
+                no_sidecar.lines
+            );
+        }
+        assert!(
+            no_sidecar
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "the only signal that coverage is absent must survive: {:?}",
+            no_sidecar.lines
+        );
+
+        // A store that has never finished a fill is in the same structural
+        // state and says so, minus the marker clause it has not earned.
+        let first_fill =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
+        let first_fill_line = first_fill
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            first_fill_line.contains("the live graph carries no vector index"),
+            "a first fill names the same structural absence: {first_fill_line}"
+        );
+        assert!(
+            !first_fill_line.contains("completed on this store before"),
+            "a first fill must not claim a completion it never had: {first_fill_line}"
+        );
+    }
+
+    /// A store whose graph authority is a remote backend has no durable local
+    /// vector-sidecar contract: the embedding worker never starts and `/embed`
+    /// refuses, so its backlog is not filling and never will. That fact
+    /// outranks both the discard reason and the coverage marker here for the
+    /// same reason it does in semantic query readiness, because every other
+    /// clause implies work that is going to happen.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_store_that_can_never_embed_is_not_promised_background_recovery() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph
+            .upsert_entity(&test_entity("gamma_transform"))
+            .unwrap();
+
+        let remote = build_graph_status_response(
+            &binding,
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_discarded: Some(
+                    "fixture: metadata no longer matches graph truth".to_string(),
+                ),
+                embedding_coverage_ever_complete: true,
+                embed_persistence_unavailable: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let embeddings_line = remote
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            embeddings_line.contains("remote storage backend")
+                && embeddings_line.contains("nothing will embed here"),
+            "a store that cannot embed must say so: {embeddings_line}"
+        );
+        assert!(
+            !embeddings_line.contains("restores coverage in the background"),
+            "no recovery may be promised where nothing will embed: {embeddings_line}"
+        );
+        assert!(
+            remote
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "a backlog that will never fill keeps its warning: {:?}",
+            remote.lines
+        );
+    }
+
+    /// A discard at open is a real gap and keeps its accounting, but it names
+    /// its cause beside the counters. Bare `0/N (N pending)` after a restart is
+    /// what sent operators toward a manual GPU embed pass the daemon's own
+    /// recovery made unnecessary.
+    #[test]
+    fn a_discarded_index_names_its_reason_beside_the_counters() {
+        let (_temp, binding, graph) = graph_validation_fixture();
+        graph.upsert_entity(&test_entity("beta_transform")).unwrap();
+        let status = graph.embedding_status();
+
+        let discarded = build_graph_status_response(
+            &binding,
+            &graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_discarded: Some(
+                    "fixture: metadata no longer matches graph truth".to_string(),
+                ),
+                embedding_coverage_ever_complete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let embeddings_line = discarded
+            .lines
+            .iter()
+            .find(|line| line.starts_with("Embeddings:"))
+            .expect("the embeddings line still renders");
+        assert!(
+            embeddings_line.contains(&format!(
+                "{}/{} indexed ({} pending)",
+                status.indexed, status.total, status.pending
+            )),
+            "a real gap keeps its measured counters: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("fixture: metadata no longer matches graph truth"),
+            "the discard reason is named where the counters are read: {embeddings_line}"
+        );
+        assert!(
+            embeddings_line.contains("restores coverage in the background"),
+            "the automatic recovery is named so nobody runs a manual pass: {embeddings_line}"
+        );
+        assert!(
+            discarded
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "a real gap keeps its warning: {:?}",
+            discarded.lines
+        );
+
+        // The reason is recorded once at open and never cleared, so once the
+        // gap it explains is closed the line must not keep naming it. A graph
+        // with nothing pending renders the plain measured line.
+        let (_temp2, binding2, empty_graph) = graph_validation_fixture();
+        let recovered = build_graph_status_response(
+            &binding2,
+            &empty_graph,
+            &Default::default(),
+            &crate::commands::resources::EmbedRuntimeState {
+                vector_index_discarded: Some(
+                    "fixture: metadata no longer matches graph truth".to_string(),
+                ),
+                embedding_coverage_ever_complete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !recovered
+                .lines
+                .iter()
+                .any(|line| line.contains("was not loaded")),
+            "a closed gap must not keep naming its discard: {:?}",
+            recovered.lines
+        );
+        assert!(
+            recovered
+                .lines
+                .iter()
+                .any(|line| line == "Embeddings: 0/0 indexed (0 pending)"),
+            "a store with nothing pending renders the plain measured line: {:?}",
+            recovered.lines
+        );
+    }
+
     #[test]
     fn graph_status_does_not_call_a_mixed_relation_graph_relationless() {
         let (_temp, binding, graph) = graph_validation_fixture();
@@ -1505,7 +1828,9 @@ mod tests {
             ))
             .unwrap();
 
-        let response = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let response =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
 
         assert!(response
             .lines
@@ -2435,7 +2760,9 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
 
         let validate = build_graph_validate_response(&binding, &graph).unwrap();
-        let status = build_graph_status_response(&binding, &graph, &Default::default()).unwrap();
+        let status =
+            build_graph_status_response(&binding, &graph, &Default::default(), &Default::default())
+                .unwrap();
 
         let validate_notes = note_lines(&validate);
         assert!(

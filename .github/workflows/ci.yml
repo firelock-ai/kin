@@ -110,12 +110,14 @@ jobs:
             ./scripts/release-archive-shape.test.cjs \
             ./scripts/release-order.test.mjs \
             ./scripts/release-hold-alarm.test.mjs \
+            ./scripts/verify-capability-proof.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
           node --check ./scripts/read-update-build-identity.cjs
           node --check ./scripts/check-release-version.mjs
           node --check ./scripts/prepare-release.mjs
           node --check ./scripts/release-order.mjs
           node --check ./scripts/release-hold-alarm.mjs
+          node --check ./scripts/verify-capability-proof.mjs
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh

@@ -3403,6 +3403,34 @@ fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileR
     None
 }
 
+/// The daemon-owned embedding facts `kin graph status` renders beside its
+/// coverage counters, in the same carrier `/commands/resources` and semantic
+/// query readiness already use.
+///
+/// Only the facts this path renders are populated. The counter fields stay at
+/// their defaults on purpose: the status renderer takes the single
+/// `embedding_status()` sample that governs every embedding line of its
+/// response, so a second sample taken here could only become a number that
+/// disagrees with the line beside it. Nothing here is rendered as a count.
+///
+/// The facts describe the HEAD store. A session temporal scope serves a
+/// different graph, so they would mislabel it; a scoped request gets the
+/// default, which renders exactly as it did before any of them existed.
+fn graph_status_embedding_runtime(
+    state: &DaemonState,
+    graph: &Arc<kin_db::InMemoryGraph>,
+) -> kin_cli::commands::resources::EmbedRuntimeState {
+    if !Arc::ptr_eq(graph, &state.graph) {
+        return kin_cli::commands::resources::EmbedRuntimeState::default();
+    }
+    kin_cli::commands::resources::EmbedRuntimeState {
+        vector_index_discarded: state.vector_index_discarded().map(str::to_string),
+        embedding_coverage_ever_complete: state.embedding_coverage_ever_complete(),
+        embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
+        ..Default::default()
+    }
+}
+
 /// POST /commands/graph — render graph CLI commands from daemon-owned graph state.
 async fn command_graph(
     headers: axum::http::HeaderMap,
@@ -3424,6 +3452,7 @@ async fn command_graph(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
+    let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     let response = kin_cli::commands::graph::execute_graph_command(
         &repository_authority,
         graph.as_ref(),
@@ -3432,6 +3461,7 @@ async fn command_graph(
             .background_work
             .reconcile()
             .report(std::time::Instant::now()),
+        &embedding_runtime,
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -6772,6 +6802,13 @@ fn semantic_locate_payload(
         "next_cursor": next_cursor,
         "results": window,
     });
+    // The file surface, in the same `files[]` shape `kin locate --json`, `POST
+    // /locate`, and the fused arm already emit, so one consumer parses every Kin
+    // locate surface. Serialized unconditionally, including as `[]` for an empty
+    // ranking, because the fused arm serializes it unconditionally too and a key
+    // that appears only when non-empty makes absence and emptiness the same
+    // reading.
+    payload["files"] = json!(cosine_file_surface(rows));
     if !degradations.is_empty() {
         payload["degradations"] = json!(degradations);
     }
@@ -6824,6 +6861,127 @@ fn locate_rows_are_all_fallback(rows: &[serde_json::Value]) -> bool {
         && !rows.iter().any(|row| {
             row.get("match_kind") == Some(&json!(kin_cli::commands::locate::LocateMatchKind::Name))
         })
+}
+
+/// Roll the retained cosine ranking up into the shared `files[]` surface.
+///
+/// This arm is entity-centric: it demotes the file to `provenance.file` on each
+/// hit and publishes no file surface of its own, so a caller asking "which files
+/// is this query about" had to page the entity ranking and aggregate the paths
+/// itself. The fused arm answers that in one field, and a measured A/B put the
+/// correct file in accuracy-v1's top five on 18 of 18 graded queries while this
+/// arm returned no file surface on 100 of 100 calls. Since this arm is the
+/// shipped default, that surface was missing from the profile nearly every
+/// caller runs.
+///
+/// The rollup is a re-view of the ranking this arm already computed, never a
+/// second retrieval: no lexical pool, no extra scoring, no reordering. Files
+/// appear in the order their best hit ranked, and each file's `score` is that
+/// best hit's score, because `rows` arrives rank-ordered so the first occurrence
+/// of a path is its strongest. `signals` is `embeddings` alone, which is the
+/// literal provenance here — every candidate came from the vector index.
+///
+/// What this therefore does NOT do, stated so the field is not read for more
+/// than it carries: it cannot rank a file whose entities did not rank. The fused
+/// arm can, because it runs a lexical and path pool this profile does not, and
+/// closing that gap would mean adding a retrieval stage to the default rather
+/// than porting a surface onto it. Flipping the default is separately refused on
+/// measured evidence, and this change deliberately leaves that verdict alone.
+///
+/// Derived from `rows`, the whole retained ranking, never from the returned page
+/// window — the same rule `all_fallback` follows. Which files a query is about is
+/// a property of the ranking, so it must not change as the caller pages through
+/// it, and `total_ranked` beside it already reports that same whole.
+fn cosine_file_surface(
+    rows: &[serde_json::Value],
+) -> Vec<kin_cli::commands::locate::LocateFileEntry> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_path: HashMap<String, kin_cli::commands::locate::LocateFileEntry> = HashMap::new();
+
+    for row in rows {
+        // A hit with no path contributes no file. Artifact hits carry one and
+        // are included; anything genuinely pathless is skipped rather than
+        // rolled up under a placeholder path no caller could open.
+        let Some(path) = row
+            .get("provenance")
+            .and_then(|provenance| provenance.get("file"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let score = row
+            .get("score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        let span = match (
+            row.get("start_line").and_then(serde_json::Value::as_u64),
+            row.get("end_line").and_then(serde_json::Value::as_u64),
+        ) {
+            (Some(start), Some(end)) => Some([start as u32, end as u32]),
+            _ => None,
+        };
+
+        if !by_path.contains_key(path) {
+            order.push(path.to_string());
+            by_path.insert(
+                path.to_string(),
+                kin_cli::commands::locate::LocateFileEntry {
+                    path: path.to_string(),
+                    score,
+                    signals: vec!["embeddings".to_string()],
+                    spans: Vec::new(),
+                    symbols: Vec::new(),
+                    explain: Vec::new(),
+                    provenance: None,
+                    // Explain-only on the fused arm, so left unset here too. The
+                    // two arms' plain file surfaces then carry the same field
+                    // set, and a consumer cannot tell them apart by shape.
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                },
+            );
+        }
+        let Some(entry) = by_path.get_mut(path) else {
+            continue;
+        };
+
+        if let Some(span) = span {
+            if !entry.spans.contains(&span) {
+                entry.spans.push(span);
+            }
+        }
+        // An artifact hit is a tracked file with no parsed entities, so it
+        // contributes its path and span but names no symbol.
+        let Some(name) = row.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        entry.symbols.push(kin_cli::commands::locate::LocateSymbol {
+            name: name.to_string(),
+            span,
+            score,
+            kind: row
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            // `entity_id` is present exactly on a live entity hit and absent on
+            // an artifact hit, which is the same distinction `definition` draws.
+            definition: row.get("entity_id").is_some(),
+            // Both explain-only on the fused arm; see `signal_scores` above.
+            origin: String::new(),
+            cosine: None,
+            snippet: row
+                .get("snippet")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
+
+    order
+        .into_iter()
+        .filter_map(|path| by_path.remove(&path))
+        .collect()
 }
 
 /// The identity half of one `semantic_locate` row: which id space the hit
@@ -12269,6 +12427,185 @@ mod tests {
         assert!(locate_rows_are_all_fallback(&[json!({ "name": "x" })]));
     }
 
+    /// One cosine-arm ranked row, in the shape the serving loop builds.
+    fn cosine_row(
+        name: &str,
+        file: Option<&str>,
+        score: f32,
+        span: Option<(u32, u32)>,
+    ) -> serde_json::Value {
+        let mut row = json!({
+            "kind": "function",
+            "name": name,
+            "score": score,
+            "provenance": { "file": file },
+        });
+        if file.is_some() {
+            row["entity_id"] = json!("00000000-0000-0000-0000-0000000000aa");
+        }
+        if let Some((start, end)) = span {
+            row["start_line"] = json!(start);
+            row["end_line"] = json!(end);
+        }
+        row
+    }
+
+    /// Render a cosine-arm page the way the serving path does, so these assert
+    /// against the real serializer rather than a hand-written payload.
+    fn cosine_locate_body(
+        rows: &[serde_json::Value],
+        page: usize,
+        page_size: usize,
+    ) -> serde_json::Value {
+        let coverage = kin_cli::commands::locate::SemanticCoverage {
+            supported: true,
+            indexed: 10,
+            total: 10,
+            pending: 0,
+            complete: true,
+            note: None,
+        };
+        let tool = semantic_locate_payload(
+            "where does the daemon start",
+            false,
+            1.0,
+            &coverage,
+            "cursor-key",
+            page,
+            page_size,
+            rows,
+            &[],
+        );
+        serde_json::from_str(
+            tool_result_json(&tool)["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_cosine_arm_rolls_its_ranking_up_into_the_shared_file_surface() {
+        let rows = vec![
+            cosine_row("start_daemon", Some("src/daemon.rs"), 0.9, Some((10, 20))),
+            cosine_row("serve", Some("src/api.rs"), 0.7, Some((5, 9))),
+            // A second, weaker hit in an already-seen file: it must fold into
+            // that file rather than opening a duplicate entry.
+            cosine_row("stop_daemon", Some("src/daemon.rs"), 0.4, Some((30, 40))),
+        ];
+        let files = cosine_file_surface(&rows);
+
+        // Files rank by their best hit, and `rows` is rank-ordered, so the first
+        // occurrence of a path both places and scores it.
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/daemon.rs", "src/api.rs"]);
+        assert_eq!(files[0].score, 0.9);
+        assert_eq!(files[1].score, 0.7);
+
+        // Every contributing row keeps its symbol under the file, in rank order,
+        // so the rollup adds a view and drops nothing from the ranking.
+        let symbols: Vec<&str> = files[0]
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(symbols, vec!["start_daemon", "stop_daemon"]);
+        assert_eq!(files[0].spans, vec![[10, 20], [30, 40]]);
+        assert_eq!(files[0].signals, vec!["embeddings".to_string()]);
+        // Explain-only fields on the fused arm stay unset here, so the two arms'
+        // plain file surfaces carry the same field set.
+        assert!(files[0].symbols[0].origin.is_empty());
+        assert!(files[0].symbols[0].cosine.is_none());
+
+        // A pathless hit contributes no file rather than a placeholder path no
+        // caller could open, and does not disturb the files around it.
+        let pathless = vec![
+            cosine_row("orphan", None, 0.8, None),
+            cosine_row("serve", Some("src/api.rs"), 0.7, None),
+        ];
+        let files = cosine_file_surface(&pathless);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/api.rs");
+
+        // An empty ranking rolls up to an empty surface, never to a panic.
+        assert!(cosine_file_surface(&[]).is_empty());
+    }
+
+    /// The rule that keeps this field meaning one thing: which files a query is
+    /// about is a property of the RANKING, so it must not change as the caller
+    /// pages through it. Deriving from the returned window instead would look
+    /// correct on page 0 of a short ranking, which is what every casual check
+    /// exercises, and would quietly shrink the answer on exactly the deep
+    /// rankings the surface exists to summarize.
+    #[test]
+    fn the_cosine_file_surface_covers_the_whole_ranking_not_the_returned_page() {
+        let rows = vec![
+            cosine_row("start_daemon", Some("src/daemon.rs"), 0.9, None),
+            cosine_row("serve", Some("src/api.rs"), 0.7, None),
+            cosine_row("route", Some("src/router.rs"), 0.5, None),
+        ];
+
+        // One row per page: the window holds a single file, the ranking holds
+        // three, and the surface reports the ranking.
+        let body = cosine_locate_body(&rows, 0, 1);
+        assert_eq!(body["results"].as_array().unwrap().len(), 1);
+        assert_eq!(body["total_ranked"], json!(3));
+        let paths: Vec<&str> = body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/daemon.rs", "src/api.rs", "src/router.rs"]);
+
+        // And it is page-invariant: paging forward re-states the same answer
+        // rather than reporting the files of whichever window was served.
+        let page_two = cosine_locate_body(&rows, 2, 1);
+        assert_eq!(page_two["results"].as_array().unwrap().len(), 1);
+        assert_eq!(page_two["files"], body["files"]);
+
+        // Serialized unconditionally, so an empty ranking says `[]` rather than
+        // omitting the key and making absence read like emptiness. This matches
+        // the fused arm, whose `files` is always serialized.
+        let empty = cosine_locate_body(&[], 0, 20);
+        assert_eq!(empty["files"], json!([]));
+    }
+
+    /// The cosine `files[]` is a rollup of `results`, so every file it names is
+    /// already counted as a row. The negative envelope must therefore keep
+    /// counting `results` alone on this arm: adding `files` into the total the
+    /// way the fused branch does would double-count the same hits and could talk
+    /// a genuinely empty page out of being qualified. The fused branch counts
+    /// both because its two surfaces are independently ranked; this one's are
+    /// not, and the shapes now look similar enough that a later tidy-up could
+    /// merge the branches without noticing.
+    #[test]
+    fn the_cosine_file_surface_does_not_change_what_the_negative_envelope_counts() {
+        let rows = vec![
+            cosine_row("start_daemon", Some("src/daemon.rs"), 0.9, None),
+            cosine_row("stop_daemon", Some("src/daemon.rs"), 0.4, None),
+        ];
+        let body = cosine_locate_body(&rows, 0, 20);
+        assert_eq!(body["routing"], json!("cosine-v0"));
+        // Two rows rolling up into one file: if the count ever became files +
+        // results it would read 3, and if it became files alone it would read 1.
+        assert_eq!(body["files"].as_array().unwrap().len(), 1);
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+
+        // An empty cosine page still carries `files: []` and must still be
+        // qualified as an absence, which is the case a files-aware count would
+        // have broken first.
+        let empty = cosine_locate_body(&[], 0, 20);
+        let negative = kin_mcp::negative::negative_for(
+            "semantic_locate",
+            &empty,
+            &kin_mcp::Envelope::daemon(),
+        )
+        .expect("an empty cosine page must carry a negative");
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
+    }
+
     #[test]
     fn cosine_match_evidence_is_deterministic_and_gates_rerank_signals() {
         use kin_model::EntityRole;
@@ -12942,6 +13279,92 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let layout = kin_core::init(&dir).unwrap().layout;
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    /// The state a hand-built runtime literal cannot reach: a real store with
+    /// no vector-index sidecar on disk and a coverage-completion marker from an
+    /// earlier life.
+    ///
+    /// `DaemonState::load_validated_vector_index` returns `None` both when the
+    /// index loaded and when there was none to load, and a loaded index stays
+    /// attached, so a store reporting no attached index with no discard reason
+    /// is the second case: the vectors are absent, not waiting. This opens the
+    /// store, reads both facts off it rather than asserting them into a struct,
+    /// and renders through the production builder, so the claim under test is
+    /// the one `kin graph status` actually prints.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_store_with_no_sidecar_is_never_told_its_embeddings_are_intact() {
+        let state = test_state();
+        std::fs::write(state.layout.kindb_embedding_coverage_marker_path(), b"1").unwrap();
+
+        assert!(
+            !state.layout.kindb_vector_index_path().exists(),
+            "the fixture store must carry no persisted vector index"
+        );
+        assert_eq!(
+            state.vector_index_discarded(),
+            None,
+            "a store that never had an index has had nothing discarded"
+        );
+        assert!(
+            state.embedding_coverage_ever_complete(),
+            "the marker must read back as a completed fill"
+        );
+
+        state
+            .graph
+            .upsert_entity(&test_entity("alpha_transform", "src/alpha.py"))
+            .unwrap();
+        let status = state.graph.embedding_status();
+        assert!(
+            status.pending > 0,
+            "the fixture must carry uncovered retrievable objects"
+        );
+        assert!(
+            state.graph.vector_index_stats().is_none(),
+            "no index may be attached in this state"
+        );
+
+        let runtime = graph_status_embedding_runtime(&state, &state.graph);
+        let response = kin_cli::commands::graph::execute_graph_command(
+            &state.local_repository_authority_binding().unwrap(),
+            state.graph.as_ref(),
+            &kin_cli::commands::graph::GraphCommandRequest::Status,
+            &Default::default(),
+            &runtime,
+        )
+        .unwrap();
+
+        for forbidden in [
+            "await the index",
+            "nothing was discarded",
+            "startup timing",
+            "rather than re-embedding",
+        ] {
+            assert!(
+                !response.lines.iter().any(|line| line.contains(forbidden)),
+                "absent vectors must not be reported as intact ({forbidden}): {:?}",
+                response.lines
+            );
+        }
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.contains("embeddings are still pending")),
+            "the only signal that coverage is absent must survive: {:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Embeddings:")
+                    && line.contains("the live graph carries no vector index")),
+            "the structural zero is named where the counters are read: {:?}",
+            response.lines
+        );
     }
 
     fn unattached_vector_coverage_reason() -> kin_cli::commands::status::EmbeddingCoverageUnobserved

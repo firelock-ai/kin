@@ -29,6 +29,9 @@ RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
 HOLD_ALARM = ROOT / "scripts" / "release-hold-alarm.mjs"
 HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
+INSTALL_PROOF_CANARY = WORKFLOWS / "install-proof-canary.yml"
+CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
+CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
 WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
@@ -537,6 +540,9 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/release-sentinel.yml": {
         "preflight": "Resolve sentinel credential",
         "patrol": "Patrol the release rail",
+    },
+    ".github/workflows/install-proof-canary.yml": {
+        "capability-canary": "Capability Contract Canary",
     },
     ".github/workflows/release-tag.yml": {
         "mint-release-tag": "Mint release tag",
@@ -6502,6 +6508,125 @@ def assert_release_hold_marker_contract(
         )
 
 
+def assert_capability_canary_contract(
+    install_proof: str,
+    canary: str,
+    capability_script: str,
+) -> None:
+    """Bind the branch canary to the same capability contract the proof enforces.
+
+    The install proof cannot read a tracked script. It runs anonymously with no
+    checkout, which is what makes it worth trusting and also why the contract
+    cannot simply be shared by import. Two copies of a contract drift, and this
+    pair drifts in the worst direction: the canary keeps passing while the proof
+    it was built to predict starts failing at tag time, where no fix on main can
+    reach the tag. So the copies are compared here instead.
+    """
+
+    blocks = re.findall(
+        r"const required = new Map\(\[\n(.*?)\n\s*\]\);", install_proof, re.S
+    )
+    if len(blocks) != 2:
+        raise AssertionError(
+            "the install proof is expected to carry exactly two required-check "
+            f"tables, the Windows repo-free one and the capability one; found {len(blocks)}"
+        )
+    # The second table is the capability validator's, which is the one the canary
+    # mirrors. The first belongs to the Windows repository-free proof, which
+    # asserts a different surface on a leg the canary does not run.
+    proof_ids = set(re.findall(r'\["([a-z_0-9]+)",', blocks[1]))
+    # The proof asserts readiness in its own arm rather than in the table, so it
+    # is required by the proof without appearing in it.
+    proof_ids.add("semantic_query_readiness")
+
+    listed = re.search(
+        r"export const REQUIRED_CHECK_IDS = \[(.*?)\];", capability_script, re.S
+    )
+    if listed is None:
+        raise AssertionError(
+            "the capability contract must export the check ids it requires"
+        )
+    canary_ids = set(re.findall(r'"([a-z_0-9]+)"', listed.group(1)))
+
+    if canary_ids != proof_ids:
+        missing = sorted(proof_ids - canary_ids)
+        extra = sorted(canary_ids - proof_ids)
+        raise AssertionError(
+            "the canary's capability contract must require exactly the health "
+            "checks the install proof requires; "
+            f"absent from the canary: {missing or 'none'}; "
+            f"required by the canary but not the proof: {extra or 'none'}"
+        )
+
+    # The rule the proof applies to every health report it reads. A canary that
+    # judges the aggregate differently would pass a report the proof rejects.
+    if 'check.id === READINESS_ID && check.status === "stale"' not in capability_script:
+        raise AssertionError(
+            "the canary must apply the proof's own aggregate-health rule, in "
+            "which a stale readiness makes the report unhealthy"
+        )
+
+    # Everything below is judged on active lines only, in both directions.
+    #
+    # A comment must not be able to satisfy a requirement, which is the trap this
+    # suite already guards elsewhere: this file explains its own rules at length,
+    # so a whole-file scan would find `--require-observed` in the paragraph
+    # explaining it and pass a canary that no longer passes the flag. A comment
+    # must not be able to trip a prohibition either, for the same reason in
+    # reverse: the header explains why the proof installs from the public
+    # endpoint and why the canary must not, and a naive scan refuses the very
+    # sentence documenting the rule.
+    active_canary = "\n".join(
+        line for line in canary.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    # The two triggers the ticket asked for, and the reason for each. A canary
+    # with only a path filter misses a break arriving through a path nobody
+    # anticipated; one with only a schedule finds it a night late.
+    if "schedule:" not in active_canary:
+        raise AssertionError("the canary must run nightly against main")
+    if "pull_request:" not in active_canary or "paths:" not in active_canary:
+        raise AssertionError(
+            "the canary must run path-filtered on the proof's known inputs"
+        )
+    for required_path in (
+        '".github/workflows/install-proof.yml"',
+        '"crates/kin-cli/src/commands/health.rs"',
+    ):
+        if required_path not in active_canary:
+            raise AssertionError(
+                "the canary's path filter must cover the proof itself and the "
+                f"readiness classifier that fenced v0.5.18; absent: {required_path}"
+            )
+
+    if "scripts/verify-capability-proof.mjs" not in active_canary:
+        raise AssertionError(
+            "the canary must actually run the shared capability contract"
+        )
+    if "--require-observed" not in active_canary:
+        raise AssertionError(
+            "the canary must assert against an observed coverage at least once; "
+            "a run that only ever saw unobservable coverage judged nothing, and a "
+            "check that cannot fail is not evidence"
+        )
+
+    # A canary publishes nothing and promotes nothing. The release path stays the
+    # release path, and a branch binary never touches it.
+    for forbidden in (
+        "contents: write",
+        "id-token: write",
+        "packages: write",
+        "gh release",
+        "npm publish",
+        "get.kinlab.dev",
+        "curl -fsSL https://get",
+    ):
+        if forbidden in active_canary:
+            raise AssertionError(
+                f"the canary must neither publish nor promote anything: {forbidden}"
+            )
+
+
 def assert_abandoned_tag_admission(
     release_tag: str,
     release_train: str,
@@ -6994,6 +7119,8 @@ def main() -> None:
     hold_alarm = HOLD_ALARM.read_text(encoding="utf-8")
     release_bot_doc = RELEASE_BOT_DOC.read_text(encoding="utf-8")
     install_proof = INSTALL_PROOF.read_text(encoding="utf-8")
+    install_proof_canary = INSTALL_PROOF_CANARY.read_text(encoding="utf-8")
+    capability_contract = CAPABILITY_CONTRACT.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     ci_workflow = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
     installer_callback = INSTALLER_CALLBACK.read_text(encoding="utf-8")
@@ -7553,6 +7680,76 @@ def main() -> None:
     # spend runners or raise an advisory alarm for a release the reviewed record
     # retired. Parse active step fields so a comment repeating the condition
     # cannot satisfy the guard while the YAML `if` omits it.
+    # The proof is the best gate Kin has and it ran only once a tag existed, so
+    # a change that broke it was discovered one release late and could not be
+    # repaired in place. The canary moves the portable half of that contract onto
+    # main. What binds the two is here, because two copies of one contract drift
+    # in the direction that matters: the canary stays green while the proof it
+    # predicts starts failing at a tag.
+    assert_capability_canary_contract(
+        install_proof, install_proof_canary, capability_contract
+    )
+    expect_assertion(
+        "the proof requires a check the canary does not",
+        "must require exactly the health checks",
+        lambda: assert_capability_canary_contract(
+            install_proof,
+            install_proof_canary,
+            capability_contract.replace('  "setup_ledger",\n', "", 1),
+        ),
+    )
+    expect_assertion(
+        "the canary drops the classifier that fenced v0.5.18 from its path filter",
+        "path filter must cover",
+        lambda: assert_capability_canary_contract(
+            install_proof,
+            install_proof_canary.replace(
+                '      - "crates/kin-cli/src/commands/health.rs"\n', "", 2
+            ),
+            capability_contract,
+        ),
+    )
+    expect_assertion(
+        "the canary can pass without ever observing coverage",
+        "check that cannot fail is not evidence",
+        lambda: assert_capability_canary_contract(
+            install_proof,
+            install_proof_canary.replace("--require-observed \\\n", ""),
+            capability_contract,
+        ),
+    )
+    expect_assertion(
+        "the canary grows the authority to publish",
+        "must neither publish nor promote",
+        lambda: assert_capability_canary_contract(
+            install_proof,
+            install_proof_canary.replace(
+                "permissions:\n  contents: read\n",
+                "permissions:\n  contents: write\n",
+                1,
+            ),
+            capability_contract,
+        ),
+    )
+    expect_assertion(
+        "the canary stops running the shared contract at all",
+        "must actually run the shared capability contract",
+        lambda: assert_capability_canary_contract(
+            install_proof,
+            install_proof_canary.replace("scripts/verify-capability-proof.mjs", "true"),
+            capability_contract,
+        ),
+    )
+    expect_assertion(
+        "the canary loses its nightly run and only fires on anticipated paths",
+        "must run nightly against main",
+        lambda: assert_capability_canary_contract(
+            install_proof,
+            install_proof_canary.replace("  schedule:\n", "  # schedule:\n", 1),
+            capability_contract,
+        ),
+    )
+
     assert_recovery_abandonment_stand_down(release_recovery)
     expect_assertion(
         "recovery repeats its stand-down condition only in comments",

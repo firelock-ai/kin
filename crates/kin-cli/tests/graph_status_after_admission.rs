@@ -208,6 +208,7 @@ fn graph_status(
         graph,
         &GraphCommandRequest::Status,
         &Default::default(),
+        &Default::default(),
     )
     .expect("run graph status")
 }
@@ -268,6 +269,7 @@ fn graph_validate(
         binding,
         graph,
         &GraphCommandRequest::Validate,
+        &Default::default(),
         &Default::default(),
     )
     .expect("run graph validate")

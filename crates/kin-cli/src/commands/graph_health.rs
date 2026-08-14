@@ -101,6 +101,25 @@ pub(crate) fn inspect_graph(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<GraphHealthReport> {
+    inspect_graph_with_pending_embeddings(binding, graph, None)
+}
+
+/// Build the report against a pending count the caller already sampled.
+///
+/// The status surface prints a coverage counter and this report's pending
+/// warning in one response. Sampling coverage twice for that response lets an
+/// embed batch complete between the two reads, so the warning names a pending
+/// count the counter beside it contradicts by exactly one batch. The two are
+/// not even drawn from the same population: `graph_stats().pending_embedding_count`
+/// counts entity ids while `embedding_status()` counts retrievable keys, so
+/// they can disagree at a single instant with no race at all. Whoever renders
+/// both takes one sample and hands it here so the two cannot disagree. Callers
+/// that render no counter pass `None` and keep the report's own sample.
+pub(crate) fn inspect_graph_with_pending_embeddings(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    graph: &kin_db::InMemoryGraph,
+    pending_embeddings: Option<usize>,
+) -> Result<GraphHealthReport> {
     let stats = graph.graph_stats();
     let supported_inputs = collect_supported_inputs(graph);
     let contamination = collect_contamination(graph)?;
@@ -110,6 +129,7 @@ pub(crate) fn inspect_graph(
         &supported_inputs,
         &contamination,
         artifact_coverage,
+        pending_embeddings,
     ))
 }
 
@@ -384,6 +404,7 @@ fn build_graph_health_report(
     supported_inputs: &SupportedInputCounts,
     contamination: &ContaminationSummary,
     artifact_coverage: RepositoryArtifactCoverage,
+    pending_embeddings: Option<usize>,
 ) -> GraphHealthReport {
     let test_role_entity_count = stats.role_counts.get("Test").copied().unwrap_or(0);
     let cochange_relation_count = stats.relation_counts.get("CoChanges").copied().unwrap_or(0);
@@ -507,11 +528,12 @@ fn build_graph_health_report(
         ));
     }
 
-    if stats.pending_embedding_count > 0 {
-        warnings.push(format!(
-            "{} embeddings are still pending",
-            stats.pending_embedding_count
-        ));
+    // One sample rules both surfaces when the caller took one, so the warning
+    // can never name a pending count the counter beside it has already moved
+    // past.
+    let pending_embeddings = pending_embeddings.unwrap_or(stats.pending_embedding_count);
+    if pending_embeddings > 0 {
+        warnings.push(format!("{pending_embeddings} embeddings are still pending"));
     }
 
     GraphHealthReport {
@@ -626,7 +648,8 @@ mod tests {
             ..complete_coverage()
         };
 
-        let report = build_graph_health_report(&stats, &supported_inputs, &contamination, coverage);
+        let report =
+            build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None);
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
@@ -655,6 +678,7 @@ mod tests {
                 path_samples: vec!["out/generated.rs".to_string()],
             },
             complete_coverage(),
+            None,
         )
     }
 
@@ -746,6 +770,7 @@ mod tests {
                 path_samples: Vec::new(),
             },
             coverage,
+            None,
         );
 
         assert!(report.repository_artifact_coverage.complete);
@@ -791,6 +816,7 @@ mod tests {
             &empty_supported_inputs(),
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(!report.repository_artifact_coverage.complete);
@@ -824,6 +850,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(report.critical_issues.is_empty());
@@ -856,6 +883,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(!report.graph_empty_for_supported_inputs);
@@ -882,6 +910,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
+            None,
         );
 
         assert!(report.graph_empty_for_supported_inputs);

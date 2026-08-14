@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Install Proof Canary
+
+# The Public Install Proof runs only once a tag exists, because it installs from
+# get.kinlab.dev with no checkout and no secrets, which is exactly what makes it
+# worth trusting. The cost of that is a feedback loop one release long: a change
+# that breaks the proof lands green, ships, and fences the release it shipped in.
+# That is the v0.5.18 story. The classifier change landed with green CI, the
+# proof caught it correctly at tag time, and the tag could not be repaired,
+# because a tag run resolves its workflows from the tag. Nothing on main can
+# reach an existing tag's run, so prevention has to fire before a tag exists.
+#
+# This is that prevention. It builds Kin from the branch, installs it into the
+# same layout the public installer uses, drives a real first run, and holds the
+# result to the portable half of the proof's capability contract. It publishes
+# nothing, promotes nothing, and proves nothing about a release: a branch binary
+# is not a release binary, and the release provenance assertions stay where they
+# belong, in the proof itself. What moves here is the part that broke.
+#
+# It is deliberately not on every pull request. The paths below are the proof's
+# known inputs, so a change that cannot affect the proof does not pay for a Rust
+# build, and the nightly run covers anything the path list fails to anticipate.
+on:
+  schedule:
+    # Nightly, so a break that arrives through a path this filter does not name
+    # is still found within hours instead of at the next cut.
+    - cron: "0 7 * * *"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/install-proof.yml"
+      - ".github/workflows/install-proof-canary.yml"
+      - "scripts/verify-capability-proof.mjs"
+      - "scripts/verify-capability-proof.test.mjs"
+      - "crates/kin-cli/src/commands/health.rs"
+      - "crates/kin-cli/src/commands/setup.rs"
+      - "crates/kin-cli/src/commands/status.rs"
+      - "crates/kin-cli/src/commands/resources.rs"
+      - "crates/kin-cli/src/commands/embed.rs"
+      - "crates/kin-cli/src/commands/init.rs"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/install-proof.yml"
+      - ".github/workflows/install-proof-canary.yml"
+      - "scripts/verify-capability-proof.mjs"
+      - "scripts/verify-capability-proof.test.mjs"
+      - "crates/kin-cli/src/commands/health.rs"
+      - "crates/kin-cli/src/commands/setup.rs"
+      - "crates/kin-cli/src/commands/status.rs"
+      - "crates/kin-cli/src/commands/resources.rs"
+      - "crates/kin-cli/src/commands/embed.rs"
+      - "crates/kin-cli/src/commands/init.rs"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  capability-canary:
+    name: Capability Contract Canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # branch 1.96.0, 2026-07-16
+
+      - name: Verify kin cargo registry config
+        run: |
+          set -euo pipefail
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then
+            echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"
+            exit 1
+          fi
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-targets: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build kin + kin-daemon from this branch
+        run: cargo build --bin kin --bin kin-daemon --locked
+
+      # The public installer puts both binaries in ~/.kin/bin, and several health
+      # checks resolve the launcher by that path rather than by whatever happens
+      # to be named `kin` on PATH. Reproduce the layout so the canary fails for
+      # the branch's behavior and never for its own staging.
+      - name: Install the branch build into the public layout
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kin/bin"
+          install -m 0755 target/debug/kin "$HOME/.kin/bin/kin"
+          install -m 0755 target/debug/kin-daemon "$HOME/.kin/bin/kin-daemon"
+          printf '%s\n' "$HOME/.kin/bin" >> "$GITHUB_PATH"
+
+      - name: Drive a real first run and capture what the proof reads
+        env:
+          SHELL: /bin/bash
+        run: |
+          set -euo pipefail
+          captures="$RUNNER_TEMP/kin-canary-captures"
+          mkdir -p "$captures"
+
+          # The proof's own fixture. `kin init` fails closed on a populated
+          # directory that is not a Git repository, so the fixture is committed
+          # and initialization takes the exact Git admission path.
+          work="$RUNNER_TEMP/kin-canary-repo"
+          mkdir -p "$work"
+          cd "$work"
+          git init -q
+          git config user.email ci@firelock.ai
+          git config user.name ci
+          printf 'def hello():\n    return 42\n' > probe.py
+          git add -A
+          git commit -qm probe
+
+          # Inert shims so setup exercises the real agent-config writers without
+          # the proprietary clients being present, exactly as the proof does.
+          # Without them the mcp_client_* checks report missing and the canary
+          # would fail for the runner rather than for the branch.
+          shims="$RUNNER_TEMP/kin-canary-agent-bin"
+          mkdir -p "$shims"
+          for agent in claude cursor codex gemini windsurf agy; do
+            printf '#!/bin/sh\nexit 0\n' > "$shims/$agent"
+            chmod +x "$shims/$agent"
+          done
+          export PATH="$shims:$PATH"
+
+          # Captures live outside the admitted worktree. The daemon admits new
+          # files as they are written, so a report written into this tree becomes
+          # corpus and the store grows while it is being measured.
+          kin init > "$captures/kin-init.txt" 2>&1
+          cat "$captures/kin-init.txt"
+          kin setup --no-interactive --intent agent --shell bash \
+            > "$captures/kin-setup.txt" 2>&1
+          cat "$captures/kin-setup.txt"
+
+          # First capture: the store as a new user finds it, before any embedding
+          # pass has been asked for.
+          kin status --json > "$captures/first-status.json"
+          kin setup status --json > "$captures/first-health.json"
+          kin doctor --json > "$captures/first-doctor.json"
+
+          # Then ask for the pass and let it run to a bounded budget. Whatever
+          # state the store reaches is a state the contract can judge, so this
+          # never needs the pass to succeed in order to mean something. The
+          # settled regime is where v0.5.18 died, so reaching it is the good case
+          # and the contract says so either way.
+          kin embed --max-seconds 240 --json > "$captures/kin-embed.json" 2>&1 || \
+            echo "::notice::the bounded embedding pass did not complete; the contract judges whatever state the store reached."
+          kin status --json > "$captures/settled-status.json"
+          kin setup status --json > "$captures/settled-health.json"
+          kin doctor --json > "$captures/settled-doctor.json"
+          echo "KIN_CANARY_CAPTURES=$captures" >> "$GITHUB_ENV"
+
+      - name: Hold the branch build to the install proof's capability contract
+        run: |
+          set -euo pipefail
+          captures="$KIN_CANARY_CAPTURES"
+          echo "::group::first run, before any embedding pass was asked for"
+          node scripts/verify-capability-proof.mjs \
+            --status "$captures/first-status.json" \
+            --report "$captures/first-health.json" \
+            --report "$captures/first-doctor.json"
+          echo "::endgroup::"
+
+          # `--require-observed` is the anti-vacuity guard. Coverage that was
+          # never observable is a window the contract deliberately concludes
+          # nothing from, and a canary that passed on nothing but windows would
+          # be a check that cannot fail rather than evidence.
+          echo "::group::after the bounded embedding pass"
+          node scripts/verify-capability-proof.mjs \
+            --require-observed \
+            --status "$captures/settled-status.json" \
+            --report "$captures/settled-health.json" \
+            --report "$captures/settled-doctor.json"
+          echo "::endgroup::"
+
+      - name: Preserve the canary captures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: install-proof-canary-captures
+          path: ${{ runner.temp }}/kin-canary-captures
+          if-no-files-found: warn
+          retention-days: 7
