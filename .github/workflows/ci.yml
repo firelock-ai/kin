@@ -109,11 +109,13 @@ jobs:
             ./scripts/read-update-build-identity.test.cjs \
             ./scripts/release-archive-shape.test.cjs \
             ./scripts/release-order.test.mjs \
+            ./scripts/release-hold-alarm.test.mjs \
             ./scripts/verify-npm-attestation.test.mjs
           node --check ./scripts/read-update-build-identity.cjs
           node --check ./scripts/check-release-version.mjs
           node --check ./scripts/prepare-release.mjs
           node --check ./scripts/release-order.mjs
+          node --check ./scripts/release-hold-alarm.mjs
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
           bash -n ./scripts/verify-npm-release.sh
@@ -327,6 +329,15 @@ jobs:
             -p kin-core --lib
           run_required_filter "managed-install spawn fence" \
             "managed_spawn_fence" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon-spawn --lib
+          # The one clause of the spawn contract only Windows can answer. Unix
+          # gets handle release from CLOEXEC, so this case passes there whether
+          # or not the code that provides it on Windows exists, and a host run
+          # of it is not evidence about Windows. Same compilation unit as the
+          # fence leg above, so it costs a run rather than a build.
+          run_required_exact "detached spawn releases the caller's stdio" \
+            "tests::a_detached_spawn_does_not_hold_the_callers_stdout_open" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon-spawn --lib
           run_required_filter "daemon shutdown identity" "shutdown" \

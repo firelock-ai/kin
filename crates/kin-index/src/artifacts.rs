@@ -195,6 +195,56 @@ fn preview_text(content: &str) -> Option<String> {
     }
 }
 
+/// Upper bound, in characters, on the text a tracked artifact retains for
+/// retrieval enrichment.
+///
+/// A tracked artifact is its own text and nothing else: this retained text is
+/// the only content the text index and the artifact embedding ever see, so a
+/// head-sized cap silently unindexes everything below it. The bound matches
+/// the historical-source retention used by ref materialization. It is a
+/// retention cap, not a display size; surfaces that render a preview apply
+/// their own display bound.
+pub const ARTIFACT_TEXT_RETENTION_CHARS: usize = 256_000;
+
+/// Bounded full text of a tracked artifact, when its bytes are text at all.
+///
+/// A textual MIME hint qualifies the bytes outright. Without one, they qualify
+/// by being at least 92% printable, which keeps extensionless binaries out of
+/// the text index. Either way the bytes must be valid UTF-8. Returns `None`
+/// for binary or empty content, never an empty string.
+pub fn opaque_text_preview(content: &[u8], mime_hint: Option<&str>) -> Option<String> {
+    let text = std::str::from_utf8(content).ok()?;
+    let textual_mime = mime_hint.is_some_and(|mime| {
+        mime.starts_with("text/")
+            || mime.contains("json")
+            || mime.contains("yaml")
+            || mime.contains("toml")
+            || mime.contains("xml")
+            || mime.contains("javascript")
+            || mime.contains("shell")
+    });
+    if !textual_mime {
+        let printable = content
+            .iter()
+            .copied()
+            .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+            .count();
+        if content.is_empty() || printable * 100 / content.len() < 92 {
+            return None;
+        }
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .chars()
+            .take(ARTIFACT_TEXT_RETENTION_CHARS)
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

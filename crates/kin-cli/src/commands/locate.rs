@@ -311,18 +311,50 @@ impl LocateIdSpace {
     }
 }
 
-/// Whether a query token IS this entity's name (or its last dotted segment).
+/// The segment of a qualified entity name that is the symbol's OWN name, with
+/// the owner it hangs off stripped: `prune_orphaned_vectors` for
+/// `InMemoryGraph::prune_orphaned_vectors`, `Raspbian` for `constant.Raspbian`.
+///
+/// Both separators are here because both are in the graph. The parsers qualify a
+/// method with its type, so Rust and C++ store `Type::method`, C stores its
+/// scope chain joined on `::`, Rust enum variants store `Enum::Variant`, and the
+/// shallow-backed languages normalize the same shape to a dot. A name layer that
+/// knows only the dot is therefore blind to every method in a Rust or C++ graph,
+/// which is most of the entities in Kin's own.
+///
+/// A trailing separator has no tail to take, so the whole name is returned
+/// rather than an empty string: nothing is a better answer than a segment that
+/// matches every empty query token.
+fn qualified_name_tail(name: &str) -> &str {
+    let dotted = name.rfind('.').map(|idx| idx + 1);
+    let scoped = name.rfind("::").map(|idx| idx + 2);
+    match dotted.max(scoped) {
+        Some(start) if start < name.len() => &name[start..],
+        _ => name,
+    }
+}
+
+/// Whether a query token IS this entity's name, or the tail segment of its
+/// qualified name ([`qualified_name_tail`]).
 ///
 /// The single definition of "the query named this symbol". `kin-daemon`'s
 /// `semantic_locate` evidence object calls this rather than keeping a second
 /// copy: one rule stated twice is one rule that can come to disagree with
 /// itself, and these two surfaces answer the same question about the same hit.
+///
+/// The tail is what makes this answer for a qualified name at all. The query
+/// tokenizer splits on every character that is not alphanumeric or an
+/// underscore, so a caller typing `InMemoryGraph::prune_orphaned_vectors`
+/// produces the tokens `inmemorygraph` and `prune_orphaned_vectors` and neither
+/// one is ever equal to the joined name. Comparing against the tail as well is
+/// what lets both the bare name and the qualified one be recognized as naming
+/// the symbol they name.
 pub fn query_names_entity(query: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
     let target = name.to_ascii_lowercase();
-    let last = target.rsplit('.').next().unwrap_or(&target).to_string();
+    let last = qualified_name_tail(&target).to_string();
     query
         .to_ascii_lowercase()
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -1030,6 +1062,37 @@ fn score_name_match(search_term: &str, entity_name: &str) -> f32 {
 
     // Exact match (all parts identical in same order)
     if search_parts == entity_parts {
+        return 5.0;
+    }
+
+    // The same exact match, against the name the symbol actually declares rather
+    // than the qualified name the graph stores it under
+    // ([`qualified_name_tail`]). `InMemoryGraph::prune_orphaned_vectors` IS
+    // named `prune_orphaned_vectors`; `InMemoryGraph` says where it lives.
+    //
+    // Without this a qualified name is not merely scored low, it is scored ZERO
+    // and dropped: [`split_identifier_parts`] does not treat `::` as a boundary,
+    // so the parts of that method are `in`, `memory`, `graph::prune`,
+    // `orphaned`, `vectors`, and a search for `prune_orphaned_vectors` finds two
+    // of its three parts. A compound term that matches only some parts is noise
+    // by the rule below, so the function returns 0.0 and every caller that gates
+    // on `> 0.0` discards the candidate the graph's own name index just handed
+    // it. That is the whole distance between a bare exact symbol name and the
+    // entity ranking: the seed loop drops it, `query_proximity_score` scores it
+    // on its signature substring alone, and the parity floor never records an
+    // exact hit for it.
+    //
+    // Deliberately narrower than making `::` a part separator outright, so
+    // part-based partials against a qualified name are unchanged and
+    // `orphaned_vectors` against the method above still scores 3.0. The
+    // single-term contains fallback at the end of this function is NOT
+    // unchanged: a term equal to the tail takes this arm at 5.0 where that
+    // fallback scored it 1.0, which crosses the lexical parity floor's quality
+    // floor and its exact-hit latch and flips the seed loop's BM25F field
+    // weight from body to name. That widening is intended and its size is
+    // unmeasured.
+    let tail_parts = split_identifier_parts(qualified_name_tail(entity_name));
+    if !tail_parts.is_empty() && search_parts == tail_parts {
         return 5.0;
     }
 
@@ -17341,6 +17404,59 @@ mod tests {
             .all(|entity| entity.id_space == LocateIdSpace::Artifact));
     }
 
+    /// The same promise through the REAL ingest enrichment instead of a
+    /// hand-rolled preview. Every fixture above hands `put_opaque` its full
+    /// body as `text_preview`, which is a state ingest never produced: the
+    /// enrichment pipeline stored every opaque artifact with no text at all,
+    /// so on a real store the text index held only a path and a MIME type and
+    /// every one of these green tests described a store that could not exist.
+    /// This test routes the bytes through `IndexPipeline::index_any_content`,
+    /// exactly what the daemon runs on admit, and puts the phrase past any
+    /// head-sized preview so head-only retention fails it too.
+    #[test]
+    #[serial_test::serial]
+    fn a_pipeline_enriched_docs_store_answers_for_deep_content() {
+        let mut body = String::from("# Kin Ecosystem AGENTS.md\n\n");
+        for index in 0..40 {
+            body.push_str(&format!(
+                "Ordinary paragraph {index} about workspace upkeep and lane hygiene, nothing \
+                 doctrinal here.\n\n"
+            ));
+        }
+        body.push_str("## Verification Rule\n\nChecks That Cannot Fail is doctrine here.\n");
+        assert!(
+            body.find("Checks That Cannot Fail").unwrap() > 2_000,
+            "the phrase must sit beyond any head-sized preview"
+        );
+
+        let bytes = body.as_bytes();
+        let indexed = kin_index::pipeline::IndexPipeline::new()
+            .index_any_content(
+                &FilePathId::new("AGENTS.md"),
+                bytes,
+                kin_blobs::digest(bytes),
+            )
+            .unwrap();
+        let kin_index::pipeline::IndexedAny::OpaqueArtifact(artifact) = indexed else {
+            panic!("markdown must take the opaque enrichment facet");
+        };
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph.put_opaque(&artifact).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let result = agent_locate(&graph, "Checks That Cannot Fail");
+        assert!(
+            artifact_row(&result, "AGENTS.md").is_some(),
+            "a pipeline-enriched docs store must answer for its own deep content; entities: {:?}",
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The bound holds, and a short page says it was short. A page cut to its
     /// limit with nothing said reads as the store having only that much.
     #[test]
@@ -18185,6 +18301,237 @@ mod tests {
         assert!(!query_names_entity("encoder", "cross_encoder_model_cached"));
         assert!(!query_names_entity("", "anything"));
         assert!(!query_names_entity("anything", ""));
+    }
+
+    /// A method the graph stores under its owner is still named by the name it
+    /// declares.
+    ///
+    /// The parsers qualify a Rust or C++ method as `Type::method`, so this is
+    /// the shape of most entities in Kin's own graph. The query tokenizer splits
+    /// on every non-identifier character, which is why NEITHER the bare name nor
+    /// the fully qualified one used to be recognized: the tokens of
+    /// `InMemoryGraph::prune_orphaned_vectors` are `inmemorygraph` and
+    /// `prune_orphaned_vectors`, and neither equals the joined name.
+    #[test]
+    fn a_query_names_a_method_the_graph_stores_under_its_owner() {
+        for query in [
+            "prune_orphaned_vectors",
+            "InMemoryGraph::prune_orphaned_vectors",
+            "where is prune_orphaned_vectors defined",
+        ] {
+            assert!(
+                query_names_entity(query, "InMemoryGraph::prune_orphaned_vectors"),
+                "{query} names the method it names"
+            );
+        }
+        // Every separator the parsers actually emit.
+        assert!(query_names_entity("Variant", "Enum::Variant"));
+        assert!(query_names_entity("method", "outer::Inner::method"));
+        assert!(query_names_entity("Raspbian", "constant.Raspbian"));
+
+        // The controls that let this check fail. Naming the OWNER is not naming
+        // the member, an unrelated token is still not a name, and a trailing
+        // separator leaves no tail that could match everything.
+        assert!(!query_names_entity(
+            "InMemoryGraph",
+            "InMemoryGraph::prune_orphaned_vectors"
+        ));
+        assert!(!query_names_entity(
+            "prune",
+            "InMemoryGraph::prune_orphaned_vectors"
+        ));
+        assert!(!query_names_entity("vectors", "InMemoryGraph::prune"));
+        assert!(!query_names_entity("anything", "Trailing::"));
+    }
+
+    /// The ranking half of the same fact: a bare exact symbol name is an EXACT
+    /// name match against the qualified entity, not the zero that dropped it.
+    ///
+    /// `split_identifier_parts` does not treat `::` as a boundary, so the parts
+    /// of the method below are `in`, `memory`, `graph::prune`, `orphaned`,
+    /// `vectors`. A search for `prune_orphaned_vectors` matches two of its three
+    /// parts, a compound partial is noise by this function's own rule, and the
+    /// result was 0.0 for the one query shape a developer types most.
+    #[test]
+    fn a_bare_symbol_name_exactly_matches_its_qualified_entity() {
+        assert_eq!(
+            score_name_match(
+                "prune_orphaned_vectors",
+                "InMemoryGraph::prune_orphaned_vectors"
+            ),
+            5.0
+        );
+        assert_eq!(score_name_match("parse_request", "http.parse_request"), 5.0);
+        // The unqualified verdict is unchanged, which is the point: this
+        // restores the exact match qualification hid rather than widening it.
+        assert_eq!(
+            score_name_match("prune_orphaned_vectors", "prune_orphaned_vectors"),
+            5.0
+        );
+
+        // Controls. Naming the owner matches nothing, a partial name stays a
+        // partial, and an unrelated compound term stays noise.
+        assert_eq!(
+            score_name_match("InMemoryGraph", "InMemoryGraph::prune_orphaned_vectors"),
+            0.0
+        );
+        assert_eq!(
+            score_name_match("orphaned_vectors", "InMemoryGraph::prune_orphaned_vectors"),
+            3.0
+        );
+        assert_eq!(
+            score_name_match("quantity_input", "InMemoryGraph::prune_orphaned_vectors"),
+            0.0
+        );
+    }
+
+    /// The defect as the dogfood measured it, in the arithmetic that produced
+    /// the number.
+    ///
+    /// `InMemoryGraph::prune_orphaned_vectors` scored 52.05 in `files[].symbols`
+    /// on 0.5.17 and 52.054 on 0.5.21, the same value on two releases. It
+    /// decomposes exactly: a name score of ZERO, one substring hit in the
+    /// signature (0.5), times the 100 proximity weight, plus 2.0 for the
+    /// function kind and 0.054 for a 54-line span. The name score being zero is
+    /// the whole of it, and 52.054 is what a symbol ranked on its signature text
+    /// alone is worth.
+    #[test]
+    fn the_exact_name_candidate_is_ranked_on_its_name_not_its_signature_text() {
+        let mut entity = test_entity(
+            "InMemoryGraph::prune_orphaned_vectors",
+            "crates/kin-db/src/engine/graph.rs",
+            5558,
+            5612,
+        );
+        entity.signature = "fn prune_orphaned_vectors(&self) -> usize".to_string();
+        let terms = vec!["prune_orphaned_vectors".to_string()];
+
+        let ranked = rank_enriched_symbols(vec![entity.clone()], &terms, false, 8);
+        assert_eq!(ranked.len(), 1);
+        let scored_on_signature_alone: f32 = 0.5 * 100.0 + 2.0 + 0.054;
+        assert!(
+            (scored_on_signature_alone - 52.054).abs() < 0.001,
+            "the recorded signature is what a zero name score composes to"
+        );
+        assert!(
+            ranked[0].score > scored_on_signature_alone,
+            "the exact-name candidate scored {} , which is the signature-text-only \
+             value the dogfood recorded on 0.5.17 and 0.5.21",
+            ranked[0].score
+        );
+        assert!(
+            (ranked[0].score - (10.5 * 100.0 + 2.0 + 0.054)).abs() < 0.01,
+            "an exact name match is worth 5.0, so proximity is 10.5 rather than 0.5"
+        );
+
+        // The control that lets this fail: an entity the query does not name
+        // keeps the signature-only shape, so the assertion above is about the
+        // name score and not about the composite being large for everything.
+        let mut unrelated = test_entity(
+            "InMemoryGraph::descriptor",
+            "crates/kin-db/src/engine/graph.rs",
+            10,
+            64,
+        );
+        unrelated.signature = "fn descriptor(&self) -> Descriptor".to_string();
+        let ranked_unrelated = rank_enriched_symbols(vec![unrelated], &terms, false, 8);
+        assert_eq!(ranked_unrelated.len(), 1);
+        assert!(
+            ranked_unrelated[0].score < 10.0,
+            "an entity the query never named must not be lifted by this change"
+        );
+    }
+
+    /// The surface an agent reads, end to end: the exact-name symbol reaches
+    /// `entities[]` LABELLED as a name hit, and the page stops declaring itself
+    /// an all-fallback ranking.
+    ///
+    /// `all_fallback` is what the MCP honesty envelope reads to say "the query
+    /// named a symbol and no ranked entity carries that name". With the
+    /// qualified name unrecognized, that sentence was emitted about a page whose
+    /// first row WAS the symbol, so the disclosure and the ranking contradicted
+    /// each other on the same response.
+    #[test]
+    fn an_exact_name_hit_reaches_the_entity_surface_as_a_name_match() {
+        let graph = kin_db::InMemoryGraph::new();
+        let path = "crates/kin-db/src/engine/graph.rs";
+        graph
+            .upsert_entity(&test_entity(
+                "InMemoryGraph::prune_orphaned_vectors",
+                path,
+                5558,
+                5612,
+            ))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity("InMemoryGraph::descriptor", path, 10, 64))
+            .unwrap();
+
+        let symbol = |name: &str, span: [u32; 2], score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some(span),
+            score,
+            kind: "method".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let mut result = LocateResult {
+            files: vec![LocateFileEntry {
+                path: path.to_string(),
+                score: 0.1909,
+                signals: vec![],
+                spans: vec![],
+                symbols: vec![
+                    symbol("InMemoryGraph::descriptor", [10, 64], 90.0),
+                    symbol(
+                        "InMemoryGraph::prune_orphaned_vectors",
+                        [5558, 5612],
+                        52.054,
+                    ),
+                ],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "prune_orphaned_vectors",
+        )
+        .unwrap();
+
+        let named = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "InMemoryGraph::prune_orphaned_vectors")
+            .expect("the exact-name symbol must reach the entity surface");
+        assert_eq!(
+            named.match_kind,
+            Some(LocateMatchKind::Name),
+            "the query is this entity's name, so the row must say so"
+        );
+        assert!(
+            !result.all_fallback,
+            "a ranking holding the named symbol is not a ranking that named nothing"
+        );
+
+        // The control: the row the query did NOT name keeps its fallback label,
+        // so the assertion above is about the name rule rather than about every
+        // row being relabelled.
+        let other = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "InMemoryGraph::descriptor")
+            .expect("the other symbol still ranks");
+        assert_eq!(other.match_kind, Some(LocateMatchKind::TextFallback));
     }
 
     #[test]

@@ -955,29 +955,7 @@ fn historical_source_text(content: &[u8]) -> Option<String> {
 }
 
 fn preview_text_if_likely_text(content: &[u8], mime_hint: Option<&str>) -> Option<String> {
-    let textual_mime = mime_hint.is_some_and(|mime| {
-        mime.starts_with("text/")
-            || mime.contains("json")
-            || mime.contains("yaml")
-            || mime.contains("toml")
-            || mime.contains("xml")
-            || mime.contains("javascript")
-            || mime.contains("shell")
-    });
-    if textual_mime {
-        return preview_text(content);
-    }
-
-    let printable = content
-        .iter()
-        .copied()
-        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
-        .count();
-    if !content.is_empty() && printable * 100 / content.len() >= 92 {
-        return preview_text(content);
-    }
-
-    None
+    kin_index::artifacts::opaque_text_preview(content, mime_hint)
 }
 
 fn build_entity_file_layout(
@@ -1193,6 +1171,51 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
+    }
+
+    /// A historical docs artifact keeps its deep text, not a head-sized
+    /// preview: FIR-2183's mechanism was that only the head of a document ever
+    /// reached the text index, so any phrase past it was unfindable.
+    #[test]
+    fn build_graph_at_ref_keeps_deep_opaque_text() {
+        let graph = InMemoryGraph::new();
+        let temp = tempfile::tempdir().unwrap();
+        let authority = test_authority(temp.path());
+
+        let genesis_id = create_fixture_change(&graph, vec![], "genesis", vec![], vec![]);
+
+        let mut body = String::from("# Notes\n\n");
+        for index in 0..40 {
+            body.push_str(&format!(
+                "Routine paragraph {index} about ordinary upkeep of the greenhouse ledger, \
+                 nothing remarkable here.\n\n"
+            ));
+        }
+        body.push_str("The quokka semaphore doctrine sits far past any head-sized preview.\n");
+        assert!(body.find("quokka").unwrap() > 2_000);
+
+        let notes_hash = save_source_blob(&authority, body.as_bytes());
+        let add_id = create_fixture_change(
+            &graph,
+            vec![genesis_id],
+            "add deep notes",
+            vec![],
+            vec![added(0x104, "NOTES.md", notes_hash)],
+        );
+
+        let historical = build_graph_at_ref_from_graph(&graph, &authority, &add_id).unwrap();
+
+        assert!(historical
+            .list_opaque_artifacts()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact.file_id.0 == "NOTES.md"
+                && artifact
+                    .text_preview
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("quokka semaphore doctrine")));
+        assert!(!historical.text_search("quokka", 10).unwrap().is_empty());
     }
 
     #[test]

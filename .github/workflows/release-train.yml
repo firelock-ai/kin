@@ -39,6 +39,14 @@ jobs:
     # the branch writer. Only the repository-scoped installation token leaves
     # the credential-minting step.
     environment: release-tag
+    outputs:
+      # This cycle's observation, handed straight to the alarm job rather than
+      # read back out of the artifact this run uploads. An artifact is listable
+      # only once the upload settles, and a newest observation that arrives late
+      # reads exactly like one that never came, which is the reading that keeps
+      # the alarm quiet. The artifact stays, because later cycles need this run
+      # to be readable from outside it.
+      marker: ${{ steps.plan.outputs.marker }}
     steps:
       - name: Mint repository-scoped release branch token
         id: app-token
@@ -195,13 +203,127 @@ jobs:
             "$admissible"
           highest_tag="$(cat "$admissible")"
           latest_tag="$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)"
+
+          # Every path out of this step now states the rail's condition in one
+          # machine-readable place, because a decision that only reaches a log
+          # notice is a decision nobody reads. Standing down is correct and
+          # frequent; standing down invisibly is how a held rail once sat for
+          # roughly twenty hours with nine merged pull requests behind it while
+          # its run history read all-green.
+          #
+          # The marker records what this run observed. It never decides what to
+          # do about it. The alarm job below owns that, so the threshold can be
+          # tested without running a rail and this step keeps exactly the exit
+          # statuses it had.
+          marker="$RUNNER_TEMP/release-hold-marker.json"
+
+          # Reviewed commits waiting behind a base tag. A base that does not
+          # resolve leaves the count absent rather than zero, because the alarm
+          # reader treats an absent count as an observation it could not make
+          # and stays quiet, while a zero would assert that nothing is waiting.
+          count_drift() {
+            local base="$1" counted=""
+            if [ -z "$base" ]; then printf 'null'; return 0; fi
+            if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+              printf 'null'
+              return 0
+            fi
+            counted="$(git rev-list --count "${base}..${main_sha}" 2>/dev/null || true)"
+            case "$counted" in
+              ''|*[!0-9]*) printf 'null' ;;
+              *) printf '%s' "$counted" ;;
+            esac
+          }
+
+          # Name the Release run that owns a blocking tag so the alarm can point
+          # at the run instead of leaving a captain to find it. Every read here
+          # is allowed to fail: an absent run id is a fact the alarm can state,
+          # and an invented one would send recovery somewhere real.
+          release_run_for_tag() {
+            local blocking="$1" runs="" found=""
+            [ -n "$blocking" ] || { printf '%s' 'null null'; return 0; }
+            runs="$(gh api \
+              "repos/${REPO}/actions/workflows/release.yml/runs?per_page=100" \
+              2>/dev/null || true)"
+            [ -n "$runs" ] || { printf '%s' 'null null'; return 0; }
+            found="$(jq -r --arg tag "$blocking" '
+              [
+                .workflow_runs[]? |
+                select(
+                  .head_branch == $tag and
+                  .status == "completed" and
+                  (
+                    .conclusion == "failure" or
+                    .conclusion == "timed_out" or
+                    .conclusion == "startup_failure"
+                  )
+                )
+              ] | sort_by(.created_at) | last // empty
+              | "\"\(.id)\" \"\(.html_url)\""
+            ' <<< "$runs" 2>/dev/null || true)"
+            case "$found" in
+              '"'*) printf '%s' "$found" ;;
+              *) printf '%s' 'null null' ;;
+            esac
+          }
+
+          write_marker() {
+            local state="$1" reason="$2" detail="$3"
+            local blocking="$4" base="$5" drift_json="$6"
+            local failed_id=null failed_url=null
+            if [ "$state" = held ]; then
+              read -r failed_id failed_url <<< "$(release_run_for_tag "$blocking")" || true
+            fi
+            jq -n \
+              --arg state "$state" \
+              --arg reason "$reason" \
+              --arg detail "$detail" \
+              --arg blocking_tag "$blocking" \
+              --arg latest_tag "$latest_tag" \
+              --arg base_tag "$base" \
+              --arg main_sha "$main_sha" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg run_url "${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}" \
+              --argjson drift "$drift_json" \
+              --argjson failed_release_run_id "$failed_id" \
+              --argjson failed_release_run_url "$failed_url" \
+              '{
+                schema: "kin.release-hold.v1",
+                state: $state,
+                reason: $reason,
+                detail: $detail,
+                blocking_tag: $blocking_tag,
+                latest_tag: $latest_tag,
+                base_tag: $base_tag,
+                drift: $drift,
+                main_sha: $main_sha,
+                run_id: $run_id,
+                run_url: $run_url,
+                failed_release_run_id: $failed_release_run_id,
+                failed_release_run_url: $failed_release_run_url,
+                observed_at: (now | todateiso8601)
+              }' > "$marker"
+            {
+              echo "marker<<KIN_RELEASE_HOLD_MARKER"
+              jq -c . "$marker"
+              echo "KIN_RELEASE_HOLD_MARKER"
+            } >> "$GITHUB_OUTPUT"
+            echo "release hold marker: $(jq -c . "$marker")"
+          }
+
           if [ -z "$highest_tag" ] || [ "$highest_tag" != "$latest_tag" ]; then
-            echo "::notice::highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery owns this state."
+            hold_detail="highest tag ${highest_tag:-<none>} is not finalized GitHub Latest ${latest_tag}; release recovery owns this state"
+            echo "::notice::${hold_detail}."
+            write_marker held tag_not_finalized "$hold_detail" \
+              "$highest_tag" "$highest_tag" "$(count_drift "$highest_tag")"
             echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! git rev-parse --verify --quiet "${tag}^{commit}" >/dev/null; then
-            echo "::notice::${tag} is already staged on main; tag reconciliation owns the next transition."
+            hold_detail="${tag} is already staged on main; tag reconciliation owns the next transition"
+            echo "::notice::${hold_detail}."
+            write_marker held tag_staged "$hold_detail" \
+              "$tag" "$highest_tag" "$(count_drift "$highest_tag")"
             echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -209,6 +331,8 @@ jobs:
           drift="$(git rev-list --count "${tag}..${main_sha}")"
           if [ "$drift" -eq 0 ]; then
             echo "::notice::main has no commits beyond ${tag}."
+            write_marker held no_drift "main has no commits beyond ${tag}" \
+              "" "$tag" 0
             echo "needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -246,6 +370,13 @@ jobs:
             echo "drift=$drift"
           } >> "$GITHUB_OUTPUT"
           echo "release drift: ${drift} first-parent range commit(s), base=${tag}, bump=${bump}"
+          # The all-clear is a marker too, and it is the one that closes the
+          # alarm. Reporting only holds would leave a resolved rail carrying an
+          # open issue until someone noticed, which is the same silence wearing
+          # the opposite costume.
+          write_marker clear "" \
+            "release drift resolved: ${drift} first-parent range commit(s), base=${tag}, bump=${bump}" \
+            "" "$tag" "$drift"
 
       - name: Create or coalesce the release branch
         id: branch
@@ -534,3 +665,199 @@ jobs:
             echo "- coalesced commits: ${DRIFT}"
             echo "- merge: armed only after protected checks"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Uploaded on every path, including the ones that stood down and the ones
+      # that failed. Later cycles read this to learn what this cycle saw, and a
+      # cycle that uploaded nothing is read as an observation that could not be
+      # made rather than as an all-clear.
+      - name: Publish this cycle's hold marker
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: release-hold-marker
+          path: ${{ runner.temp }}/release-hold-marker.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The train's decision is now readable. This job is what makes it heard.
+  #
+  # A hold is correct and common, so this deliberately does not ring on one. It
+  # rings when the rail has declined to mint for several consecutive cycles
+  # while reviewed work piled up behind it, which is the shape that cost roughly
+  # twenty hours of rail time and was visible only to a captain who read a run
+  # log by hand.
+  #
+  # A red run here is the alarm working, exactly as a red Release Recovery run
+  # is. Do not "fix" this job by making it conclude success while an issue it
+  # just opened is still open: the all-green run history is the surface that
+  # lied in the first place, and the issue alone would leave it lying.
+  hold-alarm:
+    name: Report a held rail
+    needs: reconcile
+    # Runs when the reconcile job ran, whatever it concluded. A failed train run
+    # is already loud, and its absent marker reads as unreadable here, which
+    # neither opens an alarm nor closes one.
+    #
+    # It deliberately stands down when reconcile was SKIPPED, and that condition
+    # is load-bearing rather than tidiness. The workflow_run trigger fires on
+    # every CI completion and the reconcile job's own `if` filters almost all of
+    # them out: seventeen of the last twenty runs concluded skipped, against two
+    # that reconciled. A bare `always()` would run this job on all of them, which
+    # breaks the alarm twice over. Each skipped run would contribute a cycle with
+    # no marker, and an unreadable cycle breaks the streak, so the count could
+    # never reach four. Worse, a run whose only job was skipped concludes
+    # skipped, which is exactly how the gather step below tells a non-cycle from
+    # a cycle; adding a job that always runs would conclude those runs success
+    # and hide the distinction. The alarm would have read as working and been
+    # structurally unable to fire.
+    if: always() && needs.reconcile.result != 'skipped'
+    permissions:
+      # Reading prior cycles' markers, and nothing else, needs actions:read.
+      # Nothing in this job writes to a branch, a tag, or a pull request.
+      actions: read
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # No `ref:` input. Every trigger on this workflow resolves GITHUB_SHA to a
+      # commit on the default branch, so the decision policy is read from one
+      # immutable snapshot rather than from whatever main becomes mid-run. The
+      # checkout is sparse because the only tracked file this job reads is the
+      # decision script.
+      - name: Checkout the alarm policy from the default-branch commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Gather this cycle and the cycles before it
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_MARKER: ${{ needs.reconcile.outputs.marker }}
+          THRESHOLD: "4"
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/release-hold-history"
+          mkdir -p "$work"
+          markers="$work/markers.json"
+
+          # This cycle first, then each earlier cycle that actually ran the
+          # reconcile job. A skipped run is not a cycle: the workflow_run trigger
+          # skips whenever CI concluded on something other than a successful main
+          # push, and counting those as observations would let a quiet stretch of
+          # skips stand in for a rail nobody watched.
+          current="$work/current.json"
+          if [ -n "${CURRENT_MARKER:-}" ] && jq -e . >/dev/null 2>&1 <<< "$CURRENT_MARKER"; then
+            printf '%s\n' "$CURRENT_MARKER" > "$current"
+          else
+            jq -n --arg run "$GITHUB_RUN_ID" '{unreadable: true, run_id: $run}' > "$current"
+            echo "::notice::this cycle produced no readable hold marker, so the rail's current state is unknown here."
+          fi
+
+          prior_ids="$(gh run list \
+            --repo "$REPO" \
+            --workflow release-train.yml \
+            --limit 40 \
+            --json databaseId,conclusion \
+            --jq "[.[] | select((.databaseId|tostring) != \"$GITHUB_RUN_ID\") | select(.conclusion != \"skipped\" and .conclusion != \"cancelled\") | .databaseId] | .[0:$((THRESHOLD - 1))] | .[]")"
+
+          collected="$work/collected"
+          : > "$collected"
+          printf '%s\n' "$(jq -c . "$current")" >> "$collected"
+          while IFS= read -r run_id; do
+            [ -n "$run_id" ] || continue
+            download="$work/$run_id"
+            mkdir -p "$download"
+            # A download that fails and a marker that is absent are the same
+            # finding here, and it is not "no drift". The reader treats an
+            # unreadable entry as a broken streak rather than as a quiet cycle.
+            if gh run download "$run_id" \
+                 --repo "$REPO" \
+                 --name release-hold-marker \
+                 --dir "$download" >/dev/null 2>&1 &&
+               [ -s "$download/release-hold-marker.json" ] &&
+               jq -e . "$download/release-hold-marker.json" >/dev/null 2>&1; then
+              jq -c . "$download/release-hold-marker.json" >> "$collected"
+            else
+              jq -nc --arg run "$run_id" '{unreadable: true, run_id: $run}' >> "$collected"
+            fi
+          done <<< "$prior_ids"
+
+          jq -s . "$collected" > "$markers"
+          echo "markers=$markers" >> "$GITHUB_OUTPUT"
+          echo "observed cycles: $(jq 'length' "$markers")"
+          jq -c '.[] | {run_id, state, reason, drift, unreadable}' "$markers"
+
+      - name: Decide whether the rail is quietly held, and say so if it is
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MARKERS: ${{ steps.history.outputs.markers }}
+          THRESHOLD: "4"
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/release-hold-history"
+
+          # The one title the alarm ever carries. GitHub's title search is fuzzy,
+          # so the exact-title filter after it is what keeps this idempotent: a
+          # fuzzy hit on a differently titled issue would edit the wrong one.
+          title="Release rail is held with releasable drift"
+          existing="$(gh issue list \
+            --repo "$REPO" \
+            --state open \
+            --search "\"$title\" in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" \
+            | head -1)"
+
+          issue_arg=none
+          if [ -n "$existing" ]; then
+            issue_arg="$work/issue.json"
+            jq -n --argjson number "$existing" --arg title "$title" \
+              '{number: $number, title: $title}' > "$issue_arg"
+          fi
+
+          decision="$work/decision.json"
+          node scripts/release-hold-alarm.mjs \
+            --markers "$MARKERS" \
+            --issue "$issue_arg" \
+            --threshold "$THRESHOLD" > "$decision"
+          jq -c . "$decision"
+
+          action="$(jq -er .action "$decision")"
+          reason="$(jq -er .reason "$decision")"
+          case "$action" in
+            quiet)
+              echo "rail alarm quiet (${reason}): $(jq -r '.detail // ""' "$decision")"
+              ;;
+            open)
+              body="$work/body.md"
+              jq -er .body "$decision" > "$body"
+              gh issue create --repo "$REPO" --title "$title" --body-file "$body" >/dev/null
+              echo "::error::The release rail has held with releasable drift for $(jq -er .consecutive "$decision") consecutive cycles. Opened the tracking issue that names the blocking tag and the two ways out."
+              exit 1
+              ;;
+            update)
+              body="$work/body.md"
+              jq -er .body "$decision" > "$body"
+              number="$(jq -er .issue "$decision")"
+              gh issue edit "$number" --repo "$REPO" --body-file "$body" >/dev/null
+              echo "::error::The release rail is still held with releasable drift after $(jq -er .consecutive "$decision") consecutive cycles; issue #${number} carries the current state."
+              exit 1
+              ;;
+            close)
+              number="$(jq -er .issue "$decision")"
+              comment="$work/comment.md"
+              jq -er .comment "$decision" > "$comment"
+              gh issue comment "$number" --repo "$REPO" --body-file "$comment" >/dev/null
+              gh issue close "$number" --repo "$REPO" >/dev/null
+              echo "Closed rail-hold issue #${number}: the train is minting again."
+              ;;
+            *)
+              echo "::error::unsupported alarm action: ${action}"
+              exit 1
+              ;;
+          esac

@@ -3330,7 +3330,40 @@ impl<T> ProjectionAuthorityCommit<T> {
     }
 }
 
+const SLOW_AUTHORITY_PUBLICATION: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Time repository authority publication and record what it cost.
+///
+/// The daemon times its own commit phases, but its innermost phase spans both
+/// the workspace projection this crate performs and the authority publication
+/// that runs inside it, so a slow commit cannot be attributed to either side
+/// from the daemon log alone. Naming the publication separately splits that
+/// span at the crate boundary without changing what either side does. The
+/// whole helper is timed rather than its first attempt, because a caller that
+/// waits through a retry waited for all of it.
+fn timed_authority_publication<T>(work: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let outcome = work();
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed >= SLOW_AUTHORITY_PUBLICATION {
+        tracing::info!(elapsed_ms, "slow repository authority publication");
+    } else {
+        tracing::debug!(elapsed_ms, "repository authority publication");
+    }
+    outcome
+}
+
 fn commit_repository_transaction_exact(
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    transaction: RepositoryTransaction,
+) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
+    timed_authority_publication(|| {
+        commit_repository_transaction_exact_inner(authority, transaction)
+    })
+}
+
+fn commit_repository_transaction_exact_inner(
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
 ) -> ProjectionAuthorityCommit<RepositoryCommitReceipt> {
