@@ -1,10 +1,10 @@
 {
   "name": "kin",
-  "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
+  "displayName": "Kin",
   "version": "0.1.0",
+  "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
   "author": {
-    "name": "Firelock",
-    "url": "https://kinlab.ai"
+    "name": "Firelock"
   },
   "homepage": "https://kinlab.ai",
   "repository": "https://github.com/firelock-ai/kin",
@@ -16,5 +16,6 @@
     "impact-analysis",
     "code-review",
     "mcp"
-  ]
+  ],
+  "logo": "assets/logo.png"
 }

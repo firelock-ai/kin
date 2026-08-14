@@ -281,6 +281,62 @@ Admission derives the semantic entities, not their vectors. Run `kin embed` to
 add local vector similarity over them, and confirm coverage with
 `kin graph status`.
 
+## Works with your agent
+
+Kin ships an MCP server, so any agent that speaks MCP can read the graph.
+`kin setup --intent agent` configures every client it detects in one pass. These
+are the per-client one-liners when you would rather install Kin directly.
+
+Claude Code, from inside a session:
+
+```
+/plugin marketplace add firelock-ai/kin
+/plugin install kin@kin
+```
+
+Codex:
+
+```sh
+codex plugin marketplace add firelock-ai/kin
+codex plugin add kin@kin
+```
+
+Gemini CLI:
+
+```sh
+gemini extensions install https://github.com/firelock-ai/kin
+```
+
+Cursor takes a one-click install link. Paste this into Cursor or into your
+browser's address bar:
+
+```
+cursor://anysphere.cursor-deeplink/mcp/install?name=kin&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBraW5sYWIva2luLW1jcCJdfQ==
+```
+
+Kiro takes the same thing as a web link:
+[Add Kin to Kiro](https://kiro.dev/launch/mcp/add?name=kin&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40kinlab%2Fkin-mcp%22%5D%7D).
+
+Every other client that reads a standard MCP config takes this entry:
+
+```json
+{
+  "mcpServers": {
+    "kin": { "command": "npx", "args": ["-y", "@kinlab/kin-mcp"] }
+  }
+}
+```
+
+The wrapper needs Node 20 or newer, and on its first run it downloads the
+matching Kin release, verifies its published SHA-256, and caches the binaries per
+user. Codex CLI wants the same thing as TOML under `[mcp_servers.kin]`.
+
+One caveat worth repeating: these tools answer from the graph, so the repository
+has to be admitted with `kin init .` and embedded with `kin embed` before
+`semantic_locate` can rank anything. [llms-install.md](llms-install.md) is that
+whole path written so an agent can follow it unattended, from a bare machine to a
+first verified tool call.
+
 ## Review an AI-written change
 
 **AI writes code. Kin proves what changed.**

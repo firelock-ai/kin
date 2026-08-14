@@ -1,0 +1,12 @@
+{
+  "name": "kin",
+  "version": "0.5.27",
+  "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "kin": {
+      "command": "npx",
+      "args": ["-y", "@kinlab/kin-mcp"]
+    }
+  }
+}
