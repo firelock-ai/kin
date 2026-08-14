@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.26] - 2026-08-14
+
+### Changed
+
+- Give the compat-v0 locate arm the shared file surface (#809)
+- Name why an embedding count is zero instead of leaving it to read as loss (#804)
+
+
 ## [0.5.25] - 2026-08-13
 
 ### Changed
