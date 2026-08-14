@@ -2002,6 +2002,153 @@ jobs:
             "$daemon_bin" --version
           fi
 
+  # Update the MCP Registry entry for `ai.kinlab/kin`. The registry is the
+  # substrate the other MCP catalogs read, and it validates the npm package the
+  # entry points at against live npm, so this runs only after @kinlab/kin-mcp
+  # is public at this exact version. Prerelease tags are skipped: the registry
+  # treats the newest published version as the current one, and a candidate
+  # must not become what a catalog offers.
+  #
+  # Authority is the DNS door: an Ed25519 key proves control of kinlab.ai
+  # through a TXT record. The registry also accepts
+  # `./mcp-publisher login http --domain kinlab.ai`, which proves the same
+  # namespace from https://kinlab.ai/.well-known/mcp-registry-auth, if that
+  # record is ever lost.
+  #
+  # The whole job is continue-on-error. A registry outage, a lapsed DNS record,
+  # or an unset key must never refuse a release that is already public on npm
+  # and GitHub, and the registry publishes no uptime or durability guarantee.
+  # When the publish does not happen the summary says so plainly, because a
+  # green job that published nothing is the failure mode this posture buys.
+  publish_mcp_registry:
+    name: Publish to the MCP Registry
+    needs: publish_npm_compatibility
+    if: >-
+      ${{
+        always() &&
+        needs.publish_npm_compatibility.result == 'success' &&
+        startsWith(github.ref, 'refs/tags/v') &&
+        !contains(github.ref_name, '-')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set the released version in server.json
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          jq --arg v "$version" '.version = $v | .packages[0].version = $v' \
+            server.json > server.json.tmp
+          mv server.json.tmp server.json
+          jq -e --arg v "$version" \
+            '.version == $v and .packages[0].version == $v' server.json > /dev/null
+          # The registry refuses the publish unless package.json's mcpName is
+          # exactly server.json's name, and it reports that as a package
+          # validation failure rather than as the mismatch it is.
+          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+            '.name == $pkg[0].mcpName' server.json > /dev/null
+          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+            '.packages[0].identifier == $pkg[0].name' server.json > /dev/null
+
+      - name: Wait for npm to serve the published version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 12); do
+            if [ "$(npm view "@kinlab/kin-mcp@${version}" version 2>/dev/null)" = "$version" ]; then
+              echo "npm serves @kinlab/kin-mcp@${version}"
+              exit 0
+            fi
+            [ "$attempt" -eq 12 ] || sleep 10
+          done
+          echo "::error::npm does not serve @kinlab/kin-mcp@${version} yet; the registry validates against live npm, so nothing was published"
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          curl -fsSL \
+            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_${arch}.tar.gz" \
+            | tar xz mcp-publisher
+          test -x ./mcp-publisher
+
+      - name: Authenticate to the MCP Registry
+        id: registry_login
+        env:
+          MCP_PRIVATE_KEY: ${{ secrets.MCP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MCP_PRIVATE_KEY:-}" ]; then
+            echo "::warning::MCP_PRIVATE_KEY is not configured; the MCP Registry entry will not be published"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+          ./mcp-publisher login dns --domain kinlab.ai --private-key "$MCP_PRIVATE_KEY"
+
+      - name: Publish the server entry
+        id: registry_publish
+        if: steps.registry_login.outputs.configured == 'true'
+        run: ./mcp-publisher publish
+
+      - name: Read the entry back from the registry
+        id: registry_verify
+        if: steps.registry_login.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          body="$(curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=ai.kinlab")"
+          printf '%s\n' "$body" | jq .
+          {
+            echo "### MCP Registry search for ai.kinlab"
+            echo
+            echo '```json'
+            printf '%s\n' "$body" | jq .
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s' "$body" \
+            | jq -e '[.servers[]? | .server | select(.name == "ai.kinlab/kin")] | length > 0' \
+            > /dev/null
+
+      - name: Report the registry outcome
+        if: always()
+        env:
+          CONFIGURED: ${{ steps.registry_login.outputs.configured }}
+          PUBLISHED: ${{ steps.registry_publish.outcome }}
+          READ_BACK: ${{ steps.registry_verify.outcome }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${PUBLISHED:-}" = "success" ] && [ "${READ_BACK:-}" = "success" ]; then
+            {
+              echo "### MCP Registry"
+              echo
+              echo "\`ai.kinlab/kin\` ${version} is published and reads back from the registry."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### MCP Registry"
+            echo
+            echo "**The MCP Registry publish did NOT happen for ${GITHUB_REF_NAME}.**"
+            echo
+            echo "- credential configured: ${CONFIGURED:-no}"
+            echo "- publish step: ${PUBLISHED:-did not run}"
+            echo "- read back step: ${READ_BACK:-did not run}"
+            echo
+            echo "The release itself is unaffected. npm, GitHub, the installers, and the images do not depend on this entry, which is why this job cannot refuse a release. Rerun this job, or run mcp-publisher by hand, once the cause is fixed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   finalize_release:
     name: Promote Proven Release
     needs: [publish, install_proof, version_tag_image, smoke_npm_published]

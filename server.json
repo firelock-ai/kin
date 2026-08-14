@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "ai.kinlab/kin",
+  "title": "Kin",
+  "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
+  "repository": {
+    "url": "https://github.com/firelock-ai/kin",
+    "source": "github"
+  },
+  "version": "0.5.27",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@kinlab/kin-mcp",
+      "version": "0.5.27",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
