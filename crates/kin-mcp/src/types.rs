@@ -71,11 +71,31 @@ pub struct ToolsCapability {
     pub list_changed: bool,
 }
 
+/// MCP tool annotations: the behavioral hints a client uses to decide what a
+/// call may do before it makes one.
+///
+/// Every field is emitted, including the ones the MCP schema treats as
+/// meaningful only for a writing tool. The schema's default for
+/// `destructiveHint` is `true`, so a read-only tool that omitted it would read
+/// as destructive to any client that takes the field at face value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// Short human-readable display name. The tool's `name` stays the wire
+    /// identifier clients call.
+    pub title: String,
+    pub read_only_hint: bool,
+    pub destructive_hint: bool,
+    pub idempotent_hint: bool,
+    pub open_world_hint: bool,
+}
+
 /// MCP tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    pub annotations: ToolAnnotations,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
 }
