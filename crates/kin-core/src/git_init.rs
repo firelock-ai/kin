@@ -359,7 +359,7 @@ fn init_from_git_with_hooks(
     progress.begin("commit bootstrap transaction");
     {
         let _span = info_span!("kin.init.commit_bootstrap_transaction").entered();
-        prepared.commit_repository_bootstrap(&transaction)?;
+        prepared.commit_repository_bootstrap(transaction)?;
     }
 
     let mut result = publish_repository_layout_linearized(prepared, |publication| {
