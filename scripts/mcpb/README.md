@@ -22,6 +22,9 @@ Windows are the supported platforms.
 
 https://kinlab.ai/privacy
 
+Every network exit the CLI, the daemon, and this launcher can make is enumerated in
+https://github.com/firelock-ai/kin/blob/main/docs/security/what-leaves-the-machine.md.
+
 ## Support
 
 Report problems at https://github.com/firelock-ai/kin/issues. The core is Apache-2.0 at
