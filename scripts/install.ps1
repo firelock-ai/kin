@@ -7,7 +7,7 @@
 #   irm https://get.kinlab.dev/install.ps1 | iex
 #
 # Options (via env vars):
-#   $env:KIN_VERSION = "0.5.23"  Pin a specific version (default: latest)
+#   $env:KIN_VERSION = "0.5.25"  Pin a specific version (default: latest)
 #   $env:KIN_HOME = "$HOME\.kin" Install directory (preferred; default: ~/.kin)
 #   $env:KIN_DIR = "$HOME\.kin"  Install directory compatibility alias
 #   $env:KIN_NO_SETUP = "1"     CI compatibility; native repository setup is always skipped
