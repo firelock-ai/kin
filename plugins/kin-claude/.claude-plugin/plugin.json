@@ -16,5 +16,9 @@
     "impact-analysis",
     "code-review",
     "mcp"
-  ]
+  ],
+  "interface": {
+    "logo": "./icon.png",
+    "composerIcon": "./icon.png"
+  }
 }
