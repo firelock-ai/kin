@@ -317,6 +317,10 @@ cursor://anysphere.cursor-deeplink/mcp/install?name=kin&config=eyJjb21tYW5kIjoib
 Kiro takes the same thing as a web link:
 [Add Kin to Kiro](https://kiro.dev/launch/mcp/add?name=kin&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40kinlab%2Fkin-mcp%22%5D%7D).
 
+Cline takes the standard entry below rather than a one-liner. Its CLI reads
+`~/.cline/mcp.json`. In the VS Code extension, open the MCP Servers panel, then
+the Configure tab, then Configure MCP Servers, and add the entry there.
+
 Every other client that reads a standard MCP config takes this entry:
 
 ```json

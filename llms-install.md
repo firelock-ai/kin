@@ -12,8 +12,8 @@ is connected" will look broken, because the tools will correctly report an empty
 graph.
 
 So the install is four steps, not one: install the CLI, admit the repository, build the
-vector index, wire the server into the client. Verify with a real query, and stop the daemon
-if you were only proving the install works.
+vector index, wire the server into the client. Then verify with a real query, and stop the
+daemon if you were only proving the install works. Six sections follow, in that order.
 
 ## Step 1: install the Kin CLI
 
