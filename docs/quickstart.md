@@ -81,7 +81,7 @@ what Kin admitted, run `git config --global core.autocrlf false` and clone again
 Configure the installers with environment variables (supported by both `install.sh`
 and `install.ps1` unless noted):
 
-- `KIN_VERSION`: pin a specific version (e.g. `0.1.0`); otherwise the latest release is
+- `KIN_VERSION`: pin a specific version (e.g. `0.5.25`); otherwise the latest release is
   resolved automatically.
 - `KIN_HOME`: custom managed install directory (preferred; defaults to `~/.kin`).
 - `KIN_DIR`: compatibility alias for `KIN_HOME`.
