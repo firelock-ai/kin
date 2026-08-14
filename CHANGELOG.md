@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Move the bootstrap transaction into the commit instead of copying it (#816)
 - Give the four locally-answered list commands a real --json (#818)
+- Re-key the installer and bug-report version examples to 0.5.25 (#808)
 
 
 ## [0.5.26] - 2026-08-14
