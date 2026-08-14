@@ -570,6 +570,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "smoke_npm_published": (
             "Anonymous Published npm Smoke (${{ matrix.package }})"
         ),
+        "publish_mcp_registry": "Publish to the MCP Registry",
         "finalize_release": "Promote Proven Release",
         "promote_ghcr_latest": "Promote stable ghcr latest",
         "publish_boundary_contracts": "Post-release boundary contracts publish",

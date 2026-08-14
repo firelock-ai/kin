@@ -1,0 +1,61 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "kin",
+  "display_name": "Kin",
+  "version": "0.5.27",
+  "description": "Semantic code retrieval over a graph of entities, relationships, changes, and provenance. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
+  "author": {
+    "name": "Firelock, LLC",
+    "url": "https://kinlab.ai"
+  },
+  "homepage": "https://kinlab.ai",
+  "documentation": "https://github.com/firelock-ai/kin#readme",
+  "support": "https://github.com/firelock-ai/kin/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/firelock-ai/kin"
+  },
+  "license": "Apache-2.0",
+  "icon": "icon.png",
+  "keywords": [
+    "kin",
+    "mcp",
+    "code",
+    "search",
+    "graph"
+  ],
+  "privacy_policies": [
+    "https://kinlab.ai/privacy"
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  },
+  "user_config": {
+    "workspace_directory": {
+      "type": "directory",
+      "title": "Kin workspace",
+      "description": "The Kin repository this server answers from. Choose the directory that carries .kin/; run `kin init .` there first if it does not.",
+      "required": true
+    }
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "KIN_MCP_REPO": "${user_config.workspace_directory}"
+      }
+    }
+  }
+}

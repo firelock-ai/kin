@@ -50,6 +50,35 @@ RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BU
       cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
     fi
 
+# Alternate image: Kin's MCP stdio server instead of the daemon. Select it
+# explicitly with `docker build --target mcp`. It sits BEFORE the runtime stage
+# on purpose: a build with no `--target` takes the last stage, so the daemon
+# image every existing build produces (docker.yml, cloudbuild.yaml,
+# release.yml, docker-compose.yml) is unchanged by this stage existing.
+#
+# It repeats the pinned base rather than deriving from that runtime stage
+# because every FROM here has to name its registry and pin a digest:
+# scripts/verify-base-image-pins.sh proves each pin against two registries, and
+# scripts/test-release-workflow-authority.py refuses any base a mirror could
+# resolve differently. A `FROM <stage>` line carries neither, and both checks
+# gate a release.
+FROM docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS mcp
+RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+RUN groupadd -r kin \
+    && useradd -r -g kin -d /home/kin -m kin \
+    && chmod 0700 /home/kin
+ENV HOME=/home/kin
+WORKDIR /app
+COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin
+# The MCP server is transport-only: it forwards graph tools to the repo daemon
+# it resolves for the mounted repository, so the daemon binary has to be here
+# even though nothing in this image starts one and no port is published.
+COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon
+USER kin
+# stdio transport: MCP travels over stdin and stdout, so run this image with
+# `-i`, mount the repository, and set the working directory to it.
+ENTRYPOINT ["/usr/local/bin/kin", "mcp", "start"]
+
 FROM docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r kin \
