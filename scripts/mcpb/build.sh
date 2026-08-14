@@ -13,6 +13,7 @@ here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${here}/../.." && pwd)"
 icon_source="${repo_root}/assets/mcp/icon-512.png"
 icon_target="${here}/icon.png"
+bundle="${here}/kin.mcpb"
 
 if [ ! -f "$icon_source" ]; then
   echo "error: the extension icon is missing: ${icon_source}" >&2
@@ -23,5 +24,9 @@ fi
 cp -- "$icon_source" "$icon_target"
 echo "icon: ${icon_source} -> ${icon_target}"
 
+# Name the output explicitly. With no output argument mcpb names the bundle after the
+# directory it packed, so the file lands as mcpb.mcpb while the pack summary reports a
+# filename of kin-<version>.mcpb, and neither name is what gets uploaded.
 cd -- "$here"
-exec npx -y @anthropic-ai/mcpb pack
+npx -y @anthropic-ai/mcpb pack . "$bundle"
+echo "bundle: ${bundle}"
