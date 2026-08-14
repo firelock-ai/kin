@@ -5,7 +5,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+/// Schema token stamped on every `kin backup list --json` answer.
+pub const BACKUP_LIST_SCHEMA: &str = "kin.backup.list.v1";
 
 /// `kin backup create` — Create a timestamped backup of the graph snapshot.
 pub async fn create(tag: Option<String>) -> Result<()> {
@@ -48,28 +52,84 @@ pub async fn create(tag: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// One backup on disk, as both the table and the JSON surface describe it.
+#[derive(Debug, Serialize)]
+pub struct BackupEntry {
+    /// Backup filename, the token `kin backup restore` matches against.
+    pub name: String,
+    /// Absolute path to the backup file.
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupListJson {
+    pub schema: &'static str,
+    pub count: usize,
+    pub backups: Vec<BackupEntry>,
+}
+
+/// The backups directory's contents, projected for display.
+///
+/// Reads the same `list_backup_entries` walk the text path has always used, so
+/// the two surfaces cannot report different sets.
+fn collect_backups(backups_dir: &PathBuf) -> Result<Vec<BackupEntry>> {
+    let mut backups = Vec::new();
+    for path in list_backup_entries(backups_dir)? {
+        let meta = fs::metadata(&path)
+            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+        backups.push(BackupEntry {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            path: path.display().to_string(),
+            size_bytes: meta.len(),
+        });
+    }
+    Ok(backups)
+}
+
+/// The envelope `--json` prints, built in one place so a test can gate it.
+///
+/// The runtime must not assemble this inline: a test that built its own copy
+/// would keep passing while the printed document drifted, which is the shape of
+/// a check that cannot fail.
+fn backup_list_payload(backups: Vec<BackupEntry>) -> BackupListJson {
+    BackupListJson {
+        schema: BACKUP_LIST_SCHEMA,
+        count: backups.len(),
+        backups,
+    }
+}
+
 /// `kin backup list` — List available backups.
-pub async fn list() -> Result<()> {
+pub async fn list(json: bool) -> Result<()> {
     let layout = discover_layout()?;
     let backups_dir = layout.backups_dir();
 
-    let entries = list_backup_entries(&backups_dir)?;
+    let backups = collect_backups(&backups_dir)?;
 
-    if entries.is_empty() {
+    // An empty set is an ANSWER, not an absence, so `--json` emits the same
+    // stamped envelope with a zero count rather than the prose the table shows.
+    // A caller parsing this must never have to distinguish "no backups" from
+    // "not JSON".
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&backup_list_payload(backups))?
+        );
+        return Ok(());
+    }
+
+    if backups.is_empty() {
         println!("No backups found.");
         return Ok(());
     }
 
-    println!("{} backup(s):", entries.len());
-    for entry in &entries {
-        let meta = fs::metadata(entry)
-            .with_context(|| format!("failed to read metadata for {}", entry.display()))?;
-        let name = entry
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let size = meta.len();
-        println!("  {} ({} bytes)", name, size);
+    println!("{} backup(s):", backups.len());
+    for entry in &backups {
+        println!("  {} ({} bytes)", entry.name, entry.size_bytes);
     }
 
     Ok(())
@@ -304,6 +364,56 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with("graph-"));
+    }
+
+    /// An empty backups directory is an answer, so the envelope still goes out
+    /// stamped with a zero count.
+    ///
+    /// This is the property the whole flag exists for: a caller must never have
+    /// to tell "no backups" apart from "not JSON", which is exactly what the
+    /// text path's `No backups found.` forces it to do.
+    #[test]
+    fn the_json_surface_answers_an_empty_directory_with_a_stamped_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = collect_backups(&dir.path().to_path_buf()).unwrap();
+        assert!(backups.is_empty());
+
+        let value = serde_json::to_value(backup_list_payload(backups)).unwrap();
+        assert_eq!(value["schema"], BACKUP_LIST_SCHEMA);
+        assert_eq!(value["count"].as_u64().unwrap(), 0);
+        assert!(
+            value["backups"].is_array(),
+            "the list must be present and empty, never absent"
+        );
+    }
+
+    /// Sizes and names are read off the files rather than restated, and the
+    /// count matches the list it describes.
+    #[test]
+    fn the_json_surface_reports_the_backups_on_disk_with_their_real_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups_dir = dir.path().to_path_buf();
+        fs::write(backups_dir.join("graph-20260101-000000.kndb"), b"abcde").unwrap();
+        fs::write(backups_dir.join("graph-20260102-000000.kndb"), b"xy").unwrap();
+        // Neither the extension nor the prefix matches, so neither may appear.
+        fs::write(backups_dir.join("graph-notes.txt"), b"ignored").unwrap();
+        fs::write(backups_dir.join("other-20260103-000000.kndb"), b"ignored").unwrap();
+
+        let backups = collect_backups(&backups_dir).unwrap();
+        let names: Vec<&str> = backups.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["graph-20260101-000000.kndb", "graph-20260102-000000.kndb"]
+        );
+        assert_eq!(backups[0].size_bytes, 5);
+        assert_eq!(backups[1].size_bytes, 2);
+        assert!(backups[0].path.ends_with("graph-20260101-000000.kndb"));
+
+        let value = serde_json::to_value(backup_list_payload(backups)).unwrap();
+        assert_eq!(
+            value["count"].as_u64().unwrap() as usize,
+            value["backups"].as_array().unwrap().len()
+        );
     }
 
     #[test]

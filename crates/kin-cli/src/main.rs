@@ -1242,7 +1242,11 @@ enum BackupAction {
         tag: Option<String>,
     },
     /// List available backups
-    List,
+    List {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Restore the graph from a backup
     Restore {
         /// Backup name (partial match supported)
@@ -1288,7 +1292,11 @@ enum SpecAction {
         intent: String,
     },
     /// List specs
-    List,
+    List {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Show a spec
     Show {
         /// Spec ID
@@ -1378,7 +1386,11 @@ enum GitAction {
 #[derive(Subcommand)]
 enum RemoteAction {
     /// List configured and detected remotes
-    List,
+    List {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Add or update a configured remote
     Add {
         /// Remote name
@@ -1611,7 +1623,11 @@ enum AssistantAction {
         assistant: Option<String>,
     },
     /// List installed adapters
-    List,
+    List {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Sync managed doc blocks
     Sync,
     /// Configure managed doc sync targets
@@ -2813,7 +2829,7 @@ fn main() -> Result<()> {
                 Command::Xref { entity } => commands::xref::run(entity).await,
                 Command::Spec { action } => match action {
                     SpecAction::Create { intent } => commands::spec::create(intent).await,
-                    SpecAction::List => commands::spec::list().await,
+                    SpecAction::List { json } => commands::spec::list(json).await,
                     SpecAction::Show { id } => commands::spec::show(id).await,
                 },
                 Command::Merge { branch, json } => {
@@ -2878,7 +2894,7 @@ fn main() -> Result<()> {
                     AuthAction::Status { base_url } => commands::auth::status(base_url).await,
                 },
                 Command::Remote { action } => match action {
-                    RemoteAction::List => commands::remote::list().await,
+                    RemoteAction::List { json } => commands::remote::list(json).await,
                     RemoteAction::Add {
                         name,
                         host,
@@ -3021,7 +3037,7 @@ fn main() -> Result<()> {
                 }
                 Command::Backup { action } => match action {
                     BackupAction::Create { tag } => commands::backup::create(tag).await,
-                    BackupAction::List => commands::backup::list().await,
+                    BackupAction::List { json } => commands::backup::list(json).await,
                     BackupAction::Restore { name, latest } => {
                         commands::backup::restore(name, latest).await
                     }
@@ -3123,7 +3139,7 @@ fn main() -> Result<()> {
                     AssistantAction::Doctor { assistant } => {
                         commands::assistant::run_doctor(assistant).await
                     }
-                    AssistantAction::List => commands::assistant::list().await,
+                    AssistantAction::List { json } => commands::assistant::list(json).await,
                     AssistantAction::Sync => commands::assistant::sync().await,
                     AssistantAction::Configure {
                         sync_mode,
