@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.29] - 2026-08-14
+
+### Changed
+
+- Name the MCPB bundle output and give it a README (#831)
+- Add plugin interface icons for the Codex converter (#832)
+
+
 ## [0.5.28] - 2026-08-14
 
 ### Changed
