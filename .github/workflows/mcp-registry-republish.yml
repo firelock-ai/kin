@@ -22,7 +22,6 @@ jobs:
     name: Publish to the MCP Registry
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: release
     permissions:
       contents: read
     steps:
