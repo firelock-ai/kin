@@ -1,0 +1,6 @@
+{
+  "kin": {
+    "command": "npx",
+    "args": ["-y", "@kinlab/kin-mcp"]
+  }
+}

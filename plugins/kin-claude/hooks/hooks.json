@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "This codebase uses Kin for semantic code navigation. Start code exploration with `kin trace <ExactName> --compact`. After 2-3 traces you have enough context — stop and answer. Use `kin search` only if trace is insufficient."
+            "prompt": "This codebase can be read through Kin's semantic graph instead of raw file search. Start with `semantic_search` when you know the symbol name, `semantic_locate` when you only have a description of the behavior, and `get_context_pack` to pull an entity with its callers and imports in one call. Every response carries a `_kin` envelope naming the graph state that answered; an empty result carries a `negative` verdict saying whether absence can be trusted. After 2-3 graph calls you usually have enough context. Stop and answer. If the kin CLI is installed, `kin trace <ExactName> --compact` is the terminal equivalent."
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "Reminder: prefer `kin trace <ExactName> --compact` for focused code questions. After 2-3 traces, stop and answer."
+            "prompt": "Reminder: for focused code questions prefer Kin's graph tools over grep and whole-file reads. `semantic_search` for a known name, `semantic_locate` for a described behavior, `find_references` for callers, `impact_analysis` before changing anything shared. After 2-3 calls, stop and answer."
           }
         ]
       }
