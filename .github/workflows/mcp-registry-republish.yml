@@ -6,6 +6,9 @@
 # because a person asked for this publish and should hear the answer.
 name: MCP Registry Republish
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:

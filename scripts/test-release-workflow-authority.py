@@ -516,6 +516,11 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/link-check.yml": {
         "link-check": "Check public documentation links",
     },
+    # Manual fix-forward publisher for a release whose registry entry failed;
+    # workflow_dispatch only, so it never produces a pull request check.
+    ".github/workflows/mcp-registry-republish.yml": {
+        "republish_mcp_registry": "Publish to the MCP Registry",
+    },
     # Reports an ejection on the pull request the merge queue dropped. It runs
     # on workflow_run after the fact, produces no check on a pull request, and
     # so is never a required-context producer.
