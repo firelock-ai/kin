@@ -1,7 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use crate::types::{ToolDefinition, ToolsListResult};
+use crate::types::{ToolAnnotations, ToolDefinition, ToolsListResult};
+
+/// A tool that only reads graph truth.
+///
+/// `openWorldHint` is false on every tool this crate defines: the whole surface
+/// answers from the local repository graph and reaches no external world.
+fn read_only(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.into(),
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: false,
+    }
+}
+
+/// A tool that records new state and neither replaces nor removes existing
+/// state, where calling it again records more.
+fn mutates(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.into(),
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: false,
+        open_world_hint: false,
+    }
+}
+
+/// A tool that changes state without discarding recorded content, where a
+/// repeat call with the same arguments leaves the same state behind.
+fn mutates_idempotent(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.into(),
+        read_only_hint: false,
+        destructive_hint: false,
+        idempotent_hint: true,
+        open_world_hint: false,
+    }
+}
+
+/// A tool that can overwrite or discard existing state, where a repeat call
+/// with the same arguments leaves the same state behind.
+fn destructive_idempotent(title: &str) -> ToolAnnotations {
+    ToolAnnotations {
+        title: title.into(),
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: true,
+        open_world_hint: false,
+    }
+}
 
 /// Honest JSON Schema for one transaction operation.
 ///
@@ -75,13 +125,25 @@ fn transaction_operation_schema() -> serde_json::Value {
     })
 }
 
-/// Build the list of all MCP tools that Kin exposes.
+/// Build the list of all MCP tools that Kin exposes, in name order.
+///
+/// The order is part of the contract. A client caches the prompt it builds from
+/// `tools/list`, so a surface that reordered between builds would miss that
+/// cache for every session. Sorting by name also means the order does not
+/// depend on where a new tool is inserted in the registry below.
 pub fn tool_definitions() -> ToolsListResult {
+    let mut list = registered_tools();
+    list.tools.sort_by(|left, right| left.name.cmp(&right.name));
+    list
+}
+
+fn registered_tools() -> ToolsListResult {
     ToolsListResult {
         tools: vec![
             ToolDefinition {
                 name: "kin_artifact_list".into(),
                 description: crate::handlers::artifacts::ARTIFACT_LIST_DESC.into(),
+                annotations: read_only("List artifacts"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -99,6 +161,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_artifact_read".into(),
                 description: crate::handlers::artifacts::ARTIFACT_READ_DESC.into(),
+                annotations: read_only("Read artifact"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -130,6 +193,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "semantic_search".into(),
                 description: crate::handlers::entities::SEMANTIC_SEARCH_DESC.into(),
+                annotations: read_only("Semantic search"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -145,6 +209,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "semantic_locate".into(),
                 description: crate::handlers::entities::SEMANTIC_LOCATE_DESC.into(),
+                annotations: read_only("Semantic locate"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -185,6 +250,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "get_entity".into(),
                 description: crate::handlers::entities::GET_ENTITY_DESC.into(),
+                annotations: read_only("Get entity"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -196,6 +262,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "get_entity_source".into(),
                 description: crate::handlers::entities::GET_ENTITY_SOURCE_DESC.into(),
+                annotations: read_only("Get entity source"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -207,6 +274,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "get_entity_body".into(),
                 description: crate::handlers::entities::GET_ENTITY_BODY_DESC.into(),
+                annotations: read_only("Get entity body"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -218,6 +286,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "get_entity_sources".into(),
                 description: crate::handlers::entities::GET_ENTITY_SOURCES_DESC.into(),
+                annotations: read_only("Get entity sources"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -252,6 +321,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "get_context_pack".into(),
                 description: crate::handlers::entities::GET_CONTEXT_PACK_DESC.into(),
+                annotations: read_only("Get context pack"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -267,6 +337,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "trace_computation".into(),
                 description: crate::handlers::entities::TRACE_COMPUTATION_DESC.into(),
+                annotations: read_only("Trace computation"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -281,6 +352,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "trace_data_flow".into(),
                 description: crate::handlers::entities::TRACE_DATA_FLOW_DESC.into(),
+                annotations: read_only("Trace data flow"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -300,6 +372,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "find_references".into(),
                 description: crate::handlers::entities::FIND_REFERENCES_DESC.into(),
+                annotations: read_only("Find references"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -316,6 +389,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "bulk_check_references".into(),
                 description: crate::handlers::entities::BULK_CHECK_REFERENCES_DESC.into(),
+                annotations: read_only("Bulk check references"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -344,6 +418,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "impact_analysis".into(),
                 description: crate::handlers::review::IMPACT_ANALYSIS_DESC.into(),
+                annotations: read_only("Impact analysis"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -359,6 +434,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "semantic_diff".into(),
                 description: crate::handlers::review::SEMANTIC_DIFF_DESC.into(),
+                annotations: read_only("Semantic diff"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -373,6 +449,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "semantic_review".into(),
                 description: crate::handlers::review::SEMANTIC_REVIEW_DESC.into(),
+                annotations: read_only("Semantic review"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -389,6 +466,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "shadow_gate_report".into(),
                 description: crate::handlers::review::SHADOW_GATE_REPORT_DESC.into(),
+                annotations: read_only("Shadow gate report"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -405,6 +483,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "dead_code".into(),
                 description: crate::handlers::entities::DEAD_CODE_DESC.into(),
+                annotations: read_only("Find dead code"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -420,6 +499,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "find_dead_code_seeded".into(),
                 description: crate::handlers::entities::FIND_DEAD_CODE_SEEDED_DESC.into(),
+                annotations: read_only("Find dead code by query"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -441,6 +521,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "entity_history".into(),
                 description: crate::handlers::review::ENTITY_HISTORY_DESC.into(),
+                annotations: read_only("Entity history"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -452,6 +533,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "graph_neighborhood".into(),
                 description: crate::handlers::entities::GRAPH_NEIGHBORHOOD_DESC.into(),
+                annotations: read_only("Graph neighborhood"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -466,6 +548,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "benchmark".into(),
                 description: crate::handlers::bench::BENCHMARK_DESC.into(),
+                annotations: read_only("Benchmark metrics"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -476,6 +559,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "register_session".into(),
                 description: crate::handlers::sessions::REGISTER_SESSION_DESC.into(),
+                annotations: mutates("Register assistant session"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -489,6 +573,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_session_start".into(),
                 description: crate::handlers::sessions::SESSION_START_DESC.into(),
+                annotations: mutates("Start agent session"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -516,6 +601,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_session_heartbeat".into(),
                 description: crate::handlers::sessions::SESSION_HEARTBEAT_DESC.into(),
+                annotations: mutates("Heartbeat agent session"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -527,6 +613,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_session_end".into(),
                 description: crate::handlers::sessions::SESSION_END_DESC.into(),
+                annotations: mutates_idempotent("End agent session"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -538,6 +625,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_register_intent".into(),
                 description: crate::handlers::sessions::REGISTER_INTENT_DESC.into(),
+                annotations: mutates("Register work intent"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -557,6 +645,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_release_intent".into(),
                 description: crate::handlers::sessions::RELEASE_INTENT_DESC.into(),
+                annotations: mutates_idempotent("Release work intent"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -569,6 +658,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_check_traffic".into(),
                 description: crate::handlers::sessions::CHECK_TRAFFIC_DESC.into(),
+                annotations: read_only("Check agent traffic"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -584,6 +674,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_transaction_begin".into(),
                 description: "Begin an exact repository mutation transaction. Product commits currently support full-body edits of existing source entities and relation add/upsert/remove operations; unsupported source insertion/deletion fails before repository mutation. Returns a unique transaction_id.".into(),
+                annotations: mutates("Begin transaction"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -596,6 +687,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_transaction_stage".into(),
                 description: crate::handlers::sessions::TRANSACTION_STAGE_DESC.into(),
+                annotations: mutates("Stage transaction operations"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -613,6 +705,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_transaction_validate".into(),
                 description: "Validate the intrinsic shape and supported verb/payload combinations of staged mutations without committing them. Repository-entity existence, exact spans, source bytes, tree cleanliness, and semantic reparse are validated against authority at commit time.".into(),
+                annotations: mutates_idempotent("Validate transaction"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -625,6 +718,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_transaction_commit".into(),
                 description: crate::handlers::sessions::TRANSACTION_COMMIT_DESC.into(),
+                annotations: destructive_idempotent("Commit transaction"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -642,6 +736,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_transaction_abort".into(),
                 description: "Abort an active or validated transaction and discard all staged mutations. Once kin_transaction_commit has fenced the transaction for publication this is refused, because repository authority may already have moved; re-send the commit instead, which resumes the fenced payload idempotently and reports whether it landed. You do not need abort to recover from a refused commit: a commit refused before publication already clears its staged operations and names them, so corrected ones go on the same transaction.".into(),
+                annotations: destructive_idempotent("Abort transaction"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -654,6 +749,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "explore_codebase".into(),
                 description: crate::handlers::entities::EXPLORE_CODEBASE_DESC.into(),
+                annotations: read_only("Explore codebase"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -668,6 +764,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_create".into(),
                 description: crate::handlers::work::WORK_CREATE_DESC.into(),
+                annotations: mutates("Create work item"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -683,6 +780,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_list".into(),
                 description: crate::handlers::work::WORK_LIST_DESC.into(),
+                annotations: read_only("List work items"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -695,6 +793,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_show".into(),
                 description: crate::handlers::work::WORK_SHOW_DESC.into(),
+                annotations: read_only("Show work item"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -706,6 +805,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_link".into(),
                 description: crate::handlers::work::WORK_LINK_DESC.into(),
+                annotations: mutates("Link work to scopes"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -718,6 +818,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_decompose".into(),
                 description: crate::handlers::work::WORK_DECOMPOSE_DESC.into(),
+                annotations: mutates("Decompose work item"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -730,6 +831,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_block".into(),
                 description: crate::handlers::work::WORK_BLOCK_DESC.into(),
+                annotations: mutates("Block work item"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -742,6 +844,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_implement".into(),
                 description: crate::handlers::work::WORK_IMPLEMENT_DESC.into(),
+                annotations: mutates("Record work implementation"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -754,6 +857,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_work_status".into(),
                 description: crate::handlers::work::WORK_STATUS_DESC.into(),
+                annotations: destructive_idempotent("Set work status"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -767,6 +871,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_annotation_add".into(),
                 description: crate::handlers::work::ANNOTATION_ADD_DESC.into(),
+                annotations: mutates("Add annotation"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -781,6 +886,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_annotation_list".into(),
                 description: crate::handlers::work::ANNOTATION_LIST_DESC.into(),
+                annotations: read_only("List annotations"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -793,6 +899,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_annotation_mark_resolved".into(),
                 description: crate::handlers::work::ANNOTATION_MARK_RESOLVED_DESC.into(),
+                annotations: destructive_idempotent("Resolve annotation"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -804,6 +911,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_todo_import".into(),
                 description: crate::handlers::work::TODO_IMPORT_DESC.into(),
+                annotations: mutates("Import TODO markers"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -815,6 +923,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_verify_entity".into(),
                 description: crate::handlers::verification::VERIFY_ENTITY_DESC.into(),
+                annotations: read_only("Verify entity"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -827,6 +936,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_coverage_summary".into(),
                 description: crate::handlers::verification::COVERAGE_SUMMARY_DESC.into(),
+                annotations: read_only("Coverage summary"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {}
@@ -835,6 +945,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_security_scan".into(),
                 description: crate::handlers::verification::SECURITY_SCAN_DESC.into(),
+                annotations: read_only("Security scan"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -845,6 +956,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_release_check".into(),
                 description: crate::handlers::verification::RELEASE_CHECK_DESC.into(),
+                annotations: read_only("Release readiness check"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -860,6 +972,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_contract_check".into(),
                 description: crate::handlers::verification::CONTRACT_CHECK_DESC.into(),
+                annotations: read_only("Contract check"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -871,6 +984,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_provenance_query".into(),
                 description: crate::handlers::provenance::PROVENANCE_QUERY_DESC.into(),
+                annotations: read_only("Query provenance"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -887,6 +1001,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_create".into(),
                 description: crate::handlers::review::REVIEW_CREATE_DESC.into(),
+                annotations: mutates("Create review"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -912,6 +1027,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_decide".into(),
                 description: crate::handlers::review::REVIEW_DECIDE_DESC.into(),
+                annotations: mutates("Decide review"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -928,6 +1044,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_note_add".into(),
                 description: crate::handlers::review::REVIEW_NOTE_ADD_DESC.into(),
+                annotations: mutates("Add review note"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -945,6 +1062,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_discuss".into(),
                 description: crate::handlers::review::REVIEW_DISCUSS_DESC.into(),
+                annotations: mutates("Start review discussion"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -962,6 +1080,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_discuss_reply".into(),
                 description: crate::handlers::review::REVIEW_DISCUSS_REPLY_DESC.into(),
+                annotations: mutates("Reply to review discussion"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -976,6 +1095,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_discuss_resolve".into(),
                 description: crate::handlers::review::REVIEW_DISCUSS_RESOLVE_DESC.into(),
+                annotations: destructive_idempotent("Resolve review discussion"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -991,6 +1111,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_assign".into(),
                 description: crate::handlers::review::REVIEW_ASSIGN_DESC.into(),
+                annotations: mutates("Assign reviewer"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1010,6 +1131,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_unassign".into(),
                 description: crate::handlers::review::REVIEW_UNASSIGN_DESC.into(),
+                annotations: destructive_idempotent("Unassign reviewer"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1022,6 +1144,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_list".into(),
                 description: crate::handlers::review::REVIEW_LIST_DESC.into(),
+                annotations: read_only("List reviews"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1032,6 +1155,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_review_get".into(),
                 description: crate::handlers::review::REVIEW_GET_DESC.into(),
+                annotations: read_only("Get review"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1043,6 +1167,7 @@ pub fn tool_definitions() -> ToolsListResult {
             ToolDefinition {
                 name: "kin_graph_status".into(),
                 description: crate::handlers::entities::GRAPH_STATUS_DESC.into(),
+                annotations: read_only("Graph status"),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},
@@ -1148,6 +1273,186 @@ mod tests {
             assert!(!tool.name.is_empty());
             assert!(!tool.description.is_empty());
         }
+    }
+
+    /// Every tool that changes state when it is called.
+    ///
+    /// Stated by hand rather than derived, because a derived list would agree
+    /// with whatever the registry claims and could never disagree with it. Each
+    /// name here was classified by reading its handler.
+    const WRITING_TOOLS: &[&str] = &[
+        "kin_annotation_add",
+        "kin_annotation_mark_resolved",
+        "kin_register_intent",
+        "kin_release_intent",
+        "kin_review_assign",
+        "kin_review_create",
+        "kin_review_decide",
+        "kin_review_discuss",
+        "kin_review_discuss_reply",
+        "kin_review_discuss_resolve",
+        "kin_review_note_add",
+        "kin_review_unassign",
+        "kin_session_end",
+        "kin_session_heartbeat",
+        "kin_session_start",
+        "kin_todo_import",
+        "kin_transaction_abort",
+        "kin_transaction_begin",
+        "kin_transaction_commit",
+        "kin_transaction_stage",
+        "kin_transaction_validate",
+        "kin_work_block",
+        "kin_work_create",
+        "kin_work_decompose",
+        "kin_work_implement",
+        "kin_work_link",
+        "kin_work_status",
+        "register_session",
+    ];
+
+    /// Every tool that can overwrite or discard something already recorded.
+    ///
+    /// `kin_transaction_commit` splices new bodies over existing entity source
+    /// and republishes the ref; `kin_transaction_abort` clears the staged
+    /// operations outright; `kin_work_status` and `kin_review_discuss_resolve`
+    /// replace a state field in place; `kin_annotation_mark_resolved` deletes
+    /// the annotation; `kin_review_unassign` removes the assignment.
+    const DESTRUCTIVE_TOOLS: &[&str] = &[
+        "kin_annotation_mark_resolved",
+        "kin_review_discuss_resolve",
+        "kin_review_unassign",
+        "kin_transaction_abort",
+        "kin_transaction_commit",
+        "kin_work_status",
+    ];
+
+    #[test]
+    fn every_tool_carries_a_title_and_honest_hints() {
+        let list = tool_definitions();
+        let mut titles = BTreeSet::new();
+        for tool in &list.tools {
+            let annotations = &tool.annotations;
+            assert!(
+                !annotations.title.trim().is_empty(),
+                "{} has no title",
+                tool.name
+            );
+            assert_ne!(
+                annotations.title, tool.name,
+                "{}'s title repeats the wire name instead of naming it for a human",
+                tool.name
+            );
+            assert!(
+                titles.insert(annotations.title.clone()),
+                "two tools share the title {:?}, so a client menu cannot tell them apart",
+                annotations.title
+            );
+            // Registry ceiling clients enforce on the identifier they call.
+            assert!(
+                tool.name.len() <= 64,
+                "{} is {} characters, over the 64-character tool-name limit",
+                tool.name,
+                tool.name.len()
+            );
+            assert!(
+                !annotations.open_world_hint,
+                "{} claims an open world; the whole surface answers from the local graph",
+                tool.name
+            );
+            if annotations.read_only_hint {
+                assert!(
+                    !annotations.destructive_hint,
+                    "{} is read-only and cannot also be destructive",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// The hints must be able to disagree with the registry, so both classes are
+    /// named here and compared as whole sets. A tool added without a considered
+    /// classification fails this rather than inheriting a plausible default.
+    #[test]
+    fn the_writing_and_destructive_surfaces_are_exactly_these() {
+        let list = tool_definitions();
+        let writing: BTreeSet<&str> = list
+            .tools
+            .iter()
+            .filter(|tool| !tool.annotations.read_only_hint)
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let destructive: BTreeSet<&str> = list
+            .tools
+            .iter()
+            .filter(|tool| tool.annotations.destructive_hint)
+            .map(|tool| tool.name.as_str())
+            .collect();
+
+        assert_eq!(writing, WRITING_TOOLS.iter().copied().collect());
+        assert_eq!(destructive, DESTRUCTIVE_TOOLS.iter().copied().collect());
+        assert!(
+            destructive.is_subset(&writing),
+            "a destructive tool that reports itself read-only would be auto-approved"
+        );
+    }
+
+    #[test]
+    fn tools_list_order_is_stable_and_sorted() {
+        let names = |list: &ToolsListResult| -> Vec<String> {
+            list.tools.iter().map(|tool| tool.name.clone()).collect()
+        };
+        let first = names(&tool_definitions());
+        let second = names(&tool_definitions());
+        assert_eq!(first, second, "two calls must serve the same order");
+
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "tools/list must be name-ordered");
+
+        // The registry's own order is not the served order, so the sort is
+        // doing real work rather than agreeing with the source by accident.
+        assert_ne!(names(&registered_tools()), sorted);
+    }
+
+    #[test]
+    fn serialized_tools_carry_the_annotation_object() {
+        let serialized =
+            serde_json::to_value(tool_definitions()).expect("tools/list must serialize");
+        let tools = serialized["tools"].as_array().expect("tools array");
+        for tool in tools {
+            let annotations = tool["annotations"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} serialized no annotations", tool["name"]));
+            for key in [
+                "title",
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    annotations.contains_key(key),
+                    "{} is missing annotations.{key}",
+                    tool["name"]
+                );
+            }
+        }
+
+        let locate = tools
+            .iter()
+            .find(|tool| tool["name"] == "semantic_locate")
+            .expect("semantic_locate must be exposed");
+        assert_eq!(locate["annotations"]["title"], "Semantic locate");
+        assert_eq!(locate["annotations"]["readOnlyHint"], true);
+        assert_eq!(locate["annotations"]["destructiveHint"], false);
+
+        let commit = tools
+            .iter()
+            .find(|tool| tool["name"] == "kin_transaction_commit")
+            .expect("kin_transaction_commit must be exposed");
+        assert_eq!(commit["annotations"]["readOnlyHint"], false);
+        assert_eq!(commit["annotations"]["destructiveHint"], true);
     }
 
     #[test]
