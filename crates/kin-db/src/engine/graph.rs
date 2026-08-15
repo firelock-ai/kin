@@ -5515,6 +5515,21 @@ impl InMemoryGraph {
                 .collect()
         };
 
+        // A drained id with no shallow/structured/opaque enrichment record has
+        // no embeddable document and is deliberately not requeued (requeueing
+        // work that cannot make progress spins forever). But dropping it in
+        // silence is how a store reports "+0 artifacts" with nothing pending
+        // while its tracked artifacts hold no vectors, so name the gap: the
+        // remedy is an enrichment pass creating the record, not another embed.
+        if docs.len() < ids.len() {
+            tracing::warn!(
+                dropped = ids.len() - docs.len(),
+                drained = ids.len(),
+                "artifact embedding batch dropped queued ids with no enrichment record; \
+                 these artifacts cannot be embedded until enrichment recreates their records"
+            );
+        }
+
         if docs.is_empty() {
             return Ok(0);
         }
