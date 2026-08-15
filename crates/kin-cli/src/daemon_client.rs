@@ -3827,6 +3827,23 @@ pub fn repo_daemon_recorded_endpoint(kin_root: &Path) -> (Option<u32>, Option<u1
     (read_pid_file(kin_root), read_port_file(kin_root))
 }
 
+/// One line saying how far a starting repo daemon has come, read from its
+/// recorded lifecycle markers alone: the daemon writes `daemon.pid` when its
+/// process comes up and `daemon.port` only once it is listening.
+///
+/// This is the phase string the MCP answer-early path (FIR-2316) folds into
+/// its honest still-starting `tools/call` answer. It lives here, in the
+/// declared daemon-lifecycle IO boundary, because the transport crate and the
+/// `kin mcp` launcher deliberately carry no filesystem primitive at all; they
+/// receive this as an injected probe.
+pub fn daemon_startup_phase(kin_root: &Path) -> &'static str {
+    match repo_daemon_recorded_endpoint(kin_root) {
+        (_, Some(_)) => "phase: the daemon is listening and finishing readiness checks",
+        (Some(_), None) => "phase: the daemon process is up and loading the repository graph",
+        (None, None) => "phase: resolving or spawning the repo daemon process",
+    }
+}
+
 /// The (pid, port) recorded for the per-user supervisor, read from its
 /// `supervisor.{pid,port}` files with no liveness probe. Either component is
 /// `None` when its file is absent or unparseable.
@@ -7132,6 +7149,30 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup-phase line the MCP answer-early path injects must track the
+    /// daemon's lifecycle markers: pid file means the process is up and
+    /// loading, port file means it is listening, neither means it is still
+    /// being resolved or spawned.
+    #[test]
+    fn daemon_startup_phase_tracks_the_lifecycle_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_root = tmp.path();
+        assert!(
+            daemon_startup_phase(kin_root).contains("resolving or spawning"),
+            "no markers is the resolve/spawn phase"
+        );
+        std::fs::write(kin_root.join(kin_daemon_spawn::PID_FILE_NAME), "12345").unwrap();
+        assert!(
+            daemon_startup_phase(kin_root).contains("loading the repository graph"),
+            "a pid file with no port file is the graph-load phase"
+        );
+        std::fs::write(kin_root.join(kin_daemon_spawn::PORT_FILE_NAME), "50000").unwrap();
+        assert!(
+            daemon_startup_phase(kin_root).contains("finishing readiness checks"),
+            "a published port is the readiness phase"
+        );
+    }
 
     #[test]
     fn windows_daemon_candidates_use_the_target_platform_executable_name() {

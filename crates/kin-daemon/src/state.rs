@@ -85,6 +85,11 @@ impl ChangeStore for ProspectiveChangeStore<'_> {
 /// Reconciliation loop status values.
 pub const RECON_IDLE: u8 = 0;
 pub const RECON_PROCESSING: u8 = 1;
+/// The background-work supervisor stopped the reconcile pass and the loop is
+/// parked: no admission runs until a daemon restart, while the daemon itself
+/// keeps serving. Distinct from `RECON_IDLE` so status surfaces report the
+/// stop instead of describing a stopped loop as merely quiet.
+pub const RECON_PARKED: u8 = 2;
 
 /// Flush a directory entry after an atomic namespace update where the host
 /// supports opening directories as files. Windows rejects
@@ -5193,6 +5198,7 @@ impl DaemonState {
     pub fn reconciliation_status_str(&self) -> &'static str {
         match self.reconciliation_status.load(Ordering::Relaxed) {
             RECON_PROCESSING => "processing",
+            RECON_PARKED => "parked-by-supervisor",
             _ => "idle",
         }
     }

@@ -241,13 +241,15 @@ names which gate ruled.
 ### One thing to tell the user before they judge the answers
 
 `kin setup status` prints a `Retrieval quality profile` line naming the profile serving
-queries and which retrieval levers are on. A stock install serves `compat-v0`, which is the
-default on purpose and keeps the historical ranking behavior. `KIN_PROFILE` selects a
-profile, and `accuracy-v1` is the opt-in candidate shape. Two facts matter if you change it.
+queries and which retrieval levers are on. A stock install serves `accuracy-v2`, the
+measured-accuracy default: `semantic_locate` and `kin locate` both answer from the fused
+multi-signal pipeline, entity fusion and the lexical parity floor are on, and the
+cross-encoder reranker stays off. `KIN_PROFILE` selects a different profile: `accuracy-v1`
+adds the budget-gated cross-encoder when its model is already cached, and `compat-v0` keeps
+the pre-profile lever defaults as an A/B escape hatch. Two facts matter if you change it.
 The profile is read by the process that serves queries, so it has to be set where the daemon
 starts and not on the MCP client entry, and a daemon already running has to be restarted
-under it. And `accuracy-v1` stays opt-in because it has not graduated on measurement, so
-treat it as a comparison to run rather than a fix to apply.
+under it.
 
 ## Step 6: stop the daemon when you are done
 

@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::{DaemonError, Result};
 use crate::state::{
     ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest, ProjectionChangedSet, RECON_IDLE,
-    RECON_PROCESSING,
+    RECON_PARKED, RECON_PROCESSING,
 };
 
 pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
@@ -1070,6 +1070,109 @@ fn persist_non_entity_enrichment(
     }
 }
 
+/// Create the missing non-entity enrichment records for the current resolved
+/// tree, reading bodies from the repository CAS.
+///
+/// Bulk admission (`kin init` importing a Git repository) derives entities for
+/// parser-supported sources and stops there: no shallow, structured, or opaque
+/// record is written for any other tracked file. Every downstream artifact
+/// surface keys on those records — `artifact_count()`, the artifact embedding
+/// queue, the text index that feeds lexical artifact candidacy — so a store
+/// born from bulk admission reports "+0 artifacts" on `kin embed` and can never
+/// rank an artifact, while `kin status` counts the same files as tracked. The
+/// live reconcile loop only enriches paths that produce file events, which an
+/// unchanged imported tree never does.
+///
+/// This pass is strictly additive: a path is skipped when any enrichment facet
+/// already exists for it (including an entity-source layout), when its current
+/// bytes classify as entity source, or when its tree entry carries no blob
+/// body. It never deletes or replaces a facet, so drift between an existing
+/// record and tree truth stays the reconcile loop's job. Bodies come from the
+/// repository CAS, never from the working filesystem.
+///
+/// Returns how many records were created. Callers that receive a nonzero count
+/// own bumping the state version so the records persist with the next snapshot.
+///
+/// Gated with its only runtime caller, the embed request handler: a build
+/// without embedding support has no surface that asks for this coverage, and
+/// an uncalled function fails the deny-warnings build on exactly those
+/// feature subsets.
+#[cfg(feature = "embeddings")]
+pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Result<usize> {
+    let tree = state.graph.resolved_tree();
+    let pipeline = IndexPipeline::new();
+    let mut created = 0usize;
+    let mut unreadable = 0usize;
+
+    for artifact in tree.artifacts() {
+        if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(hash) = artifact.entry.blob_identity() else {
+            continue;
+        };
+        let Some(path) = artifact.path.as_utf8() else {
+            // Non-UTF-8 paths stay byte-exact tree truth with no UTF-8
+            // enrichment surface, same as the live reconcile loop.
+            continue;
+        };
+        let file_id = FilePathId::new(path);
+
+        if state.graph.get_shallow_file(&file_id)?.is_some()
+            || state.graph.get_structured_artifact(&file_id)?.is_some()
+            || state.graph.get_opaque_artifact(&file_id)?.is_some()
+            || state.graph.get_file_layout(&file_id)?.is_some()
+        {
+            continue;
+        }
+
+        let content = match state.blobs.read(&hash) {
+            Ok(content) => content,
+            Err(error) => {
+                // A missing derived body must not fail daemon startup; CAS
+                // hydration owns repairing it, and the next pass retries.
+                unreadable += 1;
+                debug!(
+                    file = %file_id,
+                    error = %error,
+                    "enrichment coverage pass could not read tracked body from CAS"
+                );
+                continue;
+            }
+        };
+
+        if FileClassifier::classify_with_content(Path::new(path), &content)
+            == FileClassification::EntitySource
+        {
+            continue;
+        }
+
+        match pipeline.index_any_content(&file_id, &content, hash) {
+            Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
+                Ok(_) => created += 1,
+                Err(error) => warn!(
+                    file = %file_id,
+                    error = %error,
+                    "enrichment coverage pass could not persist facet"
+                ),
+            },
+            Err(error) => warn!(
+                file = %file_id,
+                error = %error,
+                "enrichment coverage pass could not enrich tracked body"
+            ),
+        }
+    }
+
+    if created > 0 || unreadable > 0 {
+        info!(
+            created,
+            unreadable, "enrichment coverage pass created missing non-entity records"
+        );
+    }
+    Ok(created)
+}
+
 /// Deferrals of one path before its log line escalates from debug to warn.
 ///
 /// A file saved while the pass is reading it defers once and reconciles on the
@@ -1246,6 +1349,94 @@ fn reconcile_error_earns_retry(error: &kin_reconcile::ReconcileError) -> bool {
     )
 }
 
+/// Sweep expired coordination intents and record every automatic release
+/// durably, under the same cross-surface gate used by registration and graph
+/// apply.
+///
+/// Called once per reconcile tick, and kept alive by the parked loop after a
+/// supervisor stop: intents are locks, and a daemon that keeps serving must
+/// keep expiring them whether or not admission still runs.
+async fn sweep_expired_intents(state: &DaemonState) {
+    let _coordination = state.coordination_gate.lock().await;
+    let mode = state.coordination_mode().as_str().to_string();
+    match state
+        .coordinator
+        .sweep_expired_intents_with_reservation(|intent| {
+            state
+                .record_coordination_event(crate::state::CoordinationEventDraft {
+                    event: "intent_release",
+                    outcome: "pending:expired".to_string(),
+                    session_id: Some(intent.session_id.to_string()),
+                    intent_id: Some(intent.intent_id.to_string()),
+                    intent_ids: vec![intent.intent_id.to_string()],
+                    transaction_id: None,
+                    scopes: intent.scopes.iter().map(crate::api::format_scope).collect(),
+                    enforcement_mode: mode.clone(),
+                    blocking_intent_ids: Vec::new(),
+                })
+                .map(|_| ())
+        }) {
+        Ok(reaped) => {
+            for intent in &reaped {
+                let _ = state.record_coordination_event(crate::state::CoordinationEventDraft {
+                    event: "intent_release",
+                    outcome: "expired".to_string(),
+                    session_id: Some(intent.session_id.to_string()),
+                    intent_id: Some(intent.intent_id.to_string()),
+                    intent_ids: vec![intent.intent_id.to_string()],
+                    transaction_id: None,
+                    scopes: intent.scopes.iter().map(crate::api::format_scope).collect(),
+                    enforcement_mode: mode.clone(),
+                    blocking_intent_ids: Vec::new(),
+                });
+            }
+            if !reaped.is_empty() {
+                debug!(reaped = reaped.len(), "swept expired intents");
+            }
+        }
+        Err(error) => {
+            state.mark_coordination_evidence_incomplete(format!(
+                "expired-intent sweep failed after reservation may have been written: {error}"
+            ));
+        }
+    }
+}
+
+/// What the reconciliation loop becomes after the background-work supervisor
+/// stops its pass: parked, not exited.
+///
+/// The loop's exit is one of the daemon's shutdown arms, so exiting on a
+/// supervisor stop tore down the API task and every other task with it,
+/// directly contradicting the stop announcement's "the daemon keeps serving"
+/// (FIR-2317). Parking keeps the task alive doing only the coordination
+/// housekeeping the daemon still owes, and ends on the daemon's own shutdown
+/// signal. Admission stays stopped until a daemon restart clears the
+/// in-memory halt, which is the "a restart retries it" the announcement
+/// promises.
+async fn park_reconcile_loop(
+    state: &DaemonState,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    interval: Duration,
+) -> Result<()> {
+    // A zero poll interval must not turn the parked loop into the very
+    // CPU-spending spin the supervisor just stopped.
+    let interval = interval.max(Duration::from_millis(200));
+    loop {
+        if *cancel.borrow() {
+            state
+                .reconciliation_status
+                .store(RECON_IDLE, Ordering::Relaxed);
+            info!("reconciliation loop shutting down");
+            return Ok(());
+        }
+        sweep_expired_intents(state).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = cancel.changed() => {}
+        }
+    }
+}
+
 /// Run the reconciliation loop until the cancellation token fires.
 ///
 /// This is the main loop of the daemon. It:
@@ -1355,69 +1546,36 @@ pub async fn run_loop(
         // taken, so nothing is abandoned mid-transaction. Graph truth is
         // untouched and the daemon keeps serving it; what stops is the automatic
         // tracking of working-copy edits, which the announced reason says.
+        //
+        // Parking, not exiting, is what keeps that announcement true: this
+        // loop's exit is a shutdown arm in the daemon's task supervision, so
+        // returning here cancelled the API task and took the whole daemon down
+        // twenty seconds after it promised to keep serving (FIR-2317). The
+        // parked loop sheds the watcher and the admission machinery, keeps the
+        // expired-intent sweep alive so coordination locks still expire, and
+        // ends only on the daemon's own shutdown. The halt is in-memory state,
+        // so a daemon restart retries the pass, exactly as announced.
         if pass.halted() {
             state
                 .reconciliation_status
-                .store(RECON_IDLE, Ordering::Relaxed);
+                .store(RECON_PARKED, Ordering::Relaxed);
             error!(
                 reason = pass.halt_reason().unwrap_or_default(),
-                "reconciliation loop stopped by the background-work supervisor"
+                "reconciliation loop stopped by the background-work supervisor; parking it while \
+                 the daemon keeps serving (a daemon restart retries the pass)"
             );
-            break;
+            pass.idle();
+            // A parked loop owes nothing, whatever its ladder still held.
+            pass.set_deferred(false, Instant::now());
+            // Shed the admission machinery: the watcher would keep buffering
+            // events nothing will ever drain.
+            drop(watcher);
+            drop(pending_events);
+            drop(retry_lane);
+            return park_reconcile_loop(&state, cancel, interval).await;
         }
 
-        // Sweep under the same cross-surface gate used by registration and
-        // graph apply, then record every automatic release durably.
-        {
-            let _coordination = state.coordination_gate.lock().await;
-            let mode = state.coordination_mode().as_str().to_string();
-            match state
-                .coordinator
-                .sweep_expired_intents_with_reservation(|intent| {
-                    state
-                        .record_coordination_event(crate::state::CoordinationEventDraft {
-                            event: "intent_release",
-                            outcome: "pending:expired".to_string(),
-                            session_id: Some(intent.session_id.to_string()),
-                            intent_id: Some(intent.intent_id.to_string()),
-                            intent_ids: vec![intent.intent_id.to_string()],
-                            transaction_id: None,
-                            scopes: intent.scopes.iter().map(crate::api::format_scope).collect(),
-                            enforcement_mode: mode.clone(),
-                            blocking_intent_ids: Vec::new(),
-                        })
-                        .map(|_| ())
-                }) {
-                Ok(reaped) => {
-                    for intent in &reaped {
-                        let _ =
-                            state.record_coordination_event(crate::state::CoordinationEventDraft {
-                                event: "intent_release",
-                                outcome: "expired".to_string(),
-                                session_id: Some(intent.session_id.to_string()),
-                                intent_id: Some(intent.intent_id.to_string()),
-                                intent_ids: vec![intent.intent_id.to_string()],
-                                transaction_id: None,
-                                scopes: intent
-                                    .scopes
-                                    .iter()
-                                    .map(crate::api::format_scope)
-                                    .collect(),
-                                enforcement_mode: mode.clone(),
-                                blocking_intent_ids: Vec::new(),
-                            });
-                    }
-                    if !reaped.is_empty() {
-                        debug!(reaped = reaped.len(), "swept expired intents");
-                    }
-                }
-                Err(error) => {
-                    state.mark_coordination_evidence_incomplete(format!(
-                        "expired-intent sweep failed after reservation may have been written: {error}"
-                    ));
-                }
-            }
-        }
+        sweep_expired_intents(&state).await;
 
         // Collect retries first and real watcher notifications second. Dedup once per tick,
         // only when something new arrived; a real remove/recreate therefore supersedes a
@@ -2332,6 +2490,90 @@ mod tests {
         );
     }
 
+    /// FIR-2317: a background-work supervisor stop parks the reconciliation
+    /// loop; it must not exit the loop task. In the daemon, the loop task's
+    /// exit is a shutdown arm that cancels the API task and drains everything,
+    /// so an exit here is exactly the "stopped a stalled pass, lost the whole
+    /// daemon" failure, twenty seconds after announcing "the daemon keeps
+    /// serving".
+    #[tokio::test]
+    async fn a_supervisor_stop_parks_the_loop_instead_of_exiting_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        // The supervisor's verdict, delivered before the loop starts so its
+        // first checkpoint observes it.
+        state
+            .background_work
+            .pass(crate::background_work::PASS_RECONCILE)
+            .halt("test: the reconcile pass was stopped by the supervisor");
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut handle = tokio::spawn(run_loop(
+            Arc::clone(&state),
+            LoopConfig::default(),
+            cancel_rx,
+        ));
+
+        // Wait for the loop to reach its checkpoint and park. The parked
+        // status is the observable that separates "parked" from "not yet
+        // scheduled", so this poll cannot pass vacuously on a slow machine.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while state.reconciliation_status.load(Ordering::Relaxed) != RECON_PARKED {
+            assert!(
+                !handle.is_finished(),
+                "the reconciliation loop exited on a supervisor stop; in the daemon this \
+                 cancels the API task and takes the whole daemon down (FIR-2317)"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the loop never reached its supervisor-stop checkpoint"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            state.reconciliation_status_str(),
+            "parked-by-supervisor",
+            "status surfaces must report the stop, not describe the loop as idle"
+        );
+
+        // Parked is not exited: the task must still be alive after the
+        // checkpoint has provably run.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handle.is_finished(),
+            "the parked loop must stay alive until the daemon itself shuts down"
+        );
+
+        // The daemon's own shutdown still ends the parked loop cleanly.
+        cancel_tx.send(true).unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(30), &mut handle)
+            .await
+            .expect("a parked reconciliation loop must still exit on shutdown")
+            .expect("the parked loop task must not panic");
+        joined.expect("the parked loop must exit cleanly");
+        assert_eq!(
+            state.reconciliation_status.load(Ordering::Relaxed),
+            RECON_IDLE,
+            "shutdown returns the status to idle"
+        );
+
+        // The halt is in-memory supervisor state, which is what makes the
+        // announcement's "a restart retries it" true: a fresh daemon process
+        // starts with an unhalted pass.
+        drop(handle);
+        drop(state);
+        let reopened = kin_core::KinLayout::discover(repo.path())
+            .expect("the repository layout must still be discoverable");
+        let restarted = DaemonState::open(reopened).expect("a fresh daemon state must open");
+        assert!(
+            !restarted
+                .background_work
+                .pass(crate::background_work::PASS_RECONCILE)
+                .halted(),
+            "a restarted daemon must retry the reconcile pass"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn admission_preserves_unsupported_bytes_and_executable_mode() {
@@ -3123,6 +3365,73 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(tree_entry(&state, "src/change.rs").is_some());
+    }
+
+    /// A store born from bulk admission holds tree truth with no non-entity
+    /// enrichment records, so nothing feeds the artifact embedding queue or the
+    /// artifact text index and `kin embed` honestly reports "+0 artifacts".
+    /// The coverage pass must recreate exactly the missing records from CAS
+    /// bodies, leave entity sources alone, and be idempotent.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn coverage_pass_recreates_missing_records_and_feeds_the_artifact_queue() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("AGENTS.md"),
+            "# Doctrine\n\nChecks That Cannot Fail live here, past any preview cap.\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("main.py"), "def fail():\n    return 1\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let doc_id = FilePathId::new("AGENTS.md");
+        assert!(state.graph.get_opaque_artifact(&doc_id).unwrap().is_some());
+
+        // Deleting the record reproduces the shape bulk admission leaves
+        // behind: the tree tracks the file, no enrichment facet exists.
+        state.graph.delete_opaque_artifact(&doc_id).unwrap();
+        assert_eq!(state.graph.artifact_count(), 0);
+        assert!(tree_entry(&state, "AGENTS.md").is_some());
+
+        let created = ensure_non_entity_enrichment_coverage(&state).unwrap();
+        assert_eq!(
+            created, 1,
+            "the doc regains its record; the entity source must not gain one"
+        );
+        let record = state
+            .graph
+            .get_opaque_artifact(&doc_id)
+            .unwrap()
+            .expect("coverage pass recreates the opaque record");
+        assert!(
+            record
+                .text_preview
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Checks That Cannot Fail"),
+            "recreated record must retain the body text retrieval indexes"
+        );
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("main.py"))
+            .unwrap()
+            .is_none());
+        assert_eq!(state.graph.artifact_count(), 1);
+
+        assert_eq!(
+            ensure_non_entity_enrichment_coverage(&state).unwrap(),
+            0,
+            "a second pass over full coverage creates nothing"
+        );
+
+        // The recreated record is exactly what the artifact embedding queue
+        // keys on, so the backfill can now see the file.
+        state.graph.queue_missing_artifacts_for_embedding();
+        assert!(
+            state.graph.pending_artifact_embeddings() >= 1,
+            "recreated record must enter the artifact embedding backfill"
+        );
     }
 
     #[tokio::test]

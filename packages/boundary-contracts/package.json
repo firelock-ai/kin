@@ -1,6 +1,6 @@
 {
   "name": "@kin/boundary-contracts",
-  "version": "0.5.31",
+  "version": "0.5.32",
   "private": false,
   "description": "Shared contracts for Kin ecosystem boundaries.",
   "type": "module",

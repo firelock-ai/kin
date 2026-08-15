@@ -181,7 +181,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- retrieval quality profile and its profile-gated levers ---------------
     // KIN_PROFILE selects the versioned retrieval profile; the levers below
     // default per-profile and an explicit value always wins over the profile.
-    EnvVarSpec { name: "KIN_PROFILE", kind: Kind::Str, default: "compat-v0", sensitivity: Sensitivity::Correctness, summary: "retrieval quality profile: compat-v0 (default, pre-profile behavior) or accuracy-v1 (opt-in candidate pending A/B-tuned graduation); proof runs pin this explicitly" },
+    EnvVarSpec { name: "KIN_PROFILE", kind: Kind::Str, default: "accuracy-v2", sensitivity: Sensitivity::Correctness, summary: "retrieval quality profile: accuracy-v2 (default: measured-accuracy levers, cross-encoder off), accuracy-v1 (opt-in: adds the budget-gated cross-encoder when its model is cached), compat-v0 (pre-profile lever defaults); proof runs pin this explicitly" },
     EnvVarSpec { name: "KIN_LOCATE_TOTAL_TIMEOUT_SECS", kind: Kind::SecsBound, default: "90", sensitivity: Sensitivity::Correctness, summary: "total locate pipeline budget in seconds; 0 disables it (unbounded)" },
     EnvVarSpec { name: "KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", kind: Kind::SecsBound, default: "20", sensitivity: Sensitivity::Correctness, summary: "locate phase budget: entity discovery; 0 = unbounded" },
     EnvVarSpec { name: "KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", kind: Kind::SecsBound, default: "20", sensitivity: Sensitivity::Correctness, summary: "locate phase budget: entity resolution; 0 = unbounded" },

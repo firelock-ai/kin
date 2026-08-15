@@ -88,14 +88,13 @@ matches declarations by name/kind/language and ignores the query for ranking), \
 semantic_locate ranks by query relevance and returns act-on-able hits: entity_id, file, \
 line span, kind, score, and a bounded inline snippet. Set granularity to \"entity\" \
 (default) for ranked declarations or \"file\" to roll results up to the most relevant \
-files. Two pipelines can answer. By default a stock daemon serves the legacy \
-single-vector cosine ranking (the `compat-v0` profile); the full fused retrieval \
-pipeline `kin locate` serves — vector similarity, lexical search, and graph-structure \
-signals fused with role-aware ranking, exact-name promotion, and (when its model is \
-available) cross-encoder reranking — is opt-in per call with `pipeline: \"fused\"` or by \
-running the daemon under KIN_PROFILE=accuracy-v1. The `routing` field reports which \
-pipeline actually answered: `cosine-v0` for the single-vector default, `fused-v1` for \
-the fused pipeline (also selectable per call with `pipeline: \"fused\"`). Every hit also \
+files. Two pipelines can answer. The default on every profile is the full fused \
+retrieval pipeline `kin locate` serves: vector similarity, lexical search, and \
+graph-structure signals fused with role-aware ranking and exact-name promotion. The \
+legacy single-vector cosine ranking stays reachable per call with \
+`pipeline: \"cosine\"` for A/B comparison. The `routing` field reports which pipeline \
+actually answered: `fused-v1` for the fused default, `cosine-v0` for the per-call \
+legacy arm. Every hit also \
 carries an additive `match_evidence` object explaining why it ranked — the ranker that \
 produced it, the score source, whether the query matched the entity name, and the \
 ranking signals that applied — derived from graph-owned retrieval data, never a \

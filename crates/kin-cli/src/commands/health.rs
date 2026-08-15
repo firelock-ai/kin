@@ -2090,17 +2090,10 @@ fn check_retrieval_profile() -> HealthCheck {
     let ce_model = env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
         .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
     let ce_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model);
-    // Has anyone configured retrieval on this install yet? Three independent
-    // signals, any one of them sufficient: a profile was selected, the reranker
-    // was overridden either way, or a reranker model was fetched into this
-    // install's cache at some point, whether or not a usable snapshot survives
-    // there now. An empty value is not a selection.
-    let selected = |key: &str| env::var(key).is_ok_and(|value| !value.trim().is_empty());
-    let ever_configured = selected("KIN_PROFILE")
-        || selected("KIN_LOCATE_CROSS_ENCODER_ENABLED")
-        || crate::retrieval_profile::cross_encoder_model_ever_fetched(&ce_model);
     // Report the daemon-serving default (the state queries actually run
-    // under), not this one-shot CLI process's own gate.
+    // under), not this one-shot CLI process's own gate. The accessor answers
+    // exactly that question, so this check cannot drift from the profile's
+    // own definition.
     let ce_active = env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED")
         .map(|value| {
             matches!(
@@ -2108,37 +2101,34 @@ fn check_retrieval_profile() -> HealthCheck {
                 "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
             )
         })
-        .unwrap_or(
-            matches!(
-                profile,
-                crate::retrieval_profile::RetrievalProfile::AccuracyV1
-            ) && ce_cached,
-        );
+        .unwrap_or_else(|_| profile.cross_encoder_daemon_default(ce_cached));
     // Every lever is read back from the profile rather than assumed from its
     // name, so a profile whose defaults change cannot leave this check
     // asserting a lever set the serving path no longer uses.
     //
-    // `declaration_cutoff_default` is deliberately excluded: it is dark for
-    // EVERY profile pending its A/B graduation gate, so counting it would make
-    // the best available profile report degraded forever, and a check that can
-    // never be green is a check nobody reads.
+    // Two levers are deliberately not counted. `declaration_cutoff_default`
+    // is dark for EVERY profile pending its A/B graduation gate. The
+    // cross-encoder rerank is off by deliberate default: the do-not-flip
+    // verdict on it stands, so serving without it is the shipped
+    // configuration, not a degradation. Counting either would make the
+    // default profile report degraded forever, and a check that can never be
+    // green is a check nobody reads. Both still show in the detail line.
     let levers_off: Vec<&str> = [
         (!profile.semantic_locate_fused()).then_some("fused semantic_locate routing"),
         (!profile.entity_fusion_default()).then_some("entity fusion"),
         (!profile.lexical_floor_readmit_default()).then_some("lexical parity floor"),
-        (!ce_active).then_some("cross-encoder rerank"),
     ]
     .into_iter()
     .flatten()
     .collect();
-    let mut detail =
+    let detail =
         format!(
         "{}profile {} — semantic_locate routing: {}; entity fusion: {}; lexical parity floor: {}; \
          cross-encoder rerank: {} (model {} {})",
-        match (levers_off.is_empty(), ever_configured) {
-            (true, _) => "",
-            (false, true) => "degraded: ",
-            (false, false) => "stock defaults: ",
+        if levers_off.is_empty() {
+            ""
+        } else {
+            "degraded: "
         },
         profile.name(),
         if profile.semantic_locate_fused() {
@@ -2152,34 +2142,19 @@ fn check_retrieval_profile() -> HealthCheck {
         ce_model,
         if ce_cached { "cached" } else { "not cached" },
     );
-    // A profile serving with levers off is answering worse than this build can,
-    // and reporting that as a passing check tells an operator their weakest
-    // retrieval configuration is the healthy one. Stale is this report's
-    // advisory tier: it renders as a yellow warning and counts as needing
-    // attention, without blocking readiness the way Missing/Misconfigured do,
-    // because a degraded profile still serves.
-    //
-    // That is the right answer for a configuration someone chose. It is the
-    // wrong answer for an install nobody has configured yet, where every lever
-    // is off because the stock profile is opt-out of nothing and the reranker
-    // model has not been downloaded: the levers were never turned off, they
-    // have never been available here. A check that scores that as degraded is
-    // permanently yellow on every machine the second its install succeeds,
-    // which is the failure `Report expected first-run states as skipped rather
-    // than failed` removed from the four checks beside this one. Unsupported is
-    // that answer: skipped rather than failed, still carrying the remediation
-    // the renderer prints for any non-Healthy check, so the opt-in stays
-    // discoverable without claiming anything is wrong.
-    let status = match (levers_off.is_empty(), ever_configured) {
-        (true, _) => HealthStatus::Healthy,
-        (false, true) => HealthStatus::Stale,
-        (false, false) => HealthStatus::Unsupported,
+    // A profile serving with levers off is answering worse than this build
+    // can, and reporting that as a passing check tells an operator their
+    // weakest retrieval configuration is the healthy one. Stale is this
+    // report's advisory tier: it renders as a yellow warning and counts as
+    // needing attention, without blocking readiness the way
+    // Missing/Misconfigured do, because a degraded profile still serves.
+    // Every counted lever is on under the shipped default, so a lever-off
+    // state can only be a profile someone chose, never a fresh install.
+    let status = if levers_off.is_empty() {
+        HealthStatus::Healthy
+    } else {
+        HealthStatus::Stale
     };
-    // Keyed on the status rather than on the conditions that produced it, so
-    // the sentence and the tier cannot drift apart.
-    if matches!(status, HealthStatus::Unsupported) {
-        detail.push_str("; opt-in, and the reranker model downloads on first use");
-    }
     let check = HealthCheck::new(
         "retrieval_profile",
         "Retrieval quality profile",
@@ -2189,30 +2164,17 @@ fn check_retrieval_profile() -> HealthCheck {
     if levers_off.is_empty() {
         return check;
     }
-    // The remediation was previously attached only when the reranker model was
-    // uncached, and the Healthy status meant the renderer never printed it. Name
-    // what is off, and name the better profile from its own identifier so this
-    // string cannot drift from the enum.
-    let best = crate::retrieval_profile::RetrievalProfile::AccuracyV1;
-    let mut fix = if ever_configured {
-        format!("off: {}", levers_off.join(", "))
-    } else {
-        format!(
-            "not enabled by the stock profile: {}",
-            levers_off.join(", ")
-        )
-    };
-    if profile != best {
+    // Name what is off, and name the way back from the default profile's own
+    // identifier so this string cannot drift from the enum. The reranker is
+    // deliberately absent from this advice: the shipped default keeps it off,
+    // and doctor must not argue with the shipped default.
+    let default_profile = crate::retrieval_profile::RetrievalProfile::default();
+    let mut fix = format!("off: {}", levers_off.join(", "));
+    if profile != default_profile {
         fix.push_str(&format!(
-            "; set KIN_PROFILE={} for the measured-accuracy defaults",
-            best.name()
+            "; unset KIN_PROFILE or set KIN_PROFILE={} for the shipped measured-accuracy defaults",
+            default_profile.name()
         ));
-    }
-    if !ce_cached {
-        fix.push_str(
-            "; prefetch the reranker model once with \
-             KIN_LOCATE_CROSS_ENCODER_ENABLED=1 (downloads on first use)",
-        );
     }
     check.with_manual_fix(fix)
 }
@@ -4296,9 +4258,9 @@ mod tests {
             .is_some_and(|fix| fix.contains("kin reconcile")));
     }
 
-    /// The degraded default must not report as a passing check. A first-run
-    /// user otherwise measures this build's weakest retrieval configuration
-    /// and is told it is the healthy one.
+    /// A lever-off profile someone chose must not report as a passing check,
+    /// and its remediation must point back at the shipped default rather than
+    /// at a profile or a download the default deliberately does not carry.
     #[test]
     #[serial]
     fn doctor_warns_on_a_profile_serving_with_levers_off() {
@@ -4322,12 +4284,18 @@ mod tests {
             .as_deref()
             .expect("a degraded profile must carry remediation");
         assert!(
-            fix.contains("cross-encoder rerank"),
+            fix.contains("entity fusion") && fix.contains("lexical parity floor"),
             "remediation must name what is off: {fix}"
         );
         assert!(
-            fix.contains("accuracy-v1"),
-            "remediation must name the better profile: {fix}"
+            fix.contains("accuracy-v2"),
+            "remediation must name the shipped default profile: {fix}"
+        );
+        // Doctor must not argue with the shipped default: no advice to select
+        // the reranker profile, no prompt to prefetch its model.
+        assert!(
+            !fix.contains("accuracy-v1") && !fix.contains("prefetch"),
+            "remediation must not recommend the reranker path: {fix}"
         );
     }
 
@@ -4362,20 +4330,18 @@ mod tests {
         );
     }
 
-    /// The state every install is in the second it succeeds: no profile
-    /// selected and no reranker model fetched. Scoring that as a degraded
-    /// serving configuration puts a permanent yellow warning on every fresh
-    /// machine, and it refused the Windows repo-free install proof, whose
-    /// tolerance requires every check to be `repo_init`, healthy, or
-    /// unsupported.
+    /// Doctor agrees with the shipped default: a fresh install with nothing
+    /// configured reports Healthy with no remediation, the deliberately-off
+    /// reranker included. A doctor that advises changing a stock install is a
+    /// doctor arguing with the product's own default.
     ///
-    /// The two falsifying halves are the point. A lever that has never been
-    /// available here is a first-run state; the same lever on an install that
-    /// fetched the model once, or that selected a profile, is the configuration
-    /// the warning exists for and still reports Stale.
+    /// The falsifying halves are the point. A cached reranker model must NOT
+    /// change the verdict (the default keeps the reranker off even where the
+    /// model is already on disk), while a lever-off profile someone chose is
+    /// the state the degraded warning exists for and still reports Stale.
     #[test]
     #[serial]
-    fn a_never_configured_install_is_not_a_degraded_retrieval_profile() {
+    fn doctor_agrees_with_the_shipped_default_and_keeps_the_reranker_off() {
         let cache = tempfile::tempdir().unwrap();
         let _hf = EnvVarGuard::set("HF_HOME", cache.path());
         let _model = EnvVarGuard::set("KIN_LOCATE_CROSS_ENCODER_MODEL", "BAAI/bge-reranker-base");
@@ -4385,23 +4351,26 @@ mod tests {
         let check = check_retrieval_profile();
 
         assert!(
-            matches!(check.status, HealthStatus::Unsupported),
-            "levers nobody has turned off are not a degradation: {:?} ({})",
+            matches!(check.status, HealthStatus::Healthy),
+            "the shipped default must report Healthy: {:?} ({})",
             check.status,
             check.detail
         );
         assert!(
-            check.detail.contains("stock defaults")
-                && check.detail.contains("downloads on first use"),
-            "the detail must name the state it is reporting: {}",
+            check.detail.contains("accuracy-v2")
+                && check.detail.contains("cross-encoder rerank: off"),
+            "the detail names the default profile and the deliberate reranker state: {}",
             check.detail
         );
-        let fix = check.manual_fix.as_deref().expect(
-            "the opt-in stays discoverable: the renderer prints a fix for any non-Healthy check",
+        assert!(
+            !check.detail.contains("degraded"),
+            "the default is not a degradation: {}",
+            check.detail
         );
         assert!(
-            fix.contains("accuracy-v1") && fix.contains("cross-encoder rerank"),
-            "the remediation still names the better profile and what it turns on: {fix}"
+            check.manual_fix.is_none(),
+            "no advice may contradict the shipped default: {:?}",
+            check.manual_fix
         );
 
         let report = assemble_health_report("test".to_string(), vec![check]);
@@ -4409,45 +4378,41 @@ mod tests {
         let summary = report.summary();
         assert_eq!(
             (summary.attention, summary.skipped),
-            (0, 1),
+            (0, 0),
             "a correct fresh install must close on zero checks needing attention"
         );
-        assert_eq!(
-            serde_json::to_value(&report).unwrap()["checks"][0]["status"],
-            "unsupported",
-            "the repo-free proof tolerance keys on this serialized status"
-        );
 
-        // Falsification one: this install fetched the reranker model once and no
-        // usable snapshot survives. That is a lever it had and lost, which is
-        // what the degraded warning exists to report.
+        // Falsification one: the reranker model is fully cached, the state
+        // earlier doctor advice created on real installs. The default must
+        // not silently start serving the reranker, and doctor must not start
+        // advising it.
         std::fs::create_dir_all(
             cache
                 .path()
                 .join("hub")
                 .join("models--BAAI--bge-reranker-base")
-                .join("blobs"),
+                .join("snapshots")
+                .join("0123456789abcdef"),
         )
         .unwrap();
-        let after_fetch = check_retrieval_profile();
+        let with_cached_model = check_retrieval_profile();
         assert!(
-            matches!(after_fetch.status, HealthStatus::Stale),
-            "a model this install fetched once must keep the warning: {:?} ({})",
-            after_fetch.status,
-            after_fetch.detail
+            matches!(with_cached_model.status, HealthStatus::Healthy),
+            "a cached model must not change the default verdict: {:?} ({})",
+            with_cached_model.status,
+            with_cached_model.detail
         );
-        assert!(after_fetch.detail.contains("degraded"));
-        assert_eq!(
-            assemble_health_report("test".to_string(), vec![after_fetch])
-                .summary()
-                .attention,
-            1
+        assert!(
+            with_cached_model
+                .detail
+                .contains("cross-encoder rerank: off"),
+            "the default keeps the reranker off even with the model cached: {}",
+            with_cached_model.detail
         );
+        assert!(with_cached_model.manual_fix.is_none());
 
-        // Falsification two: nothing fetched, but a profile was selected. The
-        // discriminator is whether anyone has engaged with retrieval
-        // configuration on this install, not the model cache alone.
-        std::fs::remove_dir_all(cache.path().join("hub")).unwrap();
+        // Falsification two: a lever-off profile someone chose. The degraded
+        // warning still exists and still fires.
         profile.apply("KIN_PROFILE", Some("compat-v0"));
         assert!(
             matches!(check_retrieval_profile().status, HealthStatus::Stale),

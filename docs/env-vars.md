@@ -64,7 +64,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ORG_ID` | string | *(unset)* | operational | organization id for federation/remote |
 | `KIN_ORIGINAL_PATH` | path | *(unset)* | operational | caller's original PATH preserved across a with/exec shim |
 | `KIN_PRIMARY_REPO_ID` | string | *(unset)* | operational | primary repo id for a multi-repo daemon |
-| `KIN_PROFILE` | string | compat-v0 | correctness | retrieval quality profile: compat-v0 (default, pre-profile behavior) or accuracy-v1 (opt-in candidate pending A/B-tuned graduation); proof runs pin this explicitly |
+| `KIN_PROFILE` | string | accuracy-v2 | correctness | retrieval quality profile: accuracy-v2 (default: measured-accuracy levers, cross-encoder off), accuracy-v1 (opt-in: adds the budget-gated cross-encoder when its model is cached), compat-v0 (pre-profile lever defaults); proof runs pin this explicitly |
 | `KIN_REGEN_ENV_DOC` | string | *(unset)* | diagnostic | dev/test tooling: set to regenerate docs/env-vars.md from the registry |
 | `KIN_REMOTE_AUTH_TOKEN` | secret | *(unset)* | secret | fallback KinLab auth token read after KIN_REMOTE_BEARER_TOKEN |
 | `KIN_REMOTE_BASE_URL` | url | *(unset)* | operational | KinLab base URL for remote and federation calls |
