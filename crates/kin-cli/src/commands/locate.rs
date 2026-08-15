@@ -16264,6 +16264,18 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Canonical-definition signal for exact-name ties (FIR-2337): owner graph
+    // mass per name-hit entity id, computed for at most this many name hits so
+    // a hundred-way `new` collision cannot turn projection into a graph walk.
+    // Fixed name-match scores tie EXACTLY when one symbol name has several
+    // definitions (four `delete_work_item` impls all scored 450.000 on the
+    // gauntlet store, and the file-order tie-break put the canonical
+    // `InMemoryGraph::` definition FOURTH, behind two test doubles and a
+    // blanket forwarding impl), so the tie is broken by which owner type
+    // carries the most structural graph mass. Non-name rows all read 0 here
+    // and fall through to the file-order tie-break unchanged.
+    let mut name_owner_mass: FxHashMap<String, usize> = FxHashMap::default();
+    let owner_mass_limit = locate_env_usize("KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT", 16);
     // Built once on the first ranked file that resolves to no entity, because
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
@@ -16329,6 +16341,13 @@ pub fn build_entity_view(
                 .as_ref()
                 .map(|origin| origin.0.clone())
                 .or_else(|| Some(file.path.clone()));
+            let match_kind = classify_locate_match(query, &entity.name, &sym.origin);
+            if match_kind == LocateMatchKind::Name && name_owner_mass.len() < owner_mass_limit {
+                name_owner_mass.insert(
+                    entity_id.clone(),
+                    kin_ranking::entity_ranking::owner_graph_mass(graph, &entity.id, &entity.name)?,
+                );
+            }
             ranked.push((
                 file_rank,
                 LocateEntity {
@@ -16342,7 +16361,7 @@ pub fn build_entity_view(
                     definition: sym.definition,
                     span: sym.span,
                     body,
-                    match_kind: Some(classify_locate_match(query, &entity.name, &sym.origin)),
+                    match_kind: Some(match_kind),
                     provenance: LocateProvenance {
                         file: file_origin,
                         origin: sym.origin.clone(),
@@ -16356,8 +16375,17 @@ pub fn build_entity_view(
 
     // Global rank: definitions first, then the exact-name tier
     // ([`locate_exact_name_tier`]: a hit the query literally named cannot be
-    // outbid by fallback scale), then composite score desc, then the file's
-    // own rank, then name/id for a total deterministic order.
+    // outbid by fallback scale), then composite score desc, then owner graph
+    // mass for the exact-name ties fixed scores produce (the canonical
+    // definition over test doubles and forwarding impls; 0 for every non-name
+    // row, so nothing else moves), then the file's own rank, then name/id for
+    // a total deterministic order.
+    let owner_mass_of = |entity: &LocateEntity| {
+        name_owner_mass
+            .get(entity.identity_key())
+            .copied()
+            .unwrap_or(0)
+    };
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.definition
             .cmp(&a.definition)
@@ -16367,12 +16395,41 @@ pub fn build_entity_view(
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| owner_mass_of(b).cmp(&owner_mass_of(a)))
             .then_with(|| a_rank.cmp(b_rank))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
+
+    // Make the tie-break arguable from the response: under --explain (the only
+    // mode that populates `origin`), every name hit whose exact score is shared
+    // by another name hit gets its owner mass appended to its resolution
+    // origin, which `semantic_locate` surfaces as `match_evidence
+    // .resolution_origin`. A rank among equals should never need source-diving
+    // to defend.
+    let mut name_score_counts: FxHashMap<u32, usize> = FxHashMap::default();
+    for entity in &result.entities {
+        if entity.match_kind == Some(LocateMatchKind::Name) {
+            *name_score_counts.entry(entity.score.to_bits()).or_default() += 1;
+        }
+    }
+    for entity in &mut result.entities {
+        if entity.match_kind == Some(LocateMatchKind::Name)
+            && name_score_counts
+                .get(&entity.score.to_bits())
+                .is_some_and(|count| *count > 1)
+            && !entity.provenance.origin.is_empty()
+        {
+            if let Some(mass) = name_owner_mass.get(entity.identity_key()) {
+                entity
+                    .provenance
+                    .origin
+                    .push_str(&format!(" tie_break=owner_graph_mass:{mass}"));
+            }
+        }
+    }
     result.total_ranked = result.entities.len();
     // Computed over the FULL ranking, before the daemon windows a page. A
     // per-page verdict would call a query successful because page 1 happened to
@@ -18760,6 +18817,267 @@ mod tests {
         assert!(
             neighbor_pos < filler_pos,
             "fallback rows keep their RRF order below the name tier"
+        );
+    }
+
+    /// FIR-2337 in the shape the flagship gauntlet measured on shipped 0.5.33:
+    /// probe qb11 `delete_work_item` returned four entities all carrying the
+    /// exact name, all `match_kind: name`, all scored exactly 450.000, and the
+    /// file-order tie-break put the canonical `InMemoryGraph::` definition
+    /// FOURTH, behind two test doubles and a blanket `&G::` forwarding impl.
+    ///
+    /// The tie is broken by owner graph mass: the definition on the type that
+    /// carries the most structural graph relations wins, mirroring the store
+    /// (InMemoryGraph 285, MockGraph 134, EmptyStore 121, `&G` ownerless 0).
+    /// The control run drops the owner edges so every mass is 0: the ordering
+    /// must then fall back to exactly the file-order tie that shipped, proving
+    /// this test moves on the tiebreak signal and nothing else.
+    #[test]
+    fn a_pure_exact_name_tie_breaks_toward_the_owner_with_graph_mass() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        // File order mirrors the shipped defect: the canonical definition's
+        // file ranks LAST among the four.
+        let impls: [(&str, &str); 4] = [
+            (
+                "MockGraph::delete_work_item",
+                "crates/kin-git/src/export.rs",
+            ),
+            ("&G::delete_work_item", "kin-model/src/graph.rs"),
+            (
+                "EmptyStore::delete_work_item",
+                "crates/kin-mcp/src/handlers/mod.rs",
+            ),
+            (
+                "InMemoryGraph::delete_work_item",
+                "crates/kin-db/src/engine/graph.rs",
+            ),
+        ];
+        // Owner mass per impl, `&G` staying ownerless like the real blanket
+        // forwarding impl. Peer entities give each owner its relation count.
+        let owner_mass: [usize; 4] = [3, 0, 2, 5];
+
+        let build = |with_owner_edges: bool| {
+            let graph = kin_db::InMemoryGraph::new();
+            let mut files = Vec::new();
+            for ((name, path), mass) in impls.iter().zip(owner_mass) {
+                let method = test_entity(name, path, 100, 140);
+                graph.upsert_entity(&method).unwrap();
+                if with_owner_edges && mass > 0 {
+                    let owner = test_entity(name.split("::").next().unwrap(), path, 10, 400);
+                    graph.upsert_entity(&owner).unwrap();
+                    graph
+                        .upsert_relation(&relation(RelationKind::Contains, owner.id, method.id))
+                        .unwrap();
+                    for _ in 1..mass {
+                        let peer = test_entity("peer_helper", path, 500, 510);
+                        graph.upsert_entity(&peer).unwrap();
+                        graph
+                            .upsert_relation(&relation(RelationKind::Calls, owner.id, peer.id))
+                            .unwrap();
+                    }
+                }
+                files.push(LocateFileEntry {
+                    path: path.to_string(),
+                    score: 0.2,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![LocateSymbol {
+                        name: name.to_string(),
+                        span: Some([100, 140]),
+                        score: 450.0,
+                        kind: "method".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                });
+            }
+            let mut result = LocateResult {
+                files,
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                "delete_work_item",
+            )
+            .unwrap();
+            result
+        };
+
+        let fixed = build(true);
+        let names: Vec<&str> = fixed
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "InMemoryGraph::delete_work_item",
+                "MockGraph::delete_work_item",
+                "EmptyStore::delete_work_item",
+                "&G::delete_work_item",
+            ],
+            "a pure exact-name tie must order by owner graph mass"
+        );
+        assert!(
+            fixed.entities[0]
+                .provenance
+                .origin
+                .contains("tie_break=owner_graph_mass:"),
+            "the tie-break must be visible in the explain origin, got {:?}",
+            fixed.entities[0].provenance.origin
+        );
+
+        // Control: no owner edges means no mass signal, and the ordering falls
+        // back to the file-order tie that shipped the defect.
+        let flat = build(false);
+        let flat_names: Vec<&str> = flat
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            flat_names,
+            vec![
+                "MockGraph::delete_work_item",
+                "&G::delete_work_item",
+                "EmptyStore::delete_work_item",
+                "InMemoryGraph::delete_work_item",
+            ],
+            "with every owner mass equal the file-order tie-break is unchanged"
+        );
+        assert!(
+            flat.entities[0]
+                .provenance
+                .origin
+                .contains("tie_break=owner_graph_mass:0"),
+            "an unbroken tie still discloses the signal it consulted, got {:?}",
+            flat.entities[0].provenance.origin
+        );
+    }
+
+    /// The tie-break must survive a missing `Contains` edge. The edge is
+    /// enrichment a freshly built store can lack while the owner type itself
+    /// parsed fine: the same kin-db file measured `CodeEmbedder::embed_batch`
+    /// at owner mass 14 through its edge on the flagship store and 0 on a
+    /// minutes-old store missing the edge, which handed the qb05 tie to
+    /// `OpenAiCompatEmbedder::` (mass 5). A graph gap is not evidence the
+    /// definition is secondary, so the owner NAME answers when the edge
+    /// cannot, and the canonical definition holds rank 1 on both store shapes.
+    #[test]
+    fn the_owner_mass_tiebreak_survives_a_missing_contains_edge() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let canonical_path = "src/embedding/embedder.rs";
+        let rival_path = "src/embedding/openai_compat.rs";
+
+        // The canonical method has NO Contains edge, only its owner class
+        // sitting in the graph under the qualified prefix name, carrying the
+        // larger structural mass.
+        let canonical = test_entity("CodeEmbedder::embed_batch", canonical_path, 100, 140);
+        let owner = test_entity("CodeEmbedder", canonical_path, 10, 400);
+        graph.upsert_entity(&canonical).unwrap();
+        graph.upsert_entity(&owner).unwrap();
+        for _ in 0..6 {
+            let peer = test_entity("peer_helper", canonical_path, 500, 510);
+            graph.upsert_entity(&peer).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, owner.id, peer.id))
+                .unwrap();
+        }
+
+        // The rival method DOES have its Contains edge, to a smaller owner.
+        let rival = test_entity("OpenAiCompatEmbedder::embed_batch", rival_path, 100, 140);
+        let rival_owner = test_entity("OpenAiCompatEmbedder", rival_path, 10, 200);
+        graph.upsert_entity(&rival).unwrap();
+        graph.upsert_entity(&rival_owner).unwrap();
+        graph
+            .upsert_relation(&relation(RelationKind::Contains, rival_owner.id, rival.id))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(RelationKind::Calls, rival_owner.id, canonical.id))
+            .unwrap();
+
+        // File order puts the rival first, exactly the order that shipped the
+        // qb05 flip, so only the mass signal can move the canonical hit up.
+        let symbol = |name: &str| LocateSymbol {
+            name: name.to_string(),
+            span: Some([100, 140]),
+            score: 450.0,
+            kind: "method".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let file = |path: &str, name: &str| LocateFileEntry {
+            path: path.to_string(),
+            score: 0.2,
+            signals: vec![],
+            spans: vec![],
+            symbols: vec![symbol(name)],
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let mut result = LocateResult {
+            files: vec![
+                file(rival_path, "OpenAiCompatEmbedder::embed_batch"),
+                file(canonical_path, "CodeEmbedder::embed_batch"),
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "embed_batch",
+        )
+        .unwrap();
+        assert_eq!(
+            result.entities[0].name, "CodeEmbedder::embed_batch",
+            "the edgeless canonical definition must win through its owner name"
+        );
+        assert!(
+            result.entities[0]
+                .provenance
+                .origin
+                .contains("tie_break=owner_graph_mass:6"),
+            "the fallback mass must be the disclosed tie-break, got {:?}",
+            result.entities[0].provenance.origin
         );
     }
 
