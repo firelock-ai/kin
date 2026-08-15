@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Flip the default profile to accuracy-v2 and route semantic_locate fused on every profile (#841)
 - Answer MCP handshake frames before the daemon binds; park a supervisor-stopped reconcile loop (#842)
+- Create missing artifact enrichment records at embed time and ship kin-db 0.7.23 (#843)
 
 
 ## [0.5.31] - 2026-08-15
