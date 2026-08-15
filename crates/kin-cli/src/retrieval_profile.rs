@@ -10,19 +10,27 @@
 //! lever exports, and so future lever flips land as a new version rather than
 //! silently changing what an existing pin means.
 //!
-//! - `compat-v0` (default): byte-identical to the pre-profile serving
-//!   behavior. The MCP `semantic_locate` tool keeps the single-vector cosine
-//!   ranking, and every lever keeps its historical default. It is the default
-//!   because a paired A/B on the frozen multi-file diagnostic measured the
-//!   accuracy-v1 candidate REGRESSING the CLI agent arm on every localization
-//!   metric; accuracy-v1 stays opt-in until its levers are tuned and graduate
-//!   on measurement.
-//! - `accuracy-v1` (opt-in): the candidate serving shape. The MCP
-//!   `semantic_locate` tool routes through the full fused locate pipeline,
-//!   entity-granularity fusion and the lexical parity floor are on, the
-//!   cross-encoder reranker runs in promotion-only blend mode under a latency
-//!   budget when its model is already cached locally, and the embedding
-//!   seed floor actually rejects near-orthogonal noise.
+//! - `accuracy-v2` (default): the measured-accuracy serving shape.
+//!   Entity-granularity fusion, the lexical parity floor, and the calibrated
+//!   embedding seed floor are on; the cross-encoder reranker is off
+//!   unconditionally. The reranker's standing do-not-flip verdict held when
+//!   the accuracy levers graduated to default, so the flip minted this new
+//!   version instead of editing `accuracy-v1` in place, and an existing
+//!   `accuracy-v1` pin keeps the conditional reranker it always had.
+//! - `accuracy-v1` (opt-in): the previous accuracy candidate. Same levers as
+//!   `accuracy-v2` plus the cross-encoder reranker in promotion-only blend
+//!   mode under a latency budget, when its model is already cached locally
+//!   and the process is a resident daemon.
+//! - `compat-v0` (opt-in): the historical lever defaults, kept for A/B
+//!   comparison and as an escape hatch. It was the shipped default until the
+//!   accuracy levers graduated on measurement: bare-name symbol lookup
+//!   through MCP `semantic_locate` scored 0 of 23 at rank one under cosine
+//!   serving against 20 of 23 under the fused pipeline.
+//!
+//! The MCP `semantic_locate` routing is not a profile lever: every profile
+//! routes the full fused locate pipeline, exactly like `POST /locate` always
+//! has, and the legacy cosine ranking stays reachable per call via
+//! `pipeline: "cosine"`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -55,29 +63,35 @@ pub fn reset_daemon_serving_for_tests() {
 /// Versioned retrieval quality profile. Selected via `KIN_PROFILE`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RetrievalProfile {
-    /// Measured-accuracy defaults (current version).
-    AccuracyV1,
-    /// Pre-profile behavior: cosine-only `semantic_locate`, historical lever
-    /// defaults. Kept for A/B comparison and as an escape hatch.
+    /// Measured-accuracy defaults (current version): the `accuracy-v1` lever
+    /// set with the cross-encoder reranker off unconditionally.
     #[default]
+    AccuracyV2,
+    /// Previous accuracy candidate: `accuracy-v2` plus the conditional
+    /// budget-gated cross-encoder. Kept addressable so an existing pin keeps
+    /// meaning exactly what it meant.
+    AccuracyV1,
+    /// Historical lever defaults. Kept for A/B comparison and as an escape
+    /// hatch.
     CompatV0,
 }
 
 impl RetrievalProfile {
     /// Resolve the active profile from `KIN_PROFILE`.
     ///
-    /// Accepts the canonical versioned names (`accuracy-v1`, `compat-v0`) plus
-    /// unversioned aliases (`accuracy`, `compat`, `legacy`) that track the
-    /// latest version of each family. Unknown values warn loudly and fall back
-    /// to the default so a typo cannot silently select an unintended serving
-    /// shape without a trace.
+    /// Accepts the canonical versioned names (`accuracy-v2`, `accuracy-v1`,
+    /// `compat-v0`) plus unversioned aliases (`accuracy`, `compat`, `legacy`)
+    /// that track the latest version of each family. Unknown values warn
+    /// loudly and fall back to the default so a typo cannot silently select an
+    /// unintended serving shape without a trace.
     pub fn from_env() -> Self {
         match std::env::var("KIN_PROFILE") {
             Ok(value) => {
                 let normalized = value.trim().to_ascii_lowercase();
                 match normalized.as_str() {
                     "" => Self::default(),
-                    "accuracy-v1" | "accuracy" => Self::AccuracyV1,
+                    "accuracy-v2" | "accuracy" => Self::AccuracyV2,
+                    "accuracy-v1" => Self::AccuracyV1,
                     "compat-v0" | "compat" | "legacy" => Self::CompatV0,
                     other => {
                         tracing::warn!(
@@ -98,22 +112,29 @@ impl RetrievalProfile {
     /// produced it.
     pub fn name(self) -> &'static str {
         match self {
+            Self::AccuracyV2 => "accuracy-v2",
             Self::AccuracyV1 => "accuracy-v1",
             Self::CompatV0 => "compat-v0",
         }
     }
 
     /// Whether the MCP `semantic_locate` tool routes through the full fused
-    /// locate pipeline (true) or the legacy single-vector cosine ranking
-    /// (false).
+    /// locate pipeline by default. True for every profile: routing is not a
+    /// profile lever. The daemon's `semantic_locate` arm routes fused
+    /// unconditionally, exactly like `POST /locate`, and the legacy cosine
+    /// ranking stays reachable per call via `pipeline: "cosine"`. Kept as an
+    /// accessor so health reporting reads one authority and a new variant has
+    /// to state its routing explicitly.
     pub fn semantic_locate_fused(self) -> bool {
-        matches!(self, Self::AccuracyV1)
+        match self {
+            Self::AccuracyV2 | Self::AccuracyV1 | Self::CompatV0 => true,
+        }
     }
 
     /// Default for `KIN_LOCATE_ENTITY_FUSION` (fuse at entity granularity
     /// before collapsing to files).
     pub fn entity_fusion_default(self) -> bool {
-        matches!(self, Self::AccuracyV1)
+        matches!(self, Self::AccuracyV2 | Self::AccuracyV1)
     }
 
     /// Default for `KIN_LOCATE_DECLARATION_CUTOFF` (confidence-calibrated
@@ -129,7 +150,7 @@ impl RetrievalProfile {
     /// over this default at the read site, so no serving default silently flips.
     pub fn declaration_cutoff_default(self) -> bool {
         match self {
-            Self::AccuracyV1 | Self::CompatV0 => false,
+            Self::AccuracyV2 | Self::AccuracyV1 | Self::CompatV0 => false,
         }
     }
 
@@ -137,12 +158,30 @@ impl RetrievalProfile {
     /// candidates the fused ranking dropped, subsuming grep on keyword
     /// queries).
     pub fn lexical_floor_readmit_default(self) -> bool {
-        matches!(self, Self::AccuracyV1)
+        matches!(self, Self::AccuracyV2 | Self::AccuracyV1)
+    }
+
+    /// The cross-encoder default a RESIDENT SERVING DAEMON applies for this
+    /// profile, given whether the model is already cached locally. One-shot
+    /// reporters (`kin doctor`, `kin setup status`) read this instead of
+    /// [`Self::cross_encoder_default`] because the state their user cares
+    /// about is the daemon's, not the reporting process's own serving gate.
+    ///
+    /// `accuracy-v2` answers false even with the model cached: the reranker's
+    /// do-not-flip verdict stands, and an install that prefetched the model
+    /// under earlier advice must not silently start paying for it when the
+    /// default profile changes. An explicit
+    /// `KIN_LOCATE_CROSS_ENCODER_ENABLED=1` still wins at the read site.
+    pub fn cross_encoder_daemon_default(self, model_cached: bool) -> bool {
+        match self {
+            Self::AccuracyV1 => model_cached,
+            Self::AccuracyV2 | Self::CompatV0 => false,
+        }
     }
 
     /// Default for `KIN_LOCATE_CROSS_ENCODER_ENABLED`.
     ///
-    /// Accuracy profile: on, but only when BOTH hold —
+    /// `accuracy-v1`: on, but only when BOTH hold —
     /// - the reranker model is already cached locally (the constructor
     ///   otherwise downloads from the network, which a default must never do
     ///   mid-query), and
@@ -150,32 +189,31 @@ impl RetrievalProfile {
     ///   so one-shot library callers and test binaries never pay a model load
     ///   by default.
     ///
+    /// `accuracy-v2` and `compat-v0` keep the reranker off unconditionally.
     /// The missing-model state is reported as a structured degradation
     /// instead of silently skipping. An explicit
     /// `KIN_LOCATE_CROSS_ENCODER_ENABLED=1` still forces the attempt (and
     /// with it the download) regardless of cache state or process kind.
     pub fn cross_encoder_default(self, model_cached: bool) -> bool {
-        match self {
-            Self::AccuracyV1 => model_cached && daemon_serving(),
-            Self::CompatV0 => false,
-        }
+        self.cross_encoder_daemon_default(model_cached) && daemon_serving()
     }
 
     /// Default for `KIN_LOCATE_RERANK_BLEND`: promotion-only additive blending
     /// of cross-encoder scores. The legacy overwrite mode substitutes raw
     /// logits for fused scores and can evict multi-signal-corroborated files,
-    /// so any profile that enables the cross-encoder must also default to the
-    /// blend.
+    /// so any profile that could serve the cross-encoder, including one whose
+    /// user enables it explicitly over a default of off, must also default to
+    /// the blend.
     pub fn rerank_blend_default(self) -> bool {
-        matches!(self, Self::AccuracyV1)
+        matches!(self, Self::AccuracyV2 | Self::AccuracyV1)
     }
 
-    /// Default for `KIN_LOCATE_RERANK_LATENCY_BUDGET_MS`. The accuracy profile
-    /// bounds the reranker so an over-budget rerank falls back to the fused
-    /// order; compat keeps the historical unbounded behavior (0).
+    /// Default for `KIN_LOCATE_RERANK_LATENCY_BUDGET_MS`. The accuracy
+    /// profiles bound the reranker so an over-budget rerank falls back to the
+    /// fused order; compat keeps the historical unbounded behavior (0).
     pub fn rerank_latency_budget_ms_default(self) -> usize {
         match self {
-            Self::AccuracyV1 => 1_500,
+            Self::AccuracyV2 | Self::AccuracyV1 => 1_500,
             Self::CompatV0 => 0,
         }
     }
@@ -189,7 +227,7 @@ impl RetrievalProfile {
     /// cosine < 0.25, which in relevance units is (1 + 0.25) / 2 = 0.625.
     pub fn embedding_min_relevance_default(self) -> f32 {
         match self {
-            Self::AccuracyV1 => 0.625,
+            Self::AccuracyV2 | Self::AccuracyV1 => 0.625,
             Self::CompatV0 => 0.25,
         }
     }
@@ -320,7 +358,7 @@ mod tests {
     #[serial_test::serial]
     fn profile_resolves_from_env_with_aliases_and_default() {
         let mut profile = kin_core::test_env::EnvVarGuard::unset("KIN_PROFILE");
-        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV2);
 
         profile.apply("KIN_PROFILE", Some("compat-v0"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
@@ -328,15 +366,75 @@ mod tests {
         profile.apply("KIN_PROFILE", Some("compat"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
+        // A versioned pin keeps meaning exactly the version it names.
         profile.apply("KIN_PROFILE", Some("ACCURACY-V1"));
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV1);
 
+        profile.apply("KIN_PROFILE", Some("accuracy-v2"));
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV2);
+
+        // The unversioned alias tracks the latest version of its family.
+        profile.apply("KIN_PROFILE", Some("accuracy"));
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV2);
+
         // Unknown values must not silently select a different serving shape.
         profile.apply("KIN_PROFILE", Some("warp-speed"));
-        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV2);
 
         profile.apply::<_, &str>("KIN_PROFILE", None);
-        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV2);
+    }
+
+    /// The shipped default: the accuracy lever set with the reranker off.
+    /// Pins the default variant, its name, and every lever value, so a future
+    /// edit cannot move the default without this test naming the change.
+    #[test]
+    #[serial_test::serial]
+    fn default_profile_is_accuracy_v2_with_the_reranker_off() {
+        let _profile = kin_core::test_env::EnvVarGuard::unset("KIN_PROFILE");
+        let default = RetrievalProfile::from_env();
+        assert_eq!(default, RetrievalProfile::AccuracyV2);
+        assert_eq!(default, RetrievalProfile::default());
+        assert_eq!(default.name(), "accuracy-v2");
+
+        assert!(default.semantic_locate_fused());
+        assert!(default.entity_fusion_default());
+        assert!(default.lexical_floor_readmit_default());
+        assert_eq!(default.rerank_latency_budget_ms_default(), 1_500);
+        assert_eq!(default.embedding_min_relevance_default(), 0.625);
+        // Blend stays the default so an explicit env enable of the
+        // cross-encoder still gets promotion-only blending.
+        assert!(default.rerank_blend_default());
+        assert!(!default.declaration_cutoff_default());
+
+        // The reranker stays off on the strongest form of its old
+        // on-condition: model cached AND resident daemon. An install that
+        // prefetched the model under earlier doctor advice must not silently
+        // start reranking when the default profile changes.
+        let _mark = DaemonServingMark;
+        mark_daemon_serving();
+        assert!(!default.cross_encoder_default(true));
+        assert!(!default.cross_encoder_daemon_default(true));
+        // ...while an accuracy-v1 pin keeps the conditional it always had.
+        assert!(RetrievalProfile::AccuracyV1.cross_encoder_default(true));
+        assert!(RetrievalProfile::AccuracyV1.cross_encoder_daemon_default(true));
+    }
+
+    /// Routing is not a profile lever: every profile, the compat escape hatch
+    /// included, routes the MCP tool through the fused pipeline.
+    #[test]
+    fn every_profile_routes_semantic_locate_fused() {
+        for profile in [
+            RetrievalProfile::AccuracyV2,
+            RetrievalProfile::AccuracyV1,
+            RetrievalProfile::CompatV0,
+        ] {
+            assert!(
+                profile.semantic_locate_fused(),
+                "{} must route semantic_locate fused",
+                profile.name()
+            );
+        }
     }
 
     #[test]
@@ -370,7 +468,11 @@ mod tests {
     #[test]
     fn compat_profile_preserves_historical_defaults() {
         let compat = RetrievalProfile::CompatV0;
-        assert!(!compat.semantic_locate_fused());
+        // The one deliberate exception: routing is profile-independent, so
+        // the compat pin preserves the historical LEVER defaults while the
+        // MCP tool routes fused like every other profile. The cosine ranking
+        // stays reachable per call via `pipeline: "cosine"`.
+        assert!(compat.semantic_locate_fused());
         assert!(!compat.entity_fusion_default());
         assert!(!compat.lexical_floor_readmit_default());
         assert!(!compat.cross_encoder_default(true));
@@ -387,7 +489,11 @@ mod tests {
         // The confidence cutoff is a graduation-gated lever: it must not be a
         // silent default under ANY profile, so that shipping it changes nothing
         // until a paired A/B flips it on. An explicit env override drives the A/B.
-        for profile in [RetrievalProfile::AccuracyV1, RetrievalProfile::CompatV0] {
+        for profile in [
+            RetrievalProfile::AccuracyV2,
+            RetrievalProfile::AccuracyV1,
+            RetrievalProfile::CompatV0,
+        ] {
             assert!(
                 !profile.declaration_cutoff_default(),
                 "{} must not enable the declaration cutoff by default",
