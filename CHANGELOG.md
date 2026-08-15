@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.32] - 2026-08-15
+
+### Changed
+
+- Flip the default profile to accuracy-v2 and route semantic_locate fused on every profile (#841)
+
+
 ## [0.5.31] - 2026-08-15
 
 ### Changed

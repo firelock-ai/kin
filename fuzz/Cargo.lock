@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "kin-parser"
-version = "0.5.31"
+version = "0.5.32"
 dependencies = [
  "kin-model",
  "serde",
