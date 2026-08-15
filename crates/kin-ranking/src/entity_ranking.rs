@@ -11,7 +11,8 @@ use std::path::Path;
 
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use kin_model::graph::GraphStore;
-use kin_model::relation::RelationKind;
+use kin_model::relation::{Relation, RelationKind};
+use kin_model::{EntityId, GraphNodeId};
 
 /// Rank declaration kinds for entity selection.
 ///
@@ -145,6 +146,105 @@ pub fn select_best_entity<G: GraphStore>(
     Ok(best.map(|(entity, _)| entity))
 }
 
+/// The entity that structurally CONTAINS this one (class to method, enum to
+/// variant), read from an already-fetched relation slice. `None` for an entity
+/// nothing contains: free functions, and forwarding impls on reference or
+/// generic owners (`&G::method`), whose qualified prefix is not a graph entity.
+pub fn containing_owner_id(entity_id: &EntityId, relations: &[Relation]) -> Option<EntityId> {
+    relations.iter().find_map(|rel| {
+        if rel.kind == RelationKind::Contains && rel.dst == GraphNodeId::Entity(*entity_id) {
+            match rel.src {
+                GraphNodeId::Entity(owner) => Some(owner),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
+/// The owner segment of a qualified entity name: `CodeEmbedder` for
+/// `CodeEmbedder::embed_batch`, `constant` for `constant.Raspbian`, `None` for
+/// a bare name. Both separators because both are in the graph (Rust/C++ store
+/// `Type::method`, shallow-backed languages normalize to a dot); the LAST
+/// separator wins so a mixed name splits where its own name starts.
+pub fn qualified_owner_prefix(name: &str) -> Option<&str> {
+    let dotted = name.rfind('.');
+    let scoped = name.rfind("::");
+    let split = match (dotted, scoped) {
+        (Some(dot), Some(scope)) => Some(if scope > dot { scope } else { dot }),
+        (Some(dot), None) => Some(dot),
+        (None, Some(scope)) => Some(scope),
+        (None, None) => None,
+    };
+    split
+        .map(|idx| &name[..idx])
+        .filter(|prefix| !prefix.is_empty())
+}
+
+/// Relation count of one entity excluding temporal `CoChanges` edges, so the
+/// number is a fact about code structure rather than commit history.
+fn structural_relation_count<G: GraphStore>(
+    store: &G,
+    id: &EntityId,
+) -> std::result::Result<usize, <G as GraphStore>::Error> {
+    Ok(store
+        .get_all_relations_for_entity(id)?
+        .iter()
+        .filter(|rel| rel.kind != RelationKind::CoChanges)
+        .count())
+}
+
+/// Structural graph mass of the type an entity hangs off: the relation count
+/// (excluding `CoChanges`) of its `Contains` parent when that edge exists, and
+/// otherwise of the entity exactly named by its qualified owner prefix. `0`
+/// only when neither resolves, which is what a blanket forwarding impl on a
+/// reference or generic owner (`&G::method`) honestly reads as.
+///
+/// This is the canonical-definition signal for breaking pure exact-name ties.
+/// When one symbol name is defined by several impls, the definition on the
+/// primary type is the one an agent means, and the primary type is the one
+/// that accretes graph mass: measured on the 26,633-entity gauntlet store,
+/// `delete_work_item` is carried by `InMemoryGraph::` (owner mass 285),
+/// `MockGraph::` (134), `EmptyStore::` (121), and a blanket `&G::` forwarding
+/// impl (no owner, 0). Incoming references on the tied METHODS themselves
+/// cannot break this tie: a shared test harness calls every impl, and on that
+/// same store the mocks collect MORE method-level calls (3/3) than the
+/// canonical definition (2), so the owner is the signal, not the method.
+///
+/// The name fallback is not a nicety. A method's `Contains` edge is
+/// enrichment that a freshly built store can lack while the owner type itself
+/// parsed fine: the same kin-db file measured owner mass 14 for
+/// `CodeEmbedder::embed_batch` through its edge on the flagship store and 0 on
+/// a minutes-old store missing the edge, which handed the tie to
+/// `OpenAiCompatEmbedder::` (mass 5). A missing edge is a graph gap, not
+/// evidence the definition is secondary, so the owner NAME answers when the
+/// edge cannot.
+pub fn owner_graph_mass<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    entity_name: &str,
+) -> std::result::Result<usize, <G as GraphStore>::Error> {
+    let relations = store.get_all_relations_for_entity(entity_id)?;
+    if let Some(owner) = containing_owner_id(entity_id, &relations) {
+        return structural_relation_count(store, &owner);
+    }
+    let Some(prefix) = qualified_owner_prefix(entity_name) else {
+        return Ok(0);
+    };
+    let candidates = store.query_entities(&kin_model::graph::EntityFilter {
+        name_pattern: Some(prefix.to_string()),
+        ..Default::default()
+    })?;
+    let mut best = 0;
+    for candidate in candidates {
+        if candidate.name == prefix && candidate.id != *entity_id {
+            best = best.max(structural_relation_count(store, &candidate.id)?);
+        }
+    }
+    Ok(best)
+}
+
 /// Rank relation kinds for trace operations.
 ///
 /// Higher values indicate more significant relations: Calls > Imports > References.
@@ -248,5 +348,63 @@ mod tests {
             trace_relation_rank(RelationKind::Imports)
                 > trace_relation_rank(RelationKind::References)
         );
+    }
+
+    fn relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: kin_model::relation::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn containing_owner_is_the_incoming_contains_source() {
+        let method = EntityId::new();
+        let owner = EntityId::new();
+        let caller = EntityId::new();
+        let rels = vec![
+            // Incoming call noise must not read as ownership.
+            relation(RelationKind::Calls, caller, method),
+            relation(RelationKind::Contains, owner, method),
+            // An OUTGOING Contains (this entity containing something else)
+            // must not read as this entity's owner either.
+            relation(RelationKind::Contains, method, caller),
+        ];
+        assert_eq!(containing_owner_id(&method, &rels), Some(owner));
+    }
+
+    #[test]
+    fn entity_nothing_contains_has_no_owner() {
+        let method = EntityId::new();
+        let caller = EntityId::new();
+        let rels = vec![relation(RelationKind::Calls, caller, method)];
+        assert_eq!(containing_owner_id(&method, &rels), None);
+        assert_eq!(containing_owner_id(&method, &[]), None);
+    }
+
+    #[test]
+    fn qualified_owner_prefix_splits_on_the_last_separator() {
+        assert_eq!(
+            qualified_owner_prefix("CodeEmbedder::embed_batch"),
+            Some("CodeEmbedder")
+        );
+        assert_eq!(
+            qualified_owner_prefix("constant.Raspbian"),
+            Some("constant")
+        );
+        assert_eq!(qualified_owner_prefix("a::b::c"), Some("a::b"));
+        assert_eq!(qualified_owner_prefix("&G::delete_work_item"), Some("&G"));
+        // Bare names have no owner segment, and a leading separator yields no
+        // usable prefix rather than an empty one.
+        assert_eq!(qualified_owner_prefix("seal_change"), None);
+        assert_eq!(qualified_owner_prefix("::rooted"), None);
+        assert_eq!(qualified_owner_prefix(".hidden"), None);
     }
 }
