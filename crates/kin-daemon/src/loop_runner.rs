@@ -1070,6 +1070,109 @@ fn persist_non_entity_enrichment(
     }
 }
 
+/// Create the missing non-entity enrichment records for the current resolved
+/// tree, reading bodies from the repository CAS.
+///
+/// Bulk admission (`kin init` importing a Git repository) derives entities for
+/// parser-supported sources and stops there: no shallow, structured, or opaque
+/// record is written for any other tracked file. Every downstream artifact
+/// surface keys on those records — `artifact_count()`, the artifact embedding
+/// queue, the text index that feeds lexical artifact candidacy — so a store
+/// born from bulk admission reports "+0 artifacts" on `kin embed` and can never
+/// rank an artifact, while `kin status` counts the same files as tracked. The
+/// live reconcile loop only enriches paths that produce file events, which an
+/// unchanged imported tree never does.
+///
+/// This pass is strictly additive: a path is skipped when any enrichment facet
+/// already exists for it (including an entity-source layout), when its current
+/// bytes classify as entity source, or when its tree entry carries no blob
+/// body. It never deletes or replaces a facet, so drift between an existing
+/// record and tree truth stays the reconcile loop's job. Bodies come from the
+/// repository CAS, never from the working filesystem.
+///
+/// Returns how many records were created. Callers that receive a nonzero count
+/// own bumping the state version so the records persist with the next snapshot.
+///
+/// Gated with its only runtime caller, the embed request handler: a build
+/// without embedding support has no surface that asks for this coverage, and
+/// an uncalled function fails the deny-warnings build on exactly those
+/// feature subsets.
+#[cfg(feature = "embeddings")]
+pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Result<usize> {
+    let tree = state.graph.resolved_tree();
+    let pipeline = IndexPipeline::new();
+    let mut created = 0usize;
+    let mut unreadable = 0usize;
+
+    for artifact in tree.artifacts() {
+        if !matches!(artifact.entry, TreeEntry::Blob { .. }) {
+            continue;
+        }
+        let Some(hash) = artifact.entry.blob_identity() else {
+            continue;
+        };
+        let Some(path) = artifact.path.as_utf8() else {
+            // Non-UTF-8 paths stay byte-exact tree truth with no UTF-8
+            // enrichment surface, same as the live reconcile loop.
+            continue;
+        };
+        let file_id = FilePathId::new(path);
+
+        if state.graph.get_shallow_file(&file_id)?.is_some()
+            || state.graph.get_structured_artifact(&file_id)?.is_some()
+            || state.graph.get_opaque_artifact(&file_id)?.is_some()
+            || state.graph.get_file_layout(&file_id)?.is_some()
+        {
+            continue;
+        }
+
+        let content = match state.blobs.read(&hash) {
+            Ok(content) => content,
+            Err(error) => {
+                // A missing derived body must not fail daemon startup; CAS
+                // hydration owns repairing it, and the next pass retries.
+                unreadable += 1;
+                debug!(
+                    file = %file_id,
+                    error = %error,
+                    "enrichment coverage pass could not read tracked body from CAS"
+                );
+                continue;
+            }
+        };
+
+        if FileClassifier::classify_with_content(Path::new(path), &content)
+            == FileClassification::EntitySource
+        {
+            continue;
+        }
+
+        match pipeline.index_any_content(&file_id, &content, hash) {
+            Ok(indexed) => match persist_non_entity_enrichment(state, indexed) {
+                Ok(_) => created += 1,
+                Err(error) => warn!(
+                    file = %file_id,
+                    error = %error,
+                    "enrichment coverage pass could not persist facet"
+                ),
+            },
+            Err(error) => warn!(
+                file = %file_id,
+                error = %error,
+                "enrichment coverage pass could not enrich tracked body"
+            ),
+        }
+    }
+
+    if created > 0 || unreadable > 0 {
+        info!(
+            created,
+            unreadable, "enrichment coverage pass created missing non-entity records"
+        );
+    }
+    Ok(created)
+}
+
 /// Deferrals of one path before its log line escalates from debug to warn.
 ///
 /// A file saved while the pass is reading it defers once and reconciles on the
@@ -3262,6 +3365,73 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(tree_entry(&state, "src/change.rs").is_some());
+    }
+
+    /// A store born from bulk admission holds tree truth with no non-entity
+    /// enrichment records, so nothing feeds the artifact embedding queue or the
+    /// artifact text index and `kin embed` honestly reports "+0 artifacts".
+    /// The coverage pass must recreate exactly the missing records from CAS
+    /// bodies, leave entity sources alone, and be idempotent.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn coverage_pass_recreates_missing_records_and_feeds_the_artifact_queue() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("AGENTS.md"),
+            "# Doctrine\n\nChecks That Cannot Fail live here, past any preview cap.\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("main.py"), "def fail():\n    return 1\n").unwrap();
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        let doc_id = FilePathId::new("AGENTS.md");
+        assert!(state.graph.get_opaque_artifact(&doc_id).unwrap().is_some());
+
+        // Deleting the record reproduces the shape bulk admission leaves
+        // behind: the tree tracks the file, no enrichment facet exists.
+        state.graph.delete_opaque_artifact(&doc_id).unwrap();
+        assert_eq!(state.graph.artifact_count(), 0);
+        assert!(tree_entry(&state, "AGENTS.md").is_some());
+
+        let created = ensure_non_entity_enrichment_coverage(&state).unwrap();
+        assert_eq!(
+            created, 1,
+            "the doc regains its record; the entity source must not gain one"
+        );
+        let record = state
+            .graph
+            .get_opaque_artifact(&doc_id)
+            .unwrap()
+            .expect("coverage pass recreates the opaque record");
+        assert!(
+            record
+                .text_preview
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Checks That Cannot Fail"),
+            "recreated record must retain the body text retrieval indexes"
+        );
+        assert!(state
+            .graph
+            .get_opaque_artifact(&FilePathId::new("main.py"))
+            .unwrap()
+            .is_none());
+        assert_eq!(state.graph.artifact_count(), 1);
+
+        assert_eq!(
+            ensure_non_entity_enrichment_coverage(&state).unwrap(),
+            0,
+            "a second pass over full coverage creates nothing"
+        );
+
+        // The recreated record is exactly what the artifact embedding queue
+        // keys on, so the backfill can now see the file.
+        state.graph.queue_missing_artifacts_for_embedding();
+        assert!(
+            state.graph.pending_artifact_embeddings() >= 1,
+            "recreated record must enter the artifact embedding backfill"
+        );
     }
 
     #[tokio::test]
