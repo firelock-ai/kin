@@ -6015,6 +6015,19 @@ async fn embed(
             // save_snapshot() acquires persist_lock internally; the non-reentrant std
             // Mutex self-deadlocks if we hold persist_lock across this call (this was
             // the daemon embed hang — the worker wedged here before embedding started).
+            // An explicit embed is the operator asking for full retrieval
+            // coverage, so create any enrichment records bulk admission never
+            // wrote before counting what there is to embed. Without them the
+            // artifact denominator reads zero and the pass honestly reports
+            // "+0 artifacts" on a store full of tracked files.
+            match crate::loop_runner::ensure_non_entity_enrichment_coverage(&state_for_embed) {
+                Ok(created) if created > 0 => state_for_embed.bump_version(),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "enrichment coverage reconcile failed before embed; artifact coverage may be short"
+                ),
+            }
             state_for_embed
                 .save_snapshot()
                 .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
