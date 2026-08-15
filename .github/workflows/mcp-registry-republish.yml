@@ -1,0 +1,107 @@
+# Publishes an already-released version to the MCP Registry from main's
+# server.json. A tag run resolves its source from the tag, so a server.json fix
+# on main can never reach a release whose registry publish already failed; this
+# dispatch is the fix-forward path for exactly that case. It requires the tag
+# and the npm package to exist, and unlike the release job it fails loud,
+# because a person asked for this publish and should hear the answer.
+name: MCP Registry Republish
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to publish, no leading v (tag and npm package must already exist)"
+        required: true
+        type: string
+
+jobs:
+  republish_mcp_registry:
+    name: Publish to the MCP Registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate the requested version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+          git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" > /dev/null
+
+      - name: Set the released version in server.json
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' \
+            server.json > server.json.tmp
+          mv server.json.tmp server.json
+          jq -e --arg v "$VERSION" \
+            '.version == $v and .packages[0].version == $v' server.json > /dev/null
+          # The registry refuses the publish unless package.json's mcpName is
+          # exactly server.json's name, and it reports that as a package
+          # validation failure rather than as the mismatch it is.
+          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+            '.name == $pkg[0].mcpName' server.json > /dev/null
+          jq -e --slurpfile pkg packages/kin-mcp/package.json \
+            '.packages[0].identifier == $pkg[0].name' server.json > /dev/null
+
+      - name: Confirm npm serves the published version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$(npm view "@kinlab/kin-mcp@${VERSION}" version 2>/dev/null)" != "$VERSION" ]; then
+            echo "::error::npm does not serve @kinlab/kin-mcp@${VERSION}; the registry validates against live npm, so this publish would be refused"
+            exit 1
+          fi
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+          curl -fsSL \
+            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_${arch}.tar.gz" \
+            | tar xz mcp-publisher
+          test -x ./mcp-publisher
+
+      - name: Authenticate to the MCP Registry
+        env:
+          MCP_PRIVATE_KEY: ${{ secrets.MCP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${MCP_PRIVATE_KEY:-}"
+          ./mcp-publisher login dns --domain kinlab.ai --private-key "$MCP_PRIVATE_KEY"
+
+      - name: Publish the server entry
+        run: ./mcp-publisher publish
+
+      - name: Read the entry back from the registry
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          body="$(curl -fsSL "https://registry.modelcontextprotocol.io/v0.1/servers?search=ai.kinlab")"
+          printf '%s\n' "$body" | jq .
+          {
+            echo "### MCP Registry search for ai.kinlab"
+            echo
+            echo '```json'
+            printf '%s\n' "$body" | jq .
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s' "$body" \
+            | jq -e --arg v "$VERSION" \
+              '[.servers[]? | .server | select(.name == "ai.kinlab/kin" and .version == $v)] | length > 0' \
+            > /dev/null

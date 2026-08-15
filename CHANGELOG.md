@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.30] - 2026-08-14
+
+### Changed
+
+- Trim the registry description under the cap and add a dispatchable republish (#833)
+- Make llms-install.md survivable for an unattended agent install (#835)
+- Let the registry republish dispatch from main (#836)
+
+
+## [0.5.29] - 2026-08-14
+
+### Changed
+
+- Name the MCPB bundle output and give it a README (#831)
+- Add plugin interface icons for the Codex converter (#832)
+
+
 ## [0.5.28] - 2026-08-14
 
 ### Changed
