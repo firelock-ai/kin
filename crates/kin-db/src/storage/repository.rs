@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 
 use kin_model::{
     ArtifactId, AuthorId, AuthorityRoot, ChangeStore, DefaultRefExpectation, DefaultRefMutation,
-    EntityDelta, EntityStore, ExternalChangeAlias, ExternalObjectId, ExternalObjectKind,
+    EntityDelta, EntityId, EntityStore, ExternalChangeAlias, ExternalObjectId, ExternalObjectKind,
     ExternalObjectRecord, ExternalReferenceDelta, FrozenLocalOverlay, GitExternalAuthority,
     GitObjectBodyLoader, GitObjectDependencyKind, GitObjectId, GitTreeEntryMode, Hash256,
     LocalAdmissionRuleSourceKind, MergeEntryResolution, MergeResolutionPayload,
@@ -26,8 +26,8 @@ use kin_model::{
     RefTarget, RefUpdatePolicy, RelationDelta, RepoPath, RepositoryAuthorityStore,
     RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryOperationRecord,
     RepositoryRef, RepositoryRefState, RepositoryTransaction, ResolvedArtifact, ResolvedTree,
-    RootBundle, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy, Timestamp,
-    TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
+    RootBundle, SemanticChange, SemanticChangeId, SensitiveArtifactKind, SharedAdmissionPolicy,
+    Timestamp, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId, WorkspaceSemanticOverlay,
     WorkspaceSnapshotBinding, WorkspaceState, WorkspaceTreeArtifact, WorkspaceTreeSnapshot,
     REPOSITORY_ROOT_SCHEMA_VERSION,
 };
@@ -3492,9 +3492,31 @@ fn materialize_workspace_graph_snapshot(
         metadata,
         workspace.base_target.as_ref(),
     )?;
-    let base_tree = base.resolved_tree.clone();
     let mut delta = workspace.semantic_overlay.transaction_delta();
-    delta.tree_deltas = exact_tree_transition(&base_tree, &workspace.tree);
+    delta.tree_deltas = exact_tree_transition(&base.resolved_tree, &workspace.tree);
+    // A clean workspace, based at its exact tree with an empty semantic
+    // overlay, IS its resolved base. Pushing an empty transaction through a
+    // full graph build only copies every domain it was handed: the build
+    // re-validates admission, re-derives relation and entity indexes, clones
+    // the entity map to stage nothing, and exports a copy of its own input.
+    // A daemon reopening after a commit holds exactly this workspace shape,
+    // which made that copy a dominant term of cold open at repository scale.
+    // The base was admission-validated by resolution above; a second pass
+    // over the same object would re-hash every change to conclude nothing.
+    if delta.entity_deltas.is_empty()
+        && delta.relation_deltas.is_empty()
+        && delta.tree_deltas.is_empty()
+        && delta.external_reference_deltas.is_empty()
+        && delta.admission_policy_delta.is_none()
+    {
+        if base.resolved_tree != workspace.tree {
+            return Err(storage(format!(
+                "workspace {} semantic overlay did not resolve its exact persisted tree",
+                workspace.workspace_id
+            )));
+        }
+        return Ok(base);
+    }
     // Materialization consumes this graph as a snapshot and drops it. Building a
     // text index for it would index every entity to answer no query: the caller
     // holding the workspace open builds its own against the persistent index.
@@ -3511,34 +3533,142 @@ fn materialize_workspace_graph_snapshot(
     Ok(materialized)
 }
 
+/// Borrowed change-history view for whole-graph replay during workspace base
+/// resolution.
+///
+/// `ChangeStore::resolve_graph_at` is a kin-model default method whose only
+/// store dependency is `get_change`. Base resolution used to reach it by
+/// cloning the entire authority snapshot into a throwaway `InMemoryGraph`,
+/// paying a second full-snapshot copy, an admission validation, relation and
+/// entity index builds, and a Merkle cache, all discarded after one replay.
+/// This view serves the identical replay from borrowed authority changes.
+///
+/// The store methods replay never reads fail closed: nothing on the
+/// materialization path can reach them, and a future caller that does must be
+/// refused rather than silently served an empty answer.
+struct AuthorityHistoryView<'a> {
+    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+}
+
+impl AuthorityHistoryView<'_> {
+    fn unsupported(operation: &str) -> KinDbError {
+        storage(format!(
+            "{operation} is unavailable through a workspace materialization history view"
+        ))
+    }
+}
+
+impl ChangeStore for AuthorityHistoryView<'_> {
+    type Error = KinDbError;
+
+    fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
+        Ok(self.changes.get(id).cloned())
+    }
+
+    fn get_entity_history(&self, _id: &EntityId) -> Result<Vec<SemanticChange>, KinDbError> {
+        Err(Self::unsupported("entity history"))
+    }
+
+    fn find_merge_bases(
+        &self,
+        _a: &SemanticChangeId,
+        _b: &SemanticChangeId,
+    ) -> Result<Vec<SemanticChangeId>, KinDbError> {
+        Err(Self::unsupported("merge-base search"))
+    }
+
+    fn create_change(&self, _change: &SemanticChange) -> Result<(), KinDbError> {
+        Err(Self::unsupported("change creation"))
+    }
+
+    fn get_changes_since(
+        &self,
+        _base: &SemanticChangeId,
+        _head: &SemanticChangeId,
+    ) -> Result<Vec<SemanticChange>, KinDbError> {
+        Err(Self::unsupported("change-range listing"))
+    }
+}
+
 fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     base_target: Option<&RefTarget>,
 ) -> Result<GraphSnapshot, KinDbError> {
-    let mut base = authority_snapshot.clone();
-    base.repository_authority = None;
-
-    if let Some(target) = base_target {
-        let change_id = target_change_id(metadata, target)?;
-        // `from_snapshot_without_text_index_with_root_hash` documents its root
-        // hash argument as accepted and ignored, so the full canonical Merkle
-        // pass this call used to feed it was pure dead cost on every
-        // workspace materialization.
-        let history = InMemoryGraph::from_snapshot_without_text_index(base.clone())?;
-        let resolved = history.resolve_graph_at(&change_id)?;
-        base.entities = resolved.entities;
-        base.relations = resolved.relations;
-        base.entity_revisions = resolved.entity_revisions;
-        base.resolved_tree = resolved.tree;
-        base.external_references = resolved.external_references;
-    } else {
-        base.entities.clear();
-        base.relations.clear();
-        base.entity_revisions.clear();
-        base.resolved_tree = ResolvedTree::default();
-        base.external_references.clear();
-    }
+    // Replay-derived domains first. The whole-snapshot clone this function
+    // used to start from copied every one of them only to overwrite or clear
+    // them, and fed a second full clone into a throwaway `InMemoryGraph`
+    // whose admission pass, relation and entity indexes, and Merkle cache
+    // were discarded after one history replay.
+    let resolved = match base_target {
+        Some(target) => {
+            let change_id = target_change_id(metadata, target)?;
+            let view = AuthorityHistoryView {
+                changes: &authority_snapshot.changes,
+            };
+            Some(view.resolve_graph_at(&change_id)?)
+        }
+        None => None,
+    };
+    let (entities, relations, entity_revisions, resolved_tree, external_references) = match resolved
+    {
+        Some(state) => (
+            state.entities,
+            state.relations,
+            state.entity_revisions,
+            state.tree,
+            state.external_references,
+        ),
+        None => (
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            ResolvedTree::default(),
+            HashMap::new(),
+        ),
+    };
+    // Every field is named so that a new snapshot domain refuses to compile
+    // here until someone decides whether a workspace base carries it. The
+    // carried domains are cloned exactly as the whole-snapshot clone carried
+    // them; adjacency is rebuilt below from the resolved relations, so the
+    // persisted authority adjacency is never copied at all.
+    let mut base = GraphSnapshot {
+        version: authority_snapshot.version,
+        entities,
+        relations,
+        outgoing: HashMap::new(),
+        incoming: HashMap::new(),
+        changes: authority_snapshot.changes.clone(),
+        change_children: authority_snapshot.change_children.clone(),
+        work_items: authority_snapshot.work_items.clone(),
+        annotations: authority_snapshot.annotations.clone(),
+        work_links: authority_snapshot.work_links.clone(),
+        reviews: authority_snapshot.reviews.clone(),
+        review_decisions: authority_snapshot.review_decisions.clone(),
+        review_notes: authority_snapshot.review_notes.clone(),
+        review_discussions: authority_snapshot.review_discussions.clone(),
+        review_assignments: authority_snapshot.review_assignments.clone(),
+        test_cases: authority_snapshot.test_cases.clone(),
+        assertions: authority_snapshot.assertions.clone(),
+        verification_runs: authority_snapshot.verification_runs.clone(),
+        mock_hints: authority_snapshot.mock_hints.clone(),
+        contracts: authority_snapshot.contracts.clone(),
+        actors: authority_snapshot.actors.clone(),
+        delegations: authority_snapshot.delegations.clone(),
+        approvals: authority_snapshot.approvals.clone(),
+        audit_events: authority_snapshot.audit_events.clone(),
+        shallow_files: authority_snapshot.shallow_files.clone(),
+        file_layouts: authority_snapshot.file_layouts.clone(),
+        structured_artifacts: authority_snapshot.structured_artifacts.clone(),
+        opaque_artifacts: authority_snapshot.opaque_artifacts.clone(),
+        resolved_tree,
+        sessions: authority_snapshot.sessions.clone(),
+        intents: authority_snapshot.intents.clone(),
+        downstream_warnings: authority_snapshot.downstream_warnings.clone(),
+        entity_revisions,
+        repository_authority: None,
+        external_references,
+    };
     rebuild_snapshot_adjacency(&mut base);
     base.validate_storage_admission()?;
     Ok(base)
@@ -11211,5 +11341,481 @@ mod tests {
             other_digest.to_string().contains("authority moved"),
             "unexpected other-digest error: {other_digest}"
         );
+    }
+
+    /// One authority store carrying a deep synthetic history and one clean
+    /// workspace based at its head, committed through the real transaction
+    /// surface so every materialization input (refs, workspace authority,
+    /// overlay derivation) is exactly what a product store carries.
+    ///
+    /// Entities deliberately have no file origin, so the fixture needs no
+    /// repository tree and no source bodies; the costs under measurement
+    /// (history replay, snapshot copying, admission passes) involve neither.
+    struct SyntheticHistoryStore {
+        manager: RepositoryAuthorityManager<MemoryBackend>,
+        workspace_id: WorkspaceId,
+        change_count: usize,
+        entity_count: usize,
+        relation_count: usize,
+        modified_entity: EntityId,
+        final_signature: String,
+        chain_source: EntityId,
+        chain_target: EntityId,
+    }
+
+    fn build_synthetic_history_store(
+        add_changes: usize,
+        adds_per_change: usize,
+        modify_changes: usize,
+        modifies_per_change: usize,
+    ) -> SyntheticHistoryStore {
+        assert!(add_changes >= 1 && adds_per_change >= 2 && modify_changes >= 1);
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+
+        let shared = SharedAdmissionPolicy::empty(0);
+        let base_time = chrono::DateTime::parse_from_rfc3339("2026-07-28T16:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let new_change =
+            |parents: Vec<SemanticChangeId>,
+             sequence: usize,
+             entity_deltas: Vec<EntityDelta>,
+             relation_deltas: Vec<RelationDelta>,
+             admission_policy_delta: Option<AdmissionPolicyDelta>| {
+                let mut change = SemanticChange {
+                    id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                    origin: ChangeOrigin::Native,
+                    parents,
+                    timestamp: Timestamp(base_time + chrono::Duration::seconds(sequence as i64)),
+                    author: AuthorId::new("synthetic-history"),
+                    message: format!("synthetic change {sequence}"),
+                    entity_deltas,
+                    relation_deltas,
+                    tree_deltas: Vec::new(),
+                    admission_policy_delta,
+                    external_reference_deltas: Vec::new(),
+                    projected_files: Vec::new(),
+                    spec_link: None,
+                    evidence: Vec::new(),
+                    risk_summary: None,
+                };
+                change.id = compute_semantic_change_id(&change).unwrap();
+                change
+            };
+
+        let mut current_entities: BTreeMap<EntityId, Entity> = BTreeMap::new();
+        let mut relations: Vec<Relation> = Vec::new();
+        let mut changes: Vec<SemanticChange> = Vec::new();
+
+        let mut seed = semantic_test_entity("src/seed.rs", "seed", LanguageId::Rust, 0x01);
+        seed.file_origin = None;
+        current_entities.insert(seed.id, seed.clone());
+        changes.push(new_change(
+            Vec::new(),
+            0,
+            vec![EntityDelta::Added { new: seed }],
+            Vec::new(),
+            Some(AdmissionPolicyDelta::initialize(shared.clone())),
+        ));
+
+        let mut chain_endpoints = None;
+        for c in 0..add_changes {
+            let mut entity_deltas = Vec::with_capacity(adds_per_change);
+            let mut relation_deltas = Vec::new();
+            let mut previous: Option<EntityId> = None;
+            for i in 0..adds_per_change {
+                let mut entity = semantic_test_entity(
+                    &format!("src/mod_{c}.rs"),
+                    &format!("fn_{c}_{i}"),
+                    LanguageId::Rust,
+                    (c % 251) as u8,
+                );
+                entity.file_origin = None;
+                if let Some(source) = previous {
+                    let relation = Relation {
+                        id: RelationId::from_content(
+                            &source.to_string(),
+                            &entity.id.to_string(),
+                            "calls",
+                        ),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(source),
+                        dst: GraphNodeId::Entity(entity.id),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Manual,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    };
+                    if chain_endpoints.is_none() {
+                        chain_endpoints = Some((source, entity.id));
+                    }
+                    relations.push(relation.clone());
+                    relation_deltas.push(RelationDelta::Added { new: relation });
+                }
+                previous = Some(entity.id);
+                current_entities.insert(entity.id, entity.clone());
+                entity_deltas.push(EntityDelta::Added { new: entity });
+            }
+            let parent = changes.last().expect("genesis exists").id;
+            changes.push(new_change(
+                vec![parent],
+                1 + c,
+                entity_deltas,
+                relation_deltas,
+                None,
+            ));
+        }
+        let (chain_source, chain_target) = chain_endpoints.expect("adds_per_change >= 2");
+
+        let mut modified_entity = None;
+        for m in 0..modify_changes {
+            let victims: Vec<EntityId> = current_entities
+                .keys()
+                .skip((m * modifies_per_change) % current_entities.len())
+                .take(modifies_per_change.max(1))
+                .copied()
+                .collect();
+            let mut entity_deltas = Vec::with_capacity(victims.len());
+            for id in victims {
+                let old = current_entities.get(&id).expect("victim exists").clone();
+                let mut new = old.clone();
+                new.signature = format!("{} /* rev {m} */", old.signature);
+                modified_entity = Some(id);
+                current_entities.insert(id, new.clone());
+                entity_deltas.push(EntityDelta::Modified { old, new });
+            }
+            let parent = changes.last().expect("chain exists").id;
+            changes.push(new_change(
+                vec![parent],
+                1 + add_changes + m,
+                entity_deltas,
+                Vec::new(),
+                None,
+            ));
+        }
+        let modified_entity = modified_entity.expect("modify_changes >= 1");
+        let final_signature = current_entities
+            .get(&modified_entity)
+            .expect("modified entity exists")
+            .signature
+            .clone();
+
+        let head = changes.last().expect("chain exists").id;
+        let base_target = RefTarget::change(head);
+        let tree_hash = compute_resolved_tree_hash(&ResolvedTree::default()).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xf1_2322));
+        let frozen_overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::Sensitive, Vec::new()).unwrap();
+        let effective_policy = EffectiveAdmissionPolicyStamp {
+            shared: shared.stamp(),
+            local: frozen_overlay.stamp(),
+        };
+        let main = RefName::branch(b"main").unwrap();
+        let mut initial = transaction_shell(&manager, 0xf1_2322);
+        let change_count = changes.len();
+        initial.changes = changes;
+        initial.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(base_target.clone()),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        initial.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main.clone()),
+        });
+        initial.workspace_mutation = Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: WorkspaceHead::Symbolic { target: main },
+            new_base_target: Some(base_target),
+            new_base_tree_hash: Some(tree_hash),
+            tree_deltas: Vec::new(),
+            new_tree_hash: tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::new_with_external_references(
+                current_entities
+                    .values()
+                    .cloned()
+                    .map(|new| EntityDelta::Added { new })
+                    .collect(),
+                relations
+                    .iter()
+                    .cloned()
+                    .map(|new| RelationDelta::Added { new })
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap(),
+            new_shared_admission_policy: shared,
+            new_admission_policy: effective_policy,
+        });
+        initial.local_overlay_delta = Some(FrozenLocalOverlayDelta::initialize(frozen_overlay));
+        manager.commit_repository_transaction(initial).unwrap();
+
+        SyntheticHistoryStore {
+            manager,
+            workspace_id,
+            change_count,
+            entity_count: current_entities.len(),
+            relation_count: relations.len(),
+            modified_entity,
+            final_signature,
+            chain_source,
+            chain_target,
+        }
+    }
+
+    /// The uncommitted relation the dirty-workspace variant stages.
+    fn synthetic_overlay_relation(store: &SyntheticHistoryStore) -> Relation {
+        Relation {
+            id: RelationId::from_content(
+                &store.chain_target.to_string(),
+                &store.chain_source.to_string(),
+                "overlay-calls",
+            ),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(store.chain_target),
+            dst: GraphNodeId::Entity(store.chain_source),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    fn stage_synthetic_overlay(store: &SyntheticHistoryStore) -> Relation {
+        let relation = synthetic_overlay_relation(store);
+        store
+            .manager
+            .commit_repository_transaction(semantic_workspace_transaction(
+                &store.manager,
+                0xf1_2323,
+                WorkspaceSemanticDelta::new_with_external_references(
+                    Vec::new(),
+                    vec![RelationDelta::Added {
+                        new: relation.clone(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        relation
+    }
+
+    /// Assert the materialized workspace snapshot is exactly the replayed
+    /// head state plus carried history, independent of how materialization is
+    /// implemented. These assertions pin the contract FIR-2322's restructure
+    /// must preserve.
+    fn assert_synthetic_materialization(
+        store: &SyntheticHistoryStore,
+        materialized: &GraphSnapshot,
+        staged: Option<&Relation>,
+    ) {
+        assert_eq!(materialized.entities.len(), store.entity_count);
+        assert_eq!(
+            materialized.relations.len(),
+            store.relation_count + usize::from(staged.is_some())
+        );
+        assert_eq!(materialized.changes.len(), store.change_count);
+        assert!(
+            materialized.repository_authority.is_none(),
+            "workspace query snapshots never carry the authority envelope"
+        );
+        assert_eq!(materialized.resolved_tree.len(), 0);
+        let modified = materialized
+            .entities
+            .get(&store.modified_entity)
+            .expect("modified entity present");
+        assert_eq!(modified.signature, store.final_signature);
+        let revisions = materialized
+            .entity_revisions
+            .get(&store.modified_entity)
+            .expect("modified entity carries a revision timeline");
+        assert!(
+            revisions.len() >= 2,
+            "a modified entity must retain more than one revision, found {}",
+            revisions.len()
+        );
+        let outgoing = materialized
+            .outgoing
+            .get(&store.chain_source)
+            .expect("chain source has outgoing adjacency");
+        let expected_relation = RelationId::from_content(
+            &store.chain_source.to_string(),
+            &store.chain_target.to_string(),
+            "calls",
+        );
+        assert!(outgoing.contains(&expected_relation));
+        assert!(
+            outgoing.windows(2).all(|pair| pair[0] <= pair[1]),
+            "persisted adjacency lists stay sorted"
+        );
+        match staged {
+            Some(relation) => {
+                assert_eq!(materialized.relations.get(&relation.id), Some(relation));
+            }
+            None => {
+                let staged_id = synthetic_overlay_relation(store).id;
+                assert!(
+                    !materialized.relations.contains_key(&staged_id),
+                    "a clean workspace must not carry the staged overlay relation"
+                );
+            }
+        }
+    }
+
+    fn materialize_synthetic(store: &SyntheticHistoryStore) -> GraphSnapshot {
+        store
+            .manager
+            .workspace_graph_snapshot(&repository_id(), &store.workspace_id)
+            .unwrap()
+            .expect("synthetic workspace materializes")
+    }
+
+    #[test]
+    fn synthetic_history_store_materializes_replayed_state_clean_and_dirty() {
+        let store = build_synthetic_history_store(3, 12, 2, 4);
+        assert!(
+            store.manager.read_authority().metadata().workspaces[0]
+                .semantic_overlay
+                .is_empty(),
+            "a workspace matching its committed base must not persist a compensating overlay"
+        );
+        let clean = materialize_synthetic(&store);
+        assert_synthetic_materialization(&store, &clean, None);
+
+        let staged = stage_synthetic_overlay(&store);
+        assert!(
+            !store.manager.read_authority().metadata().workspaces[0]
+                .semantic_overlay
+                .is_empty(),
+            "the staged relation must persist as a workspace overlay"
+        );
+        let dirty = materialize_synthetic(&store);
+        assert_synthetic_materialization(&store, &dirty, Some(&staged));
+        assert_eq!(clean.entities, dirty.entities);
+        assert_eq!(clean.entity_revisions, dirty.entity_revisions);
+    }
+
+    #[test]
+    fn authority_history_view_replays_identically_to_a_full_graph_build() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let lease = store.manager.read_authority();
+        let snapshot = lease.snapshot();
+        let head = lease
+            .resolve_target_change_id(
+                lease.metadata().workspaces[0]
+                    .base_target
+                    .as_ref()
+                    .expect("synthetic workspace bases at head"),
+            )
+            .unwrap();
+
+        let view = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        };
+        let viewed = view.resolve_graph_at(&head).unwrap();
+
+        let mut graph_input = snapshot.clone();
+        graph_input.repository_authority = None;
+        let graph = InMemoryGraph::from_snapshot_without_text_index(graph_input).unwrap();
+        let replayed = graph.resolve_graph_at(&head).unwrap();
+
+        assert_eq!(viewed.entities, replayed.entities);
+        assert_eq!(viewed.relations, replayed.relations);
+        assert_eq!(viewed.entity_revisions, replayed.entity_revisions);
+        assert_eq!(viewed.tree, replayed.tree);
+        assert_eq!(viewed.external_references, replayed.external_references);
+    }
+
+    #[test]
+    fn authority_history_view_fails_closed_outside_replay() {
+        let changes = HashMap::new();
+        let view = AuthorityHistoryView { changes: &changes };
+
+        let missing_head = SemanticChangeId::from_hash(Hash256::from_bytes([7; 32]));
+        let absent = view
+            .resolve_graph_at(&missing_head)
+            .expect_err("replaying an absent head must fail closed");
+        assert!(
+            absent.to_string().contains(&missing_head.to_string()),
+            "unexpected absent-head error: {absent}"
+        );
+
+        for (label, error) in [
+            (
+                "entity history",
+                view.get_entity_history(&EntityId::from_content("src/a.rs", "a", "function", 1))
+                    .expect_err("entity history is not served"),
+            ),
+            (
+                "merge-base search",
+                view.find_merge_bases(&missing_head, &missing_head)
+                    .expect_err("merge bases are not served"),
+            ),
+            (
+                "change-range listing",
+                view.get_changes_since(&missing_head, &missing_head)
+                    .expect_err("change ranges are not served"),
+            ),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("workspace materialization history view"),
+                "{label} must refuse by name, got: {error}"
+            );
+        }
+    }
+
+    /// Local, non-citable cold-open materialization wall-clock probe for
+    /// FIR-2322. Run explicitly in release mode:
+    ///
+    /// ```text
+    /// cargo test -p kin-db --release \
+    ///     workspace_materialization_cold_open_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn workspace_materialization_cold_open_bench() {
+        let build_started = std::time::Instant::now();
+        let store = build_synthetic_history_store(40, 500, 20, 100);
+        eprintln!(
+            "store: {} entities, {} relations, {} changes, built in {:.1}s",
+            store.entity_count,
+            store.relation_count,
+            store.change_count,
+            build_started.elapsed().as_secs_f64()
+        );
+
+        let time_rounds = |label: &str| {
+            let mut samples = Vec::new();
+            let mut latest = None;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                latest = Some(materialize_synthetic(&store));
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{label}: median {:.1} ms, min {:.1} ms, max {:.1} ms",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+            latest.expect("at least one round ran")
+        };
+
+        let clean = time_rounds("clean-workspace materialize");
+        assert_synthetic_materialization(&store, &clean, None);
+
+        let staged = stage_synthetic_overlay(&store);
+        let dirty = time_rounds("dirty-workspace materialize");
+        assert_synthetic_materialization(&store, &dirty, Some(&staged));
     }
 }
