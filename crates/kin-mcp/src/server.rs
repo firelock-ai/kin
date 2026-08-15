@@ -17,6 +17,7 @@ use crate::envelope::{self, Envelope};
 use crate::error::{McpError, Result};
 use crate::handlers::{handle_tool_call, RequestRepositoryAuthority};
 use crate::session::SessionRegistry;
+use crate::startup_binding::{StartupBindingState, StartupDaemonBinding};
 use crate::tools::tool_definitions;
 use crate::types::*;
 
@@ -198,6 +199,7 @@ const ROOTS_REQUEST_ID: &str = "kin-mcp-roots-list";
 pub async fn run_stdio_daemon(
     config: McpServerConfig,
     repo_binder: Option<RepoBinder>,
+    startup: Option<std::sync::Arc<StartupDaemonBinding>>,
 ) -> Result<()> {
     if !config.session_authority_mode.requires_daemon() {
         return Err(McpError::Other(
@@ -215,6 +217,7 @@ pub async fn run_stdio_daemon(
         config,
         repo_binder,
         bound_daemon_url_from_env(),
+        startup,
     )
     .await
 }
@@ -236,6 +239,7 @@ async fn run_stdio_daemon_over<R, W>(
     config: McpServerConfig,
     repo_binder: Option<RepoBinder>,
     bound_daemon_url: Option<String>,
+    startup: Option<std::sync::Arc<StartupDaemonBinding>>,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -253,6 +257,18 @@ where
     let mut binding = RepoBindingState::started_with(bound_daemon_url);
 
     while let Some((message, framed)) = read_stdio_message(&mut *reader).await? {
+        // The launcher's startup binding runs behind this loop so `initialize`
+        // and `tools/list` are answered immediately. Once it settles with a
+        // bound daemon, fold that into the roots-binding bookkeeping so a
+        // later roots change compares against the repository actually served.
+        if let Some(startup) = startup.as_ref() {
+            if !binding.is_bound() {
+                if let StartupBindingState::Bound(bound) = startup.snapshot() {
+                    binding.bind(bound);
+                }
+            }
+        }
+
         // Peek at the raw JSON so we can distinguish the client's requests and
         // notifications from the `roots/list` response we may have sent: a
         // response carries no `method`, which the strongly-typed
@@ -262,6 +278,31 @@ where
 
             if method == Some("initialize") {
                 client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
+            }
+
+            // A `tools/call` racing the launcher's startup binding gets a
+            // bounded moment for a warm daemon to bind, then an honest
+            // still-starting answer: never minutes of silence, and never a
+            // remedy-flavored "no daemon" error while one is on its way up.
+            if method == Some("tools/call") {
+                if let Some(startup) = startup.as_ref() {
+                    if !startup
+                        .wait_until_settled(TOOLS_CALL_STARTUP_BIND_GRACE)
+                        .await
+                    {
+                        if let Some(response) = startup_pending_response(&value, startup) {
+                            let response_json =
+                                serde_json::to_string(&response).map_err(McpError::Json)?;
+                            write_stdio_message(&mut *writer, &response_json, framed).await?;
+                        }
+                        continue;
+                    }
+                    if !binding.is_bound() {
+                        if let StartupBindingState::Bound(bound) = startup.snapshot() {
+                            binding.bind(bound);
+                        }
+                    }
+                }
             }
 
             // The client moved to a workspace we could not bind. Refuse every
@@ -477,6 +518,37 @@ impl WorkspaceMismatch {
              from it (or with --repo <path> / KIN_MCP_REPO=<path>)."
         )
     }
+}
+
+/// How long a `tools/call` waits for the launcher's startup daemon binding to
+/// settle before answering that the daemon is still starting.
+///
+/// A warm daemon binds in well under a second, so a call racing the bind gets
+/// its real answer inside this window; a cold flagship-scale start takes
+/// minutes and no defensible grace covers it, which is exactly when the honest
+/// still-starting answer is owed. Kept well under common MCP client per-call
+/// timeouts (60 s) and under the update watchdog's 30 s whole-probe budget.
+const TOOLS_CALL_STARTUP_BIND_GRACE: Duration = Duration::from_secs(10);
+
+/// Structured answer for a `tools/call` that arrived while the launcher's
+/// startup binding is still pending. `None` for a malformed call with no id,
+/// which has no response channel; the caller still drops the call rather than
+/// forwarding it.
+fn startup_pending_response(
+    request: &serde_json::Value,
+    startup: &StartupDaemonBinding,
+) -> Option<JsonRpcResponse> {
+    let id = request.get("id").filter(|id| !id.is_null())?.clone();
+    let tool = request
+        .pointer("/params/name")
+        .and_then(|name| name.as_str())
+        .unwrap_or("this tool");
+    let result = ToolCallResult::error(startup.starting_report(tool));
+    let enveloped = envelope::finalize(result, Envelope::daemon_unreachable(), tool);
+    Some(JsonRpcResponse::success(
+        Some(id),
+        serde_json::to_value(&enveloped).unwrap_or_default(),
+    ))
 }
 
 /// How long an unanswered `roots/list` suppresses another one. A client that
@@ -1984,6 +2056,15 @@ mod tests {
         repo_binder: Option<RepoBinder>,
         bound_daemon_url: Option<String>,
     ) -> Vec<serde_json::Value> {
+        drive_daemon_loop_with_startup(client_messages, repo_binder, bound_daemon_url, None).await
+    }
+
+    async fn drive_daemon_loop_with_startup(
+        client_messages: &[serde_json::Value],
+        repo_binder: Option<RepoBinder>,
+        bound_daemon_url: Option<String>,
+        startup: Option<std::sync::Arc<StartupDaemonBinding>>,
+    ) -> Vec<serde_json::Value> {
         let mut input = String::new();
         for message in client_messages {
             input.push_str(&message.to_string());
@@ -2002,6 +2083,7 @@ mod tests {
             config,
             repo_binder,
             bound_daemon_url,
+            startup,
         )
         .await
         .expect("stdio loop must drain the scripted client session");
@@ -2294,6 +2376,148 @@ mod tests {
         assert!(
             text.contains("not enabled in this MCP profile"),
             "an empty roots list must not be treated as a workspace switch: {text}"
+        );
+    }
+
+    /// The answer-early contract (FIR-2316): the handshake never waits on the
+    /// daemon. With the startup binding pending forever (the shape of a cold
+    /// flagship-scale daemon start), `initialize` and `tools/list` are still
+    /// answered from this process.
+    #[tokio::test]
+    async fn initialize_and_tools_list_answer_while_the_startup_binding_is_pending() {
+        let startup = StartupDaemonBinding::new();
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let initialize = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(1))
+            .expect("initialize must be answered while the daemon binding is pending");
+        assert!(
+            initialize.pointer("/result/serverInfo/name").is_some(),
+            "initialize must carry the ordinary result: {initialize:#?}"
+        );
+        let tools_list = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(2))
+            .expect("tools/list must be answered while the daemon binding is pending");
+        assert!(
+            tools_list.pointer("/result/tools").is_some(),
+            "tools/list must carry the ordinary result: {tools_list:#?}"
+        );
+    }
+
+    /// A `tools/call` racing a binding that never settles gets the honest
+    /// still-starting answer once the bounded grace elapses: not silence, and
+    /// not the fall-through refusal this config would otherwise produce (the
+    /// empty allow-list answers "not enabled in this MCP profile", so reaching
+    /// that text would prove the guard never ran).
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_call_during_a_pending_binding_answers_that_the_daemon_is_starting() {
+        let startup = StartupDaemonBinding::new();
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(3, "kin_graph_status"),
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(3))
+            .expect("a tool call during startup binding must be answered, not dropped");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("still starting") && text.contains("kin_graph_status"),
+            "the answer must say the daemon is starting and name the tool: {text}"
+        );
+        assert!(
+            text.contains("retry"),
+            "the remedy is retrying, not remediation: {text}"
+        );
+        assert!(
+            !text.contains("not enabled in this MCP profile"),
+            "the still-starting guard must answer before the fall-through path: {text}"
+        );
+    }
+
+    /// Once the binding settles without a daemon, tool calls fall through to
+    /// the ordinary handling instead of reporting a startup that is over.
+    #[tokio::test]
+    async fn a_tool_call_after_the_binding_settles_unbound_falls_through() {
+        let startup = StartupDaemonBinding::new();
+        startup.resolve_unbound("not a Kin repository");
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                tool_call(4, "semantic_locate"),
+            ],
+            None,
+            None,
+            Some(startup),
+        )
+        .await;
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(4))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
+        assert!(
+            !text.contains("still starting"),
+            "a settled binding must not be reported as still starting: {text}"
+        );
+        assert!(
+            text.contains("not enabled in this MCP profile"),
+            "a settled-unbound binding falls through to the ordinary handling: {text}"
+        );
+    }
+
+    /// A startup binding that settles bound folds into the roots bookkeeping:
+    /// the server then behaves as bound, so it does not keep asking a
+    /// roots-capable client for a workspace it already serves.
+    #[tokio::test]
+    async fn a_bound_startup_binding_folds_into_the_roots_bookkeeping() {
+        let startup = StartupDaemonBinding::new();
+        startup.resolve_bound(bound_repo("/repo/a", "http://127.0.0.1:4111"), false);
+        let (binder, calls) = ScriptedBinder::install(vec![]);
+
+        let responses = drive_daemon_loop_with_startup(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            ],
+            Some(binder),
+            None,
+            Some(startup),
+        )
+        .await;
+
+        assert!(
+            roots_requests(&responses).is_empty(),
+            "a server whose startup binding bound must not keep requesting workspace roots: \
+             {responses:#?}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the binder must not run while the startup binding already bound"
         );
     }
 }

@@ -2758,6 +2758,13 @@ async fn select_with_signals(
     }
 
     let (completed, result) = tokio::select! {
+        // NOTE: this arm shuts the daemon down, so the reconciliation loop
+        // must only exit for reasons that end the daemon: the cancel signal,
+        // or a real startup/runtime error. A background-work supervisor stop
+        // parks the loop inside `run_loop` instead of exiting it, precisely
+        // because reaching this arm cancels the API task and every other
+        // task, the opposite of the stop announcement's "the daemon keeps
+        // serving" (FIR-2317).
         result = &mut loop_handle => {
             info!("reconciliation loop exited");
             let _ = cancel_tx.send(true);
@@ -2893,6 +2900,13 @@ async fn select_with_signals(
     }
 
     let (completed, result) = tokio::select! {
+        // NOTE: this arm shuts the daemon down, so the reconciliation loop
+        // must only exit for reasons that end the daemon: the cancel signal,
+        // or a real startup/runtime error. A background-work supervisor stop
+        // parks the loop inside `run_loop` instead of exiting it, precisely
+        // because reaching this arm cancels the API task and every other
+        // task, the opposite of the stop announcement's "the daemon keeps
+        // serving" (FIR-2317).
         result = &mut loop_handle => {
             info!("reconciliation loop exited");
             let _ = cancel_tx.send(true);

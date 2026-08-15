@@ -20,6 +20,16 @@ use std::pin::Pin;
 /// server starts anyway and each `tools/call` fails loud with a structured,
 /// actionable error (see `kin_mcp::daemon_delegate::daemon_unavailable_tool_result`)
 /// instead of the process silently never having started at all.
+///
+/// Answer early, load behind (FIR-2316): the stdio loop starts before the
+/// daemon binding rather than after it. Resolving the repo daemon can spawn
+/// one, and a cold start on a flagship-scale store takes minutes; awaiting it
+/// here meant zero stdout frames for that whole window, without even the
+/// `initialize` response, which no handshake probe or client timeout survives.
+/// The binding now runs on a background task that publishes into a
+/// [`kin_mcp::StartupDaemonBinding`]; `initialize` and `tools/list` answer
+/// immediately, and a `tools/call` that arrives before the binding settles is
+/// answered honestly that the daemon is still starting.
 pub async fn start(
     global: bool,
     repo: Option<PathBuf>,
@@ -43,51 +53,6 @@ pub async fn start(
         }
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut bound_at_start = match bind_daemon_for_repo_dir(&cwd).await {
-        Ok(daemon_url) => {
-            eprintln!("{}", session_authority_notice());
-            eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
-            true
-        }
-        Err(reason) => {
-            if !global {
-                eprintln!(
-                    "Kin MCP: no repository bound at startup ({reason}). If the MCP client \
-                     advertises workspace roots, Kin binds to the open repository after \
-                     initialization; otherwise run `kin init .`, relaunch inside a Kin \
-                     repository, or pass --repo <path> (or set KIN_MCP_REPO=<path>)."
-                );
-            } else {
-                eprintln!("Kin MCP: the launch directory bound no repository ({reason}).");
-            }
-            false
-        }
-    };
-
-    // Registry mode: a launch directory that is no repository is the normal
-    // case, not a failure. Resolve the startup repository from the global
-    // registry instead, but never by guessing between several, which would
-    // answer about a codebase nobody named.
-    //
-    // An operator pin that failed to bind is never rescued this way. Falling
-    // through to the registry there would serve whichever repository the
-    // registry happens to name while the operator asked for a specific one:
-    // the same wrong-repository answer the roots binder refuses, reached
-    // through the registry door instead.
-    if registry_should_resolve(global, bound_at_start, repo_override.is_some()) {
-        bound_at_start = bind_from_registry().await;
-    } else if global && !bound_at_start {
-        if let Some(pinned) = &repo_override {
-            eprintln!(
-                "Kin MCP: --repo/KIN_MCP_REPO pins {}, which did not bind. Registry mode will not \
-                 substitute another repository for a pin; fix the pinned repository or drop the \
-                 pin.",
-                pinned.display()
-            );
-        }
-    }
-
     let mut config = build_mcp_start_config();
     let resolved_profile = resolve_tool_profile(
         tool_profile.as_deref(),
@@ -103,6 +68,8 @@ pub async fn start(
         );
     }
 
+    let startup = kin_mcp::StartupDaemonBinding::new();
+
     // The stdio server always binds through the MCP client's advertised
     // workspace roots: late, when nothing bound from --repo/KIN_MCP_REPO/cwd
     // (how editors that launch MCP servers from $HOME — Cursor, Windsurf, ... —
@@ -115,11 +82,16 @@ pub async fn start(
     // follows the client to another repository. It still refuses to answer for
     // one: the binder reports the disagreement and the server fails loud, rather
     // than serving the pinned repository's graph for a workspace the client
-    // moved away from.
-    let pinned_by_operator = repo_override.is_some() && bound_at_start;
+    // moved away from. With the startup binding running behind the loop, whether
+    // the pin bound is only known once it settles, so the binder reads it from
+    // the shared handle at each invocation.
+    let binder_startup = std::sync::Arc::clone(&startup);
     let repo_binder: Option<kin_mcp::RepoBinder> = Some(Box::new(
         move |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = Option<kin_mcp::BoundRepo>> + Send>> {
-            Box::pin(bind_first_kin_repo(roots, pinned_by_operator))
+            let startup = std::sync::Arc::clone(&binder_startup);
+            Box::pin(async move {
+                bind_first_kin_repo(roots, startup.pinned_by_operator()).await
+            })
         },
     ));
 
@@ -128,11 +100,102 @@ pub async fn start(
     // a revived daemon joins supervisor routing like an autostarted one.
     crate::daemon_client::install_spawn_registrar();
 
-    kin_mcp::run_stdio_daemon(config, repo_binder)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server error: {}", e))?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let bind_task = tokio::spawn(run_startup_binding(
+        global,
+        repo_override,
+        cwd,
+        std::sync::Arc::clone(&startup),
+    ));
 
-    Ok(())
+    let served = kin_mcp::run_stdio_daemon(config, repo_binder, Some(startup))
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server error: {}", e));
+
+    // The client closed stdin, so this server is done. A daemon spawn already
+    // in flight is detached and survives on its own by design, so the next
+    // session finds it warm; only the wait is abandoned.
+    bind_task.abort();
+
+    served
+}
+
+/// The startup daemon binding `start` used to run inline, now driven behind
+/// the stdio loop. Publishes every outcome into `startup` so the server can
+/// answer `tools/call` honestly while this is still in flight.
+async fn run_startup_binding(
+    global: bool,
+    repo_override: Option<PathBuf>,
+    cwd: PathBuf,
+    startup: std::sync::Arc<kin_mcp::StartupDaemonBinding>,
+) {
+    // Name the repository being bound before the slow work starts, so the
+    // still-starting report can say how far that daemon's startup has come.
+    // The probe closure defers to the daemon-lifecycle IO boundary; this
+    // module and the transport crate stay free of filesystem primitives.
+    let discovered = kin_core::KinLayout::discover(&cwd);
+    if let Some(layout) = &discovered {
+        let kin_root = layout.root().to_path_buf();
+        startup.set_phase_probe(Box::new(move || {
+            crate::daemon_client::daemon_startup_phase(&kin_root)
+        }));
+    }
+
+    let unbound_reason = match bind_daemon_for_repo_dir(&cwd).await {
+        Ok(daemon_url) => {
+            eprintln!("{}", session_authority_notice());
+            eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
+            let root = discovered
+                .as_ref()
+                .map(|layout| canonical_path(layout.working_dir()))
+                .unwrap_or(cwd);
+            startup.resolve_bound(
+                kin_mcp::BoundRepo { root, daemon_url },
+                repo_override.is_some(),
+            );
+            return;
+        }
+        Err(reason) => {
+            if !global {
+                eprintln!(
+                    "Kin MCP: no repository bound at startup ({reason}). If the MCP client \
+                     advertises workspace roots, Kin binds to the open repository after \
+                     initialization; otherwise run `kin init .`, relaunch inside a Kin \
+                     repository, or pass --repo <path> (or set KIN_MCP_REPO=<path>)."
+                );
+            } else {
+                eprintln!("Kin MCP: the launch directory bound no repository ({reason}).");
+            }
+            reason
+        }
+    };
+
+    // Registry mode: a launch directory that is no repository is the normal
+    // case, not a failure. Resolve the startup repository from the global
+    // registry instead, but never by guessing between several, which would
+    // answer about a codebase nobody named.
+    //
+    // An operator pin that failed to bind is never rescued this way. Falling
+    // through to the registry there would serve whichever repository the
+    // registry happens to name while the operator asked for a specific one:
+    // the same wrong-repository answer the roots binder refuses, reached
+    // through the registry door instead.
+    if registry_should_resolve(global, false, repo_override.is_some()) {
+        if let Some(bound) = bind_from_registry(&startup).await {
+            startup.resolve_bound(bound, false);
+            return;
+        }
+    } else if global {
+        if let Some(pinned) = &repo_override {
+            eprintln!(
+                "Kin MCP: --repo/KIN_MCP_REPO pins {}, which did not bind. Registry mode will not \
+                 substitute another repository for a pin; fix the pinned repository or drop the \
+                 pin.",
+                pinned.display()
+            );
+        }
+    }
+    startup.resolve_unbound(unbound_reason);
 }
 
 // ── Tool profile ────────────────────────────────────────────────────────
@@ -346,8 +409,8 @@ pub(crate) fn registry_startup_choice(
 }
 
 /// Bind the startup repository from the global registry, reporting why when it
-/// cannot. Returns whether a repository is bound.
-async fn bind_from_registry() -> bool {
+/// cannot. Returns the bound repository, or `None` when nothing bound.
+async fn bind_from_registry(startup: &kin_mcp::StartupDaemonBinding) -> Option<kin_mcp::BoundRepo> {
     let registry = match kin_core::registry::KinRegistry::load() {
         Ok(registry) => registry,
         Err(error) => {
@@ -356,7 +419,7 @@ async fn bind_from_registry() -> bool {
                  will fail loud until a repository binds through --repo, KIN_MCP_REPO, or the \
                  client's workspace roots."
             );
-            return false;
+            return None;
         }
     };
 
@@ -367,7 +430,7 @@ async fn bind_from_registry() -> bool {
                  writes a registry entry. Pass --repo <path> (or set KIN_MCP_REPO=<path>) to \
                  serve a repository directly."
             );
-            false
+            None
         }
         RegistryStartupChoice::Ambiguous(ids) => {
             eprintln!(
@@ -377,37 +440,50 @@ async fn bind_from_registry() -> bool {
                 ids.len(),
                 ids.join(", ")
             );
-            false
+            None
         }
-        RegistryStartupChoice::Single(path) => match bind_daemon_for_repo_dir(&path).await {
-            Ok(daemon_url) => {
-                // Match the roots path: the daemon delegate reads the
-                // per-install loopback token from <root>/.kin/daemon.token
-                // relative to the process working directory.
-                if let Err(err) = std::env::set_current_dir(&path) {
+        RegistryStartupChoice::Single(path) => {
+            // Retarget the still-starting report at the registry repository:
+            // this is the daemon whose startup the report now describes.
+            if let Some(layout) = kin_core::KinLayout::discover(&path) {
+                let kin_root = layout.root().to_path_buf();
+                startup.set_phase_probe(Box::new(move || {
+                    crate::daemon_client::daemon_startup_phase(&kin_root)
+                }));
+            }
+            match bind_daemon_for_repo_dir(&path).await {
+                Ok(daemon_url) => {
+                    // Match the roots path: the daemon delegate reads the
+                    // per-install loopback token from <root>/.kin/daemon.token
+                    // relative to the process working directory.
+                    if let Err(err) = std::env::set_current_dir(&path) {
+                        eprintln!(
+                            "Kin MCP: bound {daemon_url} but could not switch cwd to {} ({err}); \
+                             tool auth will fall back to KIN_DAEMON_AUTH_TOKEN if set.",
+                            path.display()
+                        );
+                    }
+                    eprintln!("{}", session_authority_notice());
                     eprintln!(
-                        "Kin MCP: bound {daemon_url} but could not switch cwd to {} ({err}); \
-                         tool auth will fall back to KIN_DAEMON_AUTH_TOKEN if set.",
+                        "Kin MCP: registry mode bound the only registered repository at {} (daemon \
+                         {daemon_url})",
                         path.display()
                     );
+                    Some(kin_mcp::BoundRepo {
+                        root: canonical_path(&path),
+                        daemon_url,
+                    })
                 }
-                eprintln!("{}", session_authority_notice());
-                eprintln!(
-                    "Kin MCP: registry mode bound the only registered repository at {} (daemon \
-                     {daemon_url})",
-                    path.display()
-                );
-                true
+                Err(reason) => {
+                    eprintln!(
+                        "Kin MCP: registry mode could not bind the only registered repository at {} \
+                         ({reason}); tool calls will fail loud until one binds.",
+                        path.display()
+                    );
+                    None
+                }
             }
-            Err(reason) => {
-                eprintln!(
-                    "Kin MCP: registry mode could not bind the only registered repository at {} \
-                     ({reason}); tool calls will fail loud until one binds.",
-                    path.display()
-                );
-                false
-            }
-        },
+        }
     }
 }
 
