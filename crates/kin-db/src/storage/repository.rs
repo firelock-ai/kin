@@ -583,17 +583,44 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
     }
 }
 
+/// Name the two persistence phases of one snapshot publication.
+///
+/// Serialization and the durable backend write live behind one persist call,
+/// so a slow publication could not previously say which side cost the time.
+fn record_snapshot_persistence_phases(serialize_ms: u128, write_ms: u128, snapshot_bytes: usize) {
+    if serialize_ms + write_ms >= SLOW_PUBLICATION_PHASE.as_millis() {
+        tracing::info!(
+            serialize_ms,
+            write_ms,
+            snapshot_bytes,
+            "slow repository authority snapshot persistence"
+        );
+    } else {
+        tracing::debug!(
+            serialize_ms,
+            write_ms,
+            snapshot_bytes,
+            "repository authority snapshot persistence"
+        );
+    }
+}
+
 impl RepositorySnapshotPersistence<LocalFileBackend> {
     fn persist_and_freeze(
         &self,
         next: &RepositoryAuthorityState,
     ) -> RetainedPersistOutcome<LocalAuthorityFreezeLock> {
-        let bytes = match next.snapshot.to_bytes() {
+        let mut timer = PublicationPhaseTimer::start();
+        // `next` passed the successor's own storage-admission gate under the
+        // single writer permit and is immutable from that gate to this write.
+        let bytes = match next.snapshot.to_bytes_pre_validated() {
             Ok(bytes) => bytes,
             Err(error) => return RetainedPersistOutcome::NotCommitted(error),
         };
+        let serialize_ms = timer.lap_ms();
+        let snapshot_bytes = bytes.len();
         let mut cursor = self.backend_cursor.lock();
-        match self.backend.save_snapshot_and_freeze(
+        let outcome = match self.backend.save_snapshot_and_freeze(
             self.repository_id.as_str(),
             &bytes,
             *cursor,
@@ -611,7 +638,10 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
                 RetainedPersistOutcome::Indeterminate(error)
             }
             Err(error) => RetainedPersistOutcome::NotCommitted(error),
-        }
+        };
+        let write_ms = timer.lap_ms();
+        record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
+        outcome
     }
 }
 
@@ -623,12 +653,20 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         _expected_logical_generation: Generation,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        let bytes = match next.snapshot.to_bytes() {
+        let mut timer = PublicationPhaseTimer::start();
+        // `next` passed the successor's own storage-admission gate under the
+        // single writer permit and is immutable from that gate to this write.
+        let bytes = match next.snapshot.to_bytes_pre_validated() {
             Ok(bytes) => bytes,
             Err(error) => return PersistOutcome::NotCommitted(error),
         };
+        let serialize_ms = timer.lap_ms();
+        let snapshot_bytes = bytes.len();
         let mut cursor = self.backend_cursor.lock();
-        self.persist_bytes(&bytes, &mut cursor)
+        let outcome = self.persist_bytes(&bytes, &mut cursor);
+        let write_ms = timer.lap_ms();
+        record_snapshot_persistence_phases(serialize_ms, write_ms, snapshot_bytes);
+        outcome
     }
 
     fn reconcile(
@@ -636,7 +674,9 @@ impl<B: StorageBackend + ?Sized + 'static> DurableAuthorityPersistence<Repositor
         _expected_logical_generation: Generation,
         next: &RepositoryAuthorityState,
     ) -> PersistOutcome {
-        let bytes = match next.snapshot.to_bytes() {
+        // A reconciled candidate is the exact retained `Arc` a persist attempt
+        // already serialized, so its admission gate still stands.
+        let bytes = match next.snapshot.to_bytes_pre_validated() {
             Ok(bytes) => bytes,
             Err(error) => return PersistOutcome::NotCommitted(error),
         };
@@ -1484,17 +1524,47 @@ fn prepare_repository_commit_decision<B: StorageBackend + ?Sized>(
     })
 }
 
+/// Lap timer for the publication phase breakdown.
+///
+/// Each lap returns whole milliseconds since the previous lap, so the summary
+/// event carries one field per phase and the fields sum to the prepare wall
+/// clock within rounding.
+struct PublicationPhaseTimer {
+    last: std::time::Instant,
+}
+
+impl PublicationPhaseTimer {
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn lap_ms(&mut self) -> u128 {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_millis();
+        self.last = now;
+        elapsed
+    }
+}
+
+/// One prepared successor is slow enough to name its phase breakdown loudly.
+const SLOW_PUBLICATION_PHASE: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn prepare_successor<B: StorageBackend + ?Sized>(
     current: &RepositoryAuthorityState,
     transaction: &RepositoryTransaction,
     transaction_hash: Hash256,
     backend: &B,
 ) -> Result<(RepositoryAuthorityState, RepositoryCommitReceipt), KinDbError> {
+    let prepare_started = std::time::Instant::now();
+    let mut timer = PublicationPhaseTimer::start();
     let mut snapshot = current.snapshot.clone();
     let mut metadata = snapshot
         .repository_authority
         .take()
         .expect("repository authority state always carries metadata");
+    let clone_ms = timer.lap_ms();
 
     admit_external_objects(
         backend,
@@ -1506,6 +1576,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     admit_aliases(&snapshot, &mut metadata, &transaction.aliases)?;
     apply_git_authority(backend, &snapshot, &mut metadata, transaction)?;
     metadata.admission_policies = derive_admission_policies(&snapshot.changes)?;
+    let admit_ms = timer.lap_ms();
 
     apply_ref_mutations(&snapshot, &mut metadata, transaction)?;
     apply_local_overlay(&mut metadata, transaction)?;
@@ -1514,21 +1585,33 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         &transaction.repository_id,
         transaction.local_overlay_delta.as_ref(),
     )?;
-    apply_workspace(backend, &snapshot, &mut metadata, transaction)?;
+    let refs_overlay_ms = timer.lap_ms();
+    // Every remaining validation reads the same authority-free payload:
+    // `changes` is final once admission above returns, and the steps below
+    // mutate only the detached metadata. One shared decode serves them all.
+    let replay = SharedReplayGraph::new(&snapshot);
+    apply_workspace(backend, &replay, &snapshot, &mut metadata, transaction)?;
+    let workspace_ms = timer.lap_ms();
     apply_merge_transaction(&mut metadata, transaction)?;
     validate_merge_transaction_delta_bodies(
         backend,
         &transaction.repository_id,
         transaction.merge_transaction_delta.as_ref(),
     )?;
-    verify_transaction_admission(backend, current, &snapshot, &metadata, transaction)?;
+    let merge_ms = timer.lap_ms();
+    verify_transaction_admission(backend, current, &replay, &snapshot, &metadata, transaction)?;
+    let admission_verify_ms = timer.lap_ms();
     validate_new_change_bodies(
         backend,
         &transaction.repository_id,
         &transaction.changes,
         &metadata.admission_policies,
     )?;
-    validate_history_replay(&snapshot, &transaction.changes)?;
+    let change_bodies_ms = timer.lap_ms();
+    validate_history_replay_with(&replay, &snapshot, &transaction.changes)?;
+    let history_replay_ms = timer.lap_ms();
+    let replay_decode_ms = replay.build_ms();
+    drop(replay);
 
     let next_generation = current
         .generation()
@@ -1553,6 +1636,7 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     operation.validate()?;
     metadata.operation_log.push(operation.clone());
     metadata.roots = compute_roots(&snapshot, &metadata, next_generation)?;
+    let roots_ms = timer.lap_ms();
     operation.roots_after = metadata.roots.clone();
     *metadata
         .operation_log
@@ -1576,11 +1660,49 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
         .sort_by_key(|persisted| persisted.operation_id);
     snapshot.repository_authority = Some(metadata);
     snapshot.validate_storage_admission()?;
+    let storage_admission_ms = timer.lap_ms();
 
-    Ok((
-        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes),
-        receipt,
-    ))
+    let state =
+        RepositoryAuthorityState::from_validated_successor(current, snapshot, &transaction.changes);
+    let successor_index_ms = timer.lap_ms();
+    let elapsed = prepare_started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed >= SLOW_PUBLICATION_PHASE {
+        tracing::info!(
+            elapsed_ms,
+            clone_ms,
+            admit_ms,
+            refs_overlay_ms,
+            workspace_ms,
+            merge_ms,
+            admission_verify_ms,
+            change_bodies_ms,
+            history_replay_ms,
+            replay_decode_ms,
+            roots_ms,
+            storage_admission_ms,
+            successor_index_ms,
+            "slow repository authority successor preparation"
+        );
+    } else {
+        tracing::debug!(
+            elapsed_ms,
+            clone_ms,
+            admit_ms,
+            refs_overlay_ms,
+            workspace_ms,
+            merge_ms,
+            admission_verify_ms,
+            change_bodies_ms,
+            history_replay_ms,
+            replay_decode_ms,
+            roots_ms,
+            storage_admission_ms,
+            successor_index_ms,
+            "repository authority successor preparation"
+        );
+    }
+    Ok((state, receipt))
 }
 
 fn admit_external_objects<B: StorageBackend + ?Sized>(
@@ -2550,6 +2672,7 @@ fn apply_merge_transaction(
 
 fn apply_workspace<B: StorageBackend + ?Sized>(
     backend: &B,
+    replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
     metadata: &mut PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
@@ -2585,7 +2708,7 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         current,
         derived_semantic_overlay,
     )?;
-    validate_workspace_state(snapshot, metadata, &next)?;
+    validate_workspace_state(replay, snapshot, metadata, &next)?;
     let rematerialized = materialize_workspace_graph_snapshot(snapshot, metadata, &next)?;
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
@@ -2613,15 +2736,16 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
 fn verify_transaction_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     current: &RepositoryAuthorityState,
+    replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
-    verify_workspace_admission(backend, current, snapshot, metadata, transaction)?;
+    verify_workspace_admission(backend, current, replay, snapshot, metadata, transaction)?;
     verify_native_change_admission(
         backend,
         current.authenticated_gitlinks(),
-        snapshot,
+        replay,
         metadata,
         transaction,
     )
@@ -2630,6 +2754,7 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
 fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     current: &RepositoryAuthorityState,
+    replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
@@ -2696,7 +2821,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         let was_already_admitted = current.snapshot.changes.contains_key(&change_id);
         let is_verified_git = matches!(change.origin, kin_model::ChangeOrigin::GitCommit { .. });
         if was_already_admitted || is_verified_git {
-            let base = resolve_change_tree(snapshot, change_id)?;
+            let base = replay.resolve_tree(change_id)?;
             tracked.extend(base.artifacts().map(|artifact| artifact.artifact_id));
             contextual_gitlinks.extend(base.artifacts().filter_map(|artifact| {
                 let TreeEntry::Gitlink { target } = artifact.entry else {
@@ -2734,7 +2859,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
 fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     authenticated_gitlinks: &BTreeSet<(ArtifactId, GitObjectId)>,
-    snapshot: &GraphSnapshot,
+    replay: &SharedReplayGraph<'_>,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
@@ -2743,10 +2868,10 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
         .iter()
         .filter(|change| matches!(change.origin, kin_model::ChangeOrigin::Native));
     for change in native_changes {
-        let candidate = resolve_change_tree(snapshot, change.id)?;
+        let candidate = replay.resolve_tree(change.id)?;
         let mut parent_artifacts = BTreeSet::<ArtifactId>::new();
         for parent in &change.parents {
-            let parent_tree = resolve_change_tree(snapshot, *parent)?;
+            let parent_tree = replay.resolve_tree(*parent)?;
             parent_artifacts.extend(parent_tree.artifacts().map(|artifact| artifact.artifact_id));
         }
         for artifact in candidate.artifacts() {
@@ -3047,14 +3172,63 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
     .map_err(|error| ModelError::InvalidOperation(error.to_string()).into())
 }
 
-fn resolve_change_tree(
-    snapshot: &GraphSnapshot,
-    change_id: SemanticChangeId,
-) -> Result<ResolvedTree, KinDbError> {
-    let mut replay = snapshot.clone();
-    replay.repository_authority = None;
-    let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
-    graph.resolve_tree_at(&change_id)
+/// One shared replay decode of an immutable authority-free snapshot payload.
+///
+/// Successor preparation needs the same decoded graph several times: admission
+/// verification resolves base and candidate trees, workspace validation hashes
+/// target trees, and history replay proves the whole payload decodes into a
+/// coherent graph. Each of those callers used to clone the entire snapshot and
+/// rebuild the graph from scratch, so one commit paid for the whole store four
+/// or more times over, and every rebuild repeated the same canonical content
+/// hashing. The payload cannot change underneath the sharing: `changes` is
+/// final once `admit_changes` returns, every later preparation step mutates
+/// only the detached authority metadata, and the single-writer permit
+/// serializes the whole preparation.
+///
+/// The one construction that remains is itself the history-coherence proof:
+/// building the graph revalidates storage admission over the authority-free
+/// payload and derives every entity revision timeline, exactly as each
+/// discarded rebuild did. Every later use is a read-only query against that
+/// validated decode.
+struct SharedReplayGraph<'a> {
+    snapshot: &'a GraphSnapshot,
+    graph: std::cell::OnceCell<InMemoryGraph>,
+    build_ms: std::cell::Cell<u128>,
+}
+
+impl<'a> SharedReplayGraph<'a> {
+    fn new(snapshot: &'a GraphSnapshot) -> Self {
+        Self {
+            snapshot,
+            graph: std::cell::OnceCell::new(),
+            build_ms: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Decode the snapshot once and reuse it for every later query.
+    fn graph(&self) -> Result<&InMemoryGraph, KinDbError> {
+        if self.graph.get().is_none() {
+            let started = std::time::Instant::now();
+            let mut replay = self.snapshot.clone();
+            replay.repository_authority = None;
+            let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
+            self.build_ms.set(started.elapsed().as_millis());
+            let _ = self.graph.set(graph);
+        }
+        Ok(self
+            .graph
+            .get()
+            .expect("shared replay graph was just built"))
+    }
+
+    /// Milliseconds spent building the decode, zero when it was never needed.
+    fn build_ms(&self) -> u128 {
+        self.build_ms.get()
+    }
+
+    fn resolve_tree(&self, change_id: SemanticChangeId) -> Result<ResolvedTree, KinDbError> {
+        self.graph()?.resolve_tree_at(&change_id)
+    }
 }
 
 /// Decide whether a recovered repository carries a durable record that these
@@ -3091,6 +3265,14 @@ fn validate_history_replay(
     snapshot: &GraphSnapshot,
     new_changes: &[kin_model::SemanticChange],
 ) -> Result<(), KinDbError> {
+    validate_history_replay_with(&SharedReplayGraph::new(snapshot), snapshot, new_changes)
+}
+
+fn validate_history_replay_with(
+    replay: &SharedReplayGraph<'_>,
+    snapshot: &GraphSnapshot,
+    new_changes: &[kin_model::SemanticChange],
+) -> Result<(), KinDbError> {
     // One Kahn pass over the whole change map proves the DAG is acyclic and
     // that every declared parent is persisted. Resolving each change's reachable
     // order separately re-derives exactly that, so the per-change traversal the
@@ -3102,10 +3284,9 @@ fn validate_history_replay(
     // authority-free payload and derives every entity revision timeline, both
     // of which fail closed. It is one pass over the snapshot, not per change,
     // and it proves graph truth rather than serving queries, so it needs no
-    // text index.
-    let mut replay_snapshot = snapshot.clone();
-    replay_snapshot.repository_authority = None;
-    InMemoryGraph::from_snapshot_without_text_index(replay_snapshot)?;
+    // text index. The shared decode is that exact pass: an earlier preparation
+    // step may already have paid for it, and asking for it here proves it.
+    replay.graph()?;
 
     // New transactions validate every admitted tip directly. Reopen has no
     // trusted prior process state, so replay every DAG leaf; together their
@@ -3340,11 +3521,11 @@ fn resolve_workspace_base_graph_snapshot(
 
     if let Some(target) = base_target {
         let change_id = target_change_id(metadata, target)?;
-        let expected_root_hash = crate::storage::merkle::compute_graph_root_hash(&base);
-        let history = InMemoryGraph::from_snapshot_without_text_index_with_root_hash(
-            base.clone(),
-            expected_root_hash,
-        )?;
+        // `from_snapshot_without_text_index_with_root_hash` documents its root
+        // hash argument as accepted and ignored, so the full canonical Merkle
+        // pass this call used to feed it was pure dead cost on every
+        // workspace materialization.
+        let history = InMemoryGraph::from_snapshot_without_text_index(base.clone())?;
         let resolved = history.resolve_graph_at(&change_id)?;
         base.entities = resolved.entities;
         base.relations = resolved.relations;
@@ -3537,8 +3718,11 @@ fn validate_workspace_authority(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
 ) -> Result<(), KinDbError> {
+    // One decode serves every workspace's base-tree check instead of one
+    // rebuild per workspace.
+    let replay = SharedReplayGraph::new(snapshot);
     for workspace in &metadata.workspaces {
-        validate_workspace_state(snapshot, metadata, workspace)?;
+        validate_workspace_state(&replay, snapshot, metadata, workspace)?;
         for artifact in workspace.tree.artifacts() {
             workspace_artifact_projection_mtime(metadata, workspace, artifact.artifact_id)?;
         }
@@ -3547,6 +3731,7 @@ fn validate_workspace_authority(
 }
 
 fn validate_workspace_state(
+    replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     workspace: &WorkspaceState,
@@ -3561,7 +3746,7 @@ fn validate_workspace_state(
     // symbolic resolution by `validate_workspace_symbolic_head_at_mutation`.
     if let Some(base) = &workspace.base_target {
         validate_target_exists(snapshot, metadata, base)?;
-        let expected_tree = resolve_target_tree_hash(snapshot, metadata, base)?;
+        let expected_tree = resolve_target_tree_hash(replay, metadata, base)?;
         if workspace.base_tree_hash != Some(expected_tree) {
             return Err(ModelError::Conflict(format!(
                 "workspace {} base tree does not match its exact target",
@@ -3859,15 +4044,12 @@ fn validate_workspace_head(
 }
 
 fn resolve_target_tree_hash(
-    snapshot: &GraphSnapshot,
+    replay: &SharedReplayGraph<'_>,
     metadata: &PersistedRepositoryAuthority,
     target: &RefTarget,
 ) -> Result<Hash256, KinDbError> {
     let change_id = target_change_id(metadata, target)?;
-    let mut replay = snapshot.clone();
-    replay.repository_authority = None;
-    let graph = InMemoryGraph::from_snapshot_without_text_index(replay)?;
-    let tree = graph.resolve_tree_at(&change_id)?;
+    let tree = replay.resolve_tree(change_id)?;
     kin_model::compute_resolved_tree_hash(&tree).map_err(Into::into)
 }
 
@@ -5209,6 +5391,32 @@ mod tests {
 
     fn initial_manager(backend: Arc<MemoryBackend>) -> RepositoryAuthorityManager<MemoryBackend> {
         RepositoryAuthorityManager::open(repository_id(), backend).unwrap()
+    }
+
+    #[test]
+    fn shared_replay_graph_decodes_once_and_matches_fresh_resolution() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let (transaction, expected_change, _outer_tag) = detached_tag_import_transaction(&manager);
+        manager.commit_repository_transaction(transaction).unwrap();
+        let committed = manager.read_authority();
+
+        let replay = SharedReplayGraph::new(committed.snapshot());
+        let first = std::ptr::from_ref(replay.graph().unwrap());
+        let second = std::ptr::from_ref(replay.graph().unwrap());
+        assert_eq!(first, second, "the decode must be built once and shared");
+
+        let shared_tree = replay.resolve_tree(expected_change).unwrap();
+        let mut fresh = committed.snapshot().clone();
+        fresh.repository_authority = None;
+        let fresh_tree = InMemoryGraph::from_snapshot_without_text_index(fresh)
+            .unwrap()
+            .resolve_tree_at(&expected_change)
+            .unwrap();
+        assert_eq!(
+            shared_tree, fresh_tree,
+            "a shared resolution must answer exactly what a fresh decode answers"
+        );
     }
 
     #[test]
@@ -7042,8 +7250,12 @@ mod tests {
             Some(exact_target.clone())
         );
         assert_eq!(
-            resolve_target_tree_hash(committed.snapshot(), committed.metadata(), &exact_target)
-                .unwrap(),
+            resolve_target_tree_hash(
+                &SharedReplayGraph::new(committed.snapshot()),
+                committed.metadata(),
+                &exact_target
+            )
+            .unwrap(),
             workspace.tree_hash
         );
         assert_eq!(

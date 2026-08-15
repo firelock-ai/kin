@@ -344,7 +344,20 @@ impl GraphSnapshot {
     /// For large graphs (>500K entities), this avoids cloning the entire
     /// snapshot by serializing directly when the version already matches.
     pub fn to_bytes(&self) -> Result<Vec<u8>, crate::error::KinDbError> {
-        self.to_bytes_inner(None)
+        self.to_bytes_inner(None, true)
+    }
+
+    /// Serialize a snapshot whose storage admission the caller has already
+    /// validated on this exact object.
+    ///
+    /// [`to_bytes`] revalidates storage admission before serializing, which is
+    /// right for callers handing over a snapshot of unknown provenance. The
+    /// repository publication path validates the exact successor under the
+    /// single-writer permit immediately before persisting it, and nothing can
+    /// mutate the candidate between that gate and this serialization, so the
+    /// second full-snapshot walk proved nothing. The version gate still runs.
+    pub(crate) fn to_bytes_pre_validated(&self) -> Result<Vec<u8>, crate::error::KinDbError> {
+        self.to_bytes_inner(None, false)
     }
 
     /// Like [`to_bytes`] but appends a verified root-hash trailer so open
@@ -354,12 +367,13 @@ impl GraphSnapshot {
         &self,
         root_hash: [u8; 32],
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
-        self.to_bytes_inner(Some(root_hash))
+        self.to_bytes_inner(Some(root_hash), true)
     }
 
     fn to_bytes_inner(
         &self,
         persisted_root_hash: Option<[u8; 32]>,
+        validate_admission: bool,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
         if self.version != Self::CURRENT_VERSION {
             return Err(crate::error::KinDbError::StorageError(format!(
@@ -368,7 +382,9 @@ impl GraphSnapshot {
                 Self::CURRENT_VERSION
             )));
         }
-        self.validate_storage_admission()?;
+        if validate_admission {
+            self.validate_storage_admission()?;
+        }
         let body = rmp_serde::to_vec(self).map_err(|e| {
             crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
         })?;
@@ -1886,6 +1902,38 @@ mod tests {
         let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
         assert!(loaded.entities.is_empty());
+    }
+
+    #[test]
+    fn pre_validated_serialization_matches_validated_bytes_exactly() {
+        let mut snap = GraphSnapshot::empty();
+        let e = test_entity("shared_prevalidated");
+        snap.entities.insert(e.id, e);
+
+        assert_eq!(
+            snap.to_bytes().unwrap(),
+            snap.to_bytes_pre_validated().unwrap(),
+            "skipping the redundant admission walk must not change one byte"
+        );
+    }
+
+    #[test]
+    fn pre_validated_serialization_skips_only_the_admission_walk() {
+        let mut snap = GraphSnapshot::empty();
+        let dangling = test_relation(EntityId::new(), EntityId::new());
+        snap.relations.insert(dangling.id, dangling);
+
+        let error = snap.to_bytes().unwrap_err();
+        assert!(error.to_string().contains("unadmitted"));
+        snap.to_bytes_pre_validated()
+            .expect("pre-validated serialization trusts the caller's admission gate");
+
+        snap.version = 1;
+        let error = snap.to_bytes_pre_validated().unwrap_err();
+        assert!(
+            error.to_string().contains("exactly v"),
+            "the version gate must keep running on the pre-validated path"
+        );
     }
 
     #[test]
