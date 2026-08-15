@@ -8670,11 +8670,15 @@ mod tests {
         );
     }
 
-    /// A sidecar bound to a graph that has since moved on describes entities
-    /// this store no longer has, so it is refused and announced too.
+    /// A sidecar bound to a graph that has since moved on is salvaged per
+    /// key: every vector whose entity truth is unchanged is reused, only the
+    /// genuinely new key is missing, and nothing is announced as discarded.
+    /// The whole-index refusal this test used to pin was the FIR-2325 defect;
+    /// kin-db 0.7.24 replaced it with per-key salvage, and the corrupted-format
+    /// case above still proves a real refusal stays loud.
     #[test]
     #[cfg(feature = "vector")]
-    fn an_index_bound_to_stale_graph_truth_is_refused_and_announced() {
+    fn an_index_bound_to_drifted_graph_truth_is_salvaged_per_key() {
         let repo_dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(repo_dir.path().join(".kin"));
         let graph = store_with_persisted_vector_index(&layout, None);
@@ -8685,15 +8689,18 @@ mod tests {
 
         let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref());
 
-        let reason = discarded.expect("a refused sidecar must be announced, not dropped silently");
-        assert!(
-            reason.contains("graph.kvec") && reason.contains("no longer matches"),
-            "the announcement must name what was discarded and why: {reason}"
-        );
         assert_eq!(
-            graph.embedding_status().indexed,
-            0,
-            "an index bound to stale graph truth must not be installed"
+            discarded, None,
+            "a salvageable sidecar must be reused, not announced as discarded"
+        );
+        let status = graph.embedding_status();
+        assert_eq!(
+            status.indexed, 1,
+            "the persisted vector whose entity truth is unchanged must survive the reopen"
+        );
+        assert!(
+            status.total >= 2,
+            "graph truth must still owe a vector for the entity added after the index"
         );
     }
 
