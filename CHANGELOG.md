@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.33] - 2026-08-15
+
+### Changed
+
+- Pin kin-db 0.7.27 and flip the reopen test to per-key salvage (#845)
+
+
 ## [0.5.32] - 2026-08-15
 
 ### Changed
