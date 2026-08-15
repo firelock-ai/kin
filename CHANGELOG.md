@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.31] - 2026-08-15
+
+### Changed
+
+- Bump open from 5.4.0 to 5.4.1 (#822)
+- Bump sysinfo from 0.39.5 to 0.39.6 (#823)
+- Bump libc from 0.2.186 to 0.2.189 (#824)
+- Bump rustc-hash from 2.1.2 to 2.1.3 (#825)
+
+
 ## [0.5.30] - 2026-08-14
 
 ### Changed
