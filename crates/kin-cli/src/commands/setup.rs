@@ -151,6 +151,18 @@ _kin_vfs_refresh_preload() {
     esac
 }
 
+# A socket file outlives the daemon that bound it, so only a connect
+# answered by a listener proves one is behind it. `kin-vfs status` exits 0
+# for a stale socket too; its Status line carries the verdict.
+_kin_vfs_daemon_listening() {
+    local out
+    out="$(kin-vfs status --workspace "$1" 2>/dev/null)" || return 1
+    case "$out" in
+        *"Status:"*"running"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
@@ -158,11 +170,17 @@ _kin_vfs_activate() {
     unset KIN_VFS_CANARY KIN_VFS_INTERPOSE_ACTIVE KIN_VFS_LAST_DIR
     export KIN_VFS_WORKSPACE="$ws"
     export KIN_VFS_SOCK="$sock"
-    if [[ ! -S "$sock" ]]; then
+    # -S is only a pre-filter (nothing to probe without a socket); the
+    # listener probe decides. `kin-vfs start` connects first and unlinks a
+    # stale socket itself before binding fresh.
+    if [[ ! -S "$sock" ]] || ! _kin_vfs_daemon_listening "$ws"; then
         if command -v kin-vfs >/dev/null 2>&1; then
             kin-vfs start --workspace "$ws" &>/dev/null &!
             local attempts=0
-            while [[ ! -S "$sock" ]] && (( attempts < 10 )); do
+            while (( attempts < 10 )); do
+                if [[ -S "$sock" ]] && _kin_vfs_daemon_listening "$ws"; then
+                    break
+                fi
                 sleep 0.1
                 (( attempts++ ))
             done
@@ -370,6 +388,18 @@ _kin_vfs_refresh_preload() {
     esac
 }
 
+# A socket file outlives the daemon that bound it, so only a connect
+# answered by a listener proves one is behind it. `kin-vfs status` exits 0
+# for a stale socket too; its Status line carries the verdict.
+_kin_vfs_daemon_listening() {
+    local out
+    out="$(kin-vfs status --workspace "$1" 2>/dev/null)" || return 1
+    case "$out" in
+        *"Status:"*"running"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _kin_vfs_activate() {
     local ws="$1"
     local sock="$ws/.kin/vfs.sock"
@@ -377,12 +407,18 @@ _kin_vfs_activate() {
     unset KIN_VFS_CANARY KIN_VFS_INTERPOSE_ACTIVE KIN_VFS_LAST_DIR
     export KIN_VFS_WORKSPACE="$ws"
     export KIN_VFS_SOCK="$sock"
-    if [ ! -S "$sock" ]; then
+    # -S is only a pre-filter (nothing to probe without a socket); the
+    # listener probe decides. `kin-vfs start` connects first and unlinks a
+    # stale socket itself before binding fresh.
+    if [ ! -S "$sock" ] || ! _kin_vfs_daemon_listening "$ws"; then
         if command -v kin-vfs >/dev/null 2>&1; then
             kin-vfs start --workspace "$ws" >/dev/null 2>&1 &
             disown 2>/dev/null
             local attempts=0
-            while [ ! -S "$sock" ] && [ "$attempts" -lt 10 ]; do
+            while [ "$attempts" -lt 10 ]; do
+                if [ -S "$sock" ] && _kin_vfs_daemon_listening "$ws"; then
+                    break
+                fi
                 sleep 0.1
                 attempts=$((attempts + 1))
             done
@@ -819,6 +855,15 @@ function _kin_vfs_find_workspace
     printf '%s' "$physical_workspace"
 end
 
+# A socket file outlives the daemon that bound it, so only a connect
+# answered by a listener proves one is behind it. `kin-vfs status` exits 0
+# for a stale socket too; its Status line carries the verdict.
+function _kin_vfs_daemon_listening
+    set -l out (kin-vfs status --workspace $argv[1] 2>/dev/null)
+    or return 1
+    string match -q '*Status:*running*' -- "$out"
+end
+
 function _kin_vfs_activate
     set -l ws $argv[1]
     set -l sock "$ws/.kin/vfs.sock"
@@ -830,12 +875,18 @@ function _kin_vfs_activate
     set -gx KIN_VFS_WORKSPACE $ws
     set -gx KIN_VFS_SOCK $sock
 
-    if not test -S $sock
+    # -S is only a pre-filter (nothing to probe without a socket); the
+    # listener probe decides. `kin-vfs start` connects first and unlinks a
+    # stale socket itself before binding fresh.
+    if not test -S $sock; or not _kin_vfs_daemon_listening $ws
         if command -sq kin-vfs
             kin-vfs start --workspace $ws &>/dev/null &
             disown
             set -l attempts 0
-            while not test -S $sock; and test $attempts -lt 10
+            while test $attempts -lt 10
+                if test -S $sock; and _kin_vfs_daemon_listening $ws
+                    break
+                end
                 sleep 0.1
                 set attempts (math $attempts + 1)
             end
@@ -14535,6 +14586,377 @@ wait
         assert!(BASH_HOOK.contains("_kin_vfs_clear_preload"));
         assert!(BASH_HOOK.contains("_kin_vfs_refresh_preload"));
         assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
+    }
+
+    /// FIR-2300 contract: a socket inode outlives the daemon that bound it, so
+    /// `-S` may appear only as a pre-filter. Both the decision to start a
+    /// daemon and the readiness poll must go through the
+    /// `_kin_vfs_daemon_listening` connect probe.
+    fn daemon_guard_liveness_error(shell: &str, hook: &str) -> Option<String> {
+        let (probe_def, start_guard, poll_guard, old_start_guard, old_poll) = match shell {
+            "zsh" => (
+                "_kin_vfs_daemon_listening() {",
+                "if [[ ! -S \"$sock\" ]] || ! _kin_vfs_daemon_listening \"$ws\"; then",
+                "if [[ -S \"$sock\" ]] && _kin_vfs_daemon_listening \"$ws\"; then",
+                "if [[ ! -S \"$sock\" ]]; then",
+                "while [[ ! -S \"$sock\" ]]",
+            ),
+            "bash" => (
+                "_kin_vfs_daemon_listening() {",
+                "if [ ! -S \"$sock\" ] || ! _kin_vfs_daemon_listening \"$ws\"; then",
+                "if [ -S \"$sock\" ] && _kin_vfs_daemon_listening \"$ws\"; then",
+                "if [ ! -S \"$sock\" ]; then",
+                "while [ ! -S \"$sock\" ]",
+            ),
+            "fish" => (
+                "function _kin_vfs_daemon_listening",
+                "if not test -S $sock; or not _kin_vfs_daemon_listening $ws",
+                "if test -S $sock; and _kin_vfs_daemon_listening $ws",
+                "if not test -S $sock\n",
+                "while not test -S $sock",
+            ),
+            other => return Some(format!("no liveness contract defined for shell {other}")),
+        };
+        if !hook.contains(probe_def) {
+            return Some(format!(
+                "{shell} hook defines no _kin_vfs_daemon_listening probe"
+            ));
+        }
+        if !hook.contains("kin-vfs status --workspace") {
+            return Some(format!(
+                "{shell} probe does not connect through `kin-vfs status --workspace`"
+            ));
+        }
+        if !hook.contains(start_guard) {
+            return Some(format!(
+                "{shell} start decision is not probe-gated: missing `{start_guard}`"
+            ));
+        }
+        if !hook.contains(poll_guard) {
+            return Some(format!(
+                "{shell} readiness poll is not probe-gated: missing `{poll_guard}`"
+            ));
+        }
+        if hook.contains(old_start_guard) {
+            return Some(format!(
+                "{shell} still decides on the socket-file test `{}`",
+                old_start_guard.trim_end()
+            ));
+        }
+        if hook.contains(old_poll) {
+            return Some(format!(
+                "{shell} still polls readiness with the socket-file test `{old_poll}`"
+            ));
+        }
+        None
+    }
+
+    #[test]
+    fn hook_daemon_guards_are_liveness_based() {
+        for (shell, hook) in [("zsh", ZSH_HOOK), ("bash", BASH_HOOK), ("fish", FISH_HOOK)] {
+            if let Some(err) = daemon_guard_liveness_error(shell, hook) {
+                panic!("FIR-2300 regression: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_hook_probes_the_live_pipe_namespace_not_a_file_marker() {
+        // Windows named pipes vanish with the process that serves them, so
+        // enumerating \\.\pipe\ is already a listener check; a stale-inode
+        // state is unrepresentable there. Pin the probe to the live namespace
+        // so the guard never regresses toward a file marker.
+        assert!(POWERSHELL_HOOK.contains(r#"[System.IO.Directory]::GetFiles("\\.\pipe\")"#));
+        assert!(!POWERSHELL_HOOK.contains("vfs.sock"));
+    }
+
+    /// Controls proving `hook_daemon_guards_are_liveness_based` can fail: the
+    /// exact guards the hooks shipped before FIR-2300 must be rejected in
+    /// every shell, and each late rule must be reachable on its own.
+    #[test]
+    fn liveness_guard_contract_rejects_the_pre_fir2300_guards() {
+        let old_zsh = r#"
+_kin_vfs_activate() {
+    if [[ ! -S "$sock" ]]; then
+        if command -v kin-vfs >/dev/null 2>&1; then
+            kin-vfs start --workspace "$ws" &>/dev/null &!
+            local attempts=0
+            while [[ ! -S "$sock" ]] && (( attempts < 10 )); do
+                sleep 0.1
+                (( attempts++ ))
+            done
+        fi
+    fi
+}
+"#;
+        let old_bash = r#"
+_kin_vfs_activate() {
+    if [ ! -S "$sock" ]; then
+        if command -v kin-vfs >/dev/null 2>&1; then
+            kin-vfs start --workspace "$ws" >/dev/null 2>&1 &
+            disown 2>/dev/null
+            local attempts=0
+            while [ ! -S "$sock" ] && [ "$attempts" -lt 10 ]; do
+                sleep 0.1
+                attempts=$((attempts + 1))
+            done
+        fi
+    fi
+}
+"#;
+        let old_fish = r#"
+function _kin_vfs_activate
+    if not test -S $sock
+        if command -sq kin-vfs
+            kin-vfs start --workspace $ws &>/dev/null &
+            disown
+            set -l attempts 0
+            while not test -S $sock; and test $attempts -lt 10
+                sleep 0.1
+                set attempts (math $attempts + 1)
+            end
+        end
+    end
+end
+"#;
+        for (shell, old_hook) in [("zsh", old_zsh), ("bash", old_bash), ("fish", old_fish)] {
+            assert!(
+                daemon_guard_liveness_error(shell, old_hook).is_some(),
+                "{shell}: the pre-FIR-2300 socket-file guard passed the liveness \
+                 contract, so the contract test cannot fail"
+            );
+        }
+
+        // A hook that adopts the probe for the start decision but keeps a
+        // lingering file-test poll must fail on the poll rule specifically.
+        let probe_but_old_poll = r#"
+_kin_vfs_daemon_listening() {
+    out="$(kin-vfs status --workspace "$1" 2>/dev/null)" || return 1
+}
+if [[ ! -S "$sock" ]] || ! _kin_vfs_daemon_listening "$ws"; then
+    if [[ -S "$sock" ]] && _kin_vfs_daemon_listening "$ws"; then
+        :
+    fi
+    while [[ ! -S "$sock" ]] && (( attempts < 10 )); do
+        sleep 0.1
+    done
+fi
+"#;
+        let err = daemon_guard_liveness_error("zsh", probe_but_old_poll)
+            .expect("a lingering socket-file poll must fail the contract");
+        assert!(
+            err.contains("still polls readiness"),
+            "wrong rule fired for the lingering poll control: {err}"
+        );
+    }
+
+    /// Runs each POSIX hook in a real shell against a stub `kin-vfs` and a
+    /// workspace holding a genuinely stale socket inode (bound, then dropped),
+    /// proving the guard decides on a listener rather than the socket file.
+    ///
+    /// The shim export is asserted in every scenario, including the one where
+    /// no daemon ever answers: per the authority contract, unreachable
+    /// authority must surface as EIO from the shim, never as silent raw-disk
+    /// reads, so the shell only ever decides whether to START a daemon and
+    /// never whether the preload applies.
+    #[cfg(unix)]
+    #[test]
+    fn hook_liveness_guard_starts_on_stale_sockets_and_keeps_the_shim_unconditional() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+
+        let ws = root.join("workspace");
+        fs::create_dir_all(ws.join(".kin")).unwrap();
+        // A real stale socket: bind a listener, then drop it. The inode stays
+        // behind, which is exactly the state `-S` misreads as a live daemon.
+        let sock = ws.join(".kin/vfs.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists(), "stale socket fixture was not left behind");
+
+        let kin_home = root.join("kin-home");
+        let lib = kin_home.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("libkin_vfs_shim.dylib"), b"SHIM").unwrap();
+        fs::write(lib.join("libkin_vfs_shim.so"), b"SHIM").unwrap();
+
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("kin-vfs");
+        // Mirrors the real CLI's exit contract: `status` exits 0 whether or
+        // not a daemon listens; only the Status line differs.
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_CALLS"
+case "$1" in
+status)
+    mode="$STUB_STATUS_MODE"
+    if [ "$mode" = follow_start ]; then
+        if [ -s "$STUB_START_LOG" ]; then mode=running; else mode=stale; fi
+    fi
+    echo "Workspace: $3"
+    echo "Socket:    $3/.kin/vfs.sock"
+    if [ "$mode" = running ]; then
+        echo "Status:    running (PID 12345), healthy"
+    else
+        echo "Status:    stopped (stale socket)"
+    fi
+    exit 0
+    ;;
+start)
+    printf 'start %s\n' "$3" >> "$STUB_START_LOG"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hooks_dir = root.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+
+        let posix_probe = r#"
+source "$KIN_TEST_HOOK" || { echo SOURCE_FAILED >&2; exit 97; }
+printf 'WORKSPACE=[%s]\n' "${KIN_VFS_WORKSPACE-}"
+printf 'DYLD=[%s]\n' "${DYLD_INSERT_LIBRARIES-}"
+printf 'LD=[%s]\n' "${LD_PRELOAD-}"
+"#;
+        let fish_probe = r#"
+source $KIN_TEST_HOOK; or begin; echo SOURCE_FAILED >&2; exit 97; end
+printf 'WORKSPACE=[%s]\n' "$KIN_VFS_WORKSPACE"
+printf 'DYLD=[%s]\n' "$DYLD_INSERT_LIBRARIES"
+printf 'LD=[%s]\n' "$LD_PRELOAD"
+"#;
+
+        let fish_path = [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/fish",
+            "/bin/fish",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file());
+
+        let mut shells: Vec<(&str, &str, &str, &[&str], &str)> = vec![
+            (
+                "/bin/bash",
+                "kin-vfs.bash",
+                BASH_HOOK,
+                &["--noprofile", "--norc"][..],
+                posix_probe,
+            ),
+            (
+                "/bin/zsh",
+                "kin-vfs.zsh",
+                ZSH_HOOK,
+                &["-f"][..],
+                posix_probe,
+            ),
+        ];
+        if let Some(fish) = fish_path {
+            shells.push((fish, "kin-vfs.fish", FISH_HOOK, &[][..], fish_probe));
+        }
+
+        let scenarios = [
+            ("running", 0usize, "a live listener must not be restarted"),
+            (
+                "follow_start",
+                1usize,
+                "a stale socket must trigger exactly one daemon start \
+                 (the pre-FIR-2300 -S guard started none)",
+            ),
+            (
+                "stale",
+                1usize,
+                "a daemon that never answers still gets one bounded start attempt",
+            ),
+        ];
+
+        for (shell, hook_name, hook, flags, probe) in shells {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let hook_path = hooks_dir.join(hook_name);
+            fs::write(&hook_path, hook).unwrap();
+
+            for (mode, expected_starts, why) in scenarios {
+                let run = root.join(format!("run-{mode}-{hook_name}"));
+                fs::create_dir_all(&run).unwrap();
+                let calls = run.join("calls.log");
+                let start_log = run.join("start.log");
+
+                let output = std::process::Command::new(shell)
+                    .args(flags)
+                    .arg("-c")
+                    .arg(probe)
+                    .current_dir(&ws)
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("HOME", &root)
+                    .env("KIN_HOME", &kin_home)
+                    .env("KIN_TEST_HOOK", &hook_path)
+                    .env("STUB_STATUS_MODE", mode)
+                    .env("STUB_CALLS", &calls)
+                    .env("STUB_START_LOG", &start_log)
+                    .env_remove("KIN_DIR")
+                    .env_remove("KIN_SESSION_DIR")
+                    .env_remove("KIN_VFS_DISABLE")
+                    .env_remove("KIN_VFS_STRICT")
+                    .env_remove("KIN_VFS_WORKSPACE")
+                    .env_remove("KIN_VFS_SOCK")
+                    .env_remove("DYLD_INSERT_LIBRARIES")
+                    .env_remove("LD_PRELOAD")
+                    .output()
+                    .unwrap();
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "{hook_name}/{mode}: probe shell failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+
+                let calls_text = fs::read_to_string(&calls).unwrap_or_default();
+                let starts = fs::read_to_string(&start_log)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                assert_eq!(
+                    starts, expected_starts,
+                    "{hook_name}/{mode}: {why}\ncalls:\n{calls_text}\nstdout:\n{stdout}"
+                );
+
+                assert!(
+                    calls_text.contains(&format!("status --workspace {}", ws.display())),
+                    "{hook_name}/{mode}: the guard never probed the daemon\ncalls:\n{calls_text}"
+                );
+
+                assert!(
+                    stdout.contains(&format!("WORKSPACE=[{}]", ws.display())),
+                    "{hook_name}/{mode}: workspace not activated\nstdout:\n{stdout}"
+                );
+
+                let expected_preload = if cfg!(target_os = "macos") {
+                    Some(format!(
+                        "DYLD=[{}]",
+                        lib.join("libkin_vfs_shim.dylib").display()
+                    ))
+                } else if cfg!(target_os = "linux") {
+                    Some(format!("LD=[{}]", lib.join("libkin_vfs_shim.so").display()))
+                } else {
+                    None
+                };
+                if let Some(expected) = &expected_preload {
+                    assert!(
+                        stdout.contains(expected),
+                        "{hook_name}/{mode}: shim preload missing or gated on daemon \
+                         liveness\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
