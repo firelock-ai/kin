@@ -8,6 +8,7 @@ pub mod handlers;
 pub mod negative;
 pub mod server;
 pub mod session;
+pub mod startup_binding;
 pub mod tools;
 pub mod types;
 
@@ -27,6 +28,7 @@ pub use session::{
     CoordinationSurfaceCoverage, CoordinationWritePreflight, IntentRegistrationAttempt,
     McpMutationOperation, McpMutationPayload, McpTransaction, SessionRegistry,
 };
+pub use startup_binding::{StartupBindingState, StartupDaemonBinding};
 pub use tools::{
     agent_default_tool_names, benchmark_tool_names, context_bench_tool_names, tool_definitions,
 };
