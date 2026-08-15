@@ -3265,9 +3265,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.21"
+version = "0.7.23"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "2a6c754f946db0f26e836ba0c6c9a0e7fd416f7324c0b0d09692d3dd888f0933"
+checksum = "9daa5bc4ba8a3a9edeeb859116b216a682fbcb5b461bbe77231baba3ddc2d192"
 dependencies = [
  "bincode",
  "bstr",
