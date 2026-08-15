@@ -236,7 +236,7 @@ fn registered_tools() -> ToolsListResult {
                         "pipeline": {
                             "type": "string",
                             "enum": ["fused", "cosine"],
-                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). Defaults to the daemon's active KIN_PROFILE — the stock compat-v0 profile serves 'cosine'; accuracy-v1 serves 'fused'."
+                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). The default is 'fused' on every profile, the same ranking kin locate serves; 'cosine' is the per-call escape hatch for A/B comparison."
                         },
                         "explain": {
                             "type": "boolean",

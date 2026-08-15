@@ -7618,8 +7618,8 @@ fn fused_semantic_locate_payload(
 
 /// Build the `semantic_locate` response from the full fused locate pipeline
 /// (the same multi-signal fusion + rerank `POST /locate` serves) instead of
-/// the single-vector cosine ranking. Selected by the retrieval quality
-/// profile (`KIN_PROFILE`) or an explicit per-call `pipeline` argument.
+/// the single-vector cosine ranking. The default arm on every profile; only
+/// an explicit per-call `pipeline: "cosine"` selects the legacy arm.
 ///
 /// Contract: args `{query, limit?=20, page_size?, cursor?,
 /// granularity?="entity"|"file", include_snippet?=true, explain?=false,
@@ -8147,17 +8147,14 @@ async fn mcp_tools_call(
         return Ok(Json(result));
     }
 
-    // R14 — `semantic_locate`: serve the agent's primary retrieval tool from
-    // the daemon's real pipelines. A stock daemon serves the legacy single-vector
-    // cosine ranking by default (the compat-v0 profile). The SAME fused
-    // multi-signal ranking `POST /locate` serves — vector, lexical, and graph
-    // fusion with role-aware ranking — is opt-in via `KIN_PROFILE=accuracy-v1`
-    // or a per-call `pipeline: "fused"` argument, so the richer product ranker is
-    // reachable without changing the default serving behavior. The legacy cosine
-    // ranking is also forceable per call with `pipeline: "cosine"` for A/B
-    // comparison. Both paths return partial results plus `semantic_coverage`
-    // rather than hard-gating on full embedding coverage (graceful degradation
-    // per R5).
+    // R14: serve the agent's primary retrieval tool from the daemon's real
+    // pipelines. The default route is the SAME fused multi-signal ranking
+    // `POST /locate` serves (vector, lexical, and graph fusion with role-aware
+    // ranking), on every profile: profiles supply lever defaults inside the
+    // pipeline, never the routing. The legacy single-vector cosine ranking
+    // stays reachable per call with `pipeline: "cosine"` for A/B comparison.
+    // Both paths return partial results plus `semantic_coverage` rather than
+    // hard-gating on full embedding coverage (graceful degradation per R5).
     if request.name == "semantic_locate" {
         let pipeline_override = request
             .arguments
@@ -8186,11 +8183,10 @@ async fn mcp_tools_call(
                     "invalid pipeline '{other}': expected \"fused\" or \"cosine\""
                 ))));
             }
-            None => {
-                has_extra_queries
-                    || kin_cli::retrieval_profile::RetrievalProfile::from_env()
-                        .semantic_locate_fused()
-            }
+            // No explicit pipeline: fused, unconditionally. Routing is not a
+            // profile decision; profiles supply lever defaults read inside the
+            // pipeline, and `POST /locate` has never consulted one either.
+            None => true,
         };
         if use_fused {
             return Ok(Json(
@@ -12332,7 +12328,8 @@ mod tests {
         }
     }
 
-    /// FIR-2199. The compat-v0 default arm emitted neither disclosure field.
+    /// FIR-2199. The cosine arm, then the shipped default, emitted neither
+    /// disclosure field.
     ///
     /// Measured on the shipped default profile, `match_kind` was absent from all
     /// 188 result rows across 40 queries and `all_fallback` never appeared once,
@@ -27961,6 +27958,9 @@ mod tests {
 
         // No vector index is populated. The handler must still return a valid
         // payload with a coverage field instead of hard-gating to an error.
+        // Pinned to the cosine arm explicitly: the shape assertions below are
+        // the legacy payload's coverage contract, and the default route is the
+        // fused arm.
         let response = app
             .clone()
             .oneshot(
@@ -27969,7 +27969,7 @@ mod tests {
                     .body(Body::from(
                         json!({
                             "name": "semantic_locate",
-                            "arguments": { "query": "handler", "limit": 5 }
+                            "arguments": { "query": "handler", "limit": 5, "pipeline": "cosine" }
                         })
                         .to_string(),
                     ))
@@ -28676,9 +28676,9 @@ mod tests {
     /// The FUSED `semantic_locate` page opens repository authority ONCE.
     ///
     /// This is the call-site regression test for the per-body authority open,
-    /// on the arm `POST /locate` always uses, that `pipeline: "fused"` selects,
-    /// that multi-query forces, and that `KIN_PROFILE=accuracy-v1` selects. It
-    /// runs the real MCP dispatch route, so what it bounds is the shipped path
+    /// on the arm `POST /locate` always uses and `semantic_locate` serves by
+    /// default on every profile; `pipeline: "cosine"` is the only route off
+    /// it. It runs the real MCP dispatch route, so what it bounds is the shipped path
     /// rather than a primitive: fused locate funnels into
     /// `run_with_graph_capture_budgeted`, which projects bodies TWICE over the
     /// same symbol set -- once in `attach_snippets` and again in
@@ -28923,6 +28923,32 @@ mod tests {
             .unwrap();
         let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
         assert_eq!(result.is_error, Some(true));
+    }
+
+    /// The default route (no `pipeline` argument) is the fused pipeline on
+    /// every profile, exactly the ranking `POST /locate` serves. Pinned under
+    /// an explicit compat-v0 environment because that is the profile that
+    /// used to select the cosine arm: routing must not follow it. Serial
+    /// because the guard mutates process env other lever reads consult.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_semantic_locate_routes_fused_by_default_on_every_profile() {
+        let _profile = kin_core::test_env::EnvVarGuard::set("KIN_PROFILE", "compat-v0");
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let payload = call_semantic_locate(app, json!({ "query": "handler" })).await;
+        assert_eq!(
+            payload["routing"], "fused-v1",
+            "a compat-v0 daemon must still route the default call fused"
+        );
     }
 
     // Schema parity: the fused MCP payload IS the `LocateResult` schema

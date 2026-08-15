@@ -12,16 +12,20 @@
 # result or release evidence.
 #
 # What it compares (same 16 frozen tasks, same model config, temp0/seed0):
-#   arm A  KIN_PROFILE=compat-v0   — pre-profile behavior (cosine semantic_locate)
-#   arm B  KIN_PROFILE=accuracy-v1 — fused semantic_locate + accuracy defaults
+#   arm A  KIN_PROFILE=compat-v0:   pre-profile lever defaults
+#   arm B  KIN_PROFILE=accuracy-v1: accuracy levers plus the conditional cross-encoder
+# Routing is profile-independent: semantic_locate serves the fused pipeline in
+# BOTH arms, exactly like kin locate, so this A/B isolates the lever sets. The
+# cosine arm is reachable only per call via pipeline:"cosine".
 #
 # Metrics to read from the scorer output, A vs B:
 #   - gold files surfaced %          (diagnostic north star: was 39%)
 #   - retrieval_miss / traversal_pruned counts (was 28/31 of fixable misses)
 #   - file precision / recall / F1, symbol R, line R
 #   - declared-vs-surfaced conversion, total tokens per task
-#   - per-hit `routing` field distribution (fused-v1 vs cosine-v0) as an
-#     arm-integrity check, and `degradations` frequencies
+#   - per-hit `routing` field distribution (fused-v1 expected in BOTH arms;
+#     cosine-v0 only where a call forced pipeline:"cosine") and `degradations`
+#     frequencies
 #
 # Prerequisites the operator must satisfy first (fail-loud checks below):
 #   1. Rebuild ALL binaries from the branch under test (CLI + daemon + bench
@@ -64,8 +68,8 @@ plan "      output:    $OUTPUT_DIR/mf16_accuracy_v1.jsonl (+ _turns/_results)"
 plan ""
 plan "[5/5] score both with the official scorer; read the paired deltas:"
 plan "      gold-surfaced %, traversal_pruned count, file P/R/F1, symbol R,"
-plan "      line R, conversion, tokens/task; check per-hit routing field says"
-plan "      fused-v1 only in arm B; collect degradations[] frequencies."
+plan "      line R, conversion, tokens/task; check the per-hit routing field"
+plan "      says fused-v1 in both arms; collect degradations[] frequencies."
 plan ""
 plan "optional per-call A/B without switching profiles: pass"
 plan "      pipeline:\"cosine\" / pipeline:\"fused\" on semantic_locate calls."
