@@ -1146,6 +1146,24 @@ pub struct EmbeddingStatus {
     pub total: usize,
 }
 
+/// Outcome counts from reconciling a salvaged vector sidecar against current
+/// graph truth (see [`InMemoryGraph::reconcile_salvaged_vector_index`]).
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VectorSalvageStats {
+    /// Keys retained in the index and now serving.
+    pub retained: usize,
+    /// Keys evicted because they are no longer in graph truth at all
+    /// (superseded generations, dead chains, retired artifacts).
+    pub evicted_orphans: usize,
+    /// Artifact head keys retired because a stamp drift cannot prove their
+    /// content identity per key.
+    pub retired_artifact_vectors: usize,
+    /// Entity head keys retired because the entity's current head revision has
+    /// no vector, so the head vector predates the entity's current content.
+    pub retired_stale_entity_heads: usize,
+}
+
 /// Graph-owned object resolved from a retrieval key.
 #[derive(Debug, Clone)]
 pub enum ResolvedRetrievalItem {
@@ -4320,13 +4338,15 @@ impl InMemoryGraph {
 
         // Only a graph that holds a populated index in memory writes the
         // sidecar. An in-memory `None` means the index was never loaded for
-        // this graph (e.g. it was skipped as stale on reopen) — it does NOT
-        // mean the repo has no vectors. Deleting the on-disk sidecar here would
+        // this graph (e.g. it was refused on reopen) — it does NOT mean the
+        // repo has no vectors. Deleting the on-disk sidecar here would
         // silently destroy graph-owned truth that a later embed pass or a
         // matching reopen could have reused, so an unloaded index leaves the
-        // persisted sidecar untouched. A genuinely stale sidecar is rejected on
-        // load by `load_vector_index_if_valid` (root-hash check) and rebuilt
-        // from the embedding queue, never by a destructive write here.
+        // persisted sidecar untouched. A sidecar that cannot serve the store
+        // is judged on load by `load_vector_index_if_valid` (salvaged per key
+        // on stamp drift, refused with its failing comparison named otherwise)
+        // and rebuilt from the embedding queue, never by a destructive write
+        // here.
         if let Some(ref index) = *self.vector_index.lock() {
             index.save(path)?;
         }
@@ -5718,6 +5738,113 @@ impl InMemoryGraph {
         for rev in revisions {
             state.superseded.insert(RetrievalKey::EntityRevision(*rev));
         }
+    }
+
+    /// Reconcile a salvaged vector index — one loaded under a graph-authority
+    /// stamp that no longer matches the reopened graph — down to the keys
+    /// current truth can prove, so reuse never serves a vector the graph moved
+    /// out from under.
+    ///
+    /// Per-key provability under stamp drift:
+    ///
+    /// - `EntityRevision` keys are content-addressed (`hash(entity_id,
+    ///   change_id)`, and a revision's payload is immutable once minted), so
+    ///   membership in current truth proves the vector: retained. Superseded
+    ///   and dead-chain keys fall out of truth and are evicted by the full
+    ///   prune.
+    /// - `Entity` head keys are id-stable across content edits, so presence
+    ///   proves nothing on its own. A content edit always mints a new head
+    ///   revision, so a head whose current head-revision key is ALSO in the
+    ///   index was flushed at-or-after that content and is retained; a head
+    ///   whose current head revision has no vector predates the entity's
+    ///   current content and is retired for re-embed. An entity with no
+    ///   revision chain has no drift signal and is retained as-is.
+    /// - `Artifact` keys are id-stable across content edits and artifacts mint
+    ///   no embedded revision keys, so drift leaves no per-key proof at all:
+    ///   every artifact vector is retired and re-derived from the current
+    ///   artifact documents (byte-identical documents re-embed from the text
+    ///   cache without inference).
+    ///
+    /// What this deliberately does not catch: a head vector whose own content
+    /// is current but whose graph-derived context lines drifted (a
+    /// relation-only change queued live and lost with the process). The live
+    /// producer contract re-queues those endpoints while the daemon runs; after
+    /// a restart they refresh on next touch. That bounded staleness replaces
+    /// discarding the entire index on every reopen whose stamp moved.
+    ///
+    /// Eviction order is sorted, exactly like the prune, so the surviving index
+    /// (and the slot order a later re-embed reuses) is deterministic across
+    /// boots.
+    #[cfg(feature = "vector")]
+    pub fn reconcile_salvaged_vector_index(&self) -> VectorSalvageStats {
+        let _span = tracing::info_span!("kindb.reconcile_salvaged_vector_index").entered();
+        let vi = match self.vector_index.lock().clone() {
+            Some(vi) => vi,
+            None => return VectorSalvageStats::default(),
+        };
+
+        // Full generation eviction first: drops every key outside current
+        // truth (the sidecar load marked a full reconcile pending).
+        let evicted_orphans = self.prune_orphaned_vectors();
+
+        let mut retire: Vec<RetrievalKey> = Vec::new();
+        {
+            let ent = self.entities.read();
+            let head_by_entity: hashbrown::HashMap<EntityId, EntityRevisionId> = ent
+                .entity_revisions
+                .iter()
+                .filter(|(id, _)| ent.entities.contains_key(*id))
+                .filter_map(|(id, revs)| revs.last().map(|rev| (*id, rev.revision_id)))
+                .collect();
+            for key in vi.retrievable_keys() {
+                match key {
+                    RetrievalKey::Artifact(_) | RetrievalKey::ArtifactRevision(_) => {
+                        retire.push(key);
+                    }
+                    RetrievalKey::Entity(id) => {
+                        if let Some(head) = head_by_entity.get(&id) {
+                            if !vi.contains_retrievable(&RetrievalKey::EntityRevision(*head)) {
+                                retire.push(key);
+                            }
+                        }
+                    }
+                    RetrievalKey::EntityRevision(_) => {}
+                }
+            }
+        }
+        retire.sort_unstable();
+
+        let mut retired_artifact_vectors = 0usize;
+        let mut retired_stale_entity_heads = 0usize;
+        for key in &retire {
+            if vi.remove_retrievable(key).is_ok() {
+                match key {
+                    RetrievalKey::Artifact(_) | RetrievalKey::ArtifactRevision(_) => {
+                        retired_artifact_vectors += 1;
+                    }
+                    _ => retired_stale_entity_heads += 1,
+                }
+            }
+        }
+
+        VectorSalvageStats {
+            retained: vi.len(),
+            evicted_orphans,
+            retired_artifact_vectors,
+            retired_stale_entity_heads,
+        }
+    }
+
+    /// Return the current head revision id of a live entity's revision chain,
+    /// or `None` when the entity is absent or carries no revision history.
+    pub fn latest_revision_id_for(&self, entity_id: &EntityId) -> Option<EntityRevisionId> {
+        let ent = self.entities.read();
+        if !ent.entities.contains_key(entity_id) {
+            return None;
+        }
+        ent.entity_revisions
+            .get(entity_id)
+            .and_then(|revs| revs.last().map(|rev| rev.revision_id))
     }
 
     /// Give every revision key this change minted a vector, or a place in the

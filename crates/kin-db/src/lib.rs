@@ -14,6 +14,8 @@ pub mod types;
 pub mod vector;
 
 pub use embed::CodeEmbedder;
+#[cfg(feature = "vector")]
+pub use engine::VectorSalvageStats;
 pub use engine::{EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ResolvedRetrievalItem};
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;

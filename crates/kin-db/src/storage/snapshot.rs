@@ -1408,50 +1408,112 @@ fn current_embedding_runtime_fields() -> (
     }
 }
 
+/// What a reopen may do with a persisted vector sidecar, decided from its
+/// metadata alone. Every refusal names the comparison that failed and carries
+/// both sides' values, so the log explains itself instead of announcing a
+/// generic mismatch.
 #[cfg(feature = "vector")]
-fn vector_metadata_matches_graph(
+#[derive(Debug)]
+enum SidecarVerdict {
+    /// Embedding space and graph-authority stamp both match: install as-is.
+    Exact,
+    /// The embedding space matches but the graph-authority stamp differs from
+    /// the hash recomputed over the reopened graph. The vectors are still in
+    /// the right space and keyed by content-addressed revision identity, so
+    /// they are salvageable per key rather than refusable as a whole.
+    StampDrift,
+    /// The sidecar cannot serve this store. `check` names the failing
+    /// comparison; `stored` and `current` carry the two values that disagreed.
+    Refuse {
+        check: &'static str,
+        stored: String,
+        current: String,
+    },
+}
+
+/// Classify a persisted sidecar against the live embedding runtime and the
+/// reopened graph's retrieval-authority hash.
+///
+/// The embedding-space fields (provider, model, revision, pipeline epoch,
+/// dimensions, and any caller-pinned embedder identity) decide refusal: vectors
+/// minted in a different space can never serve this store and genuinely require
+/// a rebuild. The graph-authority stamp decides only exact-vs-salvage: an
+/// ordinary commit, enrichment pass, or a live-vs-reconstructed hash asymmetry
+/// moves the stamp without invalidating a single per-key vector, so a real but
+/// different stamp is drift, not refusal. A zeroed stamp is the one deliberate
+/// exception: [`SnapshotManager::invalidate_derived_sidecars`] zeroes it as a
+/// fence before a delta commit whose exact index batch was unavailable, and
+/// that fence must keep refusing.
+#[cfg(feature = "vector")]
+fn classify_vector_sidecar(
     metadata: &VectorIndexMetadata,
     graph_root_hash: [u8; 32],
     expected_embedder_identity: Option<&str>,
-) -> bool {
-    if metadata.graph_root_hash != hex::encode(graph_root_hash) {
-        return false;
-    }
-
+) -> SidecarVerdict {
     #[cfg(feature = "embeddings")]
     {
         let runtime = crate::embed::configured_embedding_runtime();
         if metadata.embedding_provider != runtime.provider {
-            return false;
+            return SidecarVerdict::Refuse {
+                check: "embedding_provider",
+                stored: metadata.embedding_provider.clone(),
+                current: runtime.provider,
+            };
         }
         if metadata.embedding_model_id != runtime.model_id {
-            return false;
+            return SidecarVerdict::Refuse {
+                check: "embedding_model_id",
+                stored: metadata.embedding_model_id.clone(),
+                current: runtime.model_id,
+            };
         }
         if metadata.embedding_model_revision != runtime.revision {
-            return false;
+            return SidecarVerdict::Refuse {
+                check: "embedding_model_revision",
+                stored: metadata.embedding_model_revision.clone(),
+                current: runtime.revision,
+            };
         }
         if metadata.embedding_pipeline_epoch != runtime.pipeline_epoch {
-            return false;
+            return SidecarVerdict::Refuse {
+                check: "embedding_pipeline_epoch",
+                stored: metadata.embedding_pipeline_epoch.clone(),
+                current: runtime.pipeline_epoch,
+            };
         }
         if let Some(dimensions) = runtime.dimensions {
             if metadata.dimensions != dimensions {
-                return false;
+                return SidecarVerdict::Refuse {
+                    check: "dimensions",
+                    stored: metadata.dimensions.to_string(),
+                    current: dimensions.to_string(),
+                };
             }
         }
     }
 
     if let Some(expected) = expected_embedder_identity {
         if metadata.embedder_identity != expected {
-            tracing::warn!(
-                stored = %metadata.embedder_identity,
-                expected = %expected,
-                "vector sidecar embedder_identity mismatch: rejecting load"
-            );
-            return false;
+            return SidecarVerdict::Refuse {
+                check: "embedder_identity",
+                stored: metadata.embedder_identity.clone(),
+                current: expected.to_string(),
+            };
         }
     }
 
-    true
+    let current = hex::encode(graph_root_hash);
+    if metadata.graph_root_hash == current {
+        return SidecarVerdict::Exact;
+    }
+    if metadata.graph_root_hash == hex::encode([0u8; 32]) {
+        return SidecarVerdict::Refuse {
+            check: "graph_authority_stamp",
+            stored: "deliberately invalidated (zeroed) before an inexact delta commit".to_string(),
+            current,
+        };
+    }
+    SidecarVerdict::StampDrift
 }
 
 /// Append a deterministic `.archived` suffix to a path. A single archive slot
@@ -1903,15 +1965,26 @@ impl SnapshotManager {
         Self::invalidate_vector_index_metadata(&path)
     }
 
-    /// Load the persisted vector-index sidecar for `path` into `graph` only if
-    /// its metadata still matches graph truth (root hash + embedding
-    /// provider/model/revision/epoch/dimensions, via
-    /// [`vector_metadata_matches_graph`]). A stale sidecar is skipped, never
-    /// installed, and — when `write_missing_metadata` is set — the missing
-    /// entities/artifacts are queued for a clean rebuild.
+    /// Load the persisted vector-index sidecar for `path` into `graph` when its
+    /// metadata proves the vectors can serve this store, deciding per
+    /// [`classify_vector_sidecar`]:
+    ///
+    /// - an exact match installs the index as-is;
+    /// - a graph-authority stamp drift with a matching embedding space installs
+    ///   the index and reconciles it per key
+    ///   ([`InMemoryGraph::reconcile_salvaged_vector_index`]), so an ordinary
+    ///   commit or a live-vs-reconstructed hash asymmetry no longer discards
+    ///   every vector the store owns;
+    /// - an embedding-space mismatch or a deliberately zeroed stamp refuses,
+    ///   naming the failing comparison and both its values in the log.
+    ///
+    /// A refused sidecar is preserved on disk, never installed, and — when
+    /// `write_missing_metadata` is set — the missing entities/artifacts are
+    /// queued for a clean rebuild. After a salvage the same queueing admits only
+    /// the keys the reconcile retired or found missing, not the whole store.
     ///
     /// Returns `true` if a vector index was installed into the graph, `false`
-    /// if nothing was loaded (no sidecar present, or it was rejected as stale).
+    /// if nothing was loaded (no sidecar present, or it was refused).
     #[cfg(feature = "vector")]
     fn load_vector_index_if_valid(
         path: &Path,
@@ -1927,21 +2000,18 @@ impl SnapshotManager {
 
         let metadata_path = vector_index_metadata_path_for(path);
         let metadata = read_vector_index_metadata(&metadata_path)?;
-        let matched_root = metadata.as_ref().and_then(|metadata| {
-            vector_metadata_matches_graph(
+        let verdict = metadata.as_ref().map(|metadata| {
+            classify_vector_sidecar(
                 metadata,
                 retrieval_authority_hash,
                 expected_embedder_identity,
             )
-            .then_some(retrieval_authority_hash)
         });
-        let should_load = matched_root.is_some();
 
         if std::env::var("KINDB_DEBUG_KVEC").is_ok() {
             eprintln!(
-                "[KVEC-DBG] should_load={} matched_root={:?} stamp_root={:?} retrieval_authority={} meta_embedder={:?} expected_embedder={:?} meta_dims={:?} meta_model={:?}",
-                should_load,
-                matched_root.map(hex::encode),
+                "[KVEC-DBG] verdict={:?} stamp_root={:?} retrieval_authority={} meta_embedder={:?} expected_embedder={:?} meta_dims={:?} meta_model={:?}",
+                verdict,
                 metadata.as_ref().map(|m| m.graph_root_hash.clone()),
                 hex::encode(retrieval_authority_hash),
                 metadata.as_ref().map(|m| m.embedder_identity.clone()),
@@ -1951,15 +2021,43 @@ impl SnapshotManager {
             );
         }
 
-        if !should_load {
-            // Sidecar/graph-root staleness is transient (the graph may reconcile
-            // back, or a matching reopen may reuse these vectors). PRESERVE the
-            // sidecar on disk — never move/delete graph-owned truth here (the
-            // prepared-state kvec-drop regression) — just skip it and rebuild.
+        let (metadata, verdict) = match (metadata, verdict) {
+            (Some(metadata), Some(verdict)) => (metadata, verdict),
+            _ => {
+                // A .kvec with no metadata beside it has no provable embedding
+                // space. PRESERVE it on disk — never move/delete graph-owned
+                // truth here (the prepared-state kvec-drop regression) — and
+                // rebuild.
+                tracing::warn!(
+                    path = %vector_path.display(),
+                    metadata = %metadata_path.display(),
+                    check = "sidecar_metadata_present",
+                    "refusing persisted vector index: no sidecar metadata exists beside it, so its embedding space cannot be proven; rebuilding"
+                );
+                if write_missing_metadata {
+                    graph.queue_missing_for_embedding();
+                    graph.queue_missing_artifacts_for_embedding();
+                }
+                return Ok(false);
+            }
+        };
+
+        if let SidecarVerdict::Refuse {
+            check,
+            stored,
+            current,
+        } = &verdict
+        {
+            // A genuine refusal: the vectors cannot serve this store. Say
+            // exactly which comparison failed and what both sides held, then
+            // preserve the sidecar on disk and rebuild from the queue.
             tracing::warn!(
                 path = %vector_path.display(),
                 metadata = %metadata_path.display(),
-                "skipping stale vector index because metadata no longer matches graph truth"
+                check = %check,
+                stored = %stored,
+                current = %current,
+                "refusing persisted vector index: {check} does not match this store, so a rebuild is required"
             );
             if write_missing_metadata {
                 graph.queue_missing_for_embedding();
@@ -1969,12 +2067,15 @@ impl SnapshotManager {
         }
 
         // Defense-in-depth against silently-wrong neighbors: verify the index's
-        // own required model and graph self-description against the required
-        // sidecar identities.
-        let metadata = metadata.expect("matched vector metadata is present");
+        // own model and graph self-description against the sidecar metadata it
+        // was persisted beside. The expected graph root is the STORED stamp on
+        // both paths — on an exact match it equals the live hash, and on a
+        // salvage it is the hash the descriptor was stamped with — so a .kvec
+        // whose self-description disagrees with the metadata next to it (a
+        // swapped or torn pair) is caught either way.
         let expected = crate::vector::IndexDescriptor {
             model_id: Some(metadata.embedding_model_id.clone()),
-            graph_root: matched_root.map(hex::encode),
+            graph_root: Some(metadata.graph_root_hash.clone()),
         };
 
         let count = match graph.load_vector_index_compatible(&vector_path, &expected) {
@@ -1982,8 +2083,9 @@ impl SnapshotManager {
             crate::vector::VectorIndexLoad::Incompatible(reason) => {
                 tracing::warn!(
                     path = %vector_path.display(),
+                    check = "index_self_description",
                     reason = %reason,
-                    "LOUD WARNING: archiving incompatible vector index (index declares a different embedding model) and rebuilding"
+                    "LOUD WARNING: archiving incompatible vector index (its self-description contradicts the sidecar metadata beside it) and rebuilding"
                 );
                 archive_incompatible_index(&vector_path, &metadata_path);
                 if write_missing_metadata {
@@ -1994,18 +2096,44 @@ impl SnapshotManager {
             }
         };
 
-        // Generation eviction: the root-hash gate accepts a sidecar whose entity
-        // content matches even when its revision keys were minted under a prior
-        // (re-init) change id. Those keys are now orphans — drop them so the
-        // installed index reflects only current graph truth and stale
-        // generations stop competing in ANN retrieval.
-        let evicted = graph.prune_orphaned_vectors();
-        if evicted > 0 {
-            tracing::info!(
-                path = %vector_path.display(),
-                evicted,
-                "evicted orphaned-generation vectors after loading sidecar"
-            );
+        match verdict {
+            SidecarVerdict::StampDrift => {
+                // The graph moved (or hashed differently on this construction
+                // path) since the stamp was written, but every vector is still
+                // in the right embedding space and keyed by content-addressed
+                // identity. Reconcile per key instead of rebuilding: retain
+                // what current truth can prove, retire what it cannot, and let
+                // the missing-key queue admit only the genuine delta.
+                let stats = graph.reconcile_salvaged_vector_index();
+                tracing::info!(
+                    path = %vector_path.display(),
+                    stored_stamp = %metadata.graph_root_hash,
+                    current_authority = %hex::encode(retrieval_authority_hash),
+                    loaded = count,
+                    retained = stats.retained,
+                    evicted_orphans = stats.evicted_orphans,
+                    retired_artifact_vectors = stats.retired_artifact_vectors,
+                    retired_stale_entity_heads = stats.retired_stale_entity_heads,
+                    "vector sidecar stamp drifted from graph authority; salvaged the index per key instead of rebuilding, and only unproven keys will re-embed"
+                );
+            }
+            SidecarVerdict::Exact => {
+                // Generation eviction: the stamp gate accepts a sidecar whose
+                // entity content matches even when its revision keys were
+                // minted under a prior (re-init) change id. Those keys are now
+                // orphans — drop them so the installed index reflects only
+                // current graph truth and stale generations stop competing in
+                // ANN retrieval.
+                let evicted = graph.prune_orphaned_vectors();
+                if evicted > 0 {
+                    tracing::info!(
+                        path = %vector_path.display(),
+                        evicted,
+                        "evicted orphaned-generation vectors after loading sidecar"
+                    );
+                }
+            }
+            SidecarVerdict::Refuse { .. } => unreachable!("refusals return above"),
         }
 
         if count == 0 {
@@ -2020,12 +2148,15 @@ impl SnapshotManager {
     /// # Contract for out-of-process callers (e.g. the daemon)
     ///
     /// This entry point validates the sidecar against graph truth before
-    /// installing it, using the graph's own recorded root hash
-    /// ([`InMemoryGraph::snapshot_root_hash`]) plus the live embedding
-    /// provider/model/revision/epoch/dimensions. It returns `Ok(true)` if a
-    /// valid index was installed and `Ok(false)` if nothing was loaded (no
-    /// sidecar, a stale sidecar, or a graph with no recorded root hash to
-    /// validate against).
+    /// installing it, using the graph's retrieval-authority hash plus the live
+    /// embedding provider/model/revision/epoch/dimensions. A sidecar whose
+    /// embedding space matches but whose graph-authority stamp drifted is
+    /// installed and reconciled per key
+    /// ([`InMemoryGraph::reconcile_salvaged_vector_index`]) rather than
+    /// refused, so an ordinary commit between flush and reopen does not throw
+    /// prepared vectors away. It returns `Ok(true)` if an index was installed
+    /// (exactly or by salvage) and `Ok(false)` if nothing was loaded (no
+    /// sidecar, or a refusal whose failing comparison the log names).
     ///
     /// `snapshot_path` is the `.kndb` snapshot path (the same value passed to
     /// [`SnapshotManager::open`]); the `.kvec` / `.kvec.meta.json` sidecar paths
@@ -5124,7 +5255,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "vector")]
-    fn exact_tree_change_rejects_preserved_vector_sidecar_with_same_graph_root() {
+    fn exact_tree_change_retires_artifact_vector_from_salvaged_sidecar() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
@@ -5157,8 +5288,11 @@ mod tests {
         drop(mgr);
 
         // Rehydrate without loading the vector sidecar, then commit a tree-only
-        // change. The old `.kvec` is deliberately preserved on disk; its exact
-        // retrieval-authority stamp must make it ineligible.
+        // change. The old `.kvec` is deliberately preserved on disk. Reopen
+        // salvages it (the stamp drifted while the embedding space matches),
+        // and the salvage must retire the artifact key: artifact ids survive
+        // content changes, so a stamp drift leaves no per-key proof that the
+        // stored artifact vector still describes the artifact's bytes.
         let replacement = InMemoryGraph::from_snapshot(replacement_snapshot).unwrap();
         replacement
             .apply_transaction_delta(&TransactionDelta {
@@ -5189,12 +5323,21 @@ mod tests {
         );
 
         let reopened = SnapshotManager::open_read_only(&snapshot_path).unwrap();
-        assert_eq!(reopened.graph().embedding_status().indexed, 0);
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            0,
+            "the changed artifact's stale vector must not be served"
+        );
         assert_eq!(
             reopened.graph().pending_artifact_embeddings(),
             0,
             "retired artifact enrichment leaves no vector document to rebuild"
         );
+        assert!(
+            vector_path.exists(),
+            "the salvaged sidecar is preserved on disk, not archived"
+        );
+        assert!(!archived_sidecar_path(&vector_path).exists());
     }
 
     #[test]
@@ -5712,7 +5855,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "vector")]
-    fn stale_vector_metadata_prevents_load_on_reopen() {
+    fn drifted_stamp_with_undescribed_index_is_archived_and_requeued() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
@@ -5747,10 +5890,348 @@ mod tests {
         )
         .unwrap();
 
+        // The stamp drifted, so reopen attempts a per-key salvage — but this
+        // index carries no self-description, so it cannot prove it belongs to
+        // the metadata beside it. That pair is archived aside and rebuilt.
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
         assert_eq!(reloaded.graph().embedding_status().indexed, 0);
         assert_eq!(reloaded.graph().pending_embeddings(), 1);
         assert_eq!(reloaded.graph().pending_artifact_embeddings(), 1);
+        assert!(
+            !vector_path.exists(),
+            "an unprovable index/metadata pair is moved aside"
+        );
+        assert!(archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// The R7 defect (FIR-2325): a graph mutation that changes the
+    /// retrieval-authority hash without touching any embedded content used to
+    /// refuse the entire intact sidecar on reopen and re-queue every entity.
+    /// Reopen must instead salvage the index per key and re-queue nothing.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn stamp_drift_reopen_salvages_intact_sidecar_with_zero_requeue() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let owner = test_entity("salvage_owner");
+        graph.upsert_entity(&owner).unwrap();
+        let change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([21; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "mint a head revision".into(),
+            entity_deltas: vec![EntityDelta::Added { new: owner.clone() }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        });
+        graph.create_change(&change).unwrap();
+        let head = graph
+            .latest_revision_id_for(&owner.id)
+            .expect("the change mints a head revision");
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(owner.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable(RetrievalKey::EntityRevision(head), &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+        let stamped = read_vector_index_metadata(&metadata_path)
+            .unwrap()
+            .unwrap()
+            .graph_root_hash;
+        let replacement_snapshot = graph.to_snapshot();
+        drop(graph);
+        drop(mgr);
+
+        // A relation-only mutation: it moves the retrieval-authority hash but
+        // adds no retrievable key and changes no embedded content — the shape
+        // of an ordinary commit's side effects on a fully embedded store.
+        let replacement = InMemoryGraph::from_snapshot(replacement_snapshot).unwrap();
+        replacement
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::CoChanges,
+                src: GraphNodeId::Entity(owner.id),
+                dst: GraphNodeId::Entity(owner.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        assert_ne!(
+            hex::encode(replacement.retrieval_authority_hash()),
+            stamped,
+            "the fixture must actually drift the stamp, or this test proves nothing"
+        );
+        SnapshotManager::save_graph(&snapshot_path, &replacement).unwrap();
+        assert_eq!(
+            read_vector_index_metadata(&metadata_path)
+                .unwrap()
+                .unwrap()
+                .graph_root_hash,
+            stamped,
+            "an unloaded sidecar keeps its old stamp across the drift"
+        );
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        let graph = reopened.graph();
+        assert_eq!(
+            graph.embedding_status().indexed,
+            2,
+            "the entity head and its head-revision vector both survive the salvage"
+        );
+        graph.queue_missing_for_embedding();
+        graph.queue_missing_artifacts_for_embedding();
+        assert_eq!(
+            graph.pending_embeddings(),
+            0,
+            "an unchanged store re-queues zero entities across the restart"
+        );
+        assert_eq!(graph.pending_artifact_embeddings(), 0);
+        assert!(
+            vector_path.exists(),
+            "the salvaged sidecar stays on disk untouched"
+        );
+        assert!(!archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// Salvage is not blind reuse: an entity whose content moved after the
+    /// last sidecar flush has a new head revision with no vector, so its
+    /// id-stable head vector predates the current content and must be retired
+    /// and re-queued rather than served.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn stamp_drift_salvage_retires_stale_entity_head_and_requeues_it() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let owner = test_entity("stale_head_owner");
+        graph.upsert_entity(&owner).unwrap();
+        let change = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([22; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "mint the first head revision".into(),
+            entity_deltas: vec![EntityDelta::Added { new: owner.clone() }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        });
+        graph.create_change(&change).unwrap();
+        let first_head = graph
+            .latest_revision_id_for(&owner.id)
+            .expect("the change mints a head revision");
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(owner.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable(
+                RetrievalKey::EntityRevision(first_head),
+                &[0.0, 1.0, 0.0, 0.0],
+            )
+            .unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+        let replacement_snapshot = graph.to_snapshot();
+        drop(graph);
+        drop(mgr);
+
+        // Content change after the flush: a new head revision is minted, and
+        // the sidecar never saw it.
+        let replacement = InMemoryGraph::from_snapshot(replacement_snapshot).unwrap();
+        let mut modified = owner.clone();
+        modified.signature = "fn stale_head_owner_v2()".to_string();
+        replacement.upsert_entity(&modified).unwrap();
+        let second = seal_change(SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([23; 32])),
+            parents: vec![change.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "change the entity's content".into(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: owner.clone(),
+                new: modified.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        });
+        replacement.create_change(&second).unwrap();
+        let second_head = replacement
+            .latest_revision_id_for(&owner.id)
+            .expect("the modification mints a new head revision");
+        assert_ne!(
+            second_head, first_head,
+            "the content change must advance the head"
+        );
+        SnapshotManager::save_graph(&snapshot_path, &replacement).unwrap();
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        let graph = reopened.graph();
+        assert_eq!(
+            graph.embedding_status().indexed,
+            0,
+            "the superseded revision is pruned and the stale head is retired, not served"
+        );
+        graph.queue_missing_for_embedding();
+        assert_eq!(
+            graph.pending_embeddings(),
+            2,
+            "exactly the new head revision and the entity head re-queue"
+        );
+        assert!(
+            vector_path.exists(),
+            "salvage never moves or deletes the sidecar"
+        );
+        assert!(!archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// A genuinely corrupted index refuses loudly: it is archived aside under
+    /// its named check and the store rebuilds, rather than serving garbage or
+    /// failing the open. This is the control that proves the salvage path
+    /// cannot be fooled by unreadable bytes.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn corrupted_index_bytes_refuse_loudly_and_archive() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("corrupt_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+        drop(graph);
+        drop(mgr);
+
+        std::fs::write(&vector_path, b"garbage: not a vector index").unwrap();
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(reopened.graph().embedding_status().indexed, 0);
+        assert_eq!(
+            reopened.graph().pending_embeddings(),
+            1,
+            "the refusal queues a clean rebuild"
+        );
+        assert!(
+            !vector_path.exists(),
+            "corrupt bytes are moved aside, never served in place"
+        );
+        assert!(archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// The deliberate-invalidation fence survives the salvage change: a stamp
+    /// zeroed by `invalidate_derived_sidecars` before an inexact delta commit
+    /// still refuses (with its named check), is preserved on disk, and queues a
+    /// rebuild. Salvage must never resurrect a fenced sidecar.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn deliberately_invalidated_stamp_refuses_without_salvage() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("fenced_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+
+        SnapshotManager::invalidate_derived_sidecars(&snapshot_path, graph.as_ref()).unwrap();
+        drop(graph);
+        drop(mgr);
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            0,
+            "a fenced sidecar must not be salvaged"
+        );
+        assert_eq!(reopened.graph().pending_embeddings(), 1);
+        assert!(
+            vector_path.exists(),
+            "a fenced sidecar is preserved in place, not archived"
+        );
+        assert!(!archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// An embedding-space mismatch in the sidecar metadata refuses without
+    /// touching the file: the vectors live in another model's space, the
+    /// refusal names the failing field, and a rebuild queues. Unlike a
+    /// descriptor contradiction this is not archived — the pair is internally
+    /// consistent, just for a different runtime.
+    #[test]
+    #[cfg(all(feature = "vector", feature = "embeddings"))]
+    fn metadata_model_mismatch_refuses_in_place_and_requeues() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("model_mismatch_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+
+        let mut metadata = read_vector_index_metadata(&metadata_path)
+            .unwrap()
+            .expect("the save writes sidecar metadata");
+        metadata.embedding_model_id = "definitely-not-the-runtime-model@9".into();
+        write_vector_index_metadata(&metadata_path, &metadata).unwrap();
+        drop(graph);
+        drop(mgr);
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(reopened.graph().embedding_status().indexed, 0);
+        assert_eq!(reopened.graph().pending_embeddings(), 1);
+        assert!(
+            vector_path.exists(),
+            "a foreign-space sidecar is preserved in place"
+        );
+        assert!(!archived_sidecar_path(&vector_path).exists());
     }
 
     /// "Model swap on a live repo": an index that positively declares a DIFFERENT
@@ -5844,11 +6325,11 @@ mod tests {
     }
 
     /// A save from a graph that never loaded the vector index (e.g. it was
-    /// skipped on reopen because the sidecar metadata no longer matched the
-    /// graph root hash) must NOT delete the on-disk sidecar. An unloaded
-    /// in-memory index means "not loaded", never "the repo has no vectors", so
-    /// deleting graph-owned truth here would be silent data loss — the exact
-    /// prepared-state kvec-drop regression.
+    /// refused on reopen because the stamp was deliberately invalidated) must
+    /// NOT delete the on-disk sidecar. An unloaded in-memory index means "not
+    /// loaded", never "the repo has no vectors", so deleting graph-owned truth
+    /// here would be silent data loss — the exact prepared-state kvec-drop
+    /// regression.
     #[test]
     #[cfg(feature = "vector")]
     fn save_with_unloaded_index_preserves_on_disk_vector_sidecar() {
@@ -5863,21 +6344,22 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         mgr.save().unwrap();
 
-        // Write a sidecar whose metadata root hash does not match the graph, so
-        // the next reopen skips loading it and leaves the in-memory index None.
+        // Write a sidecar whose stamp is deliberately zeroed (the fence a delta
+        // commit leaves behind), so the next reopen refuses it in place and
+        // leaves the in-memory index None.
         let vectors = VectorIndex::new(4).unwrap();
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors.save(&vector_path).unwrap();
         write_vector_index_metadata(
             &metadata_path,
-            &current_vector_metadata([42u8; 32], 4, 1, "preserved-sidecar"),
+            &current_vector_metadata([0u8; 32], 4, 1, "preserved-sidecar"),
         )
         .unwrap();
         let bytes_before = std::fs::metadata(&vector_path).unwrap().len();
         assert!(bytes_before > 0, "seeded sidecar should be non-empty");
 
-        // Reopen (index skipped as stale -> in-memory None) and save again. The
-        // sidecar and its metadata must survive the save untouched.
+        // Reopen (index refused -> in-memory None) and save again. The sidecar
+        // and its metadata must survive the save untouched.
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
         assert_eq!(reloaded.graph().embedding_status().indexed, 0);
         reloaded.save().unwrap();
@@ -6581,15 +7063,22 @@ mod tests {
         );
     }
 
-    /// `vector_metadata_matches_graph`: embedder_identity mismatch must reject.
+    /// `classify_vector_sidecar`: embedder_identity mismatch must refuse, and
+    /// the refusal must name the failing comparison.
     #[test]
     #[cfg(feature = "vector")]
     fn embedder_identity_mismatch_rejects() {
         let root = [1u8; 32];
         let metadata = current_vector_metadata(root, 768, 1, "sha256-aabbcc");
         assert!(
-            !vector_metadata_matches_graph(&metadata, root, Some("sha256-ddeeff")),
-            "different embedder_identity must reject"
+            matches!(
+                classify_vector_sidecar(&metadata, root, Some("sha256-ddeeff")),
+                SidecarVerdict::Refuse {
+                    check: "embedder_identity",
+                    ..
+                }
+            ),
+            "different embedder_identity must refuse under its own named check"
         );
     }
 
@@ -6602,20 +7091,56 @@ mod tests {
         value.as_object_mut().unwrap().remove("embedder_identity");
         assert!(serde_json::from_value::<VectorIndexMetadata>(value).is_err());
         assert!(
-            vector_metadata_matches_graph(&metadata, root, None),
+            matches!(
+                classify_vector_sidecar(&metadata, root, None),
+                SidecarVerdict::Exact
+            ),
             "a bound sidecar remains valid when the caller adds no stricter producer pin"
         );
     }
 
-    /// `vector_metadata_matches_graph`: matching identities on both sides loads.
+    /// `classify_vector_sidecar`: matching identities on both sides loads.
     #[test]
     #[cfg(feature = "vector")]
     fn embedder_identity_match_loads() {
         let root = [1u8; 32];
         let metadata = current_vector_metadata(root, 768, 1, "sha256-aabbcc");
         assert!(
-            vector_metadata_matches_graph(&metadata, root, Some("sha256-aabbcc")),
+            matches!(
+                classify_vector_sidecar(&metadata, root, Some("sha256-aabbcc")),
+                SidecarVerdict::Exact
+            ),
             "matching embedder_identity must load"
+        );
+    }
+
+    /// `classify_vector_sidecar`: a real stamp that differs from the current
+    /// authority hash is drift (salvageable), while the zeroed stamp written by
+    /// deliberate invalidation refuses under its own named check. The fence
+    /// stays a fence.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn stamp_drift_salvages_but_zeroed_stamp_refuses() {
+        let stamped = [1u8; 32];
+        let metadata = current_vector_metadata(stamped, 768, 1, "sha256-aabbcc");
+        assert!(
+            matches!(
+                classify_vector_sidecar(&metadata, [2u8; 32], None),
+                SidecarVerdict::StampDrift
+            ),
+            "a real but different stamp must classify as salvageable drift"
+        );
+
+        let zeroed = current_vector_metadata([0u8; 32], 768, 1, "sha256-aabbcc");
+        assert!(
+            matches!(
+                classify_vector_sidecar(&zeroed, [2u8; 32], None),
+                SidecarVerdict::Refuse {
+                    check: "graph_authority_stamp",
+                    ..
+                }
+            ),
+            "a deliberately zeroed stamp must refuse under its own named check"
         );
     }
 
@@ -6658,13 +7183,22 @@ mod tests {
         // Same identity → loads.
         let root = graph.retrieval_authority_hash();
         assert!(
-            vector_metadata_matches_graph(&stored_metadata, root, Some("build-v1")),
+            matches!(
+                classify_vector_sidecar(&stored_metadata, root, Some("build-v1")),
+                SidecarVerdict::Exact
+            ),
             "matching identity must load"
         );
-        // Different identity → rejects.
+        // Different identity → refuses under the named check.
         assert!(
-            !vector_metadata_matches_graph(&stored_metadata, root, Some("build-v2")),
-            "different identity must reject"
+            matches!(
+                classify_vector_sidecar(&stored_metadata, root, Some("build-v2")),
+                SidecarVerdict::Refuse {
+                    check: "embedder_identity",
+                    ..
+                }
+            ),
+            "different identity must refuse"
         );
     }
 }
