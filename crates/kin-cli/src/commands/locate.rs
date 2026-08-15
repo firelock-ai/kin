@@ -249,9 +249,17 @@ fn is_false(value: &bool) -> bool {
 /// query named a real symbol, because the scores look the same either way: they
 /// are composite ranks within a result set, not evidence that anything matched.
 ///
-/// This never affects ranking or ordering. It is a statement about what the hit
-/// IS, computed from the same exact-token predicate the `semantic_locate`
-/// evidence object reports, so the two surfaces cannot drift apart.
+/// Computed from the same exact-token predicate the `semantic_locate` evidence
+/// object reports, so the two surfaces cannot drift apart. It is a statement
+/// about what the hit IS, and since the exact-name tier landed it is also a
+/// ranking input: entity ordering places `Name` hits above the other kinds
+/// within each definition band, because composite scores are not comparable
+/// across kinds. A `text_fallback` score grows with lexical corpus mass while
+/// an exact-name score is a fixed product, so at flagship scale lexical
+/// neighbors outbid the symbol the query literally named (measured on a
+/// 26,633-entity store: two text-fallback rows at 652/602 above the exact
+/// qualified match at 460). The tier makes exactness un-outbiddable at any
+/// corpus scale; scores still order hits within a tier.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocateMatchKind {
@@ -377,6 +385,28 @@ fn classify_locate_match(query: &str, name: &str, origin: &str) -> LocateMatchKi
         LocateMatchKind::Semantic
     } else {
         LocateMatchKind::TextFallback
+    }
+}
+
+/// Ordering tier of a ranked hit: exact-name hits above everything else.
+///
+/// The single place the exact-name tier is defined, read by both entity
+/// orderings (the per-query projection and the multi-query fusion), so the two
+/// surfaces cannot disagree about what outranks what. Derived from
+/// [`LocateMatchKind`], which is itself derived from [`query_names_entity`]:
+/// one predicate, stated once.
+///
+/// This exists because composite scores are not comparable across match kinds.
+/// The text-fallback scale is additive over lexical hits and grows with corpus
+/// mass, while an exact-name match scores a fixed product, so a large enough
+/// store hands rank 1 to a lexical neighbor over the symbol the query literally
+/// named. No score cap fixes that without flattening honest fallback ordering
+/// on queries that name nothing; a tier fixes it at every corpus scale and
+/// leaves scores meaningful within each tier.
+fn locate_exact_name_tier(entity: &LocateEntity) -> u8 {
+    match entity.match_kind {
+        Some(LocateMatchKind::Name) => 1,
+        _ => 0,
     }
 }
 
@@ -16324,11 +16354,14 @@ pub fn build_entity_view(
         }
     }
 
-    // Global rank: definitions first, then composite score desc, then the file's
+    // Global rank: definitions first, then the exact-name tier
+    // ([`locate_exact_name_tier`]: a hit the query literally named cannot be
+    // outbid by fallback scale), then composite score desc, then the file's
     // own rank, then name/id for a total deterministic order.
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.definition
             .cmp(&a.definition)
+            .then_with(|| locate_exact_name_tier(b).cmp(&locate_exact_name_tier(a)))
             .then_with(|| {
                 b.score
                     .partial_cmp(&a.score)
@@ -16527,12 +16560,17 @@ fn locate_entity_tiebreak_path(entity: &LocateEntity) -> &str {
 /// deduped result via Reciprocal Rank Fusion. `variants` is the ordered variant
 /// text (index-aligned with `results`; index 0 is the primary query). Entities
 /// are fused by `entity_id`, files by path; each fused hit records which variant
-/// texts surfaced it in `matched_queries`. Ordering is RRF-score-descending with
-/// deterministic tie-breaks (entities by file path then id; files by path). The
-/// per-hit composite `score` is preserved from the hit's best-ranked variant —
-/// array order carries the fused ranking. `degradations` are unioned; the debug
-/// object and semantic coverage are taken from the primary variant. With a single
-/// variant this returns that result unchanged (no fusion, no attribution).
+/// texts surfaced it in `matched_queries`. Entity ordering honors the exact-name
+/// tier first ([`locate_exact_name_tier`] on the carried record), then RRF score
+/// descending with deterministic tie-breaks (file path then id); the tier holds
+/// at the fusion layer because a fallback row surfaced by every variant can
+/// out-sum a name hit's rank reciprocals, which would hand the fused rank 1 back
+/// to the lexical neighbor the per-variant tier just demoted. Files stay
+/// RRF-descending (path tie-break). The per-hit composite `score` is preserved
+/// from the hit's best-ranked variant — array order carries the fused ranking.
+/// `degradations` are unioned; the debug object and semantic coverage are taken
+/// from the primary variant. With a single variant this returns that result
+/// unchanged (no fusion, no attribution).
 pub fn fuse_locate_results(
     variants: Vec<String>,
     results: Vec<LocateResult>,
@@ -16547,8 +16585,9 @@ pub fn fuse_locate_results(
 
     let mut fused_entities = rrf_fuse(&entity_lists, |e| e.identity_key().to_string(), rrf_k);
     fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
-        sb.partial_cmp(sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        locate_exact_name_tier(b)
+            .cmp(&locate_exact_name_tier(a))
+            .then_with(|| sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
@@ -18532,6 +18571,196 @@ mod tests {
             .find(|entity| entity.name == "InMemoryGraph::descriptor")
             .expect("the other symbol still ranks");
         assert_eq!(other.match_kind, Some(LocateMatchKind::TextFallback));
+    }
+
+    /// FIR-2338, the per-query half, in the shape the flagship gauntlet
+    /// measured on shipped 0.5.33: probe qf01 asked for
+    /// `RepositoryAuthorityState::resolve_ref_target` by its exact qualified
+    /// name, the match scored its fixed 460, and two `text_fallback` rows
+    /// outbid it at 652.03 and 602.06 because the fallback scale is additive
+    /// over lexical mass while exactness is a fixed product. 3,166 entities
+    /// never expressed it; 26,633 did.
+    ///
+    /// The control is the scale sweep: the distractor's score grows without
+    /// bound and the exact-name hit must hold rank 1 at EVERY magnitude,
+    /// because the exact-name tier is consulted before the score. Under
+    /// score-first ordering the first iteration already fails.
+    #[test]
+    fn an_exact_name_hit_cannot_be_outbid_by_text_fallback_at_any_scale() {
+        let graph = kin_db::InMemoryGraph::new();
+        let path = "crates/kin-db/src/storage/repository.rs";
+        graph
+            .upsert_entity(&test_entity(
+                "RepositoryAuthorityState::resolve_ref_target",
+                path,
+                100,
+                140,
+            ))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity(
+                "repository_authority_state_contains_commit",
+                path,
+                200,
+                260,
+            ))
+            .unwrap();
+        let symbol = |name: &str, span: [u32; 2], score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some(span),
+            score,
+            kind: "method".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+
+        // 652.03 is the score the gauntlet measured; the larger magnitudes are
+        // the "any corpus scale" claim made executable.
+        for distractor_score in [652.03_f32, 1.0e6, 1.0e9] {
+            let mut result = LocateResult {
+                files: vec![LocateFileEntry {
+                    path: path.to_string(),
+                    score: 0.2,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![
+                        symbol(
+                            "repository_authority_state_contains_commit",
+                            [200, 260],
+                            distractor_score,
+                        ),
+                        symbol(
+                            "RepositoryAuthorityState::resolve_ref_target",
+                            [100, 140],
+                            460.0,
+                        ),
+                    ],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                }],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                "RepositoryAuthorityState::resolve_ref_target",
+            )
+            .unwrap();
+            assert_eq!(
+                result.entities[0].name, "RepositoryAuthorityState::resolve_ref_target",
+                "the exact qualified match must hold rank 1 against a fallback \
+                 score of {distractor_score}"
+            );
+            assert_eq!(result.entities[0].match_kind, Some(LocateMatchKind::Name));
+        }
+
+        // Control: with no name hit in the ranking, fallback rows still order
+        // by score, so the tier is about exactness rather than a reorder of
+        // everything.
+        let mut fallback_only = LocateResult {
+            files: vec![LocateFileEntry {
+                path: path.to_string(),
+                score: 0.2,
+                signals: vec![],
+                spans: vec![],
+                symbols: vec![
+                    symbol(
+                        "RepositoryAuthorityState::resolve_ref_target",
+                        [100, 140],
+                        460.0,
+                    ),
+                    symbol(
+                        "repository_authority_state_contains_commit",
+                        [200, 260],
+                        652.03,
+                    ),
+                ],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut fallback_only,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how are refs resolved against repository authority",
+        )
+        .unwrap();
+        assert!(
+            fallback_only
+                .entities
+                .iter()
+                .all(|entity| entity.match_kind != Some(LocateMatchKind::Name)),
+            "control precondition: this query names neither entity"
+        );
+        assert_eq!(
+            fallback_only.entities[0].name, "repository_authority_state_contains_commit",
+            "with no exact-name hit, score order is untouched"
+        );
+    }
+
+    /// FIR-2338, the fusion half. RRF sums rank reciprocals per variant, so a
+    /// lexical neighbor surfaced at rank 1 by EVERY variant out-sums an exact
+    /// name hit one variant ranked first, and fusion hands rank 1 back to the
+    /// row the per-variant tier just demoted. The carried record's match kind
+    /// is the tier at this layer too.
+    #[test]
+    fn multiquery_fusion_keeps_the_exact_name_hit_above_fallback_rrf_mass() {
+        let with_kind = |name: &str, kind| {
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(kind);
+            entity
+        };
+        // "neighbor" leads both variant lists: RRF 2/(k+1). "exact" appears
+        // only in the primary list at rank 2: RRF 1/(k+3). Score order and RRF
+        // order both prefer the neighbor; only the tier can pick the name hit.
+        let fused = fuse_locate_results(
+            vec!["q0".to_string(), "q1".to_string()],
+            vec![
+                fusion_result(vec![
+                    with_kind("neighbor", LocateMatchKind::TextFallback),
+                    with_kind("filler", LocateMatchKind::TextFallback),
+                    with_kind("exact", LocateMatchKind::Name),
+                ]),
+                fusion_result(vec![
+                    with_kind("neighbor", LocateMatchKind::TextFallback),
+                    with_kind("filler", LocateMatchKind::TextFallback),
+                ]),
+            ],
+            60.0,
+        );
+        assert_eq!(
+            fused.entities[0].name, "exact",
+            "the name hit must lead the fused ranking over fallback RRF mass"
+        );
+        // Control: among fallback rows RRF still decides, so the tier did not
+        // flatten the fused ordering.
+        let neighbor_pos = fused
+            .entities
+            .iter()
+            .position(|entity| entity.name == "neighbor")
+            .unwrap();
+        let filler_pos = fused
+            .entities
+            .iter()
+            .position(|entity| entity.name == "filler")
+            .unwrap();
+        assert!(
+            neighbor_pos < filler_pos,
+            "fallback rows keep their RRF order below the name tier"
+        );
     }
 
     #[test]
