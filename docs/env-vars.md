@@ -58,7 +58,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
-| `KIN_NO_DAEMON` | bool | false | operational | force in-process execution instead of the daemon |
+| `KIN_NO_DAEMON` | bool | false | operational | never start or revive a daemon; bind only an already-running one (the probe contract behind `kin mcp start --no-spawn`) |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
 | `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |
 | `KIN_ORG_ID` | string | *(unset)* | operational | organization id for federation/remote |

@@ -564,8 +564,10 @@ setups should use `@kinlab/kin`, which includes the same MCP server as `kin mcp 
 The Kin daemon is the canonical authority for graph truth and auto-starts as needed for
 normal use. The escape hatches:
 
-- `KIN_NO_DAEMON=1`: disable daemon auto-start (use only an already-running daemon or
-  `KIN_DAEMON_URL`).
+- `KIN_NO_DAEMON=1`: never start or revive a daemon (use only an already-running daemon or
+  `KIN_DAEMON_URL`). This is the probe contract: `kin mcp start --no-spawn` sets it so
+  scheduled and boot-time checks can hold the full MCP handshake while provably spawning
+  nothing, and graph calls without a running daemon fail loud instead of starting one.
 - `KIN_DAEMON_URL`: point the CLI at an explicit daemon endpoint.
 - `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN=1`: offline/admin escape hatch that lets the read-only
   in-process commands fall back to reading the local `.kin` snapshot directly. It is never

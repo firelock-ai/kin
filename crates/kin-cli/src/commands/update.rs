@@ -254,9 +254,17 @@ fn channel_name(channel: Channel) -> &'static str {
 ///
 /// Updating is not a background detail here. Kin's binaries sit under live
 /// agent sessions, daemons part-way through embedding, MCP servers bound into
-/// running CLIs, and VFS shims mapped into other processes. Swapping bytes out
-/// from under all of that without being asked is the mechanism that produces
-/// the stale-runtime drift the watchdog then reports, so the default is to ask.
+/// running CLIs, and VFS shims mapped into other processes. What makes an
+/// unattended swap survivable is not asking first. It is the machinery around
+/// the install: the activity gates and bounded deferral decide when, the
+/// preflight stops every managed serving executable before bytes move, the
+/// restart fence forces the new binary to acknowledge, and stores reopen
+/// through per-key salvage. With that machinery in place, the default is to
+/// install (founder ruling, 2026-08-15): a machine that silently falls
+/// releases behind is the failure mode that actually happened: the founder's
+/// install sat eight releases stale until the drift itself helped take the
+/// machine down (FIR-2342). `kin update --set-policy prompt|manual` remains
+/// the opt-out.
 #[derive(
     Clone,
     Copy,
@@ -270,22 +278,44 @@ fn channel_name(channel: Channel) -> &'static str {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum UpdatePolicy {
-    /// Install unattended, but only when the machine is provably idle. The
-    /// default is not this: a silent swap under live sessions is exactly the
-    /// failure this policy exists to bound.
+    /// Install unattended through the gated executor. The default: a missing
+    /// or policy-less `update.toml` means auto, in this binary and in the
+    /// update watchdog's shell parser, which must stay in lockstep.
+    #[default]
     Auto,
     /// Notify with the remedy attached and install when the person says so.
-    #[default]
     Prompt,
     /// Never notify about an available update. Checks still run.
     Manual,
 }
 
-fn policy_name(policy: UpdatePolicy) -> &'static str {
+pub(crate) fn policy_name(policy: UpdatePolicy) -> &'static str {
     match policy {
         UpdatePolicy::Auto => "auto",
         UpdatePolicy::Prompt => "prompt",
         UpdatePolicy::Manual => "manual",
+    }
+}
+
+/// The active update policy plus whether a person recorded it, for the doctor
+/// surface. Inherited-default and recorded-choice are different answers: the
+/// first moves with the shipped default (auto since FIR-2342), the second
+/// never moves except by `kin update --set-policy`.
+pub(crate) fn active_update_policy_for_doctor() -> (UpdatePolicy, bool) {
+    #[derive(serde::Deserialize)]
+    struct PolicyProbe {
+        policy: Option<UpdatePolicy>,
+    }
+    let Ok(kin_home) = crate::commands::setup::kin_dir() else {
+        return (UpdatePolicy::default(), false);
+    };
+    let recorded = std::fs::read_to_string(kin_home.join("update.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<PolicyProbe>(&text).ok())
+        .and_then(|probe| probe.policy);
+    match recorded {
+        Some(policy) => (policy, true),
+        None => (UpdatePolicy::default(), false),
     }
 }
 
@@ -555,13 +585,20 @@ fn set_update_policy(policy: UpdatePolicy) -> Result<()> {
         policy_name(policy),
         policy_name(stored.policy)
     );
-    if policy != UpdatePolicy::Prompt {
-        println!(
-            "Recorded, not yet enforced: every mode behaves as prompt today. The recorded \
-             choice takes effect when the notifier honors it; unattended installs will run \
-             only when no agent session, managed Kin process, or part-way indexing job is \
-             detected, and Kin asks instead when that cannot be determined."
-        );
+    match policy {
+        UpdatePolicy::Auto => println!(
+            "Unattended installs run through `kin update --unattended` (the update watchdog \
+             invokes it): they wait for a moment with no managed Kin process or agent session, \
+             defer at most {UNATTENDED_DEFERRAL_WINDOW_HOURS}h, and always stop managed \
+             processes, install, and acknowledge the restart fence as one chain."
+        ),
+        UpdatePolicy::Prompt => {
+            println!("Kin will notify with the remedy attached and install only when told to.")
+        }
+        UpdatePolicy::Manual => println!(
+            "Kin will not notify about available updates. Checks still run and `kin update` \
+             still works when invoked."
+        ),
     }
     Ok(())
 }
@@ -798,12 +835,17 @@ pub async fn run(
     set_policy: Option<UpdatePolicy>,
     apply: bool,
     dry_run: bool,
+    unattended: bool,
+    force_window: bool,
 ) -> Result<()> {
     // Setting the policy is a preference write and nothing else. It runs before
     // any expectation parsing, network client, or install-root inspection so
     // that changing how updates arrive never depends on one being available.
     if let Some(policy) = set_policy {
         return set_update_policy(policy);
+    }
+    if unattended {
+        return run_unattended(force_window).await;
     }
     if dry_run && !apply {
         anyhow::bail!("--dry-run describes what --apply would do; pass both or neither");
@@ -1323,6 +1365,493 @@ fn registry_authority_preflight() -> Result<()> {
             "update preflight refused unsafe local registry authority; no release bytes were downloaded: {error}"
         )
     })
+}
+
+// ── Unattended executor ─────────────────────────────────────────────────────
+//
+// `kin update --unattended` is the executor behind the auto policy (FIR-2342):
+// the update watchdog invokes it on drift, it decides through
+// `decide_auto_update`, and on Proceed it runs the same
+// stop → install → acknowledge → repair chain a person triggers with
+// `kin update --apply`. Its stdout contract is one JSON object on the final
+// line, the same serialization appended to `$KIN_HOME/update-ledger.jsonl`,
+// so the caller and the artifact trail read one encoding.
+
+/// How long unattended updating may keep deferring to activity gates before
+/// the caller is entitled to force the window. The bound implements the
+/// founder ruling that agent sessions alone do not block forever: on a fleet
+/// machine `external_sessions` is true around the clock, so pure gating means
+/// never, and never is what left the incident machine eight releases stale.
+pub const UNATTENDED_DEFERRAL_WINDOW_HOURS: u64 = 24;
+
+const UNATTENDED_SCHEMA: &str = "kin.update-unattended.v1";
+const UNATTENDED_DEFERRAL_SCHEMA_VERSION: u32 = 1;
+
+fn unattended_deferral_path(kin_home: &Path) -> PathBuf {
+    kin_home.join("update-deferral.json")
+}
+
+fn update_ledger_path(kin_home: &Path) -> PathBuf {
+    kin_home.join("update-ledger.jsonl")
+}
+
+/// When unattended updating first found itself blocked, persisted so the
+/// deferral clock survives the six-hourly watchdog processes that read it.
+/// The clock deliberately does not reset when a newer release appears while
+/// blocked: the bound is on how long this machine stays behind, and a fleet
+/// shipping several releases a day would otherwise never converge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UnattendedDeferral {
+    schema_version: u32,
+    first_blocked_at: String,
+    first_blocked_at_unix_seconds: u64,
+    reason: String,
+    latest_version_seen: String,
+}
+
+/// One line of the update ledger, and byte-for-byte the final stdout line of
+/// `kin update --unattended`. `decision` records what the gate said
+/// (`proceed`, `prompt`, `silent`, or `forced-proceed`); `outcome` records
+/// what actually happened (`applied`, `deferred`, `silent`, `current`, or
+/// `failed`). `window_seconds` republishes the deferral bound so the caller
+/// compares `blocked_seconds` against the executor's own constant instead of
+/// carrying a second copy of it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct UnattendedLedgerEntry {
+    schema: String,
+    at: String,
+    policy: String,
+    decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    forced: bool,
+    from_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to_version: Option<String>,
+    update_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_blocked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_seconds: Option<u64>,
+    window_seconds: u64,
+    steps: Vec<String>,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl UnattendedLedgerEntry {
+    fn begin(policy: UpdatePolicy, forced: bool) -> Self {
+        Self {
+            schema: UNATTENDED_SCHEMA.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+            policy: policy_name(policy).to_string(),
+            decision: String::new(),
+            reason: None,
+            forced,
+            from_version: CURRENT_VERSION.to_string(),
+            to_version: None,
+            update_available: false,
+            first_blocked_at: None,
+            blocked_seconds: None,
+            window_seconds: UNATTENDED_DEFERRAL_WINDOW_HOURS * 3600,
+            steps: Vec::new(),
+            outcome: String::new(),
+            error: None,
+        }
+    }
+}
+
+fn load_unattended_deferral(kin_home: &Path) -> Option<UnattendedDeferral> {
+    let bytes = fs::read(unattended_deferral_path(kin_home)).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            // An unreadable state file restarts the clock, which defers longer
+            // rather than forcing earlier, which is the safe direction, but it must
+            // say so, because a clock that silently restarts reads exactly
+            // like one that never started.
+            eprintln!(
+                "Note: {} is unreadable ({error}); the deferral clock restarts from now.",
+                unattended_deferral_path(kin_home).display()
+            );
+            None
+        }
+    }
+}
+
+/// Record the first blocked moment, or return the one already recorded.
+fn record_unattended_blocked(
+    kin_home: &Path,
+    reason: &str,
+    latest_version: &str,
+) -> Result<UnattendedDeferral> {
+    if let Some(existing) = load_unattended_deferral(kin_home) {
+        return Ok(existing);
+    }
+    let now = chrono::Utc::now();
+    let state = UnattendedDeferral {
+        schema_version: UNATTENDED_DEFERRAL_SCHEMA_VERSION,
+        first_blocked_at: now.to_rfc3339(),
+        first_blocked_at_unix_seconds: now.timestamp().max(0) as u64,
+        reason: reason.to_string(),
+        latest_version_seen: latest_version.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state).context("serialize unattended deferral state")?;
+    let path = unattended_deferral_path(kin_home);
+    let staged = kin_home.join(format!(".update-deferral.tmp.{}", std::process::id()));
+    {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&staged)
+            .with_context(|| format!("stage unattended deferral state at {}", staged.display()))?;
+        file.write_all(&bytes)
+            .context("write unattended deferral state")?;
+    }
+    fs::rename(&staged, &path)
+        .with_context(|| format!("persist unattended deferral state at {}", path.display()))?;
+    Ok(state)
+}
+
+/// Forget the deferral clock. Called when the machine converges (an apply
+/// succeeded, or nothing needs applying), so the next blocked stretch starts
+/// its own window.
+fn clear_unattended_deferral(kin_home: &Path) {
+    let path = unattended_deferral_path(kin_home);
+    if let Err(error) = fs::remove_file(&path) {
+        if error.kind() != io::ErrorKind::NotFound {
+            eprintln!("Note: could not clear {} ({error}).", path.display());
+        }
+    }
+}
+
+/// Append one entry to `$KIN_HOME/update-ledger.jsonl`. Append-only by
+/// construction: the file is opened `O_APPEND` and each entry is a single
+/// line, so concurrent writers interleave whole records rather than bytes.
+fn append_update_ledger(kin_home: &Path, entry: &UnattendedLedgerEntry) -> Result<()> {
+    let path = update_ledger_path(kin_home);
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("open update ledger at {}", path.display()))?;
+    let mut line = serde_json::to_vec(entry).context("serialize update ledger entry")?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .with_context(|| format!("append update ledger at {}", path.display()))
+}
+
+/// Deliver the run's one record: append it to the ledger and print it as the
+/// final stdout line. Ledger delivery failure is reported and never converts
+/// the run's real outcome into a failure: by this point the outcome already
+/// happened.
+fn conclude_unattended(kin_home: &Path, entry: &UnattendedLedgerEntry) {
+    if let Err(error) = append_update_ledger(kin_home, entry) {
+        eprintln!("Note: could not append the update ledger: {error:#}");
+    }
+    match serde_json::to_string(entry) {
+        Ok(line) => println!("{line}"),
+        Err(error) => eprintln!("Note: could not serialize the unattended report: {error}"),
+    }
+}
+
+/// What this machine is doing right now, observed from the process table with
+/// the same matcher the update preflight refuses on, so the executor can
+/// never believe idle a machine the preflight would reject.
+///
+/// Gate semantics under policy auto (FIR-2342), stated once here:
+/// - `external_sessions`: a managed MCP serving process is alive, the stdio
+///   transport an agent session holds open. Defers the install; never blocks
+///   it forever, because the caller passes `--force-window` once the bounded
+///   deferral window is spent.
+/// - `managed_runtimes_active`: a managed daemon or VFS server is alive.
+///   Same deferral semantics; the orchestrated stop makes the forced path
+///   safe by stopping them cooperatively before any byte moves.
+/// - `work_in_flight`: work executing inside a store is only observable
+///   through a live daemon, and a live daemon already defers through
+///   `managed_runtimes_active`. With no daemon running nothing is executing,
+///   and pending-but-paused work resumes under the new binary through per-key
+///   salvage, so this probe reports `false` rather than opening a store to
+///   ask. Opening one spawns the exact heavy daemon the probe rules exist to
+///   avoid (FIR-2341).
+/// - `readable`: whether this scan ran at all. The scan is a synchronous
+///   process-table walk that either returns or the process errors before
+///   constructing an answer, so a constructed `MachineActivity` is always a
+///   read one.
+fn probe_machine_activity(kin_home: &Path, spec: &[ComponentSpec]) -> MachineActivity {
+    let mut system = System::new_all();
+    system.refresh_all();
+    let mut managed_runtimes_active = false;
+    let mut external_sessions = false;
+    for (kind, _, _) in scan_active_managed_runtimes(&system, kin_home, spec) {
+        match kind {
+            RuntimeKind::Mcp => external_sessions = true,
+            RuntimeKind::Daemon | RuntimeKind::Vfs => managed_runtimes_active = true,
+        }
+    }
+    MachineActivity {
+        managed_runtimes_active,
+        external_sessions,
+        work_in_flight: false,
+        readable: true,
+    }
+}
+
+/// Stop every managed serving executable so the unattended chain can run,
+/// instead of refusing the way the interactive preflight does.
+///
+/// Safety, in order:
+/// 1. The cooperative machine-scope sweep full uninstall already uses
+///    (workers first, supervisor last, incarnation-bound); the same
+///    reasoning applies: the update replaces the binaries every daemon on
+///    this box serves from.
+/// 2. Managed serving processes the sweep does not own (MCP stdio servers
+///    agents hold open, VFS servers) get SIGTERM. The scan matches only
+///    executables of the managed install, so nothing outside Kin's own set
+///    can be signaled, and every one of them restarts on demand (agents
+///    respawn their MCP servers, daemons autostart on next use), so the cost
+///    is a reconnect, never data: stores reopen through per-key salvage and
+///    the restart fence forces the new binary to acknowledge.
+/// 3. A bounded drain (the daemon's own shutdown escalation force-exits
+///    ~25 s after TERM, so the bound clears it), then anything still serving
+///    fails the run loudly. Updating under a live managed process is never
+///    attempted; the interactive preflight's fences all still run behind
+///    this.
+async fn stop_managed_runtimes_for_update(
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+) -> Result<Vec<String>> {
+    let mut actions = Vec::new();
+    match crate::commands::daemon::stop_all_quiet().await {
+        Ok(()) => actions.push("stopped managed daemons and supervisor cooperatively".to_string()),
+        // The sweep failing (no supervisor to talk to, a worker already gone)
+        // is not the verdict; the drain scan below is. Record what it said.
+        Err(error) => actions.push(format!("cooperative daemon stop reported: {error:#}")),
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let mut signaled: HashSet<u32> = HashSet::new();
+    loop {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let residual = scan_active_managed_runtimes(&system, kin_home, spec);
+        if residual.is_empty() {
+            return Ok(actions);
+        }
+        #[cfg(unix)]
+        for (kind, component, pid) in &residual {
+            if signaled.insert(*pid) {
+                // SAFETY: plain signal delivery to a pid this scan just
+                // matched against the managed install's own executables.
+                let rc = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM) };
+                if rc == 0 {
+                    actions.push(format!(
+                        "sent SIGTERM to managed {} {} (pid {pid})",
+                        kind.label(),
+                        component
+                    ));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = &mut signaled;
+        if std::time::Instant::now() >= deadline {
+            let survivors = residual
+                .iter()
+                .map(|(kind, component, pid)| format!("{} {} (pid {pid})", kind.label(), component))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "managed serving executables survived the unattended stop: {survivors}; nothing \
+                 was installed"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Whether an unattended run may apply. Pure, so the force-window rule is
+/// testable without a network or a process table.
+///
+/// `--force-window` overrides only the activity gates under policy auto, the
+/// executor's own caution, which the founder ruling bounds at
+/// [`UNATTENDED_DEFERRAL_WINDOW_HOURS`]. A recorded `prompt` or `manual`
+/// policy is a person's explicit choice about being asked, and no window
+/// makes an explicit choice expire.
+fn unattended_may_proceed(
+    policy: UpdatePolicy,
+    decision: &AutoDecision,
+    force_window: bool,
+) -> bool {
+    matches!(decision, AutoDecision::Proceed)
+        || (force_window
+            && policy == UpdatePolicy::Auto
+            && matches!(decision, AutoDecision::Prompt(_)))
+}
+
+/// The exact chain `kin update --apply` runs, callable from the executor.
+async fn run_apply_chain() -> Result<()> {
+    run_update_flow(
+        false,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        Vec::new(),
+        true,
+        false,
+    )
+    .await?;
+    run_chain_tail()
+}
+
+/// `kin update --unattended [--force-window]`: evaluate the auto-update
+/// decision against live machine activity and act on it, reporting one
+/// machine-readable record (see [`UnattendedLedgerEntry`]).
+///
+/// `--force-window` applies despite the activity gates, and exists for
+/// exactly one caller shape: the watchdog observing `blocked_seconds >=
+/// window_seconds` in a previous deferred record. It never overrides a
+/// recorded `prompt` or `manual` policy: those are a person's explicit
+/// choice about being asked, while the gates are the executor's own caution,
+/// which is what the ruling bounds.
+pub async fn run_unattended(force_window: bool) -> Result<()> {
+    let requested_home = crate::commands::setup::kin_dir()?;
+    let kin_home = validate_existing_install_root(&requested_home)?;
+    let spec = platform_bundle_spec(std::env::consts::OS)?;
+    ensure_mutating_update_supported(std::env::consts::OS, false)?;
+    registry_authority_preflight()?;
+
+    let config = UpdateConfig::load_from(&kin_home);
+    let policy = config.policy;
+    let channel = effective_channel(None, config.channel);
+    let mut entry = UnattendedLedgerEntry::begin(policy, force_window);
+
+    // Read-only availability check; failures here are real failures the
+    // caller must see, and they still leave a ledger line behind.
+    let availability = async {
+        let client = build_update_http_client()?;
+        let release = resolve_release(&client, channel).await?;
+        parse_release_version(&release.tag_name)
+    }
+    .await;
+    let latest_version = match availability {
+        Ok(version) => version,
+        Err(error) => {
+            // No gate ran, so there is no decision to record; the outcome is
+            // the whole story.
+            entry.decision = "none".to_string();
+            entry.outcome = "failed".to_string();
+            entry.error = Some(format!("{error:#}"));
+            conclude_unattended(&kin_home, &entry);
+            return Err(error.context("unattended update could not resolve the latest release"));
+        }
+    };
+    let latest = latest_version.to_string();
+    let current_version = parse_release_version(CURRENT_VERSION)?;
+    let update_available = latest_version > current_version;
+    entry.update_available = update_available;
+    let chain_needed = update_available
+        || restart_pending_path(&kin_home).exists()
+        || mcp_repair_pending_path(&kin_home).exists();
+
+    if !chain_needed {
+        clear_unattended_deferral(&kin_home);
+        entry.decision = "current".to_string();
+        entry.outcome = "current".to_string();
+        conclude_unattended(&kin_home, &entry);
+        return Ok(());
+    }
+
+    let activity = probe_machine_activity(&kin_home, spec);
+    let decision = decide_auto_update(policy, activity);
+    entry.reason = decision.reason().map(str::to_string);
+    let proceed = unattended_may_proceed(policy, &decision, force_window);
+
+    if !proceed {
+        match decision {
+            AutoDecision::Silent(_) => {
+                entry.decision = "silent".to_string();
+                entry.outcome = "silent".to_string();
+            }
+            _ => {
+                entry.decision = "prompt".to_string();
+                entry.outcome = "deferred".to_string();
+                let reason = decision.reason().unwrap_or("blocked");
+                match record_unattended_blocked(&kin_home, reason, &latest) {
+                    Ok(state) => {
+                        let now = chrono::Utc::now().timestamp().max(0) as u64;
+                        entry.blocked_seconds =
+                            Some(now.saturating_sub(state.first_blocked_at_unix_seconds));
+                        entry.first_blocked_at = Some(state.first_blocked_at);
+                    }
+                    Err(error) => {
+                        // A deferral that cannot be recorded still defers, but
+                        // the caller must know the clock is not running.
+                        entry.error = Some(format!("deferral state not persisted: {error:#}"));
+                    }
+                }
+            }
+        }
+        conclude_unattended(&kin_home, &entry);
+        return Ok(());
+    }
+
+    entry.decision = if matches!(decision, AutoDecision::Proceed) {
+        "proceed".to_string()
+    } else {
+        "forced-proceed".to_string()
+    };
+    if let Some(state) = load_unattended_deferral(&kin_home) {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        entry.blocked_seconds = Some(now.saturating_sub(state.first_blocked_at_unix_seconds));
+        entry.first_blocked_at = Some(state.first_blocked_at);
+    }
+
+    match stop_managed_runtimes_for_update(&kin_home, spec).await {
+        Ok(actions) => entry.steps.extend(actions),
+        Err(error) => {
+            entry.outcome = "failed".to_string();
+            entry.error = Some(format!("{error:#}"));
+            conclude_unattended(&kin_home, &entry);
+            return Err(error);
+        }
+    }
+
+    entry.to_version = update_available.then(|| latest.clone());
+    match run_apply_chain().await {
+        Ok(()) => {
+            entry.steps.extend(
+                ChainStep::ORDER
+                    .iter()
+                    .map(|step| step.describe().to_string()),
+            );
+            entry.outcome = "applied".to_string();
+            clear_unattended_deferral(&kin_home);
+            conclude_unattended(&kin_home, &entry);
+            Ok(())
+        }
+        Err(error) => {
+            entry.outcome = "failed".to_string();
+            entry.error = Some(format!("{error:#}"));
+            conclude_unattended(&kin_home, &entry);
+            Err(error)
+        }
+    }
 }
 
 fn report_successful_install(
@@ -10702,6 +11231,53 @@ fn runtime_executable_diagnostic(
     })
 }
 
+/// Every live pid currently serving `component` as `kind`. This is the one
+/// matcher, shared by the fail-closed preflight (`reject_active_managed_runtime`),
+/// the unattended activity probe, and the unattended stop's drain scan, so all
+/// three answer from the same definition of "a managed serving executable".
+fn collect_active_managed_runtime_pids(
+    system: &System,
+    kin_home: &Path,
+    kind: RuntimeKind,
+    component: ComponentSpec,
+) -> Vec<u32> {
+    let managed_path = component_path(kin_home, component);
+    let managed = managed_path.canonicalize().unwrap_or(managed_path);
+    let mut pids = Vec::new();
+    for (pid, process) in system.processes() {
+        let pid = pid.as_u32();
+        let command = process_command(process);
+        let matched =
+            process.exe().is_some_and(|executable| {
+                process_path_matches_component(pid, executable, &managed, kin_home, component)
+            }) || argv0_matches_component(&command, process.cwd(), &managed, kin_home, component);
+        if matched && is_managed_serving_process(kind, component.name, &command) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Every managed serving process on the machine, across all runtime kinds.
+fn scan_active_managed_runtimes(
+    system: &System,
+    kin_home: &Path,
+    spec: &[ComponentSpec],
+) -> Vec<(RuntimeKind, &'static str, u32)> {
+    let mut active = Vec::new();
+    for kind in [RuntimeKind::Daemon, RuntimeKind::Mcp, RuntimeKind::Vfs] {
+        for component in spec
+            .iter()
+            .filter(|component| runtime_component_matches(kind, component.name))
+        {
+            for pid in collect_active_managed_runtime_pids(system, kin_home, kind, *component) {
+                active.push((kind, component.name, pid));
+            }
+        }
+    }
+    active
+}
+
 fn reject_active_managed_runtime(
     system: &System,
     kin_home: &Path,
@@ -10715,41 +11291,38 @@ fn reject_active_managed_runtime(
         .with_context(|| format!("managed {} runtime component is missing", kind.label()))?;
     let managed_path = component_path(kin_home, *component);
     let managed = managed_path.canonicalize().unwrap_or(managed_path);
-    for (pid, process) in system.processes() {
-        let pid = pid.as_u32();
-        let command = process_command(process);
-        let matched =
-            process.exe().is_some_and(|executable| {
-                process_path_matches_component(pid, executable, &managed, kin_home, *component)
-            }) || argv0_matches_component(&command, process.cwd(), &managed, kin_home, *component);
-        if !matched || !is_managed_serving_process(kind, component_name, &command) {
-            continue;
-        }
-        let executable = process.exe().with_context(|| {
+    let Some(pid) = collect_active_managed_runtime_pids(system, kin_home, kind, *component)
+        .first()
+        .copied()
+    else {
+        return Ok(());
+    };
+    let executable = system
+        .process(Pid::from_u32(pid))
+        .and_then(|process| process.exe())
+        .with_context(|| {
             format!(
                 "active managed {} PID {pid} has no observable mapped executable path",
                 kind.label()
             )
         })?;
-        let evidence = runtime_executable_diagnostic(pid, executable).with_context(|| {
-            format!(
-                "cannot capture fail-closed executable diagnostics for active managed {} PID {pid}",
-                kind.label()
-            )
-        })?;
-        anyhow::bail!(
-            "active managed {} PID {pid} reports executable {} ({}: {}, object {}:{}, {} bytes, SHA-256 {}); stop it before self-update. This diagnostic never authorizes runtime convergence",
-            kind.label(),
-            managed.display(),
-            evidence.scope,
-            evidence.path.display(),
-            evidence.object.namespace,
-            evidence.object.file,
-            evidence.identity.size_bytes,
-            evidence.identity.sha256
-        );
-    }
-    Ok(())
+    let evidence = runtime_executable_diagnostic(pid, executable).with_context(|| {
+        format!(
+            "cannot capture fail-closed executable diagnostics for active managed {} PID {pid}",
+            kind.label()
+        )
+    })?;
+    anyhow::bail!(
+        "active managed {} PID {pid} reports executable {} ({}: {}, object {}:{}, {} bytes, SHA-256 {}); stop it before self-update. This diagnostic never authorizes runtime convergence",
+        kind.label(),
+        managed.display(),
+        evidence.scope,
+        evidence.path.display(),
+        evidence.object.namespace,
+        evidence.object.file,
+        evidence.identity.size_bytes,
+        evidence.identity.sha256
+    );
 }
 
 fn ensure_no_active_managed_runtimes(kin_home: &Path, spec: &[ComponentSpec]) -> Result<()> {
@@ -15845,6 +16418,8 @@ cwd = {:?}
             None,
             false,
             false,
+            false,
+            false,
         )
         .await
         .expect_err("check-only must report, not recover, a stale transaction");
@@ -18534,17 +19109,149 @@ cwd = {:?}
     }
 
     #[test]
-    fn the_default_policy_asks_before_swapping_bytes() {
+    fn the_default_policy_installs_unattended_on_an_idle_machine() {
         // The default decides what happens on every install that never sets a
-        // policy, which is all of them. Kin's binaries sit under live agent
-        // sessions and mapped VFS shims, so the default has to be the one that
-        // does not move them without being asked.
-        assert_eq!(UpdatePolicy::default(), UpdatePolicy::Prompt);
+        // policy, which is all of them. Founder ruling 2026-08-15 (FIR-2342):
+        // a machine left alone converges to current on its own, because the
+        // machine that silently fell eight releases behind is the one that
+        // ended in a crash loop. The safety lives in the gates and the chain,
+        // not in asking first, and the gates are asserted right below.
+        assert_eq!(UpdatePolicy::default(), UpdatePolicy::Auto);
         assert_eq!(
             decide_auto_update(UpdatePolicy::default(), idle_machine()),
-            AutoDecision::Prompt("update policy is prompt"),
-            "an idle machine on the default policy must still ask"
+            AutoDecision::Proceed,
+            "an idle machine on the default policy must converge unattended"
         );
+        // A machine that predates the flip and recorded prompt keeps prompt:
+        // the flip changes the default, never a recorded choice.
+        assert_eq!(
+            decide_auto_update(UpdatePolicy::Prompt, idle_machine()),
+            AutoDecision::Prompt("update policy is prompt"),
+            "a recorded prompt policy must be untouched by the default flip"
+        );
+    }
+
+    #[test]
+    fn the_force_window_overrides_activity_gates_and_never_a_recorded_policy() {
+        let busy = MachineActivity {
+            external_sessions: true,
+            ..idle_machine()
+        };
+        // The rule the ruling bounds: activity gates defer, and the caller
+        // may force them once the window is spent.
+        let blocked = decide_auto_update(UpdatePolicy::Auto, busy);
+        assert!(!unattended_may_proceed(UpdatePolicy::Auto, &blocked, false));
+        assert!(unattended_may_proceed(UpdatePolicy::Auto, &blocked, true));
+        // An unreadable machine is also an activity gate, and the ruling
+        // says the window bounds it too: after 24h blocked, apply anyway,
+        // trusting the fence and salvage.
+        let unreadable = decide_auto_update(
+            UpdatePolicy::Auto,
+            MachineActivity {
+                readable: false,
+                ..idle_machine()
+            },
+        );
+        assert!(unattended_may_proceed(
+            UpdatePolicy::Auto,
+            &unreadable,
+            true
+        ));
+        // A recorded human policy never expires into an install.
+        let prompt_policy = decide_auto_update(UpdatePolicy::Prompt, idle_machine());
+        assert!(!unattended_may_proceed(
+            UpdatePolicy::Prompt,
+            &prompt_policy,
+            true
+        ));
+        let manual_policy = decide_auto_update(UpdatePolicy::Manual, idle_machine());
+        assert!(!unattended_may_proceed(
+            UpdatePolicy::Manual,
+            &manual_policy,
+            true
+        ));
+        // And an idle machine proceeds with no force at all.
+        assert!(unattended_may_proceed(
+            UpdatePolicy::Auto,
+            &AutoDecision::Proceed,
+            false
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn the_deferral_clock_starts_once_and_survives_reruns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        assert!(load_unattended_deferral(home).is_none());
+        let first = record_unattended_blocked(home, "an agent or user session is open", "0.9.9")
+            .expect("record the first blocked moment");
+        // A later blocked run must read the SAME first-blocked moment, or the
+        // 24h window restarts on every watchdog cycle and never elapses.
+        let second =
+            record_unattended_blocked(home, "a different reason", "1.0.0").expect("reread");
+        assert_eq!(first.first_blocked_at, second.first_blocked_at);
+        assert_eq!(
+            second.reason, "an agent or user session is open",
+            "the recorded first reason is the fact; later reasons never rewrite it"
+        );
+
+        clear_unattended_deferral(home);
+        assert!(
+            load_unattended_deferral(home).is_none(),
+            "convergence must forget the clock so the next stretch starts its own window"
+        );
+        // Clearing an already-clear state is a no-op, not an error.
+        clear_unattended_deferral(home);
+    }
+
+    #[test]
+    fn the_update_ledger_is_append_only_lines_of_the_report_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let mut first = UnattendedLedgerEntry::begin(UpdatePolicy::Auto, false);
+        first.decision = "prompt".to_string();
+        first.outcome = "deferred".to_string();
+        first.reason = Some("an agent or user session is open".to_string());
+        append_update_ledger(home, &first).expect("append first entry");
+
+        let mut second = UnattendedLedgerEntry::begin(UpdatePolicy::Auto, true);
+        second.decision = "forced-proceed".to_string();
+        second.outcome = "applied".to_string();
+        second.to_version = Some("9.9.9".to_string());
+        second.steps = vec!["stopped managed daemons and supervisor cooperatively".to_string()];
+        append_update_ledger(home, &second).expect("append second entry");
+
+        let text = std::fs::read_to_string(update_ledger_path(home)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per action, in order: {text}");
+        let parsed_first: UnattendedLedgerEntry = serde_json::from_str(lines[0]).unwrap();
+        let parsed_second: UnattendedLedgerEntry = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parsed_first.outcome, "deferred");
+        assert_eq!(parsed_second.outcome, "applied");
+        assert_eq!(parsed_second.to_version.as_deref(), Some("9.9.9"));
+        assert_eq!(parsed_first.schema, UNATTENDED_SCHEMA);
+        assert_eq!(
+            parsed_first.window_seconds,
+            UNATTENDED_DEFERRAL_WINDOW_HOURS * 3600,
+            "the caller compares blocked_seconds against the executor's own bound"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(update_ledger_path(home))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "the ledger is operator state, not world-readable"
+            );
+        }
     }
 
     #[test]
@@ -18700,10 +19407,20 @@ cwd = {:?}
         // A missing/empty config deserializes to the stable default.
         let empty: UpdateConfig = toml::from_str("").unwrap();
         assert_eq!(empty.channel, Channel::Stable);
-        // Every install that predates the policy has a config carrying only a
-        // channel, and each one must read as prompt rather than as auto.
+        assert_eq!(
+            empty.policy,
+            UpdatePolicy::Auto,
+            "a machine with no recorded policy inherits the auto default (FIR-2342)"
+        );
+        // A config carrying only a channel never recorded a policy choice, so
+        // it inherits the default like a missing file does, which is what
+        // "existing installs inherit the default on their next binary" means.
+        // A recorded policy, by contrast, is never moved by the flip.
         let channel_only: UpdateConfig = toml::from_str("channel = \"alpha\"").unwrap();
-        assert_eq!(channel_only.policy, UpdatePolicy::Prompt);
+        assert_eq!(channel_only.policy, UpdatePolicy::Auto);
+        let recorded_prompt: UpdateConfig =
+            toml::from_str("channel = \"alpha\"\npolicy = \"prompt\"").unwrap();
+        assert_eq!(recorded_prompt.policy, UpdatePolicy::Prompt);
     }
 
     #[test]

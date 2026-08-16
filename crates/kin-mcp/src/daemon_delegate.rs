@@ -699,6 +699,23 @@ fn configured_managed_install_root() -> Option<std::path::PathBuf> {
     kin_core::layout::global_home_kin_dir()
 }
 
+/// Whether `KIN_NO_DAEMON` forbids this process from starting daemon processes.
+///
+/// Same accepted spellings as the CLI's transient-bool reader, so the one
+/// contract ("this process spawns no daemon") cannot mean different things on
+/// the two sides of the transport. The revival path consults it because
+/// revival is a spawn: a scheduled probe that sets `KIN_NO_DAEMON` and then
+/// issues a `tools/call` against a dead daemon's recorded route would
+/// otherwise start a full daemon from inside the "no daemon" session, which
+/// is exactly the boot-time spawn storm of the 2026-08-15 incident
+/// (FIR-2341).
+fn no_daemon_spawns_requested() -> bool {
+    std::env::var("KIN_NO_DAEMON")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 /// Spawn a fresh daemon and wait for it to pass `/health`.
 ///
 /// Uses the MCP-path idle timeout (30 min) unless the user has set
@@ -714,6 +731,19 @@ fn configured_managed_install_root() -> Option<std::path::PathBuf> {
 /// never cleared a stale port record, and never registered the daemon it
 /// started with the supervisor.
 async fn revive_mcp_daemon() -> Result<String, String> {
+    // The no-spawn contract is checked before any revival work, including the
+    // lock: a probe session must be able to observe "the daemon is dead" as an
+    // honest answer without this path quietly replacing the daemon it was
+    // asked about. Nothing is spawned, nothing is cleared, nothing is
+    // registered.
+    if no_daemon_spawns_requested() {
+        return Err(
+            "KIN_NO_DAEMON is set, so this session reports the dead daemon instead of \
+             starting a replacement; unset KIN_NO_DAEMON (or drop --no-spawn) and re-run \
+             to let kin start one"
+                .to_string(),
+        );
+    }
     // Serialize revival across concurrent tool calls. Every forwarded request
     // now reaches this path, so a dead daemon can be observed by several calls
     // at once; without this each would spawn its own daemon and all but one
@@ -1731,6 +1761,29 @@ mod tests {
         assert_eq!(
             find_mcp_daemon_binary_from(None, Some(&executable), None),
             Some(daemon)
+        );
+    }
+
+    /// The no-spawn contract, at the one place in this crate that can start a
+    /// process. With `KIN_NO_DAEMON` set, revival must refuse before doing any
+    /// work (the refusal happens ahead of binary discovery, record clearing,
+    /// and the spawn itself), and the refusal must name the variable so the
+    /// honest "daemon is dead" answer teaches the remedy. This is the guard
+    /// FIR-2341 demanded: a probe session that may not spawn cannot have its
+    /// own tools/call revive the daemon it is probing.
+    #[tokio::test]
+    async fn revival_refuses_to_spawn_under_kin_no_daemon() {
+        let _guard = kin_core::test_env::EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let refusal = revive_mcp_daemon()
+            .await
+            .expect_err("revival must refuse under KIN_NO_DAEMON");
+        assert!(
+            refusal.contains("KIN_NO_DAEMON"),
+            "the refusal must name the contract that produced it: {refusal}"
+        );
+        assert!(
+            refusal.contains("no-spawn") || refusal.contains("unset"),
+            "the refusal must name the remedy: {refusal}"
         );
     }
 
