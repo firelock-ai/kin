@@ -1218,6 +1218,132 @@ mod tests {
         scan_repository(root, &ignore, std::iter::empty()).unwrap()
     }
 
+    /// Compile one graph-owned policy from rule bytes, as the durable authority
+    /// boundary compiles the repository's own.
+    fn graph_owned_policy(rules: &str) -> ResolvedAdmissionMatcher {
+        ResolvedAdmissionMatcher::compile(
+            crate::admission::AdmissionCase::Sensitive,
+            vec![crate::admission::ResolvedAdmissionRuleSet::from_bytes(
+                crate::admission::AdmissionRuleSource::Shared {
+                    source_path: path(".gitignore"),
+                },
+                0,
+                None,
+                rules.as_bytes().to_vec(),
+            )],
+        )
+        .unwrap()
+    }
+
+    /// The walk skips what the graph-owned policy excludes, and does not read
+    /// it on the way.
+    ///
+    /// Proposing one of these paths is refused at the authority boundary, and
+    /// the refusal fails the whole exact-tree admission rather than that one
+    /// artifact (FIR-2346). Skipping it is therefore not an optimization. The
+    /// byte counter is asserted because an excluded subtree that is walked and
+    /// hashed anyway still costs the machine everything the skip exists to
+    /// save, which is what a churning agent worktree under an excluded
+    /// directory does on every pass.
+    #[test]
+    fn the_graph_owned_policy_prunes_untracked_paths_before_they_are_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join(".claude/worktrees/lane-a/src")).unwrap();
+        fs::write(root.join(".claude/scheduled_tasks.lock"), b"held").unwrap();
+        fs::write(
+            root.join(".claude/worktrees/lane-a/src/dirty.rs"),
+            vec![b'x'; 4096],
+        )
+        .unwrap();
+        fs::write(root.join("keep.rs"), b"fn keep() {}").unwrap();
+        let ignore = RepositoryIgnore::default();
+        let policy = graph_owned_policy(".claude/\n");
+
+        let scan = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            Some(&policy),
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        assert!(scan.entry(&path("keep.rs")).is_some());
+        assert!(scan.entry(&path(".claude/scheduled_tasks.lock")).is_none());
+        assert!(scan
+            .entry(&path(".claude/worktrees/lane-a/src/dirty.rs"))
+            .is_none());
+        assert_eq!(scan.diagnostics().policy_excluded_untracked_entries, 1);
+        assert_eq!(
+            scan.policy_excluded_paths_sample(),
+            [path(".claude")],
+            "the excluded directory is named once rather than every leaf beneath it"
+        );
+        assert!(
+            scan.diagnostics().content_bytes_read < 4096,
+            "the excluded subtree was read: {} bytes",
+            scan.diagnostics().content_bytes_read
+        );
+
+        // Two-sided. Without the policy the same walk really does reach and
+        // read all of it, so the assertions above describe the policy rather
+        // than a fixture that was never walkable.
+        let everything = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            None,
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+        .unwrap();
+        assert!(everything
+            .entry(&path(".claude/worktrees/lane-a/src/dirty.rs"))
+            .is_some());
+        assert_eq!(
+            everything.diagnostics().policy_excluded_untracked_entries,
+            0
+        );
+        assert!(everything.diagnostics().content_bytes_read > 4096);
+    }
+
+    /// Graph truth outranks the policy for a path the repository already
+    /// tracks, exactly as the authority boundary ranks them.
+    ///
+    /// Authority admits a tracked artifact whatever the rules say today, so a
+    /// walk that dropped it would report it absent and infer a removal from
+    /// that. Untracking such a path is a separate announced decision.
+    #[test]
+    fn a_tracked_path_survives_a_policy_that_would_exclude_it_today() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("vendor/lib")).unwrap();
+        fs::write(root.join("vendor/lib/tracked.rs"), b"fn tracked() {}").unwrap();
+        fs::write(root.join("vendor/lib/fresh.rs"), b"fn fresh() {}").unwrap();
+        let tracked = path("vendor/lib/tracked.rs");
+        let ignore = RepositoryIgnore::default();
+        let policy = graph_owned_policy("vendor/\n");
+
+        let scan = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            Some(&policy),
+            [&tracked],
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        assert!(
+            scan.entry(&tracked).is_some(),
+            "a tracked artifact was dropped by a rule that only governs admission"
+        );
+        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+        assert!(
+            scan.entry(&path("vendor/lib/fresh.rs")).is_none(),
+            "an untracked path under the excluded directory was admitted"
+        );
+    }
+
     /// Membership stays independent of parser support, hidden names, and
     /// vendoring. Only control metadata and derived output are excluded, and
     /// `build`/`out`/`vendor` stay admitted because those names are ambiguous.

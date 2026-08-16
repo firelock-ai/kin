@@ -4633,11 +4633,19 @@ mod tests {
         )
         .unwrap();
 
+        // The pass completing at all is what proves nothing was deferred: a
+        // deferral is only reachable from the failure arm this admission used
+        // to take, where the loop defers every path in the batch and admits
+        // none of them.
         sync_filesystem_with_graph(&state).await.unwrap();
 
         assert!(
             tree_entry(&state, "src/lib.rs").is_some(),
             "an excluded subtree left an ordinary file unadmitted"
+        );
+        assert!(
+            !entity_ids_for(&state, "src/lib.rs").is_empty(),
+            "the pass admitted a tree it derived no semantics from, which is no progress"
         );
         assert!(
             tree_entry(&state, "keep.rs").is_some(),
@@ -4724,9 +4732,8 @@ mod tests {
     /// leave the pass running.
     #[test]
     fn excluded_churn_beside_real_progress_never_parks_the_pass() {
-        let supervisor = crate::background_work::BackgroundWorkSupervisor::new(
-            Duration::from_secs(600),
-        );
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
         let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
         let start = Instant::now();
 
@@ -4749,9 +4756,8 @@ mod tests {
         // The other side: with the same clock and no progress, the sweep does
         // stop it. Without this the assertions above would hold for a
         // supervisor that never parks anything.
-        let starved = crate::background_work::BackgroundWorkSupervisor::new(
-            Duration::from_secs(600),
-        );
+        let starved =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
         let starved_pass = starved.pass(crate::background_work::PASS_RECONCILE);
         starved_pass.working(start);
         assert!(starved.sweep(start + Duration::from_secs(1_200)).len() == 1);
@@ -4765,9 +4771,8 @@ mod tests {
     /// supervisor already held the reason and the readings behind it.
     #[test]
     fn a_parked_reconcile_pass_publishes_its_reason_and_its_counts() {
-        let supervisor = crate::background_work::BackgroundWorkSupervisor::new(
-            Duration::from_secs(600),
-        );
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
         let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
         let start = Instant::now();
         pass.working(start);
@@ -4777,7 +4782,10 @@ mod tests {
         assert_eq!(stopped.len(), 1);
 
         let report = supervisor.reconcile_report(start + Duration::from_secs(1_050));
-        let parked = report.parked.clone().expect("a parked pass reports its park");
+        let parked = report
+            .parked
+            .clone()
+            .expect("a parked pass reports its park");
         assert!(parked.reason.contains("without recording any progress"));
         assert_eq!(parked.progress, 3);
         assert_eq!(parked.stall_threshold_seconds, 600);
@@ -4805,9 +4813,8 @@ mod tests {
             serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.parked, report.parked);
 
-        let healthy = crate::background_work::BackgroundWorkSupervisor::new(
-            Duration::from_secs(600),
-        );
+        let healthy =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
         healthy.pass(crate::background_work::PASS_RECONCILE);
         let healthy_report = healthy.reconcile_report(start);
         assert!(healthy_report.parked.is_none());
