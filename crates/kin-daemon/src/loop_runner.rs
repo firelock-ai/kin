@@ -3016,6 +3016,106 @@ mod tests {
         );
     }
 
+    /// Read the repository-authority generation one admission would advance.
+    ///
+    /// Every committed repository transaction advances it by exactly one, and
+    /// preparing that successor plus persisting the store is the O(store) cost
+    /// this whole seam exists to stop paying twice, so the generation is a
+    /// direct count of successors rather than a proxy for one.
+    fn authority_generation(state: &DaemonState) -> u64 {
+        current_authority_roots(state).unwrap().generation
+    }
+
+    /// The ambient watcher path publishes its own successor. Nothing about the
+    /// commit seam's deferral is allowed to reach it: an ambient tick has no
+    /// later transaction to carry its tree, so a tick that stopped publishing
+    /// would leave every observed write outside repository authority.
+    #[test]
+    fn an_ambient_tick_publishes_its_own_authority_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("ambient.rs"),
+            b"pub fn ambient() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = test_repo_path("ambient.rs");
+        let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
+
+        let before = authority_generation(&state);
+        let admission =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
+
+        assert!(
+            admission.deferred_tree.is_none(),
+            "a standalone admission owns its publication and defers nothing"
+        );
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "the tick must publish exactly one repository-authority successor"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the derived graph carries the admitted path"
+        );
+    }
+
+    /// The commit seam derives the same transition and publishes nothing, so
+    /// its caller can carry the tree in the transaction that publishes the
+    /// change. The graph still advances: the caller's transaction is what
+    /// closes the gap, and the coordination gate it holds spans both.
+    #[test]
+    fn a_deferring_admission_advances_no_authority_generation() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("deferred.rs"),
+            b"pub fn deferred() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = test_repo_path("deferred.rs");
+
+        let before = authority_generation(&state);
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+
+        assert!(
+            !admission.deltas.is_empty(),
+            "the working copy moved, so the admission must plan a transition"
+        );
+        let deferred = admission
+            .deferred_tree
+            .expect("a deferring admission hands its transition back to the caller");
+        assert_eq!(
+            authority_generation(&state),
+            before,
+            "nothing may be published until the caller's own transaction publishes it"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the derived graph carries the admitted path so the commit can plan against it"
+        );
+
+        // Closing the deferral is what a commit that never reaches authority
+        // does, and it must leave exactly the state a standalone admission
+        // would have.
+        publish_deferred_tree_after_failure(&state, &deferred);
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "closing the deferral publishes the one successor it withheld"
+        );
+    }
+
     /// The livelock signature stays dead, in the counters that carried it.
     ///
     /// The earlier spin was a closed loop: an unadmitted path failed the host

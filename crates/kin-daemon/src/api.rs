@@ -19087,6 +19087,87 @@ mod tests {
         );
     }
 
+    /// One commit pays for exactly one repository-authority successor.
+    ///
+    /// The handler used to force a filesystem admission that published the
+    /// observed working tree as its own successor, then publish the semantic
+    /// change moments later as a second one, on a tree nothing had moved in
+    /// between. Preparing a successor and persisting the store are both
+    /// O(store), so a one-line change paid the whole cost twice and the commit
+    /// wall was two complete publications.
+    ///
+    /// A committed repository transaction advances the authority generation by
+    /// exactly one, so the generation delta counts successors directly rather
+    /// than standing in for them. The assertions below also prove the commit
+    /// did real work, since a commit that published nothing would satisfy a
+    /// bare delta check by advancing the generation zero times.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_commit_publishes_exactly_one_authority_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("collapsed.rs"),
+            b"pub fn collapsed() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let before = crate::loop_runner::current_authority_roots(&state)
+            .unwrap()
+            .generation;
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "publish one file through one successor"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "commit must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["file_count"].as_u64().unwrap() >= 1,
+            "the commit must carry the admitted file: {json}"
+        );
+
+        let after = crate::loop_runner::current_authority_roots(&state)
+            .unwrap()
+            .generation;
+        assert_eq!(
+            after - before,
+            1,
+            "one commit must prepare and persist exactly one repository-authority successor"
+        );
+
+        let repo_path = kin_model::RepoPath::from_utf8("collapsed.rs").unwrap();
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the committed file must be graph-owned after the single successor"
+        );
+    }
+
     #[tokio::test]
     async fn graph_only_command_commit_fails_before_filesystem_delta_computation() {
         let state = test_state();
