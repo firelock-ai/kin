@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.36] - 2026-08-16
+
+### Changed
+
+- Name every dark span on the CLI commit path (#851)
+
+
 ## [0.5.35] - 2026-08-16
 
 ### Changed
