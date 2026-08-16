@@ -2574,7 +2574,7 @@ async fn health(
     let sampled_at = std::time::Instant::now();
     let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
-    let reconcile = state.background_work.reconcile().report(sampled_at);
+    let reconcile = state.background_work.reconcile_report(sampled_at);
     let reconcile_degraded = reconcile.degraded();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
@@ -3459,8 +3459,7 @@ async fn command_graph(
         &request,
         &state
             .background_work
-            .reconcile()
-            .report(std::time::Instant::now()),
+            .reconcile_report(std::time::Instant::now()),
         &embedding_runtime,
     )
     .map_err(internal_error)?;
