@@ -30,11 +30,27 @@ use std::pin::Pin;
 /// [`kin_mcp::StartupDaemonBinding`]; `initialize` and `tools/list` answer
 /// immediately, and a `tools/call` that arrives before the binding settles is
 /// answered honestly that the daemon is still starting.
+///
+/// `--no-spawn` is the probe contract (FIR-2341): this server binds only a
+/// daemon that is already serving and never starts one, neither in the
+/// startup binding nor through tool-call revival. It is carried as the
+/// process-wide `KIN_NO_DAEMON=1` rather than as plumbing through every
+/// resolution path, because every daemon-starting seam in this binary already
+/// honors that variable, and a flag that covered fewer of them than the
+/// variable does would be a probe mode with a spawn path left inside it.
 pub async fn start(
     global: bool,
     repo: Option<PathBuf>,
     tool_profile: Option<String>,
+    no_spawn: bool,
 ) -> Result<()> {
+    if no_spawn {
+        std::env::set_var("KIN_NO_DAEMON", "1");
+        eprintln!(
+            "Kin MCP: --no-spawn is set; this server will bind an already-running daemon but \
+             never start one, and graph tool calls without a running daemon fail loud."
+        );
+    }
     let repo_override = resolve_repo_override(repo);
     if let Some(repo_dir) = &repo_override {
         if global {

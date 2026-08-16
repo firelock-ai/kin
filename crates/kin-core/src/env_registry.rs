@@ -272,7 +272,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_CONTENT_MODE", kind: Kind::OneOf(&["deny"]), default: "", sensitivity: Sensitivity::Operational, summary: "content projection mode; 'deny' restricts native content" },
     EnvVarSpec { name: "KIN_DISCOVERY_MODE", kind: Kind::OneOf(&["deny"]), default: "", sensitivity: Sensitivity::Operational, summary: "filesystem discovery mode; 'deny' forces graph-only discovery" },
     EnvVarSpec { name: "KIN_NO_KEYRING", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "skip the OS keyring for credential storage" },
-    EnvVarSpec { name: "KIN_NO_DAEMON", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "force in-process execution instead of the daemon" },
+    EnvVarSpec { name: "KIN_NO_DAEMON", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "never start or revive a daemon; bind only an already-running one (the probe contract behind `kin mcp start --no-spawn`)" },
     EnvVarSpec { name: "KIN_ALLOW_OFFLINE_RESTORE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow restoring a backup without remote verification" },
     EnvVarSpec { name: "KIN_ALLOW_PARENT_STORE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow discovering a store in a parent directory" },
     EnvVarSpec { name: "KIN_BINARY_PATH", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "override the kin binary path for bench dispatch" },

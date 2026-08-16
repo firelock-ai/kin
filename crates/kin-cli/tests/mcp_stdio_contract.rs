@@ -55,18 +55,38 @@ struct McpRun {
 /// what this test proves, and `KIN_NO_DAEMON=1` plus an isolated registry and
 /// HOME guarantee no daemon can be spawned or discovered.
 fn run_probe_session(dir: &Path, home: &Path) -> McpRun {
+    run_configured_probe_session(dir, home, &[], &[("KIN_NO_DAEMON", "1".into())])
+}
+
+/// [`run_probe_session`] with the no-spawn contract carried explicitly by the
+/// caller (as `--no-spawn`, as `KIN_NO_DAEMON`, or deliberately as neither),
+/// plus whatever extra environment the fixture needs (`KIN_DAEMON_URL`,
+/// `KIN_DAEMON_BIN`). The spawn-control tests need all three shapes, and a
+/// helper that always injected the env var could never run its own positive
+/// control.
+fn run_configured_probe_session(
+    dir: &Path,
+    home: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, std::ffi::OsString)],
+) -> McpRun {
     let started = Instant::now();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kin"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kin"));
+    command
         .args(["mcp", "start"])
+        .args(extra_args)
         .current_dir(dir)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("TMPDIR", std::env::temp_dir())
-        .env("KIN_NO_DAEMON", "1")
         .env("KIN_VFS_DISABLE", "1")
-        .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
+        .env("KIN_REGISTRY_PATH", home.join("registry.toml"));
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -237,4 +257,131 @@ fn the_four_frame_probe_is_answered_inside_a_repository_whose_daemon_is_absent()
 
     let run = run_probe_session(&repo, &home);
     assert_four_frame_contract(&run);
+}
+
+/// The boot-incident shape (FIR-2341), replayed: a repository whose daemon
+/// died with its pid/port record left behind, probed by a session bound to the
+/// dead daemon's URL. Before the no-spawn contract covered revival, this exact
+/// session started a fresh daemon from inside the probe, the mechanism behind
+/// the 2026-08-15 boot spawn storm.
+///
+/// The spawn detector is a stub `kin-daemon` injected through `KIN_DAEMON_BIN`
+/// that records every invocation to a marker file. The positive control runs
+/// the identical session without `--no-spawn` and requires the marker to
+/// appear, which is what proves the detector can see a spawn at all; only then
+/// does the absent marker under `--no-spawn` mean zero daemon processes rather
+/// than a check that cannot fail. Unix-only because the stub is a shell script.
+#[cfg(unix)]
+#[test]
+fn a_no_spawn_probe_over_a_dead_daemon_record_spawns_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("temp root");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("create home");
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let init = common::Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(&repo)
+        .env("HOME", &home)
+        .env("KIN_NO_DAEMON", "1")
+        .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
+        .output()
+        .expect("run kin init");
+    assert!(
+        init.status.success(),
+        "kin init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // A pid that provably belonged to a real process and provably no longer
+    // does: reap a child and record its pid.
+    let dead_pid = {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .or_else(|_| std::process::Command::new("/bin/true").spawn())
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap short-lived child");
+        pid
+    };
+    // A loopback port that was free at selection time: bind, read, release.
+    let dead_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+        listener.local_addr().expect("read reserved port").port()
+    };
+    let kin_dir = repo.join(".kin");
+    std::fs::write(
+        kin_dir.join(kin_daemon_spawn::PID_FILE_NAME),
+        dead_pid.to_string(),
+    )
+    .expect("plant stale pid record");
+    std::fs::write(
+        kin_dir.join(kin_daemon_spawn::PORT_FILE_NAME),
+        dead_port.to_string(),
+    )
+    .expect("plant stale port record");
+
+    // The stub daemon: records its invocation and exits, so a run that spawns
+    // leaves evidence and leaves no process behind.
+    let marker = root.path().join("daemon-spawned.marker");
+    let stub = root.path().join("kin-daemon-stub");
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 7\n", marker.display()),
+    )
+    .expect("write stub daemon");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("mark stub executable");
+
+    let fixture_env = |ready_timeout: Option<&str>| {
+        let mut env: Vec<(&str, std::ffi::OsString)> = vec![
+            (
+                "KIN_DAEMON_URL",
+                format!("http://127.0.0.1:{dead_port}").into(),
+            ),
+            ("KIN_DAEMON_BIN", stub.clone().into_os_string()),
+        ];
+        if let Some(secs) = ready_timeout {
+            env.push(("KIN_DAEMON_READY_TIMEOUT_SECS", secs.into()));
+        }
+        env
+    };
+
+    // The claim: under --no-spawn the whole session answers and nothing is
+    // started. The tools/call error must name KIN_NO_DAEMON, which proves the
+    // binding settled, the dead daemon was observed, and revival was consulted
+    // and refused. Without that assertion, an early failure anywhere on the
+    // path would also leave the marker absent and the test would prove nothing.
+    let no_spawn = run_configured_probe_session(&repo, &home, &["--no-spawn"], &fixture_env(None));
+    assert_four_frame_contract(&no_spawn);
+    let refusal = response_with_id(&no_spawn, 3)
+        .pointer("/result/content/0/text")
+        .and_then(|text| text.as_str())
+        .expect("tools/call carries a content block")
+        .to_string();
+    assert!(
+        refusal.contains("KIN_NO_DAEMON"),
+        "the no-spawn refusal must reach the tool answer: {refusal}"
+    );
+    assert!(
+        !marker.exists(),
+        "--no-spawn probe invoked the daemon binary: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+
+    // Positive control: the identical session without --no-spawn must reach
+    // the stub, proving the marker detects spawns. The short ready timeout
+    // bounds the supervisor-spawn arm should binary validation ever start
+    // accepting the stub.
+    let unrestricted = run_configured_probe_session(&repo, &home, &[], &fixture_env(Some("2")));
+    assert_four_frame_contract(&unrestricted);
+    assert!(
+        marker.exists(),
+        "the control run must spawn the stub daemon, or the marker check cannot fail; stderr:\n{}",
+        unrestricted.stderr
+    );
 }
