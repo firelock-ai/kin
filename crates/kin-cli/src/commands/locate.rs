@@ -249,9 +249,17 @@ fn is_false(value: &bool) -> bool {
 /// query named a real symbol, because the scores look the same either way: they
 /// are composite ranks within a result set, not evidence that anything matched.
 ///
-/// This never affects ranking or ordering. It is a statement about what the hit
-/// IS, computed from the same exact-token predicate the `semantic_locate`
-/// evidence object reports, so the two surfaces cannot drift apart.
+/// Computed from the same exact-token predicate the `semantic_locate` evidence
+/// object reports, so the two surfaces cannot drift apart. It is a statement
+/// about what the hit IS, and since the exact-name tier landed it is also a
+/// ranking input: entity ordering places `Name` hits above the other kinds
+/// within each definition band, because composite scores are not comparable
+/// across kinds. A `text_fallback` score grows with lexical corpus mass while
+/// an exact-name score is a fixed product, so at flagship scale lexical
+/// neighbors outbid the symbol the query literally named (measured on a
+/// 26,633-entity store: two text-fallback rows at 652/602 above the exact
+/// qualified match at 460). The tier makes exactness un-outbiddable at any
+/// corpus scale; scores still order hits within a tier.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocateMatchKind {
@@ -377,6 +385,28 @@ fn classify_locate_match(query: &str, name: &str, origin: &str) -> LocateMatchKi
         LocateMatchKind::Semantic
     } else {
         LocateMatchKind::TextFallback
+    }
+}
+
+/// Ordering tier of a ranked hit: exact-name hits above everything else.
+///
+/// The single place the exact-name tier is defined, read by both entity
+/// orderings (the per-query projection and the multi-query fusion), so the two
+/// surfaces cannot disagree about what outranks what. Derived from
+/// [`LocateMatchKind`], which is itself derived from [`query_names_entity`]:
+/// one predicate, stated once.
+///
+/// This exists because composite scores are not comparable across match kinds.
+/// The text-fallback scale is additive over lexical hits and grows with corpus
+/// mass, while an exact-name match scores a fixed product, so a large enough
+/// store hands rank 1 to a lexical neighbor over the symbol the query literally
+/// named. No score cap fixes that without flattening honest fallback ordering
+/// on queries that name nothing; a tier fixes it at every corpus scale and
+/// leaves scores meaningful within each tier.
+fn locate_exact_name_tier(entity: &LocateEntity) -> u8 {
+    match entity.match_kind {
+        Some(LocateMatchKind::Name) => 1,
+        _ => 0,
     }
 }
 
@@ -16234,6 +16264,18 @@ pub fn build_entity_view(
     // (file_rank, LocateEntity) so global ranking can tie-break on file order.
     let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Canonical-definition signal for exact-name ties (FIR-2337): owner graph
+    // mass per name-hit entity id, computed for at most this many name hits so
+    // a hundred-way `new` collision cannot turn projection into a graph walk.
+    // Fixed name-match scores tie EXACTLY when one symbol name has several
+    // definitions (four `delete_work_item` impls all scored 450.000 on the
+    // gauntlet store, and the file-order tie-break put the canonical
+    // `InMemoryGraph::` definition FOURTH, behind two test doubles and a
+    // blanket forwarding impl), so the tie is broken by which owner type
+    // carries the most structural graph mass. Non-name rows all read 0 here
+    // and fall through to the file-order tie-break unchanged.
+    let mut name_owner_mass: FxHashMap<String, usize> = FxHashMap::default();
+    let owner_mass_limit = locate_env_usize("KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT", 16);
     // Built once on the first ranked file that resolves to no entity, because
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
@@ -16299,6 +16341,13 @@ pub fn build_entity_view(
                 .as_ref()
                 .map(|origin| origin.0.clone())
                 .or_else(|| Some(file.path.clone()));
+            let match_kind = classify_locate_match(query, &entity.name, &sym.origin);
+            if match_kind == LocateMatchKind::Name && name_owner_mass.len() < owner_mass_limit {
+                name_owner_mass.insert(
+                    entity_id.clone(),
+                    kin_ranking::entity_ranking::owner_graph_mass(graph, &entity.id, &entity.name)?,
+                );
+            }
             ranked.push((
                 file_rank,
                 LocateEntity {
@@ -16312,7 +16361,7 @@ pub fn build_entity_view(
                     definition: sym.definition,
                     span: sym.span,
                     body,
-                    match_kind: Some(classify_locate_match(query, &entity.name, &sym.origin)),
+                    match_kind: Some(match_kind),
                     provenance: LocateProvenance {
                         file: file_origin,
                         origin: sym.origin.clone(),
@@ -16324,22 +16373,63 @@ pub fn build_entity_view(
         }
     }
 
-    // Global rank: definitions first, then composite score desc, then the file's
-    // own rank, then name/id for a total deterministic order.
+    // Global rank: definitions first, then the exact-name tier
+    // ([`locate_exact_name_tier`]: a hit the query literally named cannot be
+    // outbid by fallback scale), then composite score desc, then owner graph
+    // mass for the exact-name ties fixed scores produce (the canonical
+    // definition over test doubles and forwarding impls; 0 for every non-name
+    // row, so nothing else moves), then the file's own rank, then name/id for
+    // a total deterministic order.
+    let owner_mass_of = |entity: &LocateEntity| {
+        name_owner_mass
+            .get(entity.identity_key())
+            .copied()
+            .unwrap_or(0)
+    };
     ranked.sort_by(|(a_rank, a), (b_rank, b)| {
         b.definition
             .cmp(&a.definition)
+            .then_with(|| locate_exact_name_tier(b).cmp(&locate_exact_name_tier(a)))
             .then_with(|| {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| owner_mass_of(b).cmp(&owner_mass_of(a)))
             .then_with(|| a_rank.cmp(b_rank))
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
 
     result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
+
+    // Make the tie-break arguable from the response: under --explain (the only
+    // mode that populates `origin`), every name hit whose exact score is shared
+    // by another name hit gets its owner mass appended to its resolution
+    // origin, which `semantic_locate` surfaces as `match_evidence
+    // .resolution_origin`. A rank among equals should never need source-diving
+    // to defend.
+    let mut name_score_counts: FxHashMap<u32, usize> = FxHashMap::default();
+    for entity in &result.entities {
+        if entity.match_kind == Some(LocateMatchKind::Name) {
+            *name_score_counts.entry(entity.score.to_bits()).or_default() += 1;
+        }
+    }
+    for entity in &mut result.entities {
+        if entity.match_kind == Some(LocateMatchKind::Name)
+            && name_score_counts
+                .get(&entity.score.to_bits())
+                .is_some_and(|count| *count > 1)
+            && !entity.provenance.origin.is_empty()
+        {
+            if let Some(mass) = name_owner_mass.get(entity.identity_key()) {
+                entity
+                    .provenance
+                    .origin
+                    .push_str(&format!(" tie_break=owner_graph_mass:{mass}"));
+            }
+        }
+    }
     result.total_ranked = result.entities.len();
     // Computed over the FULL ranking, before the daemon windows a page. A
     // per-page verdict would call a query successful because page 1 happened to
@@ -16527,12 +16617,17 @@ fn locate_entity_tiebreak_path(entity: &LocateEntity) -> &str {
 /// deduped result via Reciprocal Rank Fusion. `variants` is the ordered variant
 /// text (index-aligned with `results`; index 0 is the primary query). Entities
 /// are fused by `entity_id`, files by path; each fused hit records which variant
-/// texts surfaced it in `matched_queries`. Ordering is RRF-score-descending with
-/// deterministic tie-breaks (entities by file path then id; files by path). The
-/// per-hit composite `score` is preserved from the hit's best-ranked variant —
-/// array order carries the fused ranking. `degradations` are unioned; the debug
-/// object and semantic coverage are taken from the primary variant. With a single
-/// variant this returns that result unchanged (no fusion, no attribution).
+/// texts surfaced it in `matched_queries`. Entity ordering honors the exact-name
+/// tier first ([`locate_exact_name_tier`] on the carried record), then RRF score
+/// descending with deterministic tie-breaks (file path then id); the tier holds
+/// at the fusion layer because a fallback row surfaced by every variant can
+/// out-sum a name hit's rank reciprocals, which would hand the fused rank 1 back
+/// to the lexical neighbor the per-variant tier just demoted. Files stay
+/// RRF-descending (path tie-break). The per-hit composite `score` is preserved
+/// from the hit's best-ranked variant — array order carries the fused ranking.
+/// `degradations` are unioned; the debug object and semantic coverage are taken
+/// from the primary variant. With a single variant this returns that result
+/// unchanged (no fusion, no attribution).
 pub fn fuse_locate_results(
     variants: Vec<String>,
     results: Vec<LocateResult>,
@@ -16547,8 +16642,9 @@ pub fn fuse_locate_results(
 
     let mut fused_entities = rrf_fuse(&entity_lists, |e| e.identity_key().to_string(), rrf_k);
     fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
-        sb.partial_cmp(sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        locate_exact_name_tier(b)
+            .cmp(&locate_exact_name_tier(a))
+            .then_with(|| sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
             .then_with(|| a.identity_key().cmp(b.identity_key()))
     });
@@ -18532,6 +18628,457 @@ mod tests {
             .find(|entity| entity.name == "InMemoryGraph::descriptor")
             .expect("the other symbol still ranks");
         assert_eq!(other.match_kind, Some(LocateMatchKind::TextFallback));
+    }
+
+    /// FIR-2338, the per-query half, in the shape the flagship gauntlet
+    /// measured on shipped 0.5.33: probe qf01 asked for
+    /// `RepositoryAuthorityState::resolve_ref_target` by its exact qualified
+    /// name, the match scored its fixed 460, and two `text_fallback` rows
+    /// outbid it at 652.03 and 602.06 because the fallback scale is additive
+    /// over lexical mass while exactness is a fixed product. 3,166 entities
+    /// never expressed it; 26,633 did.
+    ///
+    /// The control is the scale sweep: the distractor's score grows without
+    /// bound and the exact-name hit must hold rank 1 at EVERY magnitude,
+    /// because the exact-name tier is consulted before the score. Under
+    /// score-first ordering the first iteration already fails.
+    #[test]
+    fn an_exact_name_hit_cannot_be_outbid_by_text_fallback_at_any_scale() {
+        let graph = kin_db::InMemoryGraph::new();
+        let path = "crates/kin-db/src/storage/repository.rs";
+        graph
+            .upsert_entity(&test_entity(
+                "RepositoryAuthorityState::resolve_ref_target",
+                path,
+                100,
+                140,
+            ))
+            .unwrap();
+        graph
+            .upsert_entity(&test_entity(
+                "repository_authority_state_contains_commit",
+                path,
+                200,
+                260,
+            ))
+            .unwrap();
+        let symbol = |name: &str, span: [u32; 2], score: f32| LocateSymbol {
+            name: name.to_string(),
+            span: Some(span),
+            score,
+            kind: "method".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+
+        // 652.03 is the score the gauntlet measured; the larger magnitudes are
+        // the "any corpus scale" claim made executable.
+        for distractor_score in [652.03_f32, 1.0e6, 1.0e9] {
+            let mut result = LocateResult {
+                files: vec![LocateFileEntry {
+                    path: path.to_string(),
+                    score: 0.2,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![
+                        symbol(
+                            "repository_authority_state_contains_commit",
+                            [200, 260],
+                            distractor_score,
+                        ),
+                        symbol(
+                            "RepositoryAuthorityState::resolve_ref_target",
+                            [100, 140],
+                            460.0,
+                        ),
+                    ],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                }],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                "RepositoryAuthorityState::resolve_ref_target",
+            )
+            .unwrap();
+            assert_eq!(
+                result.entities[0].name, "RepositoryAuthorityState::resolve_ref_target",
+                "the exact qualified match must hold rank 1 against a fallback \
+                 score of {distractor_score}"
+            );
+            assert_eq!(result.entities[0].match_kind, Some(LocateMatchKind::Name));
+        }
+
+        // Control: with no name hit in the ranking, fallback rows still order
+        // by score, so the tier is about exactness rather than a reorder of
+        // everything.
+        let mut fallback_only = LocateResult {
+            files: vec![LocateFileEntry {
+                path: path.to_string(),
+                score: 0.2,
+                signals: vec![],
+                spans: vec![],
+                symbols: vec![
+                    symbol(
+                        "RepositoryAuthorityState::resolve_ref_target",
+                        [100, 140],
+                        460.0,
+                    ),
+                    symbol(
+                        "repository_authority_state_contains_commit",
+                        [200, 260],
+                        652.03,
+                    ),
+                ],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+                matched_queries: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut fallback_only,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "how are refs resolved against repository authority",
+        )
+        .unwrap();
+        assert!(
+            fallback_only
+                .entities
+                .iter()
+                .all(|entity| entity.match_kind != Some(LocateMatchKind::Name)),
+            "control precondition: this query names neither entity"
+        );
+        assert_eq!(
+            fallback_only.entities[0].name, "repository_authority_state_contains_commit",
+            "with no exact-name hit, score order is untouched"
+        );
+    }
+
+    /// FIR-2338, the fusion half. RRF sums rank reciprocals per variant, so a
+    /// lexical neighbor surfaced at rank 1 by EVERY variant out-sums an exact
+    /// name hit one variant ranked first, and fusion hands rank 1 back to the
+    /// row the per-variant tier just demoted. The carried record's match kind
+    /// is the tier at this layer too.
+    #[test]
+    fn multiquery_fusion_keeps_the_exact_name_hit_above_fallback_rrf_mass() {
+        let with_kind = |name: &str, kind| {
+            let mut entity = mk_locate_entity(name, 1.0, true);
+            entity.match_kind = Some(kind);
+            entity
+        };
+        // "neighbor" leads both variant lists: RRF 2/(k+1). "exact" appears
+        // only in the primary list at rank 2: RRF 1/(k+3). Score order and RRF
+        // order both prefer the neighbor; only the tier can pick the name hit.
+        let fused = fuse_locate_results(
+            vec!["q0".to_string(), "q1".to_string()],
+            vec![
+                fusion_result(vec![
+                    with_kind("neighbor", LocateMatchKind::TextFallback),
+                    with_kind("filler", LocateMatchKind::TextFallback),
+                    with_kind("exact", LocateMatchKind::Name),
+                ]),
+                fusion_result(vec![
+                    with_kind("neighbor", LocateMatchKind::TextFallback),
+                    with_kind("filler", LocateMatchKind::TextFallback),
+                ]),
+            ],
+            60.0,
+        );
+        assert_eq!(
+            fused.entities[0].name, "exact",
+            "the name hit must lead the fused ranking over fallback RRF mass"
+        );
+        // Control: among fallback rows RRF still decides, so the tier did not
+        // flatten the fused ordering.
+        let neighbor_pos = fused
+            .entities
+            .iter()
+            .position(|entity| entity.name == "neighbor")
+            .unwrap();
+        let filler_pos = fused
+            .entities
+            .iter()
+            .position(|entity| entity.name == "filler")
+            .unwrap();
+        assert!(
+            neighbor_pos < filler_pos,
+            "fallback rows keep their RRF order below the name tier"
+        );
+    }
+
+    /// FIR-2337 in the shape the flagship gauntlet measured on shipped 0.5.33:
+    /// probe qb11 `delete_work_item` returned four entities all carrying the
+    /// exact name, all `match_kind: name`, all scored exactly 450.000, and the
+    /// file-order tie-break put the canonical `InMemoryGraph::` definition
+    /// FOURTH, behind two test doubles and a blanket `&G::` forwarding impl.
+    ///
+    /// The tie is broken by owner graph mass: the definition on the type that
+    /// carries the most structural graph relations wins, mirroring the store
+    /// (InMemoryGraph 285, MockGraph 134, EmptyStore 121, `&G` ownerless 0).
+    /// The control run drops the owner edges so every mass is 0: the ordering
+    /// must then fall back to exactly the file-order tie that shipped, proving
+    /// this test moves on the tiebreak signal and nothing else.
+    #[test]
+    fn a_pure_exact_name_tie_breaks_toward_the_owner_with_graph_mass() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        // File order mirrors the shipped defect: the canonical definition's
+        // file ranks LAST among the four.
+        let impls: [(&str, &str); 4] = [
+            (
+                "MockGraph::delete_work_item",
+                "crates/kin-git/src/export.rs",
+            ),
+            ("&G::delete_work_item", "kin-model/src/graph.rs"),
+            (
+                "EmptyStore::delete_work_item",
+                "crates/kin-mcp/src/handlers/mod.rs",
+            ),
+            (
+                "InMemoryGraph::delete_work_item",
+                "crates/kin-db/src/engine/graph.rs",
+            ),
+        ];
+        // Owner mass per impl, `&G` staying ownerless like the real blanket
+        // forwarding impl. Peer entities give each owner its relation count.
+        let owner_mass: [usize; 4] = [3, 0, 2, 5];
+
+        let build = |with_owner_edges: bool| {
+            let graph = kin_db::InMemoryGraph::new();
+            let mut files = Vec::new();
+            for ((name, path), mass) in impls.iter().zip(owner_mass) {
+                let method = test_entity(name, path, 100, 140);
+                graph.upsert_entity(&method).unwrap();
+                if with_owner_edges && mass > 0 {
+                    let owner = test_entity(name.split("::").next().unwrap(), path, 10, 400);
+                    graph.upsert_entity(&owner).unwrap();
+                    graph
+                        .upsert_relation(&relation(RelationKind::Contains, owner.id, method.id))
+                        .unwrap();
+                    for _ in 1..mass {
+                        let peer = test_entity("peer_helper", path, 500, 510);
+                        graph.upsert_entity(&peer).unwrap();
+                        graph
+                            .upsert_relation(&relation(RelationKind::Calls, owner.id, peer.id))
+                            .unwrap();
+                    }
+                }
+                files.push(LocateFileEntry {
+                    path: path.to_string(),
+                    score: 0.2,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![LocateSymbol {
+                        name: name.to_string(),
+                        span: Some([100, 140]),
+                        score: 450.0,
+                        kind: "method".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                });
+            }
+            let mut result = LocateResult {
+                files,
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                "delete_work_item",
+            )
+            .unwrap();
+            result
+        };
+
+        let fixed = build(true);
+        let names: Vec<&str> = fixed
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "InMemoryGraph::delete_work_item",
+                "MockGraph::delete_work_item",
+                "EmptyStore::delete_work_item",
+                "&G::delete_work_item",
+            ],
+            "a pure exact-name tie must order by owner graph mass"
+        );
+        assert!(
+            fixed.entities[0]
+                .provenance
+                .origin
+                .contains("tie_break=owner_graph_mass:"),
+            "the tie-break must be visible in the explain origin, got {:?}",
+            fixed.entities[0].provenance.origin
+        );
+
+        // Control: no owner edges means no mass signal, and the ordering falls
+        // back to the file-order tie that shipped the defect.
+        let flat = build(false);
+        let flat_names: Vec<&str> = flat
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert_eq!(
+            flat_names,
+            vec![
+                "MockGraph::delete_work_item",
+                "&G::delete_work_item",
+                "EmptyStore::delete_work_item",
+                "InMemoryGraph::delete_work_item",
+            ],
+            "with every owner mass equal the file-order tie-break is unchanged"
+        );
+        assert!(
+            flat.entities[0]
+                .provenance
+                .origin
+                .contains("tie_break=owner_graph_mass:0"),
+            "an unbroken tie still discloses the signal it consulted, got {:?}",
+            flat.entities[0].provenance.origin
+        );
+    }
+
+    /// The tie-break must survive a missing `Contains` edge. The edge is
+    /// enrichment a freshly built store can lack while the owner type itself
+    /// parsed fine: the same kin-db file measured `CodeEmbedder::embed_batch`
+    /// at owner mass 14 through its edge on the flagship store and 0 on a
+    /// minutes-old store missing the edge, which handed the qb05 tie to
+    /// `OpenAiCompatEmbedder::` (mass 5). A graph gap is not evidence the
+    /// definition is secondary, so the owner NAME answers when the edge
+    /// cannot, and the canonical definition holds rank 1 on both store shapes.
+    #[test]
+    fn the_owner_mass_tiebreak_survives_a_missing_contains_edge() {
+        let relation = |kind: RelationKind, src: EntityId, dst: EntityId| Relation {
+            id: RelationId::new(),
+            kind,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let graph = kin_db::InMemoryGraph::new();
+        let canonical_path = "src/embedding/embedder.rs";
+        let rival_path = "src/embedding/openai_compat.rs";
+
+        // The canonical method has NO Contains edge, only its owner class
+        // sitting in the graph under the qualified prefix name, carrying the
+        // larger structural mass.
+        let canonical = test_entity("CodeEmbedder::embed_batch", canonical_path, 100, 140);
+        let owner = test_entity("CodeEmbedder", canonical_path, 10, 400);
+        graph.upsert_entity(&canonical).unwrap();
+        graph.upsert_entity(&owner).unwrap();
+        for _ in 0..6 {
+            let peer = test_entity("peer_helper", canonical_path, 500, 510);
+            graph.upsert_entity(&peer).unwrap();
+            graph
+                .upsert_relation(&relation(RelationKind::Calls, owner.id, peer.id))
+                .unwrap();
+        }
+
+        // The rival method DOES have its Contains edge, to a smaller owner.
+        let rival = test_entity("OpenAiCompatEmbedder::embed_batch", rival_path, 100, 140);
+        let rival_owner = test_entity("OpenAiCompatEmbedder", rival_path, 10, 200);
+        graph.upsert_entity(&rival).unwrap();
+        graph.upsert_entity(&rival_owner).unwrap();
+        graph
+            .upsert_relation(&relation(RelationKind::Contains, rival_owner.id, rival.id))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(RelationKind::Calls, rival_owner.id, canonical.id))
+            .unwrap();
+
+        // File order puts the rival first, exactly the order that shipped the
+        // qb05 flip, so only the mass signal can move the canonical hit up.
+        let symbol = |name: &str| LocateSymbol {
+            name: name.to_string(),
+            span: Some([100, 140]),
+            score: 450.0,
+            kind: "method".to_string(),
+            definition: true,
+            origin: "text".to_string(),
+            cosine: None,
+            snippet: None,
+        };
+        let file = |path: &str, name: &str| LocateFileEntry {
+            path: path.to_string(),
+            score: 0.2,
+            signals: vec![],
+            spans: vec![],
+            symbols: vec![symbol(name)],
+            explain: vec![],
+            provenance: None,
+            signal_scores: None,
+            score_breakdown: None,
+            matched_queries: Vec::new(),
+        };
+        let mut result = LocateResult {
+            files: vec![
+                file(rival_path, "OpenAiCompatEmbedder::embed_batch"),
+                file(canonical_path, "CodeEmbedder::embed_batch"),
+            ],
+            ..Default::default()
+        };
+        build_entity_view(
+            &mut result,
+            &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+            &SnippetOptions::enabled(None).without_bodies(),
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+            "embed_batch",
+        )
+        .unwrap();
+        assert_eq!(
+            result.entities[0].name, "CodeEmbedder::embed_batch",
+            "the edgeless canonical definition must win through its owner name"
+        );
+        assert!(
+            result.entities[0]
+                .provenance
+                .origin
+                .contains("tie_break=owner_graph_mass:6"),
+            "the fallback mass must be the disclosed tie-break, got {:?}",
+            result.entities[0].provenance.origin
+        );
     }
 
     #[test]
