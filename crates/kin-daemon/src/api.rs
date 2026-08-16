@@ -4649,7 +4649,7 @@ async fn command_commit(
     .await
     .map_err(internal_error)?;
 
-    match command_commit_after_admission(&state, request, deferred_tree.is_some()) {
+    match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
         Ok(response) => Ok(response),
         Err(error) => {
             if let Some(admitted) = deferred_tree {
@@ -4663,13 +4663,14 @@ async fn command_commit(
 /// Plan and publish the commit for a working copy this caller has already
 /// admitted.
 ///
-/// `observed_target_tree` says the admission left its tree transition for this
-/// transaction to carry, which is also what makes the working copy the proof
-/// of the target tree rather than of the prior one.
+/// `observed` is present when the admission left its tree transition for this
+/// transaction to carry. It is the completed walk's own proof rather than a
+/// flag, so the collapsed path cannot be entered without one, and the tree it
+/// proved is checked against the tree the plan publishes.
 fn command_commit_after_admission(
     state: &Arc<DaemonState>,
     request: CommandCommitRequest,
-    observed_target_tree: bool,
+    observed: Option<&crate::repository_commit::AdmittedWorkspaceTree>,
 ) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
     let graph = &*state.graph;
     let authority_context =
@@ -4750,12 +4751,13 @@ fn command_commit_after_admission(
         }
     }
 
-    let committed = if observed_target_tree {
+    let committed = if let Some(observed) = observed {
         crate::repository_commit::commit_native_plan_with_observed_target_tree(
             &state.layout,
             state.blobs.as_ref(),
             &authority_context,
             plan,
+            observed,
         )
     } else {
         crate::repository_commit::commit_native_plan_with_projection(

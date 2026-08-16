@@ -1115,8 +1115,8 @@ pub(crate) fn commit_native_plan_with_projection(
     )
 }
 
-/// Publish one native repository transaction whose caller has already observed
-/// the working copy holding the plan's target tree.
+/// Publish one native repository transaction that also carries the exact tree
+/// transition a completed host walk observed.
 ///
 /// The commit seam derives its target tree from a complete filesystem scan
 /// taken moments earlier under the same coordination gate, so the tree
@@ -1125,12 +1125,40 @@ pub(crate) fn commit_native_plan_with_projection(
 /// transition and the semantic change, instead of publishing the tree in its
 /// own successor first and paying a second O(store) preparation and snapshot
 /// for the change.
+///
+/// `observed` is that walk's proof, and it is a parameter rather than a flag
+/// for the reason [`AdmittedWorkspaceTree`] exists at all: it cannot be
+/// constructed without a [`kin_index::CompleteScanToken`], so a collapsed
+/// commit cannot be assembled from a partial walk. Standalone publication has
+/// required that proof since it was introduced, and folding the tree into this
+/// transaction moves where the tree crosses authority without moving what has
+/// to be true before it does.
+///
+/// The proof is checked against the plan rather than merely accompanying it.
+/// A token proves some walk completed; it does not say which tree that walk
+/// proved, and a plan built against a different pair of trees would publish a
+/// transition nobody observed while carrying a genuine token for a different
+/// one.
 pub(crate) fn commit_native_plan_with_observed_target_tree(
     layout: &kin_core::KinLayout,
     blobs: &kin_blobs::BlobStore,
     authority_context: &LocalRepositoryAuthorityContext,
     plan: NativeCommitPlan,
+    observed: &AdmittedWorkspaceTree,
 ) -> Result<NativeCommitResult> {
+    if observed.previous_tree != plan.previous_tree {
+        return Err(invalid(
+            "the completed host walk was planned out of a different workspace tree than this \
+             commit publishes from; a collapsed commit may not carry a tree transition no walk \
+             observed",
+        ));
+    }
+    if observed.desired_tree != plan.target_tree {
+        return Err(invalid(
+            "the completed host walk observed a different working tree than this commit \
+             publishes; a collapsed commit may not carry a tree transition no walk observed",
+        ));
+    }
     commit_native_plan_with_working_copy_proof(
         layout,
         blobs,

@@ -3116,6 +3116,76 @@ mod tests {
         );
     }
 
+    /// A collapsed commit publishes the tree its own walk proved, or none.
+    ///
+    /// The completion proof rides along as a value only a finished walk can
+    /// mint, which is what stops a collapsed commit being assembled from a
+    /// partial one. That alone is not enough: a token says some walk finished,
+    /// not which tree it observed. So the proof is checked against the plan,
+    /// and this drives the two apart to watch the check fire. The graph moves
+    /// after the admission returns, exactly as a stray in-process tree
+    /// mutation between admission and publication would move it, and the
+    /// commit that would then publish an unobserved transition is refused.
+    #[test]
+    fn a_collapsed_commit_refuses_a_tree_its_walk_did_not_observe() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("observed.rs"),
+            b"pub fn observed() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+
+        // Move the derived tree after the walk proved it, so the plan below
+        // targets a tree no walk observed.
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        test_repo_path("never_walked.rs"),
+                        TreeEntry::gitlink(kin_model::GitObjectId::sha1([0x7c; 20])),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+
+        let authority_context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &state.graph,
+            state.blobs.as_ref(),
+            &authority_context,
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("collapsed-proof-test"),
+            "publish a tree no walk observed".to_string(),
+        )
+        .unwrap();
+
+        let error = crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+            &deferred,
+        )
+        .expect_err("a plan targeting an unobserved tree must be refused");
+        assert!(
+            error.to_string().contains("no walk observed"),
+            "the refusal must name what went wrong: {error}"
+        );
+    }
+
     /// The livelock signature stays dead, in the counters that carried it.
     ///
     /// The earlier spin was a closed loop: an unadmitted path failed the host
