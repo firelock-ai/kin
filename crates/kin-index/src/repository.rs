@@ -46,6 +46,8 @@ use kin_model::RepoPath;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::admission::ResolvedAdmissionMatcher;
+
 /// Exact materialization kind observed at a host filesystem boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScannedEntryKind {
@@ -81,6 +83,15 @@ pub struct RepositoryScanDiagnostics {
     /// Imported graph-only members preserved without inferring identity from
     /// their host materialization.
     pub graph_only_entries_preserved: usize,
+    /// Untracked entries the graph-owned admission policy excludes.
+    ///
+    /// Counted apart from `ignored_untracked_entries` because the two rule sets
+    /// are different objects: that one is this repository's `.kinignore` and the
+    /// built-in defaults, and this one is the durable policy compiled from every
+    /// `.gitignore`/`.kinignore` blob in the tree plus the frozen local overlay.
+    /// A path only the second excludes used to be proposed by the walk and
+    /// refused at the authority boundary, which failed the whole admission.
+    pub policy_excluded_untracked_entries: usize,
     pub content_bytes_read: u64,
 }
 
@@ -128,6 +139,7 @@ pub struct CompleteRepositoryScan {
     entries: BTreeMap<RepoPath, ScannedRepositoryEntry>,
     graph_only_paths: BTreeSet<RepoPath>,
     unverified_ignored_paths: BTreeSet<RepoPath>,
+    policy_excluded_sample: Vec<RepoPath>,
     diagnostics: RepositoryScanDiagnostics,
     completion: CompleteScanToken,
 }
@@ -161,6 +173,17 @@ impl CompleteRepositoryScan {
 
     pub const fn completion(&self) -> CompleteScanToken {
         self.completion
+    }
+
+    /// A bounded sample of the untracked paths the graph-owned admission
+    /// policy excluded from this walk.
+    ///
+    /// Bounded because an excluded directory is skipped whole and its leaves
+    /// are never counted individually, but a policy that names many separate
+    /// files still could. The count in the diagnostics is complete; this names
+    /// enough of it for an operator to recognize which rule is at work.
+    pub fn policy_excluded_paths_sample(&self) -> &[RepoPath] {
+        &self.policy_excluded_sample
     }
 
     /// Tracked paths the effective ignore rules excluded from observation.
@@ -693,6 +716,7 @@ pub fn scan_repository<'a>(
     scan_repository_preserving_graph_only(
         root,
         ignore,
+        None,
         tracked_paths,
         std::iter::empty::<&'a RepoPath>(),
     )
@@ -703,9 +727,28 @@ pub fn scan_repository<'a>(
 /// `graph_only_paths` currently carries imported Gitlinks. Their identity is
 /// owned by graph/import truth; a host directory is neither evidence for a
 /// Gitlink nor permission to expand its checkout into sibling Kin artifacts.
+///
+/// `policy` is the repository's compiled graph-owned admission policy, and a
+/// caller that is about to publish what this walk proposes must pass it. The
+/// two rule sets are genuinely different: `ignore` is this repository's
+/// `.kinignore` plus the built-in defaults, read from the working copy with
+/// literal component matching, while the policy is compiled at the durable
+/// authority boundary from every `.gitignore` and `.kinignore` blob in the
+/// tree plus the frozen local overlay, with gitwildmatch semantics. Proposing
+/// an untracked path the policy excludes is not a survivable disagreement:
+/// authority refuses that one artifact and the refusal fails the entire
+/// exact-tree admission, so the walk that proposed it admits nothing at all
+/// (FIR-2346). Passing `None` keeps the legacy behavior for callers that do not
+/// publish, such as coverage reports and purge previews.
+///
+/// Only untracked paths are judged against it, which is exactly the boundary
+/// authority itself applies: an artifact the repository already tracks is
+/// admitted regardless of what the policy says today, and retracting it is a
+/// separate, announced decision made against graph truth rather than here.
 pub fn scan_repository_preserving_graph_only<'a>(
     root: &Path,
     ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
@@ -734,9 +777,11 @@ pub fn scan_repository_preserving_graph_only<'a>(
     let mut scanner = Scanner {
         root,
         ignore,
+        policy,
         tracked_paths,
         graph_only_paths,
         unverified_ignored_paths,
+        policy_excluded_sample: Vec::new(),
         entries: BTreeMap::new(),
         diagnostics: RepositoryScanDiagnostics::default(),
     };
@@ -748,17 +793,24 @@ pub fn scan_repository_preserving_graph_only<'a>(
         entries: scanner.entries,
         graph_only_paths: scanner.graph_only_paths,
         unverified_ignored_paths: scanner.unverified_ignored_paths,
+        policy_excluded_sample: scanner.policy_excluded_sample,
         diagnostics: scanner.diagnostics,
         completion: CompleteScanToken { _private: () },
     })
 }
 
+/// How many policy-excluded paths one walk names outright. See
+/// [`CompleteRepositoryScan::policy_excluded_paths_sample`].
+const POLICY_EXCLUDED_SAMPLE_LIMIT: usize = 8;
+
 struct Scanner<'a> {
     root: &'a Path,
     ignore: &'a RepositoryIgnore,
+    policy: Option<&'a ResolvedAdmissionMatcher>,
     tracked_paths: BTreeSet<RepoPath>,
     graph_only_paths: BTreeSet<RepoPath>,
     unverified_ignored_paths: BTreeSet<RepoPath>,
+    policy_excluded_sample: Vec<RepoPath>,
     entries: BTreeMap<RepoPath, ScannedRepositoryEntry>,
     diagnostics: RepositoryScanDiagnostics,
 }
@@ -780,6 +832,26 @@ impl Scanner<'_> {
     /// paying a full pass over that set for every entry it inspected. Repository
     /// paths order by their bytes, so every descendant of `path` sorts after it
     /// and before the first path that does not begin with those bytes.
+    /// Whether the graph-owned admission policy excludes an untracked `path`.
+    ///
+    /// Records a bounded sample as it goes, so the pass that skipped a path can
+    /// name it once rather than leaving an operator to guess which rule fired.
+    /// `true` is only ever returned for a path this walk is about to skip, so
+    /// the sample and the count describe the same set.
+    fn policy_excludes_untracked(&mut self, path: &RepoPath, is_dir: bool) -> bool {
+        let Some(policy) = self.policy else {
+            return false;
+        };
+        if !policy.decide(path, is_dir, false).is_ignored() {
+            return false;
+        }
+        self.diagnostics.policy_excluded_untracked_entries += 1;
+        if self.policy_excluded_sample.len() < POLICY_EXCLUDED_SAMPLE_LIMIT {
+            self.policy_excluded_sample.push(path.clone());
+        }
+        true
+    }
+
     fn is_tracked_or_contains_tracked(&self, path: &RepoPath) -> bool {
         let prefix = path.as_bytes();
         self.tracked_paths
@@ -827,6 +899,19 @@ impl Scanner<'_> {
                     self.diagnostics.ignored_untracked_entries += 1;
                     continue;
                 }
+                // A directory the durable policy excludes is skipped whole, and
+                // gitwildmatch semantics are why that is exact rather than
+                // merely convenient: a rule beneath an excluded ancestor cannot
+                // re-admit anything under it, so nothing down there could ever
+                // be admitted and descending would only cost the reads. Graph
+                // truth still outranks the rules, so a directory holding a
+                // tracked path is walked and only its untracked leaves are
+                // skipped below.
+                if !self.is_tracked_or_contains_tracked(&repo_path)
+                    && self.policy_excludes_untracked(&repo_path, true)
+                {
+                    continue;
+                }
                 self.walk(&host_path)?;
                 continue;
             }
@@ -840,6 +925,16 @@ impl Scanner<'_> {
                 if !self.unverified_ignored_paths.contains(&repo_path) {
                     self.diagnostics.ignored_untracked_entries += 1;
                 }
+                continue;
+            }
+
+            // An untracked leaf the durable policy excludes. Nothing opens it,
+            // for the same reason nothing opens an ignored one: proposing it
+            // would be refused at the authority boundary, and that refusal is
+            // not survivable, it fails the whole tree admission.
+            if !self.tracked_paths.contains(&repo_path)
+                && self.policy_excludes_untracked(&repo_path, false)
+            {
                 continue;
             }
 
@@ -1121,6 +1216,132 @@ mod tests {
     fn scan(root: &Path) -> CompleteRepositoryScan {
         let ignore = RepositoryIgnore::load(root).unwrap();
         scan_repository(root, &ignore, std::iter::empty()).unwrap()
+    }
+
+    /// Compile one graph-owned policy from rule bytes, as the durable authority
+    /// boundary compiles the repository's own.
+    fn graph_owned_policy(rules: &str) -> ResolvedAdmissionMatcher {
+        ResolvedAdmissionMatcher::compile(
+            crate::admission::AdmissionCase::Sensitive,
+            vec![crate::admission::ResolvedAdmissionRuleSet::from_bytes(
+                crate::admission::AdmissionRuleSource::Shared {
+                    source_path: path(".gitignore"),
+                },
+                0,
+                None,
+                rules.as_bytes().to_vec(),
+            )],
+        )
+        .unwrap()
+    }
+
+    /// The walk skips what the graph-owned policy excludes, and does not read
+    /// it on the way.
+    ///
+    /// Proposing one of these paths is refused at the authority boundary, and
+    /// the refusal fails the whole exact-tree admission rather than that one
+    /// artifact (FIR-2346). Skipping it is therefore not an optimization. The
+    /// byte counter is asserted because an excluded subtree that is walked and
+    /// hashed anyway still costs the machine everything the skip exists to
+    /// save, which is what a churning agent worktree under an excluded
+    /// directory does on every pass.
+    #[test]
+    fn the_graph_owned_policy_prunes_untracked_paths_before_they_are_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join(".claude/worktrees/lane-a/src")).unwrap();
+        fs::write(root.join(".claude/scheduled_tasks.lock"), b"held").unwrap();
+        fs::write(
+            root.join(".claude/worktrees/lane-a/src/dirty.rs"),
+            vec![b'x'; 4096],
+        )
+        .unwrap();
+        fs::write(root.join("keep.rs"), b"fn keep() {}").unwrap();
+        let ignore = RepositoryIgnore::default();
+        let policy = graph_owned_policy(".claude/\n");
+
+        let scan = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            Some(&policy),
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        assert!(scan.entry(&path("keep.rs")).is_some());
+        assert!(scan.entry(&path(".claude/scheduled_tasks.lock")).is_none());
+        assert!(scan
+            .entry(&path(".claude/worktrees/lane-a/src/dirty.rs"))
+            .is_none());
+        assert_eq!(scan.diagnostics().policy_excluded_untracked_entries, 1);
+        assert_eq!(
+            scan.policy_excluded_paths_sample(),
+            [path(".claude")],
+            "the excluded directory is named once rather than every leaf beneath it"
+        );
+        assert!(
+            scan.diagnostics().content_bytes_read < 4096,
+            "the excluded subtree was read: {} bytes",
+            scan.diagnostics().content_bytes_read
+        );
+
+        // Two-sided. Without the policy the same walk really does reach and
+        // read all of it, so the assertions above describe the policy rather
+        // than a fixture that was never walkable.
+        let everything = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            None,
+            std::iter::empty(),
+            std::iter::empty(),
+        )
+        .unwrap();
+        assert!(everything
+            .entry(&path(".claude/worktrees/lane-a/src/dirty.rs"))
+            .is_some());
+        assert_eq!(
+            everything.diagnostics().policy_excluded_untracked_entries,
+            0
+        );
+        assert!(everything.diagnostics().content_bytes_read > 4096);
+    }
+
+    /// Graph truth outranks the policy for a path the repository already
+    /// tracks, exactly as the authority boundary ranks them.
+    ///
+    /// Authority admits a tracked artifact whatever the rules say today, so a
+    /// walk that dropped it would report it absent and infer a removal from
+    /// that. Untracking such a path is a separate announced decision.
+    #[test]
+    fn a_tracked_path_survives_a_policy_that_would_exclude_it_today() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("vendor/lib")).unwrap();
+        fs::write(root.join("vendor/lib/tracked.rs"), b"fn tracked() {}").unwrap();
+        fs::write(root.join("vendor/lib/fresh.rs"), b"fn fresh() {}").unwrap();
+        let tracked = path("vendor/lib/tracked.rs");
+        let ignore = RepositoryIgnore::default();
+        let policy = graph_owned_policy("vendor/\n");
+
+        let scan = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            Some(&policy),
+            [&tracked],
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        assert!(
+            scan.entry(&tracked).is_some(),
+            "a tracked artifact was dropped by a rule that only governs admission"
+        );
+        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+        assert!(
+            scan.entry(&path("vendor/lib/fresh.rs")).is_none(),
+            "an untracked path under the excluded directory was admitted"
+        );
     }
 
     /// Membership stays independent of parser support, hidden names, and
@@ -1657,9 +1878,11 @@ mod tests {
         let scanner = Scanner {
             root,
             ignore: &ignore,
+            policy: None,
             tracked_paths: BTreeSet::new(),
             graph_only_paths: BTreeSet::new(),
             unverified_ignored_paths: BTreeSet::new(),
+            policy_excluded_sample: Vec::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
         };
@@ -1691,6 +1914,7 @@ mod tests {
         let scan = scan_repository_preserving_graph_only(
             root,
             &RepositoryIgnore::default(),
+            None,
             [&gitlink],
             [&gitlink],
         )
@@ -1705,6 +1929,7 @@ mod tests {
         let deinitialized = scan_repository_preserving_graph_only(
             root,
             &RepositoryIgnore::default(),
+            None,
             [&gitlink],
             [&gitlink],
         )
@@ -1842,9 +2067,11 @@ mod tests {
         let scanner = Scanner {
             root,
             ignore: &ignore,
+            policy: None,
             tracked_paths: BTreeSet::new(),
             graph_only_paths: BTreeSet::new(),
             unverified_ignored_paths: BTreeSet::new(),
+            policy_excluded_sample: Vec::new(),
             entries: BTreeMap::new(),
             diagnostics: RepositoryScanDiagnostics::default(),
         };

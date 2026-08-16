@@ -156,6 +156,15 @@ struct ExactTreeAdmission {
     deltas: Vec<TreeDelta>,
     changed_paths: BTreeSet<RepoPath>,
     semantic_events: Vec<FileEvent>,
+    /// The exact admission policy this pass planned against.
+    ///
+    /// Carried back so the reconcile loop can drop host events for paths the
+    /// policy excludes without paying a second authority load per tick. The
+    /// loop's copy is therefore one pass old, which is the right staleness for
+    /// what it decides: dropping an event is advisory, admission still enforces
+    /// the policy exactly, and a rule written this tick takes effect on the
+    /// next one instead of on the one that wrote it.
+    policy: Option<kin_index::ResolvedAdmissionMatcher>,
 }
 
 fn canonicalize_host_parent_preserving_leaf(path: &Path) -> std::io::Result<PathBuf> {
@@ -347,6 +356,32 @@ fn event_is_beneath_graph_only_member(state: &DaemonState, event: &FileEvent) ->
     }
 }
 
+/// Whether the graph-owned admission policy excludes the path this event names,
+/// and graph truth does not already track it.
+///
+/// The exact test the walk and the authority boundary both apply, asked of one
+/// host notification. `policy` is the last resolved one; before the first
+/// admission of a daemon's life there is none and nothing is dropped.
+fn event_is_policy_excluded(
+    state: &DaemonState,
+    policy: Option<&kin_index::ResolvedAdmissionMatcher>,
+    event: &FileEvent,
+) -> bool {
+    let Some(policy) = policy else {
+        return false;
+    };
+    let path = match event {
+        FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+    };
+    let Ok(Some(repo_path)) = repo_path(path, state.layout.working_dir()) else {
+        return false;
+    };
+    if state.graph.artifact_id_at_path(&repo_path).is_some() {
+        return false;
+    }
+    policy.decide(&repo_path, false, false).is_ignored()
+}
+
 fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<bool> {
     for artifact in state.graph.resolved_tree().artifacts_by_path() {
         if kin_core::source_projection_disposition(&artifact.path, artifact.entry)?
@@ -417,13 +452,35 @@ fn mass_deletion_refused(removed: u64, total_graph_files: u64) -> DaemonError {
     ))
 }
 
-/// Read the repository roots the next observation will be planned against.
-pub(crate) fn current_authority_roots(state: &DaemonState) -> Result<kin_model::RootBundle> {
+/// Read the authority roots an admission plans against and the exact admission
+/// policy that authority will judge it by, from one open.
+///
+/// One open rather than two because the pair has to be coherent: planning a
+/// tree against one generation's roots and filtering it through another
+/// generation's rules would leave the walk proposing paths the publication is
+/// about to refuse, which is the failure this reads the policy to avoid.
+///
+/// A repository with no local workspace — a hosted snapshot daemon — has no
+/// policy to resolve and reports `None`. Nothing is filtered in that case, and
+/// nothing is published from a host walk there either.
+pub(crate) fn current_authority_admission(
+    state: &DaemonState,
+) -> Result<(
+    kin_model::RootBundle,
+    Option<kin_index::ResolvedAdmissionMatcher>,
+)> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
     let authority = authority_context.open().map_err(DaemonError::Graph)?;
     let roots = authority.read_authority().roots().clone();
-    Ok(roots)
+    let policy = authority
+        .workspace_admission_snapshot(
+            authority_context.repository_id(),
+            &authority_context.workspace_id(),
+        )
+        .map_err(DaemonError::Graph)?
+        .map(|snapshot| snapshot.matcher);
+    Ok((roots, policy))
 }
 
 /// What one complete walk declined to observe, taken from its own diagnostics.
@@ -437,7 +494,33 @@ fn excluded_host_content(
     crate::background_work::ExcludedHostContent {
         ignored: diagnostics.ignored_untracked_entries as u64,
         unsupported: diagnostics.unsupported_untracked_entries as u64,
+        policy_excluded: diagnostics.policy_excluded_untracked_entries as u64,
     }
+}
+
+/// Say once per pass what the graph-owned policy kept out of it.
+///
+/// Once per pass and bounded, not once per path: the founder's daemon logged
+/// the same refusal continuously, and a walk that meets a churning excluded
+/// directory would reproduce that at debug if it named every leaf. The count is
+/// complete and the sample is what makes the rule recognizable.
+fn announce_policy_exclusions(scan: &kin_index::CompleteRepositoryScan) {
+    let excluded = scan.diagnostics().policy_excluded_untracked_entries;
+    if excluded == 0 {
+        return;
+    }
+    let sample = scan
+        .policy_excluded_paths_sample()
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    debug!(
+        count = excluded,
+        sample = %sample,
+        "the graph-owned admission policy excludes these untracked host paths; \
+         they were skipped rather than proposed"
+    );
 }
 
 /// Report whether one repository path was named by an observation, either
@@ -493,7 +576,7 @@ fn exact_tree_admission(
     // Publication compare-and-swaps on this bundle, so a repository that moves
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
-    let expected_roots = current_authority_roots(state)?;
+    let (expected_roots, policy) = current_authority_admission(state)?;
     let previous = state.graph.resolved_tree();
     let tracked_paths = previous
         .artifacts_by_path()
@@ -540,11 +623,13 @@ fn exact_tree_admission(
         kin_index::scan_repository_preserving_graph_only(
             working_dir,
             &ignore,
+            policy.as_ref(),
             scanned_tracked.into_iter(),
             graph_only_paths.iter(),
         )
     })
     .map_err(kin_index::IndexError::from)?;
+    announce_policy_exclusions(&scan);
     let mut observed =
         crate::mcp_commit::timed_commit_phase("observe_tree_and_stage_blobs", || {
             crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)
@@ -712,6 +797,7 @@ fn exact_tree_admission(
         deltas,
         changed_paths,
         semantic_events: dedup_file_events(semantic_events),
+        policy,
     })
 }
 
@@ -1525,6 +1611,11 @@ pub async fn run_loop(
     // larger than `batch_size` is deferred instead of silently discarded.
     let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
     let mut backlog_warning_active = false;
+    // The admission policy the last complete pass planned against, kept so the
+    // event filter below costs no authority load of its own. `None` until the
+    // first pass resolves one, which is the safe direction: nothing is dropped
+    // and the pass itself still enforces the policy exactly.
+    let mut graph_owned_policy: Option<kin_index::ResolvedAdmissionMatcher> = None;
 
     // Register with the self-limit supervisor. Registered here rather than at
     // daemon start so a repository that never runs this loop — filesystem
@@ -1614,6 +1705,33 @@ pub async fn run_loop(
             retry_lane.forget(path);
             false
         });
+        // A path the graph-owned admission policy excludes is dropped for the
+        // same reason and with more force. Authority would refuse to admit it,
+        // and that refusal is not per-path: it fails the whole exact-tree
+        // admission, so one churning excluded file used to defer every other
+        // path in the working copy and admit nothing (FIR-2346). Even with the
+        // walk no longer proposing it, waking the tick on such an event would
+        // still buy a complete working-copy admission that can only conclude
+        // there is nothing to do, and a working stretch that records no
+        // progress is what the supervisor eventually parks the loop for. So the
+        // event never schedules work, and it ends whatever ladder the path had:
+        // the rules exclude it, so no retry can ever reach a different answer.
+        let mut policy_excluded_events = 0usize;
+        incoming_events.retain(|event| {
+            if !event_is_policy_excluded(&state, graph_owned_policy.as_ref(), event) {
+                return true;
+            }
+            let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+            retry_lane.forget(path);
+            policy_excluded_events += 1;
+            false
+        });
+        if policy_excluded_events > 0 {
+            debug!(
+                count = policy_excluded_events,
+                "dropped host events for paths the graph-owned admission policy excludes"
+            );
+        }
         // A path already waiting out a ladder step is not looked at again until
         // that step elapses, whichever queue its next notification arrived on.
         // The retry is already owed and re-reads whatever the file then holds, so
@@ -1738,6 +1856,7 @@ pub async fn run_loop(
                     &state.layout,
                     state.graph.resolved_tree().len() as u64,
                 );
+                graph_owned_policy.clone_from(&admission.policy);
                 admission
             }
             Err(error) => {
@@ -4458,6 +4577,248 @@ mod tests {
         // resetting the graph.
         assert!(tree_entry(&state, "keep.rs").is_some());
         assert_eq!(entity_ids_for(&state, "keep.rs"), kept_entities);
+    }
+
+    /// Establish a repository whose graph-owned admission policy excludes
+    /// `.claude/`, the way every real one does: the rule file is tracked before
+    /// the excluded content exists.
+    ///
+    /// A repository imported from Git resolves its policy from the `.gitignore`
+    /// blobs the import carried, so the rules are in force before the daemon's
+    /// first ambient pass. This fixture reproduces that state rather than
+    /// asserting anything about it.
+    async fn repository_with_policy_excluding_claude(root: &Path, state: &DaemonState) {
+        std::fs::write(root.join(".gitignore"), b".claude/\n").unwrap();
+        std::fs::write(root.join("keep.rs"), b"pub fn kept() -> u32 { 1 }\n").unwrap();
+        sync_filesystem_with_graph(state).await.unwrap();
+        assert!(
+            tree_entry(state, ".gitignore").is_some(),
+            "the fixture never admitted its own rule file, so no policy is in force"
+        );
+    }
+
+    /// A dirty subtree the graph-owned policy excludes admits the rest of the
+    /// tree instead of failing the whole admission.
+    ///
+    /// The scanner reads `.kinignore` and its built-in defaults; the durable
+    /// admission policy is compiled from every `.gitignore` and `.kinignore`
+    /// blob in the tree plus the frozen local overlay. A path only the second
+    /// one excludes was proposed by the walk and refused at the authority
+    /// boundary, and that refusal fails the entire exact-tree admission, so one
+    /// churning agent lock file left every other file in the working copy
+    /// unadmitted and the store answered from nothing (FIR-2346).
+    ///
+    /// The nested checkout under the excluded directory is the shape that
+    /// produced it on the founder's machine: a git worktree whose `.git` file
+    /// is control metadata while everything beside it is ordinary content.
+    #[tokio::test]
+    async fn a_dirty_policy_excluded_subtree_admits_the_rest_of_the_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        repository_with_policy_excluding_claude(&root, &state).await;
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn library() -> u32 { 2 }\n").unwrap();
+        std::fs::create_dir_all(root.join(".claude/worktrees/lane-a/src")).unwrap();
+        std::fs::write(root.join(".claude/scheduled_tasks.lock"), b"held\n").unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/lane-a/.git"),
+            b"gitdir: ../../../.git/worktrees/lane-a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".claude/worktrees/lane-a/src/dirty.rs"),
+            b"pub fn dirty() -> u32 { 3 }\n",
+        )
+        .unwrap();
+
+        // The pass completing at all is what proves nothing was deferred: a
+        // deferral is only reachable from the failure arm this admission used
+        // to take, where the loop defers every path in the batch and admits
+        // none of them.
+        sync_filesystem_with_graph(&state).await.unwrap();
+
+        assert!(
+            tree_entry(&state, "src/lib.rs").is_some(),
+            "an excluded subtree left an ordinary file unadmitted"
+        );
+        assert!(
+            !entity_ids_for(&state, "src/lib.rs").is_empty(),
+            "the pass admitted a tree it derived no semantics from, which is no progress"
+        );
+        assert!(
+            tree_entry(&state, "keep.rs").is_some(),
+            "the file admitted before the excluded subtree appeared was dropped"
+        );
+        assert!(tree_entry(&state, ".gitignore").is_some());
+        assert!(
+            tree_entry(&state, ".claude/scheduled_tasks.lock").is_none(),
+            "a policy-excluded path reached repository truth"
+        );
+        assert!(tree_entry(&state, ".claude/worktrees/lane-a/src/dirty.rs").is_none());
+
+        // The walk declined to observe them rather than silently finding
+        // nothing, and it says how many. An operator reading a missing file
+        // gets an answer instead of a quiet tree.
+        let excluded = state
+            .background_work
+            .reconcile()
+            .report(Instant::now())
+            .policy_excluded_path_count;
+        assert!(
+            excluded > 0,
+            "the pass skipped policy-excluded content without disclosing any of it"
+        );
+    }
+
+    /// Churn under an excluded path is not work, and the loop must not spend a
+    /// working stretch on it.
+    ///
+    /// Every excluded notification used to schedule a complete working-copy
+    /// admission that could only conclude there was nothing to admit, which is
+    /// a working stretch that records no progress. Ten minutes of that is what
+    /// the supervisor parks a pass for, and it parked the founder's store at
+    /// zero entities while the loop was doing exactly what it should.
+    #[tokio::test]
+    async fn continuous_excluded_churn_never_reaches_the_admission_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir().to_path_buf();
+        repository_with_policy_excluding_claude(&root, &state).await;
+
+        let (_, policy) = current_authority_admission(&state).unwrap();
+        let policy = policy.expect("a local workspace resolves an admission policy");
+        std::fs::create_dir_all(root.join(".claude/worktrees/lane-a")).unwrap();
+        std::fs::write(root.join(".claude/scheduled_tasks.lock"), b"held\n").unwrap();
+        std::fs::write(root.join("src.rs"), b"pub fn src() -> u32 { 4 }\n").unwrap();
+
+        let excluded = FileEvent::Changed(root.join(".claude/scheduled_tasks.lock"));
+        assert!(
+            event_is_policy_excluded(&state, Some(&policy), &excluded),
+            "a churning excluded path still schedules a complete admission"
+        );
+        assert!(event_is_policy_excluded(
+            &state,
+            Some(&policy),
+            &FileEvent::Changed(root.join(".claude/worktrees/lane-a/head")),
+        ));
+
+        // Two-sided, or the predicate could be "drop everything". Ordinary
+        // content still reaches the admission path, and so does a tracked path
+        // even when the rules would exclude it today.
+        assert!(!event_is_policy_excluded(
+            &state,
+            Some(&policy),
+            &FileEvent::Changed(root.join("src.rs")),
+        ));
+        assert!(!event_is_policy_excluded(
+            &state,
+            Some(&policy),
+            &FileEvent::Changed(root.join("keep.rs")),
+        ));
+        // Before the first pass of a daemon's life there is no resolved policy,
+        // and nothing may be dropped on the strength of not having one.
+        assert!(!event_is_policy_excluded(&state, None, &excluded));
+    }
+
+    /// A pass making real progress is never stalled by excluded churn beside
+    /// it.
+    ///
+    /// The supervisor's verdict is the half that decides whether the store
+    /// survives, so it is exercised directly rather than inferred from the
+    /// filter above: excluded notifications arrive continuously for well past
+    /// the stall threshold while the loop keeps admitting, and the sweep must
+    /// leave the pass running.
+    #[test]
+    fn excluded_churn_beside_real_progress_never_parks_the_pass() {
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
+        let start = Instant::now();
+
+        // Twenty minutes of ticks. Each one admits something real while
+        // excluded paths churn beside it, which is the working copy of anyone
+        // running an agent in their repository.
+        let mut now = start;
+        for tick in 0..120 {
+            now = start + Duration::from_secs(tick * 10);
+            pass.working(now);
+            pass.advanced(1, now);
+            assert!(
+                supervisor.sweep(now).is_empty(),
+                "a pass that is admitting was parked at tick {tick}"
+            );
+        }
+        assert!(!pass.halted());
+        assert!(supervisor.reconcile_report(now).parked.is_none());
+
+        // The other side: with the same clock and no progress, the sweep does
+        // stop it. Without this the assertions above would hold for a
+        // supervisor that never parks anything.
+        let starved =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let starved_pass = starved.pass(crate::background_work::PASS_RECONCILE);
+        starved_pass.working(start);
+        assert!(starved.sweep(start + Duration::from_secs(1_200)).len() == 1);
+        assert!(starved_pass.halted());
+    }
+
+    /// The park names its own cause wherever the status string appears.
+    ///
+    /// `parked-by-supervisor` was the whole account a surface gave, and the
+    /// reason lived only in a log line from whenever it happened. The
+    /// supervisor already held the reason and the readings behind it.
+    #[test]
+    fn a_parked_reconcile_pass_publishes_its_reason_and_its_counts() {
+        let supervisor =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        let pass = supervisor.pass(crate::background_work::PASS_RECONCILE);
+        let start = Instant::now();
+        pass.working(start);
+        pass.advanced(3, start);
+        pass.set_deferred(true, start);
+        let stopped = supervisor.sweep(start + Duration::from_secs(1_050));
+        assert_eq!(stopped.len(), 1);
+
+        let report = supervisor.reconcile_report(start + Duration::from_secs(1_050));
+        let parked = report
+            .parked
+            .clone()
+            .expect("a parked pass reports its park");
+        assert!(parked.reason.contains("without recording any progress"));
+        assert_eq!(parked.progress, 3);
+        assert_eq!(parked.stall_threshold_seconds, 600);
+        assert_eq!(parked.progress_age_seconds, Some(1_050));
+        assert_eq!(parked.deferred_seconds, Some(1_050));
+        assert!(
+            report
+                .degraded_reasons()
+                .iter()
+                .any(|reason| reason.contains("parked by the background-work supervisor")),
+            "a parked loop reported no degraded reason: {:?}",
+            report.degraded_reasons()
+        );
+
+        // It serializes, because every surface that carries it is JSON, and it
+        // stays absent on a healthy loop rather than serializing an empty park.
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["parked"]["progress"], 3);
+        assert_eq!(encoded["parked"]["stall_threshold_seconds"], 600);
+        assert!(encoded["parked"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("was stopped"));
+        let decoded: kin_cli::commands::resources::ReconcileHealth =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.parked, report.parked);
+
+        let healthy =
+            crate::background_work::BackgroundWorkSupervisor::new(Duration::from_secs(600));
+        healthy.pass(crate::background_work::PASS_RECONCILE);
+        let healthy_report = healthy.reconcile_report(start);
+        assert!(healthy_report.parked.is_none());
+        assert!(serde_json::to_value(&healthy_report).unwrap()["parked"].is_null());
     }
 
     /// A rule wide enough to empty the repository is refused, not obeyed.

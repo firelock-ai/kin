@@ -1213,6 +1213,7 @@ mod tests {
         let scan = kin_index::scan_repository_preserving_graph_only(
             &source,
             &ignore,
+            None,
             tracked_paths.iter(),
             graph_only_paths.iter(),
         )

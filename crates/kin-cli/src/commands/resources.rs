@@ -307,6 +307,56 @@ pub struct ReconcileHealth {
     /// which no admission can represent.
     #[serde(default)]
     pub unsupported_path_count: u64,
+    /// Untracked host paths the graph-owned admission policy excluded from the
+    /// most recent complete walk.
+    ///
+    /// Separate from `ignored_path_count` because the reader's next action is
+    /// different: that count sends them to `.kinignore` in the working copy,
+    /// this one to the `.gitignore`/`.kinignore` blobs the repository tracks and
+    /// to the frozen local overlay. It is also the count that used to be zero
+    /// while every one of those paths failed the entire admission (FIR-2346).
+    #[serde(default)]
+    pub policy_excluded_path_count: u64,
+    /// Why the reconciliation loop is parked, when it is.
+    ///
+    /// The reconcile status string reads `parked-by-supervisor` and said
+    /// nothing else, so the only account of why lived in a log line from
+    /// whenever it happened. Absent on a loop that is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<ReconcileParked>,
+}
+
+/// The background-work supervisor's account of a parked reconciliation loop.
+///
+/// Every field is what the supervisor already had when it stopped the pass. It
+/// is published beside the status string so `parked-by-supervisor` names its own
+/// cause: the reason it announced, and the two readings that produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileParked {
+    /// The reason the supervisor announced when it stopped the pass.
+    pub reason: String,
+    /// Units of work the pass had durably recorded when it was stopped. The
+    /// number the stall verdict was reached on: a pass is stalled by having
+    /// held the CPU without advancing this.
+    #[serde(default)]
+    pub progress: u64,
+    /// Seconds the pass had been working without interruption. Absent once the
+    /// park cleared the working stretch, which is the ordinary case after a
+    /// stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_seconds: Option<u64>,
+    /// Seconds since `progress` last advanced. Absent when it never did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_age_seconds: Option<u64>,
+    /// Seconds the pass has owed deferred work. A livelock's own clock: it ages
+    /// while the loop keeps re-deferring paths it may not admit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_seconds: Option<u64>,
+    /// The configured stall threshold this verdict was reached against, in
+    /// seconds. Stated so a reader knows whether the numbers above are near the
+    /// limit or past it without going to find the constant.
+    #[serde(default)]
+    pub stall_threshold_seconds: u64,
 }
 
 impl ReconcileHealth {
@@ -323,6 +373,22 @@ impl ReconcileHealth {
     /// the limit or merely a number.
     pub fn degraded_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
+        // First, because it outranks every other reading here: a parked loop is
+        // not admitting anything at all, so whatever the counters below say
+        // about the last attempt, there is no next one until the daemon
+        // restarts.
+        if let Some(parked) = &self.parked {
+            let progress_age = match parked.progress_age_seconds {
+                Some(age) => format!("last advanced {age}s ago"),
+                None => "never advanced".to_string(),
+            };
+            reasons.push(format!(
+                "the reconciliation loop is parked by the background-work supervisor and admits \
+                 nothing until the daemon restarts: {} (progress {} units, {progress_age}, stall \
+                 threshold {}s)",
+                parked.reason, parked.progress, parked.stall_threshold_seconds
+            ));
+        }
         if self.admission_failure_streak >= ADMISSION_FAILURE_STREAK_ATTENTION {
             let since = match self.last_admission_success_age_seconds {
                 Some(age) => format!("last succeeded {age}s ago"),
@@ -406,12 +472,21 @@ impl ReconcileHealth {
                 self.untracked_path_count
             ));
         }
-        if self.ignored_path_count > 0 || self.unsupported_path_count > 0 {
+        if self.ignored_path_count > 0
+            || self.unsupported_path_count > 0
+            || self.policy_excluded_path_count > 0
+        {
             let mut excluded = Vec::new();
             if self.ignored_path_count > 0 {
                 excluded.push(format!(
                     "{} excluded by the ignore rules",
                     self.ignored_path_count
+                ));
+            }
+            if self.policy_excluded_path_count > 0 {
+                excluded.push(format!(
+                    "{} excluded by the repository's graph-owned admission policy",
+                    self.policy_excluded_path_count
                 ));
             }
             if self.unsupported_path_count > 0 {
@@ -422,8 +497,8 @@ impl ReconcileHealth {
             }
             notices.push(format!(
                 "The last complete walk left host content unobserved: {}. Nothing admits these, so \
-                 a file missing from here is missing on purpose; check .kinignore before waiting \
-                 on it.",
+                 a file missing from here is missing on purpose; check .kinignore and the \
+                 repository's tracked .gitignore rules before waiting on it.",
                 excluded.join(", ")
             ));
         }
