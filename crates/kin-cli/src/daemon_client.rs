@@ -6535,6 +6535,20 @@ pub async fn ensure_supervisor_running() -> Result<String> {
         }
     }
 
+    // Everything past this point is spawn authority. `KIN_NO_DAEMON` is the
+    // process-wide no-spawn contract (the probe mode behind `kin mcp start
+    // --no-spawn` and the update watchdog's checks), and every caller that
+    // honors it gates earlier, so reaching here under it is already a bug;
+    // refusing here makes the invariant hold at the chokepoint instead of at
+    // each caller. An already-running supervisor was returned above, so this
+    // refusal costs a probe nothing it was entitled to.
+    if is_transient_bool_env("KIN_NO_DAEMON") {
+        bail!(
+            "KIN_NO_DAEMON is set and no supervisor is running, so none may be started; unset \
+             KIN_NO_DAEMON (or drop --no-spawn) to let kin start one"
+        );
+    }
+
     // Validate the binary's explicit protocol acknowledgement before taking
     // cleanup or spawn authority. In particular, an immutable base daemon is
     // rejected here and is never started under a marker it cannot adopt.

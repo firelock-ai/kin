@@ -170,9 +170,36 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_semantic_query_readiness().await);
     checks.push(check_background_work().await);
     checks.push(check_retrieval_profile());
+    checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
 
     assemble_health_report(env::consts::OS.to_string(), checks)
+}
+
+/// Report the active update policy and where it came from.
+///
+/// Always healthy: every policy is a legitimate preference, and the check
+/// exists so the doctor surface states which one governs this machine now
+/// that the default installs unattended (FIR-2342). The inherited default and
+/// a recorded choice are named apart, because only the first moves when the
+/// shipped default changes.
+fn check_update_policy() -> HealthCheck {
+    let (policy, recorded) = crate::commands::update::active_update_policy_for_doctor();
+    let name = crate::commands::update::policy_name(policy);
+    let source = if recorded {
+        "recorded in ~/.kin/update.toml"
+    } else {
+        "the default; no recorded choice"
+    };
+    HealthCheck::new(
+        "update_policy",
+        "Update policy",
+        HealthStatus::Healthy,
+        format!(
+            "{name} ({source}); auto installs unattended through the gated executor. Change with \
+             `kin update --set-policy auto|prompt|manual`."
+        ),
+    )
 }
 
 /// macOS assesses each never-before-seen binary on first launch. Cold cargo

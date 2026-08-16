@@ -1208,6 +1208,7 @@ kin mcp start [options]
 | `--global` |  | Run in global mode, serving all registered repos from ~/.kin/registry.toml |
 | `--repo <path>` |  | Bind this server to a specific Kin repository instead of relying on the launching process's working directory. Overrides KIN_MCP_REPO. Use this for a global agent-CLI MCP entry that may launch outside any Kin repository (e.g. an umbrella workspace root). |
 | `--tool-profile <profile>` |  | Tool surface to serve: `agent-default` (the curated agent belt, and the default), `full` (every tool, roughly 12k extra tokens of schemas per session), `benchmark`, or `context-bench`. Overrides KIN_MCP_TOOL_PROFILE. |
+| `--no-spawn` |  | Never start or revive a daemon from this server: bind only a daemon that is already running, and answer graph tool calls with an honest "no daemon is running" error otherwise. This is the probe mode for watchdogs and boot-time checks (equivalent to KIN_NO_DAEMON=1): the MCP handshake and tool list are served in full, and nothing heavy is ever spawned by the check itself. |
 
 ### `kin assistant`
 
@@ -2589,9 +2590,11 @@ kin update [options]
 | `--json` |  | Emit the check-only result as JSON. |
 | `--ack-restart` |  | Verify the durable restart fence and exact installed binary identities for the release awaiting acknowledgement. Legacy markers may additionally require explicit replacement-session evidence. |
 | `--runtime-session <kind=pid>` |  | Legacy-marker live replacement proof: `daemon=PID`, `mcp=PID`, or `vfs=PID`. New stop-before-update markers reject these arguments and require no replacement session evidence. Repeatable. |
-| `--set-policy <policy>` |  | Set how an available update should reach this machine and exit. `prompt` (the default) notifies with the remedy attached and waits to be told. `auto` and `manual` are recorded preferences whose enforcement has not shipped: today every mode behaves as `prompt`, and the recorded choice takes effect when the notifier honors it. |
+| `--set-policy <policy>` |  | Set how an available update should reach this machine and exit. `auto` (the default) installs unattended through the gated executor: it waits for a moment with no managed Kin process or agent session, defers at most a bounded window, and runs the full stop-install-acknowledge chain. `prompt` notifies with the remedy attached and waits to be told. `manual` never notifies; checks still run. |
 | `--apply` |  | Bring this machine current in one gesture: install the release, acknowledge the restart fence, and repair agent configs, in that order. This is what the update notification's button runs. |
 | `--dry-run` |  | With --apply: print the ordered steps and change nothing. |
+| `--unattended` |  | Run the unattended executor (what the update watchdog invokes on a stale install with policy auto): evaluate the machine-activity gates, and on proceed stop every managed Kin process cooperatively and run the full --apply chain. Blocked runs persist a deferral clock instead of installing. The final stdout line is one JSON record (also appended to ~/.kin/update-ledger.jsonl) carrying the decision, reason, blocked_seconds, and window_seconds. |
+| `--force-window` |  | With --unattended: apply despite the activity gates. For the watchdog once a deferred record shows blocked_seconds >= window_seconds (24h). Never overrides a recorded prompt or manual policy, only the executor's own activity gates. |
 
 ### `kin completions`
 
