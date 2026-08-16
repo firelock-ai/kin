@@ -837,6 +837,15 @@ struct EntityDiscovery {
     /// surfaced via the vector pool. Recorded for --explain observability only;
     /// never participates in ranking. `None` for text-only seeds.
     cosine: Option<f32>,
+    /// True when the query literally names this entity ([`query_names_entity`]).
+    /// An exact-name seed is demote-only: the role multiplier may price it
+    /// down, but no downstream cut or role gate may remove it from the
+    /// candidate set, because a query that names a symbol must always surface
+    /// that symbol. Test-role entities relied on this being absent: their x0.1
+    /// demotion plus the seed gap-cut and the test-role attribution gates
+    /// compounded into total exclusion, so an exact-name lookup of a test
+    /// returned nothing at all.
+    exact_name: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7095,6 +7104,7 @@ fn extract_search_signals(
                     let score = kind_mult * name_mult * field_weight * title_mult * role_mult;
                     let entry = entity_seeds.entry(entity.id).or_default();
                     entry.score += score;
+                    entry.exact_name |= query_names_entity(text, &entity.name);
                     if !entry.signals.contains(&"search") {
                         entry.signals.push("search");
                     }
@@ -7132,6 +7142,7 @@ fn extract_search_signals(
                 {
                     let entry = entity_seeds.entry(entity.id).or_default();
                     entry.score += score;
+                    entry.exact_name |= query_names_entity(text, &entity.name);
                     if seen.insert(entity.id) && !entry.signals.contains(&"search") {
                         entry.signals.push("search");
                     }
@@ -7173,6 +7184,7 @@ fn extract_search_signals(
                 let score = body_weight * role_mult / ((rank + 1) as f32).sqrt();
                 let entry = entity_seeds.entry(entity.id).or_default();
                 entry.score += score;
+                entry.exact_name |= query_names_entity(text, &entity.name);
                 if !entry.signals.contains(&"body") {
                     entry.signals.push("body");
                 }
@@ -10453,6 +10465,7 @@ fn extract_embedding_signals(
             let score = relevance * kind_mult * 10.0 * *query_weight * role_mult;
             let entry = entity_seeds.entry(entity.id).or_default();
             entry.score += score;
+            entry.exact_name |= query_names_entity(text, &entity.name);
             entry.cosine = Some(entry.cosine.map_or(relevance, |c| c.max(relevance)));
             if !entry.signals.contains(&"embeddings") {
                 entry.signals.push("embeddings");
@@ -10980,6 +10993,20 @@ fn resolve_entities_to_files(
                     }
                 }
             }
+            // An exact-name seed survives the cut unconditionally. Role
+            // demotion prices such a seed low enough that the gap-cut lands
+            // above it, and dropping it here is what turned a demotion into
+            // total exclusion: the entity the query literally named never
+            // reached resolution at all.
+            {
+                let retained_ids: HashSet<kin_model::EntityId> =
+                    retained.iter().map(|pair| *pair.0).collect();
+                for seed in seeds[cut_at..].iter() {
+                    if seed.1.exact_name && !retained_ids.contains(seed.0) {
+                        retained.push(*seed);
+                    }
+                }
+            }
             tracing::debug!(
                 "Seed gap detection: cut at {} (gap ratio {:.2}), {} → {} seeds ({} diverse tail files)",
                 cut_at,
@@ -11020,10 +11047,13 @@ fn resolve_entities_to_files(
 
         if let Some(ref fo) = entity.file_origin {
             let path = &fo.0;
-            if entity_is_test {
-                // Skip direct attribution for test entities but still follow
-                // their graph relations below — tests call the source that
-                // needs fixing.
+            if entity_is_test && !discovery.exact_name {
+                // Skip direct attribution for test entities the query does not
+                // literally name, but still follow their graph relations below —
+                // tests call the source that needs fixing. An exactly-named
+                // test entity mints its (role-demoted) symbol instead: a query
+                // that names a symbol must surface that symbol, whatever its
+                // role.
             } else {
                 // Definition authority: entities with real bodies (functions, classes
                 // with implementations) are definitions. Re-export files just import
@@ -11471,7 +11501,7 @@ fn entity_resolve_identity(
         let Some(file_origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if is_test_by_role(&file_origin.0, Some(&entity)) {
+        if is_test_by_role(&file_origin.0, Some(&entity)) && !discovery.exact_name {
             continue;
         }
         let keep = match best.get(file_origin.0.as_str()) {
@@ -11489,8 +11519,10 @@ fn entity_resolve_identity(
 }
 
 /// Per-entity fusion items recovered from discovery seeds: `(entity_key, file, score)`.
-/// One item per non-test, non-vendored seed entity that has a file origin, keyed by
-/// entity id and scored by its Phase-1 discovery score. Multiple entities defined in
+/// One item per non-vendored seed entity that has a file origin, keyed by
+/// entity id and scored by its Phase-1 discovery score. Test-role entities are
+/// included only when the query literally names them (`EntityDiscovery::exact_name`);
+/// every other test-role seed stays out. Multiple entities defined in
 /// one file produce multiple items — this is the entity granularity the path-keyed
 /// pipeline collapses away in `to_ranked`/`resolve_entities_to_files`.
 ///
@@ -11509,7 +11541,9 @@ fn entity_seed_keyed(
         let Some(file_origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if is_test_by_role(&file_origin.0, Some(&entity)) || is_vendored_path(&file_origin.0) {
+        if (is_test_by_role(&file_origin.0, Some(&entity)) && !discovery.exact_name)
+            || is_vendored_path(&file_origin.0)
+        {
             continue;
         }
         out.push((
@@ -14897,6 +14931,14 @@ fn role_weight(role: EntityRole, is_test_query: bool) -> f32 {
     }
 }
 
+/// True when any query term literally names the entity
+/// ([`query_names_entity`] over each term). The symbol-backfill role gates use
+/// this so an exactly-named test entity is demoted, never suppressed, from a
+/// file's symbol list.
+fn terms_name_entity(query_terms: &[String], name: &str) -> bool {
+    query_terms.iter().any(|t| query_names_entity(t, name))
+}
+
 fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let markers = [
@@ -15322,7 +15364,10 @@ fn rank_enriched_symbols(
     let mut syms: Vec<LocateSymbol> = entities
         .into_iter()
         .filter(|e| {
-            (test_query || e.role != kin_model::EntityRole::Test) && is_definitional_kind(e.kind)
+            (test_query
+                || e.role != kin_model::EntityRole::Test
+                || terms_name_entity(query_terms, &e.name))
+                && is_definitional_kind(e.kind)
         })
         .map(|e| {
             let prox = query_proximity_score(&e, query_terms);
@@ -15427,7 +15472,11 @@ fn apply_query_relevance(
     // Highest-proximity definitional entity per name in this file.
     let mut prox_by_name: HashMap<String, (f32, kin_model::Entity)> = HashMap::new();
     for e in file_entities {
-        if !is_definitional_kind(e.kind) || !(test_query || e.role != kin_model::EntityRole::Test) {
+        if !is_definitional_kind(e.kind)
+            || !(test_query
+                || e.role != kin_model::EntityRole::Test
+                || terms_name_entity(query_terms, &e.name))
+        {
             continue;
         }
         let p = query_proximity_score(&e, query_terms);
@@ -15649,7 +15698,10 @@ fn rank_body_relevant_symbols(
     let mut scored: Vec<(u32, u32, kin_model::Entity)> = entities
         .into_iter()
         .filter(|e| {
-            (test_query || e.role != kin_model::EntityRole::Test) && is_definitional_kind(e.kind)
+            (test_query
+                || e.role != kin_model::EntityRole::Test
+                || terms_name_entity(query_terms, &e.name))
+                && is_definitional_kind(e.kind)
         })
         .filter_map(|e| {
             let hits = body_relevance_score(&e, query_terms);
@@ -24455,6 +24507,236 @@ mod tests {
         );
     }
 
+    /// The uq04/uq05/uq07 gauntlet shape: a `#[test]` fn inside an inline
+    /// `mod tests` block carries `EntityRole::Test` inside a Source-role file,
+    /// and a bare-name query for it returned NOTHING (rank null) because the
+    /// role gates excluded it before the exact-name tier could rank it. The
+    /// contract is demote-not-exclude: a query that literally names a symbol
+    /// surfaces that symbol whatever its role.
+    #[test]
+    fn an_exactly_named_test_entity_seeds_and_resolves_to_its_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut test_fn = test_entity(
+            "save_with_relations",
+            "crates/kin-db/src/storage/snapshot.rs",
+            6011,
+            6042,
+        );
+        test_fn.role = EntityRole::Test;
+        graph.upsert_entity(&test_fn).unwrap();
+        graph.flush_text_index().unwrap();
+
+        let seeds = extract_search_signals("save_with_relations", &graph, false).unwrap();
+        let discovery = seeds
+            .get(&test_fn.id)
+            .expect("the exactly-named test entity must be seeded");
+        assert!(
+            discovery.exact_name,
+            "a bare-name query literally names the entity"
+        );
+
+        let (_, _, _, file_symbols, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+        let syms = file_symbols
+            .get("crates/kin-db/src/storage/snapshot.rs")
+            .expect("direct attribution must mint the file's symbol list");
+        assert!(
+            syms.iter().any(|s| s.name == "save_with_relations"),
+            "the exactly-named test fn must appear as a symbol"
+        );
+    }
+
+    /// Control for the exemption: a query that does NOT name the test entity
+    /// keeps today's behavior, so the role gate itself still works and the
+    /// positive test above cannot pass vacuously.
+    #[test]
+    fn an_unnamed_test_entity_is_still_excluded_from_direct_attribution() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut test_fn = test_entity(
+            "save_with_relations",
+            "crates/kin-db/src/storage/snapshot.rs",
+            6011,
+            6042,
+        );
+        test_fn.role = EntityRole::Test;
+        graph.upsert_entity(&test_fn).unwrap();
+
+        let seeds = HashMap::from([(
+            test_fn.id,
+            EntityDiscovery {
+                score: 22.5,
+                signals: vec!["search"],
+                cosine: None,
+                exact_name: false,
+            },
+        )]);
+        let (_, _, _, file_symbols, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+        assert!(
+            !file_symbols.contains_key("crates/kin-db/src/storage/snapshot.rs"),
+            "a test entity the query does not name still skips direct attribution"
+        );
+    }
+
+    /// The seed gap-cut is the second exclusion layer: role demotion prices an
+    /// exact-name test seed far below unrelated high-score seeds, and the cut
+    /// used to drop it entirely. It must survive the cut unconditionally.
+    #[test]
+    fn an_exact_name_seed_survives_the_gap_cut() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut test_fn = test_entity(
+            "delta_smaller_than_full_snapshot",
+            "crates/kin-db/src/storage/delta.rs",
+            1315,
+            1360,
+        );
+        test_fn.role = EntityRole::Test;
+        graph.upsert_entity(&test_fn).unwrap();
+
+        let mut seeds = HashMap::new();
+        for i in 0..4 {
+            let noise = test_entity(
+                &format!("noise_entity_{i}"),
+                &format!("src/noise_{i}.rs"),
+                1,
+                40,
+            );
+            graph.upsert_entity(&noise).unwrap();
+            seeds.insert(
+                noise.id,
+                EntityDiscovery {
+                    score: 1000.0,
+                    signals: vec!["search"],
+                    cosine: None,
+                    exact_name: false,
+                },
+            );
+        }
+        seeds.insert(
+            test_fn.id,
+            EntityDiscovery {
+                score: 22.5,
+                signals: vec!["search"],
+                cosine: None,
+                exact_name: true,
+            },
+        );
+
+        let (_, _, _, file_symbols, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+        assert!(
+            file_symbols
+                .get("crates/kin-db/src/storage/delta.rs")
+                .is_some_and(|syms| syms
+                    .iter()
+                    .any(|s| s.name == "delta_smaller_than_full_snapshot")),
+            "the exact-name seed must survive the gap-cut and resolve"
+        );
+    }
+
+    /// Entity-granular fusion (the accuracy-v2 default) is the third exclusion
+    /// layer: `entity_seed_keyed` dropped every test-role seed, so the entity
+    /// never entered the fused list. An exact-name seed is included; an
+    /// unnamed one stays out.
+    #[test]
+    fn entity_seed_keyed_includes_only_exactly_named_test_entities() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut named = test_entity("change_dag_operations", "src/engine/graph.rs", 11884, 11920);
+        named.role = EntityRole::Test;
+        let mut unnamed = test_entity("helper_assertions", "src/engine/graph.rs", 12000, 12020);
+        unnamed.role = EntityRole::Test;
+        graph.upsert_entity(&named).unwrap();
+        graph.upsert_entity(&unnamed).unwrap();
+
+        let mut seeds = HashMap::new();
+        seeds.insert(
+            named.id,
+            EntityDiscovery {
+                score: 22.5,
+                signals: vec!["search"],
+                cosine: None,
+                exact_name: true,
+            },
+        );
+        seeds.insert(
+            unnamed.id,
+            EntityDiscovery {
+                score: 5.0,
+                signals: vec!["search"],
+                cosine: None,
+                exact_name: false,
+            },
+        );
+
+        let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
+        let keys: Vec<&str> = keyed.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert!(
+            keys.contains(&format!("entity:{}", named.id).as_str()),
+            "the exactly-named test entity enters entity fusion"
+        );
+        assert!(
+            !keys.contains(&format!("entity:{}", unnamed.id).as_str()),
+            "an unnamed test entity stays out of entity fusion"
+        );
+    }
+
+    /// End to end through the real pipeline: the file carrying the exactly-
+    /// named test fn must rank, and its symbol list must carry the fn, on a
+    /// store where nothing else matches the name. The graph carries the file's
+    /// body so the run is gap-free: the source-gap counter is process-global,
+    /// and a fixture without graph-owned bodies would perturb any test
+    /// measuring it in a parallel-test process.
+    #[test]
+    #[serial_test::serial]
+    fn locate_surfaces_a_test_fn_by_exact_bare_name() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut test_fn = test_entity(
+            "save_with_relations",
+            "crates/kin-db/src/storage/snapshot.rs",
+            6011,
+            6042,
+        );
+        test_fn.role = EntityRole::Test;
+        graph.upsert_entity(&test_fn).unwrap();
+        let source = test_entity(
+            "persist_snapshot",
+            "crates/kin-db/src/storage/snapshot.rs",
+            100,
+            160,
+        );
+        graph.upsert_entity(&source).unwrap();
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("crates/kin-db/src/storage/snapshot.rs"),
+                content_hash: Hash256::from_bytes([23; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some(
+                    "fn persist_snapshot() writes; fn save_with_relations() proves relations survive"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let gaps_before = locate_graph_source_gap_count();
+        let result = run_with_graph_capture(&graph, "save_with_relations", false, 8, false)
+            .expect("locate must run");
+        let file = result
+            .files
+            .iter()
+            .find(|f| f.path == "crates/kin-db/src/storage/snapshot.rs")
+            .expect("the test fn's file must rank");
+        assert!(
+            file.symbols.iter().any(|s| s.name == "save_with_relations"),
+            "the exactly-named test fn must be an emitted symbol"
+        );
+        assert_eq!(
+            locate_graph_source_gap_count(),
+            gaps_before,
+            "this fixture is body-complete and must not move the global gap counter"
+        );
+    }
+
     #[test]
     fn resolve_entities_to_files_keeps_signal_scores_without_explain() {
         let graph = kin_db::InMemoryGraph::new();
@@ -24484,6 +24766,7 @@ mod tests {
                 score: 12.0,
                 signals: vec!["search"],
                 cosine: None,
+                exact_name: false,
             },
         )]);
 
@@ -24566,6 +24849,7 @@ mod tests {
                 score: 20.0,
                 signals: vec!["search"],
                 cosine: None,
+                exact_name: false,
             },
         )]);
 
@@ -24673,6 +24957,7 @@ mod tests {
                 score: 20.0,
                 signals: vec!["search"],
                 cosine: None,
+                exact_name: false,
             },
         )]);
 
@@ -26351,6 +26636,7 @@ mod tests {
                 score: 1.0,
                 signals: vec!["search"],
                 cosine: None,
+                exact_name: false,
             },
         );
         seeds.insert(
@@ -26359,6 +26645,7 @@ mod tests {
                 score: 1.0,
                 signals: vec!["search"],
                 cosine: None,
+                exact_name: false,
             },
         );
 
@@ -26526,6 +26813,7 @@ mod tests {
             score,
             signals: vec!["search"],
             cosine: None,
+            exact_name: false,
         }
     }
 
