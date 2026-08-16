@@ -1554,6 +1554,31 @@ pub(crate) fn timed_commit_phase<T>(phase: &'static str, work: impl FnOnce() -> 
     outcome
 }
 
+/// Time one awaited phase of the commit and report it exactly as the blocking
+/// helper does.
+///
+/// The CLI commit path opens with two phases that cannot be measured by a
+/// closure: waiting on the coordination gate, and the forced filesystem
+/// admission that runs under it. Both are `async`, and a phase that is skipped
+/// because it does not fit the helper's shape is a phase the wall time hides.
+/// The elapsed span covers suspension as well as work, which is the point for a
+/// gate wait: the queue behind a held lock is the cost being attributed.
+pub(crate) async fn timed_commit_phase_async<T>(
+    phase: &'static str,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    let started = std::time::Instant::now();
+    let outcome = work.await;
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed >= SLOW_FINALIZE_STEP {
+        tracing::info!(phase, elapsed_ms, "slow commit phase");
+    } else {
+        tracing::debug!(phase, elapsed_ms, "commit phase");
+    }
+    outcome
+}
+
 fn finalize_committed_transaction(
     state: &Arc<DaemonState>,
     sessions: &kin_mcp::SessionRegistry,
