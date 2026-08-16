@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.34] - 2026-08-16
+
+### Changed
+
+- Rank exact-name hits above fallback scale and break name ties toward the owner type (#847)
+
+
 ## [0.5.33] - 2026-08-15
 
 ### Changed
