@@ -3023,7 +3023,7 @@ mod tests {
     /// this whole seam exists to stop paying twice, so the generation is a
     /// direct count of successors rather than a proxy for one.
     fn authority_generation(state: &DaemonState) -> u64 {
-        current_authority_roots(state).unwrap().generation
+        current_authority_admission(state).unwrap().0.generation
     }
 
     /// The ambient watcher path publishes its own successor. Nothing about the
@@ -3031,6 +3031,11 @@ mod tests {
     /// later transaction to carry its tree, so a tick that stopped publishing
     /// would leave every observed write outside repository authority.
     #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
     fn an_ambient_tick_publishes_its_own_authority_successor() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
@@ -3070,6 +3075,11 @@ mod tests {
     /// change. The graph still advances: the caller's transaction is what
     /// closes the gap, and the coordination gate it holds spans both.
     #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
     fn a_deferring_admission_advances_no_authority_generation() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
@@ -3127,6 +3137,11 @@ mod tests {
     /// mutation between admission and publication would move it, and the
     /// commit that would then publish an unobserved transition is refused.
     #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
     fn a_collapsed_commit_refuses_a_tree_its_walk_did_not_observe() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);

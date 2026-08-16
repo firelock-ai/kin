@@ -19105,6 +19105,11 @@ mod tests {
     /// bare delta check by advancing the generation zero times.
     #[cfg(unix)]
     #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
     async fn one_commit_publishes_exactly_one_authority_successor() {
         let repo = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(repo.path()).unwrap();
@@ -19115,8 +19120,9 @@ mod tests {
         )
         .unwrap();
 
-        let before = crate::loop_runner::current_authority_roots(&state)
+        let before = crate::loop_runner::current_authority_admission(&state)
             .unwrap()
+            .0
             .generation;
         let response = router(Arc::clone(&state))
             .oneshot(
@@ -19150,8 +19156,9 @@ mod tests {
             "the commit must carry the admitted file: {json}"
         );
 
-        let after = crate::loop_runner::current_authority_roots(&state)
+        let after = crate::loop_runner::current_authority_admission(&state)
             .unwrap()
+            .0
             .generation;
         assert_eq!(
             after - before,
@@ -19239,6 +19246,11 @@ mod tests {
     /// name is checked too: without it a capture that silently collected nothing
     /// would satisfy every membership assertion it was given.
     #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
     async fn the_cli_commit_path_names_every_phase_it_spends() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -19340,7 +19352,6 @@ mod tests {
             "forced_filesystem_admission",
             "scan_working_copy",
             "observe_tree_and_stage_blobs",
-            "publish_workspace_admission",
             "plan_transaction",
             "plan_snapshot_clone",
             "plan_diff_semantics",
@@ -19354,14 +19365,30 @@ mod tests {
                 captured.phases
             );
         }
-        assert!(
-            !captured
-                .phases
-                .iter()
-                .any(|phase| phase == "phase_this_commit_never_spends"),
-            "a phase the path never runs must not be reported; captured {:?}",
-            captured.phases
-        );
+        for phase in [
+            // A phase the path never runs must not be reported. The fabricated
+            // name is the control: it can never appear, so it proves the
+            // assertion is looking at something.
+            "phase_this_commit_never_spends",
+            // The commit no longer publishes the admitted tree in a successor
+            // of its own. The admission derives the tree and hands it to the
+            // commit's transaction, which carries the tree transition beside
+            // the semantic change, so one repository-authority successor is
+            // prepared and one store snapshot persisted for the whole commit.
+            // Publishing the tree separately is what this phase timed, and a
+            // commit that spends it again has gone back to paying for two.
+            //
+            // The phase itself is still live and still timed on the standalone
+            // admission path, which is where the ambient watcher tick and every
+            // explicit `kin admit` publish from.
+            "publish_workspace_admission",
+        ] {
+            assert!(
+                !captured.phases.iter().any(|captured| captured == phase),
+                "the commit path must not name the {phase} phase; captured {:?}",
+                captured.phases
+            );
+        }
     }
 
     #[cfg(unix)]
