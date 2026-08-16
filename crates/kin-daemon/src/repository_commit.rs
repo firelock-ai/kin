@@ -773,36 +773,46 @@ fn plan_native_commit_inner(
                     "repository authority has no graph snapshot for workspace {workspace_id}"
                 ))
             })?;
-    let desired_workspace_graph = graph.to_snapshot();
-    let workspace_semantic_delta = kin_core::diff_workspace_semantics(
-        &authority_workspace_graph.entities,
-        &authority_workspace_graph.relations,
-        &desired_workspace_graph.entities,
-        &desired_workspace_graph.relations,
-    )?;
-    let deltas = compute_deltas_vs_repository_authority(graph, lease.snapshot(), parent.as_ref())?;
+    let desired_workspace_graph =
+        crate::mcp_commit::timed_commit_phase("plan_snapshot_clone", || graph.to_snapshot());
+    let workspace_semantic_delta =
+        crate::mcp_commit::timed_commit_phase("plan_diff_semantics", || {
+            kin_core::diff_workspace_semantics(
+                &authority_workspace_graph.entities,
+                &authority_workspace_graph.relations,
+                &desired_workspace_graph.entities,
+                &desired_workspace_graph.relations,
+            )
+        })?;
+    let deltas = crate::mcp_commit::timed_commit_phase("plan_compute_deltas", || {
+        compute_deltas_vs_repository_authority(graph, lease.snapshot(), parent.as_ref())
+    })?;
     let mut source_lengths = std::collections::BTreeMap::new();
-    let (shared_policy, admission_policy_delta) = SharedAdmissionPolicy::derive_from_tree(
-        parent_policy.as_ref(),
-        &deltas.expected_tree,
-        |hash| {
-            if let Some(length) = source_lengths.get(&hash) {
-                return Ok(*length);
-            }
-            let source = read_publishable_source(blobs, &authority, hash).map_err(|error| {
-                ModelError::InvalidOperation(format!(
-                    "{error}, while deriving the graph-owned admission policy"
-                ))
-            })?;
-            let length = u64::try_from(source.body().len()).map_err(|_| {
-                ModelError::InvalidOperation(format!(
-                    "graph-owned admission source {hash} exceeds u64"
-                ))
-            })?;
-            source_lengths.insert(hash, length);
-            Ok(length)
-        },
-    )?;
+    let (shared_policy, admission_policy_delta) =
+        crate::mcp_commit::timed_commit_phase("plan_derive_admission_policy", || {
+            SharedAdmissionPolicy::derive_from_tree(
+                parent_policy.as_ref(),
+                &deltas.expected_tree,
+                |hash| {
+                    if let Some(length) = source_lengths.get(&hash) {
+                        return Ok(*length);
+                    }
+                    let source =
+                        read_publishable_source(blobs, &authority, hash).map_err(|error| {
+                            ModelError::InvalidOperation(format!(
+                                "{error}, while deriving the graph-owned admission policy"
+                            ))
+                        })?;
+                    let length = u64::try_from(source.body().len()).map_err(|_| {
+                        ModelError::InvalidOperation(format!(
+                            "graph-owned admission source {hash} exceeds u64"
+                        ))
+                    })?;
+                    source_lengths.insert(hash, length);
+                    Ok(length)
+                },
+            )
+        })?;
 
     // Settled here, not before planning: the message may have to name what this
     // change carried in, and that set is not known until the published tree

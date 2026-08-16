@@ -4626,24 +4626,33 @@ async fn command_commit(
     // Hold one uninterrupted graph-authority gate across forced filesystem
     // admission, change construction, and branch publication. The sync helper
     // deliberately does not re-lock this non-reentrant mutex.
-    let _coordination = state.coordination_gate.lock().await;
-    crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state)
-        .await
-        .map_err(internal_error)?;
+    let _coordination = crate::mcp_commit::timed_commit_phase_async(
+        "coordination_gate_wait",
+        state.coordination_gate.lock(),
+    )
+    .await;
+    crate::mcp_commit::timed_commit_phase_async(
+        "forced_filesystem_admission",
+        crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state),
+    )
+    .await
+    .map_err(internal_error)?;
 
     let graph = &*state.graph;
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
             .map_err(repository_commit_error)?;
-    let plan = crate::repository_commit::plan_native_commit(
-        graph,
-        state.blobs.as_ref(),
-        &authority_context,
-        request.operation_id,
-        request.timestamp,
-        kin_model::AuthorId::new(kin_core::whoami()),
-        request.message,
-    )
+    let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
+        crate::repository_commit::plan_native_commit(
+            graph,
+            state.blobs.as_ref(),
+            &authority_context,
+            request.operation_id,
+            request.timestamp,
+            kin_model::AuthorId::new(kin_core::whoami()),
+            request.message,
+        )
+    })
     .map_err(repository_commit_error)?;
     let change_id = plan.change.id;
     let branch_name = plan.branch.clone();
@@ -4721,9 +4730,10 @@ async fn command_commit(
     // The repository transaction is durable authority. The in-process graph is
     // a derived query view; install the exact immutable change only after the
     // authority CAS succeeds.
-    graph
-        .create_change(&committed.change)
-        .map_err(internal_error)?;
+    crate::mcp_commit::timed_commit_phase("install_live_graph", || {
+        graph.create_change(&committed.change)
+    })
+    .map_err(internal_error)?;
     state.bump_version();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -19085,6 +19095,147 @@ mod tests {
                 .snapshot_generation
                 .load(std::sync::atomic::Ordering::Relaxed),
             generation_before
+        );
+    }
+
+    /// Every span the CLI commit path spends before durable publication names
+    /// itself in the log.
+    ///
+    /// The finalize after publication already reported its steps, so the wall a
+    /// user waits was attributable only from its tail backwards. Everything in
+    /// front of it, the coordination gate, the forced filesystem admission it
+    /// guards, transaction planning, and the live-graph install, ran silent,
+    /// which left a slow commit blamable on any of them and disprovable against
+    /// none. This drives one real commit through the router under a capture
+    /// subscriber and reads the phase lines back, so a span that stops
+    /// reporting fails here rather than reappearing as an unexplained gap.
+    ///
+    /// The names are asserted because the proof parser keys on them. A fabricated
+    /// name is checked too: without it a capture that silently collected nothing
+    /// would satisfy every membership assertion it was given.
+    #[tokio::test]
+    async fn the_cli_commit_path_names_every_phase_it_spends() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Default)]
+        struct Captured {
+            phases: Vec<String>,
+            malformed: Vec<String>,
+        }
+
+        struct CaptureLayer(Arc<std::sync::Mutex<Captured>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                #[derive(Default)]
+                struct Read {
+                    phase: Option<String>,
+                    message: Option<String>,
+                    elapsed_ms: bool,
+                }
+                impl tracing::field::Visit for Read {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "phase" {
+                            self.phase = Some(value.to_string());
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        match field.name() {
+                            "message" => self.message = Some(format!("{value:?}")),
+                            "elapsed_ms" => self.elapsed_ms = true,
+                            _ => {}
+                        }
+                    }
+                }
+
+                let mut read = Read::default();
+                event.record(&mut read);
+                let message = read.message.unwrap_or_default();
+                if message != "commit phase" && message != "slow commit phase" {
+                    return;
+                }
+                let mut captured = self.0.lock().unwrap();
+                match read.phase {
+                    // The proof parser reads `phase=` and `elapsed_ms=` off these
+                    // two needles, so a line carrying one without the other is a
+                    // parse failure and is collected as such rather than dropped.
+                    Some(phase) if read.elapsed_ms => captured.phases.push(phase),
+                    other => captured.malformed.push(format!("{message}: {other:?}")),
+                }
+            }
+        }
+
+        let state = test_state();
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("attributable.rs"), b"pub fn attributable() {}\n").unwrap();
+        let app = router(Arc::clone(&state));
+
+        let captured = Arc::new(std::sync::Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+        let response = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            app.oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "attribute the commit wall"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let captured = std::mem::take(&mut *captured.lock().unwrap());
+        assert!(
+            captured.malformed.is_empty(),
+            "every commit phase line must carry both phase and elapsed_ms: {:?}",
+            captured.malformed
+        );
+        for phase in [
+            "coordination_gate_wait",
+            "forced_filesystem_admission",
+            "scan_working_copy",
+            "observe_tree_and_stage_blobs",
+            "publish_workspace_admission",
+            "plan_transaction",
+            "plan_snapshot_clone",
+            "plan_diff_semantics",
+            "plan_compute_deltas",
+            "plan_derive_admission_policy",
+            "install_live_graph",
+        ] {
+            assert!(
+                captured.phases.iter().any(|captured| captured == phase),
+                "the commit path must name the {phase} phase; captured {:?}",
+                captured.phases
+            );
+        }
+        assert!(
+            !captured
+                .phases
+                .iter()
+                .any(|phase| phase == "phase_this_commit_never_spends"),
+            "a phase the path never runs must not be reported; captured {:?}",
+            captured.phases
         );
     }
 

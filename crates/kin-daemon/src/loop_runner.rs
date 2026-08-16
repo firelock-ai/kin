@@ -536,15 +536,19 @@ fn exact_tree_admission(
         .iter()
         .filter(|path| !retracted_paths.contains(*path))
         .collect::<Vec<&RepoPath>>();
-    let scan = kin_index::scan_repository_preserving_graph_only(
-        working_dir,
-        &ignore,
-        scanned_tracked.into_iter(),
-        graph_only_paths.iter(),
-    )
+    let scan = crate::mcp_commit::timed_commit_phase("scan_working_copy", || {
+        kin_index::scan_repository_preserving_graph_only(
+            working_dir,
+            &ignore,
+            scanned_tracked.into_iter(),
+            graph_only_paths.iter(),
+        )
+    })
     .map_err(kin_index::IndexError::from)?;
     let mut observed =
-        crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)?;
+        crate::mcp_commit::timed_commit_phase("observe_tree_and_stage_blobs", || {
+            crate::commit_deltas::observed_tree_from_complete_scan(&state.blobs, &scan, &previous)
+        })?;
     if let Some(observation) = observation {
         for artifact in previous.artifacts_by_path() {
             if observation_covers_path(observation, &artifact.path) {
@@ -658,7 +662,9 @@ fn exact_tree_admission(
             previous.clone(),
             desired_tree,
         );
-        let _ = publish_exact_workspace_tree(state, &admitted)?;
+        let _ = crate::mcp_commit::timed_commit_phase("publish_workspace_admission", || {
+            publish_exact_workspace_tree(state, &admitted)
+        })?;
         // Authority has committed the removal, so the entities derived from
         // those paths go before the graph is asked to match. kin-db refuses a
         // tree transition that leaves an entity on a path the staged tree no
