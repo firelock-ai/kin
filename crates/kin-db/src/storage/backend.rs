@@ -2158,6 +2158,43 @@ pub trait StorageBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Load the durable prepared query-graph artifact for one workspace.
+    ///
+    /// Storage never interprets the binding record and never decides whether
+    /// the payload still describes the state being opened: it returns the pair
+    /// exactly as it was written and the repository validator refuses or
+    /// accepts it. A backend must return `Ok(None)` when either half is
+    /// missing, because the pair is the artifact and half of it answers
+    /// nothing.
+    ///
+    /// `Ok(None)` is also the answer for every backend with nowhere to keep
+    /// prepared state, which is why this defaults to it.
+    fn load_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+        let _ = (repo_id, workspace_id);
+        Ok(None)
+    }
+
+    /// Record the prepared query-graph artifact for one workspace, replacing
+    /// whatever that workspace already had.
+    ///
+    /// `Ok(false)` means the backend has no durable place for prepared state.
+    /// A caller treats both that and an error as "materialize again next
+    /// time": prepared state is an accelerator bound to authority truth, never
+    /// a source of it.
+    fn record_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+        artifact: &PreparedWorkspaceGraphArtifact,
+    ) -> Result<bool, KinDbError> {
+        let _ = (repo_id, workspace_id, artifact);
+        Ok(false)
+    }
+
     /// Read snapshot authority and its journal from one coherent backend view.
     /// Transactional/lock-backed implementations override this so authority
     /// cannot move between the snapshot and journal reads.
@@ -2484,6 +2521,8 @@ impl<B: StorageBackend + ?Sized> VerifiedSourceBlobBatch for DefaultVerifiedSour
 /// {base_path}/{repo_id}/snapshots/GEN.kndb  — immutable snapshot versions
 /// {base_path}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 /// {base_path}/{repo_id}/overlays/{session_id}.bin — overlay state
+/// {base_path}/{repo_id}/prepared/{workspace_id}.kpqg — prepared query graph
+/// {base_path}/{repo_id}/prepared/{workspace_id}.kpqg.json — its binding
 /// ```
 ///
 /// Snapshot and delta files are staged and fsynced before `authority.json` is
@@ -3353,6 +3392,20 @@ pub struct HistoryValidationProof {
     pub repository_id: String,
     pub generation: Generation,
     pub snapshot_sha256: String,
+}
+
+/// One durable prepared query-graph artifact for a workspace.
+///
+/// `payload` is the KNDB frame of a materialized workspace snapshot and
+/// `binding` is the record that says which authority state that frame stands
+/// for. They are one artifact: a payload with no binding beside it vouches for
+/// nothing, and a binding with no payload names bytes that are not there.
+/// Storage keeps them together and hands both back untouched, leaving every
+/// judgement about whether they still apply to the repository validator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWorkspaceGraphArtifact {
+    pub binding: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4767,6 +4820,41 @@ impl LocalFileBackend {
 
     fn overlays_surface_name() -> &'static str {
         "overlays"
+    }
+
+    fn prepared_surface_name() -> &'static str {
+        "prepared"
+    }
+
+    #[cfg(test)]
+    fn prepared_dir(&self, repo_id: &str) -> PathBuf {
+        self.base_path.join(repo_id).join("prepared")
+    }
+
+    fn prepared_leaf(workspace_id: &str, extension: &str) -> Result<PathBuf, KinDbError> {
+        validate_local_storage_component(workspace_id, "prepared workspace id")?;
+        if workspace_id.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(KinDbError::StorageError(
+                "prepared workspace id must use canonical lowercase ASCII".to_string(),
+            ));
+        }
+        let leaf = format!("{workspace_id}{extension}");
+        validate_local_storage_component(&leaf, "prepared workspace id")?;
+        if leaf.len() > mmap::MAX_ATOMIC_DESTINATION_LEAF_BYTES {
+            return Err(KinDbError::StorageError(
+                "prepared workspace id exceeds the portable atomic recovery-staging filename budget"
+                    .to_string(),
+            ));
+        }
+        Ok(PathBuf::from(leaf))
+    }
+
+    fn prepared_payload_leaf(workspace_id: &str) -> Result<PathBuf, KinDbError> {
+        Self::prepared_leaf(workspace_id, ".kpqg")
+    }
+
+    fn prepared_binding_leaf(workspace_id: &str) -> Result<PathBuf, KinDbError> {
+        Self::prepared_leaf(workspace_id, ".kpqg.json")
     }
 
     fn overlay_leaf(session_id: &str) -> Result<PathBuf, KinDbError> {
@@ -7357,6 +7445,77 @@ impl StorageBackend for LocalFileBackend {
         lock.namespace.confirm_surface_visible(&overlays)?;
         self.confirm_repository_visible(&lock.namespace)?;
         Ok(Some(data))
+    }
+
+    /// Prepared state is deliberately read and written WITHOUT the repository
+    /// lock every other surface here takes.
+    ///
+    /// Two reasons, and both have to hold. It is not authority: nothing about
+    /// a repository's truth depends on this pair existing, being current, or
+    /// being readable, and its consumer refuses it outright on any doubt. And
+    /// it is self-validating: each half lands by rename, so a reader sees one
+    /// whole file or the other, and a pair torn across the two renames is
+    /// caught by the payload digest the binding names.
+    ///
+    /// Taking the lock would be worse than useless. Materializing a workspace
+    /// query snapshot holds no backend lock today, so acquiring one here would
+    /// serialize a read path that never blocked, and would deadlock outright
+    /// against a caller that materializes while holding a local authority
+    /// freeze, since `flock` blocks a second acquisition from the same
+    /// process.
+    fn load_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<PreparedWorkspaceGraphArtifact>, KinDbError> {
+        let payload_leaf = Self::prepared_payload_leaf(workspace_id)?;
+        let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
+        let Some(namespace) = self.repository_capability(repo_id, false)? else {
+            return Ok(None);
+        };
+        let Some(prepared) = namespace.surface(Self::prepared_surface_name(), false)? else {
+            return Ok(None);
+        };
+        // Either half alone is an interrupted write, not an artifact.
+        if !prepared.exists(&binding_leaf)? || !prepared.exists(&payload_leaf)? {
+            return Ok(None);
+        }
+        let binding = prepared.read_regular(&binding_leaf, "local prepared workspace binding")?;
+        let payload = prepared.read_regular(&payload_leaf, "local prepared workspace graph")?;
+        namespace.confirm_surface_visible(&prepared)?;
+        Ok(Some(PreparedWorkspaceGraphArtifact { binding, payload }))
+    }
+
+    fn record_prepared_workspace_graph(
+        &self,
+        repo_id: &str,
+        workspace_id: &str,
+        artifact: &PreparedWorkspaceGraphArtifact,
+    ) -> Result<bool, KinDbError> {
+        let payload_leaf = Self::prepared_payload_leaf(workspace_id)?;
+        let binding_leaf = Self::prepared_binding_leaf(workspace_id)?;
+        let Some(namespace) = self.repository_capability(repo_id, false)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no local namespace to record prepared workspace state in"
+            )));
+        };
+        let prepared = namespace
+            .surface(Self::prepared_surface_name(), true)?
+            .ok_or_else(|| {
+                KinDbError::StorageError(format!(
+                    "prepared surface disappeared while writing repo {repo_id}"
+                ))
+            })?;
+        // Payload first, binding last. A crash between the two leaves a
+        // payload nobody will read, while the reverse would leave a record
+        // naming bytes that are not there. A reader that catches the window
+        // during a rewrite sees the new payload under the old binding and
+        // refuses on the payload digest, which is the correct outcome: a
+        // refusal costs one materialization, a wrong serve costs correctness.
+        prepared.atomic_write(&payload_leaf, &artifact.payload)?;
+        prepared.atomic_write(&binding_leaf, &artifact.binding)?;
+        namespace.confirm_surface_visible(&prepared)?;
+        Ok(true)
     }
 
     fn delete_overlay(&self, repo_id: &str, session_id: &str) -> Result<(), KinDbError> {
@@ -10497,6 +10656,136 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, overlay_data);
+    }
+
+    fn prepared_fixture(binding: &[u8], payload: &[u8]) -> PreparedWorkspaceGraphArtifact {
+        PreparedWorkspaceGraphArtifact {
+            binding: binding.to_vec(),
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-00000000c0de";
+
+        assert!(backend
+            .load_prepared_workspace_graph("test-repo", workspace)
+            .unwrap()
+            .is_none());
+
+        let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
+        assert!(backend
+            .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+            .unwrap());
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .unwrap(),
+            Some(artifact),
+            "the pair must come back exactly as it was written"
+        );
+        let prepared = backend.prepared_dir("test-repo");
+        assert!(prepared.join(format!("{workspace}.kpqg")).exists());
+        assert!(prepared.join(format!("{workspace}.kpqg.json")).exists());
+
+        let replacement = prepared_fixture(br#"{"prepared_version":2}"#, b"KNDB later payload");
+        assert!(backend
+            .record_prepared_workspace_graph("test-repo", workspace, &replacement)
+            .unwrap());
+        assert_eq!(
+            backend
+                .load_prepared_workspace_graph("test-repo", workspace)
+                .unwrap(),
+            Some(replacement),
+            "recording again must replace both halves, not append a second artifact"
+        );
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_needs_both_halves() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-0000000000aa";
+        let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
+
+        for orphaned in ["{workspace}.kpqg.json", "{workspace}.kpqg"] {
+            backend
+                .record_prepared_workspace_graph("test-repo", workspace, &artifact)
+                .unwrap();
+            let removed = backend
+                .prepared_dir("test-repo")
+                .join(orphaned.replace("{workspace}", workspace));
+            std::fs::remove_file(&removed).unwrap();
+            assert!(
+                backend
+                    .load_prepared_workspace_graph("test-repo", workspace)
+                    .unwrap()
+                    .is_none(),
+                "half an artifact answers nothing, missing {}",
+                removed.display()
+            );
+        }
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_does_not_wait_on_the_repository_lock() {
+        let dir = TempDir::new().unwrap();
+        let backend = std::sync::Arc::new(LocalFileBackend::new(dir.path()));
+        initialize_local_repository_namespace(&backend, "test-repo");
+        let workspace = "0197f7a2-0000-7000-8000-0000000000cc";
+        // Materializing a workspace query snapshot holds no backend lock, so
+        // neither may reading or writing the prepared state beside it. Held
+        // here from the same process on purpose: `flock` blocks a second
+        // acquisition from one process exactly as it does across two, which is
+        // what would deadlock a caller materializing under a local authority
+        // freeze.
+        let held = backend.acquire_existing_lock("test-repo").unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&backend);
+        std::thread::spawn(move || {
+            let artifact = prepared_fixture(br#"{"prepared_version":1}"#, b"KNDB prepared payload");
+            let recorded =
+                worker.record_prepared_workspace_graph("test-repo", workspace, &artifact);
+            let loaded = worker.load_prepared_workspace_graph("test-repo", workspace);
+            let _ = sender.send((recorded, loaded));
+        });
+        let (recorded, loaded) = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("prepared state must not wait on the repository lock");
+        drop(held);
+
+        assert!(recorded.unwrap());
+        assert!(loaded.unwrap().is_some());
+    }
+
+    #[test]
+    fn local_backend_prepared_workspace_graph_is_namespaced_per_repository() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        initialize_local_repository_namespace(&backend, "repo-a");
+        initialize_local_repository_namespace(&backend, "repo-b");
+        let workspace = "0197f7a2-0000-7000-8000-0000000000bb";
+
+        backend
+            .record_prepared_workspace_graph(
+                "repo-a",
+                workspace,
+                &prepared_fixture(br#"{"repository_id":"repo-a"}"#, b"KNDB repo-a payload"),
+            )
+            .unwrap();
+        assert!(
+            backend
+                .load_prepared_workspace_graph("repo-b", workspace)
+                .unwrap()
+                .is_none(),
+            "one repository's prepared state is never another's"
+        );
     }
 
     #[test]

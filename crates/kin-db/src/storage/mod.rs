@@ -25,10 +25,11 @@ pub use authority::{
 };
 pub use backend::{
     load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
-    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, RecoveredSnapshot,
-    SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome,
-    SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlob,
-    VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta,
+    PreparedWorkspaceGraphArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
+    SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
+    StorageBackend, VerifiedSourceBlob, VerifiedSourceBlobBatch, GENERATION_INIT,
+    MAX_SOURCE_BLOB_BYTES,
 };
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
@@ -46,7 +47,8 @@ pub use merkle::{
 };
 pub use repository::{
     ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
-    RepositoryAuthorityManager, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
+    PreparedWorkspaceGraphStats, RepositoryAuthorityManager, RepositoryAuthorityState,
+    WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
 };
 pub use snapshot::SnapshotManager;
 #[cfg(feature = "vector")]
