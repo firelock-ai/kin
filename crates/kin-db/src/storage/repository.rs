@@ -3166,9 +3166,38 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
         .map(|workspace| (workspace.workspace_id, workspace))
         .collect();
     let current = workspaces.get(&mutation.workspace_id);
+    #[cfg(test)]
+    let resolutions_before = WORKSPACE_BASE_RESOLUTIONS.with(|count| count.get());
+
+    // One workspace mutation reached for a resolved base graph four times: for
+    // the workspace it starts from, for the overlay it derives against the
+    // base it ends at, for the validation pass that materialized the successor
+    // only to drop it, and for the successor materialization that is actually
+    // compared. Resolving one replays the whole reachable history and then
+    // reassembles the store, and it reads nothing but the immutable authority
+    // snapshot and the change its target names, so resolving one target twice
+    // can only reach the conclusion the first resolution already reached. The
+    // successor's target is `new_base_target` by construction, and a mutation
+    // that leaves the base where it was makes the starting workspace's target
+    // that same target again, which is the shape every forced tree admission
+    // takes.
+    let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
+    let next_base = resolve_workspace_base_graph_snapshot(
+        snapshot,
+        metadata,
+        mutation.new_base_target.as_ref(),
+    )?;
+
+    let current_base_target = current.and_then(|workspace| workspace.base_target.as_ref());
+    let current_base =
+        if workspace_base_change_id(metadata, current_base_target)? == next_base_change {
+            next_base.clone()
+        } else {
+            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target)?
+        };
     let current_graph = match current {
-        Some(workspace) => materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?,
-        None => resolve_workspace_base_graph_snapshot(snapshot, metadata, None)?,
+        Some(workspace) => materialize_workspace_graph_snapshot_from_base(current_base, workspace)?,
+        None => current_base,
     };
     let mut incremental_delta = mutation.semantic_delta.transaction_delta();
     incremental_delta.tree_deltas = mutation.tree_deltas.clone();
@@ -3176,19 +3205,27 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     desired_graph.apply_transaction_delta(&incremental_delta)?;
     let desired = desired_graph.to_snapshot();
 
-    let next_base = resolve_workspace_base_graph_snapshot(
-        snapshot,
-        metadata,
-        mutation.new_base_target.as_ref(),
-    )?;
     let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
     let next = mutation.validate_against(
         &transaction.repository_id,
         current,
         derived_semantic_overlay,
     )?;
-    validate_workspace_state(replay, snapshot, metadata, &next)?;
-    let rematerialized = materialize_workspace_graph_snapshot(snapshot, metadata, &next)?;
+    // The successor's own materialization follows immediately and is compared
+    // against the desired graph, which subsumes the materialize-and-discard
+    // check the validating entry point ends with.
+    validate_workspace_state_without_materialization(replay, snapshot, metadata, &next)?;
+    // The successor takes its base target from the mutation, so the base
+    // resolved above is the one it materializes over. Reuse is refused rather
+    // than assumed: a successor pointing somewhere else must resolve its own
+    // base or fail, never silently materialize over a base that is not its.
+    if next.base_target != mutation.new_base_target {
+        return Err(storage(format!(
+            "workspace {} successor bases at a target the mutation that produced it did not name",
+            next.workspace_id
+        )));
+    }
+    let rematerialized = materialize_workspace_graph_snapshot_from_base(next_base, &next)?;
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
@@ -3204,6 +3241,10 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     )?;
     workspaces.insert(mutation.workspace_id, next);
     metadata.workspaces = workspaces.into_values().collect();
+    #[cfg(test)]
+    WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| {
+        count.set(WORKSPACE_BASE_RESOLUTIONS.with(|total| total.get()) - resolutions_before)
+    });
     Ok(())
 }
 
@@ -3971,6 +4012,20 @@ fn materialize_workspace_graph_snapshot(
         metadata,
         workspace.base_target.as_ref(),
     )?;
+    materialize_workspace_graph_snapshot_from_base(base, workspace)
+}
+
+/// Materialize a workspace over a base graph the caller already resolved.
+///
+/// The base a workspace materializes over is a pure function of its
+/// `base_target`, so a caller holding the exact base for this workspace's
+/// target may hand it in rather than replaying the same history again. Every
+/// check below is the one the resolving entry point runs; nothing is skipped
+/// because the base arrived by argument.
+fn materialize_workspace_graph_snapshot_from_base(
+    base: GraphSnapshot,
+    workspace: &WorkspaceState,
+) -> Result<GraphSnapshot, KinDbError> {
     let mut delta = workspace.semantic_overlay.transaction_delta();
     delta.tree_deltas = exact_tree_transition(&base.resolved_tree, &workspace.tree);
     // A clean workspace, based at its exact tree with an empty semantic
@@ -3980,7 +4035,7 @@ fn materialize_workspace_graph_snapshot(
     // the entity map to stage nothing, and exports a copy of its own input.
     // A daemon reopening after a commit holds exactly this workspace shape,
     // which made that copy a dominant term of cold open at repository scale.
-    // The base was admission-validated by resolution above; a second pass
+    // The base was admission-validated when it was resolved; a second pass
     // over the same object would re-hash every change to conclude nothing.
     if delta.entity_deltas.is_empty()
         && delta.relation_deltas.is_empty()
@@ -4069,11 +4124,50 @@ impl ChangeStore for AuthorityHistoryView<'_> {
     }
 }
 
+/// Name the change a workspace base target resolves to.
+///
+/// `resolve_workspace_base_graph_snapshot` consumes `base_target` only to reach
+/// this change id, so two targets that name the same change resolve to the same
+/// base graph and one resolution serves both. Comparing resolved ids rather
+/// than targets is what makes that true for a branch and an explicit change
+/// that currently agree.
+fn workspace_base_change_id(
+    metadata: &PersistedRepositoryAuthority,
+    base_target: Option<&RefTarget>,
+) -> Result<Option<SemanticChangeId>, KinDbError> {
+    match base_target {
+        Some(target) => Ok(Some(target_change_id(metadata, target)?)),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Base-graph resolutions performed on this thread, ever.
+    ///
+    /// Read only as the endpoints of a span; the running total is meaningless
+    /// on its own because open-time and storage-admission validation resolve
+    /// bases too.
+    static WORKSPACE_BASE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Base graphs resolved by the last workspace mutation to complete on this
+    /// thread.
+    ///
+    /// Resolution is the expensive half of a workspace mutation, and the
+    /// mutation's own contract fixes how many distinct bases it names, so this
+    /// is a contract worth pinning rather than a timing observation. Each test
+    /// runs on its own thread, so a test reads this without another test's
+    /// transactions reaching it.
+    static WORKSPACE_MUTATION_BASE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     base_target: Option<&RefTarget>,
 ) -> Result<GraphSnapshot, KinDbError> {
+    #[cfg(test)]
+    WORKSPACE_BASE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     // Replay-derived domains first. The whole-snapshot clone this function
     // used to start from copied every one of them only to overwrite or clear
     // them, and fed a second full clone into a throwaway `InMemoryGraph`
@@ -4339,7 +4433,25 @@ fn validate_workspace_authority(
     Ok(())
 }
 
+/// Validate one persisted workspace, including that it still materializes.
+///
+/// The materialization at the end is the check that the persisted head, base,
+/// tree, overlay and policy still resolve to a coherent graph. A caller that
+/// materializes this workspace itself proves that and more, and calls
+/// [`validate_workspace_state_without_materialization`] instead of paying for a
+/// second one it discards.
 fn validate_workspace_state(
+    replay: &SharedReplayGraph<'_>,
+    snapshot: &GraphSnapshot,
+    metadata: &PersistedRepositoryAuthority,
+    workspace: &WorkspaceState,
+) -> Result<(), KinDbError> {
+    validate_workspace_state_without_materialization(replay, snapshot, metadata, workspace)?;
+    materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?;
+    Ok(())
+}
+
+fn validate_workspace_state_without_materialization(
     replay: &SharedReplayGraph<'_>,
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
@@ -4416,7 +4528,6 @@ fn validate_workspace_state(
         ))
         .into());
     }
-    materialize_workspace_graph_snapshot(snapshot, metadata, workspace)?;
     Ok(())
 }
 
@@ -13187,5 +13298,235 @@ mod tests {
         let dirty_served = time_rounds("dirty prepared serve", true);
         assert_synthetic_materialization(&store, &dirty_served, Some(&staged));
         assert_workspace_snapshots_identical(&dirty_served, &dirty_materialized);
+    }
+
+    /// The overlay relation staged by round `round` of the successor bench.
+    fn indexed_overlay_relation(store: &SyntheticHistoryStore, round: usize) -> Relation {
+        let kind = format!("overlay-calls-{round}");
+        Relation {
+            id: RelationId::from_content(
+                &store.chain_target.to_string(),
+                &store.chain_source.to_string(),
+                &kind,
+            ),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(store.chain_target),
+            dst: GraphNodeId::Entity(store.chain_source),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// Run `work`, reporting how many base graphs its workspace mutation
+    /// resolved. Bases resolved outside the mutation, by the successor's
+    /// storage-admission gate or by a backend that revalidates what it saves,
+    /// are deliberately not counted: they are their own contract.
+    fn mutation_base_resolutions_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| count.set(0));
+        let value = work();
+        (
+            value,
+            WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| count.get()),
+        )
+    }
+
+    /// One workspace overlay staged on top of the synthetic head, leaving the
+    /// base where it is.
+    fn overlay_transaction_at_unchanged_base(
+        store: &SyntheticHistoryStore,
+        operation: u128,
+        round: usize,
+    ) -> RepositoryTransaction {
+        semantic_workspace_transaction(
+            &store.manager,
+            operation,
+            WorkspaceSemanticDelta::new_with_external_references(
+                Vec::new(),
+                vec![RelationDelta::Added {
+                    new: indexed_overlay_relation(store, round),
+                }],
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A workspace mutation is three materialization steps over a base graph
+    /// that costs a whole history replay to resolve, and the mutation's own
+    /// contract fixes which base each step wants. Resolving a base per step
+    /// replayed the same history two extra times on every forced tree
+    /// admission, which is the shape both publications of one `kin commit`
+    /// take. This pins the resolution count so it cannot drift back.
+    #[test]
+    fn one_workspace_mutation_resolves_each_distinct_base_exactly_once() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+
+        let unchanged_base = overlay_transaction_at_unchanged_base(&store, 0xf2_2347_0001, 0);
+        let (receipt, resolutions) = mutation_base_resolutions_during(|| {
+            store
+                .manager
+                .commit_repository_transaction(unchanged_base)
+                .unwrap()
+        });
+        receipt.validate().unwrap();
+        assert_eq!(
+            resolutions, 1,
+            "a mutation that leaves its base where it was names one base graph, \
+             so it must resolve one, not one per materialization"
+        );
+
+        let advanced = advance_synthetic_base(&store);
+        let (advanced_receipt, advanced_resolutions) = mutation_base_resolutions_during(|| {
+            store.manager.commit_repository_transaction(advanced)
+        });
+        advanced_receipt.unwrap().validate().unwrap();
+        assert_eq!(
+            advanced_resolutions, 2,
+            "a mutation that advances its base names two distinct base graphs and must \
+             resolve both, never fewer"
+        );
+    }
+
+    /// A transaction advancing `main` and the workspace base onto one new
+    /// change, leaving the workspace tree and overlay where they are.
+    fn advance_synthetic_base(store: &SyntheticHistoryStore) -> RepositoryTransaction {
+        let lease = store.manager.read_authority();
+        let current = lease.metadata().workspaces[0].clone();
+        let base_target = current
+            .base_target
+            .clone()
+            .expect("synthetic workspace bases at head");
+        let base_change_id = target_change_id(lease.metadata(), &base_target).unwrap();
+        drop(lease);
+        // Repository authority persists immutable history, not a materialized
+        // entity map, so the entity to modify comes from the workspace graph
+        // the history resolves to.
+        let old = materialize_synthetic(store)
+            .entities
+            .get(&store.modified_entity)
+            .expect("modified entity resolves in the workspace graph")
+            .clone();
+
+        let mut new = old.clone();
+        new.signature = format!("{} /* advanced base */", old.signature);
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![base_change_id],
+            timestamp: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-07-28T17:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            author: AuthorId::new("synthetic-history"),
+            message: "advance the synthetic base".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: old.clone(),
+                new: new.clone(),
+            }],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        let next_target = RefTarget::change(change.id);
+
+        let mutation = WorkspaceMutation {
+            workspace_id: current.workspace_id,
+            expected: WorkspaceExpectation::MustEqual {
+                generation: current.generation,
+                head: current.head.clone(),
+                base_target: current.base_target.clone(),
+                base_tree_hash: current.base_tree_hash,
+                tree_hash: current.tree_hash,
+                semantic_overlay_hash: current.semantic_overlay_hash,
+                admission_policy: current.admission_policy,
+            },
+            new_generation: current.generation + 1,
+            new_head: current.head,
+            new_base_target: Some(next_target.clone()),
+            new_base_tree_hash: current.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: current.tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::new(
+                vec![EntityDelta::Modified { old, new }],
+                Vec::new(),
+            )
+            .unwrap(),
+            new_shared_admission_policy: current.shared_admission_policy,
+            new_admission_policy: current.admission_policy,
+        };
+
+        let mut transaction = transaction_shell(&store.manager, 0xf2_2347_0002);
+        transaction.changes.push(change);
+        transaction.ref_mutations.push(RefMutation {
+            name: RefName::branch(b"main").unwrap(),
+            expected: RefExpectation::MustEqual {
+                target: base_target,
+            },
+            new_target: Some(next_target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.workspace_mutation = Some(mutation);
+        transaction
+    }
+
+    /// Local, non-citable successor-preparation wall-clock probe for FIR-2347.
+    /// Each round publishes one workspace-scoped transaction through the real
+    /// repository transaction surface, which is the shape both publications of
+    /// a `kin commit` take. Run explicitly in release mode:
+    ///
+    /// ```text
+    /// cargo test -p kin-db --release \
+    ///     repository_successor_preparation_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "wall-clock bench; run explicitly in release mode"]
+    fn repository_successor_preparation_bench() {
+        let build_started = std::time::Instant::now();
+        let store = build_synthetic_history_store(40, 500, 20, 100);
+        eprintln!(
+            "store: {} entities, {} relations, {} changes, built in {:.1}s",
+            store.entity_count,
+            store.relation_count,
+            store.change_count,
+            build_started.elapsed().as_secs_f64()
+        );
+
+        let mut samples = Vec::new();
+        for round in 0..5 {
+            let relation = indexed_overlay_relation(&store, round);
+            let transaction = semantic_workspace_transaction(
+                &store.manager,
+                0xf2_2347_0000 + round as u128,
+                WorkspaceSemanticDelta::new_with_external_references(
+                    Vec::new(),
+                    vec![RelationDelta::Added { new: relation }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            let started = std::time::Instant::now();
+            store
+                .manager
+                .commit_repository_transaction(transaction)
+                .unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "workspace-scoped transaction: median {:.1} ms, min {:.1} ms, max {:.1} ms",
+            samples[samples.len() / 2],
+            samples[0],
+            samples[samples.len() - 1]
+        );
     }
 }
