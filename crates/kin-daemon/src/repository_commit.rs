@@ -96,6 +96,7 @@ pub struct WorkspaceAdmissionResult {
 /// authority roots and the workspace tree the transition was planned against,
 /// which is what lets publication refuse a stale desired tree instead of
 /// silently replanning it against newer authority.
+#[derive(Debug)]
 pub(crate) struct AdmittedWorkspaceTree {
     previous_tree: kin_model::ResolvedTree,
     desired_tree: kin_model::ResolvedTree,
@@ -1105,6 +1106,58 @@ pub(crate) fn commit_native_plan_with_projection(
     authority_context: &LocalRepositoryAuthorityContext,
     plan: NativeCommitPlan,
 ) -> Result<NativeCommitResult> {
+    commit_native_plan_with_working_copy_proof(
+        layout,
+        blobs,
+        authority_context,
+        plan,
+        WorkingCopyProof::MatchesPreviousTree,
+    )
+}
+
+/// Publish one native repository transaction whose caller has already observed
+/// the working copy holding the plan's target tree.
+///
+/// The commit seam derives its target tree from a complete filesystem scan
+/// taken moments earlier under the same coordination gate, so the tree
+/// transition it carries is a statement about bytes that are already on disk.
+/// Saying so here lets one repository-authority successor carry both that tree
+/// transition and the semantic change, instead of publishing the tree in its
+/// own successor first and paying a second O(store) preparation and snapshot
+/// for the change.
+pub(crate) fn commit_native_plan_with_observed_target_tree(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    plan: NativeCommitPlan,
+) -> Result<NativeCommitResult> {
+    commit_native_plan_with_working_copy_proof(
+        layout,
+        blobs,
+        authority_context,
+        plan,
+        WorkingCopyProof::ObservedTargetTree,
+    )
+}
+
+/// What the caller knows about the working copy the transaction publishes over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingCopyProof {
+    /// The working copy still holds the plan's previous tree. A tree
+    /// transition is a namespace mutation and is journalled as one.
+    MatchesPreviousTree,
+    /// A complete scan observed the working copy already holding the plan's
+    /// target tree. A tree transition is verified rather than written.
+    ObservedTargetTree,
+}
+
+fn commit_native_plan_with_working_copy_proof(
+    layout: &kin_core::KinLayout,
+    blobs: &kin_blobs::BlobStore,
+    authority_context: &LocalRepositoryAuthorityContext,
+    plan: NativeCommitPlan,
+    working_copy: WorkingCopyProof,
+) -> Result<NativeCommitResult> {
     let repository_id = authority_context.repository_id().clone();
     if plan.transaction.repository_id != repository_id {
         return Err(invalid(format!(
@@ -1147,21 +1200,44 @@ pub(crate) fn commit_native_plan_with_projection(
             crate::mcp_commit::timed_commit_phase("load_previous_projection_entries", || {
                 load_projection_entries(&authority, &plan.previous_tree, &mut body_cache)
             })?;
-        crate::mcp_commit::timed_commit_phase("reconcile_workspace_and_commit_authority", || {
-            kin_core::reconcile_source_tree_and_commit_repository_transaction(
-                layout.working_dir(),
-                &plan.previous_tree,
-                &plan.target_tree,
-                previous_entries
-                    .iter()
-                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-                target_entries
-                    .iter()
-                    .map(|(path, entry, body)| (path, *entry, body.as_ref())),
-                &authority,
-                plan.transaction,
-            )
-        })?
+        match working_copy {
+            WorkingCopyProof::ObservedTargetTree => crate::mcp_commit::timed_commit_phase(
+                "reconcile_workspace_and_commit_authority",
+                || {
+                    kin_core::verify_observed_target_tree_and_commit_repository_transaction(
+                        layout.working_dir(),
+                        &plan.previous_tree,
+                        &plan.target_tree,
+                        previous_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        target_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        &authority,
+                        plan.transaction,
+                    )
+                },
+            )?,
+            WorkingCopyProof::MatchesPreviousTree => crate::mcp_commit::timed_commit_phase(
+                "reconcile_workspace_and_commit_authority",
+                || {
+                    kin_core::reconcile_source_tree_and_commit_repository_transaction(
+                        layout.working_dir(),
+                        &plan.previous_tree,
+                        &plan.target_tree,
+                        previous_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        target_entries
+                            .iter()
+                            .map(|(path, entry, body)| (path, *entry, body.as_ref())),
+                        &authority,
+                        plan.transaction,
+                    )
+                },
+            )?,
+        }
     };
     let materializable = materializable_artifact_count(&plan.target_tree)?;
     if projected != materializable {

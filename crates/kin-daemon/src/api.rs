@@ -4630,16 +4630,50 @@ async fn command_commit(
         state.coordination_gate.lock(),
     )
     .await;
-    crate::mcp_commit::timed_commit_phase_async(
+    // The admission derives the exact tree from the working copy but does not
+    // publish it. This commit's own transaction carries that tree transition
+    // beside the semantic change, so one repository-authority successor is
+    // prepared and one store snapshot persisted for the whole commit instead
+    // of two. Nothing observes the interval: the coordination gate above spans
+    // the admission and the publication, and a commit that does not reach
+    // authority publishes the deferred tree on its way out, leaving exactly
+    // the state a failed commit leaves today.
+    //
+    // The phase keeps its name. What the span measures is unchanged, one
+    // complete host walk and the graph work behind it, and the proof parser
+    // reads that name off the phase table.
+    let deferred_tree = crate::mcp_commit::timed_commit_phase_async(
         "forced_filesystem_admission",
-        crate::loop_runner::sync_filesystem_with_graph_under_coordination(&state),
+        crate::loop_runner::sync_filesystem_with_graph_deferring_tree_publication(&state),
     )
     .await
     .map_err(internal_error)?;
 
+    match command_commit_after_admission(&state, request, deferred_tree.is_some()) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if let Some(admitted) = deferred_tree {
+                crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Plan and publish the commit for a working copy this caller has already
+/// admitted.
+///
+/// `observed_target_tree` says the admission left its tree transition for this
+/// transaction to carry, which is also what makes the working copy the proof
+/// of the target tree rather than of the prior one.
+fn command_commit_after_admission(
+    state: &Arc<DaemonState>,
+    request: CommandCommitRequest,
+    observed_target_tree: bool,
+) -> Result<Json<CommandCommitResponse>, (StatusCode, String)> {
     let graph = &*state.graph;
     let authority_context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
             .map_err(repository_commit_error)?;
     let plan = crate::mcp_commit::timed_commit_phase("plan_transaction", || {
         crate::repository_commit::plan_native_commit(
@@ -4716,12 +4750,21 @@ async fn command_commit(
         }
     }
 
-    let committed = crate::repository_commit::commit_native_plan_with_projection(
-        &state.layout,
-        state.blobs.as_ref(),
-        &authority_context,
-        plan,
-    )
+    let committed = if observed_target_tree {
+        crate::repository_commit::commit_native_plan_with_observed_target_tree(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+        )
+    } else {
+        crate::repository_commit::commit_native_plan_with_projection(
+            &state.layout,
+            state.blobs.as_ref(),
+            &authority_context,
+            plan,
+        )
+    }
     .map_err(repository_commit_error)?;
     state
         .record_repository_authority_commit(committed.receipt.generation)

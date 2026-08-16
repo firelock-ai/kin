@@ -165,6 +165,23 @@ struct ExactTreeAdmission {
     /// the policy exactly, and a rule written this tick takes effect on the
     /// next one instead of on the one that wrote it.
     policy: Option<kin_index::ResolvedAdmissionMatcher>,
+    /// The tree transition this admission derived but did not publish, present
+    /// only when the caller asked to carry it in its own transaction. Held so
+    /// the caller can publish it standalone if its own transaction never
+    /// reaches authority.
+    deferred_tree: Option<crate::repository_commit::AdmittedWorkspaceTree>,
+}
+
+/// Where an admitted exact tree crosses repository authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreePublication {
+    /// The admission publishes its own repository-authority successor. This is
+    /// the ambient watcher path and every explicit standalone admission.
+    Standalone,
+    /// The caller carries the tree transition in its own transaction. Nothing
+    /// is published here, so the caller owns the interval in which the derived
+    /// graph holds a tree repository authority has not yet accepted.
+    DeferredToCaller,
 }
 
 fn canonicalize_host_parent_preserving_leaf(path: &Path) -> std::io::Result<PathBuf> {
@@ -570,6 +587,7 @@ fn observation_covers_path(observed: &BTreeSet<RepoPath>, path: &RepoPath) -> bo
 fn exact_tree_admission(
     state: &DaemonState,
     observation: Option<&BTreeSet<RepoPath>>,
+    publication: TreePublication,
 ) -> Result<ExactTreeAdmission> {
     let working_dir = state.layout.working_dir();
     // Read the authority roots the observation is about to be planned against.
@@ -734,6 +752,7 @@ fn exact_tree_admission(
         }
     }
 
+    let mut deferred_tree = None;
     if !deltas.is_empty() {
         let desired_tree = previous.apply(&deltas).map_err(invalid_tree_transition)?;
         // Repository authority moves first. The in-memory graph is a derived
@@ -747,9 +766,32 @@ fn exact_tree_admission(
             previous.clone(),
             desired_tree,
         );
-        let _ = crate::mcp_commit::timed_commit_phase("publish_workspace_admission", || {
-            publish_exact_workspace_tree(state, &admitted)
-        })?;
+        // A deferring caller publishes this same transition inside its own
+        // transaction, so authority still moves before anything outside the
+        // caller can observe the graph: the coordination gate the caller holds
+        // spans this admission and that publication, and the caller restores
+        // this ordering by publishing the deferred tree if its transaction
+        // never reaches authority. What it buys is one repository-authority
+        // successor for the whole commit rather than two, each of which
+        // prepares and persists the complete store.
+        //
+        // A transition that moves a graph-only repository member is never
+        // deferred. An exact-source projection may not carry one, so the
+        // caller's transaction would refuse it; this publishes it here exactly
+        // as a standalone admission does.
+        let defer = publication == TreePublication::DeferredToCaller
+            && !transition_touches_graph_only_member(&deltas)?;
+        if defer {
+            deferred_tree = Some(admitted);
+        } else {
+            // The phase stays on the standalone path, which is the path that
+            // still spends it. A deferring caller reports its own publication
+            // instead, so a collapsed commit names no admission publication at
+            // all, which is what the phase table should show.
+            let _ = crate::mcp_commit::timed_commit_phase("publish_workspace_admission", || {
+                publish_exact_workspace_tree(state, &admitted)
+            })?;
+        }
         // Authority has committed the removal, so the entities derived from
         // those paths go before the graph is asked to match. kin-db refuses a
         // tree transition that leaves an entity on a path the staged tree no
@@ -798,7 +840,27 @@ fn exact_tree_admission(
         changed_paths,
         semantic_events: dedup_file_events(semantic_events),
         policy,
+        deferred_tree,
     })
+}
+
+/// Report whether one planned exact-tree transition moves a repository member
+/// that has no host representation.
+///
+/// An exact-source projection refuses to carry a graph-only transition, so a
+/// caller that means to fold the tree into its own transaction has to know
+/// before it plans rather than discover it at the projection boundary.
+fn transition_touches_graph_only_member(deltas: &[TreeDelta]) -> Result<bool> {
+    for delta in deltas {
+        for located in [delta.old_state(), delta.new_state()].into_iter().flatten() {
+            if kin_core::source_projection_disposition(&located.path, located.entry)?
+                != kin_core::SourceProjectionDisposition::Materialized
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Classify one host event against exact repository-tree truth that has
@@ -953,7 +1015,7 @@ fn admit_file_event_with_exact_tree(
 fn admit_file_event(state: &DaemonState, event: &FileEvent) -> Result<AdmittedFileEvent> {
     // Mirror production ordering: one complete-scan transaction crosses
     // authority first, then host events are classified against what it moved.
-    let admission = exact_tree_admission(state, None)?;
+    let admission = exact_tree_admission(state, None, TreePublication::Standalone)?;
     admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
@@ -968,7 +1030,7 @@ fn admit_file_event_ambient(state: &DaemonState, event: &FileEvent) -> Result<Ad
     let observation = repo_path(path, state.layout.working_dir())?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let admission = exact_tree_admission(state, Some(&observation))?;
+    let admission = exact_tree_admission(state, Some(&observation), TreePublication::Standalone)?;
     admit_file_event_with_exact_tree(state, event, &admission.changed_paths)
 }
 
@@ -1846,7 +1908,11 @@ pub async fn run_loop(
                 }
             })
             .collect::<BTreeSet<_>>();
-        let exact_admission = match exact_tree_admission(&state, Some(&observation)) {
+        let exact_admission = match exact_tree_admission(
+            &state,
+            Some(&observation),
+            TreePublication::Standalone,
+        ) {
             Ok(admission) => {
                 state
                     .background_work
@@ -2968,13 +3034,15 @@ mod tests {
         let repo_path = test_repo_path("brand_new.rs");
         let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
 
-        let first = exact_tree_admission(&state, Some(&observation)).unwrap();
+        let first =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
         assert!(
             first.changed_paths.contains(&repo_path),
             "the first tick admits the observed path"
         );
 
-        let second = exact_tree_admission(&state, Some(&observation)).unwrap();
+        let second =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
         assert!(
             second.deltas.is_empty() && second.changed_paths.is_empty(),
             "a settled path must plan nothing on the next tick: {:?}",
@@ -3069,7 +3137,8 @@ mod tests {
         // The admission runs against a working copy that does not hold the file,
         // exactly as a walk that finished before the file landed would have.
         let observation = BTreeSet::new();
-        let admission = exact_tree_admission(&state, Some(&observation)).unwrap();
+        let admission =
+            exact_tree_admission(&state, Some(&observation), TreePublication::Standalone).unwrap();
         std::fs::write(&missed, b"pub fn raced() -> u32 { 1 }\n").unwrap();
 
         let admitted = admit_file_event_with_exact_tree(
@@ -3135,7 +3204,7 @@ mod tests {
         // The commit seam, and nothing after it: no watcher event is delivered,
         // which is exactly the quiescent working copy the stale record survived
         // on.
-        exact_tree_admission(&state, None).unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
         assert!(
             tree_entry(&state, "unobserved.rs").is_some(),
             "the seam must admit the path this disclosure was about"
@@ -5005,6 +5074,80 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
 pub(crate) async fn sync_filesystem_with_graph_under_coordination(
     state: &DaemonState,
 ) -> Result<()> {
+    sync_filesystem_with_graph_publishing(state, TreePublication::Standalone)
+        .await
+        .map(|_| ())
+}
+
+/// Admit the host checkout without publishing its tree transition, and return
+/// the transition for the caller to carry.
+///
+/// `/commands/commit` uses this so one repository-authority successor carries
+/// both the admitted exact tree and the semantic change it produces. Preparing
+/// a successor and persisting the store is O(store) on both sides of the
+/// commit, so publishing the tree on its own first makes a one-line change pay
+/// that cost twice.
+///
+/// The caller must hold `coordination_gate` across this call and its own
+/// publication, and must publish the returned tree standalone if its
+/// transaction never reaches authority. `None` means nothing moved, or that
+/// the transition was not eligible to be deferred and has already been
+/// published here.
+pub(crate) async fn sync_filesystem_with_graph_deferring_tree_publication(
+    state: &DaemonState,
+) -> Result<Option<crate::repository_commit::AdmittedWorkspaceTree>> {
+    sync_filesystem_with_graph_publishing(state, TreePublication::DeferredToCaller).await
+}
+
+async fn sync_filesystem_with_graph_publishing(
+    state: &DaemonState,
+    publication: TreePublication,
+) -> Result<Option<crate::repository_commit::AdmittedWorkspaceTree>> {
+    let mut deferred = None;
+    match sync_filesystem_with_graph_publishing_inner(state, publication, &mut deferred).await {
+        Ok(()) => Ok(deferred),
+        Err(error) => {
+            if let Some(admitted) = deferred {
+                publish_deferred_tree_after_failure(state, &admitted);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Close a deferral whose caller will never publish it.
+///
+/// The derived graph already carries the admitted tree, so leaving it
+/// unpublished would leave the graph ahead of repository authority, and every
+/// later admission plans its transition out of the graph's tree and would be
+/// refused against the older authority tree. Publishing here restores the
+/// ordering a standalone admission would have established, which is exactly
+/// the state a failed commit leaves behind today.
+///
+/// This is the one path where publication itself can fail with nothing left to
+/// try. It is reported at error level rather than swallowed, and the failure a
+/// later admission raises stays loud, because a daemon whose graph outruns
+/// authority must be restarted to rebuild the graph rather than keep answering
+/// from it.
+pub(crate) fn publish_deferred_tree_after_failure(
+    state: &DaemonState,
+    admitted: &crate::repository_commit::AdmittedWorkspaceTree,
+) {
+    if let Err(error) = publish_exact_workspace_tree(state, admitted) {
+        error!(
+            error = %error,
+            "failed to publish the deferred exact workspace tree after the carrying transaction \
+             did not reach authority; the derived graph is ahead of repository authority and this \
+             daemon must be restarted before it can admit again"
+        );
+    }
+}
+
+async fn sync_filesystem_with_graph_publishing_inner(
+    state: &DaemonState,
+    publication: TreePublication,
+    deferred_out: &mut Option<crate::repository_commit::AdmittedWorkspaceTree>,
+) -> Result<()> {
     if state.filesystem_reconcile_disabled() {
         debug!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
@@ -5023,7 +5166,10 @@ pub(crate) async fn sync_filesystem_with_graph_under_coordination(
     // An explicit admission seam. Everything the working copy holds crosses
     // the compare-and-swap here, which is why `/commands/commit` calls it
     // rather than relying on whatever the watcher happened to observe.
-    let exact_admission = exact_tree_admission(state, None)?;
+    let mut exact_admission = exact_tree_admission(state, None, publication)?;
+    // Recorded before anything below can fail, so a pass that dies part way
+    // through enrichment still hands the deferral back to be closed.
+    *deferred_out = exact_admission.deferred_tree.take();
     if exact_admission.deltas.is_empty() {
         drop(graph_mutation);
         return Ok(());
