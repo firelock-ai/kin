@@ -4650,7 +4650,17 @@ async fn command_commit(
     .map_err(internal_error)?;
 
     match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
-        Ok(response) => Ok(response),
+        Ok(response) => {
+            // A transaction that reached authority carried the tree the graph
+            // holds with it, which is the divergence an earlier unclosed
+            // deferral left behind. The admission above plans out of the graph's
+            // tree, so a still-wedged daemon could not have got this far.
+            state
+                .background_work
+                .reconcile()
+                .clear_deferred_tree_wedge();
+            Ok(response)
+        }
         Err(error) => {
             if let Some(admitted) = deferred_tree {
                 crate::loop_runner::publish_deferred_tree_after_failure(&state, &admitted);
@@ -19177,6 +19187,64 @@ mod tests {
         );
     }
 
+    /// A commit that reaches authority clears a wedge, because its transaction
+    /// carried the graph's tree across.
+    ///
+    /// The other half of the deferral's own contract. A commit that fails
+    /// publishes its deferred tree standalone, and a failure there wedges the
+    /// daemon; a commit that succeeds is the same transition arriving by the
+    /// intended door, so the divergence a wedge names cannot survive it. Without
+    /// this the flag would be a one-way latch that a daemon carried until
+    /// restart even after the state had resolved.
+    #[cfg(unix)]
+    #[tokio::test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    async fn a_commit_that_reaches_authority_clears_a_recorded_wedge() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("recovered.rs"),
+            b"pub fn recovered() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        state
+            .background_work
+            .reconcile()
+            .record_deferred_tree_wedge(
+                "an earlier restoring publication failed",
+                std::time::Instant::now(),
+            );
+        assert!(
+            state
+                .background_work
+                .reconcile_report(std::time::Instant::now())
+                .degraded(),
+            "the fixture must start wedged, or the assertion below proves nothing"
+        );
+
+        let app = router(Arc::clone(&state));
+        commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "publish through the deferral's own transaction",
+        )
+        .await;
+
+        let report = state
+            .background_work
+            .reconcile_report(std::time::Instant::now());
+        assert!(
+            report.deferred_tree_wedge.is_none(),
+            "a commit that published cannot leave the graph ahead of authority"
+        );
+        assert!(!report.degraded(), "{:?}", report.degraded_reasons());
+    }
+
     #[tokio::test]
     async fn graph_only_command_commit_fails_before_filesystem_delta_computation() {
         let state = test_state();
@@ -24420,6 +24488,72 @@ mod tests {
             Some("src/lib.rs: parser rejected the transaction")
         );
         assert!(json.reconcile.last_error_at.is_some());
+    }
+
+    /// A wedged commit deferral end to end on `/health`, and the recovery that
+    /// clears it.
+    ///
+    /// The daemon is not merely failing admissions here: the derived graph holds
+    /// a tree repository authority never accepted, so every admission is refused
+    /// against the mismatched tree until this process restarts. `/health`,
+    /// `kin graph status`, `kin admit`, and `kin doctor` all answer from this
+    /// one payload, so a wedged daemon that answered `ok` here would read as
+    /// healthy on every surface a reader has.
+    ///
+    /// The wedge is recorded on the probes rather than driven through a failing
+    /// commit, the same way the failing-admission tests above plant a streak.
+    /// The double failure itself is driven at the seam that produces it, in
+    /// `loop_runner`.
+    #[tokio::test]
+    async fn health_names_a_wedged_commit_deferral_and_an_admission_clears_it() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        install_working_copy_file(&state, "docs/notes.md", b"notes\n", false);
+        state
+            .background_work
+            .reconcile()
+            .record_deferred_tree_wedge(
+                "repository authority moved after the complete workspace observation was planned",
+                std::time::Instant::now(),
+            );
+
+        let json = health_json(Arc::clone(&state)).await;
+        assert_eq!(
+            json.status, "attention",
+            "a daemon that cannot admit again until it restarts must not answer ok"
+        );
+        let wedge = json
+            .reconcile
+            .deferred_tree_wedge
+            .as_ref()
+            .expect("the wedge must cross the wire, not merely exist in the daemon");
+        assert!(wedge.error.contains("repository authority moved"));
+        assert!(wedge.at.is_some());
+        assert!(
+            json.reconcile.degraded_reasons().iter().any(|reason| {
+                reason.contains("restart required, commit deferral wedged")
+                    && reason.contains("repository authority moved")
+            }),
+            "the reason must name the recovery and carry the error: {:?}",
+            json.reconcile.degraded_reasons()
+        );
+
+        // The operator's recovery is a complete admission, and `kin admit` is
+        // the surface they run it from, so its own report is where they check
+        // whether it worked.
+        let app = router(Arc::clone(&state));
+        let (_, response) = admit_through_api(&app).await;
+        assert_eq!(response["report"]["admitted"], json!(true));
+        assert!(
+            response["report"]["reconcile"]["deferred_tree_wedge"].is_null(),
+            "the admission that cleared the wedge still reported one: {response}"
+        );
+
+        let json = health_json(state).await;
+        assert_eq!(json.status, "ok");
+        assert!(json.reconcile.deferred_tree_wedge.is_none());
     }
 
     /// The two-sided floor. A daemon that has reconciled nothing at all is the
