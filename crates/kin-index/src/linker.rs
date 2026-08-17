@@ -14,14 +14,16 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, ParseCompleteness, Relation,
-    RelationEvidence, RelationId, RelationKind, RelationOrigin, Visibility,
+    ArtifactId, Entity, EntityId, EntityKind, EntityRole, GraphNodeId, LanguageId,
+    ParseCompleteness, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+    Visibility,
 };
 use kin_parser::{
     is_call_extraction_incomplete_marker, CallArgShape, ExtractedRelation, FileImport,
 };
 
 use crate::error::{IndexError, Result as IndexResult};
+use crate::resolution::{RelationResolution, RESOLUTION_TIER_LADDER};
 
 /// Graph-assigned artifact identities keyed by repository-relative path.
 ///
@@ -426,6 +428,10 @@ struct LinkContext<'a> {
     /// callee's arity-incompatible candidates without ever pruning on missing
     /// evidence.
     entity_arity_by_id: HashMap<EntityId, ArityBounds>,
+    /// Project role of every entity. A production call site must not resolve to
+    /// a test entity while a production candidate of the same name exists, so
+    /// the same-name fan-out tiers need role in hand at resolution time.
+    entity_role_by_id: HashMap<EntityId, EntityRole>,
     entity_count_by_file: HashMap<&'a str, usize>,
     known_files: HashSet<&'a str>,
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
@@ -517,6 +523,7 @@ fn build_link_context<'a>(
         entity_kind_by_id,
         entity_language_by_id,
         entity_arity_by_id,
+        entity_role_by_id,
         entity_count_by_file,
         known_files,
     ) = {
@@ -531,12 +538,14 @@ fn build_link_context<'a>(
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
         let mut entity_language_by_id: HashMap<EntityId, LanguageId> = HashMap::new();
         let mut entity_arity_by_id: HashMap<EntityId, ArityBounds> = HashMap::new();
+        let mut entity_role_by_id: HashMap<EntityId, EntityRole> = HashMap::new();
         let mut entity_count_by_file: HashMap<&str, usize> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
         for &entity in &sorted_universe {
             entity_kind_by_id.insert(entity.id, entity.kind);
             entity_language_by_id.insert(entity.id, entity.language);
+            entity_role_by_id.insert(entity.id, entity.role);
             let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
                 continue;
             };
@@ -572,6 +581,7 @@ fn build_link_context<'a>(
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id,
+            entity_role_by_id,
             entity_count_by_file,
             known_files,
         )
@@ -634,6 +644,7 @@ fn build_link_context<'a>(
         entity_kind_by_id,
         entity_language_by_id,
         entity_arity_by_id,
+        entity_role_by_id,
         entity_count_by_file,
         known_files,
         import_map,
@@ -740,6 +751,64 @@ fn resolve_one_file(
             continue;
         }
 
+        // (a0) Receiver-scoped resolution. An attribute call carries its
+        // receiver as written; the calling file's imports say whether that
+        // receiver is a module or a value, and that decides which entities can
+        // possibly be the destination. Narrowest resolution wins: a receiver
+        // bound to a repo-local module yields exactly one edge, and a receiver
+        // bound to a module outside the repo yields no local edge at all rather
+        // than a repo-wide guess.
+        let receiver_scope = rel
+            .receiver
+            .as_deref()
+            .filter(|receiver| rel.kind == RelationKind::Calls && !receiver.is_empty())
+            .map(|receiver| {
+                (
+                    receiver,
+                    classify_receiver(
+                        receiver,
+                        &file.file_path,
+                        ctx.import_map.get(file.file_path.as_str()),
+                        &ctx.known_files,
+                    ),
+                )
+            });
+        let mut receiver_is_object = false;
+        if let Some((receiver, scope)) = receiver_scope.as_ref() {
+            let receiver_root = receiver.split('.').next().unwrap_or(receiver);
+            match scope {
+                ReceiverScope::Module(target_file) => {
+                    if let Some(dst_id) = resolve_receiver_module_target(
+                        target_file.as_str(),
+                        receiver_root,
+                        rel.dst_name.as_str(),
+                        &ctx.entity_by_file_name,
+                    ) {
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, RECEIVER_MODULE_CONFIDENCE),
+                        );
+                        continue;
+                    }
+                }
+                ReceiverScope::ExternalModule => {}
+                ReceiverScope::Object => receiver_is_object = true,
+            }
+            if !receiver_is_object {
+                // The receiver names a module, and that module does not define
+                // this callee here. Binding the bare leaf to a same-named
+                // symbol somewhere else in the repo would mint a consumer the
+                // source never had, so stop at the cross-repo placeholder.
+                if let Some(external) =
+                    make_external_reference_relation(rel, src_id, &file.file_path, &ctx.known_files)
+                {
+                    accumulate_relation(&mut resolved, &mut relation_indices, external);
+                }
+                continue;
+            }
+        }
+
         // (a) Same-file resolution. A same-file entity still wins and is emitted
         // first at full confidence, but it is frequently a declaration/prototype
         // whose definition lives in another file; when cross-file entities share
@@ -748,7 +817,11 @@ fn resolve_one_file(
         // is linked, not just the local stub. Cross-file twins are name-inferred,
         // so they carry the (c) name-match confidence (0.7), below the
         // parser-certain same-file edge (1.0).
-        if let Some(&dst_id) = dst_same_file {
+        //
+        // A call through an object skips this tier: the leaf name is a member
+        // name, and a same-file free function that happens to share it is a
+        // decoy, not the destination.
+        if let Some(&dst_id) = dst_same_file.filter(|_| !receiver_is_object) {
             accumulate_relation(
                 &mut resolved,
                 &mut relation_indices,
@@ -765,6 +838,8 @@ fn resolve_one_file(
             });
             let cross_file_twins =
                 prune_ids_by_arity(cross_file_twins, call_arity, &ctx.entity_arity_by_id);
+            let cross_file_twins =
+                narrow_candidates_by_role(src_id, cross_file_twins, &ctx.entity_role_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     accumulate_relation(
@@ -812,8 +887,14 @@ fn resolve_one_file(
             }
         }
 
-        // (b) Import-based cross-file resolution
-        if let Some(file_imports) = ctx.import_map.get(file.file_path.as_str()) {
+        // (b) Import-based cross-file resolution. Skipped for a call through an
+        // object: `dst_name` is then a member name read off a value, not the
+        // local binding an import introduced.
+        if let Some(file_imports) = ctx
+            .import_map
+            .get(file.file_path.as_str())
+            .filter(|_| !receiver_is_object)
+        {
             if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str()) {
                 if let Some(target_file) =
                     resolve_module_path(&file.file_path, module_path, &ctx.known_files)
@@ -938,8 +1019,15 @@ fn resolve_one_file(
         // recorded arity, so non-overloaded and non-C/C++ binding is unchanged.
         let other_file_candidates =
             prune_pairs_by_arity(other_file_candidates, call_arity, &ctx.entity_arity_by_id);
+        let other_file_candidates =
+            narrow_pairs_by_role(src_id, other_file_candidates, &ctx.entity_role_by_id);
 
-        if name_fallback_allowed && !other_file_candidates.is_empty() {
+        // A call through an object never reaches a module-level function, and
+        // the exact-name bucket holds exactly those: a method is indexed under
+        // its owner-qualified name and is reached by (c2) below. Letting an
+        // object call settle here is what bound `proxies.get("no_proxy")` to
+        // the public `requests.get`.
+        if name_fallback_allowed && !receiver_is_object && !other_file_candidates.is_empty() {
             let distinct_ids: HashSet<EntityId> =
                 other_file_candidates.iter().map(|&(_, id)| id).collect();
             let settled = if distinct_ids.len() == 1 {
@@ -1005,6 +1093,8 @@ fn resolve_one_file(
             }
             let distinct_targets =
                 prune_ids_by_arity(distinct_targets, call_arity, &ctx.entity_arity_by_id);
+            let distinct_targets =
+                narrow_candidates_by_role(src_id, distinct_targets, &ctx.entity_role_by_id);
             if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                 for dst_id in sorted_fanout_targets(distinct_targets) {
                     accumulate_relation(
@@ -2558,6 +2648,135 @@ fn disambiguate_same_name_candidates(
     None
 }
 
+/// What the calling file's own declarations say about the receiver of an
+/// attribute call (`receiver.method(...)`).
+///
+/// Python's `x.method()` and `mod.function()` are the same syntax and arrive
+/// with the same bare leaf name. Only the file's imports separate them, and the
+/// difference decides what the callee can possibly be: a call through an
+/// imported module reaches a module-level function in that module, while a call
+/// through an object reaches a member of some type and can never reach a
+/// module-level function. Collapsing the two is what let
+/// `Session.merge_environment_settings`, whose only `.get(` sites are
+/// `proxies.get("no_proxy")` and `os.environ.get(...)`, bind to the public
+/// `requests.get`.
+#[derive(Debug, PartialEq, Eq)]
+enum ReceiverScope {
+    /// The receiver's root name is bound by an import that resolves to a file
+    /// in this repository: the callee is a member of that module.
+    Module(String),
+    /// The receiver's root name is bound by an import whose module is not part
+    /// of this repository (stdlib, a third-party package). No local entity can
+    /// be the destination.
+    ExternalModule,
+    /// The receiver is a value — a parameter, a local, an attribute read, a
+    /// call result. Its type is not known here, but it is not a module, so the
+    /// destination must be a member of some type.
+    Object,
+}
+
+/// Classify an attribute call's receiver against the calling file's imports.
+///
+/// Only the receiver's root segment is consulted: `os.environ.get(...)` is a
+/// call through `os`, and whether `os` is a repo module or a stdlib one is
+/// exactly the question that decides whether a local `get` may be the target.
+fn classify_receiver<S>(
+    receiver: &str,
+    caller_file: &str,
+    file_imports: Option<&HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+) -> ReceiverScope
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let root = receiver.split('.').next().unwrap_or(receiver).trim();
+    if root.is_empty() || !is_path_identifier(root) {
+        return ReceiverScope::Object;
+    }
+    let Some(&(module_path, _)) = file_imports.and_then(|imports| imports.get(root)) else {
+        return ReceiverScope::Object;
+    };
+    match resolve_module_path(caller_file, module_path, known_files) {
+        Some(target_file) => ReceiverScope::Module(target_file),
+        None => ReceiverScope::ExternalModule,
+    }
+}
+
+/// Keep a production call site from resolving to a test entity while a
+/// production entity of the same name is available.
+///
+/// `RedirectSession` in `tests/test_requests.py` subclasses a redirect mixin
+/// and can never be the receiver at `adapter.send(...)` in `sessions.py`, yet a
+/// bare-name fan-out over every `send` in the repository reached it. Role is
+/// already extracted per entity, so the tiebreak costs nothing. Test callers are
+/// left alone: a test legitimately calls its own doubles.
+fn narrow_candidates_by_role(
+    src_id: EntityId,
+    targets: HashSet<EntityId>,
+    roles: &HashMap<EntityId, EntityRole>,
+) -> HashSet<EntityId> {
+    if roles.get(&src_id) != Some(&EntityRole::Source) {
+        return targets;
+    }
+    let has_source_candidate = targets
+        .iter()
+        .any(|id| roles.get(id) == Some(&EntityRole::Source));
+    if !has_source_candidate {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|id| roles.get(id) != Some(&EntityRole::Test))
+        .collect()
+}
+
+/// The `(file, id)` form of [`narrow_candidates_by_role`], for the tiers that
+/// still need each candidate's defining file to disambiguate by locality.
+fn narrow_pairs_by_role<'a>(
+    src_id: EntityId,
+    candidates: Vec<(&'a str, EntityId)>,
+    roles: &HashMap<EntityId, EntityRole>,
+) -> Vec<(&'a str, EntityId)> {
+    if roles.get(&src_id) != Some(&EntityRole::Source) {
+        return candidates;
+    }
+    let has_source_candidate = candidates
+        .iter()
+        .any(|(_, id)| roles.get(id) == Some(&EntityRole::Source));
+    if !has_source_candidate {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, id)| roles.get(id) != Some(&EntityRole::Test))
+        .collect()
+}
+
+/// Confidence for a call through a receiver the file's own imports bind to a
+/// repo-local module, resolved inside that module. The module is known and the
+/// symbol was selected within it, so this is import-scoped: the same band as
+/// the parser-pinned and namespace-member tiers.
+const RECEIVER_MODULE_CONFIDENCE: f32 = 0.9;
+
+/// Resolve an attribute call whose receiver names a repo-local module. The
+/// callee is looked up as a plain member of that module first, then as a member
+/// of a type the receiver's own root names (`Session.get` for `Session.get(...)`
+/// where `Session` was imported).
+fn resolve_receiver_module_target(
+    target_file: &str,
+    receiver_root: &str,
+    method: &str,
+    entity_by_file_name: &HashMap<(&str, &str), EntityId>,
+) -> Option<EntityId> {
+    if let Some(&dst_id) = entity_by_file_name.get(&(target_file, method)) {
+        return Some(dst_id);
+    }
+    let qualified = format!("{receiver_root}.{method}");
+    entity_by_file_name
+        .get(&(target_file, qualified.as_str()))
+        .copied()
+}
+
 /// Outcome of resolving a relation through its parser-recorded import source.
 enum ImportPinnedTarget {
     /// The pinned module resolved and names exactly one local target.
@@ -3626,6 +3845,10 @@ pub struct IncrementalLinker {
     /// incremental mirror of the batch linker's `entity_arity_by_id`; backs
     /// overload arity pruning on the live-edit path.
     pub entity_arity_by_id: HashMap<EntityId, ArityBounds>,
+    /// entity_id -> project role. The incremental mirror of the batch linker's
+    /// `entity_role_by_id`; backs the production-over-test tiebreak on the
+    /// live-edit path.
+    pub entity_role_by_id: HashMap<EntityId, EntityRole>,
     /// Set of all known files
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
@@ -3666,6 +3889,7 @@ pub struct IncrementalLinkerCheckpointV1 {
     entity_kind_by_id: Vec<(EntityId, EntityKind)>,
     entity_language_by_id: Vec<(EntityId, LanguageId)>,
     entity_arity_by_id: Vec<(EntityId, ArityBounds)>,
+    entity_role_by_id: Vec<(EntityId, EntityRole)>,
     known_files: Vec<String>,
     entities_by_file: Vec<(String, Vec<(EntityId, Visibility)>)>,
     include_targets_by_file: Vec<(String, Vec<String>)>,
@@ -3673,7 +3897,7 @@ pub struct IncrementalLinkerCheckpointV1 {
 }
 
 /// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 3;
+pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 4;
 
 /// Build-time kin-index identity included in the composite hydration
 /// checkpoint version key.
@@ -3727,6 +3951,7 @@ impl IncrementalLinker {
             entity_kind_by_id: HashMap::new(),
             entity_language_by_id: HashMap::new(),
             entity_arity_by_id: HashMap::new(),
+            entity_role_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
             include_targets_by_file: HashMap::new(),
@@ -3744,6 +3969,7 @@ impl IncrementalLinker {
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id,
+            entity_role_by_id,
             known_files,
             entities_by_file,
             include_targets_by_file,
@@ -3799,6 +4025,12 @@ impl IncrementalLinker {
             .collect();
         entity_arity_by_id.sort_by_key(|(id, _)| *id);
 
+        let mut entity_role_by_id: Vec<_> = entity_role_by_id
+            .iter()
+            .map(|(id, role)| (*id, *role))
+            .collect();
+        entity_role_by_id.sort_by_key(|(id, _)| *id);
+
         let mut known_files: Vec<_> = known_files.iter().cloned().collect();
         known_files.sort();
 
@@ -3828,6 +4060,7 @@ impl IncrementalLinker {
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id,
+            entity_role_by_id,
             known_files,
             entities_by_file,
             include_targets_by_file,
@@ -3845,6 +4078,7 @@ impl IncrementalLinker {
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id,
+            entity_role_by_id,
             known_files,
             entities_by_file,
             include_targets_by_file,
@@ -3905,6 +4139,7 @@ impl IncrementalLinker {
             entity_kind_by_id,
             entity_language_by_id,
             entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
+            entity_role_by_id: checkpoint_hash_map(entity_role_by_id, "entity_role_by_id")?,
             known_files,
             entities_by_file: checkpoint_hash_map(entities_by_file, "entities_by_file")?,
             include_targets_by_file: checkpoint_hash_map(
@@ -3925,6 +4160,7 @@ impl IncrementalLinker {
                 self.entity_kind_by_id.remove(&entity_id);
                 self.entity_language_by_id.remove(&entity_id);
                 self.entity_arity_by_id.remove(&entity_id);
+                self.entity_role_by_id.remove(&entity_id);
                 if let Some(candidates) = self.entity_by_name.get_mut(&entity_name) {
                     candidates.retain(|(fp, _)| fp != file_path);
                     if candidates.is_empty() {
@@ -4002,6 +4238,7 @@ impl IncrementalLinker {
             self.entity_kind_by_id.insert(entity.id, entity.kind);
             self.entity_language_by_id
                 .insert(entity.id, entity.language);
+            self.entity_role_by_id.insert(entity.id, entity.role);
             if let Some(bounds) = callee_arity_bounds(entity) {
                 self.entity_arity_by_id.insert(entity.id, bounds);
             }
@@ -4295,8 +4532,69 @@ fn resolve_one_file_incremental(
         // cross-file entities share the exact name (a declaration/prototype
         // whose definition lives elsewhere) also fan out to them, bounded so
         // the same-file target plus its cross-file twins stay within the cap.
-        // Cross-file twins carry the (c) name-match confidence (0.7).
-        if let Some(dst_id) = dst_same_file {
+        // (a0) Receiver-scoped resolution — mirrors the batch linker: an
+        // attribute call's receiver decides which entities can be the
+        // destination at all, so a receiver bound to a repo-local module yields
+        // exactly one edge and a receiver bound outside the repo yields none.
+        let receiver_scope = rel
+            .receiver
+            .as_deref()
+            .filter(|receiver| rel.kind == RelationKind::Calls && !receiver.is_empty())
+            .map(|receiver| {
+                (
+                    receiver,
+                    classify_receiver(
+                        receiver,
+                        &file.file_path,
+                        import_map.get(file.file_path.as_str()),
+                        &linker.known_files,
+                    ),
+                )
+            });
+        let mut receiver_is_object = false;
+        if let Some((receiver, scope)) = receiver_scope.as_ref() {
+            let receiver_root = receiver.split('.').next().unwrap_or(receiver);
+            match scope {
+                ReceiverScope::Module(target_file) => {
+                    let in_module = linker.entity_by_file_name.get(target_file.as_str());
+                    let dst_id = in_module
+                        .and_then(|names| names.get(rel.dst_name.as_str()))
+                        .copied()
+                        .or_else(|| {
+                            let qualified = format!("{receiver_root}.{}", rel.dst_name);
+                            in_module
+                                .and_then(|names| names.get(qualified.as_str()))
+                                .copied()
+                        });
+                    if let Some(dst_id) = dst_id {
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, RECEIVER_MODULE_CONFIDENCE),
+                        );
+                        continue;
+                    }
+                }
+                ReceiverScope::ExternalModule => {}
+                ReceiverScope::Object => receiver_is_object = true,
+            }
+            if !receiver_is_object {
+                if let Some(external) = make_external_reference_relation(
+                    rel,
+                    src_id,
+                    &file.file_path,
+                    &linker.known_files,
+                ) {
+                    accumulate_relation(&mut resolved, &mut relation_indices, external);
+                }
+                continue;
+            }
+        }
+
+        // Cross-file twins carry the (c) name-match confidence (0.7). A call
+        // through an object skips this tier: a same-file free function sharing
+        // the member name is a decoy, not the destination.
+        if let Some(dst_id) = dst_same_file.filter(|_| !receiver_is_object) {
             accumulate_relation(
                 &mut resolved,
                 &mut relation_indices,
@@ -4315,6 +4613,8 @@ fn resolve_one_file_incremental(
             });
             let cross_file_twins =
                 prune_ids_by_arity(cross_file_twins, call_arity, &linker.entity_arity_by_id);
+            let cross_file_twins =
+                narrow_candidates_by_role(src_id, cross_file_twins, &linker.entity_role_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     accumulate_relation(
@@ -4362,8 +4662,12 @@ fn resolve_one_file_incremental(
             }
         }
 
-        // (b) Import-based cross-file resolution
-        if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
+        // (b) Import-based cross-file resolution. Skipped for a call through
+        // an object: `dst_name` is then a member name, not an imported binding.
+        if let Some(file_imports) = import_map
+            .get(file.file_path.as_str())
+            .filter(|_| !receiver_is_object)
+        {
             if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str()) {
                 if let Some(target_file) =
                     resolve_module_path(&file.file_path, module_path, &linker.known_files)
@@ -4474,12 +4778,16 @@ fn resolve_one_file_incremental(
             call_arity,
             &linker.entity_arity_by_id,
         );
+        let other_file_candidates =
+            narrow_pairs_by_role(src_id, other_file_candidates, &linker.entity_role_by_id);
 
         // (c) Global name-match fallback. Mirrors the batch linker: a bucket
         // several cross-file entities share, with no signal to separate them,
         // leaves the call unlinked and suppresses the blind name tiers below.
+        // A call through an object skips it: the exact-name bucket holds
+        // module-level functions, which an object call can never reach.
         let mut unresolvable_name_ambiguity = false;
-        if name_fallback_allowed && !other_file_candidates.is_empty() {
+        if name_fallback_allowed && !receiver_is_object && !other_file_candidates.is_empty() {
             let distinct_ids: HashSet<EntityId> =
                 other_file_candidates.iter().map(|&(_, id)| id).collect();
             let settled = if distinct_ids.len() == 1 {
@@ -4558,6 +4866,8 @@ fn resolve_one_file_incremental(
                     .collect();
                 let distinct_targets =
                     prune_ids_by_arity(distinct_targets, call_arity, &linker.entity_arity_by_id);
+                let distinct_targets =
+                    narrow_candidates_by_role(src_id, distinct_targets, &linker.entity_role_by_id);
                 if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                     for dst_id in sorted_fanout_targets(distinct_targets) {
                         accumulate_relation(
@@ -9122,5 +9432,422 @@ void f();
                 .count();
             assert_eq!(inbound, 1, "a pinned target gains no foreign caller");
         }
+    }
+
+    // ── FIR-2360: call-edge precision ───────────────────────────────────────
+    //
+    // Every fixture below is drawn from a false edge confirmed against psf/requests
+    // on a `kin init` conversion: a call edge resolved by method name with the
+    // receiver's type discarded. Each test states which of the three resolution
+    // rules it guards so a revert makes exactly one of them fail.
+
+    fn py_entity(name: &str, file_path: &str, kind: EntityKind, role: EntityRole) -> Entity {
+        let mut entity = make_entity(name, file_path);
+        entity.language = LanguageId::Python;
+        entity.kind = kind;
+        entity.role = role;
+        entity
+    }
+
+    fn py_method(name: &str, file_path: &str, role: EntityRole) -> Entity {
+        py_entity(name, file_path, EntityKind::Method, role)
+    }
+
+    fn py_function(name: &str, file_path: &str, role: EntityRole) -> Entity {
+        py_entity(name, file_path, EntityKind::Function, role)
+    }
+
+    fn py_receiver_call(src: &str, receiver: &str, method: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            receiver: Some(receiver.to_string()),
+            call_shape: None,
+            kind: RelationKind::Calls,
+            src_name: src.to_string(),
+            dst_name: method.to_string(),
+            import_source: None,
+        }
+    }
+
+    fn import_of(module_path: &str, local_name: &str) -> FileImport {
+        FileImport {
+            module_path: module_path.to_string(),
+            specifiers: vec![kin_parser::ImportedName {
+                local_name: local_name.to_string(),
+                original_name: None,
+                is_default: false,
+            }],
+        }
+    }
+
+    fn calls_edges_from<'a>(result: &'a [Relation], src: &Entity) -> Vec<&'a Relation> {
+        result
+            .iter()
+            .filter(|rel| rel.kind == RelationKind::Calls && rel.src == GraphNodeId::Entity(src.id))
+            .collect()
+    }
+
+    /// Rule 1: the marker a response publishes must be the one the tier that
+    /// emitted the edge actually proved. The tiers stamp bare confidence
+    /// literals, so without this the ladder and the linker drift apart silently
+    /// and every downstream filter inherits the drift.
+    #[test]
+    fn each_resolution_tier_confidence_classifies_as_the_ladder_declares() {
+        let declared: HashMap<u32, RelationResolution> = RESOLUTION_TIER_LADDER
+            .iter()
+            .map(|&(confidence, resolution)| (confidence.to_bits(), resolution))
+            .collect();
+        for (confidence, expected, tier) in [
+            (1.0_f32, RelationResolution::TypeResolved, "same-file"),
+            (0.95, RelationResolution::TypeResolved, "import-declared"),
+            (
+                INHERITED_METHOD_CONFIDENCE,
+                RelationResolution::TypeResolved,
+                "inherited dispatch",
+            ),
+            (
+                IMPORT_PINNED_CONFIDENCE,
+                RelationResolution::ImportScoped,
+                "parser-pinned module",
+            ),
+            (
+                RECEIVER_MODULE_CONFIDENCE,
+                RelationResolution::ImportScoped,
+                "receiver module",
+            ),
+            (
+                LOCALITY_DISAMBIGUATED_CONFIDENCE,
+                RelationResolution::ImportScoped,
+                "locality",
+            ),
+            (0.7, RelationResolution::NameOnly, "exact name"),
+            (
+                QUALIFIED_SUFFIX_CONFIDENCE,
+                RelationResolution::NameOnly,
+                "qualified suffix",
+            ),
+            (0.3, RelationResolution::NameOnly, "bare-name fan-out"),
+            (
+                EXTERNAL_REFERENCE_CONFIDENCE,
+                RelationResolution::NameOnly,
+                "cross-repo placeholder",
+            ),
+        ] {
+            assert_eq!(
+                declared.get(&confidence.to_bits()).copied(),
+                Some(expected),
+                "the {tier} tier emits {confidence} but the ladder does not declare it that way"
+            );
+        }
+    }
+
+    /// Rule 2, narrowest resolution wins. `Store` and `Cache` both define
+    /// `save`; the calling file imports only `Store`, so the receiver's binding
+    /// names the target module and the call resolves to exactly one edge rather
+    /// than fanning out to both.
+    #[test]
+    fn an_imported_receiver_resolves_to_one_edge_not_a_same_name_fanout() {
+        let store_save = py_method("Store.save", "pkg/store.py", EntityRole::Source);
+        let cache_save = py_method("Cache.save", "pkg/cache.py", EntityRole::Source);
+        let caller = py_function("run", "pkg/app.py", EntityRole::Source);
+
+        let files = vec![
+            FileParseData {
+                file_path: "pkg/store.py".to_string(),
+                entities: vec![store_save.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/cache.py".to_string(),
+                entities: vec![cache_save.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/app.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![py_receiver_call("run", "Store", "save")],
+                // Written in the resolvable relative form. Python's own
+                // `from .store import Store` spelling does not resolve to a
+                // repo file yet; that gap is FIR-2354's cross-file work, and
+                // the receiver rule this test pins is independent of it.
+                imports: vec![import_of("./store", "Store")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = calls_edges_from(&result, &caller);
+        assert_eq!(
+            edges.len(),
+            1,
+            "an imported receiver names one module, so one edge is emitted"
+        );
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(store_save.id));
+        assert_eq!(edges[0].confidence, RECEIVER_MODULE_CONFIDENCE);
+        assert_eq!(
+            RelationResolution::of(edges[0]),
+            RelationResolution::ImportScoped
+        );
+    }
+
+    /// Rule 3, role tiebreak. A test double shadowing a production method name
+    /// must not become a callee of production code while the production
+    /// definition exists.
+    #[test]
+    fn a_test_double_shadowing_a_production_name_gains_no_production_caller() {
+        let real_save = py_method("Store.save", "src/store.py", EntityRole::Source);
+        let fake_save = py_method("FakeStore.save", "tests/test_store.py", EntityRole::Test);
+        let caller = py_method("Service.persist", "src/service.py", EntityRole::Source);
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/store.py".to_string(),
+                entities: vec![real_save.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "tests/test_store.py".to_string(),
+                entities: vec![fake_save.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/service.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![py_receiver_call("Service.persist", "store", "save")],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = calls_edges_from(&result, &caller);
+        assert_eq!(edges.len(), 1, "the test double is not a dispatch target");
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(real_save.id));
+        assert!(
+            !result.iter().any(|rel| rel.kind == RelationKind::Calls
+                && rel.dst == GraphNodeId::Entity(fake_save.id)),
+            "no production caller reaches the test double"
+        );
+    }
+
+    /// The `adapter.send` shape from psf/requests: `RedirectSession` in the test
+    /// tree subclasses a redirect mixin and can never be the receiver at
+    /// `adapter.send(request, **kwargs)` in `sessions.py`, yet a bare-name
+    /// fan-out reached it. Resolves to the adapter alone.
+    #[test]
+    fn the_requests_adapter_send_shape_resolves_to_the_adapter_only() {
+        let adapter_send = py_method(
+            "HTTPAdapter.send",
+            "src/requests/adapters.py",
+            EntityRole::Source,
+        );
+        let mixin_send = py_method(
+            "SessionRedirectMixin.send",
+            "src/requests/sessions.py",
+            EntityRole::Source,
+        );
+        let double_send = py_method(
+            "RedirectSession.send",
+            "tests/test_requests.py",
+            EntityRole::Test,
+        );
+        let session_send = py_method(
+            "Session.send",
+            "src/requests/sessions.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/requests/adapters.py".to_string(),
+                entities: vec![adapter_send.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/sessions.py".to_string(),
+                entities: vec![session_send.clone(), mixin_send.clone()],
+                relations: vec![py_receiver_call("Session.send", "adapter", "send")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "tests/test_requests.py".to_string(),
+                entities: vec![double_send.clone()],
+                // The double subclasses the mixin, not the adapter.
+                relations: vec![ExtractedRelation {
+                    receiver: None,
+                    call_shape: None,
+                    kind: RelationKind::Extends,
+                    src_name: "RedirectSession".to_string(),
+                    dst_name: "SessionRedirectMixin".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = calls_edges_from(&result, &session_send);
+        assert_eq!(
+            edges.len(),
+            1,
+            "adapter.send reaches the adapter, not every send in the repo"
+        );
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(adapter_send.id));
+    }
+
+    /// Rule 2's other half: where the ambiguity is real, the candidates are
+    /// still emitted so recall does not drop, but every one of them is marked
+    /// `name_only` so a reader can tell a guess from a fact. `req.copy()` in
+    /// psf/requests fans out to three same-named methods on unrelated types.
+    #[test]
+    fn a_genuinely_ambiguous_receiver_emits_candidates_all_marked_name_only() {
+        let prepared_copy = py_method(
+            "PreparedRequest.copy",
+            "src/requests/models.py",
+            EntityRole::Source,
+        );
+        let jar_copy = py_method(
+            "RequestsCookieJar.copy",
+            "src/requests/cookies.py",
+            EntityRole::Source,
+        );
+        let dict_copy = py_method(
+            "CaseInsensitiveDict.copy",
+            "src/requests/structures.py",
+            EntityRole::Source,
+        );
+        let caller = py_method(
+            "Session.prepare_request",
+            "src/requests/sessions.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/requests/models.py".to_string(),
+                entities: vec![prepared_copy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/cookies.py".to_string(),
+                entities: vec![jar_copy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/structures.py".to_string(),
+                entities: vec![dict_copy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/sessions.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![py_receiver_call("Session.prepare_request", "req", "copy")],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edges = calls_edges_from(&result, &caller);
+        assert_eq!(edges.len(), 3, "a real ambiguity keeps every candidate");
+        for edge in &edges {
+            assert_eq!(
+                RelationResolution::of(edge),
+                RelationResolution::NameOnly,
+                "an unprovable candidate is published as a guess, not a fact"
+            );
+            assert!(!RelationResolution::of(edge).is_proven());
+        }
+    }
+
+    /// The founding false edge, kept as a permanent guard:
+    /// `Session.merge_environment_settings --Calls--> requests.get`. The body's
+    /// only `.get(` sites are `proxies.get("no_proxy")` on a dict and
+    /// `os.environ.get(...)` on the stdlib. Neither can reach the public
+    /// module-level `get`, because a call through an object never reaches a
+    /// module-level function and a call through a stdlib module never reaches a
+    /// repo entity at all.
+    #[test]
+    fn merge_environment_settings_does_not_call_the_public_requests_get() {
+        let public_get = py_function("get", "src/requests/api.py", EntityRole::Source);
+        let caller = py_method(
+            "Session.merge_environment_settings",
+            "src/requests/sessions.py",
+            EntityRole::Source,
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/requests/api.py".to_string(),
+                entities: vec![public_get.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/requests/sessions.py".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![
+                    py_receiver_call("Session.merge_environment_settings", "proxies", "get"),
+                    py_receiver_call("Session.merge_environment_settings", "os.environ", "get"),
+                ],
+                imports: vec![import_of("os", "os")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            !result.iter().any(|rel| rel.kind == RelationKind::Calls
+                && rel.dst == GraphNodeId::Entity(public_get.id)),
+            "settings merging does not call the public API; believing it invents a cycle"
+        );
+        assert!(
+            calls_edges_from(&result, &caller).is_empty(),
+            "neither a dict nor a stdlib module is a repo entity"
+        );
+    }
+
+    /// The incremental linker resolves the same way as the batch linker. A live
+    /// edit must not re-mint the edge a full index refused.
+    #[test]
+    fn the_incremental_linker_applies_the_same_receiver_and_role_rules() {
+        let real_save = py_method("Store.save", "src/store.py", EntityRole::Source);
+        let fake_save = py_method("FakeStore.save", "tests/test_store.py", EntityRole::Test);
+        let public_get = py_function("get", "src/api.py", EntityRole::Source);
+        let caller = py_method("Service.persist", "src/service.py", EntityRole::Source);
+
+        let mut linker = IncrementalLinker::new();
+        for (path, entities) in [
+            ("src/store.py", vec![real_save.clone()]),
+            ("tests/test_store.py", vec![fake_save.clone()]),
+            ("src/api.py", vec![public_get.clone()]),
+            ("src/service.py", vec![caller.clone()]),
+        ] {
+            linker.add_file(path, admitted_artifact_id(path), &entities);
+        }
+
+        let files = vec![FileParseData {
+            file_path: "src/service.py".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![
+                py_receiver_call("Service.persist", "store", "save"),
+                py_receiver_call("Service.persist", "cfg", "get"),
+            ],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edges = calls_edges_from(&result, &caller);
+        assert_eq!(edges.len(), 1, "the test double stays out on the live path");
+        assert_eq!(edges[0].dst, GraphNodeId::Entity(real_save.id));
+        assert!(
+            !result
+                .iter()
+                .any(|rel| rel.dst == GraphNodeId::Entity(public_get.id)),
+            "an object call reaches no module-level function on the live path either"
+        );
     }
 }
