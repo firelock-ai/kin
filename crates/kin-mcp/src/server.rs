@@ -306,15 +306,34 @@ where
             }
 
             // The client moved to a workspace we could not bind. Refuse every
-            // tool call until a later roots change lands on a Kin repository:
-            // answering from the repository the client left would return a
-            // confident, well-formed result about the wrong codebase.
+            // tool call until the root becomes bindable: answering from the
+            // repository the client left would return a confident, well-formed
+            // result about the wrong codebase.
+            //
+            // The verdict is re-derived here rather than read out of the state
+            // it was recorded in. It was computed once, when the roots changed,
+            // and nothing about the announced root is fixed: `kin init` can run
+            // there, a mount can appear, a container path can be made to exist.
+            // A cached refusal outlives every one of those, so a server that
+            // was right at roots-change time keeps refusing a workspace it
+            // could now serve, and the only recovery is restarting the process.
+            // Re-binding costs nothing that matters, because every call in this
+            // state is being refused anyway.
             if method == Some("tools/call") && binding.is_mismatched() {
-                if let Some(response) = binding.repo_mismatch_response(&value) {
-                    let response_json = serde_json::to_string(&response).map_err(McpError::Json)?;
-                    write_stdio_message(&mut *writer, &response_json, framed).await?;
+                if let Some(binder) = repo_binder.as_ref() {
+                    let roots = binding.mismatched_roots();
+                    if !roots.is_empty() {
+                        apply_workspace_roots(binder, roots, &mut binding).await;
+                    }
                 }
-                continue;
+                if binding.is_mismatched() {
+                    if let Some(response) = binding.repo_mismatch_response(&value) {
+                        let response_json =
+                            serde_json::to_string(&response).map_err(McpError::Json)?;
+                        write_stdio_message(&mut *writer, &response_json, framed).await?;
+                    }
+                    continue;
+                }
             }
 
             // Our own `roots/list` response returning from the client: bind the
@@ -478,6 +497,18 @@ impl RepoBindingState {
         });
     }
 
+    /// The roots the client announced that this server could not bind.
+    ///
+    /// Empty when nothing is mismatched. Handed back so a later call can put
+    /// the same roots through the binder again instead of trusting a verdict
+    /// reached before anything on the host had a chance to change.
+    fn mismatched_roots(&self) -> Vec<PathBuf> {
+        self.mismatch
+            .as_ref()
+            .map(|mismatch| mismatch.requested_roots.clone())
+            .unwrap_or_default()
+    }
+
     /// Structured refusal for a `tools/call` that arrived while the client's
     /// workspace and this server's binding disagree. `None` for a malformed
     /// call with no id, which has no response channel — the caller still drops
@@ -514,8 +545,8 @@ impl WorkspaceMismatch {
             "kin-mcp refuses '{tool}': the MCP client's workspace roots changed to [{requested}], \
              and none of them is a Kin repository this server can bind, so Kin is still bound to \
              {bound}. Answering would return a confident result about a repository you are no \
-             longer looking at. Run `kin init .` in the new workspace, or restart the MCP server \
-             from it (or with --repo <path> / KIN_MCP_REPO=<path>)."
+             longer looking at. Run `kin init .` in the new workspace, or restart the MCP \
+             server from it (or with --repo <path> / KIN_MCP_REPO=<path>)."
         )
     }
 }
@@ -2185,8 +2216,12 @@ mod tests {
     #[tokio::test]
     async fn tool_calls_fail_loud_when_the_new_workspace_cannot_be_bound() {
         // Bind repo A, then switch to a workspace with no bindable Kin repo.
-        let (binder, _calls) = ScriptedBinder::install(vec![
+        // The third outcome is the tool call's own re-check, which must find
+        // the root still unbindable and leave the refusal exactly as it was:
+        // re-checking changes when the verdict is taken, never what it is.
+        let (binder, calls) = ScriptedBinder::install(vec![
             Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
             None,
         ]);
 
@@ -2216,6 +2251,63 @@ mod tests {
         assert!(
             text.contains("/repo/a"),
             "refusal must name the repository still bound: {text}"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "the tool call must re-check the root before refusing"
+        );
+    }
+
+    /// The refusal was computed when the roots changed and then cached, so a
+    /// root that became bindable afterwards kept being refused for the life of
+    /// the process. The reported shape: a container registration whose
+    /// announced host path was made to exist, with no way to restart the
+    /// client's MCP server.
+    #[tokio::test]
+    async fn a_root_that_becomes_bindable_self_heals_on_the_next_tool_call() {
+        let (binder, calls) = ScriptedBinder::install(vec![
+            Some(bound_repo("/repo/a", "http://127.0.0.1:4111")),
+            None,
+            Some(bound_repo("/host/path", "http://127.0.0.1:4222")),
+        ]);
+
+        let responses = drive_daemon_loop(
+            &[
+                initialize_with_roots_capability(),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                roots_response(&["/repo/a"]),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}),
+                roots_response(&["/host/path"]),
+                // No roots change and no restart in between: only the host
+                // changed under a root the client already announced.
+                tool_call(21, "semantic_locate"),
+            ],
+            Some(binder),
+            None,
+        )
+        .await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the tool call must put the recorded roots through the binder again: {calls:?}"
+        );
+        assert_eq!(
+            calls[2],
+            vec![PathBuf::from("/host/path")],
+            "the re-check must use the roots the client announced, not invent new ones"
+        );
+
+        let answer = responses
+            .iter()
+            .find(|value| value.get("id").and_then(|id| id.as_u64()) == Some(21))
+            .expect("the tool call must be answered");
+        let text = tool_error_text(answer);
+        assert!(
+            text.contains("not enabled in this MCP profile"),
+            "a root that became bindable must clear the refusal without a restart: {text}"
         );
     }
 
