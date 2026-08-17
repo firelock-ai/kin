@@ -117,6 +117,9 @@ fn evaluate_semantic_coverage(
         pending: status.pending,
         complete,
         note,
+        // Search does not run locate's source-text phase, so it observes no
+        // bodies. Absent means unobserved, never "no gap".
+        graph_bodies: None,
     })
 }
 

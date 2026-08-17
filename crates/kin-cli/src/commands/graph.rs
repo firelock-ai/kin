@@ -453,8 +453,14 @@ fn build_graph_status_response(
     let mut lines = Vec::new();
     lines.push("=== Graph Health ===".to_string());
     lines.push(String::new());
+    // Name the view before the number. This counter and the one `kin status`
+    // prints are two different measurements of one store, and a reader given
+    // both bare totals has no way to tell which denominator applies to the
+    // coverage question they are actually asking. Each surface states what it
+    // counts, and the reconciliation below states why they differ.
     lines.push(format!(
-        "Entities: {}  |  Entity-to-entity relations: {}  |  Files: {}",
+        "Entities: {} (live query graph, definitions this repository owns)  |  Entity-to-entity \
+         relations: {}  |  Files: {} (files those entities originate in)",
         entity_count,
         total_relations,
         unique_files.len()
@@ -467,8 +473,22 @@ fn build_graph_status_response(
             total_relations as f64 / entity_count as f64
         }
     ));
+    // The reconciliation between this surface and `kin status`, stated as
+    // arithmetic rather than left to the reader.
+    //
+    // These two totals counted the same store and disagreed by 45 on the
+    // 0.5.36 evidence store, with nothing on either surface acknowledging a
+    // second view existed. The excluded set is not a rounding difference: the
+    // partition above drops external reference targets from `entity_count` on
+    // purpose (counting a node this repository merely references would report
+    // documentation coverage falling with no change to documentation), while
+    // durable authority enrichment replays every semantic identity it admitted
+    // and so counts them. Naming the excluded count beside the total is what
+    // makes the two surfaces add up.
     lines.push(format!(
-        "External reference targets: {}",
+        "External reference targets: {} (referenced elsewhere, not defined here, and excluded \
+         from the entity total above; `kin status` reports durable authority enrichment, a \
+         different view that counts them, so its entity total is the larger of the two)",
         external_targets.len()
     ));
     lines.push(String::new());

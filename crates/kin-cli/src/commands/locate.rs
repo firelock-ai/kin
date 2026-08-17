@@ -143,13 +143,107 @@ pub struct SemanticCoverage {
     pub total: usize,
     /// Entities still queued for embedding.
     pub pending: usize,
-    /// True when the semantic signal was complete (`total == 0`, or every
-    /// entity indexed with nothing pending).
+    /// True when the retrieval signals this report covers were all complete.
+    ///
+    /// This is a CONJUNCTION, not the embedding fraction. Every embedding can be
+    /// indexed while ranking still runs on text fallback alone, because scoring an
+    /// entity needs a graph-owned body for its source path and the embedding
+    /// counter says nothing about whether one exists. Reporting `complete` off the
+    /// embedding count alone is how a store with 1644/1644 indexed and 111
+    /// body-less authority paths told callers retrieval was healthy while every
+    /// hit came back `match_kind: "text_fallback"`. So a known body gap clears
+    /// this flag and [`Self::graph_bodies`] carries the number behind it.
+    ///
+    /// An UNOBSERVED body coverage does not clear the flag. Absence of evidence is
+    /// not evidence of a gap, and treating it as one would report every surface
+    /// that cannot observe bodies as degraded. Read `graph_bodies.observed` to
+    /// tell "no gap" from "not looked at"; they are different answers.
     pub complete: bool,
     /// Human-readable note describing the degraded state, present only when the
     /// semantic signal was partial. Lexical + graph signals still ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Graph-owned source-body coverage behind this query's ranking.
+    ///
+    /// Absent on payloads from surfaces that ran no retrieval, and on payloads
+    /// minted before this field existed. Absent therefore means "not observed",
+    /// never "no gap".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_bodies: Option<GraphBodyCoverage>,
+}
+
+/// How much of the graph's own source-path authority carries a graph-owned body.
+///
+/// This is the `kin.locate.graph_gap` warning promoted to a number a caller can
+/// read. That warning went only to the daemon log, and its running total lived in
+/// a process-global counter whose accessor was `#[cfg(test)]`, so no caller could
+/// reach it at all. A path the graph admits as source but holds no body for is a
+/// path locate can neither scan for terms nor rank on anything but a name match,
+/// which is precisely the state that produces `all_fallback: true` on a fully
+/// embedded store.
+///
+/// Deliberately NOT a new coverage type alongside `kin_core::cross_file_coverage`
+/// and `kin_mcp::edge_coverage`. Those answer questions about relation topology:
+/// whether edges leave their file, and whether the graph holds the edge class an
+/// absence claim depends on. Body presence is a different axis, and it belongs on
+/// the coverage object whose `complete` flag it falsifies rather than in a fourth
+/// place a caller would have to know to check.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GraphBodyCoverage {
+    /// Source paths the graph owns as retrieval authority for this query.
+    pub source_paths: usize,
+    /// Of those, the ones carrying a non-empty graph-owned body.
+    pub with_body: usize,
+    /// Of those, the ones the graph holds no body for. `source_paths -
+    /// with_body`, stated rather than left to the caller's arithmetic.
+    pub gap_paths: usize,
+    /// A bounded sample of gap paths, so an operator can act without turning on
+    /// daemon logging. Capped at [`GRAPH_BODY_GAP_SAMPLE`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample: Vec<String>,
+}
+
+/// Gap paths named in [`GraphBodyCoverage::sample`]. Enough to recognize a
+/// pattern (one directory, one language, one adapter) without pasting a repo
+/// listing into every payload.
+const GRAPH_BODY_GAP_SAMPLE: usize = 8;
+
+impl GraphBodyCoverage {
+    /// Assemble from the two sets locate already holds: the graph's source-path
+    /// authority, and the subset it resolved a body for.
+    fn observe<'a>(
+        source_paths: impl IntoIterator<Item = &'a String>,
+        has_body: impl Fn(&str) -> bool,
+    ) -> Self {
+        let mut total = 0usize;
+        let mut with_body = 0usize;
+        let mut gaps: Vec<String> = Vec::new();
+        for path in source_paths {
+            total += 1;
+            if has_body(path) {
+                with_body += 1;
+            } else {
+                gaps.push(path.clone());
+            }
+        }
+        // Sorted before truncation so the sample is a stable fact about the
+        // store rather than a hash-order accident that changes between two
+        // reads of an unchanged graph.
+        gaps.sort();
+        let gap_paths = gaps.len();
+        gaps.truncate(GRAPH_BODY_GAP_SAMPLE);
+        Self {
+            source_paths: total,
+            with_body,
+            gap_paths,
+            sample: gaps,
+        }
+    }
+
+    /// Whether ranking ran against an incomplete body set.
+    fn has_gap(&self) -> bool {
+        self.gap_paths > 0
+    }
 }
 
 fn semantic_signal_supported_default() -> bool {
@@ -1434,6 +1528,7 @@ fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
                 "semantic vector ranking is unsupported in this build; lexical and graph signals remain available"
                     .to_string(),
             ),
+            graph_bodies: None,
         };
     }
 
@@ -1455,7 +1550,37 @@ fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
             pending: status.pending,
             complete,
             note,
+            graph_bodies: None,
         }
+    }
+}
+
+impl SemanticCoverage {
+    /// Fold an observed graph-body coverage into this report.
+    ///
+    /// `complete` becomes the conjunction it always claimed to be: a body gap
+    /// clears it even on a fully embedded store, because ranking an entity needs
+    /// a graph-owned body and an embedding count cannot see that. The note names
+    /// the gap so a human reading the CLI banner learns the same fact the JSON
+    /// carries, and an already-present embedding note is kept rather than
+    /// overwritten, since both causes can hold at once and the caller needs to
+    /// know which remediation applies.
+    pub fn with_graph_bodies(mut self, bodies: GraphBodyCoverage) -> Self {
+        if bodies.has_gap() {
+            self.complete = false;
+            let gap_note = format!(
+                "graph body gap: {} of {} graph-owned source paths carry no body, so entity \
+                 ranking over them falls back to text matching. Run `kin reconcile` (or re-run \
+                 `kin init`) to admit the missing bodies.",
+                bodies.gap_paths, bodies.source_paths
+            );
+            self.note = Some(match self.note.take() {
+                Some(existing) => format!("{existing} {gap_note}"),
+                None => gap_note,
+            });
+        }
+        self.graph_bodies = Some(bodies);
+        self
     }
 }
 
@@ -2296,11 +2421,16 @@ fn run_with_graph_capture_budgeted(
     // It's cheap (budget 10s) and provides result diversity that entity
     // resolution alone cannot. Without it, files only reachable via text
     // search are invisible in EntityDominant scoring.
+    // Body coverage is observed by the source-text phase and stays `None` when
+    // that phase was budget-skipped. A skipped phase measured nothing, and
+    // reporting its silence as full coverage is the exact substitution this
+    // ticket exists to remove.
+    let mut graph_body_coverage: Option<GraphBodyCoverage> = None;
     let source_text = if budget.phase_should_skip("source_text") {
         HashMap::new()
     } else {
         let phase_start = std::time::Instant::now();
-        let source_text = extract_source_text_signals(text, graph)?;
+        let signals = extract_source_text_signals(text, graph)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2310,6 +2440,8 @@ fn run_with_graph_capture_budgeted(
         {
             budget.warn_phase_timeout("source_text", phase_start.elapsed());
         }
+        graph_body_coverage = signals.graph_bodies;
+        let source_text = signals.hits;
         if source_text_priority_query {
             merge_priority_files_from_hits_with_trace(
                 &mut priority_files,
@@ -2319,6 +2451,33 @@ fn run_with_graph_capture_budgeted(
             );
         }
         source_text
+    };
+    // Fold the observation into the coverage report the caller reads, and record
+    // the gap on the degradation ledger beside it. Two channels because they
+    // answer different questions: the coverage object says how much of the store
+    // ranking could see, the degradation says this query ran degraded and names
+    // the remediation.
+    let semantic_coverage = match graph_body_coverage {
+        Some(bodies) => {
+            if bodies.has_gap() {
+                record_degradation(
+                    &mut degradations,
+                    RetrievalDegradation {
+                        component: "graph_source_bodies".to_string(),
+                        reason: "partial".to_string(),
+                        detail: format!(
+                            "{} of {} graph-owned source paths carry no body; entities in them \
+                             rank on text fallback only",
+                            bodies.gap_paths, bodies.source_paths
+                        ),
+                        remediation: "run `kin reconcile` to admit the missing source bodies"
+                            .to_string(),
+                    },
+                );
+            }
+            semantic_coverage.with_graph_bodies(bodies)
+        }
+        None => semantic_coverage,
     };
     let priority_hits: HashMap<String, Vec<FileHit>> = priority_files
         .iter()
@@ -9461,10 +9620,24 @@ fn extract_snippet_signals(
     Ok(hits)
 }
 
+/// Source-text signals for a query, plus the graph-body coverage observing them
+/// cost nothing to produce.
+///
+/// The two are returned together because this function is the only place that
+/// holds both halves of the answer: the graph's source-path authority and the
+/// subset it resolved a body for. Recomputing the observation anywhere else
+/// would mean a second `list_opaque_artifacts`, which deep-clones every source
+/// preview in the store, so the cheap place to measure is the place that already
+/// paid.
+struct SourceTextSignals {
+    hits: HashMap<String, Vec<FileHit>>,
+    graph_bodies: Option<GraphBodyCoverage>,
+}
+
 fn extract_source_text_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
-) -> Result<HashMap<String, Vec<FileHit>>> {
+) -> Result<SourceTextSignals> {
     let _span =
         tracing::info_span!("locate.extract_source_text_signals", text_len = text.len()).entered();
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
@@ -9476,7 +9649,13 @@ fn extract_source_text_signals(
     let body_text = text.lines().skip(1).collect::<Vec<_>>().join("\n");
     let source_paths = graph_source_path_set(graph);
     if source_paths.is_empty() {
-        return Ok(hits);
+        // No source-path authority means nothing to have a body for. That is a
+        // different state from "paths exist and bodies are missing", so it is
+        // reported as unobserved rather than as perfect coverage over zero paths.
+        return Ok(SourceTextSignals {
+            hits,
+            graph_bodies: None,
+        });
     }
 
     let source_previews: HashMap<String, String> = graph
@@ -9505,6 +9684,20 @@ fn extract_source_text_signals(
         })
         .map(|(path, preview)| (path.clone(), preview.clone()))
         .collect();
+
+    // Measure body coverage here, against exactly the two sets the term loops
+    // below consult. Scope is `source_paths` minus test paths, because
+    // `source_previews` excludes test paths by construction and counting them as
+    // gaps would report a hole the ranking path never had.
+    //
+    // Every miss the loops take also emits a `kin.locate.graph_gap` warning, one
+    // per path per term, which is why a session logs far more warnings than it
+    // has body-less paths. This is the same fact stated once, as a number, on
+    // the payload.
+    let graph_bodies = GraphBodyCoverage::observe(
+        source_paths.iter().filter(|path| !is_test_path(path)),
+        |path| preview_source_texts.contains_key(path),
+    );
     let mut path_term_support: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut terms = extract_search_terms(text);
@@ -9669,7 +9862,10 @@ fn extract_source_text_signals(
         &source_paths,
     );
 
-    Ok(hits)
+    Ok(SourceTextSignals {
+        hits,
+        graph_bodies: Some(graph_bodies),
+    })
 }
 
 fn promote_cli_surface_companion_headers_in_source_text(
@@ -23110,7 +23306,8 @@ mod tests {
             "Add `JSON_PRIVATE_UNLESS_TESTED` for private members used by tests",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(
             hits.contains_key("include/nlohmann/detail/iterators/iter_impl.hpp"),
@@ -25578,7 +25775,8 @@ mod tests {
             "Fix exit code on JSON parse error\n\nThe `--exit-status` option should distinguish invalid JSON parse errors.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(hits.contains_key("src/main.c"));
     }
@@ -25630,7 +25828,8 @@ mod tests {
             "Implement `_experimental_snapshot/2`\n\nEnable writes with `JQ_ENABLE_SNAPSHOT=1`.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(hits.contains_key("src/builtin.c"));
         assert!(!hits.contains_key("src/decNumber/example4.c"));
@@ -25667,7 +25866,8 @@ mod tests {
             "Implement `_experimental_snapshot/2`\n\nThis builtin performs a dry run by default before writing any data to disk.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(hits.contains_key("src/builtin.c"));
         assert!(hits.contains_key("src/main.c"));
@@ -25704,7 +25904,8 @@ mod tests {
             "fix cli issue when providing --help=false.\n\nThe help option parser should accept bool flags.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         let options_score: f32 = hits["src/options.c"].iter().map(|hit| hit.score).sum();
         let runtime_score: f32 = hits["src/runtime.c"].iter().map(|hit| hit.score).sum();
@@ -25734,7 +25935,8 @@ mod tests {
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(hits.contains_key("programs/zstdcli.c"));
     }
@@ -25759,7 +25961,8 @@ mod tests {
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(hits.contains_key("programs/zstdcli.c"));
     }
@@ -25811,7 +26014,8 @@ mod tests {
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         let cli_score: f32 = hits["programs/zstdcli.c"].iter().map(|hit| hit.score).sum();
         let fileio_score: f32 = hits["programs/fileio.h"].iter().map(|hit| hit.score).sum();
@@ -25867,7 +26071,8 @@ mod tests {
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
         )
-        .unwrap();
+        .unwrap()
+        .hits;
 
         assert!(hits.contains_key("programs/fileio.h"));
         assert!(hits.contains_key("programs/fileio_types.h"));
@@ -26891,6 +27096,7 @@ mod tests {
             pending: 0,
             complete: true,
             note: None,
+            graph_bodies: None,
         };
         assert!(
             coverage_banner(&complete).is_none(),
@@ -26904,6 +27110,7 @@ mod tests {
             pending: 6,
             complete: false,
             note: Some("custom degradation note".to_string()),
+            graph_bodies: None,
         };
         assert_eq!(
             coverage_banner(&partial_with_note).as_deref(),
@@ -26918,6 +27125,7 @@ mod tests {
             pending: 6,
             complete: false,
             note: None,
+            graph_bodies: None,
         };
         let synth = coverage_banner(&partial_no_note).expect("degraded coverage emits a banner");
         assert!(
