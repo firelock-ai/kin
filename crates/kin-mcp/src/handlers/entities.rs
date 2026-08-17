@@ -2100,9 +2100,13 @@ reachability is read directly off the graph's relation edges, you get the answer
 call without manually cross-referencing every symbol. When you'd rather start from a \
 search concept than scan files — \"which of the entities matching X are dead?\" — \
 find_dead_code_seeded combines the search and the dead-classification in one step. \
+A runtime entry point (a `main`) is never listed: it is called by the runtime rather than \
+by any edge, so no inbound edge was ever owed. \
 The response carries an additive `negative` object whose `safe_to_conclude_absent` flag \
 says whether \"nothing dead found\" is authoritative or limited by index freshness — \
-check it before concluding everything is reachable.";
+check it before concluding everything is reachable. Absence is only as good as the \
+graph's reference-edge coverage: read that from `kin graph status` before deleting \
+anything this reports.";
 
 pub fn handle_dead_code<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -2169,11 +2173,59 @@ pub fn handle_dead_code<G: GraphStore>(
         return Ok(ToolCallResult::text(json));
     }
 
-    let dead = store.find_dead_code().map_err(McpError::graph)?;
-    let limited: Vec<_> = dead.into_iter().take(limit).collect();
+    // The candidate generator asks only whether an inbound edge crosses a FILE
+    // boundary, so an entity whose only caller sits beside it in the same file
+    // arrives here as a candidate while `find_references` reports that caller.
+    // This tool's own contract is "no incoming relations at all", so it keeps
+    // only the candidates that have none, read through the same reference kinds
+    // `find_references` defaults to. An entry point is referenced by the runtime
+    // rather than by an edge, so it is not a candidate either.
+    let incoming_kinds = default_reference_kinds();
+    let mut dead = Vec::new();
+    for entity in store.find_dead_code().map_err(McpError::graph)? {
+        if dead.len() >= limit {
+            break;
+        }
+        if kin_core::entry_points::is_conventional_entry_point(&entity) {
+            continue;
+        }
+        if has_incoming_reference_edge(store, &entity.id, &incoming_kinds)? {
+            continue;
+        }
+        dead.push(entity);
+    }
 
-    let json = serde_json::to_string_pretty(&limited).map_err(McpError::Json)?;
+    let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// Whether any other entity references this one, by the same rule `kin refs`,
+/// `bulk_check_references` and `find_references` apply: an inbound edge of a
+/// reference kind, from an entity that is not this one.
+///
+/// A self-recursive function references nothing but itself, so its own edge
+/// never makes it reachable.
+fn has_incoming_reference_edge<G: GraphStore>(
+    store: &G,
+    entity_id: &kin_model::EntityId,
+    kinds: &[RelationKind],
+) -> Result<bool> {
+    for relation in store
+        .get_all_relations_for_entity(entity_id)
+        .map_err(McpError::graph)?
+    {
+        let Some(source) = relation.src.as_entity() else {
+            continue;
+        };
+        if relation.dst != kin_model::GraphNodeId::Entity(*entity_id)
+            || !kinds.contains(&relation.kind)
+            || source == *entity_id
+        {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub const FIND_DEAD_CODE_SEEDED_DESC: &str = "\

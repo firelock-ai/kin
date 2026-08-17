@@ -468,6 +468,14 @@ fn build_graph_status_response(
         ));
     }
 
+    // How much of the parsed reference surface reached the graph. Every counter
+    // above describes what the graph HOLDS; none of them could say what it is
+    // MISSING, so a graph carrying a fifth of its call edges reported density
+    // 0.38 and a clean bill while five shipped tools answered from the absent
+    // four fifths.
+    lines.push(String::new());
+    lines.extend(health.reference_edge_coverage.summary_lines());
+
     // Warnings
     let mut warnings = health.warnings.clone();
     let criticals = health.critical_issues.clone();
@@ -683,11 +691,34 @@ fn build_graph_validate_response(
 
     if issues.is_empty() {
         lines.push(String::new());
-        lines.push("✓ All checks passed.".to_string());
+        lines.push("✓ All integrity checks passed.".to_string());
     } else {
         lines.push(String::new());
         for issue in &issues {
             lines.push(format!("✗ {}", issue));
+        }
+    }
+
+    // "All checks passed" was read as a clean bill on a graph holding a fifth of
+    // its relation edges, and it was defensible only because this command checks
+    // integrity: whether the edges present point at entities that exist. It
+    // cannot check whether the edges that should exist do. So it says which
+    // question it answered and prints the answer to the other one beside it,
+    // rather than leaving a reader to assume the two are the same check.
+    lines.push(String::new());
+    lines.push(
+        "Integrity only: these checks say the edges present are coherent, not that the edges a \
+         reader expects exist."
+            .to_string(),
+    );
+    lines.extend(health.reference_edge_coverage.summary_lines());
+    let unsupportable = health.reference_edge_coverage.unsupportable_absence_reasons();
+    if !unsupportable.is_empty() {
+        lines.push(String::new());
+        for reason in unsupportable {
+            lines.push(format!(
+                "⚠ absence is not answerable from this graph: {reason}"
+            ));
         }
     }
     append_health_notes(&mut lines, &health.notes);
@@ -1863,7 +1894,25 @@ mod tests {
         assert!(response
             .lines
             .iter()
-            .any(|line| line == "✓ All checks passed."));
+            .any(|line| line == "✓ All integrity checks passed."));
+        // The verdict names the question it answered, and the answer to the
+        // other one is printed beside it. A pass here was read as a clean bill
+        // on a graph missing most of its relation edges.
+        assert!(
+            response.lines.iter().any(|line| line.starts_with(
+                "Integrity only: these checks say the edges present are coherent"
+            )),
+            "{:?}",
+            response.lines
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Reference edge coverage")),
+            "{:?}",
+            response.lines
+        );
     }
 
     #[test]

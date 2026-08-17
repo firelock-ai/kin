@@ -21,6 +21,20 @@ pub struct DeadCodeRequest {}
 pub struct DeadCodeResponse {
     #[serde(default)]
     pub lines: Vec<String>,
+    /// Whether the graph this scan read can support an absence claim at all.
+    ///
+    /// False means every row is a candidate the graph cannot stand behind, and
+    /// the rendered lines say so on each row. Defaulted so a new CLI reading an
+    /// older daemon's response does not read a missing field as a verdict.
+    #[serde(default)]
+    pub verified: bool,
+    /// Why the scan could not be verified, one reason per gap, in the same words
+    /// the output prints.
+    #[serde(default)]
+    pub unverified_reasons: Vec<String>,
+    /// The reference-edge completeness this verdict was reached on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_edge_coverage: Option<kin_core::reference_coverage::ReferenceEdgeCoverage>,
 }
 
 /// Request shape for the seeded find-dead-code primitive.
@@ -121,24 +135,55 @@ async fn run_daemon_dead_code_seeded(
         .context("daemon seeded dead-code scan failed")
 }
 
-pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCodeResponse> {
+/// Scan for unreferenced entities against graph truth.
+///
+/// `binding` is the repository authority the declared entry points are read
+/// through, from graph-owned blob storage. `None` means the caller has no
+/// authority to read manifests with; a graph that tracks manifests then reports
+/// them as unread rather than as declaring nothing.
+pub fn build_dead_code_response(
+    binding: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<DeadCodeResponse> {
+    let entry_points = collect_declared_entry_points(binding, graph)?;
+    let coverage = kin_core::reference_coverage::collect_reference_edge_coverage(graph)?;
+    build_dead_code_report(graph, &entry_points, &coverage)
+}
+
+fn build_dead_code_report(
+    graph: &kin_db::InMemoryGraph,
+    entry_points: &kin_core::entry_points::DeclaredEntryPoints,
+    coverage: &kin_core::reference_coverage::ReferenceEdgeCoverage,
+) -> Result<DeadCodeResponse> {
     let mut lines = vec!["Scanning for dead code...".to_string()];
 
     // A missing incoming edge is only evidence of deadness for an entity whose
-    // callers would have produced one. A test is invoked by its harness and a
-    // trait method is invoked through the trait, so neither is named by any
-    // edge, and reporting both as unreferenced buries the genuine finds. Both
-    // exclusions are read off graph truth, and the counts stay in the output so
-    // the scan never quietly shrinks its own number.
+    // callers would have produced one. A test is invoked by its harness, a trait
+    // method through the trait, and an entry point by the launcher its manifest
+    // declares, so none of them is named by any edge, and reporting them as
+    // unreferenced buries the genuine finds. Every exclusion is read off graph
+    // truth, and the counts stay in the output so the scan never quietly
+    // shrinks its own number.
     let mut unreferenced = Vec::new();
     let mut nonproduction = 0usize;
     let mut trait_satisfying = 0usize;
+    let mut referenced_in_file = 0usize;
+    let mut declared_entry_points = 0usize;
     for entity in graph.find_dead_code()? {
         if entity.role != EntityRole::Source {
             nonproduction += 1;
         } else if entity.kind == EntityKind::Method && satisfies_trait_contract(graph, &entity.id)?
         {
             trait_satisfying += 1;
+        } else if has_incoming_reference(graph, &entity.id)? {
+            // The candidate generator asks only whether an inbound edge crosses
+            // a file boundary, so an entity whose only caller sits beside it in
+            // the same file arrives here. `find_references` reads that caller
+            // and reports it; consulting the same collector is what stops the
+            // two surfaces from answering opposite things about one edge.
+            referenced_in_file += 1;
+        } else if is_entry_point(&entity, entry_points) {
+            declared_entry_points += 1;
         } else {
             unreferenced.push(entity);
         }
@@ -161,22 +206,73 @@ pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCod
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    // The gate. This output is a delete list, so it carries the strictest
+    // completeness bar in the product: a graph that cannot support an absence
+    // claim may still answer, but it may not answer confidently. Both halves of
+    // the evidence are checked, the reference edges the verdict rests on and the
+    // manifests the entry-point exclusion rests on.
+    let mut unverified_reasons = coverage.unsupportable_absence_reasons();
+    if !entry_points.manifests_unreadable.is_empty() {
+        unverified_reasons.push(format!(
+            "declared entry points could not be read from graph truth for {}, so an entry point \
+             may be listed below",
+            entry_points.manifests_unreadable.join(", ")
+        ));
+    }
+    let verified = unverified_reasons.is_empty();
+
     if unreferenced.is_empty() {
-        lines.push("No dead code found.".to_string());
-    } else {
+        if verified {
+            lines.push("No dead code found.".to_string());
+        } else {
+            lines.push(
+                "No unreferenced entities found, and this scan could not have found one:"
+                    .to_string(),
+            );
+        }
+    } else if verified {
         lines.push(format!(
             "Found {} unreferenced entities:",
             unreferenced.len()
         ));
-    }
-    if nonproduction > 0 || trait_satisfying > 0 {
+    } else {
         lines.push(format!(
-            "  ({nonproduction} excluded as non-production entities, {trait_satisfying} as trait-implementation methods reached through their trait)"
+            "UNVERIFIED: {} candidates. This graph cannot support a delete list:",
+            unreferenced.len()
         ));
     }
+    for reason in &unverified_reasons {
+        lines.push(format!("  incomplete: {reason}"));
+    }
+    if !verified && !unreferenced.is_empty() {
+        lines.push(
+            "  Every row below is UNVERIFIED: an entity with no edge in this graph may still be \
+             used. Do not delete on this evidence."
+                .to_string(),
+        );
+    }
+    if nonproduction > 0
+        || trait_satisfying > 0
+        || referenced_in_file > 0
+        || declared_entry_points > 0
+    {
+        lines.push(format!(
+            "  ({nonproduction} excluded as non-production entities, {trait_satisfying} as \
+             trait-implementation methods reached through their trait, {referenced_in_file} as \
+             referenced by an entity in their own file, {declared_entry_points} as declared entry \
+             points)"
+        ));
+    }
+    if !entry_points.manifests_read.is_empty() {
+        lines.push(format!(
+            "  (entry points read from {})",
+            entry_points.manifests_read.join(", ")
+        ));
+    }
+    let prefix = if verified { "  " } else { "  [unverified] " };
     for e in &unreferenced {
         lines.push(format!(
-            "  {} ({:?}, {}) - {}",
+            "{prefix}{} ({:?}, {}) - {}",
             e.name,
             e.kind,
             e.language,
@@ -187,7 +283,106 @@ pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCod
         ));
     }
 
-    Ok(DeadCodeResponse { lines })
+    Ok(DeadCodeResponse {
+        lines,
+        verified,
+        unverified_reasons,
+        reference_edge_coverage: Some(coverage.clone()),
+    })
+}
+
+/// Whether the graph holds an inbound reference edge for this entity, read
+/// through the same collector `kin refs` and `find_references` read.
+///
+/// An inbound edge whose caller record is missing still counts: the edge exists,
+/// so absence cannot be claimed, and reporting the entity as deletable because
+/// the caller's own record is absent is the least safe reading available.
+fn has_incoming_reference(graph: &impl GraphStore, entity_id: &EntityId) -> Result<bool> {
+    let collected = crate::commands::refs::collect_graph_references(
+        graph,
+        entity_id,
+        &kin_core::reference_coverage::REFERENCE_RELATION_KINDS,
+    )?;
+    Ok(!collected.references.is_empty() || !collected.missing_source_ids.is_empty())
+}
+
+/// Whether this entity is an entry point, so no inbound edge was ever owed.
+fn is_entry_point(
+    entity: &kin_model::Entity,
+    entry_points: &kin_core::entry_points::DeclaredEntryPoints,
+) -> bool {
+    kin_core::entry_points::is_conventional_entry_point(entity)
+        || entry_points.declaration_for(entity).is_some()
+}
+
+/// Read the entry points declared by the package manifests the graph tracks.
+///
+/// Manifest paths come from graph-owned structured artifacts and the bytes from
+/// graph-owned blob storage through the repository authority. Nothing here reads
+/// the working tree: a manifest the graph does not carry is recorded as unread,
+/// which makes the scan report itself unverified rather than conclude that no
+/// entry point is declared.
+fn collect_declared_entry_points(
+    binding: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<kin_core::entry_points::DeclaredEntryPoints> {
+    use kin_core::entry_points::{declares_entry_points, parse_manifest_entry_points};
+
+    let mut declared = kin_core::entry_points::DeclaredEntryPoints::default();
+    let mut manifests: Vec<String> = graph
+        .list_structured_artifacts()?
+        .into_iter()
+        .filter(|artifact| artifact.kind == kin_model::ArtifactKind::PackageManifest)
+        .map(|artifact| artifact.file_id.0)
+        .filter(|path| declares_entry_points(path))
+        .collect();
+    manifests.sort();
+    manifests.dedup();
+    if manifests.is_empty() {
+        return Ok(declared);
+    }
+
+    let authority = match binding {
+        Some(binding) => {
+            match super::repository_authority::ActiveRepositoryAuthority::open(binding) {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "dead-code could not open repository authority to read declared entry points"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let tree = graph.resolved_tree();
+    for manifest in manifests {
+        let bytes = authority.as_ref().and_then(|authority| {
+            kin_model::RepoPath::from_utf8(manifest.clone())
+                .ok()
+                .and_then(|path| tree.artifact_at_path(&path).cloned())
+                .and_then(|artifact| match artifact.entry {
+                    kin_model::TreeEntry::Blob { hash, .. } => {
+                        authority.load_source_blob(hash).ok()
+                    }
+                    _ => None,
+                })
+        });
+        match bytes {
+            Some(bytes) => {
+                declared
+                    .entries
+                    .extend(parse_manifest_entry_points(&manifest, &bytes));
+                declared.manifests_read.push(manifest);
+            }
+            None => declared.manifests_unreadable.push(manifest),
+        }
+    }
+
+    Ok(declared)
 }
 
 /// Whether the entity declares that it satisfies a trait contract.
@@ -318,34 +513,18 @@ pub fn build_dead_code_seeded_response(
     })
 }
 
-/// Count incoming relations of the given kinds for an entity.
+/// Count the entities that reference this one, of the given kinds.
 ///
-/// Mirrors the classification logic in `build_bulk_refs_response` so the
-/// "dead" flag here matches what `kin refs --bulk-json` would report
-/// (reference_count == 0 across Calls + Imports + References).
+/// Reads the collector `kin refs`, `kin refs --bulk-json` and the whole-repo
+/// scan read, so the `dead` flag here means exactly what those surfaces report:
+/// distinct referencing entities, self-edges excluded.
 fn count_incoming_references(
     graph: &impl GraphStore,
     entity_id: &EntityId,
     kinds: &[RelationKind],
 ) -> Result<usize> {
-    let allowed: std::collections::HashSet<RelationKind> = kinds.iter().copied().collect();
-    let mut count = 0usize;
-    for rel in graph.get_all_relations_for_entity(entity_id)? {
-        let Some(src_entity_id) = rel.src.as_entity() else {
-            continue;
-        };
-        if rel.dst != GraphNodeId::Entity(*entity_id) {
-            continue;
-        }
-        if !allowed.contains(&rel.kind) {
-            continue;
-        }
-        if src_entity_id == *entity_id {
-            continue;
-        }
-        count += 1;
-    }
-    Ok(count)
+    let collected = crate::commands::refs::collect_graph_references(graph, entity_id, kinds)?;
+    Ok(collected.references.len() + collected.missing_source_ids.len())
 }
 
 #[cfg(test)]
@@ -398,6 +577,49 @@ mod tests {
             import_source: None,
             evidence: vec![],
         }
+    }
+
+    /// Stamp the graph-owned parse side onto an entity, the way ingestion does.
+    ///
+    /// A fixture without it reads as an unmeasured graph, which the scan refuses
+    /// to answer confidently on — correct behavior, and not what the tests below
+    /// that assert a confident answer are about.
+    fn measured(mut entity: Entity, call_sites: u64, import_statements: u64) -> Entity {
+        entity.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.into(),
+            serde_json::Value::from(call_sites),
+        );
+        entity.metadata.extra.insert(
+            kin_parser::FILE_PARSED_IMPORT_STATEMENTS_KEY.into(),
+            serde_json::Value::from(import_statements),
+        );
+        entity
+    }
+
+    fn scan(graph: &InMemoryGraph) -> DeadCodeResponse {
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(graph).unwrap();
+        let entry_points = collect_declared_entry_points(None, graph).unwrap();
+        build_dead_code_report(graph, &entry_points, &coverage).unwrap()
+    }
+
+    /// Whether `kin refs --bulk-json` reports a caller for this entity.
+    ///
+    /// The shipped surface, not an internal helper, so the agreement asserted
+    /// below is the agreement a user observes.
+    fn bulk_refs_sees_references(graph: &InMemoryGraph, entity: &Entity) -> bool {
+        let response = crate::commands::refs::build_bulk_refs_response(
+            graph,
+            &crate::commands::refs::BulkRefsRequest {
+                entity_ids: vec![entity.id.to_string()],
+                kind: "any".to_string(),
+                compact: true,
+            },
+        )
+        .unwrap();
+        response.results[0]["has_references"]
+            .as_bool()
+            .unwrap_or(false)
     }
 
     #[test]
@@ -497,18 +719,18 @@ mod tests {
     fn scan_excludes_tests_and_trait_methods_and_says_how_many() {
         let graph = InMemoryGraph::new();
 
-        let orphan = make_entity("never_called", "src/orphan.rs");
+        let orphan = measured(make_entity("never_called", "src/orphan.rs"), 0, 0);
 
-        let mut harness_test = make_entity("checks_never_called", "src/orphan.rs");
+        let mut harness_test = measured(make_entity("checks_never_called", "src/orphan.rs"), 0, 0);
         harness_test.role = EntityRole::Test;
 
-        let mut dispatched = make_entity("Summary::matched", "src/summary.rs");
+        let mut dispatched = measured(make_entity("Summary::matched", "src/summary.rs"), 0, 0);
         dispatched.kind = EntityKind::Method;
 
-        let mut inherent = make_entity("Summary::helper", "src/summary.rs");
+        let mut inherent = measured(make_entity("Summary::helper", "src/summary.rs"), 0, 0);
         inherent.kind = EntityKind::Method;
 
-        let mut sink = make_entity("Sink", "src/sink.rs");
+        let mut sink = measured(make_entity("Sink", "src/sink.rs"), 0, 0);
         sink.kind = EntityKind::TraitDef;
 
         for entity in [&orphan, &harness_test, &dispatched, &inherent, &sink] {
@@ -522,7 +744,13 @@ mod tests {
             ))
             .unwrap();
 
-        let lines = build_dead_code_response(&graph).unwrap().lines;
+        let response = scan(&graph);
+        assert!(
+            response.verified,
+            "a graph whose files parsed no call sites and no imports has nothing unresolved: {:?}",
+            response.unverified_reasons
+        );
+        let lines = response.lines;
         let joined = lines.join("\n");
 
         assert!(
@@ -549,6 +777,10 @@ mod tests {
             joined.contains("1 excluded as non-production entities, 1 as trait-implementation"),
             "the scan reports what it set aside: {joined}"
         );
+        assert!(
+            !joined.contains("[unverified]"),
+            "a graph with nothing left to resolve answers plainly: {joined}"
+        );
 
         let orphan_line = lines
             .iter()
@@ -561,6 +793,277 @@ mod tests {
         assert!(
             orphan_line < helper_line,
             "findings order by file so two scans of one repo can be diffed: {joined}"
+        );
+    }
+
+    /// FIR-2356. `find_references` named a caller for `extract_tags`,
+    /// `strip_code`, `normalize_title` and `Database.ingest_note` while
+    /// `dead-code` called all four unreferenced, at one graph generation, because
+    /// the scan's candidate rule asked only whether an inbound edge crossed a
+    /// FILE boundary. Both surfaces now read one collector, and this asserts
+    /// they agree entity by entity rather than only on the four.
+    #[test]
+    fn dead_code_and_bulk_refs_agree_on_every_entity_including_intra_file_callers() {
+        let graph = InMemoryGraph::new();
+
+        let parse_note = measured(make_entity("parse_note", "nk/parsing.py"), 2, 1);
+        let extract_tags = measured(make_entity("extract_tags", "nk/parsing.py"), 2, 1);
+        let strip_code = measured(make_entity("strip_code", "nk/parsing.py"), 2, 1);
+        let ingest_dir = measured(make_entity("Database.ingest_dir", "nk/storage.py"), 1, 1);
+        let ingest_note = measured(make_entity("Database.ingest_note", "nk/storage.py"), 1, 1);
+        let orphan = measured(make_entity("legacy_helper", "nk/legacy.py"), 0, 0);
+
+        let entities = [
+            &parse_note,
+            &extract_tags,
+            &strip_code,
+            &ingest_dir,
+            &ingest_note,
+            &orphan,
+        ];
+        for entity in entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // Intra-file callers, the edges the two surfaces disagreed about.
+        graph
+            .upsert_relation(&make_relation(
+                parse_note.id,
+                extract_tags.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(
+                parse_note.id,
+                strip_code.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation(
+                ingest_dir.id,
+                ingest_note.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+        // One cross-file edge, so the graph can support an absence claim at all
+        // and this test is about agreement rather than about the gate.
+        graph
+            .upsert_relation(&make_relation(
+                ingest_dir.id,
+                parse_note.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        assert!(
+            response.verified,
+            "the fixture resolves cross-file edges: {:?}",
+            response.unverified_reasons
+        );
+        let joined = response.lines.join("\n");
+
+        for entity in entities {
+            let referenced = bulk_refs_sees_references(&graph, entity);
+            let listed = joined.contains(&format!("  {} (", entity.name));
+            assert_ne!(
+                referenced, listed,
+                "kin refs and dead-code must agree about {}: refs says referenced={referenced}, \
+                 dead-code listed={listed}\n{joined}",
+                entity.name
+            );
+        }
+
+        assert!(
+            joined.contains("legacy_helper"),
+            "the one entity nothing references is still reported: {joined}"
+        );
+        assert!(
+            joined.contains("3 as referenced by an entity in their own file"),
+            "the scan says how many candidates their own file already referenced: {joined}"
+        );
+    }
+
+    /// FIR-2356 regression, in the exact shape of the founding failure: a
+    /// multi-module project with a declared entry point and cross-file usage,
+    /// ingested into a graph that resolved no cross-file edge. The scan may
+    /// answer; it may not answer confidently, and it may never list the entry
+    /// point.
+    #[test]
+    fn a_multi_module_project_never_yields_a_confident_delete_list() {
+        let graph = InMemoryGraph::new();
+
+        let main = measured(make_entity("main", "nk/cli.py"), 3, 2);
+        let cmd_ingest = measured(make_entity("cmd_ingest", "nk/cli.py"), 3, 2);
+        let parse_note = measured(make_entity("parse_note", "nk/parsing.py"), 4, 1);
+        let extract_tags = measured(make_entity("extract_tags", "nk/parsing.py"), 4, 1);
+        let ingest_dir = measured(make_entity("Database.ingest_dir", "nk/storage.py"), 2, 2);
+        let ingest_note = measured(make_entity("Database.ingest_note", "nk/storage.py"), 2, 2);
+        let mut suite = measured(make_entity("test_parse_note", "tests/test_parsing.py"), 6, 3);
+        suite.role = EntityRole::Test;
+
+        for entity in [
+            &main,
+            &cmd_ingest,
+            &parse_note,
+            &extract_tags,
+            &ingest_dir,
+            &ingest_note,
+            &suite,
+        ] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // Only the intra-file calls resolved, exactly as the 0.5.36 graph held
+        // them: 16 intra-file Calls edges and not one crossing a file.
+        for (src, dst) in [
+            (main.id, cmd_ingest.id),
+            (parse_note.id, extract_tags.id),
+            (ingest_dir.id, ingest_note.id),
+        ] {
+            graph
+                .upsert_relation(&make_relation(src, dst, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+
+        assert!(
+            !response.verified,
+            "a graph holding no cross-file edge cannot support a delete list: {joined}"
+        );
+        assert!(
+            !joined.contains("Found "),
+            "the confident phrasing is what made this output actionable: {joined}"
+        );
+        assert!(
+            joined.contains("UNVERIFIED"),
+            "the output says what it is: {joined}"
+        );
+        assert!(
+            joined.contains("Do not delete on this evidence"),
+            "the output says what not to do with it: {joined}"
+        );
+        assert!(
+            response
+                .unverified_reasons
+                .iter()
+                .any(|reason| reason.contains("no cross-file reference edge")),
+            "the reason is the measured gap, not a generic caveat: {:?}",
+            response.unverified_reasons
+        );
+        assert!(
+            !joined.contains("main ("),
+            "a declared entry point is referenced by construction and is never listed: {joined}"
+        );
+        assert!(
+            !joined.contains("extract_tags") && !joined.contains("Database.ingest_note"),
+            "an entity its own file already calls is not unreferenced: {joined}"
+        );
+        for row in response
+            .lines
+            .iter()
+            .filter(|line| line.contains(" (Function, ") || line.contains(" (Method, "))
+        {
+            assert!(
+                row.contains("[unverified]"),
+                "every row carries its own label, because a row read alone is what gets acted \
+                 on: {row}"
+            );
+        }
+
+        // Same project, cross-file edges resolved: the graph can now support the
+        // claim, and there is nothing left to report.
+        for (src, dst) in [
+            (cmd_ingest.id, ingest_dir.id),
+            (ingest_dir.id, parse_note.id),
+            (suite.id, parse_note.id),
+        ] {
+            graph
+                .upsert_relation(&make_relation(src, dst, RelationKind::Calls))
+                .unwrap();
+        }
+        let repaired = scan(&graph);
+        let repaired_joined = repaired.lines.join("\n");
+        assert!(
+            repaired.verified,
+            "resolved cross-file edges support the claim: {:?}",
+            repaired.unverified_reasons
+        );
+        assert!(
+            repaired_joined.contains("No dead code found."),
+            "every entity in the fixture is reachable once the edges resolve: {repaired_joined}"
+        );
+    }
+
+    /// A manifest the graph tracks but this scan could not read is a hole in the
+    /// entry-point evidence, so the scan reports itself unverified rather than
+    /// concluding no entry point is declared.
+    #[test]
+    fn an_unread_manifest_makes_the_scan_unverified() {
+        let graph = InMemoryGraph::new();
+        let orphan = measured(make_entity("never_called", "nk/legacy.py"), 0, 0);
+        graph.upsert_entity(&orphan).unwrap();
+
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
+        let entry_points = kin_core::entry_points::DeclaredEntryPoints {
+            entries: Vec::new(),
+            manifests_read: Vec::new(),
+            manifests_unreadable: vec!["pyproject.toml".to_string()],
+        };
+        let response = build_dead_code_report(&graph, &entry_points, &coverage).unwrap();
+
+        assert!(!response.verified, "{:?}", response.lines);
+        assert!(
+            response
+                .unverified_reasons
+                .iter()
+                .any(|reason| reason.contains("pyproject.toml")),
+            "the reason names the manifest it could not read: {:?}",
+            response.unverified_reasons
+        );
+        let joined = response.lines.join("\n");
+        assert!(joined.contains("[unverified] never_called"), "{joined}");
+    }
+
+    /// A console script bound to a function that is not named `main` is still an
+    /// entry point, and the output says which manifest it was read from.
+    #[test]
+    fn a_declared_entry_point_is_never_listed_and_its_source_is_named() {
+        let graph = InMemoryGraph::new();
+        let launcher = measured(make_entity("run", "nk/cli.py"), 0, 0);
+        let orphan = measured(make_entity("never_called", "nk/legacy.py"), 0, 0);
+        graph.upsert_entity(&launcher).unwrap();
+        graph.upsert_entity(&orphan).unwrap();
+
+        let coverage =
+            kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
+        let entry_points = kin_core::entry_points::DeclaredEntryPoints {
+            entries: kin_core::entry_points::parse_manifest_entry_points(
+                "pyproject.toml",
+                b"[project.scripts]\nnk = \"nk.cli:run\"\n",
+            ),
+            manifests_read: vec!["pyproject.toml".to_string()],
+            manifests_unreadable: Vec::new(),
+        };
+        let response = build_dead_code_report(&graph, &entry_points, &coverage).unwrap();
+        let joined = response.lines.join("\n");
+
+        assert!(response.verified, "{:?}", response.unverified_reasons);
+        assert!(
+            !joined.contains("run ("),
+            "the declared console script is referenced by its launcher: {joined}"
+        );
+        assert!(
+            joined.contains("never_called"),
+            "an entity no manifest declares is still reported: {joined}"
+        );
+        assert!(
+            joined.contains("1 as declared entry points")
+                && joined.contains("entry points read from pyproject.toml"),
+            "the scan discloses what it excluded and where the evidence came from: {joined}"
         );
     }
 

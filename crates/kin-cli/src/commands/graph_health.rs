@@ -74,6 +74,15 @@ pub struct GraphHealthReport {
     pub cochange_relation_count: usize,
     pub semantic_relation_count: usize,
     pub semantic_relation_density_excluding_cochanges: f64,
+    /// Reference-edge completeness per language: call sites and import
+    /// statements the parser read, against the edges the graph resolved.
+    ///
+    /// The counters beside it all describe what the graph holds. This is the one
+    /// that describes what it is missing, which is what no surface reported when
+    /// `graph validate` passed on a graph missing 16 imports and roughly 40
+    /// cross-file call edges.
+    #[serde(default)]
+    pub reference_edge_coverage: kin_core::reference_coverage::ReferenceEdgeCoverage,
     pub critical_issues: Vec<String>,
     pub warnings: Vec<String>,
     /// Observations that describe a healthy graph rather than a defect. They
@@ -124,12 +133,15 @@ pub(crate) fn inspect_graph_with_pending_embeddings(
     let supported_inputs = collect_supported_inputs(graph);
     let contamination = collect_contamination(graph)?;
     let artifact_coverage = collect_repository_artifact_coverage(binding, graph)?;
+    let reference_edge_coverage =
+        kin_core::reference_coverage::collect_reference_edge_coverage(graph)?;
     Ok(build_graph_health_report(
         &stats,
         &supported_inputs,
         &contamination,
         artifact_coverage,
         pending_embeddings,
+        reference_edge_coverage,
     ))
 }
 
@@ -405,6 +417,7 @@ fn build_graph_health_report(
     contamination: &ContaminationSummary,
     artifact_coverage: RepositoryArtifactCoverage,
     pending_embeddings: Option<usize>,
+    reference_edge_coverage: kin_core::reference_coverage::ReferenceEdgeCoverage,
 ) -> GraphHealthReport {
     let test_role_entity_count = stats.role_counts.get("Test").copied().unwrap_or(0);
     let cochange_relation_count = stats.relation_counts.get("CoChanges").copied().unwrap_or(0);
@@ -550,6 +563,7 @@ fn build_graph_health_report(
         cochange_relation_count,
         semantic_relation_count,
         semantic_relation_density_excluding_cochanges: semantic_density,
+        reference_edge_coverage,
         critical_issues,
         warnings,
         notes,
@@ -649,7 +663,7 @@ mod tests {
         };
 
         let report =
-            build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None);
+            build_graph_health_report(&stats, &supported_inputs, &contamination, coverage, None, Default::default());
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
@@ -678,8 +692,7 @@ mod tests {
                 path_samples: vec!["out/generated.rs".to_string()],
             },
             complete_coverage(),
-            None,
-        )
+            None, Default::default())
     }
 
     #[test]
@@ -770,8 +783,7 @@ mod tests {
                 path_samples: Vec::new(),
             },
             coverage,
-            None,
-        );
+            None, Default::default());
 
         assert!(report.repository_artifact_coverage.complete);
         assert!(report.critical_issues.is_empty());
@@ -816,8 +828,7 @@ mod tests {
             &empty_supported_inputs(),
             &no_contamination(),
             coverage,
-            None,
-        );
+            None, Default::default());
 
         assert!(!report.repository_artifact_coverage.complete);
         assert!(report
@@ -850,8 +861,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
-            None,
-        );
+            None, Default::default());
 
         assert!(report.critical_issues.is_empty());
         assert!(report
@@ -883,8 +893,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
-            None,
-        );
+            None, Default::default());
 
         assert!(!report.graph_empty_for_supported_inputs);
         assert!(report.critical_issues.is_empty());
@@ -910,8 +919,7 @@ mod tests {
             },
             &no_contamination(),
             coverage,
-            None,
-        );
+            None, Default::default());
 
         assert!(report.graph_empty_for_supported_inputs);
     }
