@@ -127,6 +127,12 @@ impl ReferencedDestinations {
     pub fn can_retire(&self, kind: RelationKind, entity_name: &str) -> bool {
         self.trustworthy && !self.mentions(kind, entity_name)
     }
+
+    /// Whether the parse behind this evidence was complete. A recovered tree
+    /// can omit declarations, so nothing may be retired on its silence.
+    pub fn is_complete(&self) -> bool {
+        self.trustworthy
+    }
 }
 
 /// What one cross-file pass produced.
@@ -136,9 +142,14 @@ pub struct CrossFilePass {
     /// resolved. Entity-level relations here always cross a file boundary;
     /// same-file relations stay the pipeline's business.
     pub resolved: Vec<Relation>,
-    /// Artifact-level import edges this process authored for the reconciled
-    /// file that its current source no longer declares.
-    pub retired: Vec<Relation>,
+    /// Artifact-level import and include edges the current source of every
+    /// file in this pass declares. The complete set for those files, so a
+    /// caller that can read an artifact node's existing relations can retire
+    /// what is missing here.
+    pub artifact_imports: Vec<Relation>,
+    /// The artifacts this pass re-derived import edges for, and is therefore
+    /// authoritative over.
+    pub source_artifacts: Vec<ArtifactId>,
     /// Destination names the reconciled file still mentions.
     pub referenced: ReferencedDestinations,
     /// Whether the pass ran at all. False when the file has no admitted
@@ -169,12 +180,13 @@ pub struct LiveCrossFileLinker {
     /// keeps backward binding bounded; without it a write would have to ask
     /// every file whether it was waiting.
     waiting_on: HashMap<String, BTreeSet<String>>,
-    /// Artifact-level import edges this process authored, per source file, so a
-    /// deleted import line can be retired rather than left behind.
-    authored_artifact_edges: HashMap<String, Vec<Relation>>,
     seeded: bool,
     refreshed: bool,
     capacity_reported: bool,
+    /// Files the most recent pass resolved. The cost bound made observable:
+    /// this is the number a test can assert stays independent of repository
+    /// size, and the number a trace can read when a write looks slow.
+    last_files_resolved: usize,
 }
 
 impl LiveCrossFileLinker {
@@ -193,6 +205,12 @@ impl LiveCrossFileLinker {
     /// Number of files currently retained for backward binding.
     pub fn pending_file_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Files the most recent pass resolved: the edited file plus the files that
+    /// were waiting on a name it defines.
+    pub fn last_files_resolved(&self) -> usize {
+        self.last_files_resolved
     }
 
     /// Index the entity universe from graph truth.
@@ -244,6 +262,15 @@ impl LiveCrossFileLinker {
         self.linker.known_files.contains(file_path)
     }
 
+    /// Whether the universe already holds the file behind this artifact.
+    ///
+    /// Retiring an import edge requires this: a destination the linker has
+    /// never heard of is one module resolution could not have reached, so its
+    /// absence from a pass proves nothing about the source declaration.
+    pub fn knows_artifact(&self, artifact_id: &ArtifactId) -> bool {
+        self.file_by_artifact_id.contains_key(artifact_id)
+    }
+
     /// Re-index the universe once when it is provably behind graph truth.
     ///
     /// A file the graph already holds entities for, that this linker has never
@@ -268,7 +295,6 @@ impl LiveCrossFileLinker {
     /// Drop a file from the universe and from the waiting index.
     pub fn forget_file(&mut self, file_path: &str) {
         self.uninstall_file(file_path);
-        self.authored_artifact_edges.remove(file_path);
         self.clear_pending(file_path);
     }
 
@@ -315,6 +341,7 @@ impl LiveCrossFileLinker {
         completeness: ParseCompleteness,
     ) -> CrossFilePass {
         let referenced = ReferencedDestinations::from_extracted(extracted, &completeness);
+        self.last_files_resolved = 0;
         if !self.seeded {
             return CrossFilePass {
                 referenced,
@@ -366,6 +393,7 @@ impl LiveCrossFileLinker {
         }
 
         let files_resolved = batch.len();
+        self.last_files_resolved = files_resolved;
         let relations =
             match link_cross_file_incremental_with_completeness(&batch, &self.linker, &completeness_map)
             {
@@ -388,10 +416,21 @@ impl LiveCrossFileLinker {
             batch.iter().map(|f| f.file_path.clone()).collect();
 
         let mut resolved = Vec::new();
-        let mut artifact_edges_by_file: HashMap<String, Vec<Relation>> = HashMap::new();
+        let mut artifact_imports: Vec<Relation> = Vec::new();
         for relation in relations {
             match (relation.src, relation.dst) {
                 (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) => {
+                    // A module path that resolves to no repository file makes
+                    // the linker mint a cross-repo external-reference
+                    // placeholder whose destination is a synthetic id. The
+                    // batch path turns those into real `ExternalReference`
+                    // records in the same transaction; nothing on the live path
+                    // does, and admitting the edge alone would name an endpoint
+                    // the graph does not hold. Third-party imports therefore
+                    // stay unbound here rather than half-bound.
+                    if kin_index::is_external_import_placeholder(&relation) {
+                        continue;
+                    }
                     let Some(src_file) = self.file_by_entity.get(&src) else {
                         continue;
                     };
@@ -417,45 +456,21 @@ impl LiveCrossFileLinker {
                     if !batched_paths.contains(path) {
                         continue;
                     }
-                    artifact_edges_by_file
-                        .entry(path.clone())
-                        .or_default()
-                        .push(relation.clone());
-                    resolved.push(relation);
+                    artifact_imports.push(relation);
                 }
                 _ => {}
             }
         }
 
-        // An import line that was deleted leaves behind an artifact edge this
-        // process authored and no longer derives. Only edges authored in this
-        // process are retired: an edge from a batch link this process never saw
-        // is not ours to judge.
-        let mut retired = Vec::new();
-        for path in &batched_paths {
-            let produced: HashSet<_> = artifact_edges_by_file
-                .get(path)
-                .into_iter()
-                .flatten()
-                .map(|relation| relation.id)
-                .collect();
-            if let Some(previous) = self.authored_artifact_edges.get(path) {
-                for relation in previous {
-                    if !produced.contains(&relation.id) {
-                        retired.push(relation.clone());
-                    }
-                }
-            }
-            match artifact_edges_by_file.get(path) {
-                Some(edges) => {
-                    self.authored_artifact_edges
-                        .insert(path.clone(), edges.clone());
-                }
-                None => {
-                    self.authored_artifact_edges.remove(path);
-                }
-            }
-        }
+        // Artifact-level import edges are reconciled against graph truth by the
+        // caller, which can read an artifact node's relations; this pass only
+        // reports what the current source declares and which artifacts it is
+        // authoritative for.
+        let mut source_artifacts: Vec<ArtifactId> = batched_paths
+            .iter()
+            .filter_map(|path| self.artifact_id_by_file.get(path).copied())
+            .collect();
+        source_artifacts.sort_by_key(|id| format!("{id:?}"));
 
         self.record_pending(file_path, completeness, extracted, imports);
         for dependent in &dependents {
@@ -464,7 +479,8 @@ impl LiveCrossFileLinker {
 
         CrossFilePass {
             resolved,
-            retired,
+            artifact_imports,
+            source_artifacts,
             referenced,
             ran: true,
             files_resolved,

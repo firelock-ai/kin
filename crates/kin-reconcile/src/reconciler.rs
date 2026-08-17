@@ -984,29 +984,93 @@ impl Reconciler {
             }
         }
 
-        // Artifact-level import edges this process authored for a file whose
-        // source no longer declares them. These never reach `existing_relations`
-        // — that set is gathered per entity, and an artifact edge has no entity
-        // endpoint — so the loop above cannot see them. Only edges this process
-        // authored are retired: an artifact edge from an init-time batch link
-        // this process never observed is not ours to judge.
-        let mut removed_relation_ids: HashSet<RelationId> = delta
+        // Artifact-level import and include edges. These never reach
+        // `existing_relations` — that set is gathered per entity, and an
+        // artifact edge has no entity endpoint — so the loop above cannot see
+        // them at all. Reconcile them against graph truth: the pass re-derived
+        // the complete import set of every file it resolved, from those files'
+        // own declarations.
+        let mut claimed_relation_ids: HashSet<RelationId> = delta
             .relation_deltas
             .iter()
             .map(RelationDelta::target_id)
             .collect();
-        for relation in &cross_file.retired {
-            if !removed_relation_ids.insert(relation.id) {
-                continue;
+        if cross_file.ran {
+            let produced_by_id: HashMap<RelationId, &Relation> = cross_file
+                .artifact_imports
+                .iter()
+                .map(|relation| (relation.id, relation))
+                .collect();
+            let mut stored_ids: HashSet<RelationId> = HashSet::new();
+
+            for artifact_id in &cross_file.source_artifacts {
+                let node = GraphNodeId::Artifact(*artifact_id);
+                let stored = graph
+                    .traverse(
+                        &node,
+                        &[RelationKind::Imports, RelationKind::Includes],
+                        1,
+                    )
+                    .map(|sub| sub.relations)
+                    .unwrap_or_default();
+                for relation in stored {
+                    if relation.src != node {
+                        continue;
+                    }
+                    if !stored_ids.insert(relation.id) {
+                        continue;
+                    }
+                    match produced_by_id.get(&relation.id) {
+                        Some(current) if **current == relation => {}
+                        Some(current) => {
+                            if claimed_relation_ids.insert(relation.id) {
+                                delta.relation_deltas.push(RelationDelta::Modified {
+                                    old: relation.clone(),
+                                    new: (*current).clone(),
+                                });
+                            }
+                        }
+                        None => {
+                            // Retire only what this pass could have re-derived:
+                            // a complete parse, and a destination the linker
+                            // knows. A destination it has never heard of is one
+                            // module resolution could not have reached, so the
+                            // edge's absence here says nothing about the source.
+                            let destination_known = match relation.dst {
+                                GraphNodeId::Artifact(id) => {
+                                    self.cross_file.knows_artifact(&id)
+                                }
+                                _ => false,
+                            };
+                            if cross_file.referenced.is_complete()
+                                && destination_known
+                                && claimed_relation_ids.insert(relation.id)
+                            {
+                                delta.relation_deltas.push(RelationDelta::Removed {
+                                    old: relation.clone(),
+                                });
+                                debug!(
+                                    relation_id = %relation.id,
+                                    kind = ?relation.kind,
+                                    "artifact import edge retired: the source no longer declares it"
+                                );
+                            }
+                        }
+                    }
+                }
             }
-            delta.relation_deltas.push(RelationDelta::Removed {
-                old: relation.clone(),
-            });
-            debug!(
-                relation_id = %relation.id,
-                kind = ?relation.kind,
-                "artifact import edge retired: the source no longer declares it"
-            );
+
+            for relation in &cross_file.artifact_imports {
+                if stored_ids.contains(&relation.id) {
+                    continue;
+                }
+                if !claimed_relation_ids.insert(relation.id) {
+                    continue;
+                }
+                delta.relation_deltas.push(RelationDelta::Added {
+                    new: relation.clone(),
+                });
+            }
         }
 
         let added_count = added.len();
