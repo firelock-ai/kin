@@ -17549,6 +17549,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "publish the derived entity into authority"
                         })
                         .to_string(),
@@ -17712,6 +17713,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "move authority past the sealed stash"
                         })
                         .to_string(),
@@ -19207,6 +19209,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "publish one file through one successor"
                         })
                         .to_string(),
@@ -19250,6 +19253,115 @@ mod tests {
                 .is_some(),
             "the committed file must be graph-owned after the single successor"
         );
+    }
+
+    /// The endpoint used to resolve its own author, and the resolution was two
+    /// environment reads with the word "unknown" behind them. It now takes the
+    /// author from the caller and has no fallback at all, so a request that
+    /// names nobody has to be refused rather than completed. The daemon cannot
+    /// answer this question for itself: it runs with every `GIT_*` variable
+    /// scrubbed and does not share the caller's working directory.
+    #[tokio::test]
+    async fn commit_refuses_a_request_that_names_no_author() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("unattributable.rs"),
+            b"pub fn unattributable() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let before = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "message": "nobody authored this"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        assert!(
+            status.is_client_error(),
+            "a commit naming no author must be refused, got {status}"
+        );
+        let after = crate::loop_runner::current_authority_admission(&state)
+            .unwrap()
+            .0
+            .generation;
+        assert_eq!(
+            after, before,
+            "a refused commit must publish no authority successor"
+        );
+    }
+
+    /// The author the caller named is the author the change carries, byte for
+    /// byte. A daemon that normalized, truncated, or re-derived it would be
+    /// answering with its own idea of who committed.
+    #[tokio::test]
+    async fn commit_records_the_author_the_caller_named() {
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let state = Arc::new(DaemonState::open(initialized.layout).unwrap());
+        std::fs::write(
+            repo.path().join("attributed.rs"),
+            b"pub fn attributed() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operation_id": kin_model::OperationId::new(),
+                            "timestamp": kin_model::Timestamp::now(),
+                            "author": "Ada Lovelace <ada@example.com>",
+                            "message": "attribute this change to a person"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "commit must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(&state)
+                .unwrap();
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let committed = lease
+            .snapshot()
+            .changes
+            .values()
+            .find(|change| change.message == "attribute this change to a person")
+            .expect("the published change");
+        assert_eq!(committed.author.0, "Ada Lovelace <ada@example.com>");
     }
 
     /// A commit that reaches authority clears a wedge, because its transaction
@@ -19334,6 +19446,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "must not infer emptyDir removals"
                         })
                         .to_string(),
@@ -19459,6 +19572,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "attribute the commit wall"
                         })
                         .to_string(),
@@ -19568,6 +19682,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "obsolete dry run must not commit",
                             "dry_run": true
                         })
@@ -19597,6 +19712,7 @@ mod tests {
                         json!({
                             "operation_id": kin_model::OperationId::new(),
                             "timestamp": kin_model::Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": "commit the complete arbitrary repository"
                         })
                         .to_string(),
@@ -19678,6 +19794,7 @@ mod tests {
                         json!({
                             "operation_id": operation_id,
                             "timestamp": Timestamp::now(),
+                            "author": "Test Author <test@example.invalid>",
                             "message": message
                         })
                         .to_string(),
