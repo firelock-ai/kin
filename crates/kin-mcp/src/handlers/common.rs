@@ -1376,11 +1376,17 @@ pub struct ExactEntitySource {
 /// seam is per-dependency in a context pack, which is documented as fitted to a
 /// token budget, so the waste scaled with the pack.
 ///
-/// For the same reason this carries no `artifact_path`. A `RepoPath` is bytes,
-/// and its wire form is a `{"bytes_hex": …}` object, so the path arrived as
-/// twice its own length in hex beside the plain `file_path` every caller of
-/// this seam already emits. Two spellings of one path, one of them unreadable,
-/// per entry, inside a budgeted pack.
+/// For the same reason this carries no `artifact_path` for a path a plain
+/// string can spell. A `RepoPath` is bytes, and its wire form is a
+/// `{"bytes_hex": …}` object, so the path arrived as twice its own length in
+/// hex beside the plain `file_path` every caller of this seam already emits.
+/// Two spellings of one path, one of them unreadable, per entry, inside a
+/// budgeted pack.
+///
+/// A path whose bytes are not valid UTF-8 has no lossless plain form, so there
+/// the byte-exact spelling is the only representation those bytes have and the
+/// field is kept. `artifact_id` is emitted either way, and `kin_artifact_read`
+/// resolves the byte-exact path from it.
 pub fn source_provenance_fields(
     source: &ExactEntitySource,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1420,6 +1426,9 @@ pub fn source_provenance_fields(
         serde_json::json!(source.span_coherence.label()),
     );
     fields.insert("artifact_id".into(), serde_json::json!(source.artifact_id));
+    if source.path.as_utf8().is_none() {
+        fields.insert("artifact_path".into(), serde_json::json!(source.path));
+    }
     fields.insert(
         "artifact_entry".into(),
         serde_json::json!(super::artifacts::TreeEntryWire::from(source.entry)),
