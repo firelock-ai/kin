@@ -2390,8 +2390,7 @@ mod tests {
         );
         let carried = plan.command().get_envs().any(|(key, value)| {
             key == "KIN_DAEMON_AUTO_EMBED"
-                && value.map(|value| value.to_string_lossy().into_owned())
-                    == Some("0".to_string())
+                && value.map(|value| value.to_string_lossy().into_owned()) == Some("0".to_string())
         });
         assert!(
             carried,

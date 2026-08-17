@@ -4286,9 +4286,7 @@ fn states_a_behavior_lever(cli: &kin_core::behavior_env::BehaviorEnv) -> bool {
 /// Read the behavior-env surface an already-running daemon reports, or `None`
 /// when it cannot be read at all. A daemon predating the surface answers with an
 /// empty map, which yields no divergence rather than a false one.
-async fn fetch_daemon_behavior_env(
-    base_url: &str,
-) -> Option<kin_core::behavior_env::BehaviorEnv> {
+async fn fetch_daemon_behavior_env(base_url: &str) -> Option<kin_core::behavior_env::BehaviorEnv> {
     let mut request =
         daemon_health_client().get(format!("{}/health", base_url.trim_end_matches('/')));
     if let Some(token) = resolve_daemon_auth_token() {
