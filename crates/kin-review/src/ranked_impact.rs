@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use kin_index::RelationResolution;
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
 use kin_model::ids::{EntityId, RelationId};
@@ -94,6 +95,13 @@ pub struct RelationPathStep {
     pub to_entity_id: EntityId,
     pub to_identity: StableEntityIdentity,
     pub confidence_basis_points: u32,
+    /// How this hop's edge was resolved: `type_resolved`, `import_scoped`, or
+    /// `name_only`. A path is only as trustworthy as its weakest hop, and a
+    /// `name_only` hop was matched by bare name with nothing at the call site
+    /// proving the destination. Defaulted on read so a report recorded before
+    /// the marker existed still deserializes.
+    #[serde(default)]
+    pub resolution: String,
     /// Parser/linker evidence copied from the graph edge. Source spans, rules,
     /// tokens, and resolved paths remain machine-checkable in the output.
     pub evidence: Vec<RelationEvidence>,
@@ -227,6 +235,7 @@ pub fn rank_impact_at<I: ImpactGraph>(
                 to_entity_id: frontier.entity_id,
                 to_identity: StableEntityIdentity::from_entity(&frontier.entity),
                 confidence_basis_points: confidence_basis_points(relation.confidence),
+                resolution: RelationResolution::of(&relation).as_str().to_string(),
                 evidence: relation.evidence.clone(),
             };
             let mut path = frontier.path.clone();

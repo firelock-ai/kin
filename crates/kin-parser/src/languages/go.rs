@@ -112,6 +112,7 @@ impl LanguageAdapter for GoAdapter {
                     .all(|m| type_method_names.contains(m))
                 {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Implements,
                         src_name: type_name.clone(),
@@ -490,6 +491,7 @@ fn extract_go_node(
                 // Emit Contains relation from receiver type to method
                 if !receiver_type.is_empty() {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: receiver_type.clone(),
@@ -545,6 +547,7 @@ fn extract_go_node(
                                         span: member.span.clone(),
                                     });
                                     relations.push(ExtractedRelation {
+                                        receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Contains,
                                         src_name: name.clone(),
@@ -554,6 +557,7 @@ fn extract_go_node(
                                 }
                                 for embedded in &members.embedded {
                                     relations.push(ExtractedRelation {
+                                        receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Extends,
                                         src_name: name.clone(),
@@ -582,6 +586,7 @@ fn extract_go_node(
                             if let Some(ref struct_node) = type_node {
                                 for embedded in extract_embedded_types(struct_node, source) {
                                     relations.push(ExtractedRelation {
+                                        receiver: None,
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Extends,
                                         src_name: name.clone(),
@@ -960,6 +965,7 @@ fn extract_calls_from_body(
                 if is_valid_callee_name(&callee) {
                     let idx = relations.len();
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
@@ -977,6 +983,7 @@ fn extract_calls_from_body(
                 let channel_name = channel.utf8_text(source).unwrap_or("").to_string();
                 if !channel_name.is_empty() {
                     relations.push(ExtractedRelation {
+                        receiver: None,
                         call_shape: None,
                         kind: kin_model::RelationKind::SendsMessage,
                         src_name: context_name.to_string(),
@@ -994,6 +1001,7 @@ fn extract_calls_from_body(
                         let spawned = function.utf8_text(source).unwrap_or("").to_string();
                         if !spawned.is_empty() {
                             relations.push(ExtractedRelation {
+                                receiver: None,
                                 call_shape: None,
                                 kind: kin_model::RelationKind::Spawns,
                                 src_name: context_name.to_string(),
@@ -1033,6 +1041,7 @@ fn emit_value_references(
     for name in names {
         if name != context_name && ref_seen.insert(name.clone()) {
             relations.push(ExtractedRelation {
+                receiver: None,
                 call_shape: None,
                 kind: kin_model::RelationKind::References,
                 src_name: context_name.to_string(),

@@ -187,11 +187,26 @@ pub struct ExtractedRelation {
     /// argument-incompatible candidates out of the call's binding set instead of
     /// fanning out to every same-named overload.
     pub call_shape: Option<CallArgShape>,
+    /// For a `Calls` edge written as an attribute/member call, the receiver
+    /// expression exactly as it appears in source: `adapter` for
+    /// `adapter.send(...)`, `os.environ` for `os.environ.get(...)`. `None`
+    /// means the callee was a bare identifier (`helper(...)`), the receiver was
+    /// pinned into `dst_name` already (`self.m()` arrives as `Class.m`), or the
+    /// adapter does not record receivers.
+    ///
+    /// The linker needs this to tell a call through an object from a call
+    /// through a module. Both arrive with the same bare leaf name, but only the
+    /// module form can reach a module-level function, so discarding the
+    /// receiver is what let a `proxies.get(...)` call site bind to the public
+    /// `requests.get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
 }
 
 /// Construct the reserved negative call-extraction coverage record.
 pub fn call_extraction_incomplete_marker() -> ExtractedRelation {
     ExtractedRelation {
+        receiver: None,
         kind: RelationKind::DependsOn,
         src_name: String::new(),
         dst_name: CALL_EXTRACTION_INCOMPLETE_MARKER_V1.to_string(),
@@ -207,6 +222,7 @@ pub fn is_call_extraction_incomplete_marker(relation: &ExtractedRelation) -> boo
         && relation.dst_name == CALL_EXTRACTION_INCOMPLETE_MARKER_V1
         && relation.import_source.is_none()
         && relation.call_shape.is_none()
+        && relation.receiver.is_none()
 }
 
 /// A single import declaration from source code.

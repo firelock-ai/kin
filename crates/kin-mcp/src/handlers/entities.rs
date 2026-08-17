@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use super::repository_authority::RequestRepositoryAuthority;
+use kin_index::RelationResolution;
 use kin_model::entity::EntityKind;
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::relation::RelationKind;
@@ -855,7 +856,13 @@ When no references come back, the additive `negative` object's `safe_to_conclude
 flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
 complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
 before treating the entity as safe to delete. An entity_id or name that resolves to nothing \
-carries the same object, naming the resolution miss rather than reporting an empty result.";
+carries the same object, naming the resolution miss rather than reporting an empty result. \
+Every row carries `resolution`: `type_resolved` (the destination is proven by a local \
+binding, a declared import, or a resolved dispatch class), `import_scoped` (the target \
+module was known and the symbol selected inside it), or `name_only` (a bare same-name \
+match across the repo, with nothing at the reference site proving it). A `name_only` row \
+is a candidate, not a fact; do not count it as use, and do not conclude something is \
+unused from the absence of anything but `name_only` rows without confirming.";
 
 fn normalize_cross_repo_repo_id(raw: Option<&str>) -> std::result::Result<String, String> {
     raw.map(str::trim)
@@ -970,6 +977,9 @@ fn spine_reference_rows(
             // CrossRepoEdge proves a dependency but does not retain whether
             // the source relation was Calls/Imports/References.
             relation_kinds: Vec::new(),
+            // The resolving edge lives in the other repository's graph, so how
+            // it was resolved is not knowable here. Absent, not guessed.
+            resolution: None,
         });
     }
 
@@ -1000,6 +1010,12 @@ fn reference_row_json(row: ReferenceRow) -> serde_json::Value {
             .into_iter()
             .map(relation_kind_name)
             .collect::<Vec<_>>(),
+        // How strongly this reference was resolved: `type_resolved`,
+        // `import_scoped`, or `name_only`. `name_only` is a same-name match
+        // with nothing at the call site proving the destination, so it is a
+        // candidate rather than a fact. Absent only for a federated row, whose
+        // edge lives in another repository's graph.
+        "resolution": row.resolution.map(RelationResolution::as_str),
     })
 }
 
@@ -2444,7 +2460,10 @@ flag says whether \"no flow from here\" is authoritative or merely \"not indexed
 never read as \"this calls nothing\". A focal name the graph holds more than once, and a method \
 whose incoming calls may not have been linked, each downgrade that flag rather than certifying \
 absence. A focal that resolves to no entity at all carries the same object, naming the \
-resolution miss rather than reporting an empty chain.";
+resolution miss rather than reporting an empty chain. \
+Each step carries `resolution` for the edge that reached it: `type_resolved`, \
+`import_scoped`, or `name_only`. A chain is only as trustworthy as its weakest hop, so a \
+`name_only` step means the flow it claims may not exist at all.";
 
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
@@ -2593,6 +2612,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     "step": step_index,
                     "role": role,
                     "relation_kind": format!("{:?}", rel.kind),
+                    // How the edge INTO this step was resolved. A chain is only
+                    // as trustworthy as its weakest hop, and a `name_only` hop
+                    // means the flow may not exist at all.
+                    "resolution": RelationResolution::of(&rel).as_str(),
                     "parent_step": parent_step,
                     "depth": next_depth,
                     "entity_id": next_entity.id.to_string(),
@@ -2691,7 +2714,10 @@ When no neighbors come back, the additive `negative` object's `safe_to_conclude_
 flag says whether that absence is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the side that was walked, so an empty 'in' result is never \
 read as \"no dependencies\". A focal that is not in the graph is reported as that gap \
-rather than as an isolated entity.";
+rather than as an isolated entity. Every edge also carries `resolution` \
+(`type_resolved`, `import_scoped`, `name_only`) saying how strongly its destination was \
+proven; a `name_only` edge was matched by bare name and is a candidate, not structure you \
+can rely on.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -2787,6 +2813,10 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
                         "kind": format!("{:?}", rel.kind),
                         "direction": edge_direction,
                         "from": current.to_string(),
+                        // A `name_only` edge was matched by name alone and is a
+                        // candidate, not a fact. Neighborhoods are read as
+                        // structure, so an unmarked guess spreads furthest here.
+                        "resolution": RelationResolution::of(&rel).as_str(),
                     }));
                 }
 

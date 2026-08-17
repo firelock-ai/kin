@@ -29,6 +29,7 @@ pub mod linker;
 pub mod overlay;
 pub mod pipeline;
 pub mod repository;
+pub mod resolution;
 pub mod support;
 pub mod watcher;
 
@@ -74,6 +75,7 @@ pub use repository::{
     IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore, RepositoryScanDiagnostics,
     ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES, PYTHON_VIRTUALENV_MARKER,
 };
+pub use resolution::{RelationResolution, RESOLUTION_FIELD, RESOLUTION_TIER_LADDER};
 pub use support::{compute_coverage_report, CoverageReport};
 pub use watcher::{FileEvent, FileWatcher};
 

@@ -121,9 +121,18 @@ fn spine_xref_lines(
                 response.edges.len()
             ));
             for edge in &response.edges {
+                // The resolving edge lives in the other repository's graph, so
+                // its resolution is read from the tier confidence that crossed
+                // the boundary. `name_only` means a same-name match, not a
+                // proven cross-repo dependency.
                 lines.push(format!(
-                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2})",
-                    edge.src_repo, edge.src_entity, edge.dst_repo, edge.dst_entity, edge.confidence
+                    "    - Impact: [{}] {} depends on us ([{}] {}) (conf: {:.2}, {})",
+                    edge.src_repo,
+                    edge.src_entity,
+                    edge.dst_repo,
+                    edge.dst_entity,
+                    edge.confidence,
+                    kin_index::RelationResolution::from_confidence(edge.confidence).as_str()
                 ));
             }
             if !authority_complete {

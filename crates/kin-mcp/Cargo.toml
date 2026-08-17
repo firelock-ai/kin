@@ -17,6 +17,7 @@ kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-parser = { workspace = true }
+kin-index = { workspace = true }
 kin-context = { workspace = true }
 kin-review = { workspace = true }
 kin-runtime = { workspace = true }

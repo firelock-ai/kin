@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
+use kin_index::RelationResolution;
 use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
@@ -210,11 +211,12 @@ pub fn build_refs_response(
             .unwrap_or_else(|| "unknown".to_string());
         let line = entry.start_line.unwrap_or(0);
         lines.push(format!(
-            "  {} @ {}:{} [{}]",
+            "  {} @ {}:{} [{}] ({})",
             entry.name,
             file_path,
             line,
-            relation_kinds_label(&entry.relation_kinds)
+            relation_kinds_label(&entry.relation_kinds),
+            entry.resolution.as_str()
         ));
     }
 
@@ -551,6 +553,9 @@ pub(crate) struct ReferenceEntry {
     pub(crate) file_path: Option<String>,
     start_line: Option<u32>,
     pub(crate) relation_kinds: Vec<RelationKind>,
+    /// Strongest resolution among the edges behind this row. A `name_only` row
+    /// is a same-name match with nothing at the reference site proving it.
+    resolution: RelationResolution,
 }
 
 #[derive(Debug, Clone)]
@@ -612,6 +617,7 @@ pub(crate) fn collect_graph_references(
 ) -> Result<ReferenceCollection> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, Vec<RelationKind>> = HashMap::new();
+    let mut resolutions: HashMap<EntityId, RelationResolution> = HashMap::new();
     let mut matched_kinds = Vec::new();
 
     for rel in graph.get_all_relations_for_entity(entity_id)? {
@@ -631,6 +637,11 @@ pub(crate) fn collect_graph_references(
         }
         push_relation_kind(grouped.entry(src_entity_id).or_default(), rel.kind);
         push_relation_kind(&mut matched_kinds, rel.kind);
+        let resolution = RelationResolution::of(&rel);
+        resolutions
+            .entry(src_entity_id)
+            .and_modify(|current| *current = (*current).max(resolution))
+            .or_insert(resolution);
     }
 
     let mut references = Vec::with_capacity(grouped.len());
@@ -647,6 +658,10 @@ pub(crate) fn collect_graph_references(
             file_path: entity.file_origin.as_ref().map(|f| f.0.clone()),
             start_line: entity.span.as_ref().map(|s| s.start_line),
             relation_kinds: source_kinds,
+            resolution: resolutions
+                .get(&source_id)
+                .copied()
+                .unwrap_or(RelationResolution::NameOnly),
         });
     }
     missing_source_ids.sort();
