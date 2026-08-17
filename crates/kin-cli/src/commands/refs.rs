@@ -545,19 +545,19 @@ fn relation_kind_label(kind: RelationKind) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceEntry {
-    entity_id: EntityId,
-    name: String,
-    file_path: Option<String>,
+pub(crate) struct ReferenceEntry {
+    pub(crate) entity_id: EntityId,
+    pub(crate) name: String,
+    pub(crate) file_path: Option<String>,
     start_line: Option<u32>,
-    relation_kinds: Vec<RelationKind>,
+    pub(crate) relation_kinds: Vec<RelationKind>,
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceCollection {
-    references: Vec<ReferenceEntry>,
-    missing_source_ids: Vec<EntityId>,
-    matched_kinds: Vec<RelationKind>,
+pub(crate) struct ReferenceCollection {
+    pub(crate) references: Vec<ReferenceEntry>,
+    pub(crate) missing_source_ids: Vec<EntityId>,
+    pub(crate) matched_kinds: Vec<RelationKind>,
 }
 
 /// Collect incoming references to `target` from graph-owned relation edges.
@@ -598,7 +598,14 @@ fn collect_references(
     Ok(entries)
 }
 
-fn collect_graph_references(
+/// The one collector every reference-consulting surface reads.
+///
+/// `kin refs`, `kin refs --bulk-json` and the dead-code scan all answer from
+/// this, because two lists of inbound edges are exactly what produced the
+/// FIR-2356 contradiction: `find_references` named a caller for four entities
+/// that `dead-code`, reading a different rule, called unreferenced at the same
+/// graph generation.
+pub(crate) fn collect_graph_references(
     graph: &impl GraphStore,
     entity_id: &EntityId,
     relation_kinds: &[RelationKind],

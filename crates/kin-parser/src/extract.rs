@@ -12,6 +12,16 @@ pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 pub const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 pub const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
+/// Call sites the parser read in this entity's file, before any resolution.
+///
+/// The denominator of reference-edge completeness. Extraction already knows it
+/// and previously dropped it, so a graph could hold a fifth of its call edges
+/// with no surface able to say so.
+pub const FILE_PARSED_CALL_SITES_KEY: &str = "file_parsed_call_sites";
+
+/// Import statements the parser read in this entity's file, before resolution.
+pub const FILE_PARSED_IMPORT_STATEMENTS_KEY: &str = "file_parsed_import_statements";
+
 /// Reserved parser-to-linker control record: at least one source-level call in
 /// this file could not be represented with a statically proven named target.
 /// This includes wholly unrepresentable callees and receiver calls whose leaf
@@ -258,6 +268,47 @@ pub fn attach_file_context_metadata(
                 serde_json::Value::String(surface_context.clone()),
             );
         }
+    }
+}
+
+/// Record, on every entity of the file, how many call sites and import
+/// statements the parser read there.
+///
+/// This is the parse side of reference-edge completeness. It is written where
+/// extraction already holds both numbers, so no surface has to re-parse to say
+/// how much of the relation graph resolved. A file whose parser recovery
+/// omitted calls records no call-site count rather than a count it cannot
+/// stand behind, and a reader treats an absent count as unmeasured rather than
+/// as zero.
+pub fn attach_file_reference_parse_counts(
+    entities: &mut [Entity],
+    relations: &[ExtractedRelation],
+    imports: &[FileImport],
+) {
+    if entities.is_empty() {
+        return;
+    }
+
+    let call_extraction_complete = !relations.iter().any(is_call_extraction_incomplete_marker);
+    let call_sites = relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::Calls)
+        .count();
+    let import_statements = imports.len();
+
+    for entity in entities {
+        if call_extraction_complete {
+            entity.metadata.extra.insert(
+                FILE_PARSED_CALL_SITES_KEY.into(),
+                serde_json::Value::from(call_sites),
+            );
+        } else {
+            entity.metadata.extra.remove(FILE_PARSED_CALL_SITES_KEY);
+        }
+        entity.metadata.extra.insert(
+            FILE_PARSED_IMPORT_STATEMENTS_KEY.into(),
+            serde_json::Value::from(import_statements),
+        );
     }
 }
 
