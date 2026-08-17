@@ -139,6 +139,12 @@ pub fn transaction_liveness(repo_root: &Path, pid: u32) -> TransactionLiveness {
 
 /// The transaction this process currently has open, shared with the beat thread.
 struct ActiveTransaction {
+    /// Identifies which guard installed this. A guard retires the marker only
+    /// when the slot still holds its own token, so an outer guard dropping
+    /// after an inner one took the slot cannot silence a transaction that is
+    /// still running — which would put the daemon straight back into the state
+    /// this module exists to make visible.
+    token: u64,
     kin_root: PathBuf,
     operation: &'static str,
     opened: std::time::Instant,
@@ -226,15 +232,19 @@ fn ensure_beat_thread() {
 /// it, which is the intended asymmetry: the leftover marker is what tells the
 /// next reader the daemon died with work in flight.
 pub struct TransactionGuard {
+    token: u64,
     kin_root: PathBuf,
 }
 
 impl TransactionGuard {
     /// Open a transaction marker for `kin_root` (the `.kin` directory).
     pub fn open(kin_root: &Path, operation: &'static str) -> Self {
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = std::time::Instant::now();
         if let Ok(mut guard) = active().lock() {
             *guard = Some(ActiveTransaction {
+                token,
                 kin_root: kin_root.to_path_buf(),
                 operation,
                 opened: now,
@@ -245,6 +255,7 @@ impl TransactionGuard {
         ensure_beat_thread();
         publish_beat();
         Self {
+            token,
             kin_root: kin_root.to_path_buf(),
         }
     }
@@ -252,10 +263,22 @@ impl TransactionGuard {
 
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = active().lock() {
-            *guard = None;
+        let owned = match active().lock() {
+            Ok(mut guard) => {
+                let owned = guard.as_ref().is_some_and(|open| open.token == self.token);
+                if owned {
+                    *guard = None;
+                }
+                owned
+            }
+            Err(_) => false,
+        };
+        // Leave the marker alone when a later transaction owns the slot: it is
+        // that transaction's proof of life now, and clearing it would blind the
+        // reaper to a commit that is still running.
+        if owned {
+            let _ = std::fs::remove_file(self.kin_root.join(TRANSACTION_FILE_NAME));
         }
-        let _ = std::fs::remove_file(self.kin_root.join(TRANSACTION_FILE_NAME));
     }
 }
 
@@ -284,7 +307,12 @@ mod tests {
         kin_root
     }
 
+    // The open transaction lives in one process-wide slot, so two tests holding
+    // guards at once write each other's phases. Production serializes commits
+    // behind the coordination gate; the test binary does not, so these share a
+    // group. Every test that opens a `TransactionGuard` belongs in it.
     #[test]
+    #[serial_test::serial(commit_transaction_marker)]
     fn an_open_transaction_reads_as_open_for_its_own_pid_and_absent_for_another() {
         let dir = tempfile::tempdir().unwrap();
         let kin_root = repo_with_kin(dir.path());
@@ -313,6 +341,35 @@ mod tests {
             transaction_liveness(dir.path(), pid),
             TransactionLiveness::None,
             "a closed transaction must retire its marker"
+        );
+    }
+
+    /// A guard retires only its own transaction. Without the token an outer
+    /// guard dropping after an inner one took the slot would clear the marker of
+    /// a commit that is still running, putting the daemon back into exactly the
+    /// unreachable-and-apparently-stalled state that gets it killed.
+    #[test]
+    #[serial_test::serial(commit_transaction_marker)]
+    fn dropping_an_outer_guard_never_retires_a_later_transactions_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_root = repo_with_kin(dir.path());
+        let pid = std::process::id();
+
+        let outer = TransactionGuard::open(&kin_root, "commit");
+        let inner = TransactionGuard::open(&kin_root, "commit");
+        drop(outer);
+        assert!(
+            matches!(
+                transaction_liveness(dir.path(), pid),
+                TransactionLiveness::Open(_)
+            ),
+            "the transaction still running must still be published"
+        );
+
+        drop(inner);
+        assert_eq!(
+            transaction_liveness(dir.path(), pid),
+            TransactionLiveness::None
         );
     }
 
