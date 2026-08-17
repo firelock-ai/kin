@@ -111,7 +111,7 @@ jobs:
       # pins a per-toolchain sha deliberately: it wants stable and passes only
       # `targets`.
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # default branch
+        uses: ./.github/actions/rust-toolchain
         with:
           toolchain: nightly-2026-06-17
 
