@@ -3534,8 +3534,17 @@ async fn command_dead_code(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let response = kin_cli::commands::dead_code::build_dead_code_response(graph.as_ref())
-        .map_err(internal_error)?;
+    // The scan reads declared entry points through this authority, from
+    // graph-owned blob storage. Without it a console script reads as
+    // unreferenced, so the scan reports itself unverified rather than list one.
+    let repository_authority = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let response = kin_cli::commands::dead_code::build_dead_code_response(
+        Some(&repository_authority),
+        graph.as_ref(),
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 

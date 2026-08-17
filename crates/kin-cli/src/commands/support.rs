@@ -368,6 +368,7 @@ mod tests {
             cochange_relation_count: 0,
             semantic_relation_count: 4,
             semantic_relation_density_excluding_cochanges: 1.33,
+            reference_edge_coverage: Default::default(),
             critical_issues: Vec::new(),
             warnings: vec!["1 files are still shallow-tracked".to_string()],
             notes: Vec::new(),
@@ -463,6 +464,7 @@ mod tests {
             cochange_relation_count: 0,
             semantic_relation_count: 7,
             semantic_relation_density_excluding_cochanges: 0.78,
+            reference_edge_coverage: Default::default(),
             critical_issues: Vec::new(),
             warnings: Vec::new(),
             notes: vec![
@@ -523,6 +525,7 @@ mod tests {
                 cochange_relation_count: 0,
                 semantic_relation_count: 1,
                 semantic_relation_density_excluding_cochanges: 0.5,
+                reference_edge_coverage: Default::default(),
                 critical_issues: Vec::new(),
                 warnings: Vec::new(),
                 notes: Vec::new(),
