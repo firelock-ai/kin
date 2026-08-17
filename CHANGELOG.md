@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind the release retry timeout test to its invariant, not an attempt count (#883)
 - Stop the supervisor reaping a daemon that has a commit in flight (#871)
 - Resolve a real commit identity or refuse, instead of stamping "Author: unknown" (#876)
+- Resolve call edges by receiver scope and role, and mark what each edge proved (#868)
 
 
 ## [0.5.37] - 2026-08-17
