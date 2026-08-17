@@ -4622,6 +4622,16 @@ async fn command_commit(
         ));
     }
 
+    // Announce this commit before anything else, and keep announcing it until
+    // the handler returns. The ambient reconcile tick reads this and stands its
+    // own publication down, because the admission below sweeps the whole working
+    // copy and the transaction after it carries the resulting tree: a tick that
+    // publishes first pays a complete O(store) publication for a tree this
+    // commit is about to publish anyway.
+    //
+    // Before the gate, not after it. A tick that already holds the gate is still
+    // deciding whether to publish, and it decides by reading this.
+    let _pending_commit = state.pending_commits.announce();
     // Hold one uninterrupted graph-authority gate across forced filesystem
     // admission, change construction, and branch publication. The sync helper
     // deliberately does not re-lock this non-reentrant mutex.
