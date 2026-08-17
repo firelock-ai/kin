@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop the supervisor reaping a daemon that has a commit in flight (#871)
 - Resolve a real commit identity or refuse, instead of stamping "Author: unknown" (#876)
 - Resolve call edges by receiver scope and role, and mark what each edge proved (#868)
+- Synchronise the exited-child reaper test on the exit itself (#884)
 
 
 ## [0.5.37] - 2026-08-17
