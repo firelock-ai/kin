@@ -152,8 +152,7 @@ pub fn observe_cross_file_reference_coverage_for_languages<S: EntityStore>(
     }
 
     for (index, language) in observed_languages.iter().enumerate() {
-        let (states, examined, budget_exhausted) =
-            observe_language(store, *language, &requested);
+        let (states, examined, budget_exhausted) = observe_language(store, *language, &requested);
         examined_total += examined;
         any_budget_exhausted |= budget_exhausted;
         for (slot, (_, state)) in merged.iter_mut().zip(states.iter()) {
@@ -327,7 +326,11 @@ fn endpoint_file<S: EntityStore>(
     if let Some(file) = files.get(id) {
         return file.clone();
     }
-    store.get_entity(id).ok().flatten().and_then(|entity| entity.file_origin)
+    store
+        .get_entity(id)
+        .ok()
+        .flatten()
+        .and_then(|entity| entity.file_origin)
 }
 
 #[cfg(test)]
@@ -457,18 +460,12 @@ mod tests {
             ))
             .unwrap();
 
-        let rust = observe_cross_file_reference_coverage(
-            &store,
-            &rust_callee,
-            &[RelationKind::Calls],
-        );
+        let rust =
+            observe_cross_file_reference_coverage(&store, &rust_callee, &[RelationKind::Calls]);
         assert_eq!(rust["classes"]["calls"], json!("present"));
 
-        let python = observe_cross_file_reference_coverage(
-            &store,
-            &python_target,
-            &[RelationKind::Calls],
-        );
+        let python =
+            observe_cross_file_reference_coverage(&store, &python_target, &[RelationKind::Calls]);
         assert_eq!(python["classes"]["calls"], json!("absent"));
     }
 

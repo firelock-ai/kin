@@ -210,9 +210,7 @@ fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
                     .iter()
                     .filter_map(Value::as_str)
                     .map(str::to_ascii_lowercase)
-                    .filter(|kind| {
-                        matches!(kind.as_str(), "calls" | "imports" | "references")
-                    })
+                    .filter(|kind| matches!(kind.as_str(), "calls" | "imports" | "references"))
                     .collect()
             })
             .unwrap_or_else(reference_classes),
@@ -290,15 +288,10 @@ fn edge_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
             .unwrap_or("unknown")
     };
 
-    if requested
-        .iter()
-        .any(|class| state_for(class) == "present")
-    {
+    if requested.iter().any(|class| state_for(class) == "present") {
         return None;
     }
-    if requested
-        .iter()
-        .any(|class| state_for(class) == "unknown")
+    if requested.iter().any(|class| state_for(class) == "unknown")
         || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
     {
         return Some(format!(
@@ -1796,7 +1789,10 @@ mod tests {
             absence_cross_file_classes("bulk_check_references", &json!({})),
             all
         );
-        assert_eq!(absence_cross_file_classes("trace_data_flow", &json!({})), all);
+        assert_eq!(
+            absence_cross_file_classes("trace_data_flow", &json!({})),
+            all
+        );
         assert_eq!(
             absence_cross_file_classes("impact_analysis", &json!({})),
             all,
@@ -2066,10 +2062,7 @@ mod tests {
             negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(reason.starts_with("spine_repo_unregistered"), "{reason}");
-        assert!(
-            !reason.contains("mismatch"),
-            "nothing mismatched: {reason}"
-        );
+        assert!(!reason.contains("mismatch"), "nothing mismatched: {reason}");
     }
 
     /// A reason with no computed code behind it keeps the catch-all label rather
