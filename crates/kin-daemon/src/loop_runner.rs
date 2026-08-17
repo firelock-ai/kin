@@ -909,7 +909,10 @@ fn exact_tree_admission(
 /// this one call, none of which the commit race is about. This is the seam a
 /// test drives so the race can be composed in a fixed order instead of hoped
 /// for.
-#[cfg(test)]
+// Gated to match its only caller, the unix-only race test in `api`: a helper
+// whose callers are platform-gated is dead code on every other platform, and
+// the CI gate compiles with `-D warnings`.
+#[cfg(all(test, unix))]
 pub(crate) fn ambient_admission_for_test(
     state: &DaemonState,
     observation: &BTreeSet<RepoPath>,
@@ -5912,7 +5915,6 @@ mod tests {
             "no poll cadence may turn the grace into a stall"
         );
     }
-
 }
 
 /// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
