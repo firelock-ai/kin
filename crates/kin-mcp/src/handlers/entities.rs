@@ -3811,8 +3811,175 @@ mod tests {
         assert!(mismatched["cross_repo"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("root mismatch")));
+        // A registered root the live graph has advanced past is stale authority,
+        // and the code says which condition held rather than leaving every spine
+        // gap wearing one label.
+        assert_eq!(mismatched["cross_repo"]["code"], SPINE_ROOT_STALE);
+        assert!(mismatched["negative"]["trust_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with(SPINE_ROOT_STALE)));
         assert_eq!(mismatched["negative"]["safe_to_conclude_absent"], false);
         assert!(mismatched["references"].as_array().unwrap().is_empty());
+    }
+
+    /// FIR-2353, second observation: a single-repo install whose repository the
+    /// spine never registered reported "spine root mismatch" as the reason a
+    /// local miss could not be trusted. Nothing had mismatched and nothing was
+    /// cross-repo, so the answer taught its reader to discount reason text. The
+    /// condition that actually held now names itself, and the word mismatch does
+    /// not appear.
+    #[tokio::test]
+    async fn an_unregistered_repository_reports_itself_rather_than_a_root_mismatch() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
+        let live_root = graph_root(&graph);
+
+        // A spine that exists and has never been told about this repository,
+        // which is the ordinary state of a fresh single-repo install.
+        let spine = kin_spine::InMemorySpineBackend::new();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = handle_find_references_with_authority(
+            &args,
+            &graph,
+            FindReferencesAuthority {
+                repo_id: "nk",
+                graph_root: &live_root,
+                spine: Some(&spine),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let response = parsed_response(&crate::finalize_with_envelope(
+            response,
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert_eq!(response["cross_repo"]["status"], "unavailable");
+        assert_eq!(response["cross_repo"]["code"], SPINE_REPO_UNREGISTERED);
+        let reason = response["cross_repo"]["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("mismatch"),
+            "an unregistered repository has nothing to mismatch: {reason}"
+        );
+        let trust_reason = response["negative"]["trust_reason"].as_str().unwrap();
+        assert!(
+            trust_reason.starts_with(SPINE_REPO_UNREGISTERED),
+            "the reason names the condition that held: {trust_reason}"
+        );
+        assert!(
+            !trust_reason.contains("mismatch"),
+            "and never the one that did not: {trust_reason}"
+        );
+    }
+
+    /// The FIR-2353 headline, end to end through the handler: a graph holding
+    /// entities and one intra-file call edge, healthy by every freshness signal,
+    /// answering for a symbol a sibling file calls. The answer is empty because
+    /// the graph holds no cross-file edge that could have carried the reference,
+    /// and the envelope has to say so rather than certify the symbol as unused.
+    #[tokio::test]
+    async fn find_references_on_an_intra_file_only_graph_refuses_to_certify_absence() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        let caller = make_entity("save_note", "nk/storage.rs");
+        let sibling = make_entity("write_bytes", "nk/storage.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+        // The extractor linked what it could see inside one file and nothing
+        // across files, which is the exact shape the isolated-install repro hit.
+        store
+            .upsert_relation(&make_relation(caller.id, sibling.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!([]),
+            "the observation is what makes the gap visible: {}",
+            response["edge_coverage"]
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], false,
+            "an agent acting on a true verdict here deletes live code: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "inconclusive");
+        // And the edge gap LEADS, ahead of the ambient path's own cross-repo
+        // binding gap, because it is the factor that limited this answer.
+        assert!(
+            trust_reason(&response).starts_with("cross_file_edges_absent"),
+            "{}",
+            trust_reason(&response)
+        );
+    }
+
+    /// The other half of the same claim, on the daemon authority path so nothing
+    /// but the edge coverage differs: one cross-file call edge and the identical
+    /// empty answer is certified again. A fix that made every absence
+    /// inconclusive would pass the test above and fail this one.
+    #[tokio::test]
+    async fn find_references_certifies_absence_once_the_graph_links_calls_across_files() {
+        let graph = InMemoryGraph::new();
+        let target = make_entity("parse_note", "nk/parsing.rs");
+        graph.upsert_entity(&target).unwrap();
+        seed_cross_file_call_witness(&graph);
+        let registered_root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo("nk", vec![spine_entry("nk", &target)], &registered_root);
+        spine.refresh_cross_repo_edges("nk", &[], &[], &["nk".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &graph,
+                FindReferencesAuthority {
+                    repo_id: "nk",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(response["references"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response["edge_coverage"]["cross_file_classes"],
+            serde_json::json!(["calls"])
+        );
+        assert_eq!(
+            response["negative"]["safe_to_conclude_absent"], true,
+            "a graph that links calls across files still earns absence: {}",
+            response["negative"]
+        );
+        assert_eq!(response["negative"]["trust"], "authoritative");
     }
 
     #[tokio::test]
