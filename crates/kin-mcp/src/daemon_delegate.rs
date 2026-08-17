@@ -2376,6 +2376,47 @@ mod tests {
     }
 
     #[test]
+    fn revival_carries_the_operator_background_embed_opt_out() {
+        // A daemon revived under an agent session is still the operator's
+        // machine. The opt-out decides whether opening a store starts a bulk
+        // accelerator pass, and this path spawns without a human watching, so
+        // the value has to travel with the spawn rather than be inherited from
+        // whatever the shim's environment happened to be.
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_DAEMON_AUTO_EMBED", "0");
+        let plan = mcp_spawn_plan(
+            std::path::PathBuf::from("/usr/bin/kin-daemon"),
+            std::path::PathBuf::from("/repo"),
+            None,
+        );
+        let carried = plan.command().get_envs().any(|(key, value)| {
+            key == "KIN_DAEMON_AUTO_EMBED"
+                && value.map(|value| value.to_string_lossy().into_owned())
+                    == Some("0".to_string())
+        });
+        assert!(
+            carried,
+            "the MCP revival spawn dropped the operator's background-embedding opt-out"
+        );
+    }
+
+    #[test]
+    fn revival_states_no_background_embed_choice_the_operator_did_not_make() {
+        let _env = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_AUTO_EMBED");
+        let plan = mcp_spawn_plan(
+            std::path::PathBuf::from("/usr/bin/kin-daemon"),
+            std::path::PathBuf::from("/repo"),
+            None,
+        );
+        assert!(
+            !plan
+                .command()
+                .get_envs()
+                .any(|(key, _)| key == "KIN_DAEMON_AUTO_EMBED"),
+            "the MCP revival spawn invented a background-embedding setting"
+        );
+    }
+
+    #[test]
     fn revival_reads_the_port_the_daemon_reported() {
         let dir = tempfile::tempdir().unwrap();
         // The port file is the handshake; nothing else names the port.
