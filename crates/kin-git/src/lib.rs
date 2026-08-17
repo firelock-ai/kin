@@ -53,7 +53,8 @@ pub use lossless::{
     LosslessGitRepository,
 };
 pub use preflight::{
-    preflight_git_migration, preflight_git_migration_after_publication, GitBranchTrackingFact,
+    preflight_git_migration, preflight_git_migration_after_publication, reprove_git_migration,
+    reprove_git_migration_after_publication, GitBranchTrackingFact,
     GitIndexPreflightProof, GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind,
     GitMigrationCompatibilityFacts, GitMigrationPreflightProof, GitRemoteConfigFact,
     GitRemoteMappingFacts, GitTrackedWorktreeProof, GitWorkspaceDivergence,
