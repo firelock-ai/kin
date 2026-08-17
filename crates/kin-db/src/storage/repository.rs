@@ -3262,13 +3262,46 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
     verify_workspace_admission(backend, current, replay, snapshot, metadata, transaction)?;
-    verify_native_change_admission(
-        backend,
-        current.authenticated_gitlinks(),
-        replay,
-        metadata,
-        transaction,
-    )
+    verify_native_change_admission(backend, current, replay, metadata, transaction)
+}
+
+/// The exclusion-rule generation that judges what a transaction introduces.
+///
+/// Exclusion rules apply forward. Newly proposed artifacts are judged by the
+/// policy generation that was already in force, never by the generation the
+/// same transaction publishes, because that successor policy is derived from
+/// the very tree it would be judging: `SharedAdmissionPolicy::derive_from_tree`
+/// reads the desired tree's own `.gitignore` and `.kinignore` blobs. A
+/// transaction that introduces a rule beside the untracked content that rule
+/// newly excludes therefore refuted itself, and refuted itself identically on
+/// every retry, because the rule file could never land. That is a livelock
+/// rather than a refusal, and it is what judging by the predecessor resolves.
+/// It is also what Git does: a new ignore rule does not reach back into what a
+/// repository already holds.
+///
+/// The generation in force before a workspace mutation is the pre-transaction
+/// state of that same workspace. A workspace this transaction creates has no
+/// earlier generation at all, so the policy it publishes is the only one that
+/// has ever applied to its content, and that policy judges it.
+///
+/// Two things deliberately stay at the successor generation. The frozen local
+/// overlay is host configuration the caller records rather than anything
+/// derived from the tree being judged, so it carries none of the circularity
+/// above. Sensitive-artifact allowances stay on
+/// `ArtifactAdmissionContext::policy`, because an allowance is an explicit
+/// per-path grant naming an exact content hash and the transaction that records
+/// one means to admit the artifact it approves.
+///
+/// Fail-loud is intact under the judging generation: content the rules already
+/// in force exclude still fails the whole transaction, and every later proposal
+/// is judged by the rule that just landed.
+fn judging_shared_policy<'a>(
+    previous_workspace: Option<&'a WorkspaceState>,
+    published: &'a SharedAdmissionPolicy,
+) -> &'a SharedAdmissionPolicy {
+    previous_workspace
+        .map(|previous| &previous.shared_admission_policy)
+        .unwrap_or(published)
 }
 
 fn verify_workspace_admission<B: StorageBackend + ?Sized>(
@@ -3292,11 +3325,16 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
                 mutation.workspace_id
             ))
         })?;
+    let previous_workspace = current
+        .metadata()
+        .workspaces
+        .iter()
+        .find(|candidate| candidate.workspace_id == workspace.workspace_id);
     let overlay = local_overlay_for_workspace(metadata, workspace)?;
     let matcher = resolve_admission_matcher(
         backend,
         &transaction.repository_id,
-        &workspace.shared_admission_policy,
+        judging_shared_policy(previous_workspace, &workspace.shared_admission_policy),
         overlay,
     )?;
 
@@ -3308,12 +3346,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     // transaction cannot authorize an arbitrary target.
     let authenticated_gitlinks = current.authenticated_gitlinks();
     let mut contextual_gitlinks = BTreeSet::new();
-    if let Some(previous) = current
-        .metadata()
-        .workspaces
-        .iter()
-        .find(|candidate| candidate.workspace_id == workspace.workspace_id)
-    {
+    if let Some(previous) = previous_workspace {
         tracked.extend(
             previous
                 .tree
@@ -3378,11 +3411,12 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
 
 fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     backend: &B,
-    authenticated_gitlinks: &BTreeSet<(ArtifactId, GitObjectId)>,
+    current: &RepositoryAuthorityState,
     replay: &SharedReplayGraph<'_>,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
+    let authenticated_gitlinks = current.authenticated_gitlinks();
     let native_changes = transaction
         .changes
         .iter()
@@ -3469,8 +3503,44 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 ))
             })?;
         let overlay = local_overlay_for_workspace(metadata, workspace)?;
+        let previous_workspace = current
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.workspace_id == workspace.workspace_id);
+        // The generation in force before this change is its first parent's, and
+        // a root change has no parent, so the workspace it is bound to supplies
+        // the one that was in force. See `judging_shared_policy`: a change that
+        // carries a new rule file is derived from the same tree the rule would
+        // judge, so judging it by its own generation is the FIR-2348 livelock.
+        let judging = change
+            .parents
+            .first()
+            .and_then(|parent| {
+                metadata
+                    .admission_policies
+                    .iter()
+                    .find(|resolved| resolved.change_id == *parent)
+            })
+            .and_then(|resolved| resolved.policy.as_ref())
+            .unwrap_or_else(|| judging_shared_policy(previous_workspace, policy));
         let matcher =
-            resolve_admission_matcher(backend, &transaction.repository_id, policy, overlay)?;
+            resolve_admission_matcher(backend, &transaction.repository_id, judging, overlay)?;
+        // An artifact the pre-transaction workspace already carried is already
+        // repository authority, exactly as `verify_workspace_admission` treats
+        // it. The parent comparison above cannot see that on its own: a change
+        // publishing an already-admitted workspace tree introduces every path
+        // its parent lacks, including paths an earlier generation admitted
+        // under the rules that were in force then.
+        let workspace_tracked = previous_workspace
+            .map(|previous| {
+                previous
+                    .tree
+                    .artifacts()
+                    .map(|artifact| artifact.artifact_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         for artifact in introduced {
             let gitlink_is_admitted = match artifact.entry {
                 TreeEntry::Gitlink { target } => {
@@ -3485,7 +3555,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 artifact,
                 ArtifactAdmissionContext {
                     policy,
-                    tracked: false,
+                    tracked: workspace_tracked.contains(&artifact.artifact_id),
                     gitlink_is_admitted,
                     label: &format!("native change {}", change.id),
                 },
@@ -3645,6 +3715,16 @@ struct ArtifactAdmissionContext<'a> {
     label: &'a str,
 }
 
+/// Judge one proposed artifact against the exact rules that bind it.
+///
+/// The two halves answer to different generations on purpose. `matcher` carries
+/// the exclusion rules that were in force BEFORE this transaction, which is the
+/// contract `judging_shared_policy` states and the reason a transaction can
+/// introduce an ignore rule at all. `context.policy` carries the successor's
+/// sensitive-artifact allowances, so a transaction that records an allowance
+/// admits the artifact it approves. Neither half is skipped: an artifact the
+/// standing rules exclude, and untracked sensitive content with no allowance,
+/// each fail the whole transaction.
 fn verify_artifact_admission<B: StorageBackend + ?Sized>(
     backend: &B,
     repository_id: &RepositoryId,
@@ -10373,6 +10453,404 @@ mod tests {
             .unwrap()
             .entry;
         assert_eq!(retained, TreeEntry::blob(next_hash, false));
+    }
+
+    /// One repository whose workspace is only ever advanced by host passes, the
+    /// way the daemon advances it.
+    ///
+    /// Every pass derives the successor shared policy from the desired tree
+    /// through the same `SharedAdmissionPolicy::derive_from_tree` the daemon
+    /// calls, so a pass that admits a `.gitignore` really does carry that rule
+    /// into the successor generation. Nothing here filters the proposal: the
+    /// caller-side prune lives in kin's walker, and what these tests are about
+    /// is what authority does with a proposal that still carries the paths a
+    /// brand-new rule names.
+    struct AmbientWorkspace {
+        manager: RepositoryAuthorityManager<MemoryBackend>,
+        lengths: BTreeMap<Hash256, u64>,
+        next_artifact: u128,
+    }
+
+    impl AmbientWorkspace {
+        fn start(operation: u128) -> Self {
+            let manager = initial_manager(Arc::new(MemoryBackend::default()));
+            let transaction = unborn_workspace_transaction(&manager, operation, 0x20, b"main");
+            manager.commit_repository_transaction(transaction).unwrap();
+            Self {
+                manager,
+                lengths: BTreeMap::new(),
+                next_artifact: 0x100,
+            }
+        }
+
+        fn workspace(&self) -> WorkspaceState {
+            self.manager.read_authority().metadata().workspaces[0].clone()
+        }
+
+        fn tree(&self) -> ResolvedTree {
+            self.workspace().tree
+        }
+
+        fn holds(&self, path: &str) -> bool {
+            self.tree()
+                .artifact_at_path(&RepoPath::from_utf8(path).unwrap())
+                .is_some()
+        }
+
+        fn rule_source_paths(&self) -> Vec<String> {
+            self.workspace()
+                .shared_admission_policy
+                .sources
+                .iter()
+                .map(|source| source.path.to_string())
+                .collect()
+        }
+
+        fn blob(&mut self, body: &[u8]) -> TreeEntry {
+            let hash = digest(body);
+            self.manager.save_source_blob(hash, body).unwrap();
+            self.lengths.insert(hash, body.len() as u64);
+            TreeEntry::blob(hash, false)
+        }
+
+        fn deltas(&mut self, paths: &[(&str, &[u8])]) -> Vec<TreeDelta> {
+            let tree = self.tree();
+            let mut deltas = Vec::new();
+            for (path, body) in paths {
+                let path = RepoPath::from_utf8(*path).unwrap();
+                let entry = self.blob(body);
+                match tree.artifact_at_path(&path) {
+                    Some(existing) => deltas.push(TreeDelta::Updated {
+                        artifact_id: existing.artifact_id,
+                        old: existing.located_entry(),
+                        new: LocatedEntry::new(path, entry),
+                    }),
+                    None => {
+                        self.next_artifact += 1;
+                        deltas.push(TreeDelta::Added {
+                            artifact_id: ArtifactId(Uuid::from_u128(self.next_artifact)),
+                            new: LocatedEntry::new(path, entry),
+                        });
+                    }
+                }
+            }
+            deltas
+        }
+
+        fn derive(
+            &self,
+            parent: Option<&SharedAdmissionPolicy>,
+            tree: &ResolvedTree,
+        ) -> (SharedAdmissionPolicy, Option<AdmissionPolicyDelta>) {
+            let lengths = self.lengths.clone();
+            SharedAdmissionPolicy::derive_from_tree(parent, tree, |hash| {
+                lengths.get(&hash).copied().ok_or_else(|| {
+                    ModelError::InvalidOperation(format!("fixture has no body length for {hash}"))
+                })
+            })
+            .unwrap()
+        }
+
+        /// One ambient pass: admit these host paths into the workspace tree.
+        fn pass(&mut self, operation: u128, paths: &[(&str, &[u8])]) -> Result<(), KinDbError> {
+            let current = self.workspace();
+            let deltas = self.deltas(paths);
+            let next_tree = current.tree.apply(&deltas).unwrap();
+            let (policy, _) = self.derive(Some(&current.shared_admission_policy), &next_tree);
+            let mutation = WorkspaceMutation {
+                workspace_id: current.workspace_id,
+                expected: WorkspaceExpectation::MustEqual {
+                    generation: current.generation,
+                    head: current.head.clone(),
+                    base_target: current.base_target.clone(),
+                    base_tree_hash: current.base_tree_hash,
+                    tree_hash: current.tree_hash,
+                    semantic_overlay_hash: current.semantic_overlay_hash,
+                    admission_policy: current.admission_policy,
+                },
+                new_generation: current.generation + 1,
+                new_head: current.head.clone(),
+                new_base_target: current.base_target.clone(),
+                new_base_tree_hash: current.base_tree_hash,
+                tree_deltas: deltas,
+                new_tree_hash: compute_resolved_tree_hash(&next_tree).unwrap(),
+                semantic_delta: WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: policy.clone(),
+                new_admission_policy: EffectiveAdmissionPolicyStamp {
+                    shared: policy.stamp(),
+                    local: current.admission_policy.local,
+                },
+            };
+            let mut transaction = transaction_shell(&self.manager, operation);
+            transaction.workspace_mutation = Some(mutation);
+            self.manager
+                .commit_repository_transaction(transaction)
+                .map(|_| ())
+        }
+
+        /// Publish the workspace tree as one Native change, admitting `paths` in
+        /// the same transaction the way a commit carrying its own tree admission
+        /// does.
+        fn commit(
+            &mut self,
+            operation: u128,
+            message: &str,
+            paths: &[(&str, &[u8])],
+        ) -> Result<(), KinDbError> {
+            let current = self.workspace();
+            let lease = self.manager.read_authority();
+            let parent = current
+                .base_target
+                .as_ref()
+                .map(|target| target_change_id(lease.metadata(), target).unwrap());
+            let parent_policy = parent.and_then(|change| {
+                lease
+                    .metadata()
+                    .admission_policies
+                    .iter()
+                    .find(|resolved| resolved.change_id == change)
+                    .and_then(|resolved| resolved.policy.clone())
+            });
+            let parent_tree = parent
+                .map(|change| {
+                    let mut replay = lease.snapshot().clone();
+                    replay.repository_authority = None;
+                    InMemoryGraph::from_snapshot_without_text_index(replay)
+                        .unwrap()
+                        .resolve_tree_at(&change)
+                        .unwrap()
+                })
+                .unwrap_or_default();
+            drop(lease);
+
+            let deltas = self.deltas(paths);
+            let next_tree = current.tree.apply(&deltas).unwrap();
+            let (policy, policy_delta) = self.derive(parent_policy.as_ref(), &next_tree);
+            let change_deltas = next_tree
+                .artifacts_by_path()
+                .filter(|artifact| parent_tree.get(&artifact.artifact_id) != Some(*artifact))
+                .map(|artifact| match parent_tree.get(&artifact.artifact_id) {
+                    Some(old) => TreeDelta::Updated {
+                        artifact_id: artifact.artifact_id,
+                        old: old.located_entry(),
+                        new: artifact.located_entry(),
+                    },
+                    None => TreeDelta::Added {
+                        artifact_id: artifact.artifact_id,
+                        new: artifact.located_entry(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut change = SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+                origin: ChangeOrigin::Native,
+                parents: parent.into_iter().collect(),
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("authority-test"),
+                message: message.to_string(),
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: change_deltas,
+                admission_policy_delta: policy_delta,
+                external_reference_deltas: Vec::new(),
+                projected_files: Vec::new(),
+                spec_link: None,
+                evidence: Vec::new(),
+                risk_summary: None,
+            };
+            change.id = compute_semantic_change_id(&change).unwrap();
+            let target = RefTarget::change(change.id);
+            let tree_hash = compute_resolved_tree_hash(&next_tree).unwrap();
+            let mutation = WorkspaceMutation {
+                workspace_id: current.workspace_id,
+                expected: WorkspaceExpectation::MustEqual {
+                    generation: current.generation,
+                    head: current.head.clone(),
+                    base_target: current.base_target.clone(),
+                    base_tree_hash: current.base_tree_hash,
+                    tree_hash: current.tree_hash,
+                    semantic_overlay_hash: current.semantic_overlay_hash,
+                    admission_policy: current.admission_policy,
+                },
+                new_generation: current.generation + 1,
+                new_head: current.head.clone(),
+                new_base_target: Some(target.clone()),
+                new_base_tree_hash: Some(tree_hash),
+                tree_deltas: deltas,
+                new_tree_hash: tree_hash,
+                semantic_delta: WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: policy.clone(),
+                new_admission_policy: EffectiveAdmissionPolicyStamp {
+                    shared: policy.stamp(),
+                    local: current.admission_policy.local,
+                },
+            };
+            let mut transaction = transaction_shell(&self.manager, operation);
+            transaction.changes.push(change);
+            transaction.ref_mutations.push(RefMutation {
+                name: RefName::branch(b"main").unwrap(),
+                expected: match current.base_target.clone() {
+                    Some(target) => RefExpectation::MustEqual { target },
+                    None => RefExpectation::MustNotExist,
+                },
+                new_target: Some(target),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            });
+            transaction.workspace_mutation = Some(mutation);
+            self.manager
+                .commit_repository_transaction(transaction)
+                .map(|_| ())
+        }
+    }
+
+    fn assert_policy_exclusion(error: &KinDbError, path: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains("excluded by the exact graph-owned admission policy")
+                && message.contains(path),
+            "expected a policy exclusion naming {path}, got: {message}"
+        );
+    }
+
+    /// The regression FIR-2346 found and deliberately did not pin, now asserting
+    /// the fixed outcome: one pass carries a new `.gitignore` and the untracked
+    /// content that rule newly excludes, and authority admits the whole pass.
+    #[test]
+    fn a_pass_that_introduces_an_ignore_rule_admits_what_the_rule_newly_excludes() {
+        let mut repo = AmbientWorkspace::start(0xa100);
+        repo.pass(0xa101, &[("src/lib.rs", b"pub fn kin() {}\n")])
+            .unwrap();
+        assert!(repo.rule_source_paths().is_empty());
+
+        repo.pass(
+            0xa102,
+            &[
+                (".gitignore", b".claude/\n"),
+                (".claude/lock", b"held\n"),
+                ("src/main.rs", b"fn main() {}\n"),
+            ],
+        )
+        .expect("a pass that introduces an ignore rule must not be judged by that rule");
+
+        assert!(repo.holds(".gitignore"), "the rule file itself must land");
+        assert!(
+            repo.holds(".claude/lock"),
+            "content the new rule newly excludes lands with the rule that excludes it"
+        );
+        assert!(
+            repo.holds("src/main.rs") && repo.holds("src/lib.rs"),
+            "every other file in the same pass lands too"
+        );
+        assert_eq!(
+            repo.rule_source_paths(),
+            vec![".gitignore".to_string()],
+            "the rule is in force from the next generation on"
+        );
+
+        // The rule is in force now, so a path it excludes that this generation
+        // never admitted fails loudly rather than silently. That is what kin's
+        // walker prunes before proposing, which is why the following pass
+        // proposes nothing under the new rule.
+        let error = repo
+            .pass(0xa103, &[(".claude/settings.json", b"{}\n")])
+            .expect_err("a newly proposed excluded path must still fail loudly");
+        assert_policy_exclusion(&error, ".claude/settings.json");
+
+        // And the pass the pruned walker actually produces admits, with the
+        // previously admitted excluded path still in the tree it re-verifies.
+        repo.pass(0xa104, &[("src/other.rs", b"pub fn other() {}\n")])
+            .expect("a pass proposing nothing under the new rule admits");
+        assert!(repo.holds(".claude/lock") && repo.holds("src/other.rs"));
+    }
+
+    /// The same forward reading in the other direction: removing a rule takes
+    /// effect from the next generation, so the pass that removes it lands and
+    /// the pass after that admits what the rule used to exclude.
+    #[test]
+    fn removing_an_ignore_rule_un_excludes_content_for_the_next_pass() {
+        let mut repo = AmbientWorkspace::start(0xb100);
+        repo.pass(
+            0xb101,
+            &[
+                (".gitignore", b"build/\n"),
+                ("src/lib.rs", b"pub fn kin() {}\n"),
+            ],
+        )
+        .unwrap();
+
+        let error = repo
+            .pass(0xb102, &[("build/output.bin", b"binary\n")])
+            .expect_err("the rule in force must exclude a newly proposed path under it");
+        assert_policy_exclusion(&error, "build/output.bin");
+
+        // Dropping the rule and admitting the content it excluded in one pass is
+        // judged by the rule still in force. kin's walker never proposes that
+        // pair, because it prunes against the same generation authority judges
+        // by, so the removal lands on its own first.
+        let error = repo
+            .pass(
+                0xb103,
+                &[
+                    (".gitignore", b"# nothing ignored\n"),
+                    ("build/output.bin", b"binary\n"),
+                ],
+            )
+            .expect_err("a rule removal does not retroactively admit in its own pass");
+        assert_policy_exclusion(&error, "build/output.bin");
+
+        repo.pass(0xb104, &[(".gitignore", b"# nothing ignored\n")])
+            .expect("the rule removal lands on its own");
+        repo.pass(0xb105, &[("build/output.bin", b"binary\n")])
+            .expect("the next pass admits what the removed rule used to exclude");
+        assert!(repo.holds("build/output.bin"));
+    }
+
+    /// A commit is judged the same way, or the workspace would admit a tree no
+    /// change could ever publish.
+    #[test]
+    fn a_native_change_is_judged_by_the_generation_in_force_before_it() {
+        let mut repo = AmbientWorkspace::start(0xc100);
+        repo.pass(
+            0xc101,
+            &[
+                (".gitignore", b".claude/\n"),
+                (".claude/lock", b"held\n"),
+                ("src/lib.rs", b"pub fn kin() {}\n"),
+            ],
+        )
+        .unwrap();
+
+        // A root change publishing the admitted workspace tree introduces every
+        // path its absent parent lacks. Those paths are already repository
+        // authority, so the rule the workspace now carries does not re-judge
+        // them.
+        repo.commit(0xc102, "publish the admitted workspace tree", &[])
+            .expect("a change may publish a tree an earlier generation admitted");
+        assert!(repo.holds(".claude/lock") && repo.holds(".gitignore"));
+
+        // A commit that admits its own tree carries the same shape as a pass: a
+        // new rule beside the content it newly excludes, judged by the parent
+        // generation.
+        repo.commit(
+            0xc103,
+            "ignore logs while admitting one",
+            &[
+                (".gitignore", b".claude/\nlogs/\n"),
+                ("logs/today.log", b"line\n"),
+            ],
+        )
+        .expect("a change that introduces an ignore rule must not be judged by that rule");
+        assert!(repo.holds("logs/today.log"));
+
+        // Fail-loud survives: the rule is in force for the next commit.
+        let error = repo
+            .commit(
+                0xc104,
+                "admit an excluded log",
+                &[("logs/old.log", b"line\n")],
+            )
+            .expect_err("a newly introduced excluded path must still fail the change");
+        assert_policy_exclusion(&error, "logs/old.log");
     }
 
     #[test]
