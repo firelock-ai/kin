@@ -11084,14 +11084,47 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Block until `pid` has terminated, leaving it unreaped.
+    ///
+    /// `WNOWAIT` is what makes this a synchronization point rather than a
+    /// substitute for the code under test: it returns exactly when the child
+    /// becomes reapable and leaves it in that state, so the classifier's own
+    /// `try_wait` is still the call that observes the corpse and reaps it.
+    /// Anything that consumed the child here, including a plain `wait`, would
+    /// leave the classifier reading a cached status down a branch the daemon
+    /// path never takes.
+    #[cfg(unix)]
+    fn block_until_terminated_leaving_it_reapable(pid: u32) {
+        let pid = libc::pid_t::try_from(pid).expect("a pid we spawned fits pid_t");
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if observed == 0 {
+                return;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EINTR),
+                "a child we spawned must stay observable until we reap it: {error}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_daemon_that_already_exited_is_reaped() {
         let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn a child that exits immediately");
-        // Let it actually exit before classifying.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        block_until_terminated_leaving_it_reapable(child.id());
 
         let disposition = kin_daemon_spawn::startup_disposition(&mut child)
             .expect("a child we spawned is observable");
