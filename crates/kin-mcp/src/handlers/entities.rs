@@ -2446,8 +2446,18 @@ by entity_id or by exact name. Reach for it when you need to follow a path \"wha
 this call, and what do those call?\" or \"trace this value back to its source\" and want \
 the chain in traversal order, not a bag of neighbors. Its value is that the whole walk \
 happens substrate-side and comes back as one structured response, so you don't loop \
-get_entity_source per hop and exhaust your tool-call budget. Tune depth and \
-limit_per_step to control breadth; results flag when they were truncated. \
+get_entity_source per hop and exhaust your tool-call budget. Ask for the chain's SHAPE with \
+include_body=false (names, kinds, roles, spans, edges, no source) — that is the cheap call, and \
+the one to reach for unless you mean to read the code. The response bounds its own size \
+(max_response_chars) and cuts bodies before edges, so it is never refused for being too large; \
+any cut is reported in `degradations` with the numbers. Tune depth and limit_per_step to control \
+breadth: the per-step cap keeps the most relevant neighbors (located over file-less, source over \
+test, Calls over Imports over References, the expanded node's own file first) rather than \
+whatever order the relation table returned, and any node whose fan-out was cut carries \
+`fanout_truncated` with `fanout_dropped`, listed together under `clipped_steps`, so you can \
+re-query exactly that node with a wider limit_per_step. Every step reports the same keys: a \
+symbol the graph owns no file for carries explicit nulls plus `external: true` rather than a \
+shorter record, and one symbol never appears both located and file-less in one response. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the direction that was walked, so an empty 'callers' result is \
@@ -2458,6 +2468,140 @@ resolution miss rather than reporting an empty chain. \
 Each step carries `resolution` for the edge that reached it: `type_resolved`, \
 `import_scoped`, or `name_only`. A chain is only as trustworthy as its weakest hop, so a \
 `name_only` step means the flow it claims may not exist at all.";
+
+/// One node of a trace walk, carrying the file and directory its fan-out is
+/// scored against.
+///
+/// Relevance is measured against the node being EXPANDED rather than the focal:
+/// at depth 3 the focal's directory says nothing about which of a distant node's
+/// callees continue the chain.
+struct TraceFrontierNode {
+    /// Step index of this node; `0` is the focal.
+    step: usize,
+    id: kin_model::ids::EntityId,
+    depth: usize,
+    file: Option<String>,
+    dir: Option<String>,
+}
+
+impl TraceFrontierNode {
+    fn at(step: usize, depth: usize, entity: &kin_model::entity::Entity) -> Self {
+        Self {
+            step,
+            id: entity.id,
+            depth,
+            file: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            dir: kin_ranking::entity_ranking::entity_directory(entity),
+        }
+    }
+
+    fn rooted(entity: &kin_model::entity::Entity) -> Self {
+        Self::at(0, 0, entity)
+    }
+}
+
+/// One neighbor a node offers, before the per-step cap decides whether it is
+/// kept.
+struct TraceFanoutCandidate {
+    entity: kin_model::entity::Entity,
+    role: &'static str,
+    relation_kind: RelationKind,
+    confidence: f32,
+    /// Classification of the edge this candidate is currently described by.
+    /// It moves with `relation_kind` and `confidence` when a stronger edge to
+    /// the same neighbor replaces them, so the step reports what the edge it
+    /// names actually proved.
+    resolution: RelationResolution,
+}
+
+/// Order one side of a node's fan-out by relevance, most relevant first, with
+/// name and id tiebreaks so the same store returns the same chain every run.
+fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFrontierNode) {
+    candidates.sort_by(|left, right| {
+        let left_score = trace_fanout_score(
+            &left.entity,
+            left.relation_kind,
+            node.file.as_deref(),
+            node.dir.as_deref(),
+            left.confidence,
+        );
+        let right_score = trace_fanout_score(
+            &right.entity,
+            right.relation_kind,
+            node.file.as_deref(),
+            node.dir.as_deref(),
+            right.confidence,
+        );
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left.entity.name.cmp(&right.entity.name))
+            .then_with(|| left.entity.id.0.cmp(&right.entity.id.0))
+    });
+}
+
+/// The one record shape every entity in a trace is reported in: the same keys
+/// whether the graph owns a location for the symbol or holds it only as a
+/// reference target, with explicit nulls and an `external` marker instead of a
+/// shorter object.
+///
+/// This arm serves no bodies — it answers from a generic graph store with no
+/// repository authority to project source through — so `body` is null on every
+/// record here and `bodies_included` on the response says so.
+fn trace_entity_value(entity: &kin_model::entity::Entity) -> serde_json::Value {
+    let (start_line, end_line) = match entity.span.as_ref() {
+        Some(span) => {
+            let (start, end) = presentation_span_lines(span);
+            (Some(start), Some(end))
+        }
+        None => (None, None),
+    };
+    serde_json::json!({
+        "entity_id": entity.id.to_string(),
+        "entity_name": entity.name.clone(),
+        "entity_kind": format!("{:?}", entity.kind),
+        "entity_role": format!("{:?}", entity.role).to_lowercase(),
+        "entity_file": entity.file_origin.as_ref().map(|path| path.to_string()),
+        "external": trace_entity_is_external(entity),
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+        "body": serde_json::Value::Null,
+        "span_coherence": serde_json::Value::Null,
+    })
+}
+
+/// One chain step: its edge, its depth, its entity record, and its own fan-out
+/// truncation, flat so every step carries one key set.
+fn trace_step_value(
+    step: usize,
+    role: &str,
+    relation_kind: &str,
+    resolution: &str,
+    parent_step: usize,
+    depth: usize,
+    entity: &kin_model::entity::Entity,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "step": step,
+        "role": role,
+        "relation_kind": relation_kind,
+        // How the edge INTO this step was resolved. A chain is only as
+        // trustworthy as its weakest hop, and a `name_only` hop means the flow
+        // may not exist at all.
+        "resolution": resolution,
+        "parent_step": parent_step,
+        "depth": depth,
+        "fanout_truncated": false,
+        "fanout_dropped": 0,
+    });
+    let record = trace_entity_value(entity);
+    if let (Some(target), Some(source)) = (value.as_object_mut(), record.as_object()) {
+        for (key, entry) in source {
+            target.insert(key.clone(), entry.clone());
+        }
+    }
+    value
+}
 
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
@@ -2533,23 +2677,40 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let mut visited: std::collections::HashSet<kin_model::ids::EntityId> =
         std::collections::HashSet::new();
     visited.insert(focal_entity.id);
+    // Which step already stands for a symbol NAME, so an import alias and the
+    // function it aliases never arrive as two identities for one symbol. Seeded
+    // with the focal only when the graph owns a file for it.
+    let mut name_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    if focal_entity.file_origin.is_some() {
+        name_index.insert(focal_entity.name.clone(), 0);
+    }
+    let mut external_identities_merged = 0usize;
+    let mut clipped_steps: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
 
-    let mut frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = vec![(0, focal_entity.id, 0)];
+    // Frontier: (step, entity, depth, file, dir) — the expanded node's own
+    // location travels with it, because relevance is scored against the node
+    // being expanded rather than against the focal.
+    let mut frontier: Vec<TraceFrontierNode> = vec![TraceFrontierNode::rooted(&focal_entity)];
 
     while !frontier.is_empty() {
-        let mut next_frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = Vec::new();
-        for (parent_step, parent_id, parent_depth) in frontier.drain(..) {
-            if parent_depth >= depth {
+        let mut next_frontier: Vec<TraceFrontierNode> = Vec::new();
+        for node in frontier.drain(..) {
+            if node.depth >= depth {
                 continue;
             }
             let relations = store
-                .get_all_relations_for_entity(&parent_id)
+                .get_all_relations_for_entity(&node.id)
                 .map_err(McpError::graph)?;
-            // Independent per-direction budgets so `direction=both` doesn't
-            // starve one side when relations are emitted in either order.
-            let mut callee_count = 0usize;
-            let mut caller_count = 0usize;
+            // Every neighbor is collected before any is kept: a per-step cap is
+            // a choice between candidates, and a loop that admits as it reads
+            // keeps whatever the relation table listed first.
+            let mut candidates: Vec<TraceFanoutCandidate> = Vec::new();
+            let mut candidate_index: std::collections::HashMap<
+                (kin_model::ids::EntityId, &'static str),
+                usize,
+            > = std::collections::HashMap::new();
             for rel in &relations {
                 if !allowed.contains(&rel.kind) {
                     continue;
@@ -2560,66 +2721,164 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     _ => None,
                 };
                 let (next_id, role) = if want_callees
-                    && src_entity == Some(parent_id)
+                    && src_entity == Some(node.id)
                     && dst_entity.is_some()
-                    && dst_entity != Some(parent_id)
+                    && dst_entity != Some(node.id)
                 {
                     (dst_entity.unwrap(), "callee")
                 } else if want_callers
-                    && dst_entity == Some(parent_id)
+                    && dst_entity == Some(node.id)
                     && src_entity.is_some()
-                    && src_entity != Some(parent_id)
+                    && src_entity != Some(node.id)
                 {
                     (src_entity.unwrap(), "caller")
                 } else {
                     continue;
                 };
 
-                if role == "callee" && callee_count >= limit_per_step {
-                    truncated = true;
-                    continue;
-                }
-                if role == "caller" && caller_count >= limit_per_step {
-                    truncated = true;
+                // Already in the chain by another edge: not a candidate, and not
+                // a drop either.
+                if visited.contains(&next_id) {
                     continue;
                 }
 
-                if !visited.insert(next_id) {
-                    continue;
+                match candidate_index.get(&(next_id, role)) {
+                    Some(&existing) => {
+                        let candidate: &mut TraceFanoutCandidate = &mut candidates[existing];
+                        let stronger = trace_relation_rank(rel.kind)
+                            > trace_relation_rank(candidate.relation_kind)
+                            || (rel.kind == candidate.relation_kind
+                                && rel.confidence > candidate.confidence);
+                        if stronger {
+                            candidate.relation_kind = rel.kind;
+                            candidate.confidence = rel.confidence;
+                            candidate.resolution = RelationResolution::of(rel);
+                        }
+                    }
+                    None => {
+                        let Some(entity) = store.get_entity(&next_id).map_err(McpError::graph)?
+                        else {
+                            continue;
+                        };
+                        candidate_index.insert((next_id, role), candidates.len());
+                        candidates.push(TraceFanoutCandidate {
+                            entity,
+                            role,
+                            relation_kind: rel.kind,
+                            confidence: rel.confidence,
+                            resolution: RelationResolution::of(rel),
+                        });
+                    }
                 }
-                if role == "callee" {
-                    callee_count += 1;
+            }
+
+            // Independent per-direction budgets so `direction=both` doesn't
+            // starve one side when relations are emitted in either order.
+            let (mut callees, mut callers): (
+                Vec<TraceFanoutCandidate>,
+                Vec<TraceFanoutCandidate>,
+            ) = candidates.into_iter().partition(|c| c.role == "callee");
+            sort_trace_candidates(&mut callees, &node);
+            sort_trace_candidates(&mut callers, &node);
+            let dropped_callees = callees.len().saturating_sub(limit_per_step);
+            let dropped_callers = callers.len().saturating_sub(limit_per_step);
+            callees.truncate(limit_per_step);
+            callers.truncate(limit_per_step);
+
+            if dropped_callees + dropped_callers > 0 {
+                truncated = true;
+                let dropped = dropped_callees + dropped_callers;
+                let (entity_id, entity_name) = if node.step == 0 {
+                    (focal_entity.id.to_string(), focal_entity.name.clone())
                 } else {
-                    caller_count += 1;
-                }
+                    let step = &mut chain[node.step - 1];
+                    step["fanout_truncated"] = serde_json::Value::Bool(true);
+                    let already = step["fanout_dropped"].as_u64().unwrap_or(0);
+                    step["fanout_dropped"] =
+                        serde_json::Value::from(already.saturating_add(dropped as u64));
+                    (
+                        step["entity_id"].as_str().unwrap_or_default().to_string(),
+                        step["entity_name"].as_str().unwrap_or_default().to_string(),
+                    )
+                };
+                clipped_steps.push(serde_json::json!({
+                    "step": node.step,
+                    "entity_id": entity_id,
+                    "entity_name": entity_name,
+                    "dropped_callees": dropped_callees,
+                    "dropped_callers": dropped_callers,
+                    "limit_per_step": limit_per_step,
+                }));
+            }
+
+            for candidate in callees.into_iter().chain(callers) {
                 if chain.len() >= MAX_TOTAL_STEPS {
                     truncated = true;
                     break;
                 }
-                let next_entity = match store.get_entity(&next_id).map_err(McpError::graph)? {
-                    Some(entity) => entity,
-                    None => continue,
-                };
-                let next_depth = parent_depth + 1;
+                let candidate_external = trace_entity_is_external(&candidate.entity);
+                if let Some(&existing) = name_index.get(candidate.entity.name.as_str()) {
+                    let existing_external = existing > 0
+                        && chain[existing - 1]["external"].as_bool().unwrap_or(false);
+                    if candidate_external {
+                        visited.insert(candidate.entity.id);
+                        external_identities_merged += 1;
+                        continue;
+                    }
+                    if existing_external {
+                        // Fill the placeholder in with the record the graph owns,
+                        // rather than admitting one symbol under two identities.
+                        let promoted_depth =
+                            chain[existing - 1]["depth"].as_u64().unwrap_or(0) as usize;
+                        let promoted = trace_step_value(
+                            existing,
+                            chain[existing - 1]["role"].as_str().unwrap_or("callee"),
+                            chain[existing - 1]["relation_kind"]
+                                .as_str()
+                                .unwrap_or("Calls"),
+                            chain[existing - 1]["resolution"]
+                                .as_str()
+                                .unwrap_or_else(|| RelationResolution::NameOnly.as_str()),
+                            chain[existing - 1]["parent_step"].as_u64().unwrap_or(0) as usize,
+                            promoted_depth,
+                            &candidate.entity,
+                        );
+                        chain[existing - 1] = promoted;
+                        visited.insert(candidate.entity.id);
+                        external_identities_merged += 1;
+                        if promoted_depth < depth {
+                            next_frontier.push(TraceFrontierNode::at(
+                                existing,
+                                promoted_depth,
+                                &candidate.entity,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                if !visited.insert(candidate.entity.id) {
+                    continue;
+                }
+                let next_depth = node.depth + 1;
                 let step_index = chain.len() + 1;
-                chain.push(serde_json::json!({
-                    "step": step_index,
-                    "role": role,
-                    "relation_kind": format!("{:?}", rel.kind),
-                    // How the edge INTO this step was resolved. A chain is only
-                    // as trustworthy as its weakest hop, and a `name_only` hop
-                    // means the flow may not exist at all.
-                    "resolution": RelationResolution::of(&rel).as_str(),
-                    "parent_step": parent_step,
-                    "depth": next_depth,
-                    "entity_id": next_entity.id.to_string(),
-                    "entity_name": next_entity.name,
-                    "entity_kind": format!("{:?}", next_entity.kind),
-                    "entity_file": next_entity.file_origin.as_ref().map(|p| p.to_string()),
-                    "signature": (!next_entity.signature.is_empty()).then_some(next_entity.signature),
-                }));
+                name_index
+                    .entry(candidate.entity.name.clone())
+                    .or_insert(step_index);
+                chain.push(trace_step_value(
+                    step_index,
+                    candidate.role,
+                    &format!("{:?}", candidate.relation_kind),
+                    candidate.resolution.as_str(),
+                    node.step,
+                    next_depth,
+                    &candidate.entity,
+                ));
                 if next_depth < depth {
-                    next_frontier.push((step_index, next_id, next_depth));
+                    next_frontier.push(TraceFrontierNode::at(
+                        step_index,
+                        next_depth,
+                        &candidate.entity,
+                    ));
                 }
             }
             if chain.len() >= MAX_TOTAL_STEPS {
@@ -2648,11 +2907,17 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     });
     let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
-        "focal_name": focal_entity.name,
+        "focal_name": focal_entity.name.clone(),
         "focal_kind": format!("{:?}", focal_entity.kind),
         "focal_file": focal_entity.file_origin.as_ref().map(|p| p.to_string()),
+        "focal_entity": trace_entity_value(&focal_entity),
         "direction": direction,
         "depth": depth,
+        "limit_per_step": limit_per_step,
+        // This arm reads no bodies at all: it answers from a generic graph store,
+        // with no repository authority to project source through. Stating it
+        // keeps `include_body` from reading as honoured here.
+        "bodies_included": false,
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
@@ -2663,6 +2928,12 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     });
     if let Some(edge_coverage) = edge_coverage {
         result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    }
+    if !clipped_steps.is_empty() {
+        result["clipped_steps"] = serde_json::Value::Array(clipped_steps);
+    }
+    if external_identities_merged > 0 {
+        result["external_identities_merged"] = serde_json::Value::from(external_identities_merged);
     }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;

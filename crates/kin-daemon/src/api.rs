@@ -8179,6 +8179,26 @@ async fn mcp_tools_call(
             .get("direction")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string());
+        // `compact: true` is the same request as `include_body: false`, and an
+        // agent that learned the spelling from another tool here should not get a
+        // 228k-character response because it used that one. An explicit
+        // `include_body` wins, so the two can never disagree silently.
+        let include_body = request
+            .arguments
+            .get("include_body")
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                request
+                    .arguments
+                    .get("compact")
+                    .and_then(serde_json::Value::as_bool)
+                    .map(|compact| !compact)
+            });
+        let max_response_chars = request
+            .arguments
+            .get("max_response_chars")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
         let Some(focal) = focal else {
             return Ok(Json(kin_mcp::ToolCallResult::error(
                 "missing required parameter: focal".to_string(),
@@ -8208,6 +8228,8 @@ async fn mcp_tools_call(
             depth,
             direction: parsed_direction,
             limit_per_step,
+            include_body,
+            max_response_chars,
         };
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,

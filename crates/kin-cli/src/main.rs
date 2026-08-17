@@ -506,6 +506,14 @@ enum Command {
         /// Max relations expanded per step (default 5, capped at 25).
         #[arg(long = "limit-per-step", value_name = "M")]
         limit_per_step: Option<usize>,
+        /// Return the chain's shape — names, kinds, roles, spans, edges —
+        /// without inlining any source body.
+        #[arg(long = "no-bodies", default_value_t = false)]
+        no_bodies: bool,
+        /// Serialized characters this response may occupy before the tool cuts
+        /// bodies, and then steps, to fit (default 80000).
+        #[arg(long = "max-response-chars", value_name = "C")]
+        max_response_chars: Option<usize>,
     },
     /// Show this repository's recorded cross-repo dependencies
     Deps {
@@ -2870,9 +2878,18 @@ fn main() -> Result<()> {
                     depth,
                     direction,
                     limit_per_step,
+                    no_bodies,
+                    max_response_chars,
                 } => {
-                    commands::trace_data_flow::run_seeded(focal, depth, direction, limit_per_step)
-                        .await
+                    commands::trace_data_flow::run_seeded(
+                        focal,
+                        depth,
+                        direction,
+                        limit_per_step,
+                        no_bodies.then_some(false),
+                        max_response_chars,
+                    )
+                    .await
                 }
                 Command::Deps { all, json } => commands::deps::run(all, json).await,
                 Command::Xref { entity } => commands::xref::run(entity).await,
