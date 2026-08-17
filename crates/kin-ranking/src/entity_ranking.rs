@@ -288,6 +288,106 @@ pub fn trace_callee_score(
     )
 }
 
+/// True when the graph holds this entity as a reference target it owns no
+/// location for: an imported symbol another repository defines, a builtin, or an
+/// import alias the extractor split off the definition.
+///
+/// Keyed on the file origin rather than on [`EntityRole::External`], because the
+/// two disagree in both directions and only the file decides what a caller can
+/// do with the record. A vendored dependency's entities are `External` by role
+/// and carry real files, so they are addressable; the file-less placeholders
+/// measured in a converted Python repository were `Module`-kinded with the
+/// default `Source` role. A record with no file has no span, so no body, no
+/// line, and nothing to open.
+pub fn trace_entity_is_external(entity: &Entity) -> bool {
+    entity.file_origin.is_none()
+}
+
+/// How much a role earns a scarce fan-out slot when a step has more candidates
+/// than it may keep.
+///
+/// Test code is not noise, but a per-step cap is a choice between candidates,
+/// and a caller asking what a function calls means its production callees before
+/// the harness that exercises them. Measured on a converted `psf/requests`: the
+/// six-wide caller cap on `HTTPAdapter.send` kept five `TestRequests` methods
+/// and a test server while dropping `Session.send` and
+/// `HTTPDigestAuth.handle_401`, the only two real callers, so the same graph
+/// answered "who calls this" with five tests or two source functions depending
+/// on which tool trimmed what.
+fn trace_role_rank(role: &EntityRole) -> usize {
+    match role {
+        EntityRole::Source => 4,
+        EntityRole::Vendored | EntityRole::External => 3,
+        EntityRole::Generated => 2,
+        EntityRole::Test => 1,
+        EntityRole::Docs => 0,
+    }
+}
+
+/// The comparable relevance key for one fan-out candidate. Higher is kept.
+pub type TraceFanoutScore = (
+    bool,
+    usize,
+    usize,
+    bool,
+    bool,
+    usize,
+    u32,
+    std::cmp::Reverse<usize>,
+);
+
+/// Relevance of one candidate against the other candidates of the SAME step, so
+/// a per-step cap keeps the chain rather than whatever order the relation table
+/// happened to return.
+///
+/// Compared as a tuple, most significant first:
+/// 1. the graph holds a location for it (a file-less placeholder never takes a
+///    slot from a symbol a caller can open)
+/// 2. role rank (source over test; see [`trace_role_rank`])
+/// 3. relation rank (Calls over Imports over References)
+/// 4. declared in the same FILE as the node being expanded
+/// 5. declared in the same DIRECTORY as it
+/// 6. declaration kind rank (functions and methods over constants)
+/// 7. the edge's own confidence
+/// 8. shorter name, which only ever breaks a tie the seven signals above left
+///
+/// `parent_file` and `parent_dir` describe the node whose fan-out is being cut,
+/// not the focal: locality is what makes a chain readable, and at depth 3 the
+/// focal's directory says nothing about which of a distant node's callees
+/// continue the path. On the measured trace this is the signal that decides:
+/// `resolve_redirects` dropped `get_redirect_target` and `rebuild_method`, both
+/// in its own file, in favour of `SupportsRead.read` and `HTTPAdapter.close`.
+pub fn trace_fanout_score(
+    entity: &Entity,
+    relation_kind: RelationKind,
+    parent_file: Option<&str>,
+    parent_dir: Option<&str>,
+    confidence: f32,
+) -> TraceFanoutScore {
+    let same_file = parent_file
+        .zip(entity.file_origin.as_ref())
+        .map(|(parent, file)| parent == file.0.as_str())
+        .unwrap_or(false);
+    let same_dir = parent_dir
+        .zip(entity_directory(entity).as_deref())
+        .map(|(parent, dir)| parent == dir)
+        .unwrap_or(false);
+    // Quantized because the key is compared with `Ord` and `f32` is not. Three
+    // decimals keep every confidence the graph records distinguishable while
+    // staying immune to the last-bit noise of a float that was multiplied out.
+    let confidence = (confidence.clamp(0.0, 1.0) * 1000.0).round() as u32;
+    (
+        !trace_entity_is_external(entity),
+        trace_role_rank(&entity.role),
+        trace_relation_rank(relation_kind),
+        same_file,
+        same_dir,
+        declaration_kind_rank(&entity.kind),
+        confidence,
+        std::cmp::Reverse(entity.name.len()),
+    )
+}
+
 /// Compute a composite score for trace constant selection.
 pub fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, bool, usize) {
     let same_dir = focal_dir
@@ -387,6 +487,122 @@ mod tests {
         let rels = vec![relation(RelationKind::Calls, caller, method)];
         assert_eq!(containing_owner_id(&method, &rels), None);
         assert_eq!(containing_owner_id(&method, &[]), None);
+    }
+
+    fn fanout_entity(name: &str, file: Option<&str>) -> Entity {
+        use kin_model::entity::{EntityMetadata, FingerprintAlgorithm, SemanticFingerprint};
+        use kin_model::ids::{FilePathId, Hash256, LanguageId};
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: file.map(FilePathId::new),
+            span: None,
+            signature: format!("def {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn score(entity: &Entity) -> TraceFanoutScore {
+        trace_fanout_score(
+            entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+        )
+    }
+
+    #[test]
+    fn a_located_callee_outranks_a_file_less_placeholder() {
+        let admitted = fanout_entity("get_redirect_target", Some("src/requests/sessions.py"));
+        let placeholder = fanout_entity("urljoin", None);
+        assert!(trace_entity_is_external(&placeholder));
+        assert!(!trace_entity_is_external(&admitted));
+        assert!(score(&admitted) > score(&placeholder));
+    }
+
+    #[test]
+    fn a_source_callee_outranks_a_test_one() {
+        let source = fanout_entity("Session.send", Some("src/requests/sessions.py"));
+        let mut test = fanout_entity("TestRequests.test_send", Some("tests/test_requests.py"));
+        test.role = EntityRole::Test;
+        assert!(score(&source) > score(&test));
+    }
+
+    #[test]
+    fn a_callee_in_the_expanded_node_s_own_file_outranks_a_distant_one() {
+        // The measured inversion: `resolve_redirects` kept `HTTPAdapter.close`
+        // (adapters.py) and dropped `rebuild_method`, which sits beside it.
+        let neighbour = fanout_entity("rebuild_method", Some("src/requests/sessions.py"));
+        let distant = fanout_entity("HTTPAdapter.close", Some("src/requests/adapters.py"));
+        assert!(score(&neighbour) > score(&distant));
+    }
+
+    #[test]
+    fn a_call_edge_outranks_a_reference_edge_to_the_same_kind_of_callee() {
+        let entity = fanout_entity("rebuild_proxies", Some("src/requests/sessions.py"));
+        let called = trace_fanout_score(
+            &entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+        );
+        let referenced = trace_fanout_score(
+            &entity,
+            RelationKind::References,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+        );
+        assert!(called > referenced);
+    }
+
+    #[test]
+    fn a_more_confident_edge_outranks_a_guessed_one() {
+        let entity = fanout_entity("rebuild_auth", Some("src/requests/sessions.py"));
+        let certain = trace_fanout_score(
+            &entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            1.0,
+        );
+        let guessed = trace_fanout_score(
+            &entity,
+            RelationKind::Calls,
+            Some("src/requests/sessions.py"),
+            Some("src/requests"),
+            0.4,
+        );
+        assert!(certain > guessed);
+    }
+
+    /// A vendored dependency carries real files, so it is addressable and must
+    /// not be scored as a placeholder the way a file-less import alias is.
+    #[test]
+    fn a_vendored_entity_with_a_file_is_not_external() {
+        let mut vendored = fanout_entity("urllib3.connectionpool", Some("vendor/urllib3/pool.py"));
+        vendored.role = EntityRole::External;
+        assert!(!trace_entity_is_external(&vendored));
+        let placeholder = fanout_entity("urllib3.connectionpool", None);
+        assert!(score(&vendored) > score(&placeholder));
     }
 
     #[test]
