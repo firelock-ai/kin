@@ -1278,6 +1278,18 @@ pub struct DaemonState {
     /// so it is pre-existing content rather than something ambient observation
     /// saw arrive, however late the watcher event naming it drains.
     pub retired_graph_only_members: crate::graph_only_members::RetiredGraphOnlyMembers,
+    /// Commits inside this daemon right now. The ambient reconcile tick reads it
+    /// to avoid publishing a repository-authority successor for a working copy a
+    /// commit is already on its way to admit and publish itself.
+    pub(crate) pending_commits: crate::pending_commits::PendingCommits,
+    /// How long this daemon's last exact-tree publication took, in microseconds,
+    /// or zero when it has not published one yet.
+    ///
+    /// Read by the reconcile tick to size how long it is worth holding off for
+    /// an imminent commit: the wait is only ever worth a fraction of the
+    /// publication it might save, and that publication is O(store), so its cost
+    /// is measured rather than assumed.
+    last_authority_publication_micros: AtomicU64,
     /// True when the background embedding worker has permanently stopped (it
     /// exhausted its consecutive-panic budget). The graph/locate/reconcile
     /// surfaces keep serving — embeddings are a DERIVED index — but the vector
@@ -2299,6 +2311,8 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             retired_graph_only_members: Default::default(),
+            pending_commits: Default::default(),
+            last_authority_publication_micros: AtomicU64::new(0),
             embed_worker_failed: AtomicBool::new(false),
             derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
@@ -2518,6 +2532,8 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             retired_graph_only_members: Default::default(),
+            pending_commits: Default::default(),
+            last_authority_publication_micros: AtomicU64::new(0),
             embed_worker_failed: AtomicBool::new(false),
             derived_views_stale: RwLock::new(None),
             mcp_transactions: Mutex::new(HashMap::new()),
@@ -4999,6 +5015,34 @@ impl DaemonState {
     /// as a daemon-health signal.
     pub fn is_mass_deletion_blocked(&self) -> bool {
         self.mass_deletion_blocked.load(Ordering::Relaxed)
+    }
+
+    /// Record what one exact-tree publication cost.
+    ///
+    /// Microseconds rather than milliseconds because a publication on a small
+    /// repository is well under a millisecond, and the reading that matters
+    /// most is the cheap one: it is what tells the reconcile tick that holding
+    /// off for an imminent commit would cost more than the publication it could
+    /// save.
+    pub(crate) fn record_authority_publication(&self, elapsed: Duration) {
+        self.last_authority_publication_micros.store(
+            u64::try_from(elapsed.as_micros())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// What this daemon's last exact-tree publication cost, or `None` when it
+    /// has not published one yet.
+    pub(crate) fn last_authority_publication(&self) -> Option<Duration> {
+        match self
+            .last_authority_publication_micros
+            .load(Ordering::Relaxed)
+        {
+            0 => None,
+            micros => Some(Duration::from_micros(micros)),
+        }
     }
 
     /// Duration since the last successful save.

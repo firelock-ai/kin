@@ -170,14 +170,46 @@ struct ExactTreeAdmission {
     /// the caller can publish it standalone if its own transaction never
     /// reaches authority.
     deferred_tree: Option<crate::repository_commit::AdmittedWorkspaceTree>,
+    /// The pass derived a transition and then stood down for a commit that had
+    /// entered the daemon while it worked. Nothing was published and nothing was
+    /// applied to the derived graph, so the caller must treat this pass as not
+    /// having happened and let the commit admit the working copy itself.
+    yielded_to_pending_commit: bool,
+}
+
+impl ExactTreeAdmission {
+    /// A pass that stood down for a commit already inside the daemon.
+    ///
+    /// It carries no deltas because it admitted nothing: the transition it
+    /// derived was dropped unpublished, so reporting it would name work that
+    /// never crossed authority.
+    fn yielded(policy: Option<kin_index::ResolvedAdmissionMatcher>) -> Self {
+        Self {
+            deltas: Vec::new(),
+            changed_paths: BTreeSet::new(),
+            semantic_events: Vec::new(),
+            policy,
+            deferred_tree: None,
+            yielded_to_pending_commit: true,
+        }
+    }
 }
 
 /// Where an admitted exact tree crosses repository authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreePublication {
     /// The admission publishes its own repository-authority successor. This is
-    /// the ambient watcher path and every explicit standalone admission.
+    /// every explicit standalone admission.
     Standalone,
+    /// [`Standalone`](Self::Standalone), unless a commit entered the daemon
+    /// before this pass reached its publication, in which case the pass stands
+    /// down and publishes nothing.
+    ///
+    /// The ambient watcher path. A commit forces its own complete admission of
+    /// the working copy and carries the resulting tree inside the transaction
+    /// that publishes its change, so a tick that publishes first buys nothing
+    /// and costs one whole O(store) publication.
+    StandaloneUnlessACommitIsWaiting,
     /// The caller carries the tree transition in its own transaction. Nothing
     /// is published here, so the caller owns the interval in which the derived
     /// graph holds a tree repository authority has not yet accepted.
@@ -426,6 +458,7 @@ pub(crate) fn publish_exact_workspace_tree(
 ) -> Result<Option<u64>> {
     let authority_context =
         crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
+    let started = Instant::now();
     let Some(admission) = crate::repository_commit::publish_workspace_tree(
         state.blobs.as_ref(),
         &authority_context,
@@ -436,6 +469,9 @@ pub(crate) fn publish_exact_workspace_tree(
     else {
         return Ok(None);
     };
+    // What this cost is what the reconcile tick is deciding whether to spend, so
+    // it is measured here rather than modelled from the store's size.
+    state.record_authority_publication(started.elapsed());
     state.record_repository_authority_commit(admission.receipt.generation)?;
     info!(
         workspace = %admission.workspace_id,
@@ -781,8 +817,29 @@ fn exact_tree_admission(
         // as a standalone admission does.
         let defer = publication == TreePublication::DeferredToCaller
             && !transition_touches_graph_only_member(&deltas)?;
+        // The last point at which standing down is free, and the last one at
+        // which it is possible. Everything above derived a transition and wrote
+        // nothing that outlives this call; everything below crosses
+        // repository authority or advances the derived graph, and a pass that
+        // stopped between them would leave the graph carrying a tree authority
+        // never accepted.
+        //
+        // The commit that this defers to may have arrived a moment ago, while
+        // this pass was walking the working copy. It will admit the same paths
+        // itself, because its own admission is unbounded by any observation.
+        // Nothing is lost by dropping this transition on the floor, and the
+        // whole point is that the commit publishes once for both.
+        let yields = publication == TreePublication::StandaloneUnlessACommitIsWaiting
+            && state.pending_commits.any();
         if defer {
             deferred_tree = Some(admitted);
+        } else if yields {
+            debug!(
+                deltas = deltas.len(),
+                "standing this ambient admission down for a commit already inside the daemon; \
+                 its transaction carries the tree"
+            );
+            return Ok(ExactTreeAdmission::yielded(policy));
         } else {
             // The phase stays on the standalone path, which is the path that
             // still spends it. A deferring caller reports its own publication
@@ -841,7 +898,31 @@ fn exact_tree_admission(
         semantic_events: dedup_file_events(semantic_events),
         policy,
         deferred_tree,
+        yielded_to_pending_commit: false,
     })
+}
+
+/// Run one ambient reconcile round's admission the way the loop runs it, and
+/// report whether it stood down for a commit.
+///
+/// The loop itself is a watcher, a batcher, and a retry ladder wrapped around
+/// this one call, none of which the commit race is about. This is the seam a
+/// test drives so the race can be composed in a fixed order instead of hoped
+/// for.
+// Gated to match its only caller, the unix-only race test in `api`: a helper
+// whose callers are platform-gated is dead code on every other platform, and
+// the CI gate compiles with `-D warnings`.
+#[cfg(all(test, unix))]
+pub(crate) fn ambient_admission_for_test(
+    state: &DaemonState,
+    observation: &BTreeSet<RepoPath>,
+) -> Result<bool> {
+    exact_tree_admission(
+        state,
+        Some(observation),
+        TreePublication::StandaloneUnlessACommitIsWaiting,
+    )
+    .map(|admission| admission.yielded_to_pending_commit)
 }
 
 /// Report whether one planned exact-tree transition moves a repository member
@@ -1556,6 +1637,104 @@ async fn sweep_expired_intents(state: &DaemonState) {
     }
 }
 
+/// How many consecutive rounds the reconcile tick may stand down for commits
+/// before it admits regardless.
+///
+/// A backstop rather than a hot path. A commit that is announcing itself is
+/// either holding the coordination gate or queued on it, so a tick that
+/// proceeds past this bound does not race that commit: it queues on the same
+/// gate, and by the time it gets there the commit has admitted the whole
+/// working copy and the tick finds nothing left to publish. What the bound
+/// actually protects against is a client that keeps a commit handler inside the
+/// daemon without ever reaching authority. The tick must not hold its own
+/// admission for that forever, whatever else is wrong.
+///
+/// Eight rounds is under a second at the daemon's default cadence, and it is
+/// several orders of magnitude longer than the gap between a commit announcing
+/// itself and reaching the gate, which is the gap this yield exists to cover.
+const MAX_CONSECUTIVE_COMMIT_YIELDS: u32 = 8;
+
+/// The largest share of a publication that is worth spending to avoid one.
+const COMMIT_YIELD_GRACE_SHARE: u32 = 8;
+
+/// The largest number of poll intervals a tick will hold off for.
+const COMMIT_YIELD_GRACE_INTERVALS: u32 = 5;
+
+/// The upper bound on holding off, whatever the other two say.
+const COMMIT_YIELD_GRACE_CEILING: Duration = Duration::from_secs(1);
+
+/// How long a tick holds off before publishing, waiting to see whether a commit
+/// is about to make its publication redundant.
+///
+/// The window matters because the two arrive together by construction: an agent
+/// writes a file and runs `kin commit` in the same breath, the watcher
+/// notification reaches this loop first, and the commit's own process is still
+/// starting up. On the run this was measured against, the tick reached its
+/// publication roughly 150ms before the commit reached the daemon, and then
+/// spent 11.7 seconds publishing a tree the commit published again immediately
+/// afterwards.
+///
+/// The wait is bounded three ways, because it is only ever worth a fraction of
+/// what it saves. At most an eighth of what the last publication cost, so a
+/// repository whose publications are microseconds waits microseconds and one
+/// whose publications are seconds waits meaningfully. At most five poll
+/// intervals, so a loop configured to react faster holds off proportionally
+/// less. And never more than a second.
+///
+/// A daemon that has not published yet has no measurement to scale by, so it
+/// uses the interval bound alone. That is the protective direction on purpose:
+/// the first publication of a process is exactly the one whose cost is unknown.
+fn commit_yield_grace(state: &DaemonState, interval: Duration) -> Duration {
+    let ceiling = interval
+        .saturating_mul(COMMIT_YIELD_GRACE_INTERVALS)
+        .min(COMMIT_YIELD_GRACE_CEILING);
+    match state.last_authority_publication() {
+        Some(last) => (last / COMMIT_YIELD_GRACE_SHARE).min(ceiling),
+        None => ceiling,
+    }
+}
+
+/// Report whether this reconcile round should stand down for a commit.
+///
+/// True when one is already inside the daemon, or when one arrives while this
+/// waits out [`commit_yield_grace`]. A commit admits the whole working copy
+/// itself and carries the resulting tree in the transaction that publishes its
+/// change, so a round that stands down loses no observation: its events stay
+/// queued, and the next round either finds them already admitted or admits them
+/// itself.
+///
+/// The wait holds no lock. It happens before the round takes the coordination
+/// gate, so the commit it is waiting for is never waiting on it.
+async fn wait_out_imminent_commit(
+    state: &DaemonState,
+    interval: Duration,
+    consecutive_yields: u32,
+) -> bool {
+    if consecutive_yields >= MAX_CONSECUTIVE_COMMIT_YIELDS {
+        return false;
+    }
+    // Registered before the count is read, so a commit that announces itself in
+    // between wakes this wait rather than falling between the two.
+    let arrival = state.pending_commits.arrival();
+    tokio::pin!(arrival);
+    arrival.as_mut().enable();
+    if state.pending_commits.any() {
+        return true;
+    }
+    let grace = commit_yield_grace(state, interval);
+    if grace.is_zero() {
+        return false;
+    }
+    tokio::select! {
+        _ = arrival => {}
+        _ = tokio::time::sleep(grace) => {}
+    }
+    // Read again rather than assuming the wakeup was an arrival: a commit that
+    // announced itself and finished inside the grace has already admitted this
+    // working copy, and there is nothing left to stand down for.
+    state.pending_commits.any()
+}
+
 /// What the reconciliation loop becomes after the background-work supervisor
 /// stops its pass: parked, not exited.
 ///
@@ -1678,6 +1857,10 @@ pub async fn run_loop(
     // first pass resolves one, which is the safe direction: nothing is dropped
     // and the pass itself still enforces the policy exactly.
     let mut graph_owned_policy: Option<kin_index::ResolvedAdmissionMatcher> = None;
+    // Rounds stood down in a row for commits, reset by every round that admits.
+    // Bounded by MAX_CONSECUTIVE_COMMIT_YIELDS so a commit that never leaves the
+    // daemon cannot hold ambient admission off forever.
+    let mut commit_yields: u32 = 0;
 
     // Register with the self-limit supervisor. Registered here rather than at
     // daemon start so a repository that never runs this loop — filesystem
@@ -1843,6 +2026,35 @@ pub async fn run_loop(
             continue;
         }
 
+        // Stand this round down for a commit that is already inside the daemon,
+        // or for one that announces itself while this waits. A commit forces a
+        // complete admission of the working copy and carries the resulting tree
+        // in the transaction that publishes its change, so a tick that publishes
+        // first buys nothing and costs one whole O(store) publication. The
+        // agent-shaped cadence, write a file and commit it immediately, puts
+        // the watcher notification and the commit within a few hundred
+        // milliseconds of each other, and the tick wins that race almost every
+        // time.
+        //
+        // Nothing is lost by standing down: the events stay in the queue and no
+        // path is deferred, because a yield is not a failure and must not feed
+        // the retry ladder. The working stretch is deliberately not ended here
+        // either. This path is bounded, and a stretch cleared on a path the loop
+        // keeps reaching is a stretch the supervisor can no longer measure.
+        if wait_out_imminent_commit(&state, interval, commit_yields).await {
+            commit_yields += 1;
+            debug!(
+                consecutive = commit_yields,
+                pending = pending_events.len(),
+                "holding this reconcile round for a commit inside the daemon"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = cancel.changed() => {}
+            }
+            continue;
+        }
+
         state
             .reconciliation_status
             .store(RECON_PROCESSING, Ordering::Relaxed);
@@ -1911,9 +2123,32 @@ pub async fn run_loop(
         let exact_admission = match exact_tree_admission(
             &state,
             Some(&observation),
-            TreePublication::Standalone,
+            TreePublication::StandaloneUnlessACommitIsWaiting,
         ) {
+            // A commit entered the daemon while this pass was walking the
+            // working copy, so the pass derived a transition and published
+            // nothing. Its events go back on the queue rather than into the
+            // retry ladder: nothing failed, and the next round will find them
+            // either already admitted by the commit or still owed.
+            Ok(admission) if admission.yielded_to_pending_commit => {
+                commit_yields += 1;
+                drop(graph_mutation);
+                drop(reconciler);
+                drop(coordination);
+                enqueue_file_events(&mut pending_events, watcher_batch);
+                debug!(
+                    consecutive = commit_yields,
+                    "stood this reconcile round down at its publication for a commit inside \
+                     the daemon"
+                );
+                state
+                    .reconciliation_status
+                    .store(RECON_IDLE, Ordering::Relaxed);
+                tokio::time::sleep(interval).await;
+                continue;
+            }
             Ok(admission) => {
+                commit_yields = 0;
                 state
                     .background_work
                     .reconcile()
@@ -3326,6 +3561,257 @@ mod tests {
                 .deferred_tree_wedge
                 .is_none(),
             "a publication that reached authority resolves the divergence a wedge names"
+        );
+    }
+
+    /// The ambient tick with nothing else in the daemon publishes exactly as it
+    /// did before it learned to stand down. Its mode is the only thing that
+    /// changed, and a mode that skipped a publication on a quiet daemon would
+    /// leave every observed write outside repository authority.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn an_ambient_tick_with_no_commit_in_flight_publishes_its_own_successor() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("quiet.rs"),
+            b"pub fn quiet() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = test_repo_path("quiet.rs");
+        let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
+
+        let before = authority_generation(&state);
+        let admission = exact_tree_admission(
+            &state,
+            Some(&observation),
+            TreePublication::StandaloneUnlessACommitIsWaiting,
+        )
+        .unwrap();
+
+        assert!(
+            !admission.yielded_to_pending_commit,
+            "there is no commit to stand down for"
+        );
+        assert!(
+            !admission.deltas.is_empty(),
+            "the observed write must be admitted"
+        );
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "a tick with no commit in flight publishes exactly one successor"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the derived graph carries the admitted path"
+        );
+    }
+
+    /// The racing shape, decided the way it is decided in the daemon: the tick
+    /// reaches its publication while a commit is inside the daemon, and stands
+    /// down.
+    ///
+    /// What it must leave behind is a pass that never happened. Publishing is
+    /// the cost being avoided, so the generation must not move; but a tick that
+    /// skipped only the publication and still applied its transition would leave
+    /// the derived graph carrying a tree repository authority never accepted,
+    /// and every later admission plans out of that tree and is refused against
+    /// the older one. So the graph must not carry the path either.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_tick_that_meets_a_commit_at_its_publication_publishes_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("raced.rs"),
+            b"pub fn raced() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let repo_path = test_repo_path("raced.rs");
+        let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
+
+        let before = authority_generation(&state);
+        let commit = state.pending_commits.announce();
+        let admission = exact_tree_admission(
+            &state,
+            Some(&observation),
+            TreePublication::StandaloneUnlessACommitIsWaiting,
+        )
+        .unwrap();
+
+        assert!(
+            admission.yielded_to_pending_commit,
+            "a commit inside the daemon must take this tick's publication"
+        );
+        assert!(
+            admission.deltas.is_empty(),
+            "a pass that admitted nothing must report nothing admitted"
+        );
+        assert_eq!(
+            authority_generation(&state),
+            before,
+            "standing down must cost no repository-authority successor"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_none(),
+            "the derived graph must not run ahead of the authority the tick declined to move"
+        );
+
+        // The commit leaves, and the same tick admits normally again.
+        drop(commit);
+        let admission = exact_tree_admission(
+            &state,
+            Some(&observation),
+            TreePublication::StandaloneUnlessACommitIsWaiting,
+        )
+        .unwrap();
+        assert!(
+            !admission.yielded_to_pending_commit,
+            "the daemon is quiet again, so the next round admits"
+        );
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "one successor for the file, published by whichever pass got to it"
+        );
+    }
+
+    /// A commit already inside the daemon takes the round with no wait at all.
+    #[tokio::test]
+    async fn a_round_stands_down_for_a_commit_that_is_already_inside_the_daemon() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let _commit = state.pending_commits.announce();
+
+        assert!(
+            wait_out_imminent_commit(&state, Duration::from_secs(3600), 0).await,
+            "a commit inside the daemon is read directly, not waited for"
+        );
+    }
+
+    /// A quiet daemon waits out the grace and then admits. The grace is what
+    /// makes the yield reach the real cadence, because the commit's own
+    /// process is still starting when the watcher notification lands. A round
+    /// that refused to wait at all would only ever catch a commit that arrived
+    /// during the walk.
+    #[tokio::test]
+    async fn a_round_waits_out_the_grace_and_then_admits_when_no_commit_arrives() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let started = std::time::Instant::now();
+        assert!(
+            !wait_out_imminent_commit(&state, Duration::from_millis(2), 0).await,
+            "no commit arrived, so the round admits"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait is bounded by the grace, not by the arrival it hoped for"
+        );
+    }
+
+    /// A commit that announces itself during the grace still takes the round.
+    /// This is the shape the defect was measured in: the tick reached its
+    /// publication about 150ms before the commit reached the daemon.
+    #[tokio::test]
+    async fn a_round_stands_down_for_a_commit_that_arrives_during_the_grace() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+
+        let announcing = Arc::clone(&state);
+        let arriving = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _commit = announcing.pending_commits.announce();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        // A 200ms poll interval puts the grace at its one-second ceiling, which
+        // is fifty times the arrival above.
+        assert!(
+            wait_out_imminent_commit(&state, Duration::from_millis(200), 0).await,
+            "a commit that arrives inside the grace takes the round"
+        );
+        arriving.abort();
+    }
+
+    /// The starvation bound. A commit that is announcing itself is holding the
+    /// coordination gate or queued on it, so a round that proceeds past the
+    /// bound queues behind it rather than racing it. What must not be possible
+    /// is a client that keeps a commit handler inside the daemon without ever
+    /// reaching authority holding ambient admission off forever.
+    #[tokio::test]
+    async fn consecutive_yields_are_bounded_so_a_permanent_commit_cannot_suppress_admission() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let _never_leaves = state.pending_commits.announce();
+
+        for round in 0..MAX_CONSECUTIVE_COMMIT_YIELDS {
+            assert!(
+                wait_out_imminent_commit(&state, Duration::from_millis(2), round).await,
+                "round {round} is within the bound and stands down"
+            );
+        }
+        assert!(
+            !wait_out_imminent_commit(
+                &state,
+                Duration::from_millis(2),
+                MAX_CONSECUTIVE_COMMIT_YIELDS
+            )
+            .await,
+            "past the bound the round admits, however loudly a commit is still announcing itself"
+        );
+    }
+
+    /// The grace is worth a fraction of what it protects, never a fixed price.
+    /// A repository whose publications are microseconds must not spend half a
+    /// second holding off from one.
+    #[test]
+    fn the_grace_scales_with_what_a_publication_actually_costs() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let interval = Duration::from_millis(100);
+
+        assert_eq!(
+            commit_yield_grace(&state, interval),
+            interval * COMMIT_YIELD_GRACE_INTERVALS,
+            "a daemon that has never published has no measurement to scale by and uses the \
+             interval bound"
+        );
+
+        state.record_authority_publication(Duration::from_micros(400));
+        assert_eq!(
+            commit_yield_grace(&state, interval),
+            Duration::from_micros(50),
+            "a publication measured in microseconds is not worth a wait measured in \
+             milliseconds"
+        );
+
+        state.record_authority_publication(Duration::from_secs(12));
+        assert_eq!(
+            commit_yield_grace(&state, interval),
+            interval * COMMIT_YIELD_GRACE_INTERVALS,
+            "an eighth of twelve seconds is more than the interval bound allows"
+        );
+        assert!(
+            commit_yield_grace(&state, Duration::from_secs(60)) <= COMMIT_YIELD_GRACE_CEILING,
+            "no poll cadence may turn the grace into a stall"
         );
     }
 
