@@ -41,7 +41,15 @@ runs:
         set -euo pipefail
         toolchain="$INPUT_TOOLCHAIN"
         if [ -z "$toolchain" ]; then
-          pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
+          # This action lives at <repo>/.github/actions/rust-toolchain, so the
+          # repository root is three levels above it. Deriving the root from the
+          # action's own location keeps this correct when a job checks the
+          # repository out under a `path:` instead of at the workspace root,
+          # where $GITHUB_WORKSPACE would point at the wrong tree.
+          pin="$GITHUB_ACTION_PATH/../../../rust-toolchain.toml"
+          if [ ! -f "$pin" ]; then
+            pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
+          fi
           if [ -f "$pin" ]; then
             toolchain=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p;' "$pin" | sed -n '1p')
           fi
