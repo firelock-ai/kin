@@ -4652,6 +4652,17 @@ async fn command_commit(
     // Before the gate, not after it. A tick that already holds the gate is still
     // deciding whether to publish, and it decides by reading this.
     let _pending_commit = state.pending_commits.announce();
+
+    // Publish that this daemon has a write transaction open, on a path that
+    // survives the runtime having no worker free to answer anything. The commit
+    // below is synchronous work on a runtime worker, so `/health` — the only
+    // question the supervisor's reaper asks before killing a daemon — can go
+    // unanswered for the whole commit while the reaper's other signal, growth in
+    // `daemon.log`, also stalls behind a phase that logs only when it finishes.
+    // The marker and its beat are what make a busy daemon distinguishable from a
+    // wedged one.
+    let _transaction =
+        crate::commit_liveness::TransactionGuard::open(state.layout.root(), "commit");
     // Hold one uninterrupted graph-authority gate across forced filesystem
     // admission, change construction, and branch publication. The sync helper
     // deliberately does not re-lock this non-reentrant mutex.
@@ -8511,6 +8522,10 @@ async fn mcp_tools_call(
             )
             .await
         } else if request.name == "kin_transaction_commit" {
+            // Synchronous authority work on a runtime worker, exactly like the
+            // CLI commit path, so it publishes the same mid-transaction proof.
+            let _transaction =
+                crate::commit_liveness::TransactionGuard::open(state.layout.root(), "commit");
             Ok(crate::mcp_commit::commit_exact_transaction(
                 &state,
                 &sessions,

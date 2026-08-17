@@ -18,6 +18,7 @@ pub mod checkout;
 pub mod clone;
 pub mod cochange;
 pub mod commit;
+pub mod commit_progress;
 pub mod conflicts;
 pub mod context;
 pub mod contextbench_locate;

@@ -117,6 +117,7 @@
 pub mod api;
 pub mod background_work;
 pub mod commit_deltas;
+pub mod commit_liveness;
 pub mod daemon;
 pub mod error;
 pub mod graph_only_members;
