@@ -3126,6 +3126,209 @@ mod tests {
         );
     }
 
+    /// Move repository authority while a caller is holding an open deferral.
+    ///
+    /// Publishes `desired` as this workspace's tree through the same seam every
+    /// admission publishes through, which advances the authority roots the
+    /// deferral was planned against. Nothing else has to cooperate to produce
+    /// the double failure: the deferral's own publication compare-and-swaps on
+    /// those roots and refuses rather than replanning a stale desired tree onto
+    /// newer authority, which is exactly what a concurrent authority write does
+    /// to it in production.
+    fn publish_authority_tree_out_of_band(state: &DaemonState, desired: kin_model::ResolvedTree) {
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+                .unwrap();
+        let (expected_roots, previous_tree) = {
+            let authority = context.open().unwrap();
+            let lease = authority.read_authority();
+            let previous = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == context.workspace_id())
+                .map(|workspace| workspace.tree.clone())
+                .unwrap_or_default();
+            (lease.roots().clone(), previous)
+        };
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            state.layout.working_dir(),
+            expected_roots,
+            previous_tree,
+            desired,
+        );
+        crate::repository_commit::publish_workspace_tree(
+            state.blobs.as_ref(),
+            &context,
+            &admitted,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("out-of-band-authority-writer"),
+        )
+        .expect("the fixture's own authority write must succeed")
+        .expect("it has to move authority, or the deferral below would still publish cleanly");
+    }
+
+    /// The double failure, and the record that is the only account a status
+    /// surface gets of it.
+    ///
+    /// A commit that fails publishes its deferred tree standalone on the way
+    /// out. When that publication fails too, the derived graph is left holding a
+    /// tree repository authority never accepted, every later admission is
+    /// refused against the mismatched tree, and only a restart clears it. It was
+    /// logged once at error level and named on no surface at all, so an operator
+    /// watching admissions refuse had nothing telling them the daemon itself was
+    /// what needed restarting.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_failed_restoring_publication_wedges_the_daemon_and_says_so() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join("base.rs"), b"pub fn base() -> u32 { 1 }\n").unwrap();
+        exact_tree_admission(&state, None, TreePublication::Standalone).unwrap();
+        let baseline = authority_generation(&state);
+
+        std::fs::write(
+            repo.path().join("carried.rs"),
+            b"pub fn carried() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+        assert_eq!(
+            authority_generation(&state),
+            baseline,
+            "nothing may be published while the deferral is open"
+        );
+        assert!(
+            state
+                .background_work
+                .reconcile_report(Instant::now())
+                .deferred_tree_wedge
+                .is_none(),
+            "the fixture reported a wedge before one happened"
+        );
+
+        // The second failure. Authority moves under the open deferral, so the
+        // publication that would restore it has no valid transition left.
+        publish_authority_tree_out_of_band(&state, kin_model::ResolvedTree::default());
+        publish_deferred_tree_after_failure(&state, &deferred);
+
+        let report = state.background_work.reconcile_report(Instant::now());
+        let wedge = report
+            .deferred_tree_wedge
+            .as_ref()
+            .expect("the double failure must reach the surfaces that answer for this daemon");
+        assert!(
+            wedge.error.contains("repository authority moved"),
+            "the publication's own error is what names the cause: {wedge:?}"
+        );
+        assert!(
+            wedge.at.is_some(),
+            "a wall-clock stamp is what lines this up against the daemon log"
+        );
+        let reasons = report.degraded_reasons();
+        assert!(
+            reasons.iter().any(|reason| {
+                reason.contains("restart required, commit deferral wedged")
+                    && reason.contains(&wedge.error)
+            }),
+            "a wedged daemon must name the restart and carry the error: {reasons:?}"
+        );
+        assert!(report.degraded(), "a wedged daemon is not a healthy one");
+
+        // The state that reason describes is real rather than cosmetic. The
+        // graph holds a tree authority never accepted, so the next admission
+        // with anything to publish is refused against the mismatched tree, which
+        // is what an operator watches happen with no explanation attached.
+        std::fs::write(
+            repo.path().join("later.rs"),
+            b"pub fn later() -> u32 { 3 }\n",
+        )
+        .unwrap();
+        let refusal = exact_tree_admission(&state, None, TreePublication::Standalone)
+            .expect_err("a wedged daemon must refuse the next admission rather than publish it");
+        assert!(
+            refusal
+                .to_string()
+                .contains("not this workspace's authority tree"),
+            "the refusal must name the mismatch the wedge describes: {refusal}"
+        );
+    }
+
+    /// The falsification, and the ordinary case beside it. A commit that fails
+    /// is routine, and the publication restoring its deferred tree normally
+    /// succeeds, leaving exactly the state a standalone admission would have.
+    /// A flag that fired on the single failure would report every failed commit
+    /// as a daemon needing a restart.
+    #[test]
+    // Commit phases are emitted at debug level when they are fast, and the
+    // level a `tracing` event is filtered by is a process-global hint. A test
+    // that captures those events therefore cannot run beside one that emits
+    // them, so every test on either side of that shares this group.
+    #[serial_test::serial(commit_phase_capture)]
+    fn a_restored_deferral_leaves_nothing_wedged_and_clears_an_earlier_wedge() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("restored.rs"),
+            b"pub fn restored() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+
+        publish_deferred_tree_after_failure(&state, &deferred);
+
+        let report = state.background_work.reconcile_report(Instant::now());
+        assert!(
+            report.deferred_tree_wedge.is_none(),
+            "a deferral that closed is not a wedge: {:?}",
+            report.deferred_tree_wedge
+        );
+        assert!(!report.degraded(), "{:?}", report.degraded_reasons());
+        assert!(
+            serde_json::to_value(&report).unwrap()["deferred_tree_wedge"].is_null(),
+            "a healthy daemon must serialize no wedge field at all"
+        );
+
+        // A daemon carrying an earlier wedge is cleared by a deferral that does
+        // close. Publishing planned against the authority tree and advanced it,
+        // which a graph running ahead of authority cannot do.
+        state
+            .background_work
+            .reconcile()
+            .record_deferred_tree_wedge("an earlier restoring publication failed", Instant::now());
+        std::fs::write(
+            repo.path().join("second.rs"),
+            b"pub fn second() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        let admission =
+            exact_tree_admission(&state, None, TreePublication::DeferredToCaller).unwrap();
+        let deferred = admission
+            .deferred_tree
+            .expect("the admission defers its transition to this caller");
+        publish_deferred_tree_after_failure(&state, &deferred);
+        assert!(
+            state
+                .background_work
+                .reconcile_report(Instant::now())
+                .deferred_tree_wedge
+                .is_none(),
+            "a publication that reached authority resolves the divergence a wedge names"
+        );
+    }
+
     /// A collapsed commit publishes the tree its own walk proved, or none.
     ///
     /// The completion proof rides along as a value only a finished walk can
@@ -5314,17 +5517,40 @@ async fn sync_filesystem_with_graph_publishing(
 /// later admission raises stays loud, because a daemon whose graph outruns
 /// authority must be restarted to rebuild the graph rather than keep answering
 /// from it.
+///
+/// The error log is not the whole disclosure. It is written once, at the moment
+/// of the failure, and every status surface afterwards showed a daemon whose
+/// admissions happened to be failing, which is what a wedged daemon and a merely
+/// unlucky one look like from the outside. The state is recorded on the
+/// reconcile probes as well, so `/health`, `/commands/resources`, `kin graph
+/// status`, `kin admit`, and `kin doctor` all name the restart rather than
+/// leaving a reader to infer it from a refusal.
 pub(crate) fn publish_deferred_tree_after_failure(
     state: &DaemonState,
     admitted: &crate::repository_commit::AdmittedWorkspaceTree,
 ) {
-    if let Err(error) = publish_exact_workspace_tree(state, admitted) {
-        error!(
-            error = %error,
-            "failed to publish the deferred exact workspace tree after the carrying transaction \
-             did not reach authority; the derived graph is ahead of repository authority and this \
-             daemon must be restarted before it can admit again"
-        );
+    match publish_exact_workspace_tree(state, admitted) {
+        Ok(_) => {
+            // The deferral closed, so whatever earlier one did not is resolved:
+            // this publication planned against the authority tree it just
+            // advanced, which a graph running ahead of authority cannot do.
+            state
+                .background_work
+                .reconcile()
+                .clear_deferred_tree_wedge();
+        }
+        Err(error) => {
+            error!(
+                error = %error,
+                "failed to publish the deferred exact workspace tree after the carrying transaction \
+                 did not reach authority; the derived graph is ahead of repository authority and this \
+                 daemon must be restarted before it can admit again"
+            );
+            state
+                .background_work
+                .reconcile()
+                .record_deferred_tree_wedge(&error, Instant::now());
+        }
     }
 }
 

@@ -1698,6 +1698,13 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS",
         "KIN_DAEMON_READY_TIMEOUT_SECS",
         "KIN_BYPASS_EMBEDDING_COVERAGE_CHECK",
+        // A runtime-bound command that sets this and is not carried proves the
+        // opposite of what its test asserts: the child embeds, and the test
+        // reads that as the product ignoring an operator. That is how the
+        // toggle was first reported dead on the CLI spawn path. The value is
+        // per-command configuration rather than repository or session
+        // authority, so carrying it costs the isolation boundary nothing.
+        "KIN_DAEMON_AUTO_EMBED",
     ];
     !is_internal_runtime_capability(key)
         && (ALLOWED.iter().any(|allowed| env_os_name_eq(key, allowed))

@@ -324,6 +324,10 @@ pub struct ReconcileHealth {
     /// whenever it happened. Absent on a loop that is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parked: Option<ReconcileParked>,
+    /// The derived graph is holding an exact tree repository authority never
+    /// accepted, and only a restart clears it. Absent on every other daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_tree_wedge: Option<DeferredTreeWedge>,
 }
 
 /// The background-work supervisor's account of a parked reconciliation loop.
@@ -359,6 +363,36 @@ pub struct ReconcileParked {
     pub stall_threshold_seconds: u64,
 }
 
+/// A commit deferral that could not be closed, and the publication error that
+/// left it open.
+///
+/// The commit path admits the working copy without publishing its tree, so one
+/// repository-authority successor carries both the admitted tree and the change.
+/// A commit that never reaches authority publishes that tree standalone on its
+/// way out. When that publication fails too, the derived graph is left holding a
+/// tree authority never accepted: every later admission plans out of the graph's
+/// tree and is refused against the older authority tree, and it stays that way
+/// until the daemon restarts and rebuilds the graph from authority.
+///
+/// It takes two failures where the second is an authority write that had just
+/// succeeded under the same gate, so it is rare by construction. What it was not
+/// was legible: the only account lived in one error log, while every status
+/// surface kept reporting a daemon that was merely failing its admissions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredTreeWedge {
+    /// The restoring publication's error, verbatim. The one fact that separates
+    /// a wedge from the ordinary refusals that follow it.
+    pub error: String,
+    /// Seconds since the wedge was recorded. Monotonic, so a wall-clock
+    /// adjustment cannot shrink it.
+    #[serde(default)]
+    pub age_seconds: u64,
+    /// Wall-clock time the wedge was recorded, RFC 3339, for lining the state up
+    /// against the daemon log that carries the failing commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
 impl ReconcileHealth {
     /// Every reason this reconcile state is degraded, worst first, empty when
     /// it is not.
@@ -373,7 +407,21 @@ impl ReconcileHealth {
     /// the limit or merely a number.
     pub fn degraded_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
-        // First, because it outranks every other reading here: a parked loop is
+        // First of all, because it outranks even a park: a parked loop resumes
+        // on the next daemon, while this one refuses every admission it is
+        // handed until an operator restarts it, and the counters below record
+        // exactly those refusals without naming what causes them.
+        if let Some(wedge) = &self.deferred_tree_wedge {
+            reasons.push(format!(
+                "restart required, commit deferral wedged: a commit failed {}s ago and the \
+                 publication restoring its deferred tree failed too, so the derived graph holds an \
+                 exact tree repository authority never accepted and every later admission is \
+                 refused against the mismatched tree until this daemon restarts; restoring \
+                 publication error: {}",
+                wedge.age_seconds, wedge.error
+            ));
+        }
+        // Next, because it outranks every other reading here: a parked loop is
         // not admitting anything at all, so whatever the counters below say
         // about the last attempt, there is no next one until the daemon
         // restarts.
@@ -1004,6 +1052,104 @@ mod tests {
         };
         assert!(stuck.degraded());
         assert!(stuck.degraded_reasons()[0].contains(&BACKLOG_STALE_SECONDS.to_string()));
+    }
+
+    /// A wedged commit deferral has to say the two things a reader acts on:
+    /// that a restart is what clears it, and what the publication actually
+    /// failed with. Without the first, an operator waits for a loop that will
+    /// never admit again; without the second, the only account of the cause is a
+    /// log line from whenever it happened.
+    #[test]
+    fn a_wedged_commit_deferral_names_the_restart_and_the_publication_error() {
+        let wedged = ReconcileHealth {
+            deferred_tree_wedge: Some(DeferredTreeWedge {
+                error: "repository authority moved after the complete workspace observation was \
+                        planned"
+                    .to_string(),
+                age_seconds: 96,
+                at: Some("2026-08-17T09:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        };
+        let reasons = wedged.degraded_reasons();
+        assert_eq!(reasons.len(), 1, "one fault, one reason: {reasons:?}");
+        let reason = &reasons[0];
+        assert!(
+            reason.contains("restart required, commit deferral wedged"),
+            "the recovery an operator has to perform is the headline: {reason}"
+        );
+        assert!(
+            reason.contains("repository authority moved"),
+            "the daemon's own publication error, not a summary invented here: {reason}"
+        );
+        assert!(
+            reason.contains("96"),
+            "how long the daemon has been wedged is what separates it from a \
+             refusal that just happened: {reason}"
+        );
+        assert!(wedged.degraded());
+
+        // It outranks the park, because a parked loop resumes on the next daemon
+        // and this one refuses whatever it is handed until then.
+        let both = ReconcileHealth {
+            parked: Some(ReconcileParked {
+                reason: "no progress".to_string(),
+                ..Default::default()
+            }),
+            ..wedged.clone()
+        };
+        assert_eq!(both.degraded_reasons().len(), 2);
+        assert!(
+            both.degraded_reasons()[0].contains("commit deferral wedged"),
+            "{:?}",
+            both.degraded_reasons()
+        );
+
+        // The falsification: the identical daemon with nothing wedged is healthy
+        // and serializes no wedge at all, so a surface reading the field cannot
+        // mistake an additive absence for a state it failed to check.
+        let healthy = ReconcileHealth {
+            deferred_tree_wedge: None,
+            ..wedged.clone()
+        };
+        assert!(!healthy.degraded(), "{:?}", healthy.degraded_reasons());
+        assert!(serde_json::to_value(&healthy).unwrap()["deferred_tree_wedge"].is_null());
+    }
+
+    /// The wedge crosses the wire intact. Every surface but the daemon's own
+    /// reads this through JSON, so a field that degraded a daemon in process and
+    /// vanished on the way out would leave `/health`, `kin graph status`, and
+    /// `kin doctor` reporting the healthy answer they reported before.
+    #[test]
+    fn a_wedge_round_trips_through_json_and_reaches_the_rendered_lines() {
+        let wedged = ReconcileHealth {
+            deferred_tree_wedge: Some(DeferredTreeWedge {
+                error: "workspace generation exhausted".to_string(),
+                age_seconds: 12,
+                at: Some("2026-08-17T09:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&wedged).unwrap();
+        assert_eq!(
+            encoded["deferred_tree_wedge"]["error"],
+            "workspace generation exhausted"
+        );
+        assert_eq!(encoded["deferred_tree_wedge"]["age_seconds"], 12);
+        let decoded: ReconcileHealth = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, wedged);
+
+        let lines = render_reconcile_lines(&wedged);
+        assert!(
+            lines.iter().any(|line| line.contains("Reconcile degraded")
+                && line.contains("restart required, commit deferral wedged")),
+            "the wedge has to reach the text surface: {lines:?}"
+        );
+        assert_eq!(
+            render_reconcile_lines(&ReconcileHealth::default()).len(),
+            1,
+            "a daemon with nothing wedged prints no extra line"
+        );
     }
 
     /// The reconcile line is rendered whether or not anything is wrong. A

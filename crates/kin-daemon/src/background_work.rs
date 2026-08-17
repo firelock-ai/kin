@@ -710,6 +710,12 @@ struct ReconcileProbesInner {
     untracked_paths_sample: Vec<String>,
     /// What the most recent complete walk deliberately did not observe.
     excluded: ExcludedHostContent,
+    /// The publication error that left a commit's deferred tree unpublished.
+    ///
+    /// Held beside the admission counters because it is what explains them: once
+    /// it is set, every admission failure recorded below is a refusal against
+    /// the mismatched tree rather than an independent fault.
+    deferred_tree_wedge: Option<RecordedFault>,
 }
 
 /// Host content one complete walk declined to observe at all.
@@ -776,6 +782,34 @@ impl ReconcileProbes {
         let mut inner = self.lock();
         inner.admission_failure_streak = 0;
         inner.last_admission_success = Some(RecordedFault::new(String::new(), now));
+        // A complete admission that succeeded is proof the graph's tree reached
+        // repository authority, which is exactly the divergence a wedge names.
+        // Clearing it here rather than on a timer means the state can only leave
+        // the surfaces by being resolved.
+        inner.deferred_tree_wedge = None;
+    }
+
+    /// A commit's deferred tree was left unpublished because the publication
+    /// restoring it failed as well.
+    ///
+    /// The daemon is not merely failing admissions at this point: the derived
+    /// graph holds a tree repository authority never accepted, so every later
+    /// admission is refused against the mismatched tree until this process
+    /// restarts. Recorded rather than logged alone, because the log line is
+    /// gone by the time anyone reads a status surface.
+    pub fn record_deferred_tree_wedge(&self, error: impl std::fmt::Display, now: Instant) {
+        let mut inner = self.lock();
+        inner.deferred_tree_wedge = Some(RecordedFault::new(error.to_string(), now));
+    }
+
+    /// Repository authority accepted the tree the graph holds again.
+    ///
+    /// The counterpart to [`Self::record_deferred_tree_wedge`], for the paths
+    /// that resolve the divergence without going through a complete admission:
+    /// a later deferral whose restoring publication succeeds, and a commit whose
+    /// own transaction carries the tree across.
+    pub fn clear_deferred_tree_wedge(&self) {
+        self.lock().deferred_tree_wedge = None;
     }
 
     /// Whether the loop finished a tick still holding work.
@@ -855,6 +889,13 @@ impl ReconcileProbes {
             unsupported_path_count: inner.excluded.unsupported,
             policy_excluded_path_count: inner.excluded.policy_excluded,
             parked: None,
+            deferred_tree_wedge: inner.deferred_tree_wedge.as_ref().map(|fault| {
+                kin_cli::commands::resources::DeferredTreeWedge {
+                    error: fault.message.clone(),
+                    age_seconds: age(fault),
+                    at: Some(fault.wall_clock.to_rfc3339()),
+                }
+            }),
         }
     }
 }
@@ -1371,6 +1412,60 @@ mod tests {
             !report.degraded(),
             "a loop that is admitting again is not degraded"
         );
+    }
+
+    /// A wedged commit deferral survives every later failure and clears on the
+    /// one event that resolves it.
+    ///
+    /// Both halves are load-bearing. A wedged daemon goes on failing admissions
+    /// forever, and each of those failures is a consequence of the wedge rather
+    /// than a fresh cause, so a record that any later fault overwrote would
+    /// erase the one line naming the restart. A record nothing could clear would
+    /// be worse: the state does end, on a complete admission that succeeds, and
+    /// a surface that kept reporting it would teach a reader to ignore it.
+    #[test]
+    fn a_wedged_deferral_outlives_later_failures_and_clears_on_a_successful_admission() {
+        let probes = ReconcileProbes::default();
+        let base = Instant::now();
+        probes.record_deferred_tree_wedge(
+            "repository authority moved after the complete workspace observation was planned",
+            at(base, 10),
+        );
+
+        let report = probes.report(at(base, 70));
+        let wedge = report
+            .deferred_tree_wedge
+            .as_ref()
+            .expect("a wedged daemon reports its wedge");
+        assert!(
+            wedge.error.contains("repository authority moved"),
+            "the publication's own error is what a reader acts on: {wedge:?}"
+        );
+        assert_eq!(wedge.age_seconds, 60);
+        assert!(
+            wedge.at.is_some(),
+            "a wall-clock stamp is what lines this up against the daemon log"
+        );
+        assert!(report.degraded());
+
+        // The refusals that follow are the wedge, not new information, and they
+        // must not displace it.
+        for step in 1..=4 {
+            probes.record_admission_failure(
+                "the complete workspace observation was planned against a tree that is not this \
+                 workspace's authority tree",
+                at(base, 100 + step * 10),
+            );
+        }
+        assert!(probes.report(at(base, 200)).deferred_tree_wedge.is_some());
+
+        probes.record_admission_success(at(base, 300));
+        let recovered = probes.report(at(base, 300));
+        assert!(
+            recovered.deferred_tree_wedge.is_none(),
+            "an admission that succeeded is proof the graph's tree reached authority"
+        );
+        assert!(!recovered.degraded(), "{:?}", recovered.degraded_reasons());
     }
 
     /// A dropped reconcile event leaves one path's enrichment stale until that

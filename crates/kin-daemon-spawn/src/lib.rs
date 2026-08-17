@@ -57,6 +57,17 @@ pub const DAEMON_PORT_ARGUMENT: &str = "0";
 /// not reconnect. Both spawn paths and the daemon's own default read this.
 pub const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
 
+/// Operator opt-out for the background embedding pass the daemon starts on its
+/// own after its first reconciliation cycle.
+///
+/// The daemon reads this from its own process environment at start, so the
+/// value that decides the pass is the one the *spawning* command held. Every
+/// spawn built here pins the caller's value onto the child explicitly rather
+/// than leaving it to inheritance, so the delivery is a stated property of the
+/// spawn (and assertable without starting a process) instead of an accident of
+/// what the authority scrub happens not to remove.
+pub const DAEMON_AUTO_EMBED_ENV: &str = "KIN_DAEMON_AUTO_EMBED";
+
 /// File the daemon writes its bound port into once it is listening.
 pub const PORT_FILE_NAME: &str = "daemon.port";
 
@@ -2703,8 +2714,28 @@ impl DaemonSpawnPlan {
         if let Some(supervisor_url) = &self.supervisor_url {
             cmd.env("KIN_SUPERVISOR_URL", supervisor_url);
         }
+        carry_operator_auto_embed(&mut cmd, std::env::var_os(DAEMON_AUTO_EMBED_ENV));
         detach_from_caller(&mut cmd);
         cmd
+    }
+}
+
+/// Pin the operator's background-embedding opt-out onto a daemon spawn.
+///
+/// `value` is the spawning command's own setting, or `None` when it set none.
+/// An unset variable pins nothing: the daemon's default is on, and inventing a
+/// value here would turn "the operator said nothing" into "the operator said
+/// yes", which reads identically in the child and is not the same statement.
+///
+/// Pinning a set value is not redundant with inheritance. It states the
+/// carriage at the boundary, so a later addition to the ambient-authority
+/// denylist, or a caller that rebuilds the child environment instead of
+/// inheriting it, cannot drop an operator's opt-out silently — the failure mode
+/// the daemon has no way to report, because a dropped opt-out is
+/// indistinguishable from one that was never set.
+fn carry_operator_auto_embed(cmd: &mut Command, value: Option<std::ffi::OsString>) {
+    if let Some(value) = value {
+        cmd.env(DAEMON_AUTO_EMBED_ENV, value);
     }
 }
 
@@ -5059,6 +5090,57 @@ mod tests {
             "KIN_SUPERVISOR_URL".to_string(),
             Some("http://127.0.0.1:9000".to_string())
         )));
+    }
+
+    /// The command's explicit environment overlay as a map, with a removal
+    /// recorded as `Some(None)` exactly as `Command::get_envs` reports it.
+    fn command_env(command: &Command) -> std::collections::BTreeMap<String, Option<String>> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_spawn_carries_the_operator_background_embed_opt_out() {
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        carry_operator_auto_embed(&mut command, Some(std::ffi::OsString::from("0")));
+        assert_eq!(
+            command_env(&command).get(DAEMON_AUTO_EMBED_ENV),
+            Some(&Some("0".to_string())),
+            "a daemon spawn dropped the operator's background-embedding opt-out"
+        );
+    }
+
+    #[test]
+    fn a_spawn_invents_no_opt_out_the_operator_did_not_state() {
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        carry_operator_auto_embed(&mut command, None);
+        assert_eq!(
+            command_env(&command).get(DAEMON_AUTO_EMBED_ENV),
+            None,
+            "a daemon spawn stated a background-embedding choice the operator never made"
+        );
+    }
+
+    #[test]
+    fn the_authority_scrub_cannot_drop_the_background_embed_opt_out() {
+        // The scrub runs before the pin inside `command()`, and callers run it
+        // again afterwards. Neither ordering may remove the opt-out: it is
+        // operator configuration, not ambient repository authority.
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        carry_operator_auto_embed(&mut command, Some(std::ffi::OsString::from("false")));
+        scrub_daemon_process_authority(&mut command);
+        assert_eq!(
+            command_env(&command).get(DAEMON_AUTO_EMBED_ENV),
+            Some(&Some("false".to_string())),
+            "the daemon authority scrub removed the operator's background-embedding opt-out"
+        );
     }
 
     #[test]
