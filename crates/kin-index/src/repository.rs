@@ -9,7 +9,9 @@
 //! metadata is inherently excluded, and the compiler/packager output named by
 //! [`DEFAULT_IGNORED_NAMES`] is excluded by default because the graph is the
 //! system of record for source truth, not for derived bytes that any build
-//! reproduces.
+//! reproduces. A Python virtual environment is excluded by the same default on
+//! different evidence: it is recognized by [`PYTHON_VIRTUALENV_MARKER`] rather
+//! than by its directory name, which no rule could predict.
 //!
 //! An ignore rule is a statement about IO, not only about membership. Nothing
 //! the effective rules exclude is opened, read, hashed, or verified here, and
@@ -233,6 +235,11 @@ impl CompleteRepositoryScan {
 /// so in its `.kinignore`. The rule for adding an entry here is that the name
 /// must be unambiguously derived output across the ecosystems that use it.
 ///
+/// `venv` and `env` are the same problem and get a different answer:
+/// [`PYTHON_VIRTUALENV_MARKER`] recognizes a virtual environment by the file
+/// PEP 405 requires it to carry, so an environment is excluded whatever it was
+/// named while an ordinary directory sharing the name stays admitted.
+///
 /// A `!` rule re-admits anything here, and re-admission is scoped: it cancels
 /// only the rules matching at or above its own boundary, so `!target` does not
 /// also re-admit `target/node_modules`.
@@ -242,6 +249,8 @@ pub const DEFAULT_IGNORED_NAMES: &[&str] = &[
     "target",
     // Package-manager dependency trees.
     "node_modules",
+    "bower_components",
+    "__pypackages__",
     // JavaScript and Python packaging output.
     "dist",
     // Python bytecode and environment/tool caches.
@@ -253,6 +262,7 @@ pub const DEFAULT_IGNORED_NAMES: &[&str] = &[
     ".mypy_cache",
     ".ruff_cache",
     ".ipynb_checkpoints",
+    ".eggs",
     // JavaScript framework and bundler caches.
     ".next",
     ".nuxt",
@@ -268,6 +278,25 @@ pub const DEFAULT_IGNORED_NAMES: &[&str] = &[
     // Finder metadata.
     ".DS_Store",
 ];
+
+/// The file PEP 405 requires at the root of every Python virtual environment.
+///
+/// A name list cannot answer this one. `python3 -m venv <name>` takes the name
+/// from its caller, `.venv` and `venv` and `env` are all in common use, and two
+/// of those three routinely name ordinary source directories, so excluding them
+/// by name would either miss real environments or delete real code from the
+/// graph. The marker is the interpreter's own declaration that a directory is a
+/// materialized environment rather than authored source, and `python3 -m venv`
+/// writes it before it installs anything, so a fresh environment is recognized
+/// on the first walk that sees it and never races the live watcher for the
+/// semantic graph.
+///
+/// The check is scoped to untracked directories a walk is about to descend
+/// into, so it can only decline to admit something new. It never retracts
+/// graph-owned truth, which is why the host-blind retraction predicate in
+/// [`tracked_paths_retracted_by_ignore`] does not consult it and cannot drift
+/// from it: for a tracked path this rule is inert by construction.
+pub const PYTHON_VIRTUALENV_MARKER: &str = "pyvenv.cfg";
 
 /// Roots already warned about a missing `.kinignore` in this process.
 static WARNED_ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> =
@@ -432,9 +461,10 @@ impl RepositoryIgnore {
         }
         Some(format!(
             "no .kinignore: admission is running on {} built-in default excludes \
-             ({}). Derived output outside those names will be ingested as \
-             repository truth. Write a .kinignore to state this repository's \
-             rules, and use `!name` to re-admit a default.",
+             ({}), plus any directory carrying a {PYTHON_VIRTUALENV_MARKER}. \
+             Derived output outside those names will be ingested as repository \
+             truth. Write a .kinignore to state this repository's rules, and use \
+             `!name` to re-admit a default.",
             DEFAULT_IGNORED_NAMES.len(),
             DEFAULT_IGNORED_NAMES.join(", ")
         ))
@@ -501,6 +531,17 @@ impl RepositoryIgnore {
         let bytes = path.as_bytes();
         let floor = self.readmit_floor(bytes).unwrap_or(0);
         Self::rules_match_below(&self.names, &self.prefixes, bytes, floor)
+    }
+
+    /// Whether a `!` rule re-admits `path` itself or an ancestor of it.
+    ///
+    /// This is how a repository overrides an exclusion that no pattern could
+    /// have named, such as the virtual-environment marker: `!venv` in
+    /// `.kinignore` re-admits that environment whole. A rule pointing strictly
+    /// deeper is not an override of the boundary above it, so it does not
+    /// count here.
+    pub fn readmits(&self, path: &RepoPath) -> bool {
+        self.readmit_floor(path.as_bytes()).is_some()
     }
 
     /// Whether the walk must descend into an otherwise-excluded `directory`
@@ -785,7 +826,7 @@ pub fn scan_repository_preserving_graph_only<'a>(
         entries: BTreeMap::new(),
         diagnostics: RepositoryScanDiagnostics::default(),
     };
-    scanner.walk(root)?;
+    scanner.walk(root, false)?;
     scanner.diagnostics.admitted_entries = scanner.entries.len();
     scanner.diagnostics.graph_only_entries_preserved = scanner.graph_only_paths.len();
     scanner.diagnostics.ignored_tracked_entries_unverified = scanner.unverified_ignored_paths.len();
@@ -852,6 +893,16 @@ impl Scanner<'_> {
         true
     }
 
+    /// Whether `directory` is a Python virtual environment this walk declines
+    /// to admit.
+    ///
+    /// The re-admission test comes first so an operator override costs no host
+    /// IO, and so the answer for a directory the repository re-admitted is the
+    /// same whether or not the marker happens to be there.
+    fn excludes_python_virtualenv(&self, repo_path: &RepoPath, host_path: &Path) -> bool {
+        !self.ignore.readmits(repo_path) && host_path.join(PYTHON_VIRTUALENV_MARKER).is_file()
+    }
+
     fn is_tracked_or_contains_tracked(&self, path: &RepoPath) -> bool {
         let prefix = path.as_bytes();
         self.tracked_paths
@@ -860,7 +911,16 @@ impl Scanner<'_> {
             .any(|tracked| tracked == path || tracked.as_bytes()[prefix.len()..].starts_with(b"/"))
     }
 
-    fn walk(&mut self, directory: &Path) -> Result<(), IncompleteRepositoryScan> {
+    /// `within_excluded_environment` marks a descent that only happened because
+    /// graph truth tracks something below an excluded Python environment. The
+    /// walk reaches those tracked paths and admits nothing else on the way, so
+    /// one file committed into an environment before this rule existed cannot
+    /// re-open the whole site-packages tree behind it.
+    fn walk(
+        &mut self,
+        directory: &Path,
+        within_excluded_environment: bool,
+    ) -> Result<(), IncompleteRepositoryScan> {
         self.diagnostics.directories_visited += 1;
         let entries = fs::read_dir(directory)
             .map_err(|error| self.fail(directory, "read directory", error))?;
@@ -892,10 +952,8 @@ impl Scanner<'_> {
             let ignored = self.ignore.matches(&repo_path);
 
             if file_type.is_dir() {
-                if ignored
-                    && !self.is_tracked_or_contains_tracked(&repo_path)
-                    && !self.ignore.readmits_below(&repo_path)
-                {
+                let holds_tracked = self.is_tracked_or_contains_tracked(&repo_path);
+                if ignored && !holds_tracked && !self.ignore.readmits_below(&repo_path) {
                     self.diagnostics.ignored_untracked_entries += 1;
                     continue;
                 }
@@ -907,12 +965,38 @@ impl Scanner<'_> {
                 // truth still outranks the rules, so a directory holding a
                 // tracked path is walked and only its untracked leaves are
                 // skipped below.
-                if !self.is_tracked_or_contains_tracked(&repo_path)
-                    && self.policy_excludes_untracked(&repo_path, true)
-                {
+                if !holds_tracked && self.policy_excludes_untracked(&repo_path, true) {
                     continue;
                 }
-                self.walk(&host_path)?;
+                // A materialized Python environment, recognized by the marker
+                // its interpreter writes rather than by a name anyone chose.
+                // Skipped whole for the same reason a policy-excluded directory
+                // is: nothing beneath an excluded environment is authored
+                // source, so descending would only cost the reads. Re-admitting
+                // the environment directory itself (`!venv`) is the override,
+                // and it is checked before the host is touched at all.
+                let excluded_environment = self.excludes_python_virtualenv(&repo_path, &host_path);
+                if (excluded_environment || within_excluded_environment) && !holds_tracked {
+                    self.diagnostics.ignored_untracked_entries += 1;
+                    continue;
+                }
+                self.walk(
+                    &host_path,
+                    within_excluded_environment || excluded_environment,
+                )?;
+                continue;
+            }
+
+            // A leaf inside an excluded environment, reached only because graph
+            // truth tracks something down here. Tracked identity is observed as
+            // it always is; everything else stays out, so the descent admits
+            // exactly what it came for. Checked before `ignored` handling so a
+            // tracked path can never fall into the counter for an untracked one.
+            if within_excluded_environment
+                && !self.tracked_paths.contains(&repo_path)
+                && !self.ignore.readmits(&repo_path)
+            {
+                self.diagnostics.ignored_untracked_entries += 1;
                 continue;
             }
 
@@ -1612,6 +1696,141 @@ mod tests {
             );
         }
         assert_eq!(everything.len(), derived.len() + 1);
+    }
+
+    /// Materialize the directory `python3 -m venv <name>` produces, down to the
+    /// marker file PEP 405 requires and a plausible site-packages leaf.
+    fn create_virtualenv(root: &Path, name: &str) {
+        let env = root.join(name);
+        fs::create_dir_all(env.join("lib/python3.11/site-packages/pytest")).unwrap();
+        fs::create_dir_all(env.join("bin")).unwrap();
+        fs::write(
+            env.join(PYTHON_VIRTUALENV_MARKER),
+            b"home = /usr/bin\nversion = 3.11.2\n",
+        )
+        .unwrap();
+        fs::write(env.join("bin/activate"), b"# activate").unwrap();
+        fs::write(
+            env.join("lib/python3.11/site-packages/pytest/__init__.py"),
+            b"__version__ = '9.1.1'",
+        )
+        .unwrap();
+    }
+
+    /// A fresh repository with no user action of any kind must keep a virtual
+    /// environment out of the graph, whichever of the three common names its
+    /// author used. `.venv` is covered by name; `venv` and `env` are names that
+    /// also occur as ordinary source directories, so only the marker can tell
+    /// the two apart.
+    #[test]
+    fn a_freshly_created_virtualenv_is_excluded_without_any_user_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for name in [".venv", "venv", "env"] {
+            create_virtualenv(root, name);
+        }
+        fs::write(root.join("app.py"), b"print('hi')").unwrap();
+
+        // No .kinignore, no .gitignore: exactly what `kin init` leaves behind.
+        let admitted = scan(root);
+        assert!(admitted.entry(&path("app.py")).is_some());
+        for name in [".venv", "venv", "env"] {
+            assert!(
+                admitted
+                    .entry(&path(&format!("{name}/bin/activate")))
+                    .is_none(),
+                "{name} leaked into the graph"
+            );
+            assert!(
+                admitted
+                    .entry(&path(&format!(
+                        "{name}/lib/python3.11/site-packages/pytest/__init__.py"
+                    )))
+                    .is_none(),
+                "{name} site-packages leaked into the graph"
+            );
+        }
+        assert_eq!(
+            admitted.len(),
+            1,
+            "only the authored file belongs in the graph: {:?}",
+            admitted.paths().collect::<Vec<_>>()
+        );
+
+        // Two-sided: the same names WITHOUT the marker are ordinary source and
+        // stay admitted, so the assertions above describe the marker rather
+        // than a name list that would have deleted real code.
+        let sources = tempfile::tempdir().unwrap();
+        let sources = sources.path();
+        for name in ["venv", "env"] {
+            fs::create_dir_all(sources.join(name)).unwrap();
+            fs::write(sources.join(name).join("__init__.py"), b"# real source").unwrap();
+        }
+        let admitted = scan(sources);
+        assert!(admitted.entry(&path("venv/__init__.py")).is_some());
+        assert!(admitted.entry(&path("env/__init__.py")).is_some());
+    }
+
+    /// The escape hatch has to reach an exclusion no pattern named, or a
+    /// repository that deliberately tracks a checked-in environment has no way
+    /// back. `!venv` in `.kinignore` re-admits the environment whole.
+    #[test]
+    fn a_readmit_rule_overrides_the_virtualenv_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        create_virtualenv(root, "venv");
+        create_virtualenv(root, "tools/env");
+
+        fs::write(root.join(".kinignore"), b"!venv\n").unwrap();
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        assert!(
+            scan.entry(&path("venv/bin/activate")).is_some(),
+            "!venv did not re-admit the environment it names"
+        );
+        assert!(
+            scan.entry(&path("tools/env/bin/activate")).is_none(),
+            "re-admitting one environment must not re-admit the others"
+        );
+
+        // Falsification: drop the rule and the same fixture loses the tree.
+        fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
+        let none = RepositoryIgnore::load(root).unwrap();
+        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        assert!(scan.entry(&path("venv/bin/activate")).is_none());
+    }
+
+    /// Graph truth outranks the marker exactly as it outranks every other
+    /// admission rule: a repository that already tracks a path inside an
+    /// environment keeps observing it, so the rule can never turn into a silent
+    /// retraction of what the graph already owns.
+    #[test]
+    fn the_virtualenv_marker_never_retracts_already_tracked_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        create_virtualenv(root, "venv");
+        let tracked = path("venv/bin/activate");
+
+        let ignore = RepositoryIgnore::default();
+        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+        assert!(
+            scan.entry(&tracked).is_some(),
+            "a tracked path was dropped by a rule that only governs admission"
+        );
+        assert!(scan.missing_tracked_paths([&tracked]).is_empty());
+        assert!(
+            tracked_paths_retracted_by_ignore(&ignore, [&tracked], std::iter::empty()).is_empty(),
+            "the marker must not appear in the retraction predicate"
+        );
+
+        // Reaching the tracked path must not re-open the environment around it.
+        // One file committed into a venv before this rule existed would
+        // otherwise drag all of site-packages back in on every pass.
+        assert_eq!(
+            scan.paths().collect::<Vec<_>>(),
+            [&tracked],
+            "the descent admitted more than the tracked path it came for"
+        );
     }
 
     #[test]
