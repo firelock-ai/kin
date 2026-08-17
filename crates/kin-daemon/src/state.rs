@@ -5026,7 +5026,9 @@ impl DaemonState {
     /// save.
     pub(crate) fn record_authority_publication(&self, elapsed: Duration) {
         self.last_authority_publication_micros.store(
-            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX).max(1),
+            u64::try_from(elapsed.as_micros())
+                .unwrap_or(u64::MAX)
+                .max(1),
             Ordering::Relaxed,
         );
     }
@@ -5034,7 +5036,10 @@ impl DaemonState {
     /// What this daemon's last exact-tree publication cost, or `None` when it
     /// has not published one yet.
     pub(crate) fn last_authority_publication(&self) -> Option<Duration> {
-        match self.last_authority_publication_micros.load(Ordering::Relaxed) {
+        match self
+            .last_authority_publication_micros
+            .load(Ordering::Relaxed)
+        {
             0 => None,
             micros => Some(Duration::from_micros(micros)),
         }
