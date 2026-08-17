@@ -4641,7 +4641,8 @@ async fn command_commit(
     // `daemon.log`, also stalls behind a phase that logs only when it finishes.
     // The marker and its beat are what make a busy daemon distinguishable from a
     // wedged one.
-    let _transaction = crate::commit_liveness::TransactionGuard::open(state.layout.root(), "commit");
+    let _transaction =
+        crate::commit_liveness::TransactionGuard::open(state.layout.root(), "commit");
     // Hold one uninterrupted graph-authority gate across forced filesystem
     // admission, change construction, and branch publication. The sync helper
     // deliberately does not re-lock this non-reentrant mutex.

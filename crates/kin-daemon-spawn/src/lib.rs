@@ -3353,6 +3353,102 @@ pub async fn register_started_daemon(kin_root: &Path, daemon_url: &str) -> Resul
 mod tests {
     use super::*;
 
+    /// Whether the OS still has an entry for this pid. A zombie answers yes for
+    /// as long as its parent lives without waiting on it, so this is exactly the
+    /// observable that separates a reaped child from an unreaped corpse: an
+    /// unadopted child would answer yes here forever.
+    ///
+    /// Gated to match its only caller, which is `#[cfg(unix)]` — an ungated
+    /// helper whose callers are all gated is dead code on the other platform and
+    /// fails the `-D warnings` leg there.
+    #[cfg(unix)]
+    fn process_entry_exists(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Six `[kin-daemon] <defunct>` entries accumulated in one brownfield agent
+    /// session. Every spawn path calls `setsid` and then relies on the launcher
+    /// exiting so init inherits and waits on the daemon; `setsid` does not change
+    /// the parent pid, so under `kin mcp start` — which reaches a daemon spawn on
+    /// binding, on rebinding, and on every tool call that revives one — the
+    /// launcher stays the parent and dropping the handle waits on nothing.
+    ///
+    /// Falsify by replacing the `adopt_detached_daemon_child` call with `drop`:
+    /// every pid then answers `kill(pid, 0)` until this process exits and the
+    /// loop below runs to its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn adopted_daemon_children_are_reaped_rather_than_left_defunct() {
+        const RESTARTS: usize = 6;
+        let mut pids = Vec::with_capacity(RESTARTS);
+        for _ in 0..RESTARTS {
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn a short-lived stand-in for a daemon");
+            pids.push(child.id());
+            adopt_detached_daemon_child(child);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let unreaped: Vec<u32> = pids
+                .iter()
+                .copied()
+                .filter(|pid| process_entry_exists(*pid))
+                .collect();
+            if unreaped.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {RESTARTS} adopted children were still in the process table after 10s: \
+                 {unreaped:?}",
+                unreaped.len()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_death_note_round_trips_and_names_the_work_that_was_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_daemon_death_note(dir.path()).is_none());
+
+        let note = DaemonDeathNote {
+            pid: 387,
+            killed_by: "kin-supervisor-reaper".to_string(),
+            reason: "reaping misbehaving repo daemon: OrphanedUnreachableStalled".to_string(),
+            in_flight: Some("commit in phase publish_workspace_admission for 86s".to_string()),
+            at: "2026-08-17T11:43:00Z".to_string(),
+        };
+        write_daemon_death_note(dir.path(), &note);
+
+        let read = read_daemon_death_note(dir.path()).expect("a written note must read back");
+        assert_eq!(read.pid, 387);
+        assert!(read.summary().contains("OrphanedUnreachableStalled"));
+        assert!(
+            read.summary().contains("publish_workspace_admission"),
+            "the note must name the work that was interrupted: {}",
+            read.summary()
+        );
+
+        clear_daemon_death_note(dir.path());
+        assert!(
+            read_daemon_death_note(dir.path()).is_none(),
+            "a cleared note must not be blamed for the next outage"
+        );
+    }
+
+    #[test]
+    fn a_supervisor_reason_reaches_the_log_an_operator_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        append_to_daemon_log(dir.path(), "kin-daemon TERMINATED BY SUPERVISOR: because");
+        let log = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
+        assert!(log.contains("TERMINATED BY SUPERVISOR: because"), "{log}");
+    }
+
     // These are intentionally cross-platform. The permanent native-Windows
     // authority leg selects this name prefix so Windows proves the same
     // shared/exclusive lease and retired-root contract as Unix.

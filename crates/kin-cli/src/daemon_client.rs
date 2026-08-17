@@ -7128,6 +7128,10 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
         .await
         .map_err(AutoStartError::spawn)?;
+    // A death note explains the outage that made this spawn necessary, and
+    // nothing after it. Left in place it would be quoted as the cause of the
+    // next unrelated transport failure.
+    kin_daemon_spawn::clear_daemon_death_note(kin_root);
     info!(daemon = %base_url, "daemon is up and ready");
     Ok(base_url)
 }

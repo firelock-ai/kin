@@ -213,11 +213,9 @@ fn ensure_beat_thread() {
     STARTED.get_or_init(|| {
         let _ = std::thread::Builder::new()
             .name("kin-transaction-beat".to_string())
-            .spawn(|| {
-                loop {
-                    std::thread::sleep(BEAT_INTERVAL);
-                    publish_beat();
-                }
+            .spawn(|| loop {
+                std::thread::sleep(BEAT_INTERVAL);
+                publish_beat();
             });
     });
 }
